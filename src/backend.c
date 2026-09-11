@@ -45,6 +45,9 @@
 // Fixed-size output path buffer for the WAV recorder -- bigger than AUDIO_DEVICE_NAME_LEN since
 // a real filesystem path (not just an ALSA device name) needs the room.
 #define RECORD_PATH_LEN 256
+// Programmable tempo: hard ceiling on how many (time, bpm) tempo markers the tempo-map can hold
+// at once -- see the Tempo section on SynthSharedControls and compute_current_tempo_bpm().
+#define TEMPO_MARKER_MAX 16
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
@@ -128,6 +131,16 @@ typedef struct {
 // param[2] DeRez (tank downsample rate, 0..1), param[3] Predelay (0..1), param[4] Wetness
 // (0..1 -- NOT a crossfade, see run_fx_creamcoat's comment). See run_fx_creamcoat().
 #define FX_TYPE_CREAMCOAT 2
+// Ported from Airwindows Density3 (MIT license). A highpass (leaky-integrator subtraction) into
+// a density/waveshaping saturator. param[0] Density (0..1 -> 0..5 internally; >0.2 pushes into
+// an increasingly hard sine-based clipper, <0.2 into a softer arcsine-family curve, blending
+// smoothly through the neutral point), param[1] Highpass (0..1, how much of a leaky-integrator
+// lowpass is subtracted from the signal before saturating), param[2] Output (0..1, linear
+// makeup gain applied after saturation). The original plugin's own internal Dry/Wet (its 4th
+// param) is deliberately NOT exposed as its own control -- the slot's generic `mix` above
+// already provides an equivalent crossfade, and exposing both would just be two knobs doing the
+// same job. See run_fx_density3().
+#define FX_TYPE_DENSITY3 3
 #define FX_SLOT_PARAM_COUNT 8
 typedef struct {
     float fx_type;
@@ -196,6 +209,11 @@ typedef struct {
 // so string bytes go from 192 to 448) -- see the WavRecorder functions/the recording block in
 // main(). New total: 338 float items + 448 string bytes. The Python side's struct.pack format
 // changes from "319f64s64s64s" to "338f64s64s64s256s".
+// BREAKING CHANGE (programmable Tempo): added tempo_bpm (the Tempo knob, global sidebar) +
+// tempo_marker_count + tempo_marker_time[TEMPO_MARKER_MAX=16] + tempo_marker_bpm[TEMPO_MARKER_MAX]
+// (+34 floats) -- see compute_current_tempo_bpm() and the Tempo section below. No new string
+// fields. New total: 372 float items + 448 string bytes. The Python side's struct.pack format
+// changes from "338f64s64s64s256s" to "372f64s64s64s256s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -394,6 +412,23 @@ typedef struct {
     // detected_input_channels in the status feedback the backend sends back).
     float record_input_channel_enable[RECORD_MAX_CHANNELS];
 
+    // --- Tempo (Global panel) ---
+    // A single flat "Tempo" knob for the common case, plus a programmable tempo-MAP system: up
+    // to TEMPO_MARKER_MAX (time, bpm) marker pairs, linearly interpolated between whichever two
+    // markers bracket the engine's current elapsed time -- see compute_current_tempo_bpm().
+    // Elapsed time here means seconds since this engine process started (main()'s running
+    // sample count / SAMPLE_RATE); there's no other transport/song-position concept in this
+    // engine. tempo_marker_count == 0 means "ignore the marker arrays entirely, tempo_bpm alone
+    // is the whole story" -- currently the only value the frontend ever sends, since there's no
+    // marker editor UI yet. The marker arrays are still reserved in the wire layout so a future
+    // editor (or anything else driving the protocol directly) can populate them without another
+    // breaking change. Nothing in the DSP consumes the computed tempo yet -- this lays the
+    // groundwork for future tempo-synced features (e.g. delay time, LFO rate).
+    float tempo_bpm;
+    float tempo_marker_count;
+    float tempo_marker_time[TEMPO_MARKER_MAX]; // seconds since engine start
+    float tempo_marker_bpm[TEMPO_MARKER_MAX];
+
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
     // it last opened each stream with, and closes/reopens that stream on a live change via
@@ -431,6 +466,39 @@ static inline int effective_block_size(const SynthSharedControls *knobs) {
     if (n < 1) n = 1;
     if (n > BUFFER_SIZE) n = BUFFER_SIZE;
     return n;
+}
+
+// Programmable tempo: resolves the Tempo knob (tempo_bpm) plus an optional tempo-map
+// (tempo_marker_count time/bpm pairs) into a single "what's the tempo right now" value.
+//
+// With no markers programmed (the common case, and currently the only case the frontend ever
+// sends), this is just tempo_bpm -- a plain flat tempo. With markers, it finds whichever two
+// markers bracket `elapsed_seconds` and linearly interpolates between their bpm values; before
+// the first marker it holds that marker's bpm flat (rather than extrapolating backwards), and
+// after the last it holds the last marker's bpm flat -- the same convention a DAW tempo track
+// uses. Markers don't need to be given in time order: this scans for the nearest-before and
+// nearest-after markers directly, so out-of-order input still resolves correctly.
+static float compute_current_tempo_bpm(const SynthSharedControls *knobs, double elapsed_seconds) {
+    int count = (int)knobs->tempo_marker_count;
+    if (count < 0) count = 0;
+    if (count > TEMPO_MARKER_MAX) count = TEMPO_MARKER_MAX;
+    if (count == 0) return knobs->tempo_bpm;
+
+    int prev = -1; double prev_time = -1e18;
+    int next = -1; double next_time = 1e18;
+    for (int i = 0; i < count; i++) {
+        double t = (double)knobs->tempo_marker_time[i];
+        if (t <= elapsed_seconds && t > prev_time) { prev = i; prev_time = t; }
+        if (t > elapsed_seconds && t < next_time) { next = i; next_time = t; }
+    }
+    if (prev < 0 && next < 0) return knobs->tempo_bpm; // defensive fallback, shouldn't happen when count > 0
+    if (prev < 0) return knobs->tempo_marker_bpm[next]; // before the first marker: hold its bpm flat
+    if (next < 0) return knobs->tempo_marker_bpm[prev]; // after the last marker: hold its bpm flat
+
+    double span = next_time - prev_time;
+    double frac = (span > 1e-9) ? (elapsed_seconds - prev_time) / span : 0.0;
+    double bpm = (double)knobs->tempo_marker_bpm[prev] + frac * ((double)knobs->tempo_marker_bpm[next] - (double)knobs->tempo_marker_bpm[prev]);
+    return (float)bpm;
 }
 
 typedef struct {
@@ -1197,6 +1265,115 @@ static void run_fx_creamcoat(FXSlotEngine *engine, const FXSlotParams *params, f
     *r = outSampleR;
 }
 
+// --- FX_TYPE_DENSITY3: ported from Airwindows Density3 (MIT license) ---
+// Highpass (a leaky-integrator lowpass subtracted from the input) feeding a density/waveshaping
+// saturator. `density` (0..5, from param[0]*5) selects between two Taylor-series curves: above
+// 1.0, an increasingly hard sine-based clip (the higher density goes, the more the input is
+// pre-scaled before the sine approximation, so it clips harder); below 1.0, a softer
+// arcsine-family curve; density itself blends smoothly through 1.0 (a pure highpass, no added
+// coloration). This is a direct per-sample port of the original's processReplacing (the
+// float-precision path, matching this engine's own float sample pipeline) -- only VST host
+// plumbing (chunks, program names, canDo) was dropped, along with the original's OWN internal
+// Dry/Wet param (see the FX_TYPE_DENSITY3 comment on why).
+typedef struct {
+    float iirSampleL, iirSampleR;
+    uint32_t fpdL, fpdR;
+} FxDensity3State;
+
+// Shared waveshaping core for one channel, factored out of the original's copy-pasted L/R
+// blocks (both channels ran byte-for-byte identical math on their own sample). `x` is the
+// signal AFTER the highpass subtraction; returns the same density-blended result the original
+// computed inline.
+static inline float density3_waveshape_sample(float x, float density) {
+    float altered = x;
+    if (density > 1.0f) {
+        float half_pi = (float)(M_PI * 0.5);
+        altered = fmaxf(fminf(x * density * half_pi, half_pi), -half_pi);
+        float xx = altered * altered;
+        float temp = altered * xx;
+        altered -= temp / 6.0f;      temp *= xx;
+        altered += temp / 120.0f;    temp *= xx;
+        altered -= temp / 5040.0f;   temp *= xx;
+        altered += temp / 362880.0f; temp *= xx;
+        altered -= temp / 39916800.0f;
+    }
+    if (density < 1.0f) {
+        float clamped = fmaxf(fminf(x, 1.0f), -1.0f);
+        float polarity = clamped;
+        float xx = x * clamped;
+        float temp = xx;
+        altered = temp / 2.0f;       temp *= xx;
+        altered -= temp / 24.0f;     temp *= xx;
+        altered += temp / 720.0f;    temp *= xx;
+        altered -= temp / 40320.0f;  temp *= xx;
+        altered += temp / 3628800.0f;
+        altered *= (polarity < 0.0f) ? -1.0f : 1.0f;
+    }
+    if (density > 2.0f) return altered;
+    float blend = fabsf(density - 1.0f);
+    return x * (1.0f - blend) + altered * blend;
+}
+
+static void run_fx_density3(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxDensity3State *st = (FxDensity3State *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxDensity3State));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+        st->fpdL = (uint32_t)rand(); while (st->fpdL < 16386) st->fpdL = (uint32_t)rand();
+        st->fpdR = (uint32_t)rand(); while (st->fpdR < 16386) st->fpdR = (uint32_t)rand();
+    }
+
+    // param[0] Density, param[1] Highpass, param[2] Output -- all 0..1 (see the FX_TYPE_DENSITY3
+    // comment above for what each becomes internally).
+    float density = fmaxf(0.0f, fminf(1.0f, params->param[0])) * 5.0f;
+    float highpass = fmaxf(0.0f, fminf(1.0f, params->param[1]));
+    float output = fmaxf(0.0f, fminf(1.0f, params->param[2]));
+
+    // overallscale/iirAmount match the original exactly: the highpass's leaky-integrator
+    // coefficient is scaled so its character stays consistent across sample rates, referenced
+    // against 44100Hz. highpass^3 (not highpass itself) gives most of the knob's travel to the
+    // low end of its range, where the audible difference per turn is largest.
+    float overallscale = (float)SAMPLE_RATE / 44100.0f;
+    float iir_amount = (highpass * highpass * highpass) / overallscale;
+    // The original resets its leaky-integrator state to silence once per processReplacing call
+    // whenever Highpass is fully off, so a stale nonzero iir sample can never leak back in as a
+    // DC-ish offset if Highpass is turned back up later. Called once per sample here rather than
+    // once per host buffer, but functionally identical: once iir_amount is 0, this keeps forcing
+    // the state to 0 every sample, same end state as the original's once-per-buffer reset.
+    if (iir_amount <= 0.0f) { st->iirSampleL = 0.0f; st->iirSampleR = 0.0f; }
+
+    float inputSampleL = *l, inputSampleR = *r;
+    if (fabsf(inputSampleL) < 1.18e-23f) inputSampleL = (float)st->fpdL * 1.18e-17f;
+    if (fabsf(inputSampleR) < 1.18e-23f) inputSampleR = (float)st->fpdR * 1.18e-17f;
+
+    st->iirSampleL = st->iirSampleL * (1.0f - iir_amount) + inputSampleL * iir_amount;
+    inputSampleL -= st->iirSampleL;
+    st->iirSampleR = st->iirSampleR * (1.0f - iir_amount) + inputSampleR * iir_amount;
+    inputSampleR -= st->iirSampleR;
+
+    inputSampleL = density3_waveshape_sample(inputSampleL, density);
+    inputSampleR = density3_waveshape_sample(inputSampleR, density);
+
+    inputSampleL *= output;
+    inputSampleR *= output;
+
+    // 32-bit-float dither, scaled relative to each sample's own magnitude (frexpf's exponent) --
+    // same convention (and constant, 5.5e-36f) already used by run_fx_ensemble/run_fx_creamcoat
+    // above, rather than the original plugin's own literal (Airwindows' per-plugin dither
+    // constants vary release to release; this codebase standardizes on one).
+    int expon;
+    frexpf(inputSampleL, &expon);
+    st->fpdL ^= st->fpdL << 13; st->fpdL ^= st->fpdL >> 17; st->fpdL ^= st->fpdL << 5;
+    inputSampleL += (((float)st->fpdL - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+    frexpf(inputSampleR, &expon);
+    st->fpdR ^= st->fpdR << 13; st->fpdR ^= st->fpdR >> 17; st->fpdR ^= st->fpdR << 5;
+    inputSampleR += (((float)st->fpdR - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+
+    *l = inputSampleL;
+    *r = inputSampleR;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -1239,6 +1416,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
         switch (type) {
             case FX_TYPE_ENSEMBLE: run_fx_ensemble(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
             case FX_TYPE_CREAMCOAT: run_fx_creamcoat(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+            case FX_TYPE_DENSITY3: run_fx_density3(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
             case FX_TYPE_OFF:
             default:
                 break; // pass-through
@@ -1427,6 +1605,9 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->record_downmix_stereo = 0.0f;
     for (int c = 0; c < RECORD_MAX_CHANNELS; c++) knobs->record_input_channel_enable[c] = 0.0f;
     knobs->record_path[0] = '\0';
+    knobs->tempo_bpm = 120.0f; // a common, neutral default tempo
+    knobs->tempo_marker_count = 0.0f; // no tempo map programmed -- tempo_bpm alone applies
+    for (int t = 0; t < TEMPO_MARKER_MAX; t++) { knobs->tempo_marker_time[t] = 0.0f; knobs->tempo_marker_bpm[t] = 0.0f; }
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -2621,6 +2802,7 @@ typedef struct {
     float elapsed_seconds;
     float record_error;
     float detected_input_channels;
+    float tempo_bpm_live; // compute_current_tempo_bpm()'s result -- equals tempo_bpm whenever no tempo markers are programmed
 } EngineStatus;
 
 int main() {
@@ -2696,6 +2878,10 @@ int main() {
     SynthVoice voices[MAX_VOICES]; for (int i = 0; i < MAX_VOICES; i++) init_voice(&voices[i]);
     MonoNoteStack mono_stack = {0};
 
+    // Engine "uptime" in samples, purely for the Tempo system's elapsed-time axis (see
+    // compute_current_tempo_bpm()) -- there's no other transport/song-position concept here.
+    uint64_t total_frames_rendered = 0;
+
     while (g_synth_running) {
         poll_control_socket(server_fd, &client_fd, socket_packet_buffer, &control_bytes_received, &active_knobs);
         bool poly_mode_active = (active_knobs.is_polyphonic != 0.0f);
@@ -2738,6 +2924,14 @@ int main() {
         // at the hard BUFFER_SIZE ceiling; only the first block_size frames of each are
         // actually read/written/rendered this iteration.
         int block_size = effective_block_size(&active_knobs);
+
+        // Programmable tempo: resolved once per block from the Tempo knob/tempo-map (see
+        // compute_current_tempo_bpm()) against this engine's own running uptime. Nothing in the
+        // DSP consumes this yet -- it's reported back to the GUI (EngineStatus.tempo_bpm_live)
+        // purely so the Tempo knob visibly does something end-to-end even before a tempo-synced
+        // feature exists to actually use it.
+        double engine_elapsed_seconds = (double)total_frames_rendered / (double)SAMPLE_RATE;
+        float current_tempo_bpm = compute_current_tempo_bpm(&active_knobs, engine_elapsed_seconds);
 
         // Read one block of external input, ALL detected_input_channels of it -- interleaved,
         // stride detected_input_channels per frame (not always 2 anymore; see
@@ -2868,11 +3062,13 @@ int main() {
                 .elapsed_seconds = engine_active ? (atomic_load_explicit(&record_engine.frames_written, memory_order_relaxed) / (float)SAMPLE_RATE) : 0.0f,
                 .record_error = atomic_load_explicit(&record_engine.start_failed, memory_order_relaxed) ? 1.0f : 0.0f,
                 .detected_input_channels = (float)detected_input_channels,
+                .tempo_bpm_live = current_tempo_bpm,
             };
             send(client_fd, &status, sizeof(status), 0);
             vu_decimator = 0;
         }
         write_audio_block(pcm_handle, buffer, block_size, active_voices_count, render_ms);
+        total_frames_rendered += (uint64_t)block_size;
     }
     // Flush/finalize a still-running take on shutdown: signal the writer thread to stop (if a
     // recording was active) and to exit, then join it so its final fclose actually happens

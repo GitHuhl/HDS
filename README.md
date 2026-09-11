@@ -170,9 +170,26 @@ A digital synthesizer split into two processes:
   it's actually running on, watched via the backend's stderr diagnostics.
 
   There is no Global tab -- Program name/Load/Save, Poly/Mono Legato, Hard
-  Sync, Pitch Bend Range, Sustain Pedal Polarity, FM Depth, and Glide all
-  live in the always-visible left sidebar (above the Output/VU strip)
-  instead, since they're relevant no matter which tab is open. The Pitch
+  Sync, Pitch Bend Range, Sustain Pedal Polarity, FM Depth, Glide, and
+  Tempo all live in the always-visible left sidebar (above the Output/VU
+  strip) instead, since they're relevant no matter which tab is open. The
+  Tempo knob (20-300 BPM, default 120) sets `tempo_bpm`; a small label
+  under it mirrors the backend's own resolved value (`EngineStatus.
+  tempo_bpm_live`, round-tripped over the same status socket as the VU
+  meter/recording state), proving the value actually reaches the engine
+  end to end. Nothing in the DSP consumes tempo yet -- this is groundwork
+  for future tempo-synced features (e.g. delay time, LFO rate) -- but the
+  backend already implements a full programmable tempo-MAP system, not
+  just a flat number: `tempo_marker_count` + up to `TEMPO_MARKER_MAX`
+  (16) `(time, bpm)` marker pairs, linearly interpolated between whichever
+  two bracket the engine's own elapsed time (`compute_current_tempo_bpm()`
+  in `backend.c`; time is seconds since the engine process started, holding
+  flat before the first marker and after the last, same convention as a
+  DAW tempo track). There's no marker editor UI yet, so the frontend always
+  sends `tempo_marker_count=0` (the knob is the whole story for now) -- the
+  marker arrays are still reserved in the wire layout so a future editor
+  (or anything else driving the protocol directly) can populate them
+  without another breaking wire-protocol change. The Pitch
   Bend Range group is two spin boxes, up/down, not pots -- an incremental
   control that reads out in semitones. Right-clicking any LFO's Depth pot
   (without dragging -- a right-click *drag* still does the existing
@@ -226,8 +243,8 @@ switchable; input enable/gain) is summed in just before the FX bus, so it
 passes through the same 12 slots as the synth's own voices. Each slot has
 a generic 8-param bank + mix + bypass (`process_fx_chain()` in
 `backend.c`); most slot types are still an unimplemented pass-through,
-ready for more effects to be ported into the dispatch switch. Two are
-implemented so far, both ported from Airwindows (MIT license):
+ready for more effects to be ported into the dispatch switch. Three are
+implemented so far, all ported from Airwindows (MIT license):
 
 - **Ensemble** — a 12-tap fixed-delay ensemble/chorus (not a reverb: no
   feedback loop). Params: Depth (widens/lengthens the delay taps) and
@@ -240,6 +257,16 @@ implemented so far, both ported from Airwindows (MIT license):
   downsample rate — a character control, not just a CPU knob), Predelay,
   and Wetness (also its own internal blend, not a crossfade — see the
   comment in `run_fx_creamcoat`).
+- **Density3** — a highpass (a leaky-integrator lowpass subtracted from
+  the signal) feeding a density/waveshaping saturator: a Taylor-series
+  sine-based clipper above its neutral point, a softer arcsine-family
+  curve below it, blending smoothly through the middle. Params: Density
+  (0 = softest curve, 100 = hardest sine clip), Highpass (0 = off, cubic
+  response so most of the knob's useful range is near the low end), and
+  Output (makeup gain). Unlike the original plugin, there's no separate
+  Dry/Wet param here — the slot's generic Mix knob already does that job,
+  so exposing both would just be two controls doing the same thing (see
+  the `FX_TYPE_DENSITY3` comment in `backend.c`).
 
 Adding a new effect means: a `FX_TYPE_*` define + its processing function
 + a case in `process_fx_chain()`'s switch (`backend.c`), and a matching

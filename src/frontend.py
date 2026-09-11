@@ -41,6 +41,10 @@ BUFFER_SIZE_HARD_LIMIT = 1024
 # Recording tab: must match RECORD_MAX_CHANNELS / RECORD_PATH_LEN in backend.c exactly.
 RECORD_MAX_CHANNELS = 16
 RECORD_PATH_LEN = 256
+# Programmable tempo: must match TEMPO_MARKER_MAX in backend.c exactly. There's no marker editor
+# UI yet -- the frontend always sends tempo_marker_count=0 -- but the wire layout still reserves
+# this many (time, bpm) marker slots so a future editor doesn't need another breaking change.
+TEMPO_MARKER_MAX = 16
 
 # CreamCoat's 17 "Select" room-size presets, in order -- text taken verbatim from the original
 # plugin's own per-case comments (e.g. "5 to 51 ms, 96 seat room").
@@ -90,6 +94,16 @@ FX_TYPE_METADATA = [
         {"label": "DeRez", "range": (0, 100), "default": 100},
         {"label": "Predelay", "range": (0, 100), "default": 0},
         {"label": "Wetness", "range": (0, 100), "default": 25},
+    ]},
+    {"name": "Density3", "params": [
+        # Default 50 -> density=2.5 on the backend (well into the sine-clipper range) rather
+        # than the original plugin's raw 0.0 init -- a density of 0 is barely audible, a poor
+        # first impression of what this effect actually does.
+        {"label": "Density", "range": (0, 100), "default": 50},
+        {"label": "Highpass", "range": (0, 100), "default": 0},
+        {"label": "Output", "range": (0, 100), "default": 100},
+        # No Dry/Wet param here -- the slot's generic Mix knob already does that job; see the
+        # FX_TYPE_DENSITY3 comment in backend.c.
     ]},
 ]
 
@@ -996,6 +1010,25 @@ class SynthGui(QWidget):
         global_layout.addWidget(self.glide_random_dial, alignment=Qt.AlignmentFlag.AlignCenter)
         self.glide_random_readout = QLabel("0%"); self.glide_random_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         global_layout.addWidget(self.glide_random_readout)
+        global_layout.addSpacing(4)
+
+        # Tempo: a flat "what tempo is it" knob, plus a programmable tempo-map system in the
+        # backend (tempo markers, interpolated between -- see compute_current_tempo_bpm() in
+        # backend.c). No marker editor UI exists yet, so this knob is currently the only way to
+        # set it; tempo_readout mirrors the knob locally (matching Glide's pattern), and
+        # tempo_live_readout shows what the backend actually resolved it to (round-trips through
+        # EngineStatus -- always equal to the knob for now, since no markers are ever sent, but
+        # this proves the wire-up end to end and is ready for when markers exist).
+        global_layout.addWidget(QLabel("Tempo"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.tempo_dial = PotentiometerKnob("Tempo", self)
+        self.tempo_dial.setRange(20, 300); self.tempo_dial.setValue(120)
+        global_layout.addWidget(self.tempo_dial, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.tempo_readout = QLabel("120 BPM"); self.tempo_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        global_layout.addWidget(self.tempo_readout)
+        self.tempo_live_readout = QLabel("")
+        self.tempo_live_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tempo_live_readout.setStyleSheet("color: #888; font-size: 9px;")
+        global_layout.addWidget(self.tempo_live_readout)
         global_layout.addStretch()
 
         global_group.setLayout(global_layout)
@@ -2416,7 +2449,7 @@ class SynthGui(QWidget):
     # into this once the Recording tab needed live state back from the engine (is a take
     # actually running, how long, did the last start attempt fail, how many channels does the
     # current input device actually have).
-    _STATUS_FORMAT = "5f"
+    _STATUS_FORMAT = "6f"
     _STATUS_SIZE = struct.calcsize(_STATUS_FORMAT)
 
     def listen_for_status_frames(self):
@@ -2433,17 +2466,19 @@ class SynthGui(QWidget):
         except (socket.error, BlockingIOError):
             pass
         while len(self._status_recv_buf) >= self._STATUS_SIZE:
-            peak, is_recording, elapsed_seconds, record_error, detected_channels = struct.unpack(
+            peak, is_recording, elapsed_seconds, record_error, detected_channels, tempo_bpm_live = struct.unpack(
                 self._STATUS_FORMAT, self._status_recv_buf[:self._STATUS_SIZE]
             )
             self._status_recv_buf = self._status_recv_buf[self._STATUS_SIZE:]
             self.vu_meter.setValue(int(max(0, min(100, peak * 100.0))))
             self._update_recording_status(bool(is_recording), elapsed_seconds, bool(record_error), int(detected_channels))
+            self.tempo_live_readout.setText(f"engine: {tempo_bpm_live:.1f} BPM")
     def transmit_knob_packet(self):
         glide_ms = self.glide_dial.value()
         self.glide_readout.setText(f"{glide_ms} ms")
         glide_random_pct = self.glide_random_dial.value()
         self.glide_random_readout.setText(f"{glide_random_pct}%")
+        self.tempo_readout.setText(f"{self.tempo_dial.value()} BPM")
 
         vassign = 1.0 if self.poly_radio.isChecked() else 0.0
         v1_shape = float(self.vco1_combo.currentIndex())
@@ -2637,6 +2672,16 @@ class SynthGui(QWidget):
             checked = idx < len(self.record_input_channel_cbs) and self.record_input_channel_cbs[idx].isChecked()
             packet_list.append(1.0 if checked else 0.0)
 
+        # Tempo (+34 items): the Tempo knob (tempo_bpm) plus a programmable tempo-map system in
+        # the backend -- tempo_marker_count + up to TEMPO_MARKER_MAX (time, bpm) marker pairs,
+        # interpolated between (see compute_current_tempo_bpm() in backend.c). No marker editor
+        # UI exists yet, so marker_count is always 0 and the arrays always zero -- reserved in
+        # the wire layout for a future editor rather than requiring another breaking change then.
+        packet_list.append(float(self.tempo_dial.value()))
+        packet_list.append(0.0)  # tempo_marker_count
+        packet_list.extend([0.0] * TEMPO_MARKER_MAX)  # tempo_marker_time[]
+        packet_list.extend([0.0] * TEMPO_MARKER_MAX)  # tempo_marker_bpm[]
+
         # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
         # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
         # + 1 (filter_a_mode) + 4 (filter_a) + 1 (filter_a_multi_routing) + 12 (filter_a_multi[3] * 4)
@@ -2647,14 +2692,15 @@ class SynthGui(QWidget):
         # + 2 (vco1/vco2 pulse width) + 4 (noise osc: vol/pan/mute/tilt) + 4 (sub osc: shape/vol/pan/mute)
         # + 2 (ext in enable/gain) + 132 (12 FX slots * 11) + 1 (fx_routing_mode) + 2 (pb range)
         # + 1 (sustain polarity) + 1 (audio latency) + 1 (polyphony) + 1 (block size)
-        # + 19 (recording: enable/synth-output/downmix + 16 channel enables) = 338 floats,
-        # followed by 4 fixed strings (not floats): output_device, input_device, midi_device
-        # (64 bytes each), then record_path (256 bytes -- a real filesystem path needs more room
-        # than an ALSA device name).
+        # + 19 (recording: enable/synth-output/downmix + 16 channel enables)
+        # + 34 (tempo: tempo_bpm + tempo_marker_count + 16 marker times + 16 marker bpms) = 372
+        # floats, followed by 4 fixed strings (not floats): output_device, input_device,
+        # midi_device (64 bytes each), then record_path (256 bytes -- a real filesystem path
+        # needs more room than an ALSA device name).
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
         binary_packet = struct.pack(
-            f"338f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s",
+            f"372f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
@@ -2691,6 +2737,7 @@ def runtime_connect_and_bind(gui):
     gui.fm_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.glide_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.glide_random_dial.valueChanged.connect(gui.transmit_knob_packet)
+    gui.tempo_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco1_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco2_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
 
