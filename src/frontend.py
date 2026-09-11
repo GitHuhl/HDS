@@ -8,8 +8,8 @@ import re
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
                              QSlider, QPushButton, QProgressBar, QSpinBox, QLineEdit, QCheckBox,
-                             QScrollArea)
-from PyQt6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor
+                             QScrollArea, QMenu, QInputDialog)
+from PyQt6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor, QAction
 from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal
 
 def _format_semitones_cents(total_cents):
@@ -268,6 +268,11 @@ class PotentiometerKnob(QWidget):
         self._right_dragged = False
         self._cursor_hidden = False
 
+        # Optional callable(QPoint) invoked on a plain right-click (press+release with no
+        # drag in between) -- lets a caller show a context menu (e.g. LFO depth's "Modulation
+        # Source" menu) without stealing the existing right-drag fine-adjustment gesture.
+        self._context_menu_callback = None
+
         self._fade_timer = QTimer(self)
         self._fade_timer.setSingleShot(True)
         self._fade_timer.timeout.connect(self._hide_popup)
@@ -275,6 +280,10 @@ class PotentiometerKnob(QWidget):
         self._hover_timer = QTimer(self)
         self._hover_timer.setSingleShot(True)
         self._hover_timer.timeout.connect(self._show_popup)
+
+    def setContextMenuCallback(self, callback):
+        """callback(global_pos: QPoint) is called on a plain right-click (no drag)."""
+        self._context_menu_callback = callback
 
     def setRange(self, min_val, max_val):
         self._min_value = min_val
@@ -365,11 +374,14 @@ class PotentiometerKnob(QWidget):
             self._hide_popup()
             event.accept()
         elif event.button() == Qt.MouseButton.RightButton:
+            was_dragged = self._right_dragged
             self._right_press_pos = None
             self._right_dragged = False
             self._drag_button = None
             self._restore_cursor()
             self._hide_popup()
+            if not was_dragged and self._context_menu_callback is not None:
+                self._context_menu_callback(event.globalPosition().toPoint())
             event.accept()
 
     def wheelEvent(self, event: QWheelEvent):
@@ -862,6 +874,47 @@ class SynthGui(QWidget):
         self.hard_sync_checkbox = QCheckBox("Hard Sync")
         self.hard_sync_checkbox.setToolTip("Osc 2 resets to phase 0 every time Osc 1 completes a cycle")
         global_layout.addWidget(self.hard_sync_checkbox)
+        global_layout.addSpacing(4)
+
+        pb_box = QGroupBox("Pitch Bend Range")
+        pb_lay = QHBoxLayout(); pb_lay.setSpacing(6); pb_lay.setContentsMargins(4, 4, 4, 4)
+
+        pb_up_col = QVBoxLayout(); pb_up_col.setSpacing(0)
+        pb_up_col.addWidget(QLabel("Up"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.pb_range_up_spin = QSpinBox()
+        self.pb_range_up_spin.setRange(0, 24)
+        self.pb_range_up_spin.setValue(2)
+        self.pb_range_up_spin.setSuffix(" st")
+        self.pb_range_up_spin.setStyleSheet("font-size: 10px; color: #00adb5; background-color: #2b2b36; font-weight: bold;")
+        self.pb_range_up_spin.setFixedWidth(58)
+        pb_up_col.addWidget(self.pb_range_up_spin, alignment=Qt.AlignmentFlag.AlignCenter)
+        pb_lay.addLayout(pb_up_col)
+
+        pb_down_col = QVBoxLayout(); pb_down_col.setSpacing(0)
+        pb_down_col.addWidget(QLabel("Down"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.pb_range_down_spin = QSpinBox()
+        self.pb_range_down_spin.setRange(0, 24)
+        self.pb_range_down_spin.setValue(2)
+        self.pb_range_down_spin.setSuffix(" st")
+        self.pb_range_down_spin.setStyleSheet("font-size: 10px; color: #00adb5; background-color: #2b2b36; font-weight: bold;")
+        self.pb_range_down_spin.setFixedWidth(58)
+        pb_down_col.addWidget(self.pb_range_down_spin, alignment=Qt.AlignmentFlag.AlignCenter)
+        pb_lay.addLayout(pb_down_col)
+
+        pb_box.setLayout(pb_lay)
+        global_layout.addWidget(pb_box)
+        global_layout.addSpacing(4)
+
+        sustain_box = QGroupBox("Sustain Pedal Polarity")
+        sustain_lay = QHBoxLayout(); sustain_lay.setSpacing(6); sustain_lay.setContentsMargins(4, 4, 4, 4)
+        self.sustain_polarity_normal = QRadioButton("Normal")
+        self.sustain_polarity_normal.setChecked(True)
+        self.sustain_polarity_inverted = QRadioButton("Inverted")
+        self.sustain_polarity_inverted.setToolTip("For a pedal wired backwards (sends 0 when pressed instead of when released)")
+        sustain_lay.addWidget(self.sustain_polarity_normal)
+        sustain_lay.addWidget(self.sustain_polarity_inverted)
+        sustain_box.setLayout(sustain_lay)
+        global_layout.addWidget(sustain_box)
         global_layout.addSpacing(4)
 
         global_layout.addWidget(QLabel("FM Depth"), alignment=Qt.AlignmentFlag.AlignCenter)
@@ -1456,6 +1509,18 @@ class SynthGui(QWidget):
         self.lfo_combos, self.lfo_dials, self.lfo_readouts = [], [], []
         self.lfo_sync_combos, self.lfo_dest_combos, self.lfo_depth_dials, self.lfo_visualizers = [], [], [], []
         self.lfo_phase_dials = []
+        # Modulation Source (right-click on an LFO's Depth pot): -1.0 = None, 0.0-127.0 = that
+        # MIDI CC number, 128.0 = channel aftertouch. Mirrors PackLfoParams.mod_source_cc.
+        self.lfo_mod_source_cc = [-1.0, -1.0, -1.0, -1.0]
+        # Common Modulation Source choices offered on every LFO's right-click menu.
+        self._MOD_SOURCE_PRESETS = [
+            ("None", -1.0),
+            ("Mod Wheel (CC1)", 1.0),
+            ("Breath Controller (CC2)", 2.0),
+            ("Foot Controller (CC4)", 4.0),
+            ("Expression (CC11)", 11.0),
+            ("Channel Aftertouch", 128.0),
+        ]
 
         matrix_shared_routes = [
             "None", "Osc 1 Pitch", "Osc 2 Pitch", "Osc 1+2 Pitch", "O1 Fine", "O2 Fine", "Osc 1 Amp", "Osc 2 Amp",
@@ -1472,7 +1537,12 @@ class SynthGui(QWidget):
             "LFO 1 Rate", "LFO 2 Rate", "LFO 3 Rate", "LFO 4 Rate",
             "LFO 1 Dp", "LFO 2 Dp", "LFO 3 Dp", "LFO 4 Dp", "FM Depth", "Mix Balance",
             "Osc 1 Phase", "Osc 2 Phase", "O1 Unison Detune", "O2 Unison Detune",
-            "LFO 1 Phase", "LFO 2 Phase", "LFO 3 Phase", "LFO 4 Phase"
+            "LFO 1 Phase", "LFO 2 Phase", "LFO 3 Phase", "LFO 4 Phase",
+            # Added for full oscillator/mixer coverage: pan (targets 32/33), pulse width
+            # (34/35, only audible when that oscillator's Shape is Pulse), and the Noise/Sub
+            # sources' own amp/pan/tilt (36-40) -- previously only reachable by hand.
+            "Osc 1 Pan", "Osc 2 Pan", "Osc 1 Pulse Width", "Osc 2 Pulse Width",
+            "Noise Amp", "Noise Pan", "Noise Tilt", "Sub Amp", "Sub Pan",
         ]
 
         for x in range(1, 5):
@@ -1508,6 +1578,9 @@ class SynthGui(QWidget):
             lfo_row.addWidget(QLabel("Dp:"))
             lfo_row.addWidget(dp_dial)
             self.lfo_depth_dials.append(dp_dial)
+            lfo_idx_for_menu = x - 1
+            dp_dial.setContextMenuCallback(lambda pos, i=lfo_idx_for_menu: self._show_mod_source_menu(i, pos))
+            self._update_mod_source_tooltip(lfo_idx_for_menu)
 
             phase_dial = PotentiometerKnob(f"LFO {x} Phase", self)
             phase_dial.setRange(0, 360)
@@ -1550,14 +1623,14 @@ class SynthGui(QWidget):
         self.btn_randomize_eg = QPushButton("🎲")
         self.btn_randomize_eg.setFixedSize(24, 22)
         self.btn_randomize_eg.setStyleSheet("font-size: 11px;")
-        self.btn_randomize_eg.setToolTip("Randomize all 4 assignable EGs")
+        self.btn_randomize_eg.setToolTip("Randomize all 6 assignable EGs")
         eg_header_row.addWidget(self.btn_randomize_eg)
         eg_layout.addLayout(eg_header_row)
         self.btn_randomize_eg.clicked.connect(self.randomize_assignable_egs)
 
         self.envelopes, self.eg_dest_combos, self.eg_intensity_dials = [], [], []
 
-        for x in range(1, 5):
+        for x in range(1, 7):
             panel = ADSRPanel(f"EG {x}", (5, 1000), (5, 2000), (10, 2000))
             panel.title_layout.addStretch()
 
@@ -1885,6 +1958,47 @@ class SynthGui(QWidget):
             combo.setCurrentText(current_text)
             combo.blockSignals(False)
 
+    def _mod_source_label(self, cc_value):
+        for label, val in self._MOD_SOURCE_PRESETS:
+            if val == cc_value:
+                return label
+        if 0.0 <= cc_value < 128.0:
+            return f"CC {int(cc_value)}"
+        return "None"
+
+    def _update_mod_source_tooltip(self, idx):
+        label = self._mod_source_label(self.lfo_mod_source_cc[idx])
+        self.lfo_depth_dials[idx].setToolTip(f"LFO {idx + 1} Depth  |  Modulation Source: {label}\n(right-click to assign)")
+
+    def _set_mod_source(self, idx, cc_value):
+        self.lfo_mod_source_cc[idx] = cc_value
+        self._update_mod_source_tooltip(idx)
+        self.transmit_knob_packet()
+
+    def _prompt_custom_cc(self, idx):
+        current = int(self.lfo_mod_source_cc[idx]) if 0 <= self.lfo_mod_source_cc[idx] < 128 else 1
+        cc_num, ok = QInputDialog.getInt(self, "Custom MIDI CC", "CC number (0-127):", current, 0, 127, 1)
+        if ok:
+            self._set_mod_source(idx, float(cc_num))
+
+    def _show_mod_source_menu(self, idx, global_pos):
+        menu = QMenu("Modulation Source", self)
+        menu.addSection("Modulation Source")
+        current = self.lfo_mod_source_cc[idx]
+        for label, val in self._MOD_SOURCE_PRESETS:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(current == val)
+            action.triggered.connect(lambda checked, i=idx, v=val: self._set_mod_source(i, v))
+            menu.addAction(action)
+        menu.addSeparator()
+        custom_action = QAction("Custom CC…", self)
+        custom_action.setCheckable(True)
+        custom_action.setChecked(current >= 0.0 and current < 128.0 and current not in (1.0, 2.0, 4.0, 11.0))
+        custom_action.triggered.connect(lambda checked, i=idx: self._prompt_custom_cc(i))
+        menu.addAction(custom_action)
+        menu.exec(global_pos)
+
     def connect_to_backend(self):
         try:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1929,8 +2043,8 @@ class SynthGui(QWidget):
         # Baseline header list: Maps 13 core parameter elements exactly
         packet_list = [vassign, v1_shape, v2_shape, fm, v1_vol, v2_vol, g_time, m_vol, v1_p, v2_p, v1_fine, v2_pitch, v2_fine]
 
-        # Pack 8 parameters (D, H, A, Dec, S, R, Attack Start, Attack Peak) for all 7 envelope instances (+56 items)
-        # Order matches C struct exactly: Osc 1 Amp, Osc 2 Amp, Noise Amp, then EG 1-4.
+        # Pack 8 parameters (D, H, A, Dec, S, R, Attack Start, Attack Peak) for all 9 envelope instances (+72 items)
+        # Order matches C struct exactly: Osc 1 Amp, Osc 2 Amp, Noise Amp, then EG 1-6.
         all_panels = [self.vco1_amp_eg, self.vco2_amp_eg, self.noise_amp_eg] + self.envelopes
         for panel in all_panels:
             packet_list.append(float(panel.dials["D"].value()))
@@ -1970,7 +2084,7 @@ class SynthGui(QWidget):
         packet_list.append(float(self.q_dials[4].value()))
         packet_list.append(float(self.vcf_poles[4].currentIndex()))
         packet_list.append(float(self.vcf_types[4].currentIndex()))
-        # Add active LFO configurations (+24 items, incl. phase offset)
+        # Add active LFO configurations (+28 items, incl. phase offset + mod source CC)
         for idx in range(4):
             lfo_hz = float(self.lfo_dials[idx].value()) / 10.0
             self.lfo_readouts[idx].setText(f"{lfo_hz:.1f} Hz")
@@ -1981,16 +2095,17 @@ class SynthGui(QWidget):
             packet_list.append(float(self.lfo_sync_combos[idx].currentIndex()))
             packet_list.append(float(self.lfo_dest_combos[idx].currentIndex()))
             packet_list.append(float(self.lfo_phase_dials[idx].value()))
-        # Append the 4 custom EG intensity multipliers (+4 items)
-        for idx in range(4):
+            packet_list.append(float(self.lfo_mod_source_cc[idx]))
+        # Append the 6 custom EG intensity multipliers (+6 items)
+        for idx in range(6):
             packet_list.append(float(self.eg_intensity_dials[idx].value()) / 100.0)
 
-        # Append each assignable EG's own mod destination (+4 items)
-        for idx in range(4):
+        # Append each assignable EG's own mod destination (+6 items)
+        for idx in range(6):
             packet_list.append(float(self.eg_dest_combos[idx].currentIndex()))
 
-        # Append the 7 active envelope mode selection indices (+7 items).
-        # Sequence matches C struct exactly: Osc 1 Amp, Osc 2 Amp, Noise Amp, then EG 1-4.
+        # Append the 9 active envelope mode selection indices (+9 items).
+        # Sequence matches C struct exactly: Osc 1 Amp, Osc 2 Amp, Noise Amp, then EG 1-6.
         packet_list.append(float(self.vco1_amp_eg.combo_type.currentIndex()))
         packet_list.append(float(self.vco2_amp_eg.combo_type.currentIndex()))
         packet_list.append(float(self.noise_amp_eg.combo_type.currentIndex()))
@@ -2071,15 +2186,28 @@ class SynthGui(QWidget):
         # FX Bus routing: 0 = Series, 1 = Parallel (+1 item)
         packet_list.append(1.0 if self.fx_routing_btn.isChecked() else 0.0)
 
-        # UNIFIED CONTRACT VERIFICATION
-        # 151 (baseline through 4-osc additions) + 2 (ext in) + 132 (12 FX slots * 11)
-        # + 1 (fx_routing_mode) = 286 floats, followed by 3 fixed 64-byte device name strings
+        # Pitch Bend range, up/down, semitones (+2 items)
+        packet_list.append(float(self.pb_range_up_spin.value()))
+        packet_list.append(float(self.pb_range_down_spin.value()))
+
+        # Sustain pedal polarity: 0 = Normal, 1 = Inverted (+1 item)
+        packet_list.append(1.0 if self.sustain_polarity_inverted.isChecked() else 0.0)
+
+        # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
+        # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_a_mode)
+        # + 4 (filter_a) + 1 (filter_a_multi_routing) + 12 (filter_a_multi[3] * 4)
+        # + 4 (filter_b) + 28 (4 LFOs * 7, incl. phase offset + mod_source_cc)
+        # + 6 (eg_intensity) + 6 (eg_dest_target) + 9 (eg_mode)
+        # + 4 (unison saw width/detune) + 1 (mono glide randomization)
+        # + 2 (vco1/vco2 mute) + 1 (hard sync) + 2 (vco1/vco2 phase offset)
+        # + 2 (vco1/vco2 pulse width) + 4 (noise osc: vol/pan/mute/tilt) + 4 (sub osc: shape/vol/pan/mute)
+        # + 2 (ext in enable/gain) + 132 (12 FX slots * 11) + 1 (fx_routing_mode) + 2 (pb range)
+        # + 1 (sustain polarity) = 315 floats, followed by 3 fixed 64-byte device name strings
         # (not floats): output_device, input_device, midi_device.
-        # 13 + 56 + 1 + 1 + 4 + 1 + 12 + 4 + 24 + 4 + 4 + 7 + 4 + 1 + 2 + 1 + 2 + 10 + 2 + 132 + 1 = 286
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
         binary_packet = struct.pack(
-            f"286f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
+            f"315f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
@@ -2097,6 +2225,10 @@ def runtime_connect_and_bind(gui):
     gui.poly_radio.toggled.connect(gui.transmit_knob_packet)
     gui.mono_radio.toggled.connect(gui.transmit_knob_packet)
     gui.hard_sync_checkbox.toggled.connect(gui.transmit_knob_packet)
+    gui.pb_range_up_spin.valueChanged.connect(gui.transmit_knob_packet)
+    gui.pb_range_down_spin.valueChanged.connect(gui.transmit_knob_packet)
+    gui.sustain_polarity_normal.toggled.connect(gui.transmit_knob_packet)
+    gui.sustain_polarity_inverted.toggled.connect(gui.transmit_knob_packet)
     gui.master_vol.valueChanged.connect(gui.transmit_knob_packet)
 
     # Oscillator selection changes

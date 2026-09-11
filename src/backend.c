@@ -17,7 +17,8 @@
 #define BUFFER_SIZE 128
 #define MAX_VOICES  64
 #define LFO_COUNT   4
-#define ENV_COUNT   7  // Osc 1 Amp, Osc 2 Amp, Noise Osc Amp, + EG 1-4
+#define ASSIGNABLE_EG_COUNT 6  // EG 1-6 (in addition to Osc 1 Amp, Osc 2 Amp, Noise Osc Amp)
+#define ENV_COUNT   (3 + ASSIGNABLE_EG_COUNT)  // Osc 1 Amp, Osc 2 Amp, Noise Osc Amp, + assignable EGs
 #define UNISON_SAW_VOICES 7
 #define FX_SLOT_COUNT 12
 #define AUDIO_DEVICE_NAME_LEN 64
@@ -68,6 +69,11 @@ typedef struct {
 
 typedef struct {
     float wave_type; float rate_hz; float mod_depth; float key_sync; float dest_target; float phase_offset;
+    // Modulation Source (right-click on the depth pot in the GUI): scales this LFO's output by
+    // a live MIDI controller, e.g. gating vibrato depth with the mod wheel. -1 = None (no
+    // scaling -- the LFO always runs at its knob depth). 0-127 = that MIDI CC number. 128 =
+    // channel (monophonic) aftertouch. See render_audio_block's LFO loop.
+    float mod_source_cc;
 } PackLfoParams;
 
 // A single filter's parameters: State-Variable Filter (SVF) core, cutoff/resonance/type, plus
@@ -134,6 +140,19 @@ typedef struct {
 // BREAKING CHANGE (MIDI device selection): added 1 more fixed 64-byte string (midi_device --
 // not a float; see AUDIO_DEVICE_NAME_LEN). New total: 286 float items + 192 string bytes. The
 // Python side's struct.pack format changes from "286f64s64s" to "286f64s64s64s".
+// BREAKING CHANGE (pitch bend range, sustain pedal polarity, LFO Modulation Source): added 3
+// trailing floats (pb_range_up, pb_range_down, sustain_pedal_polarity) + grew PackLfoParams from
+// 6 to 7 fields (added mod_source_cc), i.e. +4 floats across the 4 LFOs = +7 floats total. New
+// total: 293 float items + 192 string bytes. The Python side's struct.pack format changes from
+// "286f64s64s64s" to "293f64s64s64s". (Mod matrix destinations 32-40, added the same round of
+// work, are new *values* an existing float (dest_target) can take -- they don't change the wire
+// layout.)
+// BREAKING CHANGE (6 assignable EGs, up from 4): ASSIGNABLE_EG_COUNT went 4 -> 6, so ENV_COUNT
+// (3 + ASSIGNABLE_EG_COUNT) went 7 -> 9. That grows eg[ENV_COUNT] by 2 entries (+16 floats, 8
+// params each) and eg_mode[ENV_COUNT] by 2 (+2 floats), plus eg_intensity/eg_dest_target each
+// grow from 4 to 6 elements (+2 floats each) -- total +22 floats. New total: 315 float items +
+// 192 string bytes. The Python side's struct.pack format changes from "293f64s64s64s" to
+// "315f64s64s64s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -150,7 +169,7 @@ typedef struct {
     float vco2_pitch_offset;
     float vco2_fine_tune;
 
-    // 48 Envelope Parameter Items (6 Envelopes * 8 Parameters, incl. attack start/peak level)
+    // 72 Envelope Parameter Items (ENV_COUNT=9 Envelopes * 8 Parameters, incl. attack start/peak level)
     PackEGParams eg[ENV_COUNT];
 
     // --- FILTER SECTION (overhauled): 4 oscillators -> mixer -> Filter A -> Filter B, with
@@ -179,16 +198,17 @@ typedef struct {
     // Filter B: always a single, normal filter -- no Multi mode of its own. (+4 floats)
     FilterParams filter_b;
 
-    // 24 Active LFO Mapping Items (4 LFOs * 6 Properties, incl. phase offset)
+    // 28 Active LFO Mapping Items (4 LFOs * 7 Properties, incl. phase offset + mod source CC)
     PackLfoParams lfo[LFO_COUNT];
 
-    // 4 Custom EG Intensity Modulators
-    float eg_intensity[4];
+    // ASSIGNABLE_EG_COUNT (6) Custom EG Intensity Modulators
+    float eg_intensity[ASSIGNABLE_EG_COUNT];
 
-    // 4 Custom EG Destination Targets (each assignable EG routes independently of the LFOs)
-    float eg_dest_target[4];
+    // ASSIGNABLE_EG_COUNT (6) Custom EG Destination Targets (each assignable EG routes
+    // independently of the LFOs)
+    float eg_dest_target[ASSIGNABLE_EG_COUNT];
 
-    // 6 Active Envelope Topology Selection Mode Indices
+    // ENV_COUNT (9) Active Envelope Topology Selection Mode Indices
     float eg_mode[ENV_COUNT];
 
     // Unison Saw Shape Controls
@@ -262,6 +282,18 @@ typedef struct {
     // independently, all 12 outputs summed and averaged -- see process_fx_chain()).
     float fx_routing_mode;
 
+    // Pitch Bend range, in semitones, applied equally to both oscillators. Separately
+    // specifiable up/down since real-world PB ranges are often asymmetric (e.g. a guitar-style
+    // patch bending up a whole step but down a minor third). See pb_bend_cents in
+    // render_audio_block.
+    float pb_range_up;
+    float pb_range_down;
+
+    // Sustain pedal polarity: 0 = Normal (CC64 >= 64 means held, matching essentially every
+    // sustain pedal), 1 = Inverted (for the rare pedal wired backwards, sending 0 when
+    // pressed). See handle_sustain_pedal_change()/the CC64 handling in process_midi_input.
+    float sustain_pedal_polarity;
+
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
     // it last opened each stream with, and closes/reopens that stream on a live change via
@@ -321,8 +353,8 @@ typedef struct {
     float fb_low[2][2];
     float fb_band[2][2];
 
-    // Assignable envelope instances 1-4
-    ADSR assign_eg[4];
+    // Assignable envelope instances 1-ASSIGNABLE_EG_COUNT
+    ADSR assign_eg[ASSIGNABLE_EG_COUNT];
 
     // Dedicated Noise Oscillator: its own amp envelope, plus one-pole low-passed state used to
     // derive the "low" half of the tilt-EQ color control (see render_audio_block).
@@ -339,6 +371,11 @@ typedef struct {
     // pitch glide (an overlapping legato note, or falling back to a still-held note on release).
     // 1.0 = no variation (uses the plain Glide Time knob exactly).
     float glide_time_multiplier;
+
+    // Sustain pedal: set instead of actually releasing when a note-off arrives while the pedal
+    // is held (see handle_note_off/handle_sustain_release). Cleared on any fresh retrigger of
+    // this voice slot, since a new note-on makes whatever was pending before moot.
+    bool sustain_pending;
 } SynthVoice;
 // FIXED: Restored 'p->s' to reference sustain data properties correctly
 void tick_adsr(ADSR *env, const PackEGParams *p, int mode) {
@@ -1225,9 +1262,9 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->filter_a_multi_routing = 0.0f; // Series, matching the old default 3-filter behavior
     for(int f=0; f<3; f++) { knobs->filter_a_multi[f].cutoff = 400.0f + (f*200); knobs->filter_a_multi[f].res_q = 20.0f; knobs->filter_a_multi[f].slope_poles = 0.0f; knobs->filter_a_multi[f].filter_type = 1.0f; }
     knobs->filter_b.cutoff = 4000.0f; knobs->filter_b.res_q = 20.0f; knobs->filter_b.slope_poles = 0.0f; knobs->filter_b.filter_type = 0.0f; // Off by default -- Filter A alone matches old single-filter-ish defaults
-    for(int l=0; l<LFO_COUNT; l++) { knobs->lfo[l].wave_type = 0.0f; knobs->lfo[l].rate_hz = 5.0f; knobs->lfo[l].mod_depth = 0.0f; knobs->lfo[l].key_sync = 1.0f; knobs->lfo[l].dest_target = 0.0f; knobs->lfo[l].phase_offset = 0.0f; }
+    for(int l=0; l<LFO_COUNT; l++) { knobs->lfo[l].wave_type = 0.0f; knobs->lfo[l].rate_hz = 5.0f; knobs->lfo[l].mod_depth = 0.0f; knobs->lfo[l].key_sync = 1.0f; knobs->lfo[l].dest_target = 0.0f; knobs->lfo[l].phase_offset = 0.0f; knobs->lfo[l].mod_source_cc = -1.0f; }
     for(int e=0; e<ENV_COUNT; e++) { knobs->eg[e].d = 0.0f; knobs->eg[e].h = 0.0f; knobs->eg[e].a = 10.0f; knobs->eg[e].dec = 150.0f; knobs->eg[e].s = 80.0f; knobs->eg[e].r = 300.0f; knobs->eg[e].al = 0.0f; knobs->eg[e].pk = 100.0f; knobs->eg_mode[e] = 0.0f; }
-    for(int i=0; i<4; i++) { knobs->eg_intensity[i] = 1.0f; knobs->eg_dest_target[i] = 0.0f; }
+    for(int i=0; i<ASSIGNABLE_EG_COUNT; i++) { knobs->eg_intensity[i] = 1.0f; knobs->eg_dest_target[i] = 0.0f; }
     // Subtle default detune (matches the old fixed +/-1.5% spread) and no width until the user asks for it
     knobs->vco1_unison_saw_detune = 25.0f; knobs->vco1_unison_saw_width = 50.0f;
     knobs->vco2_unison_saw_detune = 25.0f; knobs->vco2_unison_saw_width = 50.0f;
@@ -1250,6 +1287,8 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->fx[f].bypass = 0.0f;
     }
     knobs->fx_routing_mode = 0.0f; // Series
+    knobs->pb_range_up = 2.0f; knobs->pb_range_down = 2.0f; // standard +/-2 semitone default
+    knobs->sustain_pedal_polarity = 0.0f; // Normal
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -1262,12 +1301,13 @@ static void init_voice(SynthVoice *voice) {
     for(int u=0; u<UNISON_SAW_VOICES; u++) { voice->vco1_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco2_unison_saw_phases[u] = (float)rand()/RAND_MAX; }
     for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voice->fa_low[c][f][0]=0.0f; voice->fa_low[c][f][1]=0.0f; voice->fa_band[c][f][0]=0.0f; voice->fa_band[c][f][1]=0.0f; } voice->fb_low[c][0]=0.0f; voice->fb_low[c][1]=0.0f; voice->fb_band[c][0]=0.0f; voice->fb_band[c][1]=0.0f; }
     voice->glide_time_multiplier = 1.0f;
+    voice->sustain_pending = false;
     voice->vco1_eg.state = STATE_IDLE; voice->vco1_eg.current_level = 0.0f; voice->vco1_eg.release_level = 0.0f;
     voice->vco2_eg.state = STATE_IDLE; voice->vco2_eg.current_level = 0.0f; voice->vco2_eg.release_level = 0.0f;
     voice->noise_eg.state = STATE_IDLE; voice->noise_eg.current_level = 0.0f; voice->noise_eg.release_level = 0.0f;
     voice->noise_tilt_lp = 0.0f;
     voice->sub_phase = (float)rand()/RAND_MAX; voice->sub_tri_state = 0.0f;
-    for(int e=0; e<4; e++) { voice->assign_eg[e].state = STATE_IDLE; voice->assign_eg[e].current_level = 0.0f; voice->assign_eg[e].release_level = 0.0f; }
+    for(int e=0; e<ASSIGNABLE_EG_COUNT; e++) { voice->assign_eg[e].state = STATE_IDLE; voice->assign_eg[e].current_level = 0.0f; voice->assign_eg[e].release_level = 0.0f; }
 }
 // Rolls a randomized glide-time multiplier for Mono Legato: 1.0 = no variation. glide_random_pct
 // (0-100) controls how far the multiplier can wander from 1.0 in either direction; floored well
@@ -1289,6 +1329,18 @@ typedef struct {
     int notes[MONO_STACK_SIZE];
     int count;
 } MonoNoteStack;
+
+// Live performance-controller state -- continuously updated from incoming MIDI Control Change/
+// Pitch Bend/Channel Pressure messages (see process_midi_input), read every sample by
+// render_audio_block for pitch bend and by run_lfo-adjacent code for CC-scaled LFO depth (see
+// FX_TYPE_*-style "Modulation Source" on each LFO). Deliberately NOT part of SynthSharedControls
+// -- this is performance data driven by the player's controller, not a GUI-set knob value.
+typedef struct {
+    float cc[128];          // 0..1, last received value of each MIDI CC number
+    float pitch_bend;       // -1..1, 0 = centered
+    float channel_pressure; // 0..1, monophonic (channel-wide) aftertouch
+    bool sustain_held;      // CC64, after applying sustain_pedal_polarity -- see process_midi_input
+} MidiLiveState;
 
 static void mono_stack_push(MonoNoteStack *stack, int note) {
     for (int i = 0; i < stack->count; i++) {
@@ -1329,6 +1381,10 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
     voices[slot].midi_note = note;
     voices[slot].vco1_target_freq = target_hz;
     voices[slot].vco2_target_freq = target_hz;
+    // Any note-on onto this slot makes a previously-deferred sustain release moot -- either the
+    // slot was stolen from a sustain-pending voice (about to be fully reset below regardless),
+    // or this is a fresh key that has nothing to do with whatever the pedal was holding.
+    voices[slot].sustain_pending = false;
 
     // Mono Legato: only retrigger (reset phase/filters/envelopes) when this is genuinely the
     // first key of a phrase. If another key is already held when this one comes down, it's an
@@ -1355,7 +1411,7 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         // its own here -- it shares vco1_eg, already retriggered above.)
         int mn = (int)knobs->eg_mode[2]; voices[slot].noise_eg.state = (mn == 5) ? STATE_DELAY : STATE_ATTACK;
         voices[slot].noise_eg.current_level = (mn == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[2].al / 100.0f));
-        for(int e=0; e<4; e++) {
+        for(int e=0; e<ASSIGNABLE_EG_COUNT; e++) {
             int me = (int)knobs->eg_mode[3 + e]; voices[slot].assign_eg[e].state = (me == 5) ? STATE_DELAY : STATE_ATTACK;
             voices[slot].assign_eg[e].current_level = (me == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[3 + e].al / 100.0f));
         }
@@ -1366,13 +1422,23 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
     if (!poly_mode_active) mono_stack_push(mono_stack, note);
 }
 
-static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knobs, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
+// Puts a voice's envelopes into RELEASE from wherever they currently are. Factored out since
+// it's needed from three places: a normal note-off (poly and mono), and releasing every voice
+// that was deferred by the sustain pedal once it lifts (see handle_sustain_release).
+static void trigger_voice_release(SynthVoice *voice) {
+    voice->vco1_eg.release_level = voice->vco1_eg.current_level; voice->vco1_eg.state = STATE_RELEASE;
+    voice->vco2_eg.release_level = voice->vco2_eg.current_level; voice->vco2_eg.state = STATE_RELEASE;
+    voice->noise_eg.release_level = voice->noise_eg.current_level; voice->noise_eg.state = STATE_RELEASE;
+    for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) { voice->assign_eg[e].release_level = voice->assign_eg[e].current_level; voice->assign_eg[e].state = STATE_RELEASE; }
+}
+
+static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
     if (poly_mode_active) {
         for (int v = 0; v < MAX_VOICES; v++) { if (voices[v].midi_note == note) {
-            voices[v].vco1_eg.release_level = voices[v].vco1_eg.current_level; voices[v].vco1_eg.state = STATE_RELEASE;
-            voices[v].vco2_eg.release_level = voices[v].vco2_eg.current_level; voices[v].vco2_eg.state = STATE_RELEASE;
-            voices[v].noise_eg.release_level = voices[v].noise_eg.current_level; voices[v].noise_eg.state = STATE_RELEASE;
-            for(int e=0; e<4; e++) { voices[v].assign_eg[e].release_level = voices[v].assign_eg[e].current_level; voices[v].assign_eg[e].state = STATE_RELEASE; }
+            // Sustain pedal held: defer the actual release until it lifts (see
+            // handle_sustain_release) instead of releasing right now.
+            if (midi_live->sustain_held) voices[v].sustain_pending = true;
+            else trigger_voice_release(&voices[v]);
         } }
         return;
     }
@@ -1391,11 +1457,21 @@ static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knob
         // Falling back to a still-held note is also a real audible glide -- reroll its time too.
         voices[0].glide_time_multiplier = roll_glide_multiplier(knobs->mono_glide_random);
         // Falling back to a still-held note never retriggers or releases -- the sound never stopped.
+    } else if (midi_live->sustain_held) {
+        voices[0].sustain_pending = true;
     } else {
-        voices[0].vco1_eg.release_level = voices[0].vco1_eg.current_level; voices[0].vco1_eg.state = STATE_RELEASE;
-        voices[0].vco2_eg.release_level = voices[0].vco2_eg.current_level; voices[0].vco2_eg.state = STATE_RELEASE;
-        voices[0].noise_eg.release_level = voices[0].noise_eg.current_level; voices[0].noise_eg.state = STATE_RELEASE;
-        for(int e=0; e<4; e++) { voices[0].assign_eg[e].release_level = voices[0].assign_eg[e].current_level; voices[0].assign_eg[e].state = STATE_RELEASE; }
+        trigger_voice_release(&voices[0]);
+    }
+}
+
+// Called when the sustain pedal transitions held -> released: actually releases every voice
+// that had a note-off deferred while it was held.
+static void handle_sustain_release(SynthVoice voices[]) {
+    for (int v = 0; v < MAX_VOICES; v++) {
+        if (voices[v].sustain_pending) {
+            voices[v].sustain_pending = false;
+            trigger_voice_release(&voices[v]);
+        }
     }
 }
 
@@ -1510,14 +1586,30 @@ static void midi_autoconnect_scan(snd_seq_t *seq, int our_port, const char *midi
 // our_midi_port/midi_sources are only needed for hotplug auto-connect (SND_SEQ_EVENT_PORT_START/
 // PORT_EXIT) -- these arrive on the same event stream as NOTEON/NOTEOFF because main() subscribes
 // our port to the ALSA announce port at startup (see main()'s comment on that subscription).
-static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], bool poly_mode_active, MonoNoteStack *mono_stack, int our_midi_port, MidiSourceList *midi_sources) {
+static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], bool poly_mode_active, MonoNoteStack *mono_stack, int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live) {
     snd_seq_event_t *ev = NULL;
     while (snd_seq_event_input_pending(seq_handle, 1) > 0) {
         snd_seq_event_input(seq_handle, &ev); if (ev == NULL) continue;
         if (ev->type == SND_SEQ_EVENT_NOTEON || ev->type == SND_SEQ_EVENT_NOTEOFF) {
             int note = ev->data.note.note;
             if (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0) { handle_note_on(voices, knobs, global_lfo_phases, note, poly_mode_active, mono_stack); }
-            else { handle_note_off(voices, knobs, note, poly_mode_active, mono_stack); }
+            else { handle_note_off(voices, knobs, midi_live, note, poly_mode_active, mono_stack); }
+        } else if (ev->type == SND_SEQ_EVENT_CONTROLLER) {
+            int cc_num = ev->data.control.param;
+            if (cc_num >= 0 && cc_num < 128) midi_live->cc[cc_num] = fmaxf(0.0f, fminf(1.0f, ev->data.control.value / 127.0f));
+            if (cc_num == 64) {
+                // Sustain pedal. polarity: 0 = Normal (>=64 means held, essentially every real
+                // pedal), 1 = Inverted (for the rare one wired backwards).
+                bool raw_held = ev->data.control.value >= 64;
+                bool now_held = (knobs->sustain_pedal_polarity != 0.0f) ? !raw_held : raw_held;
+                if (midi_live->sustain_held && !now_held) handle_sustain_release(voices); // pedal just lifted
+                midi_live->sustain_held = now_held;
+            }
+        } else if (ev->type == SND_SEQ_EVENT_PITCHBEND) {
+            // ALSA's own sequencer convention: value is already signed, -8192..8191, 0 = centered.
+            midi_live->pitch_bend = fmaxf(-1.0f, fminf(1.0f, ev->data.control.value / 8192.0f));
+        } else if (ev->type == SND_SEQ_EVENT_CHANPRESS) {
+            midi_live->channel_pressure = fmaxf(0.0f, fminf(1.0f, ev->data.control.value / 127.0f));
         } else if (ev->type == SND_SEQ_EVENT_PORT_START) {
             // A new ALSA sequencer client/port just appeared -- e.g. a USB MIDI keyboard was
             // just plugged in. Auto-connect immediately if it matches the current selection
@@ -1534,16 +1626,14 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
         snd_seq_free_event(ev);
     }
 }
-static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], const float *ext_in_buffer, float *out_buffer) {
+static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], const float *ext_in_buffer, const MidiLiveState *midi_live, float *out_buffer) {
     float peak = 0.0f;
     // Each oscillator is panned to stereo AT THE MIXER, before the signal reaches Filter A/B --
     // Filter A/B then run as two fully independent mono filters (one per channel, see fa_low/
     // fb_low's [channel] dimension) so that placement survives filtering instead of collapsing
-    // to mono first. These knobs are constant across a whole buffer, so computed once here.
-    float pan1_l = cosf((knobs->vco1_pan + 1.0f) * (M_PI / 4.0f)), pan1_r = sinf((knobs->vco1_pan + 1.0f) * (M_PI / 4.0f));
-    float pan2_l = cosf((knobs->vco2_pan + 1.0f) * (M_PI / 4.0f)), pan2_r = sinf((knobs->vco2_pan + 1.0f) * (M_PI / 4.0f));
-    float pan_noise_l = cosf((knobs->noise_pan + 1.0f) * (M_PI / 4.0f)), pan_noise_r = sinf((knobs->noise_pan + 1.0f) * (M_PI / 4.0f));
-    float pan_sub_l = cosf((knobs->sub_pan + 1.0f) * (M_PI / 4.0f)), pan_sub_r = sinf((knobs->sub_pan + 1.0f) * (M_PI / 4.0f));
+    // to mono first. Pan is a mod destination (targets 32/33/37/40 -- see the per-voice mod
+    // accumulation below), so unlike most per-block constants here it's computed per-voice,
+    // per-sample instead of once for the whole buffer.
 
     // PERF: Unison Saw's per-unison pan (cosf/sinf) only depends on the Width knob, which is
     // constant across the whole buffer -- computed once here instead of every sample, for
@@ -1557,6 +1647,14 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // linearly crossfaded by the Tilt knob. The coefficient depends only on SAMPLE_RATE and the
     // fixed pivot, so it's a compile-time-equivalent constant -- computed once here too.
     const float noise_tilt_coeff = 1.0f - expf(-2.0f * (float)M_PI * 800.0f / (float)SAMPLE_RATE);
+
+    // Pitch Bend: applies equally to both oscillators (like a real keyboard's wheel bends the
+    // whole voice, not one oscillator), with separately specifiable up/down range in semitones.
+    // midi_live->pitch_bend is constant across this whole block (only process_midi_input, called
+    // once before render_audio_block each block, updates it) so it's computed once here too.
+    float pb_bend_cents = (midi_live->pitch_bend >= 0.0f)
+        ? midi_live->pitch_bend * knobs->pb_range_up * 100.0f
+        : midi_live->pitch_bend * knobs->pb_range_down * 100.0f;
 
     // One-sample-delayed feedback state for LFO Phase modulation: holds each LFO's phase-shift
     // contribution from other LFOs and from voice 0's assignable EGs (the reference source for
@@ -1584,7 +1682,14 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // is never touched, so Rate/sync stay completely unaffected by this.
             float phase_offset = fmodf((knobs->lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
             float read_phase = fmodf(global_lfo_phases[l] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
-            lfo_out[l] = lookup_lfo_waveform((int)knobs->lfo[l].wave_type, read_phase) * knobs->lfo[l].mod_depth;
+            // Modulation Source: scales this LFO's contribution by a live MIDI controller (e.g.
+            // gating vibrato depth with the mod wheel) on top of the plain Depth knob. Unassigned
+            // (-1, the default) is a pure no-op -- cc_source_scale stays 1.0.
+            int mod_src = (int)knobs->lfo[l].mod_source_cc;
+            float cc_source_scale = 1.0f;
+            if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
+            else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
+            lfo_out[l] = lookup_lfo_waveform((int)knobs->lfo[l].wave_type, read_phase) * knobs->lfo[l].mod_depth * cc_source_scale;
             global_lfo_phases[l] += knobs->lfo[l].rate_hz / (float)SAMPLE_RATE;
             if (global_lfo_phases[l] >= 1.0f) global_lfo_phases[l] -= 1.0f;
         }
@@ -1609,7 +1714,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             voices[v].vco1_current_freq += (voices[v].vco1_target_freq - voices[v].vco1_current_freq) * portamento_coefficient;
             voices[v].vco2_current_freq += (voices[v].vco2_target_freq - voices[v].vco2_current_freq) * portamento_coefficient;
 
-            float mod_vco1_pitch = knobs->vco1_fine_tune, mod_vco2_pitch = knobs->vco2_fine_tune + (knobs->vco2_pitch_offset * 100.0f);
+            float mod_vco1_pitch = knobs->vco1_fine_tune + pb_bend_cents, mod_vco2_pitch = knobs->vco2_fine_tune + (knobs->vco2_pitch_offset * 100.0f) + pb_bend_cents;
             float mod_vco1_amp = 0.0f, mod_vco2_amp = 0.0f, fm_mod = 0.0f, mix_bal = 0.0f;
             // Filter cutoff/resonance mod destinations (targets 8-13), 3 slots each:
             //   slot 0 (targets 8/9)   = Filter A's PRIMARY filter: filter_a when Normal, or
@@ -1632,6 +1737,14 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float mod_vco1_phase = 0.0f, mod_vco2_phase = 0.0f;
             // Unison Saw Detune Width as a mod destination (new).
             float mod_vco1_unison_detune = 0.0f, mod_vco2_unison_detune = 0.0f;
+            // Pan/Pulse Width/Noise/Sub as mod destinations (targets 32-40 -- see the
+            // matrix_shared_routes comment in frontend.py for the full list). Pan mods are
+            // applied directly (same convention as Phase); the rest get a scale factor sized so
+            // a unity-depth LFO/EG sweeps the whole musically useful range.
+            float mod_vco1_pan = 0.0f, mod_vco2_pan = 0.0f;
+            float mod_vco1_pulse_width = 0.0f, mod_vco2_pulse_width = 0.0f;
+            float mod_noise_amp = 0.0f, mod_noise_pan = 0.0f, mod_noise_tilt = 0.0f;
+            float mod_sub_amp = 0.0f, mod_sub_pan = 0.0f;
 
             for (int l = 0; l < LFO_COUNT; l++) {
                 int target = (int)knobs->lfo[l].dest_target; float val = lfo_out[l];
@@ -1652,12 +1765,21 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 if (target == 25) mod_vco2_phase += val;
                 if (target == 26) mod_vco1_unison_detune += val * 2000.0f;
                 if (target == 27) mod_vco2_unison_detune += val * 2000.0f;
+                if (target == 32) mod_vco1_pan += val;
+                if (target == 33) mod_vco2_pan += val;
+                if (target == 34) mod_vco1_pulse_width += val * 50.0f;
+                if (target == 35) mod_vco2_pulse_width += val * 50.0f;
+                if (target == 36) mod_noise_amp += val;
+                if (target == 37) mod_noise_pan += val;
+                if (target == 38) mod_noise_tilt += val * 100.0f;
+                if (target == 39) mod_sub_amp += val;
+                if (target == 40) mod_sub_pan += val;
             }
 
             // FIXED: each assignable EG now routes using its own destination combo (eg_dest_target),
             // not the corresponding LFO's destination -- the GUI already had a per-EG destination
             // dropdown, but it was never wired to anything back here.
-            for (int e = 0; e < 4; e++) {
+            for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) {
                 int target = (int)knobs->eg_dest_target[e]; float val = voices[v].assign_eg[e].current_level * knobs->eg_intensity[e];
                 if (target == 1) mod_vco1_pitch += val * 1200.0f;
                 if (target == 2) mod_vco2_pitch += val * 1200.0f;
@@ -1673,6 +1795,15 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 if (target == 25) mod_vco2_phase += val;
                 if (target == 26) mod_vco1_unison_detune += val * 2000.0f;
                 if (target == 27) mod_vco2_unison_detune += val * 2000.0f;
+                if (target == 32) mod_vco1_pan += val;
+                if (target == 33) mod_vco2_pan += val;
+                if (target == 34) mod_vco1_pulse_width += val * 50.0f;
+                if (target == 35) mod_vco2_pulse_width += val * 50.0f;
+                if (target == 36) mod_noise_amp += val;
+                if (target == 37) mod_noise_pan += val;
+                if (target == 38) mod_noise_tilt += val * 100.0f;
+                if (target == 39) mod_sub_amp += val;
+                if (target == 40) mod_sub_pan += val;
             }
 
             // Phase pot (0-360 degrees) plus any modulation, converted to a 0..1 fractional-cycle
@@ -1684,6 +1815,23 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float vco1_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco1_unison_saw_detune + mod_vco1_unison_detune));
             float vco2_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco2_unison_saw_detune + mod_vco2_unison_detune));
 
+            // Pan (targets 32/33/37/40), base knob plus any modulation, clamped back into
+            // [-1,1] -- computed per-voice/per-sample now that it's modulatable (see the
+            // comment where this used to be a per-block constant, above the voice loop).
+            float pan1_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan)) + 1.0f) * (M_PI / 4.0f));
+            float pan1_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan)) + 1.0f) * (M_PI / 4.0f));
+            float pan2_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan)) + 1.0f) * (M_PI / 4.0f));
+            float pan2_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan)) + 1.0f) * (M_PI / 4.0f));
+            float pan_noise_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->noise_pan + mod_noise_pan)) + 1.0f) * (M_PI / 4.0f));
+            float pan_noise_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->noise_pan + mod_noise_pan)) + 1.0f) * (M_PI / 4.0f));
+            float pan_sub_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->sub_pan + mod_sub_pan)) + 1.0f) * (M_PI / 4.0f));
+            float pan_sub_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->sub_pan + mod_sub_pan)) + 1.0f) * (M_PI / 4.0f));
+
+            // Pulse Width (targets 34/35), base knob plus any modulation, clamped into the same
+            // [2,98] range band_limited_pulse already expects (see lookup_osc_sample).
+            float vco1_pulse_width_final = fmaxf(2.0f, fminf(98.0f, knobs->vco1_pulse_width + mod_vco1_pulse_width));
+            float vco2_pulse_width_final = fmaxf(2.0f, fminf(98.0f, knobs->vco2_pulse_width + mod_vco2_pulse_width));
+
             float hz1 = voices[v].vco1_current_freq * powf(2.0f, mod_vco1_pitch / 1200.0f);
             float hz2 = voices[v].vco2_current_freq * powf(2.0f, mod_vco2_pitch / 1200.0f);
             float dt1 = hz1 / (float)SAMPLE_RATE, dt2 = hz2 / (float)SAMPLE_RATE;
@@ -1692,7 +1840,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             if ((WaveType)((int)knobs->vco2_shape) == WAVE_UNISON_SAW) v2_out = render_unison_saw(voices[v].vco2_unison_saw_phases, dt2, vco2_unison_detune_final, vco2_unison_pan_l, vco2_unison_pan_r, phase_offset2, &v2_side_l, &v2_side_r);
             else {
                 float vco2_read_phase = fmodf(voices[v].vco2_phase + phase_offset2, 1.0f); if (vco2_read_phase < 0.0f) vco2_read_phase += 1.0f;
-                v2_out = lookup_osc_sample((WaveType)((int)knobs->vco2_shape), vco2_read_phase, dt2, knobs->vco2_pulse_width / 100.0f, &voices[v].vco2_tri_state);
+                v2_out = lookup_osc_sample((WaveType)((int)knobs->vco2_shape), vco2_read_phase, dt2, vco2_pulse_width_final / 100.0f, &voices[v].vco2_tri_state);
             }
             float gain2 = (knobs->vco2_mute != 0.0f || knobs->vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco2_vol + mix_bal + mod_vco2_amp));
             float osc2_amp = gain2 * voices[v].vco2_eg.current_level;
@@ -1716,7 +1864,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float v1_out = 0.0f, v1_side_l = 0.0f, v1_side_r = 0.0f;
             bool osc1_is_unison_saw = (WaveType)((int)knobs->vco1_shape) == WAVE_UNISON_SAW;
             if (osc1_is_unison_saw) v1_out = render_unison_saw(voices[v].vco1_unison_saw_phases, dt1, vco1_unison_detune_final, vco1_unison_pan_l, vco1_unison_pan_r, phase_offset1, &v1_side_l, &v1_side_r);
-            else v1_out = lookup_osc_sample((WaveType)((int)knobs->vco1_shape), fm_phase, dt1, knobs->vco1_pulse_width / 100.0f, &voices[v].vco1_tri_state);
+            else v1_out = lookup_osc_sample((WaveType)((int)knobs->vco1_shape), fm_phase, dt1, vco1_pulse_width_final / 100.0f, &voices[v].vco1_tri_state);
             float gain1 = (knobs->vco1_mute != 0.0f || knobs->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco1_vol - mix_bal + mod_vco1_amp));
             float osc1_amp = gain1 * voices[v].vco1_eg.current_level;
 
@@ -1738,7 +1886,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // implicitly tracks everything Osc 1's pitch does with zero pitch controls of its own.
             float dt_sub = (hz1 * 0.5f) / (float)SAMPLE_RATE;
             float sub_out = lookup_osc_sample(sub_wave_to_osc_wave((int)knobs->sub_shape), voices[v].sub_phase, dt_sub, 0.5f, &voices[v].sub_tri_state);
-            float gain_sub = (knobs->sub_mute != 0.0f || knobs->sub_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->sub_vol));
+            float gain_sub = (knobs->sub_mute != 0.0f || knobs->sub_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->sub_vol + mod_sub_amp));
             // Shares Osc 1's own amp envelope by design (see the struct comment) rather than a
             // separate one -- it's meant to always move exactly in lockstep with Osc 1.
             float sub_amp = sub_out * gain_sub * voices[v].vco1_eg.current_level;
@@ -1751,9 +1899,9 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float white = (((float)rand() / (float)RAND_MAX) * 2.0f) - 1.0f;
             voices[v].noise_tilt_lp += noise_tilt_coeff * (white - voices[v].noise_tilt_lp);
             float noise_high = white - voices[v].noise_tilt_lp;
-            float tilt_frac = fmaxf(-1.0f, fminf(1.0f, knobs->noise_tilt / 100.0f));
+            float tilt_frac = fmaxf(-1.0f, fminf(1.0f, (knobs->noise_tilt + mod_noise_tilt) / 100.0f));
             float noise_out = voices[v].noise_tilt_lp * (1.0f - tilt_frac) + noise_high * (1.0f + tilt_frac);
-            float gain_noise = (knobs->noise_mute != 0.0f || knobs->noise_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->noise_vol));
+            float gain_noise = (knobs->noise_mute != 0.0f || knobs->noise_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->noise_vol + mod_noise_amp));
             float noise_amp = noise_out * gain_noise * voices[v].noise_eg.current_level;
             float noise_l = noise_amp * pan_noise_l, noise_r = noise_amp * pan_noise_r;
 
@@ -1811,7 +1959,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             if (target >= 28 && target <= 31) new_lfo_phase_mod[target - 28] += lfo_out[l];
         }
         if (voices[0].vco1_eg.state != STATE_IDLE || voices[0].vco2_eg.state != STATE_IDLE) {
-            for (int e = 0; e < 4; e++) {
+            for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) {
                 int target = (int)knobs->eg_dest_target[e];
                 if (target >= 28 && target <= 31) new_lfo_phase_mod[target - 28] += voices[0].assign_eg[e].current_level * knobs->eg_intensity[e];
             }
@@ -1938,6 +2086,7 @@ int main() {
     snd_seq_connect_from(seq_handle, our_midi_port, SND_SEQ_CLIENT_SYSTEM, SND_SEQ_PORT_SYSTEM_ANNOUNCE);
 
     MidiSourceList midi_sources = {0};
+    MidiLiveState midi_live = {0}; // pitch_bend/channel_pressure/cc[] all start at their "centered/off" 0.0
     midi_autoconnect_scan(seq_handle, our_midi_port, active_knobs.midi_device, &midi_sources);
     char applied_midi_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
@@ -1975,7 +2124,7 @@ int main() {
             snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
         }
 
-        process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack, our_midi_port, &midi_sources);
+        process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack, our_midi_port, &midi_sources, &midi_live);
 
         // Read one block of external input. Silence (the zero-init) if there's no working
         // capture device, or a read comes back short/broken -- external input degrading to
@@ -1991,7 +2140,7 @@ int main() {
         }
 
         float buffer[BUFFER_SIZE * 2];
-        float block_peak = render_audio_block(voices, &active_knobs, global_lfo_phases, capture_buffer, buffer);
+        float block_peak = render_audio_block(voices, &active_knobs, global_lfo_phases, capture_buffer, &midi_live, buffer);
 
         vu_decimator++;
         if (client_fd >= 0 && vu_decimator >= 12) { send(client_fd, &block_peak, sizeof(float), 0); vu_decimator = 0; }

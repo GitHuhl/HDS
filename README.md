@@ -6,7 +6,7 @@ A digital synthesizer split into two processes:
   audio directly to a PCM device, captures external audio from an input
   device, and exposes every synth parameter over a Unix domain socket
   (`/tmp/synth.sock`) as a fixed-layout packed struct (`SynthSharedControls`,
-  286 floats + 3 device name strings). Also streams back a peak-level float
+  315 floats + 3 device name strings). Also streams back a peak-level float
   for the GUI's VU meter. The final output stage carries an always-on
   safety limiter (instant attack, ~50ms release) ahead of a hard clamp, so
   an overload (e.g. several voices lining up, or Parallel FX routing
@@ -21,21 +21,41 @@ A digital synthesizer split into two processes:
   `process_midi_input()`). The Audio tab's MIDI Input dropdown can pin one
   specific device by name instead of auto-detecting everything; a pinned
   device still auto-reconnects after an unplug/replug.
+
+  Beyond notes, the MIDI pipeline reads CC (every controller number, live
+  in `MidiLiveState.cc[128]`), pitch bend, channel aftertouch, and the
+  sustain pedal (CC64, with a polarity switch for pedals wired backwards --
+  see `sustain_pedal_polarity`). Pitch bend has independently specifiable
+  up/down ranges in semitones (`pb_range_up`/`pb_range_down`). Sustain
+  correctly defers note-off until the pedal lifts, in both poly and mono
+  modes, without leaking a stale "pending release" into a note that gets
+  retriggered while the pedal is still down.
 - **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
   knobs and draggable ADSR envelope graphs, tabbed into Global / Play /
   Filters / LFOs / Envelopes / FX / Audio. Packs the same struct
-  (`struct.pack("286f64s64s64s", ...)`) and sends it over the socket
+  (`struct.pack("315f64s64s64s", ...)`) and sends it over the socket
   whenever a control changes. If it can't connect to the backend it falls
   back to a mock mode so the UI still runs standalone.
+
+  The Global tab has a Pitch Bend Range group (two spin boxes, up/down, not
+  pots -- an incremental control that reads out in semitones) and a Sustain
+  Pedal Polarity group (Normal/Inverted), both near the Mono/Poly switch.
+  Right-clicking any LFO's Depth pot (without dragging -- a right-click
+  *drag* still does the existing fine-adjustment gesture) opens a
+  "Modulation Source" menu: None, Mod Wheel, Breath, Foot Controller,
+  Expression, Channel Aftertouch, or a custom CC number, which scales that
+  LFO's output live off the chosen MIDI source.
 
 Engine features: 2 main oscillators (Saw/Square/Triangle/Sine/Unison
 Saw/Noise/Pulse) with FM and hard sync, a dedicated sub oscillator and
 noise oscillator, a 2-filter (A/B) architecture where Filter A can itself
-be a 3-filter legacy engine, 7 envelope generators (Osc1/Osc2/Noise amp +
-4 assignable, each switchable between ADSR/AR/AD/ASR/AHD/DADSR/AHDSR, with
-the Sustain stage chaseable in real time while a note is held), 4 LFOs,
-and a shared mod matrix routing LFOs and assignable EGs to pitch, amp,
-filter cutoff/resonance, FM depth, phase, and unison detune.
+be a 3-filter legacy engine, 9 envelope generators (Osc1/Osc2/Noise amp +
+6 assignable, each switchable between ADSR/AR/AD/ASR/AHD/DADSR/AHDSR, with
+the Sustain stage chaseable in real time while a note is held), 4 LFOs
+(each with its own MIDI Modulation Source), and a shared mod matrix
+routing LFOs and assignable EGs to pitch, amp, pan, pulse width, filter
+cutoff/resonance, FM depth, phase, unison detune, and the noise/sub
+oscillators' own amp, pan, and tilt.
 
 A 12-slot FX bus (`FX` tab) runs on the full stereo mix, after Filter A/B
 and before master volume, routable Series (each slot fed the previous
