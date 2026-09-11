@@ -6,42 +6,53 @@ A digital synthesizer split into two processes:
   audio directly to a PCM device, captures external audio from an input
   device, and exposes every synth parameter over a Unix domain socket
   (`/tmp/synth.sock`) as a fixed-layout packed struct (`SynthSharedControls`,
-  317 floats + 3 device name strings). Also streams back a peak-level float
+  319 floats + 3 device name strings). Also streams back a peak-level float
   for the GUI's VU meter. The final output stage carries an always-on
   safety limiter (instant attack, ~50ms release) ahead of a hard clamp, so
   an overload (e.g. several voices lining up, or Parallel FX routing
   summing 12 hot slots) degrades to smooth gain reduction rather than
   brick-wall clipping.
 
-  Polyphony is `MAX_VOICES` = 32. This was raised to 96 for headroom on
-  fast/dense playing, then brought back down after real hardware testing
-  showed render_audio_block already exceeding its per-block real-time
-  budget at just 33-36 active voices on a plain, unmodulated, FX-off
-  patch -- close to the cheapest possible thing this engine renders. See
-  the comment on `MAX_VOICES` before raising it again: do it with the same
-  real-hardware measurement, not by picking a bigger number. Idle voice
-  slots are still near-free -- the per-voice render loops skip a slot the
-  instant it goes fully silent -- so this cost only applies to genuinely
-  active voices. Voice-stealing (once every slot is active) picks the
-  quietest/already-releasing voice instead of blindly resetting slot 0, so
-  hitting the ceiling degrades gracefully rather than clicking.
+  Polyphony and render block size are **live, user-adjustable controls**
+  (Audio tab: Polyphony, Block Size), not fixed numbers picked once and
+  shipped -- the right value for either is a property of the actual machine
+  this runs on, and guessing one number for every deployment either wastes
+  headroom on fast hardware or underruns on slow hardware. `MAX_VOICES`
+  (256) and `BUFFER_SIZE` (1024) are now just hard array-allocation
+  ceilings; `active_voice_limit` and `block_size_frames` are the real,
+  live values, clamped into those ceilings by `effective_voice_limit()`/
+  `effective_block_size()` and used everywhere a loop needs to know "how
+  many voices/samples right now" instead of the old compile-time macros.
+  Both apply on the very next block, no restart or stream reopen needed.
+  Idle voice slots are still near-free -- the per-voice render loops skip
+  a slot the instant it goes fully silent -- so raising Polyphony only
+  costs real CPU once that many voices are genuinely active. Voice-stealing
+  (once every active slot is full) picks the quietest/already-releasing
+  voice instead of blindly resetting slot 0, so hitting the ceiling
+  degrades gracefully rather than clicking.
 
-  Every active voice's LFO/EG modulation dispatch now skips straight past
+  Three stderr-only diagnostics make tuning Polyphony/Block Size/Latency an
+  informed process instead of guesswork: `[voices]` fires from
+  `handle_note_on` whenever the polyphony ceiling is actually hit (confirms
+  whether Polyphony is even the relevant factor before touching it);
+  `[perf]` fires when a block itself took longer to render than its own
+  real-time budget, with active voice count and block size; `[audio]` fires
+  alongside any ALSA underrun/xrun `snd_pcm_recover` recovers from, with
+  the same context. Push Polyphony up, watch the terminal under real
+  playing, back off if you see warnings.
+
+  Every active voice's LFO/EG modulation dispatch also skips straight past
   its ~19-branch destination-matching chain when that source isn't routed
   anywhere (`dest_target == 0`/"None") instead of evaluating the whole
   chain for nothing -- a real, measured (~6-10% per block) win on a plain
-  unmodulated patch, found via the same real-hardware profiling above.
+  unmodulated patch, found via the same real-hardware profiling that led to
+  the live Polyphony/Block Size controls above.
 
   Output latency is set by the ALSA buffer target in `open_pcm_stream()`
-  (`audio_latency_ms`, the Audio tab's Latency control -- default 25ms, not
-  the internal render chunk size `BUFFER_SIZE` = 128 samples/~2.7ms). Two
-  stderr-only diagnostics help tell a genuine CPU-throughput shortfall
-  apart from anything else: `[perf]` fires when a block itself took longer
-  to render than its own real-time budget (with active voice count), and
-  `[audio]` fires alongside any ALSA underrun/xrun snd_pcm_recover recovers
-  from, with the same context. `[voices]` fires from `handle_note_on`
-  whenever the polyphony ceiling is actually hit, to confirm whether
-  `MAX_VOICES` is even the relevant factor before touching it.
+  (`audio_latency_ms`, the Audio tab's Latency control -- default 25ms).
+  This is independent of Block Size: Latency is how deep ALSA's own ring
+  buffer is (the real floor on output latency), Block Size is how many
+  frames get rendered and handed to ALSA per main-loop iteration.
 
   MIDI input auto-connects with no `aconnect` ever needed: at startup it
   scans ALSA sequencer clients and subscribes to every real (kernel-backed,
@@ -63,17 +74,23 @@ A digital synthesizer split into two processes:
 - **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
   knobs and draggable ADSR envelope graphs, tabbed into Play / Filters /
   LFOs / Envelopes / FX / Audio. Packs the same struct
-  (`struct.pack("317f64s64s64s", ...)`) and sends it over the socket
+  (`struct.pack("319f64s64s64s", ...)`) and sends it over the socket
   whenever a control changes. If it can't connect to the backend it falls
   back to a mock mode so the UI still runs standalone.
 
-  The Audio tab has a Latency preset dropdown (Snappy/Normal/Safe/Extra
-  Safe, 15-100ms) -- a friendly stand-in for the raw ALSA buffer target,
-  kept as presets rather than a bare millisecond field to stay in the
-  appliance spirit. It's a real safety-margin/responsiveness tradeoff for
-  occasional, marginal CPU overruns, not a fix for a genuinely overloaded
-  patch (too many voices/too expensive a patch stays a "use fewer voices
-  or a lighter patch" problem, however big the buffer is).
+  The Audio tab's Performance group has three real, direct engine controls:
+  **Polyphony** (a plain spin box, 1-256 voices, default 32), **Block Size**
+  (a dropdown of concrete sample counts: 32/64/128/256/512/1024, default
+  128), and **Latency** (a friendly Snappy/Normal/Safe/Extra Safe preset
+  dropdown, 15-100ms, over the raw ALSA buffer target -- kept as presets
+  since unlike the other two there's no more "direct" unit than milliseconds
+  itself). Polyphony and Block Size apply on the very next block; Latency
+  applies live too but closes and reopens the output/input stream(s) to do
+  it. None of these are a fix for a genuinely overloaded patch (too many
+  voices/too expensive a patch stays a "turn Polyphony down or use a
+  lighter patch" problem, however big the buffer is) -- they're real,
+  serious tuning controls for matching the engine to whatever hardware
+  it's actually running on, watched via the backend's stderr diagnostics.
 
   There is no Global tab -- Program name/Load/Save, Poly/Mono Legato, Hard
   Sync, Pitch Bend Range, Sustain Pedal Polarity, FM Depth, and Glide all

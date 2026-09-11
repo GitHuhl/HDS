@@ -30,6 +30,12 @@ AUDIO_DEVICE_NAME_LEN = 64
 # FX bus geometry must match FX_SLOT_COUNT / FX_SLOT_PARAM_COUNT in backend.c exactly.
 FX_SLOT_COUNT = 12
 FX_SLOT_PARAM_COUNT = 8
+# Hard array-allocation ceilings -- must match MAX_VOICES / BUFFER_SIZE in backend.c exactly.
+# The ACTUAL live polyphony/block size are user-adjustable (Audio tab) up to these ceilings;
+# see active_voice_limit/block_size_frames and effective_voice_limit()/effective_block_size()
+# in backend.c for why this isn't just one fixed number anymore.
+MAX_VOICES_HARD_LIMIT = 256
+BUFFER_SIZE_HARD_LIMIT = 1024
 
 # CreamCoat's 17 "Select" room-size presets, in order -- text taken verbatim from the original
 # plugin's own per-case comments (e.g. "5 to 51 ms, 96 seat room").
@@ -1905,14 +1911,76 @@ class SynthGui(QWidget):
         in_row.addWidget(self.input_device_combo, stretch=1)
         device_lay.addLayout(in_row)
 
-        # Latency: a friendly stand-in for the raw ALSA buffer/period sizing -- deliberately not
-        # exposed as bare millisecond/frame-count fields, to keep the appliance feel. This is a
-        # real, useful knob though, not just a placebo: it's a safety-margin/responsiveness
-        # tradeoff for exactly the kind of marginal, occasional CPU overrun that shows up as an
-        # audible underrun/crackle under a heavy patch or high note count -- see
-        # audio_latency_ms in backend.c. It does NOT fix a genuinely sustained overload (too
-        # many voices, too expensive a patch, consistently over budget); for that, the fix is
-        # a lighter patch or fewer voices, not a bigger buffer.
+        refresh_row = QHBoxLayout()
+        self.btn_refresh_devices = QPushButton("Rescan Devices")
+        self.btn_refresh_devices.setFixedHeight(24)
+        refresh_row.addWidget(self.btn_refresh_devices)
+        refresh_row.addStretch()
+        device_lay.addLayout(refresh_row)
+        self.btn_refresh_devices.clicked.connect(self.refresh_audio_devices)
+
+        device_note = QLabel("Changing a device applies live — the backend closes and reopens that stream.")
+        device_note.setStyleSheet("font-size: 9px; color: #888;")
+        device_note.setWordWrap(True)
+        device_lay.addWidget(device_note)
+
+        device_box.setLayout(device_lay)
+        audio_outer_lay.addWidget(device_box)
+
+        # ----------------------------------------------------
+        # PERFORMANCE: real, direct engine-tuning controls -- how many voices can be active at
+        # once, how many samples get rendered per cycle, and the ALSA buffer depth. These used
+        # to be numbers picked once at compile time and shipped fixed (see MAX_VOICES/
+        # BUFFER_SIZE in backend.c); the right value for any of them is a property of the actual
+        # machine this runs on, not something to guess once for every deployment. All three
+        # apply live -- no restart needed -- and the backend's stderr diagnostics ([voices]/
+        # [perf]/[audio]) exist specifically so raising these is an informed process: push a
+        # value up, watch for warnings under real playing, back off if you see them.
+        # ----------------------------------------------------
+        perf_box = QGroupBox("Performance")
+        perf_lay = QVBoxLayout()
+        perf_lay.setSpacing(6)
+
+        poly_row = QHBoxLayout()
+        poly_row.addWidget(QLabel("Polyphony:"))
+        self.polyphony_spin = QSpinBox()
+        self.polyphony_spin.setRange(1, MAX_VOICES_HARD_LIMIT)
+        self.polyphony_spin.setValue(32)
+        self.polyphony_spin.setSuffix(" voices")
+        self.polyphony_spin.setStyleSheet("font-size: 10px; color: #00adb5; background-color: #2b2b36; font-weight: bold;")
+        self.polyphony_spin.setToolTip(
+            "How many notes can be sounding at once before the oldest/quietest one gets stolen\n"
+            "to make room for a new one (stealing always prefers an already-fading voice over a\n"
+            "held one, so it's rarely audible). Higher = more headroom for dense chords and\n"
+            "sustain-pedal buildup, at a real, roughly linear CPU cost -- watch the terminal for\n"
+            f"[voices]/[perf]/[audio] warnings while raising this. Hard ceiling: {MAX_VOICES_HARD_LIMIT}."
+        )
+        poly_row.addWidget(self.polyphony_spin, stretch=1)
+        perf_lay.addLayout(poly_row)
+
+        bs_row = QHBoxLayout()
+        bs_row.addWidget(QLabel("Block Size:"))
+        self.block_size_combo = QComboBox()
+        self._BLOCK_SIZE_PRESETS = [32, 64, 128, 256, 512, 1024]
+        self.block_size_combo.addItems([f"{v} samples" for v in self._BLOCK_SIZE_PRESETS])
+        self.block_size_combo.setCurrentIndex(self._BLOCK_SIZE_PRESETS.index(128)) # matches the backend default
+        self.block_size_combo.setToolTip(
+            "How many samples get rendered and handed to the audio driver per cycle. Smaller =\n"
+            "snappier MIDI-to-audio response and finer-grained modulation, at more per-block\n"
+            "overhead; larger = less overhead per sample, at coarser MIDI timing. Independent of\n"
+            "Latency (the ALSA buffer depth) -- this only controls the render/write chunk size."
+        )
+        bs_row.addWidget(self.block_size_combo, stretch=1)
+        perf_lay.addLayout(bs_row)
+
+        # Latency: a friendly stand-in for the raw ALSA buffer/period sizing -- kept as presets
+        # rather than a bare millisecond field, since unlike Polyphony/Block Size there isn't
+        # really a meaningful "direct" unit here beyond milliseconds itself, and presets keep the
+        # common choices one click away. Real, useful knob though, not a placebo: it's a
+        # safety-margin/responsiveness tradeoff for marginal, occasional CPU overruns -- see
+        # audio_latency_ms in backend.c. Doesn't fix a genuinely sustained overload (too many
+        # voices, too expensive a patch, consistently over budget); for that, the fix is Polyphony
+        # or a lighter patch, not a bigger buffer.
         latency_row = QHBoxLayout()
         latency_row.addWidget(QLabel("Latency:"))
         self.audio_latency_combo = QComboBox()
@@ -1930,23 +1998,15 @@ class SynthGui(QWidget):
             "If you're hearing crackling/dropouts under heavy playing, try Safe or Extra Safe."
         )
         latency_row.addWidget(self.audio_latency_combo, stretch=1)
-        device_lay.addLayout(latency_row)
+        perf_lay.addLayout(latency_row)
 
-        refresh_row = QHBoxLayout()
-        self.btn_refresh_devices = QPushButton("Rescan Devices")
-        self.btn_refresh_devices.setFixedHeight(24)
-        refresh_row.addWidget(self.btn_refresh_devices)
-        refresh_row.addStretch()
-        device_lay.addLayout(refresh_row)
-        self.btn_refresh_devices.clicked.connect(self.refresh_audio_devices)
+        perf_note = QLabel("Polyphony and Block Size apply on the next block, no reopen needed. Latency applies live too — the backend closes and reopens the output/input stream(s).")
+        perf_note.setStyleSheet("font-size: 9px; color: #888;")
+        perf_note.setWordWrap(True)
+        perf_lay.addWidget(perf_note)
 
-        device_note = QLabel("Changing a device or the Latency setting applies live — the backend closes and reopens the stream(s).")
-        device_note.setStyleSheet("font-size: 9px; color: #888;")
-        device_note.setWordWrap(True)
-        device_lay.addWidget(device_note)
-
-        device_box.setLayout(device_lay)
-        audio_outer_lay.addWidget(device_box)
+        perf_box.setLayout(perf_lay)
+        audio_outer_lay.addWidget(perf_box)
 
         midi_box = QGroupBox("MIDI Input")
         midi_lay = QVBoxLayout()
@@ -2342,6 +2402,14 @@ class SynthGui(QWidget):
         latency_ms = self._LATENCY_PRESETS[latency_idx][1] if 0 <= latency_idx < len(self._LATENCY_PRESETS) else 25.0
         packet_list.append(float(latency_ms))
 
+        # Live polyphony ceiling (+1 item) -- see active_voice_limit in backend.c
+        packet_list.append(float(self.polyphony_spin.value()))
+
+        # Live render block size, samples (+1 item) -- see block_size_frames in backend.c
+        bs_idx = self.block_size_combo.currentIndex()
+        block_size = self._BLOCK_SIZE_PRESETS[bs_idx] if 0 <= bs_idx < len(self._BLOCK_SIZE_PRESETS) else 128
+        packet_list.append(float(block_size))
+
         # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
         # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
         # + 1 (filter_a_mode) + 4 (filter_a) + 1 (filter_a_multi_routing) + 12 (filter_a_multi[3] * 4)
@@ -2351,12 +2419,13 @@ class SynthGui(QWidget):
         # + 2 (vco1/vco2 mute) + 1 (hard sync) + 2 (vco1/vco2 phase offset)
         # + 2 (vco1/vco2 pulse width) + 4 (noise osc: vol/pan/mute/tilt) + 4 (sub osc: shape/vol/pan/mute)
         # + 2 (ext in enable/gain) + 132 (12 FX slots * 11) + 1 (fx_routing_mode) + 2 (pb range)
-        # + 1 (sustain polarity) + 1 (audio latency) = 317 floats, followed by 3 fixed 64-byte
-        # device name strings (not floats): output_device, input_device, midi_device.
+        # + 1 (sustain polarity) + 1 (audio latency) + 1 (polyphony) + 1 (block size) = 319
+        # floats, followed by 3 fixed 64-byte device name strings (not floats): output_device,
+        # input_device, midi_device.
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
         binary_packet = struct.pack(
-            f"317f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
+            f"319f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
@@ -2481,6 +2550,8 @@ def runtime_connect_and_bind(gui):
     gui.output_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
     gui.input_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
     gui.audio_latency_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+    gui.polyphony_spin.valueChanged.connect(gui.transmit_knob_packet)
+    gui.block_size_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
     gui.midi_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
 
     # Initialize separate telemetry thread loop for VU meter updates

@@ -15,23 +15,20 @@
 #include <time.h>
 
 #define SAMPLE_RATE 48000
-#define BUFFER_SIZE 128
-// This was raised to 96 (from 64) for headroom on fast/dense playing, then brought back down
-// to 32 after real hardware measurements (via the underrun diagnostics on write_audio_block/
-// handle_note_on) showed the ACTUAL target machine's render_audio_block already exceeds its
-// per-block real-time budget (2.667ms at BUFFER_SIZE=128/48kHz) at just 33-36 active voices --
-// on a plain, unmodulated sawtooth patch with no FX engaged, i.e. close to the cheapest
-// possible thing this engine can render. That number only gets worse once FX slots or actual
-// LFO/EG modulation routing are in use (FX processing is a fixed per-block cost on top of the
-// per-voice ones; a routed mod source skips the target==0 fast path added alongside this
-// change and pays full per-voice cost again). 32 leaves real margin below that measured
-// failure point rather than treating voice-stealing (see handle_note_on) as a rare edge case.
-// Idle voice slots are still near-free -- the per-voice loops skip a slot once all three of its
-// amp envelopes go STATE_IDLE -- so this cost only applies to genuinely ACTIVE voices. If you
-// want to push this back up, the honest way is with the same diagnostics: confirm on the real
-// target hardware, under real patches (FX + modulation engaged, not just a bare sawtooth), not
-// by raising the number and hoping.
-#define MAX_VOICES  32
+// BUFFER_SIZE and MAX_VOICES are now hard CEILINGS for array allocation only -- how many
+// frames actually get rendered per block, and how many voices are actually allowed to be
+// simultaneously active, are live user controls (SynthSharedControls.block_size_frames and
+// .active_voice_limit, both on the Audio tab) rather than a number picked once at compile time
+// and shipped fixed. This exists because the right value for either one is a property of the
+// ACTUAL machine this is running on -- a fast desktop and a constrained embedded board don't
+// have the same answer, and guessing one number for every deployment either wastes headroom on
+// fast hardware or underruns on slow hardware. The diagnostics on write_audio_block/
+// handle_note_on/the main loop's [perf] check exist so that tuning these live is an informed
+// process (raise it, watch for [perf]/[voices]/[audio] warnings, back off if you see them) --
+// see effective_voice_limit()/effective_block_size() for how the live values get clamped into
+// these ceilings.
+#define BUFFER_SIZE 1024
+#define MAX_VOICES  256
 #define LFO_COUNT   4
 #define ASSIGNABLE_EG_COUNT 6  // EG 1-6 (in addition to Osc 1 Amp, Osc 2 Amp, Noise Osc Amp)
 #define ENV_COUNT   (3 + ASSIGNABLE_EG_COUNT)  // Osc 1 Amp, Osc 2 Amp, Noise Osc Amp, + assignable EGs
@@ -177,6 +174,12 @@ typedef struct {
 // BREAKING CHANGE (adjustable audio latency): added audio_latency_ms (+1 float), the Audio
 // tab's Latency control -- see open_pcm_stream(). New total: 317 float items + 192 string
 // bytes. The Python side's struct.pack format changes from "316f64s64s64s" to "317f64s64s64s".
+// BREAKING CHANGE (live polyphony + block size): MAX_VOICES and BUFFER_SIZE became hard
+// allocation ceilings (256 and 1024 respectively) instead of fixed values; added
+// active_voice_limit and block_size_frames (+2 floats), the Audio tab's Polyphony and Block
+// Size controls -- see effective_voice_limit()/effective_block_size(). New total: 319 float
+// items + 192 string bytes. The Python side's struct.pack format changes from "317f64s64s64s"
+// to "319f64s64s64s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -336,6 +339,25 @@ typedef struct {
     // added latency. See the Audio tab's Latency control.
     float audio_latency_ms;
 
+    // Live polyphony ceiling: how many voices are allowed to be simultaneously ACTIVE, clamped
+    // into [1, MAX_VOICES] by effective_voice_limit(). MAX_VOICES itself is just the hard array
+    // allocation size now -- this is the real, tunable ceiling, because the right number is a
+    // property of the actual machine this is running on (see the comment on MAX_VOICES/
+    // BUFFER_SIZE). Idle voice slots stay near-free regardless of this value; raising it only
+    // costs real CPU once that many voices are genuinely active at once. See the Audio tab's
+    // Polyphony control, and the [voices]/[perf]/[audio] diagnostics for tuning it live.
+    float active_voice_limit;
+
+    // Live render block size, in samples, clamped into [1, BUFFER_SIZE] by
+    // effective_block_size(). Smaller = snappier MIDI-to-audio response (a fresh note waits at
+    // most one block before it's reflected in the output) and finer-grained modulation, at the
+    // cost of more per-block call/syscall overhead; larger = less overhead per sample rendered,
+    // at the cost of coarser MIDI timing. Independent of audio_latency_ms (the ALSA buffer
+    // depth) -- this only controls how many frames get computed and handed to ALSA per
+    // main-loop iteration, not how deep ALSA's own ring buffer is. See the Audio tab's Block
+    // Size control.
+    float block_size_frames;
+
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
     // it last opened each stream with, and closes/reopens that stream on a live change via
@@ -352,6 +374,23 @@ typedef struct {
     // still reconnects automatically if that same-named device is unplugged and replugged.
     char midi_device[AUDIO_DEVICE_NAME_LEN];
 } SynthSharedControls;
+
+// Clamp the live polyphony/block-size controls into their hard array-allocation ceilings.
+// Centralized here so every loop bound and buffer-fill site derives the same clamped value the
+// same way, rather than each repeating its own (fmaxf/fminf + cast) inline.
+static inline int effective_voice_limit(const SynthSharedControls *knobs) {
+    int n = (int)knobs->active_voice_limit;
+    if (n < 1) n = 1;
+    if (n > MAX_VOICES) n = MAX_VOICES;
+    return n;
+}
+static inline int effective_block_size(const SynthSharedControls *knobs) {
+    int n = (int)knobs->block_size_frames;
+    if (n < 1) n = 1;
+    if (n > BUFFER_SIZE) n = BUFFER_SIZE;
+    return n;
+}
+
 typedef struct {
     EnvelopeState state;
     int env_type; // 0:ADSR, 1:AR, 2:AD, 3:ASR, 4:AHD, 5:DADSR, 6:AHDSR
@@ -1333,6 +1372,8 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->pb_range_up = 2.0f; knobs->pb_range_down = 2.0f; // standard +/-2 semitone default
     knobs->sustain_pedal_polarity = 0.0f; // Normal
     knobs->audio_latency_ms = 25.0f; // matches the old hardcoded 25ms target -- no behavior change by default
+    knobs->active_voice_limit = 32.0f; // matches the last-measured-safe default -- live-adjustable from here
+    knobs->block_size_frames = 128.0f; // matches the old hardcoded BUFFER_SIZE -- no behavior change by default
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -1417,18 +1458,19 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         // still audibly releasing (Noise Osc Amp envelope) could get stolen and reset mid-tail
         // -- an audible click, not just a modulation glitch, since the noise oscillator is a
         // real sound source. noise_eg must be idle too before a voice counts as free.
-        for (int v = 0; v < MAX_VOICES; v++) { if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE && voices[v].noise_eg.state == STATE_IDLE) { slot = v; break; } }
+        int voice_limit = effective_voice_limit(knobs);
+        for (int v = 0; v < voice_limit; v++) { if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE && voices[v].noise_eg.state == STATE_IDLE) { slot = v; break; } }
         if (slot == -1) {
-            // Polyphony ceiling hit (MAX_VOICES simultaneously active voices) -- every slot is
-            // busy. FIXED: this used to unconditionally steal slot 0, resetting whatever was
-            // playing there regardless of how audible it currently was -- a hard, audible
-            // click/cutoff on an arbitrary note, every time. Instead, steal the voice a
+            // Polyphony ceiling hit (active_voice_limit simultaneously active voices) -- every
+            // slot is busy. FIXED: this used to unconditionally steal slot 0, resetting
+            // whatever was playing there regardless of how audible it currently was -- a hard,
+            // audible click/cutoff on an arbitrary note, every time. Instead, steal the voice a
             // listener is least likely to notice disappearing: prefer one already in RELEASE
             // (fading out on its own) with the lowest combined level, and only fall back to a
             // still-sustaining/attacking voice (by lowest level) if literally none are
             // releasing.
             float best_score = 1e30f; // lower = safer to steal
-            for (int v = 0; v < MAX_VOICES; v++) {
+            for (int v = 0; v < voice_limit; v++) {
                 float level = voices[v].vco1_eg.current_level + voices[v].vco2_eg.current_level + voices[v].noise_eg.current_level;
                 bool releasing = (voices[v].vco1_eg.state == STATE_RELEASE || voices[v].vco2_eg.state == STATE_RELEASE || voices[v].noise_eg.state == STATE_RELEASE);
                 // A releasing voice always beats a non-releasing one regardless of level --
@@ -1438,9 +1480,9 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
                 if (score < best_score) { best_score = score; slot = v; }
             }
             // DIAGNOSTIC: confirms whether you're actually hitting the polyphony ceiling at
-            // all -- if this never prints, MAX_VOICES isn't the thing to look at for an
-            // underrun/glitch you're chasing.
-            fprintf(stderr, "[voices] polyphony ceiling hit (%d active) -- stole slot %d (score %.4f)\n", MAX_VOICES, slot, best_score);
+            // all -- if this never prints, the Polyphony control isn't the thing to look at for
+            // an underrun/glitch you're chasing.
+            fprintf(stderr, "[voices] polyphony ceiling hit (%d active) -- stole slot %d (score %.4f)\n", voice_limit, slot, best_score);
         }
     } else { slot = 0; }
 
@@ -1501,7 +1543,8 @@ static void trigger_voice_release(SynthVoice *voice) {
 
 static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
     if (poly_mode_active) {
-        for (int v = 0; v < MAX_VOICES; v++) { if (voices[v].midi_note == note) {
+        int voice_limit = effective_voice_limit(knobs);
+        for (int v = 0; v < voice_limit; v++) { if (voices[v].midi_note == note) {
             // Sustain pedal held: defer the actual release until it lifts (see
             // handle_sustain_release) instead of releasing right now.
             if (midi_live->sustain_held) voices[v].sustain_pending = true;
@@ -1533,8 +1576,9 @@ static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knob
 
 // Called when the sustain pedal transitions held -> released: actually releases every voice
 // that had a note-off deferred while it was held.
-static void handle_sustain_release(SynthVoice voices[]) {
-    for (int v = 0; v < MAX_VOICES; v++) {
+static void handle_sustain_release(SynthVoice voices[], const SynthSharedControls *knobs) {
+    int voice_limit = effective_voice_limit(knobs);
+    for (int v = 0; v < voice_limit; v++) {
         if (voices[v].sustain_pending) {
             voices[v].sustain_pending = false;
             trigger_voice_release(&voices[v]);
@@ -1669,7 +1713,7 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
                 // pedal), 1 = Inverted (for the rare one wired backwards).
                 bool raw_held = ev->data.control.value >= 64;
                 bool now_held = (knobs->sustain_pedal_polarity != 0.0f) ? !raw_held : raw_held;
-                if (midi_live->sustain_held && !now_held) handle_sustain_release(voices); // pedal just lifted
+                if (midi_live->sustain_held && !now_held) handle_sustain_release(voices, knobs); // pedal just lifted
                 midi_live->sustain_held = now_held;
             }
         } else if (ev->type == SND_SEQ_EVENT_PITCHBEND) {
@@ -1740,7 +1784,9 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // clamp. Persists across calls for the same reason as the state above.
     static float limiter_gain = 1.0f;
 
-    for (int i = 0; i < BUFFER_SIZE; i++) {
+    int voice_limit = effective_voice_limit(knobs);
+    int block_size = effective_block_size(knobs);
+    for (int i = 0; i < block_size; i++) {
         float mixed_l = 0.0f, mixed_r = 0.0f;
         float lfo_out[LFO_COUNT] = {0.0f};
         for (int l = 0; l < LFO_COUNT; l++) {
@@ -1761,7 +1807,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             if (global_lfo_phases[l] >= 1.0f) global_lfo_phases[l] -= 1.0f;
         }
 
-        for (int v = 0; v < MAX_VOICES; v++) {
+        for (int v = 0; v < voice_limit; v++) {
             // Sub Osc has no idle-check of its own -- it's silent whenever Osc 1's own amp
             // envelope (which it shares) is silent, so it doesn't need to factor in here.
             if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE && voices[v].noise_eg.state == STATE_IDLE) continue;
@@ -2258,24 +2304,32 @@ int main() {
 
         process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack, our_midi_port, &midi_sources, &midi_live);
 
+        // block_size/voice_limit are computed fresh every iteration since both are live,
+        // user-adjustable controls (Audio tab: Block Size, Polyphony) -- see
+        // effective_block_size()/effective_voice_limit(). capture_buffer/buffer stay declared
+        // at the hard BUFFER_SIZE ceiling; only the first block_size frames of each are
+        // actually read/written/rendered this iteration.
+        int block_size = effective_block_size(&active_knobs);
+
         // Read one block of external input. Silence (the zero-init) if there's no working
         // capture device, or a read comes back short/broken -- external input degrading to
         // silence should never be able to stall or crash the synth's own audio output.
         float capture_buffer[BUFFER_SIZE * 2] = {0.0f};
         if (pcm_capture_handle) {
-            snd_pcm_sframes_t got = snd_pcm_readi(pcm_capture_handle, capture_buffer, BUFFER_SIZE);
+            snd_pcm_sframes_t got = snd_pcm_readi(pcm_capture_handle, capture_buffer, block_size);
             if (got < 0) {
                 snd_pcm_recover(pcm_capture_handle, (int)got, 0);
-            } else if ((snd_pcm_uframes_t)got < BUFFER_SIZE) {
-                memset(capture_buffer + (got * 2), 0, (BUFFER_SIZE - (size_t)got) * 2 * sizeof(float));
+            } else if ((snd_pcm_uframes_t)got < (snd_pcm_uframes_t)block_size) {
+                memset(capture_buffer + (got * 2), 0, ((size_t)block_size - (size_t)got) * 2 * sizeof(float));
             }
         }
 
-        // DIAGNOSTIC: cheap (MAX_VOICES simple state checks, negligible next to the render
-        // itself) count of currently-active voices, purely to report alongside any underrun/
-        // over-budget warning below -- see the comment on write_audio_block.
+        // DIAGNOSTIC: cheap (active_voice_limit simple state checks, negligible next to the
+        // render itself) count of currently-active voices, purely to report alongside any
+        // underrun/over-budget warning below -- see the comment on write_audio_block.
+        int voice_limit = effective_voice_limit(&active_knobs);
         int active_voices_count = 0;
-        for (int v = 0; v < MAX_VOICES; v++) {
+        for (int v = 0; v < voice_limit; v++) {
             if (voices[v].vco1_eg.state != STATE_IDLE || voices[v].vco2_eg.state != STATE_IDLE || voices[v].noise_eg.state != STATE_IDLE) active_voices_count++;
         }
 
@@ -2285,18 +2339,18 @@ int main() {
         float block_peak = render_audio_block(voices, &active_knobs, global_lfo_phases, capture_buffer, &midi_live, buffer);
         clock_gettime(CLOCK_MONOTONIC, &render_t1);
         double render_ms = (render_t1.tv_sec - render_t0.tv_sec) * 1000.0 + (render_t1.tv_nsec - render_t0.tv_nsec) / 1e6;
-        double budget_ms = (BUFFER_SIZE / (double)SAMPLE_RATE) * 1000.0;
+        double budget_ms = (block_size / (double)SAMPLE_RATE) * 1000.0;
         // DIAGNOSTIC: if rendering this block alone took longer than the block's own real-time
         // budget, that's a root cause an ALSA underrun can be pinned on directly, independent of
         // whatever else might be going on in the OS -- the engine itself couldn't keep up.
         if (render_ms > budget_ms) {
-            fprintf(stderr, "[perf] render_audio_block took %.3fms (budget %.3fms) with %d active voices -- too slow, will cause underruns\n",
-                    render_ms, budget_ms, active_voices_count);
+            fprintf(stderr, "[perf] render_audio_block took %.3fms (budget %.3fms, block size %d) with %d active voices -- too slow, will cause underruns\n",
+                    render_ms, budget_ms, block_size, active_voices_count);
         }
 
         vu_decimator++;
         if (client_fd >= 0 && vu_decimator >= 12) { send(client_fd, &block_peak, sizeof(float), 0); vu_decimator = 0; }
-        write_audio_block(pcm_handle, buffer, BUFFER_SIZE, active_voices_count, render_ms);
+        write_audio_block(pcm_handle, buffer, block_size, active_voices_count, render_ms);
     }
     if (client_fd >= 0) close(client_fd);
     if (server_fd >= 0) close(server_fd);
