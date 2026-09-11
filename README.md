@@ -6,7 +6,7 @@ A digital synthesizer split into two processes:
   audio directly to a PCM device, captures external audio from an input
   device, and exposes every synth parameter over a Unix domain socket
   (`/tmp/synth.sock`) as a fixed-layout packed struct (`SynthSharedControls`,
-  468 floats + 3 device name strings + 1 file path string + 1 flat sample-
+  532 floats + 3 device name strings + 1 file path string + 1 flat sample-
   path-bank blob). Also streams
   back a small status struct (`EngineStatus`: peak level, recording state/
   elapsed time/error, detected input channel count) over the same socket --
@@ -174,14 +174,18 @@ A digital synthesizer split into two processes:
   consumed, rather than re-read from the audio-thread-owned field on every
   later pass -- closing a real race a fast release-then-reclaim of the same
   pool slot could otherwise hit (caught and fixed via `-fsanitize=thread`).
-  A loop region (`loop_start`/`loop_end`, defaulting to a generic 40%-85%
-  span) crossfades the tail of the ring into its start over
-  `SAMPLE_XFADE_SIZE` (1024) frames to avoid an audible seam; a non-looping
-  sample instead releases its stream cleanly at natural end-of-data. Only
-  the first two channels of a multichannel WAV are read (native stereo is
-  downmixed L+R to mono, then re-panned through the same Pan knob every
-  other oscillator uses); PCM 16/24/32-bit and 32-bit float WAV are
-  supported.
+  A loop region (`loop_start`/`loop_end`, real per-zone points set from the
+  Mapping tab's waveform editor -- whole-file by default) crossfades the
+  tail of the ring into its start over `SAMPLE_XFADE_SIZE` (1024) frames to
+  avoid an audible seam, with a minimum enforced loop length of one full
+  crossfade window so a very tight loop can't leave that crossfade
+  permanently active instead of a brief transition; `loop_enabled` (also
+  per-zone) turned off makes it a genuine one-shot that releases its
+  stream cleanly at natural end-of-data instead of looping at all -- e.g.
+  drum hits. Only the first two channels of a multichannel WAV are read
+  (native stereo is downmixed L+R to mono, then re-panned through the same
+  Pan knob every other oscillator uses); PCM 16/24/32-bit and 32-bit float
+  WAV are supported.
 
   Which loaded slot actually plays is real per-note/velocity zone mapping
   (SFZ-style): each of the `MAX_SAMPLE_SLOTS` (16) slots is also a zone
@@ -202,13 +206,25 @@ A digital synthesizer split into two processes:
   `handle_note_on`; mono mode's held-note fallback stack
   (`MonoNoteStack`) carries each stacked note's own velocity too, so
   falling back to an earlier still-held key restores that key's velocity
-  rather than leaking whichever note was struck last. There's still no
+  rather than leaking whichever note was struck last.
+
+  Several slots sharing a **round-robin group** (`round_robin_group`, 0 =
+  independent) and an equally-specific matching zone cycle through each
+  other one hit at a time instead of the same one always winning --
+  `find_matching_sample_slot()` collects every tied-most-specific match,
+  then rotates through whichever group the first (lowest-index) candidate
+  belongs to via a small per-group hit counter, falling back to the
+  original deterministic lowest-index behavior for an ungrouped tie so
+  nothing changes for anyone not opting in. Loop points/enable and
+  round-robin grouping travel as fractions/plain flags in the wire
+  protocol and are applied every block the same way the rest of a zone's
+  metadata is, independent of the DFD file-load path. There's still no
   program-save capability -- that remains future work once this and the
   rest of the engine are proven solid together.
 - **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
   knobs and draggable ADSR envelope graphs, tabbed into Play / Filters /
   LFOs / Envelopes / FX / Audio / Recording / Mapping. Packs the same struct
-  (`struct.pack("468f64s64s64s256s4096s", ...)`) and sends it over the socket
+  (`struct.pack("532f64s64s64s256s4096s", ...)`) and sends it over the socket
   whenever a control changes. If it can't connect to the backend it falls
   back to a mock mode so the UI still runs standalone.
 
@@ -239,7 +255,29 @@ A digital synthesizer split into two processes:
   prototype's `print()`-based stubs). Up to `MAX_SAMPLE_SLOTS` (16) zones
   at once, tracked past that with a status line and a graceful refusal
   rather than a crash. Set an oscillator's Shape (Play tab) to "Sample"
-  and play.
+  and play. Each note's own lane (in both the grid above and the
+  reference keyboard below it) is a strict, non-overlapping partition of
+  the available width, not a physically-realistic key shape that
+  overhangs its neighbors -- a real piano's black keys visually overhang
+  the seam between their two white neighbors, which is correct for a
+  piano but means a drop or drag near a boundary could resolve to the
+  wrong note here; every key gets its own exclusive pixel range instead,
+  so a zone always snaps cleanly to the note it's actually mapped to.
+
+  Selecting exactly one zone also shows it in the **Zone Inspector**
+  (`ZoneInspectorPanel`) below the keyboard: a Loop checkbox, a
+  Round-Robin Group spin box (0 = independent), and a waveform view
+  (`SampleLoopEditor`, decoded straight from the WAV file with numpy --
+  entirely separate from the backend's own DFD streaming, purely to draw
+  a picture) with draggable orange/red Loop Start/Loop End markers over
+  a shaded loop region. Dragging a marker sends the new loop point live,
+  same as every other edit here. Give two or more overlapping zones
+  (typically several velocity-matched variations of the same hit, e.g.
+  a handful of snare samples) the same non-zero Round-Robin Group and
+  they cycle through each other on successive hits instead of the same
+  one always winning; round-robin zones are cascaded a few pixels apart
+  in the grid (with a colored "RRn" badge) rather than fully overlapping,
+  so every member stays visible and individually clickable.
 
   The Audio tab's Performance group has three real, direct engine controls:
   **Polyphony** (a plain spin box, 1-256 voices, default 32), **Block Size**
@@ -385,7 +423,7 @@ knobs a given effect actually uses instead of 8 generic "P1..P8" dials.
 ## Build & run
 
 Requires ALSA dev headers (`libasound2-dev` on Debian/Ubuntu) and Python 3
-with PyQt6.
+with PyQt6 and numpy (the Mapping tab's waveform display).
 
 ```sh
 make                    # builds ./synth_engine

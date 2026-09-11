@@ -273,6 +273,19 @@ typedef struct {
 // render_sample_osc's ratio calculation. No new string fields. New total: 468 float items + 4544
 // string bytes. The Python side's struct.pack format changes from "388f64s64s64s256s4096s" to
 // "468f64s64s64s256s4096s".
+// BREAKING CHANGE (Sampler feature expansion: loop editor + round-robin): added
+// sample_slot_loop_start[MAX_SAMPLE_SLOTS], sample_slot_loop_end[MAX_SAMPLE_SLOTS],
+// sample_slot_loop_enabled[MAX_SAMPLE_SLOTS], sample_slot_round_robin_group[MAX_SAMPLE_SLOTS]
+// (+64 floats, right after sample_slot_unpitched[]). Loop start/end travel as fractions (0.0-1.0)
+// of the file's own total_frames -- see apply_sample_slot_zone_metadata()'s conversion to real
+// frame indices and the Mapping tab's waveform loop editor in frontend.py, which never needs to
+// know a file's actual frame count. loop_enabled replaces load_sample_slot()'s old hardcoded
+// "always loop 40%-85%" default -- a slot with looping off now genuinely one-shots and releases
+// its stream at natural end (see render_sample_osc). round_robin_group lets several slots sharing
+// a group id and an overlapping zone cycle through each other on successive hits instead of the
+// same one always winning -- see find_matching_sample_slot(). No new string fields. New total:
+// 532 float items + 4544 string bytes. The Python side's struct.pack format changes from
+// "468f64s64s64s256s4096s" to "532f64s64s64s256s4096s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -508,6 +521,20 @@ typedef struct {
     float sample_slot_max_velocity[MAX_SAMPLE_SLOTS];
     float sample_slot_unpitched[MAX_SAMPLE_SLOTS]; // != 0 -- playback rate always 1.0 (the Mapping
                                                      // tab's Root Key dropdown's "DRUM" entry)
+
+    // Loop points, as fractions (0.0-1.0) of the file's own total_frames, not absolute frame
+    // numbers -- the Mapping tab's waveform loop editor works in fractions of its own rendered
+    // waveform width, so it never needs to learn total_frames (backend-only, from the WAV header
+    // parse). See apply_sample_slot_zone_metadata()'s conversion back to real frame indices.
+    float sample_slot_loop_start[MAX_SAMPLE_SLOTS];
+    float sample_slot_loop_end[MAX_SAMPLE_SLOTS];
+    float sample_slot_loop_enabled[MAX_SAMPLE_SLOTS]; // != 0 -- loop; 0 -- one-shot, natural end
+                                                        // releases the stream (see render_sample_osc)
+
+    // Round-robin: slots sharing the same non-zero group id, whose zones both match a given
+    // (note, velocity), cycle through each other on successive hits instead of the same one
+    // always winning -- see find_matching_sample_slot(). 0 = independent zone (default).
+    float sample_slot_round_robin_group[MAX_SAMPLE_SLOTS];
 
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
@@ -2135,6 +2162,12 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->sample_slot_min_velocity[s] = 0.0f;
         knobs->sample_slot_max_velocity[s] = 127.0f;
         knobs->sample_slot_unpitched[s] = 0.0f;
+        // Whole-file loop by default -- least surprising for a freshly dropped, not-yet-edited
+        // sample (no arbitrary mid-file jump the user hasn't seen/confirmed in the loop editor).
+        knobs->sample_slot_loop_start[s] = 0.0f;
+        knobs->sample_slot_loop_end[s] = 1.0f;
+        knobs->sample_slot_loop_enabled[s] = 1.0f;
+        knobs->sample_slot_round_robin_group[s] = 0.0f;
     }
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
@@ -2256,6 +2289,9 @@ typedef struct {
     int min_note, max_note;
     int min_velocity, max_velocity;
     bool unpitched; // playback rate forced to 1.0 regardless of note -- see render_sample_osc
+    int round_robin_group; // 0 = independent zone; >0 = cycles with every other loaded, currently
+                            // zone-matching slot sharing this same group id -- see
+                            // find_matching_sample_slot()/g_round_robin_hit_count[].
     unsigned int data_start_offset;
     unsigned int total_frames;
     unsigned short num_channels;
@@ -2348,11 +2384,15 @@ static bool load_sample_slot(int index, const char *path, int root_note) {
     slot->bits_per_sample = bits_per_sample;
     slot->audio_format = audio_format;
     slot->data_start_offset = (unsigned int)ftell(f);
-    slot->loop_enabled = true;
-    slot->loop_start = (unsigned int)(total_frames * 0.40);
-    slot->loop_end = (unsigned int)(total_frames * 0.85);
-    if (slot->loop_end >= total_frames) slot->loop_end = (total_frames > 5) ? total_frames - 5 : 0;
-    if (slot->loop_start >= slot->loop_end) slot->loop_start = 0;
+    // Loop points/enable are real per-zone data now (the Mapping tab's waveform loop editor),
+    // not computed here -- apply_sample_slot_zone_metadata() sets the real values from the wire
+    // immediately after this function returns (same call site in main(), same block), using
+    // total_frames just assigned above. These are just safe placeholders for the moment in
+    // between (and for any caller that loads a slot without ever calling that function, e.g. a
+    // test): no looping, full range, so a slot is never silently looped somewhere unintended.
+    slot->loop_enabled = false;
+    slot->loop_start = 0;
+    slot->loop_end = total_frames;
 
     unsigned int pre_roll_frames = (total_frames < SAMPLE_PRE_ROLL_LIMIT) ? total_frames : SAMPLE_PRE_ROLL_LIMIT;
     slot->pre_roll_frames = pre_roll_frames;
@@ -2576,19 +2616,58 @@ static void apply_sample_slot_zone_metadata(const SynthSharedControls *knobs) {
         g_sample_slots[s].min_velocity = (int)knobs->sample_slot_min_velocity[s];
         g_sample_slots[s].max_velocity = (int)knobs->sample_slot_max_velocity[s];
         g_sample_slots[s].unpitched = knobs->sample_slot_unpitched[s] != 0.0f;
+        g_sample_slots[s].round_robin_group = (int)knobs->sample_slot_round_robin_group[s];
+
+        // Loop points travel as fractions (0.0-1.0) of the file's own total_frames, not absolute
+        // frame numbers -- the Mapping tab's waveform editor works in fractions of the rendered
+        // waveform's width, so it never needs to learn total_frames itself (that lives only on
+        // this side, from load_sample_slot's WAV header parse). Only meaningful once a file is
+        // actually loaded (total_frames > 0); left alone otherwise so a zone drawn before its
+        // sample finishes loading doesn't compute garbage against a zero-length file.
+        g_sample_slots[s].loop_enabled = knobs->sample_slot_loop_enabled[s] != 0.0f;
+        if (g_sample_slots[s].loaded && g_sample_slots[s].total_frames > 1) {
+            unsigned int total = g_sample_slots[s].total_frames;
+            float start_frac = fmaxf(0.0f, fminf(1.0f, knobs->sample_slot_loop_start[s]));
+            float end_frac = fmaxf(0.0f, fminf(1.0f, knobs->sample_slot_loop_end[s]));
+            unsigned int loop_start = (unsigned int)(start_frac * (float)(total - 1));
+            unsigned int loop_end = (unsigned int)(end_frac * (float)(total - 1));
+            // Enforce a minimum loop length of one full crossfade window -- a loop shorter than
+            // SAMPLE_XFADE_SIZE would have render_sample_osc's loop-splice crossfade (see its
+            // frames_left <= SAMPLE_XFADE_SIZE check) permanently active rather than a brief
+            // transition, which is audibly wrong (a constant blur) rather than just "a short
+            // loop." Clamped against total so this never pushes loop_end past the file itself.
+            unsigned int min_len = (unsigned int)SAMPLE_XFADE_SIZE;
+            if (total - 1 < min_len) min_len = (total > 1) ? total - 1 : 0; // degenerate tiny file
+            if (loop_end < loop_start + min_len) {
+                loop_end = loop_start + min_len;
+                if (loop_end > total - 1) { loop_end = total - 1; loop_start = (loop_end > min_len) ? loop_end - min_len : 0; }
+            }
+            g_sample_slots[s].loop_start = loop_start;
+            g_sample_slots[s].loop_end = loop_end;
+        }
     }
 }
+
+// Round-robin hit counters, one per possible group id (index 0 unused -- group 0 means "not
+// grouped", see SampleSlot.round_robin_group). Persists across calls the same way limiter_gain/
+// lfo_phase_mod_state do elsewhere in this file (one synth instance, one audio thread -- no
+// atomics needed, this is audio-thread-only state).
+static unsigned int g_round_robin_hit_count[MAX_SAMPLE_SLOTS + 1] = {0};
 
 // Finds the loaded sample slot whose zone (key range AND velocity range, both inclusive) covers
 // this (note, velocity) -- the real per-note/velocity mapping (SFZ-style): a note outside every
 // loaded zone is silent, not "nearest root note always plays something." Overlapping zones (the
 // Mapping tab's rectangles are freeform -- nothing stops the user from drawing two that overlap)
 // are resolved by preferring the SMALLEST matching zone (key range * velocity range), the most
-// deliberately-specific one, tie-broken by slot index; velocity-layered instruments typically
-// don't overlap at all within one key, so this tie-break rarely matters in practice. Returns -1
+// deliberately-specific one. Among ties at that smallest area (the normal case for several
+// round-robin variations all dropped at the exact same key+velocity range), slots sharing a
+// non-zero round_robin_group cycle through each other one hit at a time instead of the same one
+// always winning; an ungrouped tie (or a genuine unintentional overlap the user hasn't grouped)
+// keeps the original deterministic behavior of always picking the lowest slot index. Returns -1
 // if nothing loaded matches.
 static int find_matching_sample_slot(int note, int velocity) {
-    int best = -1;
+    int candidates[MAX_SAMPLE_SLOTS];
+    int candidate_count = 0;
     long best_area = -1; // -1 sentinel: "no candidate yet", distinct from a real zero-area zone
     for (int i = 0; i < MAX_SAMPLE_SLOTS; i++) {
         SampleSlot *slot = &g_sample_slots[i];
@@ -2596,8 +2675,26 @@ static int find_matching_sample_slot(int note, int velocity) {
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
         long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
-        if (best_area < 0 || area < best_area) { best_area = area; best = i; }
+        if (best_area < 0 || area < best_area) { best_area = area; candidate_count = 0; }
+        if (area == best_area) candidates[candidate_count++] = i;
     }
+    if (candidate_count == 0) return -1;
+    if (candidate_count == 1) return candidates[0];
+
+    int group = g_sample_slots[candidates[0]].round_robin_group;
+    if (group <= 0) return candidates[0];
+
+    int group_members[MAX_SAMPLE_SLOTS];
+    int member_count = 0;
+    for (int c = 0; c < candidate_count; c++) {
+        if (g_sample_slots[candidates[c]].round_robin_group == group) group_members[member_count++] = candidates[c];
+    }
+    if (member_count <= 1) return candidates[0];
+
+    int group_idx = group;
+    if (group_idx < 1) group_idx = 1; else if (group_idx > MAX_SAMPLE_SLOTS) group_idx = MAX_SAMPLE_SLOTS;
+    unsigned int hit = g_round_robin_hit_count[group_idx]++;
+    int best = group_members[hit % (unsigned int)member_count];
     return best;
 }
 

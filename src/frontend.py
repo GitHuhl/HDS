@@ -7,6 +7,7 @@ import random
 import subprocess
 import re
 from datetime import datetime
+import numpy as np
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
                              QSlider, QPushButton, QProgressBar, QSpinBox, QLineEdit, QCheckBox,
@@ -26,6 +27,86 @@ def _retain_hidden(widget):
     policy.setRetainSizeWhenHidden(True)
     widget.setSizePolicy(policy)
     return widget
+
+def _decode_wav_peaks(path, num_buckets=600):
+    """Reads a WAV file's audio data (mirroring backend.c's load_sample_slot format support --
+    PCM 16/24/32-bit integer or 32-bit IEEE float, any channel count) and downsamples it to
+    num_buckets (min, max) peak pairs for the Mapping tab's waveform display. Entirely
+    independent of the backend's own WAV parsing/DFD streaming -- this only ever runs on the GUI
+    side, purely to draw a picture, so the engine never needs to round-trip sample data over the
+    socket just so the GUI can show a waveform. Returns (mins, maxs, total_frames) as float32
+    numpy arrays / int, or None if the file can't be opened or isn't a format we understand.
+    Channels are averaged into one mono trace the same way render_sample_osc's own downmix does
+    (first two channels only), matching what the zone will actually sound like."""
+    try:
+        with open(path, "rb") as f:
+            riff = f.read(12)
+            if len(riff) < 12 or riff[0:4] != b"RIFF" or riff[8:12] != b"WAVE":
+                return None
+            fmt = None
+            data_offset, data_size = None, None
+            while True:
+                header = f.read(8)
+                if len(header) < 8:
+                    break
+                chunk_id, chunk_size = header[0:4], struct.unpack("<I", header[4:8])[0]
+                if chunk_id == b"fmt ":
+                    fmt_bytes = f.read(chunk_size)
+                    audio_format, num_channels, _sr, _br, _ba, bits_per_sample = struct.unpack("<HHIIHH", fmt_bytes[:16])
+                    fmt = (audio_format, num_channels, bits_per_sample)
+                elif chunk_id == b"data":
+                    data_offset, data_size = f.tell(), chunk_size
+                    break
+                else:
+                    f.seek(chunk_size, 1)
+            if fmt is None or data_offset is None:
+                return None
+            audio_format, num_channels, bits_per_sample = fmt
+            f.seek(data_offset)
+            raw = f.read(data_size)
+
+        if audio_format == 1 and bits_per_sample == 16:
+            samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+        elif audio_format == 1 and bits_per_sample == 24:
+            n = len(raw) // 3
+            buf = np.frombuffer(raw[: n * 3], dtype=np.uint8).reshape(-1, 3)
+            as_i32 = (buf[:, 0].astype(np.int32) << 8) | (buf[:, 1].astype(np.int32) << 16) | (buf[:, 2].astype(np.int32) << 24)
+            samples = as_i32.astype(np.float32) / 2147483648.0
+        elif audio_format == 1 and bits_per_sample == 32:
+            samples = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+        elif audio_format == 3 and bits_per_sample == 32:
+            samples = np.frombuffer(raw, dtype="<f4").astype(np.float32)
+        else:
+            return None
+
+        if num_channels < 1:
+            return None
+        total_frames = len(samples) // num_channels
+        if total_frames < 1:
+            return None
+        samples = samples[: total_frames * num_channels].reshape(total_frames, num_channels)
+        mono = samples[:, :2].mean(axis=1) if num_channels >= 2 else samples[:, 0]
+
+        num_buckets = max(1, min(num_buckets, total_frames))
+        edges = np.linspace(0, total_frames, num_buckets + 1).astype(np.int64)
+        mins = np.empty(num_buckets, dtype=np.float32)
+        maxs = np.empty(num_buckets, dtype=np.float32)
+        for i in range(num_buckets):
+            chunk = mono[edges[i]:edges[i + 1]]
+            if chunk.size == 0:
+                mins[i] = maxs[i] = 0.0
+            else:
+                mins[i] = chunk.min()
+                maxs[i] = chunk.max()
+        return mins, maxs, total_frames
+    except (OSError, ValueError, struct.error):
+        return None
+
+# Distinct badge colors for round-robin groups 1, 2, 3, ... (cycles if there are more groups
+# than colors -- purely cosmetic, doesn't affect which group a zone actually belongs to).
+_ROUND_ROBIN_COLORS = ["#c0392b", "#2980b9", "#27ae60", "#8e44ad", "#d35400", "#16a085"]
+def _round_robin_group_color(group):
+    return QColor(_ROUND_ROBIN_COLORS[(group - 1) % len(_ROUND_ROBIN_COLORS)])
 
 # Device name byte width must match AUDIO_DEVICE_NAME_LEN in backend.c exactly.
 AUDIO_DEVICE_NAME_LEN = 64
@@ -916,6 +997,12 @@ class SampleZone:
         self.is_selected = False
         self.key_center = note_number  # pitch reference note; -1 = DRUM (unpitched)
         self.slot_index = slot_index   # which backend Sample Bank slot (0..MAX_SAMPLE_SLOTS-1) this is
+        # Loop points as fractions (0.0-1.0) of the file's own length -- whole-file by default,
+        # least surprising for a freshly dropped, not-yet-edited sample (see SampleLoopEditor).
+        self.loop_start = 0.0
+        self.loop_end = 1.0
+        self.loop_enabled = True
+        self.round_robin_group = 0  # 0 = independent zone; >0 = cycles with same-group zones
 
 class MidiKeyButton(QPushButton):
     """A single piano key on the Mapping tab's reference keyboard -- visual only (no MIDI is
@@ -1021,6 +1108,7 @@ class SamplerMappingGrid(QWidget):
             if len(self.sample_zones) != initial_count:
                 if self.parent_window:
                     self.parent_window.synchronize_root_key_dropdown(None)
+                    self.parent_window.sync_loop_editor_to_zone(None)
                     self.parent_window.set_mapping_status(None)
                 self.update()
                 if self.parent_window: self.parent_window.transmit_knob_packet()
@@ -1039,7 +1127,9 @@ class SamplerMappingGrid(QWidget):
                     for z in self.sample_zones: z.is_selected = False
                 zone.is_selected = True
 
-                if self.parent_window: self.parent_window.synchronize_root_key_dropdown(zone)
+                if self.parent_window:
+                    self.parent_window.synchronize_root_key_dropdown(zone)
+                    self.parent_window.sync_loop_editor_to_zone(zone)
 
                 self.zone_start_snapshots = {z: (z.root_note, z.max_note, z.min_velocity, z.max_velocity) for z in self.sample_zones if z.is_selected}
                 margin = 6
@@ -1051,7 +1141,9 @@ class SamplerMappingGrid(QWidget):
                 return
         if not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
             for z in self.sample_zones: z.is_selected = False
-        if self.parent_window: self.parent_window.synchronize_root_key_dropdown(None)
+        if self.parent_window:
+            self.parent_window.synchronize_root_key_dropdown(None)
+            self.parent_window.sync_loop_editor_to_zone(None)
         self.drag_mode, self.drag_start_pos, self.marquee_current_pos = "marquee", pos, pos
         self.update()
 
@@ -1116,23 +1208,50 @@ class SamplerMappingGrid(QWidget):
                 painter.setPen(QPen(QColor("#111111"), 1))
                 painter.drawLine(lx, 0, lx, self.height())
                 painter.drawLine(lx + w - 1, 0, lx + w - 1, self.height())
+        # Round-robin visual stacking: zones sharing a group typically share the same key+
+        # velocity range too (that's the point of grouping them), so drawing them at their real,
+        # identical rects would fully hide all but the topmost. Cascade each group's members by a
+        # few pixels so every one stays visible and individually clickable -- purely a drawing
+        # offset; hit-testing/dragging (get_zone_rect) always use the real, un-cascaded rect.
+        group_members = {}
+        for zone in self.sample_zones:
+            if zone.round_robin_group > 0:
+                group_members.setdefault(zone.round_robin_group, []).append(zone)
+        cascade_offset = {}
+        for members in group_members.values():
+            if len(members) > 1:
+                for idx, zone in enumerate(sorted(members, key=lambda z: z.slot_index)):
+                    cascade_offset[id(zone)] = idx * 9
+
         for zone in self.sample_zones:
             rect = self.get_zone_rect(zone)
             if rect.isValid():
-                painter.fillRect(rect, QColor(0, 152, 255, 150) if zone.is_selected else QColor(80, 80, 80, 110))
+                offset = cascade_offset.get(id(zone), 0)
+                draw_rect = rect.translated(offset, offset) if offset else rect
+
+                painter.fillRect(draw_rect, QColor(0, 152, 255, 150) if zone.is_selected else QColor(80, 80, 80, 110))
                 painter.setPen(QPen(QColor("#00c0ff") if zone.is_selected else QColor("#aaaaaa"), 1.5))
-                painter.drawRect(rect)
+                painter.drawRect(draw_rect)
 
                 if zone.key_center != -1 and zone.key_center in self.key_geometries:
                     cx, cw = self.key_geometries[zone.key_center]
-                    painter.fillRect(QRectF(float(cx), rect.bottom() - 4, float(cw), 4), QColor("#ffaa00"))
+                    painter.fillRect(QRectF(float(cx) + offset, draw_rect.bottom() - 4, float(cw), 4), QColor("#ffaa00"))
+
+                if zone.round_robin_group > 0:
+                    badge_rect = QRectF(draw_rect.left() + 2, draw_rect.top() + 2, 26, 12)
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QBrush(_round_robin_group_color(zone.round_robin_group)))
+                    painter.drawRoundedRect(badge_rect, 2, 2)
+                    painter.setPen(QColor("white"))
+                    painter.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+                    painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, f"RR{zone.round_robin_group}")
 
                 painter.save()
                 painter.setPen(QColor("white"))
                 painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
-                painter.translate(rect.left() + (rect.width() / 2) + 3, rect.bottom() - 6)
+                painter.translate(draw_rect.left() + (draw_rect.width() / 2) + 3, draw_rect.bottom() - 6)
                 painter.rotate(-90)
-                painter.drawText(0, 0, painter.fontMetrics().elidedText(zone.filename, Qt.TextElideMode.ElideRight, int(rect.height()) - 12))
+                painter.drawText(0, 0, painter.fontMetrics().elidedText(zone.filename, Qt.TextElideMode.ElideRight, int(draw_rect.height()) - 12))
                 painter.restore()
         if self.drag_mode == "marquee":
             painter.setPen(QPen(QColor(0, 192, 255, 200), 1.5, Qt.PenStyle.DashLine))
@@ -1226,6 +1345,179 @@ class ScalablePianoKeyboard(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             if self.currently_pressed_key and not self.currently_pressed_key.is_latched: self.currently_pressed_key.setChecked(False)
             self.currently_pressed_key = None
+
+class SampleLoopEditor(QWidget):
+    """Waveform display + draggable loop-start/loop-end markers for the Mapping tab's currently
+    selected zone. Decodes each zone's WAV file once (cached by path, purely for this picture --
+    entirely separate from the backend's own DFD streaming/pre-roll cache) and sends loop_start/
+    loop_end back to the backend as fractions of the file's length whenever a marker moves."""
+    def __init__(self, parent_window, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent_window
+        self.setMinimumHeight(110)
+        self.setMouseTracking(True)
+        self.zone = None
+        self._peaks_cache = {}  # file_path -> (mins, maxs, total_frames) or None (decode failed)
+        self._drag_target = None  # "start" | "end" | None
+
+    def _get_peaks(self, path):
+        if path not in self._peaks_cache:
+            self._peaks_cache[path] = _decode_wav_peaks(path)
+        return self._peaks_cache[path]
+
+    def set_zone(self, zone):
+        self.zone = zone
+        self._drag_target = None
+        self.update()
+
+    def _margin(self): return 6
+    def _marker_x(self, frac):
+        m = self._margin()
+        return m + frac * (self.width() - m * 2)
+
+    def _x_to_frac(self, x):
+        m = self._margin()
+        w = max(1, self.width() - m * 2)
+        return max(0.0, min(1.0, (x - m) / w))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#1a1a1f"))
+        if self.zone is None:
+            painter.setPen(QColor("#666"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Select a single zone to edit its loop points")
+            return
+
+        peaks = self._get_peaks(self.zone.file_path)
+        m = self._margin()
+        w = self.width() - m * 2
+        h = self.height()
+        mid_y = h / 2
+
+        if peaks is None:
+            painter.setPen(QColor("#a55"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Couldn't read waveform for this file")
+        else:
+            mins, maxs, _total = peaks
+            n = len(mins)
+            bar_w = w / n if n else w
+            painter.setPen(QPen(QColor("#00adb5"), 1))
+            for i in range(n):
+                x = m + i * bar_w
+                y_top = mid_y - float(maxs[i]) * (mid_y - 4)
+                y_bot = mid_y - float(mins[i]) * (mid_y - 4)
+                painter.drawLine(int(x), int(y_top), int(x), int(y_bot))
+
+        loop_x0 = self._marker_x(self.zone.loop_start)
+        loop_x1 = self._marker_x(self.zone.loop_end)
+        shade = QColor(0, 173, 181, 45) if self.zone.loop_enabled else QColor(120, 120, 120, 35)
+        painter.fillRect(QRectF(loop_x0, 0, loop_x1 - loop_x0, h), shade)
+
+        for frac, color in ((self.zone.loop_start, QColor("#ffaa00")), (self.zone.loop_end, QColor("#ff5555"))):
+            x = self._marker_x(frac)
+            painter.setPen(QPen(color, 2))
+            painter.drawLine(int(x), 0, int(x), h)
+
+    def _marker_hit(self, x, frac):
+        return abs(x - self._marker_x(frac)) < 6
+
+    def mousePressEvent(self, event):
+        if self.zone is None or event.button() != Qt.MouseButton.LeftButton: return
+        x = event.position().x()
+        if self._marker_hit(x, self.zone.loop_end): self._drag_target = "end"  # end marker checked
+        elif self._marker_hit(x, self.zone.loop_start): self._drag_target = "start"  # first, in case they overlap
+        else: self._drag_target = None
+
+    def mouseMoveEvent(self, event):
+        if self.zone is None: return
+        x = event.position().x()
+        if self._drag_target is None:
+            near = self._marker_hit(x, self.zone.loop_start) or self._marker_hit(x, self.zone.loop_end)
+            self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor) if near else QCursor(Qt.CursorShape.ArrowCursor))
+            return
+        frac = self._x_to_frac(x)
+        min_gap = 0.002  # keep start strictly before end -- a visually tiny but real minimum gap
+        if self._drag_target == "start":
+            self.zone.loop_start = min(frac, self.zone.loop_end - min_gap)
+        else:
+            self.zone.loop_end = max(frac, self.zone.loop_start + min_gap)
+        self.update()
+        if self.parent_window: self.parent_window.transmit_knob_packet()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_target = None
+
+class ZoneInspectorPanel(QWidget):
+    """Per-selected-zone controls for the Mapping tab: loop enable + the waveform/marker editor
+    above, Round-Robin Group alongside. Shows a placeholder instead of the whole panel content
+    when zero or more than one zone is selected -- editing loop points or a round-robin group for
+    several zones at once doesn't make sense, each has its own file/waveform."""
+    def __init__(self, parent_window, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent_window
+        self.zone = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        header = QHBoxLayout()
+        self.filename_label = QLabel("No zone selected")
+        self.filename_label.setStyleSheet("font-size: 10px; color: #aaa;")
+        header.addWidget(self.filename_label, stretch=1)
+
+        self.loop_enabled_cb = QCheckBox("Loop")
+        self.loop_enabled_cb.setToolTip("On: sustains by looping between the markers below while a note is held.\nOff: plays once and stops (one-shot) -- e.g. drum hits.")
+        self.loop_enabled_cb.toggled.connect(self._on_loop_enabled_toggled)
+        header.addWidget(self.loop_enabled_cb)
+
+        header.addWidget(QLabel("Round-Robin Group:"))
+        self.round_robin_spin = QSpinBox()
+        self.round_robin_spin.setRange(0, MAX_SAMPLE_SLOTS)
+        self.round_robin_spin.setSpecialValueText("None")
+        self.round_robin_spin.setToolTip("0 = independent zone. Give two or more overlapping zones the same non-zero\ngroup number to cycle through them on successive hits instead of always\nplaying the same one -- e.g. several velocity-matched snare hit variations.")
+        self.round_robin_spin.valueChanged.connect(self._on_round_robin_changed)
+        header.addWidget(self.round_robin_spin)
+        outer.addLayout(header)
+
+        self.waveform = SampleLoopEditor(parent_window=parent_window)
+        outer.addWidget(self.waveform)
+
+        self.set_zone(None)
+
+    def set_zone(self, zone):
+        self.zone = zone
+        self.loop_enabled_cb.blockSignals(True)
+        self.round_robin_spin.blockSignals(True)
+        if zone is None:
+            self.filename_label.setText("No zone selected")
+            self.loop_enabled_cb.setChecked(True)
+            self.loop_enabled_cb.setEnabled(False)
+            self.round_robin_spin.setValue(0)
+            self.round_robin_spin.setEnabled(False)
+        else:
+            self.filename_label.setText(zone.filename)
+            self.loop_enabled_cb.setChecked(zone.loop_enabled)
+            self.loop_enabled_cb.setEnabled(True)
+            self.round_robin_spin.setValue(zone.round_robin_group)
+            self.round_robin_spin.setEnabled(True)
+        self.loop_enabled_cb.blockSignals(False)
+        self.round_robin_spin.blockSignals(False)
+        self.waveform.set_zone(zone)
+
+    def _on_loop_enabled_toggled(self, checked):
+        if self.zone is None: return
+        self.zone.loop_enabled = checked
+        self.waveform.update()
+        if self.parent_window: self.parent_window.transmit_knob_packet()
+
+    def _on_round_robin_changed(self, value):
+        if self.zone is None: return
+        self.zone.round_robin_group = value
+        if self.parent_window: self.parent_window.mapping_grid.update()  # redraw group badges
+        if self.parent_window: self.parent_window.transmit_knob_packet()
+
 class SynthGui(QWidget):
     def __init__(self):
         super().__init__()
@@ -2629,6 +2921,9 @@ class SynthGui(QWidget):
         mapping_outer_lay.addWidget(self.mapping_grid, stretch=1)
         mapping_outer_lay.addWidget(self.mapping_keyboard, stretch=0)
 
+        self.zone_inspector = ZoneInspectorPanel(parent_window=self)
+        mapping_outer_lay.addWidget(self.zone_inspector, stretch=0)
+
         self.set_mapping_status(None)
 
         # ----------------------------------------------------
@@ -2772,6 +3067,12 @@ class SynthGui(QWidget):
         elif zone.key_center == -1: self.root_key_box.setCurrentIndex(128)
         else: self.root_key_box.setCurrentIndex(zone.key_center)
         self.root_key_box.blockSignals(False)
+
+    def sync_loop_editor_to_zone(self, zone):
+        """Keeps the Mapping tab's loop/round-robin inspector (ZoneInspectorPanel) showing
+        whichever single zone is currently selected, same convention as the Root Key dropdown
+        above -- called from the same SamplerMappingGrid selection-change sites."""
+        self.zone_inspector.set_zone(zone)
 
     def _on_root_key_selection_changed(self, index):
         if index == -1: return
@@ -3151,12 +3452,14 @@ class SynthGui(QWidget):
         # field-declaration order, matching sample_slot_root_note[]/min_note[]/etc.'s actual
         # memory layout exactly, not group each slot's own fields together.
         zone_by_slot = {z.slot_index: z for z in self.mapping_grid.sample_zones}
-        root_notes, min_notes, max_notes, min_vels, max_vels, unpitched_flags, sample_slot_paths = [], [], [], [], [], [], []
+        root_notes, min_notes, max_notes, min_vels, max_vels, unpitched_flags = [], [], [], [], [], []
+        loop_starts, loop_ends, loop_enableds, rr_groups, sample_slot_paths = [], [], [], [], []
         for slot_idx in range(MAX_SAMPLE_SLOTS):
             zone = zone_by_slot.get(slot_idx)
             if zone is None:
                 root_notes.append(60.0); min_notes.append(0.0); max_notes.append(127.0)
                 min_vels.append(0.0); max_vels.append(127.0); unpitched_flags.append(0.0)
+                loop_starts.append(0.0); loop_ends.append(1.0); loop_enableds.append(1.0); rr_groups.append(0.0)
                 sample_slot_paths.append("")
             else:
                 is_drum = (zone.key_center == -1)
@@ -3166,9 +3469,15 @@ class SynthGui(QWidget):
                 min_vels.append(float(zone.min_velocity))
                 max_vels.append(float(zone.max_velocity))
                 unpitched_flags.append(1.0 if is_drum else 0.0)
+                loop_starts.append(float(zone.loop_start))
+                loop_ends.append(float(zone.loop_end))
+                loop_enableds.append(1.0 if zone.loop_enabled else 0.0)
+                rr_groups.append(float(zone.round_robin_group))
                 sample_slot_paths.append(zone.file_path)
         packet_list.extend(root_notes); packet_list.extend(min_notes); packet_list.extend(max_notes)
         packet_list.extend(min_vels); packet_list.extend(max_vels); packet_list.extend(unpitched_flags)
+        packet_list.extend(loop_starts); packet_list.extend(loop_ends); packet_list.extend(loop_enableds)
+        packet_list.extend(rr_groups)
 
         # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
         # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
@@ -3183,7 +3492,9 @@ class SynthGui(QWidget):
         # + 19 (recording: enable/synth-output/downmix + 16 channel enables)
         # + 34 (tempo: tempo_bpm + tempo_marker_count + 16 marker times + 16 marker bpms)
         # + 96 (sample bank: 6 floats * MAX_SAMPLE_SLOTS[16] -- root_note, min_note, max_note,
-        #   min_velocity, max_velocity, unpitched) = 468
+        #   min_velocity, max_velocity, unpitched)
+        # + 64 (sample bank cont'd: 4 floats * MAX_SAMPLE_SLOTS[16] -- loop_start, loop_end,
+        #   loop_enabled, round_robin_group) = 532
         # floats, followed by 5 fixed strings (not floats): output_device, input_device,
         # midi_device (64 bytes each), record_path (256 bytes -- a real filesystem path needs
         # more room than an ALSA device name), then sample_slot_path[] -- MAX_SAMPLE_SLOTS
@@ -3197,7 +3508,7 @@ class SynthGui(QWidget):
             for slot_idx in range(MAX_SAMPLE_SLOTS)
         )
         binary_packet = struct.pack(
-            f"468f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s{MAX_SAMPLE_SLOTS * SAMPLE_PATH_LEN}s",
+            f"532f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s{MAX_SAMPLE_SLOTS * SAMPLE_PATH_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
