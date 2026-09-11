@@ -6,7 +6,7 @@ A digital synthesizer split into two processes:
   audio directly to a PCM device, captures external audio from an input
   device, and exposes every synth parameter over a Unix domain socket
   (`/tmp/synth.sock`) as a fixed-layout packed struct (`SynthSharedControls`,
-  388 floats + 3 device name strings + 1 file path string + 1 flat sample-
+  468 floats + 3 device name strings + 1 file path string + 1 flat sample-
   path-bank blob). Also streams
   back a small status struct (`EngineStatus`: peak level, recording state/
   elapsed time/error, detected input channel count) over the same socket --
@@ -183,18 +183,32 @@ A digital synthesizer split into two processes:
   other oscillator uses); PCM 16/24/32-bit and 32-bit float WAV are
   supported.
 
-  This is deliberately minimal groundwork, not the finished sampler:
-  `find_nearest_sample_slot()` picks whichever loaded slot's root note is
-  closest to the played note (one slot plays pitch-shifted across the
-  whole keyboard, not real per-note/velocity zone mapping), and there's no
-  program-save capability yet. Real zone mapping (a dedicated Mapping tab)
-  and program save/load are future work once this engine itself is proven
-  solid -- see the Samples tab below for the minimal loader that exists
-  today.
+  Which loaded slot actually plays is real per-note/velocity zone mapping
+  (SFZ-style): each of the `MAX_SAMPLE_SLOTS` (16) slots is also a zone
+  (`min_note`/`max_note`, `min_velocity`/`max_velocity`, plus an
+  `unpitched` flag for DRUM/one-shot samples that should always play at
+  their native rate). `find_matching_sample_slot(note, velocity)` picks
+  whichever loaded slot's key range AND velocity range both cover the
+  note -- a note outside every zone is silent, not "nearest root note
+  always plays something." Overlapping zones resolve to the smallest
+  (most specific) match. The zone fields are cheap plain data, applied to
+  `g_sample_slots[]` every block regardless of whether a slot's file path
+  itself changed (`apply_sample_slot_zone_metadata()`), so dragging a
+  zone's key/velocity range in the Mapping tab takes effect immediately
+  without re-loading the file. This depends on the engine actually
+  tracking MIDI velocity, which nothing here did before it (not even
+  amp/filter response for the periodic oscillators): note-on velocity is
+  now captured per voice (`SynthVoice.midi_velocity`) and threaded through
+  `handle_note_on`; mono mode's held-note fallback stack
+  (`MonoNoteStack`) carries each stacked note's own velocity too, so
+  falling back to an earlier still-held key restores that key's velocity
+  rather than leaking whichever note was struck last. There's still no
+  program-save capability -- that remains future work once this and the
+  rest of the engine are proven solid together.
 - **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
   knobs and draggable ADSR envelope graphs, tabbed into Play / Filters /
-  LFOs / Envelopes / FX / Audio / Recording / Samples. Packs the same struct
-  (`struct.pack("388f64s64s64s256s4096s", ...)`) and sends it over the socket
+  LFOs / Envelopes / FX / Audio / Recording / Mapping. Packs the same struct
+  (`struct.pack("468f64s64s64s256s4096s", ...)`) and sends it over the socket
   whenever a control changes. If it can't connect to the backend it falls
   back to a mock mode so the UI still runs standalone.
 
@@ -209,14 +223,23 @@ A digital synthesizer split into two processes:
   folder, that also cleanly clears `record_enable` on the wire rather than
   leaving the button checked against a backend that already gave up).
 
-  The **Samples** tab is a deliberately minimal loader for the DFD sample
-  engine above: a flat bank of `MAX_SAMPLE_SLOTS` (16) rows, each a Root
-  Note spin box (0-127) and a Browse/Clear file picker (`*.wav`) writing
-  into `sample_slot_root_note[]`/`sample_slot_path[]`. Set an oscillator's
-  Shape (Play tab) to "Sample" and play -- whichever loaded slot's Root
-  Note is closest to the note played is what sounds. This is intentionally
-  not the real per-note/velocity zone-mapping UI (a future Mapping tab);
-  it exists only so the engine can be loaded and played from the GUI.
+  The **Mapping** tab is the real Sample Bank zone editor for the DFD
+  engine above: drag-and-drop a `.wav` file onto a reference piano
+  keyboard to create a zone there (or use the "+ Add Sample" button as a
+  fallback, which does the same thing at Middle C); drag a zone's body to
+  move it, an edge to resize its key or velocity range; shift-click or
+  marquee-drag to select multiple zones; Delete/Backspace to remove them.
+  A Root Key dropdown (128 notes + "DRUM (Unpitched)") sets the selected
+  zone's own pitch-reference note independent of its key range. Every
+  edit is live -- no separate "Apply" step, same convention as every
+  other control in this file -- driving `sample_slot_root_note[]`/
+  `min_note[]`/`max_note[]`/`min_velocity[]`/`max_velocity[]`/
+  `unpitched[]`/`path[]` directly (`SamplerMappingGrid`, adapted from a
+  standalone prototype into this file's real backend instead of that
+  prototype's `print()`-based stubs). Up to `MAX_SAMPLE_SLOTS` (16) zones
+  at once, tracked past that with a status line and a graceful refusal
+  rather than a crash. Set an oscillator's Shape (Play tab) to "Sample"
+  and play.
 
   The Audio tab's Performance group has three real, direct engine controls:
   **Polyphony** (a plain spin box, 1-256 voices, default 32), **Block Size**

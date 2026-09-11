@@ -48,10 +48,12 @@
 // Programmable tempo: hard ceiling on how many (time, bpm) tempo markers the tempo-map can hold
 // at once -- see the Tempo section on SynthSharedControls and compute_current_tempo_bpm().
 #define TEMPO_MARKER_MAX 16
-// DFD (direct-from-disk) sample playback: how many sample files can be loaded/mapped at once.
-// Deliberately small for now -- this is the minimal wire-protocol shape needed to load and test
-// WAVE_SAMPLE end to end; the real per-note/velocity zone mapping (SFZ-style) is future work, not
-// this pass. See the Sample Bank section on SynthSharedControls.
+// DFD (direct-from-disk) sample playback: how many sample zones (Mapping tab) can be loaded at
+// once. Deliberately kept at its original minimal-pass size rather than raised in the same pass
+// that added real key/velocity zone matching -- each slot costs a fixed 256-byte path plus 5
+// floats on the wire, so raising this is a straightforward but separate follow-up once real
+// multisample instruments (many velocity-layered zones) need more than 16. See the Sample Bank
+// section on SynthSharedControls and find_matching_sample_slot().
 #define MAX_SAMPLE_SLOTS 16
 #define SAMPLE_PATH_LEN 256
 // How many voices/oscillators can be actively DFD-streaming at once, independent of MAX_VOICES --
@@ -257,6 +259,20 @@ typedef struct {
 // test WAVE_SAMPLE end to end (see MAX_SAMPLE_SLOTS's comment) -- NOT the real per-note/velocity
 // zone mapping system, which is future work. New total: 388 float items + 4544 string bytes. The
 // Python side's struct.pack format changes from "372f64s64s64s256s" to "388f64s64s64s256s4096s".
+// BREAKING CHANGE (Sample Bank zone mapping / Mapping tab): added sample_slot_min_note[
+// MAX_SAMPLE_SLOTS], sample_slot_max_note[MAX_SAMPLE_SLOTS], sample_slot_min_velocity[
+// MAX_SAMPLE_SLOTS], sample_slot_max_velocity[MAX_SAMPLE_SLOTS], sample_slot_unpitched[
+// MAX_SAMPLE_SLOTS] (+80 floats, right after sample_slot_root_note[] -- see find_matching_
+// sample_slot()/apply_sample_slot_zone_metadata() and the Mapping tab in frontend.py). This is
+// the real per-note/velocity zone mapping the previous entry called out as future work: a note
+// now only sounds through a loaded slot whose key range AND velocity range both cover it
+// (find_matching_sample_slot()) -- a note outside every zone is silent, rather than the old
+// "nearest root note always plays something" behavior. sample_slot_unpitched (the Mapping tab's
+// Root Key dropdown's "DRUM (Unpitched)" entry) forces that slot's playback rate to 1.0 regardless
+// of which note in its zone triggered it, instead of pitch-shifting relative to root_note -- see
+// render_sample_osc's ratio calculation. No new string fields. New total: 468 float items + 4544
+// string bytes. The Python side's struct.pack format changes from "388f64s64s64s256s4096s" to
+// "468f64s64s64s256s4096s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -472,16 +488,26 @@ typedef struct {
     float tempo_marker_time[TEMPO_MARKER_MAX]; // seconds since engine start
     float tempo_marker_bpm[TEMPO_MARKER_MAX];
 
-    // --- Sample Bank (DFD/WAVE_SAMPLE) ---
-    // Minimal loadable sample slots -- just enough to load and test WAVE_SAMPLE oscillator
-    // playback end to end (see MAX_SAMPLE_SLOTS's comment). Root note pairs with the matching
-    // entry in sample_slot_path[] (below, with the other trailing strings). main() detects a
-    // live change to a slot's path (compared against what it last loaded, same convention as the
-    // device-name live-reload checks) and calls load_sample_slot() on the audio thread -- see
-    // the DFD sample playback section above handle_note_on(). This is NOT per-note/velocity zone
-    // mapping (a single slot plays pitch-shifted across the whole keyboard, nearest-root-note
-    // wins between multiple loaded slots) -- that's future work for a Mapping tab.
+    // --- Sample Bank (DFD/WAVE_SAMPLE) + Mapping tab zones ---
+    // Loadable sample slots, each a real key-range + velocity-range zone (SFZ-style). Root note
+    // pairs with the matching entry in sample_slot_path[] (below, with the other trailing
+    // strings). main() detects a live change to a slot's PATH (compared against what it last
+    // loaded, same convention as the device-name live-reload checks) and calls load_sample_slot()
+    // on the audio thread -- see the DFD sample playback section above handle_note_on(). The zone
+    // fields below (root note + key/velocity range) are cheap plain data, not file I/O, so they're
+    // applied to g_sample_slots[] every block regardless of whether the path itself changed --
+    // see apply_sample_slot_zone_metadata() in main(); this is also what makes dragging a zone's
+    // key/velocity range in the Mapping tab take effect immediately, without needing to re-browse
+    // the file. A note only sounds through a slot whose key range AND velocity range both cover it
+    // (find_matching_sample_slot()) -- a note outside every loaded zone is silent, real sampler
+    // behavior, not "nearest root note always plays something."
     float sample_slot_root_note[MAX_SAMPLE_SLOTS];
+    float sample_slot_min_note[MAX_SAMPLE_SLOTS];
+    float sample_slot_max_note[MAX_SAMPLE_SLOTS];
+    float sample_slot_min_velocity[MAX_SAMPLE_SLOTS];
+    float sample_slot_max_velocity[MAX_SAMPLE_SLOTS];
+    float sample_slot_unpitched[MAX_SAMPLE_SLOTS]; // != 0 -- playback rate always 1.0 (the Mapping
+                                                     // tab's Root Key dropdown's "DRUM" entry)
 
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
@@ -576,6 +602,11 @@ typedef struct {
 
 typedef struct {
     int midi_note;
+    int midi_velocity; // 0-127, captured at note-on -- currently used only by the Sample Bank's
+                        // velocity-layer zone matching (find_matching_sample_slot); not yet
+                        // applied to amp/filter response for the periodic oscillators (no
+                        // engine-wide velocity sensitivity exists yet, see handle_note_on's
+                        // comment on this).
 
     float vco1_phase;
     float vco1_target_freq;
@@ -2094,7 +2125,17 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->tempo_bpm = 120.0f; // a common, neutral default tempo
     knobs->tempo_marker_count = 0.0f; // no tempo map programmed -- tempo_bpm alone applies
     for (int t = 0; t < TEMPO_MARKER_MAX; t++) { knobs->tempo_marker_time[t] = 0.0f; knobs->tempo_marker_bpm[t] = 0.0f; }
-    for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) { knobs->sample_slot_root_note[s] = 60.0f; knobs->sample_slot_path[s][0] = '\0'; }
+    for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) {
+        knobs->sample_slot_root_note[s] = 60.0f;
+        knobs->sample_slot_path[s][0] = '\0';
+        // Full keyboard/velocity range by default -- an unmapped-but-loaded slot (no zone drawn
+        // yet in the Mapping tab) still plays everywhere, same as before zones existed.
+        knobs->sample_slot_min_note[s] = 0.0f;
+        knobs->sample_slot_max_note[s] = 127.0f;
+        knobs->sample_slot_min_velocity[s] = 0.0f;
+        knobs->sample_slot_max_velocity[s] = 127.0f;
+        knobs->sample_slot_unpitched[s] = 0.0f;
+    }
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -2102,6 +2143,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
 
 static void init_voice(SynthVoice *voice) {
     voice->midi_note = -1;
+    voice->midi_velocity = 100;
     voice->vco1_phase = 0.0f; voice->vco1_target_freq = 0.0f; voice->vco1_current_freq = 0.0f; voice->vco1_tri_state = 0.0f;
     voice->vco2_phase = 0.0f; voice->vco2_target_freq = 0.0f; voice->vco2_current_freq = 0.0f; voice->vco2_tri_state = 0.0f;
     for(int u=0; u<UNISON_SAW_VOICES; u++) { voice->vco1_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco2_unison_saw_phases[u] = (float)rand()/RAND_MAX; }
@@ -2135,6 +2177,10 @@ static float roll_glide_multiplier(float glide_random_pct) {
 #define MONO_STACK_SIZE 8
 typedef struct {
     int notes[MONO_STACK_SIZE];
+    int velocities[MONO_STACK_SIZE]; // parallel to notes[] -- each note's own velocity, so
+                                      // falling back to an earlier still-held key (handle_note_off)
+                                      // restores THAT key's velocity rather than leaking whichever
+                                      // note was struck last (see the fallback in handle_note_off).
     int count;
 } MonoNoteStack;
 
@@ -2150,25 +2196,26 @@ typedef struct {
     bool sustain_held;      // CC64, after applying sustain_pedal_polarity -- see process_midi_input
 } MidiLiveState;
 
-static void mono_stack_push(MonoNoteStack *stack, int note) {
+static void mono_stack_push(MonoNoteStack *stack, int note, int velocity) {
     for (int i = 0; i < stack->count; i++) {
         if (stack->notes[i] == note) {
-            for (int j = i; j < stack->count - 1; j++) stack->notes[j] = stack->notes[j + 1];
+            for (int j = i; j < stack->count - 1; j++) { stack->notes[j] = stack->notes[j + 1]; stack->velocities[j] = stack->velocities[j + 1]; }
             stack->count--;
             break;
         }
     }
-    if (stack->count < MONO_STACK_SIZE) { stack->notes[stack->count++] = note; }
+    if (stack->count < MONO_STACK_SIZE) { stack->notes[stack->count] = note; stack->velocities[stack->count] = velocity; stack->count++; }
     else {
-        for (int j = 0; j < MONO_STACK_SIZE - 1; j++) stack->notes[j] = stack->notes[j + 1];
+        for (int j = 0; j < MONO_STACK_SIZE - 1; j++) { stack->notes[j] = stack->notes[j + 1]; stack->velocities[j] = stack->velocities[j + 1]; }
         stack->notes[MONO_STACK_SIZE - 1] = note;
+        stack->velocities[MONO_STACK_SIZE - 1] = velocity;
     }
 }
 
 static void mono_stack_remove(MonoNoteStack *stack, int note) {
     for (int i = 0; i < stack->count; i++) {
         if (stack->notes[i] == note) {
-            for (int j = i; j < stack->count - 1; j++) stack->notes[j] = stack->notes[j + 1];
+            for (int j = i; j < stack->count - 1; j++) { stack->notes[j] = stack->notes[j + 1]; stack->velocities[j] = stack->velocities[j + 1]; }
             stack->count--;
             return;
         }
@@ -2190,10 +2237,10 @@ static void mono_stack_remove(MonoNoteStack *stack, int note) {
 // ONLY thing that ever opens/reads/closes a FILE* or writes into a ring buffer; the audio thread
 // only ever reads a ring buffer and publishes tiny atomic start/stop commands.
 //
-// This is deliberately the minimal shape needed to get WAVE_SAMPLE working correctly end to end
-// through HDS's own mature EG/filter/LFO/mod-matrix/FX-bus pipeline (see render_sample_osc's
-// comment) -- it is NOT the real per-note/velocity zone mapping system (SFZ-style), which is
-// explicitly future work once this engine itself is proven solid.
+// Sample playback itself is adapted to HDS's own mature EG/filter/LFO/mod-matrix/FX-bus pipeline
+// (see render_sample_osc's comment) rather than bringing in a parallel one. Zone selection --
+// which loaded slot a given (note, velocity) actually plays -- is the real per-note/velocity
+// mapping system (SFZ-style): see find_matching_sample_slot() and the Mapping tab in frontend.py.
 
 // One loaded sample file's metadata plus its RAM pre-roll cache. Loaded via load_sample_slot(),
 // called from the audio thread only when the corresponding wire-protocol sample-slot path
@@ -2202,6 +2249,13 @@ typedef struct {
     bool loaded;
     char file_path[SAMPLE_PATH_LEN];
     int root_note;               // MIDI note this sample plays back at its native (unpitched) rate
+    // Zone range this slot answers to -- see find_matching_sample_slot(). Applied every block from
+    // the wire's sample_slot_min_note[]/max_note[]/min_velocity[]/max_velocity[] regardless of
+    // whether the file path itself changed (apply_sample_slot_zone_metadata() in main()), unlike
+    // root_note/file_path/everything below which only update on an actual load (path change).
+    int min_note, max_note;
+    int min_velocity, max_velocity;
+    bool unpitched; // playback rate forced to 1.0 regardless of note -- see render_sample_osc
     unsigned int data_start_offset;
     unsigned int total_frames;
     unsigned short num_channels;
@@ -2508,26 +2562,53 @@ static void *sample_disk_thread_main(void *arg) {
     return NULL;
 }
 
-// Finds the loaded sample slot whose root note is closest to `note` -- a simple, deliberately
-// crude placeholder for real per-note/velocity zone mapping (see MAX_SAMPLE_SLOTS's comment).
-// Returns -1 if nothing is loaded at all.
-static int find_nearest_sample_slot(int note) {
-    int best = -1, best_dist = 999999;
+// Copies the Mapping tab's zone metadata (key range, velocity range, root note) from the wire
+// into g_sample_slots[] -- cheap plain-data assignment, safe to run every block regardless of
+// whether a slot's file path changed (see the comment at its call site in main() and on
+// SampleSlot's zone fields). Runs even for a currently-unloaded slot; harmless (find_matching_
+// sample_slot already skips any slot with !loaded), and means a zone drawn before its sample
+// finishes loading is already in place the instant load_sample_slot flips loaded=true.
+static void apply_sample_slot_zone_metadata(const SynthSharedControls *knobs) {
+    for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) {
+        g_sample_slots[s].root_note = (int)knobs->sample_slot_root_note[s];
+        g_sample_slots[s].min_note = (int)knobs->sample_slot_min_note[s];
+        g_sample_slots[s].max_note = (int)knobs->sample_slot_max_note[s];
+        g_sample_slots[s].min_velocity = (int)knobs->sample_slot_min_velocity[s];
+        g_sample_slots[s].max_velocity = (int)knobs->sample_slot_max_velocity[s];
+        g_sample_slots[s].unpitched = knobs->sample_slot_unpitched[s] != 0.0f;
+    }
+}
+
+// Finds the loaded sample slot whose zone (key range AND velocity range, both inclusive) covers
+// this (note, velocity) -- the real per-note/velocity mapping (SFZ-style): a note outside every
+// loaded zone is silent, not "nearest root note always plays something." Overlapping zones (the
+// Mapping tab's rectangles are freeform -- nothing stops the user from drawing two that overlap)
+// are resolved by preferring the SMALLEST matching zone (key range * velocity range), the most
+// deliberately-specific one, tie-broken by slot index; velocity-layered instruments typically
+// don't overlap at all within one key, so this tie-break rarely matters in practice. Returns -1
+// if nothing loaded matches.
+static int find_matching_sample_slot(int note, int velocity) {
+    int best = -1;
+    long best_area = -1; // -1 sentinel: "no candidate yet", distinct from a real zero-area zone
     for (int i = 0; i < MAX_SAMPLE_SLOTS; i++) {
-        if (!g_sample_slots[i].loaded) continue;
-        int dist = abs(g_sample_slots[i].root_note - note);
-        if (dist < best_dist) { best_dist = dist; best = i; }
+        SampleSlot *slot = &g_sample_slots[i];
+        if (!slot->loaded) continue;
+        if (note < slot->min_note || note > slot->max_note) continue;
+        if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
+        long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
+        if (best_area < 0 || area < best_area) { best_area = area; best = i; }
     }
     return best;
 }
 
 // Starts (or restarts) an oscillator's sample playback for a fresh note -- releases whatever
 // stream it might already hold (a retrigger/voice-steal case) and claims a new one if
-// find_nearest_sample_slot finds something loaded. Leaves *stream_idx at -1 (silent) if nothing
-// is loaded or the stream pool is exhausted, rather than failing the whole note-on.
-static void start_sample_osc(int *stream_idx, double *ptr, bool *preroll, int note) {
+// find_matching_sample_slot finds a zone covering this note+velocity. Leaves *stream_idx at -1
+// (silent) if nothing matches or the stream pool is exhausted, rather than failing the whole
+// note-on.
+static void start_sample_osc(int *stream_idx, double *ptr, bool *preroll, int note, int velocity) {
     if (*stream_idx >= 0) { release_sample_stream(*stream_idx); *stream_idx = -1; }
-    int slot = find_nearest_sample_slot(note);
+    int slot = find_matching_sample_slot(note, velocity);
     *ptr = 0.0;
     *preroll = true;
     *stream_idx = (slot >= 0) ? claim_sample_stream(slot) : -1;
@@ -2570,8 +2651,13 @@ static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll
     SampleSlot *slot = &g_sample_slots[atomic_load_explicit(&stream->slot_index, memory_order_relaxed)];
     if (!slot->loaded) return 0.0f;
 
-    float root_hz = 440.0f * powf(2.0f, (float)(slot->root_note - 69) / 12.0f);
-    float ratio = (root_hz > 1.0f) ? fmaxf(0.01f, hz / root_hz) : 1.0f;
+    float ratio;
+    if (slot->unpitched) {
+        ratio = 1.0f; // DRUM (Unpitched) -- always plays at its native recorded rate
+    } else {
+        float root_hz = 440.0f * powf(2.0f, (float)(slot->root_note - 69) / 12.0f);
+        ratio = (root_hz > 1.0f) ? fmaxf(0.01f, hz / root_hz) : 1.0f;
+    }
 
     double ptr = *ptr_inout;
     bool preroll = *preroll_inout;
@@ -2656,7 +2742,7 @@ static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll
     return (out_l + out_r) * 0.5f;
 }
 
-static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
+static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], int note, int velocity, bool poly_mode_active, MonoNoteStack *mono_stack) {
     int slot = -1;
     if (poly_mode_active) {
         // BUG FIX: this used to only check vco1_eg/vco2_eg, so a voice whose noise_eg was
@@ -2693,6 +2779,7 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
 
     float target_hz = 440.0f * powf(2.0f, (note - 69) / 12.0f);
     voices[slot].midi_note = note;
+    voices[slot].midi_velocity = velocity;
     voices[slot].vco1_target_freq = target_hz;
     voices[slot].vco2_target_freq = target_hz;
     // Any note-on onto this slot makes a previously-deferred sustain release moot -- either the
@@ -2719,13 +2806,13 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         // and release any stream a stolen/retriggered voice was still holding from a previous
         // note even if this new note doesn't need one -- see start_sample_osc()'s comment.
         if ((WaveType)((int)knobs->vco1_shape) == WAVE_SAMPLE) {
-            start_sample_osc(&voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, note);
+            start_sample_osc(&voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, note, velocity);
         } else if (voices[slot].vco1_sample_stream >= 0) {
             release_sample_stream(voices[slot].vco1_sample_stream);
             voices[slot].vco1_sample_stream = -1;
         }
         if ((WaveType)((int)knobs->vco2_shape) == WAVE_SAMPLE) {
-            start_sample_osc(&voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, note);
+            start_sample_osc(&voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, note, velocity);
         } else if (voices[slot].vco2_sample_stream >= 0) {
             release_sample_stream(voices[slot].vco2_sample_stream);
             voices[slot].vco2_sample_stream = -1;
@@ -2749,7 +2836,7 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         // An overlapping legato note: this is an actual audible glide, so reroll its time.
         voices[slot].glide_time_multiplier = roll_glide_multiplier(knobs->mono_glide_random);
     }
-    if (!poly_mode_active) mono_stack_push(mono_stack, note);
+    if (!poly_mode_active) mono_stack_push(mono_stack, note, velocity);
 }
 
 // Puts a voice's envelopes into RELEASE from wherever they currently are. Factored out since
@@ -2783,6 +2870,7 @@ static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knob
         int fallback_note = mono_stack->notes[mono_stack->count - 1];
         float target_hz = 440.0f * powf(2.0f, (fallback_note - 69) / 12.0f);
         voices[0].midi_note = fallback_note;
+        voices[0].midi_velocity = mono_stack->velocities[mono_stack->count - 1];
         voices[0].vco1_target_freq = target_hz;
         voices[0].vco2_target_freq = target_hz;
         // Falling back to a still-held note is also a real audible glide -- reroll its time too.
@@ -2924,7 +3012,7 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
         snd_seq_event_input(seq_handle, &ev); if (ev == NULL) continue;
         if (ev->type == SND_SEQ_EVENT_NOTEON || ev->type == SND_SEQ_EVENT_NOTEOFF) {
             int note = ev->data.note.note;
-            if (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0) { handle_note_on(voices, knobs, global_lfo_phases, note, poly_mode_active, mono_stack); }
+            if (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0) { handle_note_on(voices, knobs, global_lfo_phases, note, ev->data.note.velocity, poly_mode_active, mono_stack); }
             else { handle_note_off(voices, knobs, midi_live, note, poly_mode_active, mono_stack); }
         } else if (ev->type == SND_SEQ_EVENT_CONTROLLER) {
             int cc_num = ev->data.control.param;
@@ -3935,6 +4023,10 @@ int main() {
                 snprintf(applied_sample_slot_path[s], SAMPLE_PATH_LEN, "%s", active_knobs.sample_slot_path[s]);
             }
         }
+        // Sample Bank zone metadata: cheap plain data (no file I/O), so applied every block
+        // regardless of whether the path itself changed -- this is what makes dragging a zone's
+        // key/velocity range in the Mapping tab take effect immediately, unlike a genuine reload.
+        apply_sample_slot_zone_metadata(&active_knobs);
 
         process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack, our_midi_port, &midi_sources, &midi_live);
 

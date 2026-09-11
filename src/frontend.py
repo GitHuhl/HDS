@@ -11,8 +11,8 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
                              QSlider, QPushButton, QProgressBar, QSpinBox, QLineEdit, QCheckBox,
                              QScrollArea, QMenu, QInputDialog, QFileDialog, QGridLayout)
-from PyQt6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor, QAction
-from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal
+from PyQt6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor, QAction, QFont
+from PyQt6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, pyqtSignal
 
 def _format_semitones_cents(total_cents):
     """Format a raw cents value as 'SS.CC st' (e.g. 2401 -> '24.01 st')."""
@@ -893,6 +893,326 @@ class ADSRPanel(QGroupBox):
         self.attack_level_pct = state.get("al", 0)
         self.attack_peak_pct = state.get("pk", 100)
         self._on_dial_moved()
+
+# ==========================================================================================
+# MAPPING TAB -- Sample Bank zone editor. Adapted from a standalone prototype the same author
+# provided (a drag-and-drop key-range/velocity-range zone grid + a scaled piano keyboard), wired
+# here into the real backend instead of the prototype's print()-based stubs: every zone edit
+# (drop, drag/resize, delete, root-key change) calls transmit_knob_packet() the same way every
+# other live control in this file does, and each SampleZone is synced 1:1 to a backend slot
+# (sample_slot_root_note[]/min_note[]/max_note[]/min_velocity[]/max_velocity[]/unpitched[]/path[]
+# in backend.c) by its own slot_index -- see SynthGui.transmit_knob_packet's Sample Bank section.
+# ==========================================================================================
+class SampleZone:
+    """One loaded sample mapped across a key range and a velocity range -- one entry in the
+    Sample Bank, synced to a backend slot (sample_slot_*[slot_index]) by slot_index."""
+    def __init__(self, file_path, note_number, slot_index):
+        self.file_path = file_path
+        self.filename = os.path.basename(file_path)
+        self.root_note = note_number   # lower bound of the key range
+        self.max_note = note_number    # upper bound of the key range
+        self.min_velocity = 40
+        self.max_velocity = 90
+        self.is_selected = False
+        self.key_center = note_number  # pitch reference note; -1 = DRUM (unpitched)
+        self.slot_index = slot_index   # which backend Sample Bank slot (0..MAX_SAMPLE_SLOTS-1) this is
+
+class MidiKeyButton(QPushButton):
+    """A single piano key on the Mapping tab's reference keyboard -- visual only (no MIDI is
+    sent), used to click-preview where a note falls while editing zones."""
+    def __init__(self, note_number, is_black, parent=None):
+        super().__init__(parent)
+        self.note_number = note_number
+        self.is_black = is_black
+        self.is_latched = False
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setCheckable(True)
+        if not self.is_black and (self.note_number % 12 == 0):
+            self.setText(f"C{(self.note_number // 12) - 1}")
+        self.update_style()
+
+    def update_style(self):
+        if self.is_black:
+            self.setStyleSheet("QPushButton { background-color: black; color: white; font-size: 8px; border: 1px solid #111; border-radius: 1px; padding-bottom: 2px; } QPushButton:checked { background-color: #007acc; }")
+        else:
+            self.setStyleSheet("QPushButton { background-color: white; color: #444; font-size: 9px; font-weight: bold; border: 1px solid #bbb; border-bottom-left-radius: 3px; border-bottom-right-radius: 3px; text-align: bottom; padding-bottom: 6px; } QPushButton:checked { background-color: #0098ff; color: white; }")
+
+class SamplerMappingGrid(QWidget):
+    """The interactive key-range/velocity-range zone editor: drag-and-drop a .wav to create a
+    zone, drag its body to move it, drag an edge to resize its key or velocity range, marquee-
+    select multiple zones, Delete/Backspace to remove selected zones."""
+    def __init__(self, parent_window, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent_window  # the SynthGui instance -- for transmit_knob_packet()/status
+        self.key_geometries = {}
+        self.black_key_offsets = {1, 3, 6, 8, 10}
+        self.sample_zones = []
+        self.setAcceptDrops(True)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.active_zone = None
+        self.drag_mode = None
+        self.drag_start_pos = QPoint()
+        self.marquee_current_pos = QPoint()
+        self.zone_start_snapshots = {}
+
+    def update_grid_layout(self, key_geometries):
+        self.key_geometries = key_geometries
+        self.update()
+
+    def get_note_at_x(self, x_pos):
+        for note in range(128):
+            if (note % 12) in self.black_key_offsets and note in self.key_geometries:
+                lx, w = self.key_geometries[note]
+                if lx <= x_pos <= (lx + w): return note
+        for note in range(128):
+            if (note % 12) not in self.black_key_offsets and note in self.key_geometries:
+                lx, w = self.key_geometries[note]
+                if lx <= x_pos <= (lx + w): return note
+        return None
+
+    def get_y_for_velocity(self, vel): return int((1.0 - (vel / 127.0)) * self.height())
+    def get_velocity_for_y(self, y): return max(0, min(127, int((1.0 - (y / self.height())) * 127)))
+
+    def get_zone_rect(self, zone):
+        if zone.root_note not in self.key_geometries or zone.max_note not in self.key_geometries: return QRectF()
+        lx, _ = self.key_geometries[zone.root_note]
+        elx, ew = self.key_geometries[zone.max_note]
+        return QRectF(float(lx), float(self.get_y_for_velocity(zone.max_velocity)), float((elx + ew) - lx), float(self.get_y_for_velocity(zone.min_velocity) - self.get_y_for_velocity(zone.max_velocity)))
+
+    def get_marquee_rect(self): return QRectF(QPointF(self.drag_start_pos), QPointF(self.marquee_current_pos)).normalized()
+    def dragEnterEvent(self, e): e.acceptProposedAction() if e.mimeData().hasUrls() else None
+    def dragMoveEvent(self, e): e.acceptProposedAction() if e.mimeData().hasUrls() else None
+
+    def _next_free_slot_index(self):
+        used = {z.slot_index for z in self.sample_zones}
+        for i in range(MAX_SAMPLE_SLOTS):
+            if i not in used: return i
+        return -1
+
+    def add_zone_at_note(self, file_path, note_number):
+        """Creates a new zone for file_path at note_number, if a Sample Bank slot is free.
+        Shared by drag-and-drop and the "+ Add Sample" fallback button."""
+        slot_index = self._next_free_slot_index()
+        if slot_index < 0:
+            if self.parent_window: self.parent_window.set_mapping_status(f"Sample Bank full ({MAX_SAMPLE_SLOTS}/{MAX_SAMPLE_SLOTS}) — delete a zone to add another.", error=True)
+            return False
+        self.sample_zones.append(SampleZone(file_path, note_number, slot_index))
+        if self.parent_window: self.parent_window.set_mapping_status(None)
+        self.update()
+        if self.parent_window: self.parent_window.transmit_knob_packet()
+        return True
+
+    def dropEvent(self, e):
+        if e.mimeData().hasUrls():
+            any_added = False
+            for url in e.mimeData().urls():
+                fp = url.toLocalFile()
+                if fp.lower().endswith('.wav'):
+                    tn = self.get_note_at_x(e.position().toPoint().x())
+                    if tn is not None and self.add_zone_at_note(fp, tn): any_added = True
+            e.acceptProposedAction()
+            if any_added: self.update()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            initial_count = len(self.sample_zones)
+            self.sample_zones = [z for z in self.sample_zones if not z.is_selected]
+            if len(self.sample_zones) != initial_count:
+                if self.parent_window:
+                    self.parent_window.synchronize_root_key_dropdown(None)
+                    self.parent_window.set_mapping_status(None)
+                self.update()
+                if self.parent_window: self.parent_window.transmit_knob_packet()
+        else:
+            super().keyPressEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton: return
+        self.setFocus()
+        pos = event.position().toPoint()
+        for zone in reversed(self.sample_zones):
+            rect = self.get_zone_rect(zone)
+            if rect.contains(QPointF(pos)):
+                self.active_zone, self.drag_start_pos = zone, pos
+                if not zone.is_selected and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+                    for z in self.sample_zones: z.is_selected = False
+                zone.is_selected = True
+
+                if self.parent_window: self.parent_window.synchronize_root_key_dropdown(zone)
+
+                self.zone_start_snapshots = {z: (z.root_note, z.max_note, z.min_velocity, z.max_velocity) for z in self.sample_zones if z.is_selected}
+                margin = 6
+                if abs(pos.x() - rect.left()) < margin: self.drag_mode = "resize_left"
+                elif abs(pos.x() - rect.right()) < margin: self.drag_mode = "resize_right"
+                elif abs(pos.y() - rect.top()) < margin: self.drag_mode = "resize_top"
+                elif abs(pos.y() - rect.bottom()) < margin: self.drag_mode = "resize_bottom"
+                else: self.drag_mode = "move"
+                return
+        if not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            for z in self.sample_zones: z.is_selected = False
+        if self.parent_window: self.parent_window.synchronize_root_key_dropdown(None)
+        self.drag_mode, self.drag_start_pos, self.marquee_current_pos = "marquee", pos, pos
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        if self.drag_mode is None:
+            c_set = False
+            for zone in self.sample_zones:
+                rect = self.get_zone_rect(zone)
+                if rect.contains(QPointF(pos)):
+                    margin = 6
+                    if abs(pos.x() - rect.left()) < margin or abs(pos.x() - rect.right()) < margin:
+                        self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
+                        c_set = True
+                    elif abs(pos.y() - rect.top()) < margin or abs(pos.y() - rect.bottom()) < margin:
+                        self.setCursor(QCursor(Qt.CursorShape.SizeVerCursor))
+                        c_set = True
+                    break
+            if not c_set: self.unsetCursor()
+        if self.drag_mode is None: return
+        if self.drag_mode == "marquee":
+            self.marquee_current_pos = pos
+            m_rect = self.get_marquee_rect()
+            for zone in self.sample_zones: zone.is_selected = m_rect.intersects(self.get_zone_rect(zone))
+            self.update()
+            return
+        current_note, start_click_note = self.get_note_at_x(pos.x()), self.get_note_at_x(self.drag_start_pos.x())
+        if current_note is None or start_click_note is None: return
+        n_off, v_off = current_note - start_click_note, int(((pos.y() - self.drag_start_pos.y()) / self.height()) * 127)
+        for zone, snap in self.zone_start_snapshots.items():
+            sr, sm, smin, smax = snap
+            if self.drag_mode == "resize_left" and (sr + n_off) <= zone.max_note and 0 <= (sr + n_off) < 128: zone.root_note = sr + n_off
+            elif self.drag_mode == "resize_right" and (sm + n_off) >= zone.root_note and 0 <= (sm + n_off) < 128: zone.max_note = sm + n_off
+            elif self.drag_mode == "resize_top" and max(0, min(127, smax - v_off)) >= zone.min_velocity: zone.max_velocity = max(0, min(127, smax - v_off))
+            elif self.drag_mode == "resize_bottom" and max(0, min(127, smin - v_off)) <= zone.max_velocity: zone.min_velocity = max(0, min(127, smin - v_off))
+            elif self.drag_mode == "move":
+                if 0 <= (sr + n_off) < 128 and 0 <= (sm + n_off) < 128: zone.root_note, zone.max_note = sr + n_off, sm + n_off
+                if 0 <= (smin - v_off) <= 127 and 0 <= (smax - v_off) <= 127: zone.min_velocity, zone.max_velocity = smin - v_off, smax - v_off
+        self.update()
+        if self.parent_window: self.parent_window.transmit_knob_packet()
+
+    def mouseReleaseEvent(self, event):
+        self.active_zone, self.drag_mode = None, None
+        self.zone_start_snapshots.clear()
+        self.unsetCursor()
+        self.update()
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#1e1e1e"))
+        if not self.key_geometries: return
+        for note in range(128):
+            if (note % 12) not in self.black_key_offsets and note in self.key_geometries:
+                lx, w = self.key_geometries[note]
+                painter.fillRect(lx, 0, w, self.height(), QColor("#242424") if note % 2 == 0 else QColor("#202020"))
+                painter.setPen(QPen(QColor("#2d2d2d"), 1))
+                painter.drawLine(lx + w - 1, 0, lx + w - 1, self.height())
+        for note in range(128):
+            if (note % 12) in self.black_key_offsets and note in self.key_geometries:
+                lx, w = self.key_geometries[note]
+                painter.fillRect(lx, 0, w, self.height(), QColor("#161616"))
+                painter.setPen(QPen(QColor("#111111"), 1))
+                painter.drawLine(lx, 0, lx, self.height())
+                painter.drawLine(lx + w - 1, 0, lx + w - 1, self.height())
+        for zone in self.sample_zones:
+            rect = self.get_zone_rect(zone)
+            if rect.isValid():
+                painter.fillRect(rect, QColor(0, 152, 255, 150) if zone.is_selected else QColor(80, 80, 80, 110))
+                painter.setPen(QPen(QColor("#00c0ff") if zone.is_selected else QColor("#aaaaaa"), 1.5))
+                painter.drawRect(rect)
+
+                if zone.key_center != -1 and zone.key_center in self.key_geometries:
+                    cx, cw = self.key_geometries[zone.key_center]
+                    painter.fillRect(QRectF(float(cx), rect.bottom() - 4, float(cw), 4), QColor("#ffaa00"))
+
+                painter.save()
+                painter.setPen(QColor("white"))
+                painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+                painter.translate(rect.left() + (rect.width() / 2) + 3, rect.bottom() - 6)
+                painter.rotate(-90)
+                painter.drawText(0, 0, painter.fontMetrics().elidedText(zone.filename, Qt.TextElideMode.ElideRight, int(rect.height()) - 12))
+                painter.restore()
+        if self.drag_mode == "marquee":
+            painter.setPen(QPen(QColor(0, 192, 255, 200), 1.5, Qt.PenStyle.DashLine))
+            painter.setBrush(QBrush(QColor(0, 152, 255, 40)))
+            painter.drawRect(self.get_marquee_rect())
+
+class ScalablePianoKeyboard(QWidget):
+    """A fluid-scaling reference keyboard that forwards its key geometry to the mapping grid so
+    zone rectangles line up with real key positions. Click/drag previews a key visually (no MIDI
+    is sent); right-click latches a key held for reference while editing."""
+    def __init__(self, grid_widget, parent=None):
+        super().__init__(parent)
+        self.grid_widget = grid_widget
+        self.white_keys, self.black_keys, self.currently_pressed_key = [], [], None
+        self.setFixedHeight(160)
+        self.init_keys()
+
+    def init_keys(self):
+        self.black_key_offsets = {1, 3, 6, 8, 10}
+        for note in range(128):
+            is_black = (note % 12) in self.black_key_offsets
+            key = MidiKeyButton(note, is_black, self)
+            if not is_black: self.white_keys.append(key)
+            else: self.black_keys.append(key)
+
+    def resizeEvent(self, event):
+        total_width, total_height = self.width(), self.height()
+        white_width = total_width / len(self.white_keys)
+        black_width, black_height, white_height = white_width * 0.65, int(total_height * 0.60), total_height
+        current_white_idx = 0
+        white_left_positions, grid_positions = {}, {}
+        for key in self.white_keys:
+            left_pos = int(current_white_idx * white_width)
+            actual_w = int((current_white_idx + 1) * white_width) - left_pos
+            key.setGeometry(left_pos, 0, actual_w, white_height)
+            white_left_positions[key.note_number], grid_positions[key.note_number] = left_pos, (left_pos, actual_w)
+            current_white_idx += 1
+        for key in self.black_keys:
+            base_white_note = key.note_number - 1
+            if base_white_note in white_left_positions:
+                left_pos = (white_left_positions[base_white_note] + int(white_width)) - int(black_width / 2)
+                key.setGeometry(left_pos, 0, int(black_width), black_height)
+                grid_positions[key.note_number] = (left_pos, int(black_width))
+        for b_key in self.black_keys: b_key.raise_()
+        if self.grid_widget: self.grid_widget.update_grid_layout(grid_positions)
+
+    def getKeyAtPos(self, pos: QPoint):
+        for key in self.black_keys:
+            if key.geometry().contains(pos): return key
+        for key in self.white_keys:
+            if key.geometry().contains(pos): return key
+        return None
+
+    def calculate_velocity(self, key, pos: QPoint):
+        return max(1, min(int((max(0, min(pos.y() - key.y(), key.height())) / key.height()) * 127), 127))
+
+    def update_mouse_playback(self, pos: QPoint):
+        target_key = self.getKeyAtPos(pos)
+        if target_key != self.currently_pressed_key:
+            if self.currently_pressed_key and not self.currently_pressed_key.is_latched: self.currently_pressed_key.setChecked(False)
+            self.currently_pressed_key = target_key
+            if self.currently_pressed_key and not self.currently_pressed_key.is_latched:
+                self.currently_pressed_key.setChecked(True)
+
+    def mousePressEvent(self, event):
+        pos = event.position().toPoint()
+        target_key = self.getKeyAtPos(pos)
+        if not target_key: return
+        if event.button() == Qt.MouseButton.LeftButton: self.update_mouse_playback(pos)
+        elif event.button() == Qt.MouseButton.RightButton:
+            target_key.is_latched = not target_key.is_latched
+            target_key.setChecked(target_key.is_latched)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton: self.update_mouse_playback(event.position().toPoint())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self.currently_pressed_key and not self.currently_pressed_key.is_latched: self.currently_pressed_key.setChecked(False)
+            self.currently_pressed_key = None
 class SynthGui(QWidget):
     def __init__(self):
         super().__init__()
@@ -924,7 +1244,7 @@ class SynthGui(QWidget):
         self.tab_fx = QWidget()
         self.tab_audio = QWidget()
         self.tab_recording = QWidget()
-        self.tab_samples = QWidget()
+        self.tab_mapping = QWidget()
 
         # ----------------------------------------------------
         # GLOBAL CONTROLS: live in the always-visible left sidebar (not a tab) so Program,
@@ -2247,79 +2567,56 @@ class SynthGui(QWidget):
         self._update_record_button_enabled()
 
         # ----------------------------------------------------
-        # SAMPLES TAB CONTENT -- deliberately minimal: a flat bank of MAX_SAMPLE_SLOTS (file path,
-        # root note) pairs, loaded into an Osc's Shape once it's set to "Sample" (find_nearest_
-        # sample_slot in backend.c picks whichever loaded slot's root note is closest to the
-        # played note). This is NOT the real per-note/velocity zone mapping UI (the future
-        # Mapping tab, merging keyboard_gui5.py) -- that's explicitly deferred until the DFD
-        # engine itself (WAVE_SAMPLE/render_sample_osc) is proven solid. This tab exists only so
-        # the engine can actually be loaded and played from the GUI in the meantime.
+        # MAPPING TAB CONTENT -- the real Sample Bank zone editor: drag-and-drop a .wav onto the
+        # keyboard to map it, drag a zone's body to move it or an edge to resize its key/velocity
+        # range, right-click-free click to preview a key. Every edit here is live (no separate
+        # "Apply" step) -- same convention as every other control in this file, see
+        # SamplerMappingGrid's mouseMoveEvent/dropEvent/keyPressEvent. Up to MAX_SAMPLE_SLOTS
+        # (16) zones at once; each is synced to its own backend slot by SampleZone.slot_index.
         # ----------------------------------------------------
-        samples_outer_lay = QVBoxLayout(self.tab_samples)
-        samples_outer_lay.setContentsMargins(6, 6, 6, 6)
-        samples_outer_lay.setSpacing(6)
+        mapping_outer_lay = QVBoxLayout(self.tab_mapping)
+        mapping_outer_lay.setContentsMargins(6, 6, 6, 6)
+        mapping_outer_lay.setSpacing(6)
 
-        samples_header = QLabel(
-            "Load WAV files into the Sample Bank, then set an oscillator's Shape (Play tab) to \"Sample\". "
-            "A played note uses whichever loaded slot's Root Note is closest — no zone editing yet."
+        mapping_header = QLabel(
+            "Drag a .wav file onto the keyboard below to map it. Drag a zone's body to move it, an edge to "
+            "resize its key/velocity range. Shift-click or marquee-drag to select multiple; Delete/Backspace "
+            "to remove. Set an oscillator's Shape (Play tab) to \"Sample\" to hear it."
         )
-        samples_header.setStyleSheet("font-size: 9px; color: #888;")
-        samples_header.setWordWrap(True)
-        samples_outer_lay.addWidget(samples_header)
+        mapping_header.setStyleSheet("font-size: 9px; color: #888;")
+        mapping_header.setWordWrap(True)
+        mapping_outer_lay.addWidget(mapping_header)
 
-        samples_scroll = QScrollArea()
-        samples_scroll.setWidgetResizable(True)
-        samples_scroll_content = QWidget()
-        samples_grid = QGridLayout(samples_scroll_content)
-        samples_grid.setSpacing(4)
-        samples_grid.setContentsMargins(2, 2, 2, 2)
+        mapping_top_bar = QHBoxLayout()
+        mapping_top_bar.addWidget(QLabel("Root Key (selected zone):"))
+        self.root_key_box = QComboBox()
+        self.root_key_box.setFixedWidth(190)
+        note_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        for note in range(128):
+            octave = (note // 12) - 1
+            self.root_key_box.addItem(f"{note_names[note % 12]}{octave} ({note})", note)
+        self.root_key_box.addItem("DRUM (Unpitched)", -1)
+        self.root_key_box.setCurrentIndex(-1)
+        self.root_key_box.currentIndexChanged.connect(self._on_root_key_selection_changed)
+        mapping_top_bar.addWidget(self.root_key_box)
 
-        header_row = 0
-        for col, text in enumerate(["Slot", "Root Note", "File", ""]):
-            lbl = QLabel(f"<b>{text}</b>")
-            lbl.setStyleSheet("font-size: 10px;")
-            samples_grid.addWidget(lbl, header_row, col)
+        btn_add_sample = QPushButton("+ Add Sample…")
+        btn_add_sample.setToolTip("Fallback for when dragging a file in isn't convenient -- adds it at Middle C, same as a drop there.")
+        btn_add_sample.clicked.connect(self._pick_and_add_sample)
+        mapping_top_bar.addWidget(btn_add_sample)
 
-        self.sample_slot_root_note_spins = []
-        self.sample_slot_path_fields = []
-        self.sample_slot_paths = [""] * MAX_SAMPLE_SLOTS
-        for slot_idx in range(MAX_SAMPLE_SLOTS):
-            row = header_row + 1 + slot_idx
-            samples_grid.addWidget(QLabel(str(slot_idx)), row, 0)
+        mapping_top_bar.addStretch()
+        self.mapping_status_label = QLabel("")
+        self.mapping_status_label.setStyleSheet("font-size: 10px; color: #888;")
+        mapping_top_bar.addWidget(self.mapping_status_label)
+        mapping_outer_lay.addLayout(mapping_top_bar)
 
-            root_spin = QSpinBox()
-            root_spin.setRange(0, 127)
-            root_spin.setValue(60)
-            root_spin.setFixedWidth(56)
-            root_spin.setToolTip("MIDI note number this sample plays back at its recorded pitch (60 = Middle C).")
-            samples_grid.addWidget(root_spin, row, 1)
-            self.sample_slot_root_note_spins.append(root_spin)
+        self.mapping_grid = SamplerMappingGrid(parent_window=self)
+        self.mapping_keyboard = ScalablePianoKeyboard(grid_widget=self.mapping_grid)
+        mapping_outer_lay.addWidget(self.mapping_grid, stretch=1)
+        mapping_outer_lay.addWidget(self.mapping_keyboard, stretch=0)
 
-            path_field = QLineEdit("")
-            path_field.setReadOnly(True)
-            path_field.setPlaceholderText("(empty — slot not loaded)")
-            path_field.setStyleSheet("color: #00adb5; background-color: #1e1e24; font-size: 10px; padding: 2px;")
-            samples_grid.addWidget(path_field, row, 2)
-            self.sample_slot_path_fields.append(path_field)
-
-            btns_row = QHBoxLayout()
-            btn_browse = QPushButton("Browse…")
-            btn_browse.setFixedHeight(22)
-            btn_browse.clicked.connect(lambda checked, i=slot_idx: self._pick_sample_slot_file(i))
-            btns_row.addWidget(btn_browse)
-            btn_clear = QPushButton("Clear")
-            btn_clear.setFixedHeight(22)
-            btn_clear.clicked.connect(lambda checked, i=slot_idx: self._clear_sample_slot(i))
-            btns_row.addWidget(btn_clear)
-            btns_container = QWidget()
-            btns_container.setLayout(btns_row)
-            samples_grid.addWidget(btns_container, row, 3)
-
-            root_spin.valueChanged.connect(self.transmit_knob_packet)
-
-        samples_grid.setColumnStretch(2, 1)
-        samples_scroll.setWidget(samples_scroll_content)
-        samples_outer_lay.addWidget(samples_scroll, stretch=1)
+        self.set_mapping_status(None)
 
         # ----------------------------------------------------
         # ASSEMBLE AND ANCHOR TOUCH DECK TO ROOT LAYOUT
@@ -2331,7 +2628,7 @@ class SynthGui(QWidget):
         self.tab_widget.addTab(self.tab_fx, "FX")
         self.tab_widget.addTab(self.tab_audio, "Audio")
         self.tab_widget.addTab(self.tab_recording, "Recording")
-        self.tab_widget.addTab(self.tab_samples, "Samples")
+        self.tab_widget.addTab(self.tab_mapping, "Mapping")
 
         outer_layout.addWidget(self.tab_widget, stretch=5)
         self.setLayout(outer_layout)
@@ -2435,20 +2732,45 @@ class SynthGui(QWidget):
             self.record_folder = folder
             self.record_folder_field.setText(folder)
 
-    def _pick_sample_slot_file(self, slot_idx):
-        start_dir = os.path.dirname(self.sample_slot_paths[slot_idx]) if self.sample_slot_paths[slot_idx] else os.path.expanduser("~")
-        path, _ = QFileDialog.getOpenFileName(self, f"Load Sample — Slot {slot_idx}", start_dir, "WAV files (*.wav)")
+    def _pick_and_add_sample(self):
+        """Fallback for the Mapping tab's "+ Add Sample" button -- creates a zone at Middle C,
+        same as dropping the file there. Drag-and-drop directly onto a specific key is still the
+        primary way to place a zone somewhere other than Middle C."""
+        path, _ = QFileDialog.getOpenFileName(self, "Add Sample", os.path.expanduser("~"), "WAV files (*.wav)")
         if path:
-            self.sample_slot_paths[slot_idx] = path
-            self.sample_slot_path_fields[slot_idx].setText(os.path.basename(path))
-            self.sample_slot_path_fields[slot_idx].setToolTip(path)
-            self.transmit_knob_packet()
+            self.mapping_grid.add_zone_at_note(path, 60)
 
-    def _clear_sample_slot(self, slot_idx):
-        self.sample_slot_paths[slot_idx] = ""
-        self.sample_slot_path_fields[slot_idx].setText("")
-        self.sample_slot_path_fields[slot_idx].setToolTip("")
-        self.transmit_knob_packet()
+    def set_mapping_status(self, message, error=False):
+        """Status line under the Mapping tab's top bar -- used for the Sample Bank full warning
+        and cleared (shows the live zone count instead) once that's no longer the case."""
+        if message is None:
+            n = len(self.mapping_grid.sample_zones)
+            message = f"Sample Bank: {n}/{MAX_SAMPLE_SLOTS} zones"
+            error = False
+        self.mapping_status_label.setText(message)
+        self.mapping_status_label.setStyleSheet(f"font-size: 10px; color: {'#ff5555' if error else '#888'};")
+
+    def synchronize_root_key_dropdown(self, zone):
+        """Keeps the Mapping tab's Root Key combo showing whichever selected zone's key center
+        was most recently clicked (or blank/-1 if none is selected) -- mirrors how a knob's
+        readout follows selection elsewhere in this file."""
+        self.root_key_box.blockSignals(True)
+        if zone is None: self.root_key_box.setCurrentIndex(-1)
+        elif zone.key_center == -1: self.root_key_box.setCurrentIndex(128)
+        else: self.root_key_box.setCurrentIndex(zone.key_center)
+        self.root_key_box.blockSignals(False)
+
+    def _on_root_key_selection_changed(self, index):
+        if index == -1: return
+        target_value = self.root_key_box.itemData(index)
+        updated = False
+        for zone in self.mapping_grid.sample_zones:
+            if zone.is_selected:
+                zone.key_center = target_value
+                updated = True
+        if updated:
+            self.mapping_grid.update()
+            self.transmit_knob_packet()
 
     def _generate_record_filename(self):
         os.makedirs(self.record_folder, exist_ok=True)
@@ -2801,11 +3123,39 @@ class SynthGui(QWidget):
         packet_list.extend([0.0] * TEMPO_MARKER_MAX)  # tempo_marker_time[]
         packet_list.extend([0.0] * TEMPO_MARKER_MAX)  # tempo_marker_bpm[]
 
-        # Sample Bank (+16 items): root note per slot, paired with the fixed-width file path
-        # strings packed at the very end (below) -- see sample_slot_root_note[]/sample_slot_path[]
-        # in backend.c. Empty path = slot not loaded, regardless of what root note is sitting here.
+        # Sample Bank (+96 items): the Mapping tab's zones, one backend slot per SampleZone.slot_index
+        # -- root note (key center; DRUM sends 60 as a placeholder since sample_slot_unpitched
+        # forces playback rate to 1.0 regardless), key range, velocity range, and the unpitched
+        # flag, paired with the fixed-width file path strings packed at the very end (below). A
+        # slot with no zone (empty path) sends the harmless full-range defaults -- see
+        # sample_slot_root_note[]/min_note[]/max_note[]/min_velocity[]/max_velocity[]/unpitched[]/
+        # path[] in backend.c and find_matching_sample_slot(). Empty path = slot not loaded,
+        # regardless of what the other fields say.
+        #
+        # IMPORTANT: the C struct is struct-of-arrays (all 16 root notes, THEN all 16 min notes,
+        # THEN all 16 max notes, ...), not array-of-structs (root/min/max/... per slot, repeated)
+        # -- so this must build six separate MAX_SAMPLE_SLOTS-long lists and extend() them in
+        # field-declaration order, matching sample_slot_root_note[]/min_note[]/etc.'s actual
+        # memory layout exactly, not group each slot's own fields together.
+        zone_by_slot = {z.slot_index: z for z in self.mapping_grid.sample_zones}
+        root_notes, min_notes, max_notes, min_vels, max_vels, unpitched_flags, sample_slot_paths = [], [], [], [], [], [], []
         for slot_idx in range(MAX_SAMPLE_SLOTS):
-            packet_list.append(float(self.sample_slot_root_note_spins[slot_idx].value()))
+            zone = zone_by_slot.get(slot_idx)
+            if zone is None:
+                root_notes.append(60.0); min_notes.append(0.0); max_notes.append(127.0)
+                min_vels.append(0.0); max_vels.append(127.0); unpitched_flags.append(0.0)
+                sample_slot_paths.append("")
+            else:
+                is_drum = (zone.key_center == -1)
+                root_notes.append(60.0 if is_drum else float(zone.key_center))
+                min_notes.append(float(zone.root_note))   # key range lower bound
+                max_notes.append(float(zone.max_note))    # key range upper bound
+                min_vels.append(float(zone.min_velocity))
+                max_vels.append(float(zone.max_velocity))
+                unpitched_flags.append(1.0 if is_drum else 0.0)
+                sample_slot_paths.append(zone.file_path)
+        packet_list.extend(root_notes); packet_list.extend(min_notes); packet_list.extend(max_notes)
+        packet_list.extend(min_vels); packet_list.extend(max_vels); packet_list.extend(unpitched_flags)
 
         # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
         # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
@@ -2819,7 +3169,8 @@ class SynthGui(QWidget):
         # + 1 (sustain polarity) + 1 (audio latency) + 1 (polyphony) + 1 (block size)
         # + 19 (recording: enable/synth-output/downmix + 16 channel enables)
         # + 34 (tempo: tempo_bpm + tempo_marker_count + 16 marker times + 16 marker bpms)
-        # + 16 (sample_slot_root_note[MAX_SAMPLE_SLOTS]) = 388
+        # + 96 (sample bank: 6 floats * MAX_SAMPLE_SLOTS[16] -- root_note, min_note, max_note,
+        #   min_velocity, max_velocity, unpitched) = 468
         # floats, followed by 5 fixed strings (not floats): output_device, input_device,
         # midi_device (64 bytes each), record_path (256 bytes -- a real filesystem path needs
         # more room than an ALSA device name), then sample_slot_path[] -- MAX_SAMPLE_SLOTS
@@ -2829,11 +3180,11 @@ class SynthGui(QWidget):
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
         sample_paths_blob = b"".join(
-            self.sample_slot_paths[slot_idx].encode("utf-8")[:SAMPLE_PATH_LEN - 1].ljust(SAMPLE_PATH_LEN, b"\x00")
+            sample_slot_paths[slot_idx].encode("utf-8")[:SAMPLE_PATH_LEN - 1].ljust(SAMPLE_PATH_LEN, b"\x00")
             for slot_idx in range(MAX_SAMPLE_SLOTS)
         )
         binary_packet = struct.pack(
-            f"388f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s{MAX_SAMPLE_SLOTS * SAMPLE_PATH_LEN}s",
+            f"468f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s{MAX_SAMPLE_SLOTS * SAMPLE_PATH_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
