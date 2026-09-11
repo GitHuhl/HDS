@@ -2050,11 +2050,19 @@ class SynthGui(QWidget):
         gain_col.addWidget(QLabel("Gain"), alignment=Qt.AlignmentFlag.AlignCenter)
         self.ext_in_gain_dial = PotentiometerKnob("Input Gain", self)
         self.ext_in_gain_dial.setRange(0, 200)
-        self.ext_in_gain_dial.setValue(100)
+        # Always starts at -inf (silence), never at unity -- an upstream mic pre/interface can be
+        # left at any gain, and there must be no chance of a burst hitting the FX bus the instant
+        # Enable is checked. The user always has to manually bring this up themselves.
+        self.ext_in_gain_dial.setValue(0)
+        self.ext_in_gain_dial.value_formatter = lambda v: "-inf dB" if v <= 0 else f"{v}%"
         gain_col.addWidget(self.ext_in_gain_dial, alignment=Qt.AlignmentFlag.AlignCenter)
         ext_in_lay.addLayout(gain_col)
 
-        ext_in_note = QLabel("Routed into the same FX bus as the synth's own voices — passes through all 12 FX slots.")
+        ext_in_note = QLabel(
+            "Routed into the same FX bus as the synth's own voices — passes through all 12 FX slots.\n"
+            "Gain always starts at -inf on launch, regardless of what it was last set to — bring it "
+            "up manually after Enable, rather than risk a burst from a hot upstream mic pre."
+        )
         ext_in_note.setStyleSheet("font-size: 9px; color: #888;")
         ext_in_note.setWordWrap(True)
         ext_in_lay.addWidget(ext_in_note, stretch=1)
@@ -2303,6 +2311,7 @@ class SynthGui(QWidget):
             self.record_toggle_btn.setEnabled(any_source)
 
     def _on_record_toggled(self, checked):
+        self.record_toggle_btn.setText("■ Stop" if checked else "● Record")
         if checked:
             self._current_record_path = self._generate_record_filename()
             self.record_status_label.setText(f"Starting… {os.path.basename(self._current_record_path)}")
@@ -2339,6 +2348,7 @@ class SynthGui(QWidget):
                 self.record_toggle_btn.blockSignals(True)
                 self.record_toggle_btn.setChecked(False)
                 self.record_toggle_btn.blockSignals(False)
+                self.record_toggle_btn.setText("● Record")  # blockSignals above skipped _on_record_toggled's own text update
                 self.transmit_knob_packet() # actually tell the backend to clear record_enable too
         elif is_recording:
             mins, secs = divmod(int(elapsed_seconds), 60)

@@ -1404,7 +1404,12 @@ static void init_default_controls(SynthSharedControls *knobs) {
     // Noise Osc Amp envelope lives at eg[2]/eg_mode[2] and was covered by the generic
     // `for(int e=0; e<ENV_COUNT; e++)` default-fill loop above -- nothing extra needed here.
 
-    knobs->ext_in_enable = 0.0f; knobs->ext_in_gain = 1.0f;
+    // ext_in_gain defaults to 0.0 (silence/-inf), not unity: an upstream mic pre or interface
+    // could already be set hot, and External Input must never be able to burst into the FX bus
+    // the moment ext_in_enable goes live (e.g. right after this engine (re)starts, before the
+    // frontend's own dial -- which also always inits to 0 -- has sent its first packet). The
+    // user always has to bring this up manually.
+    knobs->ext_in_enable = 0.0f; knobs->ext_in_gain = 0.0f;
     for (int f = 0; f < FX_SLOT_COUNT; f++) {
         knobs->fx[f].fx_type = FX_TYPE_OFF;
         for (int p = 0; p < FX_SLOT_PARAM_COUNT; p++) knobs->fx[f].param[p] = 0.0f;
