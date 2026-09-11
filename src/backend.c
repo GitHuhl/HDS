@@ -129,8 +129,11 @@ typedef struct {
 // floats; see AUDIO_DEVICE_NAME_LEN). Running total after that change was 285 float items + 128
 // string bytes.
 // BREAKING CHANGE (FX routing): added 1 float (fx_routing_mode, Series/Parallel -- see the
-// comment on that field). New total: 286 float items + 128 string bytes. The Python side's
-// struct.pack format changes from "285f64s64s" to "286f64s64s".
+// comment on that field). Running total after that change was 286 float items + 128 string
+// bytes.
+// BREAKING CHANGE (MIDI device selection): added 1 more fixed 64-byte string (midi_device --
+// not a float; see AUDIO_DEVICE_NAME_LEN). New total: 286 float items + 192 string bytes. The
+// Python side's struct.pack format changes from "286f64s64s" to "286f64s64s64s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -266,6 +269,14 @@ typedef struct {
     // items: a device name is text, not a knob value.
     char output_device[AUDIO_DEVICE_NAME_LEN];
     char input_device[AUDIO_DEVICE_NAME_LEN];
+
+    // MIDI input source selection: "auto" (default) connects to every real (kernel-backed, not
+    // "Midi Through", not the ALSA System client) MIDI source currently present AND keeps
+    // listening for new ones plugged in later -- see midi_autoconnect_scan()/the announce-port
+    // subscription in main(). Any other value is taken as an exact ALSA sequencer client name
+    // (as shown in the Audio tab's MIDI dropdown) to connect to instead of auto-detecting --
+    // still reconnects automatically if that same-named device is unplugged and replugged.
+    char midi_device[AUDIO_DEVICE_NAME_LEN];
 } SynthSharedControls;
 typedef struct {
     EnvelopeState state;
@@ -1189,9 +1200,11 @@ static void poll_control_socket(int server_fd, int *client_fd, char *packet_buf,
         if (*bytes_so_far == sizeof(SynthSharedControls)) {
             memcpy(knobs, packet_buf, sizeof(SynthSharedControls));
             // Defensive: guarantee null-termination regardless of what the GUI actually sent,
-            // since these two fields get handed straight to snd_pcm_open() as C strings.
+            // since these fields get handed straight to snd_pcm_open()/string-compared as C
+            // strings.
             knobs->output_device[AUDIO_DEVICE_NAME_LEN - 1] = '\0';
             knobs->input_device[AUDIO_DEVICE_NAME_LEN - 1] = '\0';
+            knobs->midi_device[AUDIO_DEVICE_NAME_LEN - 1] = '\0';
             *bytes_so_far = 0;
         }
     } else if (bytes_received == 0 || (bytes_received < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
@@ -1239,6 +1252,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->fx_routing_mode = 0.0f; // Series
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
+    snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
 }
 
 static void init_voice(SynthVoice *voice) {
@@ -1385,7 +1399,118 @@ static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knob
     }
 }
 
-static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], bool poly_mode_active, MonoNoteStack *mono_stack) {
+// --- MIDI auto-connect: no more manually running aconnect ---
+//
+// Keeps track of which ALSA sequencer client:port pairs are currently subscribed to feed our
+// own MIDI input port, so a full rescan (on startup, or when the user's midi_device selection
+// changes) can cleanly tear down exactly what it previously connected before reconnecting under
+// the new selection.
+#define MAX_TRACKED_MIDI_SOURCES 32
+typedef struct {
+    int count;
+    int client[MAX_TRACKED_MIDI_SOURCES];
+    int port[MAX_TRACKED_MIDI_SOURCES];
+} MidiSourceList;
+
+static void midi_source_list_add(MidiSourceList *list, int client, int port) {
+    if (list->count >= MAX_TRACKED_MIDI_SOURCES) return; // more than 32 simultaneous MIDI sources is not a real scenario
+    list->client[list->count] = client;
+    list->port[list->count] = port;
+    list->count++;
+}
+
+// Drops every tracked entry for a given client (a client can, in principle, have contributed
+// more than one port) -- used when that client disappears, so a later-reused client id can't be
+// mistaken for the device that just left.
+static void midi_source_list_remove_client(MidiSourceList *list, int client) {
+    for (int i = 0; i < list->count; i++) {
+        if (list->client[i] == client) {
+            for (int j = i; j < list->count - 1; j++) { list->client[j] = list->client[j+1]; list->port[j] = list->port[j+1]; }
+            list->count--;
+            i--;
+        }
+    }
+}
+
+// Pure decision logic, deliberately factored out from the ALSA client-info lookup that feeds it
+// so it can be unit-tested without a live sequencer connection. client_id==SND_SEQ_CLIENT_SYSTEM
+// (0) is always rejected (the kernel's own Timer/Announce ports, not a MIDI source); a
+// non-kernel (SND_SEQ_KERNEL_CLIENT is the type given to real hardware- or driver-backed clients
+// -- USB MIDI class devices among them) client is rejected since it's some other application's
+// virtual port, not a physical device; "Midi Through" is ALSA's own generic passthrough client,
+// present on essentially every Linux install, and connecting to it would just be a no-op patch
+// cable to nothing, so it's rejected by name. pref NULL/""/"auto" means auto-detect (matches any
+// client that clears those checks); anything else must match `name` exactly.
+static bool midi_client_should_autoconnect(int client_id, int client_type, const char *name, const char *pref) {
+    if (client_id == SND_SEQ_CLIENT_SYSTEM) return false;
+    if (client_type != SND_SEQ_KERNEL_CLIENT) return false;
+    if (!name || name[0] == '\0') return false;
+    if (strcmp(name, "Midi Through") == 0) return false;
+    bool auto_mode = (!pref || pref[0] == '\0' || strcmp(pref, "auto") == 0);
+    return auto_mode || strcmp(name, pref) == 0;
+}
+
+// Same reasoning, factored out for the same testability: a port must be readable (a source we
+// can receive FROM) and subscribable, and must not be marked NO_EXPORT (aconnect itself skips
+// NO_EXPORT ports when listing connectable clients -- they're for the owning application's
+// internal use only).
+static bool midi_port_caps_are_connectable_source(unsigned int caps) {
+    return (caps & SND_SEQ_PORT_CAP_READ) && (caps & SND_SEQ_PORT_CAP_SUBS_READ) && !(caps & SND_SEQ_PORT_CAP_NO_EXPORT);
+}
+
+// Looks up client_id's name/type live and delegates to midi_client_should_autoconnect(). Split
+// out from that pure function only because this half needs a live seq handle.
+static bool midi_client_matches(snd_seq_t *seq, int client_id, const char *pref, char *name_out, size_t name_out_len) {
+    snd_seq_client_info_t *info;
+    snd_seq_client_info_alloca(&info);
+    if (snd_seq_get_any_client_info(seq, client_id, info) < 0) return false;
+    const char *name = snd_seq_client_info_get_name(info);
+    bool matches = midi_client_should_autoconnect(client_id, snd_seq_client_info_get_type(info), name, pref);
+    if (matches && name_out) snprintf(name_out, name_out_len, "%s", name ? name : "");
+    return matches;
+}
+
+// Finds the first connectable source port on a client and subscribes our port to it (i.e.
+// "connects from" it, in aconnect's terminology). Best-effort: does nothing if the client has
+// no such port, or the subscription fails (e.g. it raced and just disappeared).
+static void midi_connect_client(snd_seq_t *seq, int our_port, int client_id, MidiSourceList *tracked) {
+    snd_seq_port_info_t *pinfo;
+    snd_seq_port_info_alloca(&pinfo);
+    snd_seq_port_info_set_client(pinfo, client_id);
+    snd_seq_port_info_set_port(pinfo, -1);
+    while (snd_seq_query_next_port(seq, pinfo) >= 0) {
+        if (!midi_port_caps_are_connectable_source(snd_seq_port_info_get_capability(pinfo))) continue;
+        int port = snd_seq_port_info_get_port(pinfo);
+        if (snd_seq_connect_from(seq, our_port, client_id, port) == 0) {
+            midi_source_list_add(tracked, client_id, port);
+            fprintf(stderr, "MIDI: connected from client %d:%d\n", client_id, port);
+        }
+        return; // one port per client is enough -- most keyboards expose exactly one anyway
+    }
+}
+
+// Full rescan: drops every previously auto-connected source, then reconnects everything that
+// currently matches `midi_device_pref` ("auto", or an exact client name pinned from the Audio
+// tab). Used at startup and whenever that preference changes live.
+static void midi_autoconnect_scan(snd_seq_t *seq, int our_port, const char *midi_device_pref, MidiSourceList *tracked) {
+    for (int i = 0; i < tracked->count; i++) snd_seq_disconnect_from(seq, our_port, tracked->client[i], tracked->port[i]);
+    tracked->count = 0;
+
+    snd_seq_client_info_t *cinfo;
+    snd_seq_client_info_alloca(&cinfo);
+    snd_seq_client_info_set_client(cinfo, -1);
+    while (snd_seq_query_next_client(seq, cinfo) >= 0) {
+        int client_id = snd_seq_client_info_get_client(cinfo);
+        if (midi_client_matches(seq, client_id, midi_device_pref, NULL, 0)) {
+            midi_connect_client(seq, our_port, client_id, tracked);
+        }
+    }
+}
+
+// our_midi_port/midi_sources are only needed for hotplug auto-connect (SND_SEQ_EVENT_PORT_START/
+// PORT_EXIT) -- these arrive on the same event stream as NOTEON/NOTEOFF because main() subscribes
+// our port to the ALSA announce port at startup (see main()'s comment on that subscription).
+static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], bool poly_mode_active, MonoNoteStack *mono_stack, int our_midi_port, MidiSourceList *midi_sources) {
     snd_seq_event_t *ev = NULL;
     while (snd_seq_event_input_pending(seq_handle, 1) > 0) {
         snd_seq_event_input(seq_handle, &ev); if (ev == NULL) continue;
@@ -1393,6 +1518,18 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
             int note = ev->data.note.note;
             if (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0) { handle_note_on(voices, knobs, global_lfo_phases, note, poly_mode_active, mono_stack); }
             else { handle_note_off(voices, knobs, note, poly_mode_active, mono_stack); }
+        } else if (ev->type == SND_SEQ_EVENT_PORT_START) {
+            // A new ALSA sequencer client/port just appeared -- e.g. a USB MIDI keyboard was
+            // just plugged in. Auto-connect immediately if it matches the current selection
+            // (which reconnects a pinned device after unplug/replug too, not just "auto" mode).
+            if (midi_client_matches(seq_handle, ev->data.addr.client, knobs->midi_device, NULL, 0)) {
+                midi_connect_client(seq_handle, our_midi_port, ev->data.addr.client, midi_sources);
+            }
+        } else if (ev->type == SND_SEQ_EVENT_PORT_EXIT) {
+            // Keep our bookkeeping in sync -- ALSA already tears down the subscription itself,
+            // but a stale tracked entry could otherwise be mistaken for a different device that
+            // later reuses the same now-free client id.
+            midi_source_list_remove_client(midi_sources, ev->data.addr.client);
         }
         snd_seq_free_event(ev);
     }
@@ -1791,7 +1928,19 @@ int main() {
         close(server_fd); unlink(socket_path); return 1;
     }
     snd_seq_set_client_name(seq_handle, "YourSynth Socket Engine");
-    snd_seq_create_simple_port(seq_handle, "Input", SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE, SND_SEQ_PORT_TYPE_MIDI_GENERIC);
+    int our_midi_port = snd_seq_create_simple_port(seq_handle, "Input", SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE, SND_SEQ_PORT_TYPE_MIDI_GENERIC);
+
+    // Subscribe our own port to the ALSA System client's Announce port -- this makes every
+    // client/port creation and removal on the whole system show up as SND_SEQ_EVENT_PORT_START/
+    // PORT_EXIT events in our own input stream (handled in process_midi_input), which is what
+    // lets a USB MIDI keyboard plugged in after startup auto-connect too, with no aconnect ever
+    // needed. Best-effort: if it fails, MIDI auto-connect still works at startup, just not live.
+    snd_seq_connect_from(seq_handle, our_midi_port, SND_SEQ_CLIENT_SYSTEM, SND_SEQ_PORT_SYSTEM_ANNOUNCE);
+
+    MidiSourceList midi_sources = {0};
+    midi_autoconnect_scan(seq_handle, our_midi_port, active_knobs.midi_device, &midi_sources);
+    char applied_midi_device[AUDIO_DEVICE_NAME_LEN];
+    snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
 
     char socket_packet_buffer[sizeof(SynthSharedControls)]; size_t control_bytes_received = 0;
     float global_lfo_phases[LFO_COUNT] = {0.0f}; int vu_decimator = 0;
@@ -1819,8 +1968,14 @@ int main() {
             open_pcm_stream(active_knobs.input_device, SND_PCM_STREAM_CAPTURE, &pcm_capture_handle); // best-effort
             snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
         }
+        if (strncmp(active_knobs.midi_device, applied_midi_device, AUDIO_DEVICE_NAME_LEN) != 0) {
+            // Selection changed live from the Audio tab -- drop whatever was auto-connected
+            // under the old selection and rescan under the new one.
+            midi_autoconnect_scan(seq_handle, our_midi_port, active_knobs.midi_device, &midi_sources);
+            snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
+        }
 
-        process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack);
+        process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack, our_midi_port, &midi_sources);
 
         // Read one block of external input. Silence (the zero-init) if there's no working
         // capture device, or a read comes back short/broken -- external input degrading to

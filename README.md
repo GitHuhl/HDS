@@ -4,20 +4,29 @@ A digital synthesizer split into two processes:
 
 - **`src/backend.c`** — the DSP/audio engine. Plain C against ALSA: renders
   audio directly to a PCM device, captures external audio from an input
-  device, reads MIDI note on/off from an ALSA sequencer port, and exposes
-  every synth parameter over a Unix domain socket (`/tmp/synth.sock`) as a
-  fixed-layout packed struct (`SynthSharedControls`, 286 floats + 2 device
-  name strings). Also streams back a peak-level float for the GUI's VU
-  meter. The final output stage carries an always-on safety limiter
-  (instant attack, ~50ms release) ahead of a hard clamp, so an overload
-  (e.g. several voices lining up, or Parallel FX routing summing 12 hot
-  slots) degrades to smooth gain reduction rather than brick-wall clipping.
+  device, and exposes every synth parameter over a Unix domain socket
+  (`/tmp/synth.sock`) as a fixed-layout packed struct (`SynthSharedControls`,
+  286 floats + 3 device name strings). Also streams back a peak-level float
+  for the GUI's VU meter. The final output stage carries an always-on
+  safety limiter (instant attack, ~50ms release) ahead of a hard clamp, so
+  an overload (e.g. several voices lining up, or Parallel FX routing
+  summing 12 hot slots) degrades to smooth gain reduction rather than
+  brick-wall clipping.
+
+  MIDI input auto-connects with no `aconnect` ever needed: at startup it
+  scans ALSA sequencer clients and subscribes to every real (kernel-backed,
+  not "Midi Through") MIDI source found, and stays subscribed to the ALSA
+  announce port so a keyboard plugged in later connects live too (see
+  `midi_autoconnect_scan()`/the `SND_SEQ_EVENT_PORT_START` handling in
+  `process_midi_input()`). The Audio tab's MIDI Input dropdown can pin one
+  specific device by name instead of auto-detecting everything; a pinned
+  device still auto-reconnects after an unplug/replug.
 - **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
   knobs and draggable ADSR envelope graphs, tabbed into Global / Play /
   Filters / LFOs / Envelopes / FX / Audio. Packs the same struct
-  (`struct.pack("286f64s64s", ...)`) and sends it over the socket whenever
-  a control changes. If it can't connect to the backend it falls back to a
-  mock mode so the UI still runs standalone.
+  (`struct.pack("286f64s64s64s", ...)`) and sends it over the socket
+  whenever a control changes. If it can't connect to the backend it falls
+  back to a mock mode so the UI still runs standalone.
 
 Engine features: 2 main oscillators (Saw/Square/Triangle/Sine/Unison
 Saw/Noise/Pulse) with FM and hard sync, a dedicated sub oscillator and

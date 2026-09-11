@@ -4,6 +4,7 @@ import struct
 import math
 import random
 import subprocess
+import re
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
                              QSlider, QPushButton, QProgressBar, QSpinBox, QLineEdit, QCheckBox,
@@ -83,8 +84,8 @@ FX_TYPE_METADATA = [
 
 def _list_alsa_devices(list_cmd):
     """Best-effort enumeration of ALSA PCM device names via `aplay -L` / `arecord -L`. Falls
-    back to just ["default"] if the tool isn't installed, times out, or returns nothing -- the
-    combo box is still editable text either way, so "default" is always a safe starting point."""
+    back to just ["default"] if the tool isn't installed, times out, or returns nothing --
+    "default" is always a safe starting point."""
     names = []
     try:
         result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=2)
@@ -96,6 +97,35 @@ def _list_alsa_devices(list_cmd):
     if "default" in names:
         names.remove("default")
     return ["default"] + names
+
+# Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --
+# must match the backend's own "auto"/empty-string convention in midi_client_should_autoconnect.
+MIDI_AUTO_LABEL = "Auto (recommended)"
+
+_ACONNECT_CLIENT_RE = re.compile(r"^client\s+(\d+):\s*'(.*)'\s*\[type=(\w+)")
+
+def _list_midi_input_devices():
+    """Best-effort enumeration of real MIDI source device names via `aconnect -i` (lists
+    input-capable clients, i.e. things that GENERATE MIDI -- keyboards/controllers -- as opposed
+    to `aconnect -o`'s output-capable/receiving clients). Falls back to just [MIDI_AUTO_LABEL] if
+    the tool isn't installed, times out, or nothing qualifies -- backend.c applies the exact same
+    System-client/kernel-type/"Midi Through" filtering independently when it does its own live
+    scan, so this list is a preview of what auto-connect would pick up, not the source of truth."""
+    names = []
+    try:
+        result = subprocess.run(["aconnect", "-i"], capture_output=True, text=True, timeout=2)
+        for line in result.stdout.splitlines():
+            m = _ACONNECT_CLIENT_RE.match(line)
+            if not m:
+                continue
+            client_id, name, client_type = int(m.group(1)), m.group(2), m.group(3)
+            if client_id == 0 or client_type != "kernel" or name == "Midi Through":
+                continue
+            if name not in names:
+                names.append(name)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return [MIDI_AUTO_LABEL] + names
 
 def _encode_device_name(name):
     """Pack a device name into the fixed AUDIO_DEVICE_NAME_LEN-byte, null-terminated field the
@@ -1701,6 +1731,29 @@ class SynthGui(QWidget):
         device_box.setLayout(device_lay)
         audio_outer_lay.addWidget(device_box)
 
+        midi_box = QGroupBox("MIDI Input")
+        midi_lay = QVBoxLayout()
+        midi_lay.setSpacing(6)
+
+        midi_row = QHBoxLayout()
+        midi_row.addWidget(QLabel("Device:"))
+        self.midi_device_combo = QComboBox()
+        self.midi_device_combo.addItems(_list_midi_input_devices())
+        midi_row.addWidget(self.midi_device_combo, stretch=1)
+        midi_lay.addLayout(midi_row)
+
+        midi_note = QLabel(
+            "Auto connects to every real MIDI device present, and keeps listening for ones "
+            "plugged in later — no aconnect needed. Pick a specific device here to use only that "
+            "one (it still reconnects automatically if unplugged and replugged)."
+        )
+        midi_note.setStyleSheet("font-size: 9px; color: #888;")
+        midi_note.setWordWrap(True)
+        midi_lay.addWidget(midi_note)
+
+        midi_box.setLayout(midi_lay)
+        audio_outer_lay.addWidget(midi_box)
+
         ext_in_box = QGroupBox("External Audio Input")
         ext_in_lay = QHBoxLayout()
         ext_in_lay.setSpacing(8)
@@ -1818,13 +1871,17 @@ class SynthGui(QWidget):
                 columns[p_idx].setVisible(False)
 
     def refresh_audio_devices(self):
-        """Re-scans ALSA device names, preserving whatever's currently selected/typed if it's
-        still present (or just keeping the typed text if it isn't a scanned name at all)."""
-        for combo, list_cmd in ((self.output_device_combo, ["aplay", "-L"]), (self.input_device_combo, ["arecord", "-L"])):
+        """Re-scans ALSA audio + MIDI device names, preserving whatever's currently selected if
+        it's still present in the rescanned list."""
+        for combo, lister in (
+            (self.output_device_combo, lambda: _list_alsa_devices(["aplay", "-L"])),
+            (self.input_device_combo, lambda: _list_alsa_devices(["arecord", "-L"])),
+            (self.midi_device_combo, _list_midi_input_devices),
+        ):
             current_text = combo.currentText()
             combo.blockSignals(True)
             combo.clear()
-            combo.addItems(_list_alsa_devices(list_cmd))
+            combo.addItems(lister())
             combo.setCurrentText(current_text)
             combo.blockSignals(False)
 
@@ -2016,14 +2073,17 @@ class SynthGui(QWidget):
 
         # UNIFIED CONTRACT VERIFICATION
         # 151 (baseline through 4-osc additions) + 2 (ext in) + 132 (12 FX slots * 11)
-        # + 1 (fx_routing_mode) = 286 floats, followed by 2 fixed 64-byte device name strings
-        # (not floats).
+        # + 1 (fx_routing_mode) = 286 floats, followed by 3 fixed 64-byte device name strings
+        # (not floats): output_device, input_device, midi_device.
         # 13 + 56 + 1 + 1 + 4 + 1 + 12 + 4 + 24 + 4 + 4 + 7 + 4 + 1 + 2 + 1 + 2 + 10 + 2 + 132 + 1 = 286
+        midi_selection = self.midi_device_combo.currentText()
+        midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
         binary_packet = struct.pack(
-            f"286f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
+            f"286f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
+            _encode_device_name(midi_wire_value),
         )
         if self.sock is not None:
             try: self.sock.sendall(binary_packet)
@@ -2138,6 +2198,7 @@ def runtime_connect_and_bind(gui):
     gui.ext_in_gain_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.output_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
     gui.input_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
+    gui.midi_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
 
     # Initialize separate telemetry thread loop for VU meter updates
     gui.vu_timer = QTimer()
