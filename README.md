@@ -6,13 +6,16 @@ A digital synthesizer split into two processes:
   audio directly to a PCM device, captures external audio from an input
   device, reads MIDI note on/off from an ALSA sequencer port, and exposes
   every synth parameter over a Unix domain socket (`/tmp/synth.sock`) as a
-  fixed-layout packed struct (`SynthSharedControls`, 285 floats + 2 device
+  fixed-layout packed struct (`SynthSharedControls`, 286 floats + 2 device
   name strings). Also streams back a peak-level float for the GUI's VU
-  meter.
+  meter. The final output stage carries an always-on safety limiter
+  (instant attack, ~50ms release) ahead of a hard clamp, so an overload
+  (e.g. several voices lining up, or Parallel FX routing summing 12 hot
+  slots) degrades to smooth gain reduction rather than brick-wall clipping.
 - **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
   knobs and draggable ADSR envelope graphs, tabbed into Global / Play /
   Filters / LFOs / Envelopes / FX / Audio. Packs the same struct
-  (`struct.pack("285f64s64s", ...)`) and sends it over the socket whenever
+  (`struct.pack("286f64s64s", ...)`) and sends it over the socket whenever
   a control changes. If it can't connect to the backend it falls back to a
   mock mode so the UI still runs standalone.
 
@@ -25,15 +28,17 @@ the Sustain stage chaseable in real time while a note is held), 4 LFOs,
 and a shared mod matrix routing LFOs and assignable EGs to pitch, amp,
 filter cutoff/resonance, FM depth, phase, and unison detune.
 
-A 12-slot serial FX bus (`FX` tab) runs on the full stereo mix, after
-Filter A/B and before master volume. External audio (`Audio` tab: output/
-input device selection, live-switchable; input enable/gain) is summed in
-just before the FX bus, so it passes through the same 12 slots as the
-synth's own voices. Each slot has a generic 8-param bank + mix + bypass
-(`process_fx_chain()` in `backend.c`); most slot types are still an
-unimplemented pass-through, ready for more effects to be ported into the
-dispatch switch. Two are implemented so far, both ported from Airwindows
-(MIT license):
+A 12-slot FX bus (`FX` tab) runs on the full stereo mix, after Filter A/B
+and before master volume, routable Series (each slot fed the previous
+slot's output) or Parallel (every slot fed the same input independently,
+all 12 summed and averaged) via the routing button at the top of the tab.
+External audio (`Audio` tab: output/input device selection, live-
+switchable; input enable/gain) is summed in just before the FX bus, so it
+passes through the same 12 slots as the synth's own voices. Each slot has
+a generic 8-param bank + mix + bypass (`process_fx_chain()` in
+`backend.c`); most slot types are still an unimplemented pass-through,
+ready for more effects to be ported into the dispatch switch. Two are
+implemented so far, both ported from Airwindows (MIT license):
 
 - **Ensemble** — a 12-tap fixed-delay ensemble/chorus (not a reverb: no
   feedback loop). Params: Depth (widens/lengthens the delay taps) and

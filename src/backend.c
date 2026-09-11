@@ -126,8 +126,11 @@ typedef struct {
 // BREAKING CHANGE (FX bus + external input + device selection): added 2 floats (ext_in_enable,
 // ext_in_gain) + 132 floats (FX_SLOT_COUNT=12 slots * 11 floats each: fx_type, 8 generic params,
 // mix, bypass) + 2 fixed 64-byte device name strings (output_device, input_device -- not
-// floats; see AUDIO_DEVICE_NAME_LEN). New total: 285 float items + 128 string bytes. The
-// Python side's struct.pack format changes from "151f" to "285f64s64s".
+// floats; see AUDIO_DEVICE_NAME_LEN). Running total after that change was 285 float items + 128
+// string bytes.
+// BREAKING CHANGE (FX routing): added 1 float (fx_routing_mode, Series/Parallel -- see the
+// comment on that field). New total: 286 float items + 128 string bytes. The Python side's
+// struct.pack format changes from "285f64s64s" to "286f64s64s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -245,11 +248,16 @@ typedef struct {
     float ext_in_enable;
     float ext_in_gain;
 
-    // FX Bus: FX_SLOT_COUNT slots run in series on the summed stereo mix (voices + external
-    // input), after Filter A/B (which stay per-voice) and before master_volume -- see
-    // process_fx_chain(). Each ported effect fills in its own case in that function's dispatch
-    // switch; until then every slot is a pass-through (see FX_TYPE_OFF).
+    // FX Bus: FX_SLOT_COUNT slots on the summed stereo mix (voices + external input), after
+    // Filter A/B (which stay per-voice) and before master_volume -- see process_fx_chain(). Each
+    // ported effect fills in its own case in that function's dispatch switch; until then every
+    // slot is a pass-through (see FX_TYPE_OFF).
     FXSlotParams fx[FX_SLOT_COUNT];
+
+    // FX Bus routing: 0 = Series (mixer -> slot0 -> slot1 -> ... -> slot11 -> output, each
+    // slot fed the previous slot's output), 1 = Parallel (every slot fed the SAME pre-FX input
+    // independently, all 12 outputs summed and averaged -- see process_fx_chain()).
+    float fx_routing_mode;
 
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
@@ -1018,15 +1026,25 @@ static void run_fx_creamcoat(FXSlotEngine *engine, const FXSlotParams *params, f
     *r = outSampleR;
 }
 
-// Runs the FX_SLOT_COUNT-slot serial FX bus in place on one stereo sample. Called once per
-// sample (not per voice) on the fully summed mix -- see render_audio_block, where this sits
-// after all voices (and the external input) have been added together, and before
-// master_volume is applied. Ported effects land as new cases in the inner switch; each one
-// reads/writes its own fx_engine[s].state (lazily allocating it on first call after a type
-// change) and is responsible for freeing it if it allocated anything, via a matching branch in
-// the "type changed" block below. Until effects are ported in, every fx_type other than Off is
-// unreached and simply passes the dry signal through unchanged, same as Off.
-static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], float *l, float *r) {
+// Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
+// (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
+// voices (and the external input) have been added together, and before master_volume is
+// applied. Ported effects land as new cases in the inner switch; each one reads/writes its own
+// fx_engine[s].state (lazily allocating it on first call after a type change) and is
+// responsible for freeing it if it allocated anything, via a matching branch in the "type
+// changed" block below. Until effects are ported in, every fx_type other than Off is unreached
+// and simply passes the dry signal through unchanged, same as Off.
+//
+// routing_mode selects how the 12 slots combine (see fx_routing_mode's comment on
+// SynthSharedControls): 0 = Series, each slot fed the previous slot's output, *l/*r updated in
+// place after every slot. 1 = Parallel, every slot fed the SAME original dry input
+// independently (an Off/bypassed slot in Parallel contributes its own unprocessed dry copy,
+// same convention as run_filter_a_multi's Parallel routing), all 12 results summed and
+// averaged into *l/*r at the end.
+static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, float *l, float *r) {
+    float parallel_in_l = *l, parallel_in_r = *r;
+    float parallel_sum_l = 0.0f, parallel_sum_r = 0.0f;
+
     for (int s = 0; s < FX_SLOT_COUNT; s++) {
         int type = (int)fx_params[s].fx_type;
         if (type != fx_engine[s].active_type) {
@@ -1037,9 +1055,15 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
             fx_engine[s].state = NULL;
             fx_engine[s].active_type = type;
         }
-        if (fx_params[s].bypass != 0.0f || type == FX_TYPE_OFF) continue;
 
-        float dry_l = *l, dry_r = *r;
+        float dry_l = (routing_mode == 0) ? *l : parallel_in_l;
+        float dry_r = (routing_mode == 0) ? *r : parallel_in_r;
+
+        if (fx_params[s].bypass != 0.0f || type == FX_TYPE_OFF) {
+            if (routing_mode == 1) { parallel_sum_l += dry_l; parallel_sum_r += dry_r; }
+            continue; // Series: *l/*r simply untouched by this slot
+        }
+
         float wet_l = dry_l, wet_r = dry_r;
         switch (type) {
             case FX_TYPE_ENSEMBLE: run_fx_ensemble(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
@@ -1049,8 +1073,17 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                 break; // pass-through
         }
         float mix = fmaxf(0.0f, fminf(100.0f, fx_params[s].mix)) / 100.0f;
-        *l = dry_l * (1.0f - mix) + wet_l * mix;
-        *r = dry_r * (1.0f - mix) + wet_r * mix;
+        float out_l = dry_l * (1.0f - mix) + wet_l * mix;
+        float out_r = dry_r * (1.0f - mix) + wet_r * mix;
+
+        if (routing_mode == 1) { parallel_sum_l += out_l; parallel_sum_r += out_r; continue; }
+        *l = out_l;
+        *r = out_r;
+    }
+
+    if (routing_mode == 1) {
+        *l = parallel_sum_l / (float)FX_SLOT_COUNT;
+        *r = parallel_sum_r / (float)FX_SLOT_COUNT;
     }
 }
 
@@ -1203,6 +1236,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->fx[f].mix = 100.0f; // fully wet once a real effect is assigned to this slot
         knobs->fx[f].bypass = 0.0f;
     }
+    knobs->fx_routing_mode = 0.0f; // Series
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
 }
@@ -1399,6 +1433,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     static FXSlotEngine fx_engine[FX_SLOT_COUNT];
     static bool fx_engine_initialized = false;
     if (!fx_engine_initialized) { reset_fx_engine(fx_engine); fx_engine_initialized = true; }
+
+    // Always-on master safety limiter gain -- see its use below, right before the final output
+    // clamp. Persists across calls for the same reason as the state above.
+    static float limiter_gain = 1.0f;
 
     for (int i = 0; i < BUFFER_SIZE; i++) {
         float mixed_l = 0.0f, mixed_r = 0.0f;
@@ -1654,10 +1692,30 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
 
         // FX Bus: runs last, on the fully summed mix, before master_volume -- see
         // process_fx_chain's own comment for the routing rationale.
-        process_fx_chain(knobs->fx, fx_engine, &mixed_l, &mixed_r);
+        process_fx_chain(knobs->fx, fx_engine, (int)knobs->fx_routing_mode, &mixed_l, &mixed_r);
 
         float f_l = mixed_l * knobs->master_volume * 0.15f, f_r = mixed_r * knobs->master_volume * 0.15f;
-        out_buffer[i*2] = fmaxf(-0.98f, fminf(0.98f, f_l)); out_buffer[i*2+1] = fmaxf(-0.98f, fminf(0.98f, f_r));
+
+        // Always-on master safety limiter: the hard clamp two lines below guarantees the DAC
+        // never sees a sample outside [-ceiling, ceiling], but on its own that's brick-wall
+        // clipping -- ugly, harmonically harsh distortion on any over. This applies smooth gain
+        // reduction instead: instant attack (so a sudden peak -- e.g. several voices lining up,
+        // or 12 FX slots summed in Parallel routing -- still can never clip) but a short release
+        // so the reduction isn't audible as pumping on an isolated transient. Both channels
+        // always share one gain value so the stereo image isn't skewed.
+        const float limiter_ceiling = 0.98f;
+        float peak_now = fmaxf(fabsf(f_l), fabsf(f_r));
+        float needed_gain = (peak_now > limiter_ceiling) ? (limiter_ceiling / peak_now) : 1.0f;
+        if (needed_gain < limiter_gain) {
+            limiter_gain = needed_gain; // attack: instant, so THIS sample can never clip
+        } else {
+            float release_rate = 1.0f - expf(-1.0f / (0.050f * SAMPLE_RATE)); // ~50ms release
+            limiter_gain += (needed_gain - limiter_gain) * release_rate;
+        }
+        f_l *= limiter_gain;
+        f_r *= limiter_gain;
+
+        out_buffer[i*2] = fmaxf(-limiter_ceiling, fminf(limiter_ceiling, f_l)); out_buffer[i*2+1] = fmaxf(-limiter_ceiling, fminf(limiter_ceiling, f_r));
         if (fabsf(f_l) > peak) peak = fabsf(f_l);
         if (fabsf(f_r) > peak) peak = fabsf(f_r);
     }

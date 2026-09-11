@@ -809,7 +809,9 @@ class SynthGui(QWidget):
         prog_lay.addWidget(self.btn_prev_prog)
 
         self.program_name_field = QLineEdit()
-        self.program_name_field.setText("Unsaved Program")
+        # Real placeholder text, not literal contents -- it should vanish once the user types
+        # their own name instead of having to be selected-and-deleted first.
+        self.program_name_field.setPlaceholderText("Unsaved Program")
         self.program_name_field.setStyleSheet("color: #00adb5; background-color: #1e1e24; font-weight: bold; font-size: 12px; padding: 3px;")
         prog_lay.addWidget(self.program_name_field)
 
@@ -937,6 +939,20 @@ class SynthGui(QWidget):
         self.vco1_combo.addItems(["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse"])
         v1_strip.addWidget(self.vco1_combo)
 
+        # Pulse Width is a direct sub-parameter of the Shape choice (only meaningful when Shape
+        # is Pulse) -- kept right under Shape, not down by Volume, so it reads as part of "what
+        # this oscillator's wave looks like" rather than a mixing control.
+        self.vco1_pulse_box = QWidget()
+        v1_pw_lay = QVBoxLayout(self.vco1_pulse_box)
+        v1_pw_lay.setContentsMargins(0, 2, 0, 0)
+        v1_pw_lay.addWidget(QLabel("Pulse Width"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco1_pulse_width = PotentiometerKnob("O1 Pulse Width", self)
+        self.vco1_pulse_width.setRange(2, 98)
+        self.vco1_pulse_width.setValue(50)
+        v1_pw_lay.addWidget(self.vco1_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
+        _retain_hidden(self.vco1_pulse_box)
+        v1_strip.addWidget(self.vco1_pulse_box)
+
         v1_tune_block = QVBoxLayout()
         v1_pitch_placeholder_lbl = QLabel("Pitch Offset")
         v1_pitch_placeholder_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -999,17 +1015,6 @@ class SynthGui(QWidget):
         _retain_hidden(self.vco1_unison_box)
         v1_strip.addWidget(self.vco1_unison_box)
 
-        self.vco1_pulse_box = QWidget()
-        v1_pw_lay = QVBoxLayout(self.vco1_pulse_box)
-        v1_pw_lay.setContentsMargins(0, 2, 0, 0)
-        v1_pw_lay.addWidget(QLabel("Pulse Width"), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.vco1_pulse_width = PotentiometerKnob("O1 Pulse Width", self)
-        self.vco1_pulse_width.setRange(2, 98)
-        self.vco1_pulse_width.setValue(50)
-        v1_pw_lay.addWidget(self.vco1_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
-        _retain_hidden(self.vco1_pulse_box)
-        v1_strip.addWidget(self.vco1_pulse_box)
-
         v1_vol_layout = QVBoxLayout()
         v1_vol_layout.setSpacing(2)
         v1_vol_layout.addWidget(QLabel("Vol:"), alignment=Qt.AlignmentFlag.AlignCenter)
@@ -1044,6 +1049,20 @@ class SynthGui(QWidget):
         self.vco2_combo.addItems(["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse"])
         self.vco2_combo.setCurrentIndex(3)
         v2_strip.addWidget(self.vco2_combo)
+
+        # Pulse Width is a direct sub-parameter of the Shape choice (only meaningful when Shape
+        # is Pulse) -- kept right under Shape, not down by Volume, so it reads as part of "what
+        # this oscillator's wave looks like" rather than a mixing control.
+        self.vco2_pulse_box = QWidget()
+        v2_pw_lay = QVBoxLayout(self.vco2_pulse_box)
+        v2_pw_lay.setContentsMargins(0, 2, 0, 0)
+        v2_pw_lay.addWidget(QLabel("Pulse Width"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco2_pulse_width = PotentiometerKnob("O2 Pulse Width", self)
+        self.vco2_pulse_width.setRange(2, 98)
+        self.vco2_pulse_width.setValue(50)
+        v2_pw_lay.addWidget(self.vco2_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
+        _retain_hidden(self.vco2_pulse_box)
+        v2_strip.addWidget(self.vco2_pulse_box)
 
         v2_tune_block = QVBoxLayout()
         v2_tune_block.addWidget(QLabel("Pitch Offset"), alignment=Qt.AlignmentFlag.AlignCenter)
@@ -1104,17 +1123,6 @@ class SynthGui(QWidget):
         v2_unison_lay.addLayout(v2_unison_d_col)
         _retain_hidden(self.vco2_unison_box)
         v2_strip.addWidget(self.vco2_unison_box)
-
-        self.vco2_pulse_box = QWidget()
-        v2_pw_lay = QVBoxLayout(self.vco2_pulse_box)
-        v2_pw_lay.setContentsMargins(0, 2, 0, 0)
-        v2_pw_lay.addWidget(QLabel("Pulse Width"), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.vco2_pulse_width = PotentiometerKnob("O2 Pulse Width", self)
-        self.vco2_pulse_width.setRange(2, 98)
-        self.vco2_pulse_width.setValue(50)
-        v2_pw_lay.addWidget(self.vco2_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
-        _retain_hidden(self.vco2_pulse_box)
-        v2_strip.addWidget(self.vco2_pulse_box)
 
         v2_vol_layout = QVBoxLayout()
         v2_vol_layout.setSpacing(2)
@@ -1234,6 +1242,16 @@ class SynthGui(QWidget):
         self.btn_sync_amp_eg.setToolTip("Copy Osc 1 Amp EG settings to Osc 2 Amp EG")
         self.vco1_amp_eg.title_layout.addWidget(self.btn_sync_amp_eg)
         self.btn_sync_amp_eg.clicked.connect(lambda: self.vco2_amp_eg.set_state(self.vco1_amp_eg.get_state()))
+
+        # Osc 2 and Noise have no sync button of their own -- reserve the exact same footprint
+        # in their title rows anyway so all three panels stay the same height/alignment instead
+        # of only Osc 1's row being taller.
+        for panel in (self.vco2_amp_eg, self.noise_amp_eg):
+            sync_btn_spacer = QWidget()
+            sync_btn_spacer.setFixedSize(30, 16)
+            _retain_hidden(sync_btn_spacer)
+            sync_btn_spacer.setVisible(False)
+            panel.title_layout.addWidget(sync_btn_spacer)
 
         amp_eg_lay.addWidget(self.vco1_amp_eg)
         amp_eg_lay.addWidget(self.vco2_amp_eg)
@@ -1544,9 +1562,25 @@ class SynthGui(QWidget):
         fx_outer_lay = QVBoxLayout(self.tab_fx)
         fx_outer_lay.setContentsMargins(4, 4, 4, 4)
 
-        fx_header = QLabel("<b>FX Bus</b> — 12 slots in series, applied to the full mix (synth + External Input)")
+        fx_header_row = QHBoxLayout()
+        fx_header = QLabel("<b>FX Bus</b> — 12 slots, applied to the full mix (synth + External Input)")
         fx_header.setStyleSheet("font-size: 10px; color: #888; padding: 2px;")
-        fx_outer_lay.addWidget(fx_header)
+        fx_header_row.addWidget(fx_header)
+        fx_header_row.addStretch()
+
+        self.fx_routing_btn = QPushButton("Series")
+        self.fx_routing_btn.setCheckable(True)
+        self.fx_routing_btn.setFixedSize(90, 22)
+        self.fx_routing_btn.setStyleSheet("font-size: 10px; font-weight: bold;")
+        self.fx_routing_btn.setToolTip(
+            "Series: mixer -> slot 1 -> slot 2 -> ... -> slot 12 -> output.\n"
+            "Parallel: every slot fed the same input independently, all 12 summed and averaged."
+        )
+        self.fx_routing_btn.toggled.connect(
+            lambda checked: self.fx_routing_btn.setText("Parallel" if checked else "Series")
+        )
+        fx_header_row.addWidget(self.fx_routing_btn)
+        fx_outer_lay.addLayout(fx_header_row)
 
         fx_scroll = QScrollArea()
         fx_scroll.setWidgetResizable(True)
@@ -1640,7 +1674,6 @@ class SynthGui(QWidget):
         out_row = QHBoxLayout()
         out_row.addWidget(QLabel("Output:"))
         self.output_device_combo = QComboBox()
-        self.output_device_combo.setEditable(True)
         self.output_device_combo.addItems(_list_alsa_devices(["aplay", "-L"]))
         out_row.addWidget(self.output_device_combo, stretch=1)
         device_lay.addLayout(out_row)
@@ -1648,7 +1681,6 @@ class SynthGui(QWidget):
         in_row = QHBoxLayout()
         in_row.addWidget(QLabel("Input:"))
         self.input_device_combo = QComboBox()
-        self.input_device_combo.setEditable(True)
         self.input_device_combo.addItems(_list_alsa_devices(["arecord", "-L"]))
         in_row.addWidget(self.input_device_combo, stretch=1)
         device_lay.addLayout(in_row)
@@ -1979,12 +2011,16 @@ class SynthGui(QWidget):
             packet_list.append(float(self.fx_mix_dials[slot_idx].value()))
             packet_list.append(1.0 if self.fx_bypass_buttons[slot_idx].isChecked() else 0.0)
 
+        # FX Bus routing: 0 = Series, 1 = Parallel (+1 item)
+        packet_list.append(1.0 if self.fx_routing_btn.isChecked() else 0.0)
+
         # UNIFIED CONTRACT VERIFICATION
-        # 151 (baseline through 4-osc additions) + 2 (ext in) + 132 (12 FX slots * 11) = 285
-        # floats, followed by 2 fixed 64-byte device name strings (not floats).
-        # 13 + 56 + 1 + 1 + 4 + 1 + 12 + 4 + 24 + 4 + 4 + 7 + 4 + 1 + 2 + 1 + 2 + 10 + 2 + 132 = 285
+        # 151 (baseline through 4-osc additions) + 2 (ext in) + 132 (12 FX slots * 11)
+        # + 1 (fx_routing_mode) = 286 floats, followed by 2 fixed 64-byte device name strings
+        # (not floats).
+        # 13 + 56 + 1 + 1 + 4 + 1 + 12 + 4 + 24 + 4 + 4 + 7 + 4 + 1 + 2 + 1 + 2 + 10 + 2 + 132 + 1 = 286
         binary_packet = struct.pack(
-            f"285f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
+            f"286f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
@@ -2095,6 +2131,7 @@ def runtime_connect_and_bind(gui):
             p_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
         gui.fx_mix_dials[slot_idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.fx_bypass_buttons[slot_idx].toggled.connect(gui.transmit_knob_packet)
+    gui.fx_routing_btn.toggled.connect(gui.transmit_knob_packet)
 
     # External Audio Input + Audio device selection
     gui.ext_in_enable.toggled.connect(gui.transmit_knob_packet)
