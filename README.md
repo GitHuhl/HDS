@@ -85,6 +85,41 @@ A digital synthesizer split into two processes:
   recording (e.g. switching Input devices) stops the take automatically
   rather than silently scrambling the interleaving.
 
+  All actual disk I/O for recording (`fopen`/`fwrite`/`fseek`/`fclose` --
+  opening the file, writing the header, every sample block, and patching/
+  closing on stop) runs on a **dedicated writer thread**
+  (`record_writer_thread_main`), never on the main audio thread. Buffered
+  stdio's `fwrite()` isn't bounded-time-safe: it periodically triggers a
+  blocking `write(2)` syscall once its internal buffer fills, and disk
+  latency (USB/SD/network storage, or the system under I/O contention) has
+  no upper bound the way a block's real-time budget does -- doing that
+  write inline in the same loop that paces live audio output would risk
+  exactly the underruns the rest of the engine works hard to avoid
+  elsewhere. Instead, the audio thread only ever does bounded, allocation-
+  free work for recording: `wav_recorder_gather_block()` (pure arithmetic --
+  the same downmix/channel-selection logic as always, just no longer
+  followed by a write) and `record_ring_push()`, a wait-free push into a
+  16MB lock-free SPSC ring buffer (`RecordRing`, C11 `<stdatomic.h>`,
+  1<<22 floats -- roughly 4.8s of backlog even at the worst case of 18
+  channels @ 48kHz). If the writer thread ever falls behind far enough to
+  fill the ring (a genuinely stalled disk), new audio is dropped and
+  counted (`[record] writer thread falling behind -- N sample(s)
+  dropped...`) rather than the push ever blocking -- losing a moment of
+  the *recording* is preferable to risking a dropout in the *live output*,
+  which must never stall. Starting/stopping a take is the same kind of
+  handshake: the audio thread publishes parameters into `RecordEngine` and
+  atomically posts a `RECORD_CMD_START`/`RECORD_CMD_STOP` command (a
+  plain-write-then-release-store, paired with an acquire-exchange on the
+  writer side), so even the `fopen`/header-write on start and the
+  `fseek`-patch/`fclose` on stop happen off the audio thread. Verified with
+  a synchronous single-threaded simulation (byte-for-byte WAV output
+  unchanged from before this refactor), a real-thread stress test that
+  hammers pushes with no throttling at all -- deliberately outrunning the
+  writer -- while timing every call (observed max ~0.2ms against a 2.667ms
+  budget for a 128-frame block, with reconciled drop counts and zero
+  corruption in what did get written), and a clean `-fsanitize=thread` run
+  confirming the atomic handshake is race-free.
+
   MIDI input auto-connects with no `aconnect` ever needed: at startup it
   scans ALSA sequencer clients and subscribes to every real (kernel-backed,
   not "Midi Through") MIDI source found, and stays subscribed to the ALSA

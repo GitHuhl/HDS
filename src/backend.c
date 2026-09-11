@@ -13,6 +13,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #define SAMPLE_RATE 48000
 // BUFFER_SIZE and MAX_VOICES are now hard CEILINGS for array allocation only -- how many
@@ -2296,6 +2298,19 @@ static bool open_pcm_stream(const char *device_name, snd_pcm_stream_t stream, sn
 // native sample format exactly, so no int conversion/dithering is needed, and is natively
 // readable by every modern DAW/editor (Audacity, REAPER, ffmpeg, etc). RIFF/data/fact chunk
 // sizes are written as placeholders and patched in on stop, once the real length is known.
+//
+// REALTIME SAFETY: every function in this section that touches the filesystem (fopen/fwrite/
+// fseek/fclose) runs ONLY on the dedicated writer thread below (record_writer_thread_main), never
+// on the main audio thread. Buffered stdio's fwrite() is not bounded-time-safe -- it periodically
+// triggers a blocking write(2) syscall once its internal buffer fills, and disk I/O latency
+// (especially USB/SD/network storage, or under system I/O contention) is not bounded the way the
+// audio thread's per-block real-time budget requires. A stall there would show up as exactly the
+// kind of underrun this file works hard to avoid everywhere else. So the audio thread only ever
+// does bounded, allocation-free work for recording: computing the gather/downmix arithmetic
+// (wav_recorder_gather_block, pure math, no I/O) and a wait-free ring-buffer push
+// (record_ring_push, never blocks -- see RecordRing). All the actual file I/O, including opening
+// the file and writing the header on start and patching/closing it on stop, happens on the writer
+// thread instead, driven by a tiny atomic command handshake (RecordEngine) from the audio thread.
 typedef struct {
     FILE *file;
     int channels;
@@ -2314,17 +2329,75 @@ typedef struct {
     int sel_input_channel_count; // detected_input_channels at record-start, for indexing capture_buffer's stride
 } WavRecorder;
 
+// Lock-free single-producer/single-consumer ring buffer of raw interleaved float samples, used
+// to hand recorded audio from the audio thread (producer) to the writer thread (consumer)
+// without either side ever blocking on the other. Capacity is a power of two so index wraparound
+// is a cheap mask; read_idx/write_idx are monotonically increasing counters (never actually
+// wrapped themselves), which is what makes "how much is available/free" a plain subtraction with
+// no ambiguity between empty and full. 1<<22 floats (16MB) gives ~4.8s of backlog headroom even
+// at the worst case of 18 channels @ 48kHz -- far more than any realistic disk stall -- while
+// still being cheap enough to just keep as a static allocation (see the "static" rationale on
+// capture_buffer/ext_in_stereo above: this is far too large to put on main()'s stack).
+#define RECORD_RING_CAPACITY (1 << 22)
+typedef struct {
+    float data[RECORD_RING_CAPACITY];
+    _Atomic size_t write_idx;       // only ever written by the audio thread (producer)
+    _Atomic size_t read_idx;        // only ever written by the writer thread (consumer)
+    _Atomic uint64_t dropped_samples; // diagnostic only: incremented by the producer when full
+} RecordRing;
+
+// Wait-free: never blocks, never loops waiting for the consumer. If there isn't room, the new
+// data is dropped (and counted) rather than overwriting unread data or stalling the caller --
+// on the audio thread, dropping a moment of the *recording* is far preferable to risking an
+// audible dropout in the *live output*, which is the one thing that must never stall.
+static void record_ring_push(RecordRing *ring, const float *data, size_t n) {
+    if (n == 0) return;
+    size_t w = atomic_load_explicit(&ring->write_idx, memory_order_relaxed);
+    size_t r = atomic_load_explicit(&ring->read_idx, memory_order_acquire);
+    size_t used = w - r;
+    size_t free_space = RECORD_RING_CAPACITY - used;
+    if (n > free_space) {
+        atomic_fetch_add_explicit(&ring->dropped_samples, n, memory_order_relaxed);
+        return;
+    }
+    for (size_t i = 0; i < n; i++) ring->data[(w + i) & (RECORD_RING_CAPACITY - 1)] = data[i];
+    atomic_store_explicit(&ring->write_idx, w + n, memory_order_release);
+}
+
+// Consumer side (writer thread only). Pops up to max_n samples into out[], returns how many were
+// actually available. Never blocks -- if the ring is empty, returns 0 immediately.
+static size_t record_ring_pop(RecordRing *ring, float *out, size_t max_n) {
+    size_t r = atomic_load_explicit(&ring->read_idx, memory_order_relaxed);
+    size_t w = atomic_load_explicit(&ring->write_idx, memory_order_acquire);
+    size_t available = w - r;
+    size_t n = available < max_n ? available : max_n;
+    for (size_t i = 0; i < n; i++) out[i] = ring->data[(r + i) & (RECORD_RING_CAPACITY - 1)];
+    atomic_store_explicit(&ring->read_idx, r + n, memory_order_release);
+    return n;
+}
+
 static void wav_write_u32(FILE *f, uint32_t v) { uint8_t b[4] = { (uint8_t)v, (uint8_t)(v>>8), (uint8_t)(v>>16), (uint8_t)(v>>24) }; fwrite(b, 1, 4, f); }
 static void wav_write_u16(FILE *f, uint16_t v) { uint8_t b[2] = { (uint8_t)v, (uint8_t)(v>>8) }; fwrite(b, 1, 2, f); }
+
+// Pure arithmetic, no I/O -- how many channels a given selection resolves to (0 means "nothing
+// selected"). Used by the audio thread (to size its gather buffer synchronously, before the
+// writer thread has even seen the start request) and by the writer thread's actual file-open
+// (wav_recorder_start below), so both sides are guaranteed to agree on the channel count without
+// either one having to wait on the other.
+static int wav_recorder_compute_channels(bool include_synth_output, bool downmix_stereo, const bool *input_channel_enable, int input_channel_count) {
+    int selected = include_synth_output ? 2 : 0;
+    for (int c = 0; c < input_channel_count; c++) if (input_channel_enable[c]) selected++;
+    if (selected <= 0) return 0;
+    return downmix_stereo ? 2 : selected;
+}
 
 // Computes the selected channel count and freezes the selection into *rec, opens the WAV file,
 // and writes its header. Returns false (leaving *rec untouched, still inactive) if nothing is
 // selected or the file can't be opened -- the caller should treat either as "did not start."
-static bool wav_recorder_start(WavRecorder *rec, const char *path, bool include_synth_output, bool downmix_stereo, const float *input_channel_enable, int input_channel_count) {
-    int selected = include_synth_output ? 2 : 0;
-    for (int c = 0; c < input_channel_count; c++) if (input_channel_enable[c] != 0.0f) selected++;
-    if (selected <= 0) { fprintf(stderr, "[record] cannot start: no channels selected\n"); return false; }
-    int channels = downmix_stereo ? 2 : selected;
+// Writer-thread-only: performs blocking file I/O.
+static bool wav_recorder_start(WavRecorder *rec, const char *path, bool include_synth_output, bool downmix_stereo, const bool *input_channel_enable, int input_channel_count) {
+    int channels = wav_recorder_compute_channels(include_synth_output, downmix_stereo, input_channel_enable, input_channel_count);
+    if (channels <= 0) { fprintf(stderr, "[record] cannot start: no channels selected\n"); return false; }
 
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "[record] failed to open '%s' for writing: %s\n", path, strerror(errno)); return false; }
@@ -2355,7 +2428,7 @@ static bool wav_recorder_start(WavRecorder *rec, const char *path, bool include_
     rec->active = true;
     rec->sel_include_synth_output = include_synth_output;
     rec->sel_downmix_stereo = downmix_stereo;
-    for (int c = 0; c < RECORD_MAX_CHANNELS; c++) rec->sel_input_channel[c] = (c < input_channel_count) && (input_channel_enable[c] != 0.0f);
+    for (int c = 0; c < RECORD_MAX_CHANNELS; c++) rec->sel_input_channel[c] = (c < input_channel_count) && input_channel_enable[c];
     rec->sel_input_channel_count = input_channel_count;
     return true;
 }
@@ -2386,32 +2459,76 @@ static void wav_recorder_stop(WavRecorder *rec) {
     fprintf(stderr, "[record] stopped: %u frames (%.2fs), %d channel(s)\n", rec->frames_written, rec->frames_written / (float)SAMPLE_RATE, rec->channels);
 }
 
+// Audio-thread-side mirror of a WavRecorder's selection (NOT its file state -- the audio thread
+// never touches a FILE*). Set synchronously on the record-start edge from the same live knobs
+// the writer thread's copy is derived from, via the identical wav_recorder_compute_channels(), so
+// the two sides can never disagree about the channel count despite computing it independently.
+typedef struct {
+    bool active;
+    bool sel_include_synth_output;
+    bool sel_downmix_stereo;
+    bool sel_input_channel[RECORD_MAX_CHANNELS];
+    int sel_input_channel_count;
+    int channels;
+} RecordGatherState;
+
+typedef enum { RECORD_CMD_NONE = 0, RECORD_CMD_START, RECORD_CMD_STOP } RecordCommand;
+
+// Cross-thread interface between the audio thread and the dedicated recording writer thread.
+// The audio thread only ever: (1) writes cmd_* fields then publishes `command` with a release
+// store, (2) pushes gathered audio into `ring` (wait-free), (3) reads the is_active/start_failed/
+// frames_written status fields for the GUI's EngineStatus feedback. Everything else --
+// wav_recorder_start/write/stop and all their file I/O -- happens only on the writer thread.
+typedef struct {
+    RecordRing ring;
+    pthread_t thread;
+    _Atomic int command;   // RecordCommand
+    _Atomic bool shutdown;
+
+    // Parameters for a pending START, valid once `command` is observed as RECORD_CMD_START by
+    // the writer thread. Plain (non-atomic) fields are safe here because the release store to
+    // `command` (audio thread) paired with the acquire exchange of `command` (writer thread)
+    // establishes a happens-before edge covering everything written before that store.
+    char cmd_path[RECORD_PATH_LEN];
+    bool cmd_include_synth_output;
+    bool cmd_downmix_stereo;
+    bool cmd_input_channel_enable[RECORD_MAX_CHANNELS];
+    int cmd_input_channel_count;
+
+    // Writer thread -> audio thread status, polled for the GUI's EngineStatus feedback.
+    _Atomic bool is_active;
+    _Atomic bool start_failed;
+    _Atomic uint32_t frames_written;
+} RecordEngine;
+
 // Gathers one block's worth of frames from the synth's own post-FX stereo output and the raw
-// N-channel capture buffer, per the SELECTION FROZEN AT RECORD-START (rec->sel_* -- not the
-// live knobs, so a checkbox toggled mid-take can't desync the file's already-committed channel
-// layout), and writes them. `capture_buffer`'s actual stride must still match
-// rec->sel_input_channel_count -- the caller is responsible for stopping the recording first if
+// N-channel capture buffer, per the SELECTION FROZEN AT RECORD-START (sel->sel_* -- not the live
+// knobs, so a checkbox toggled mid-take can't desync the interleaving the writer thread's file
+// header already committed to), and pushes the result into the ring for the writer thread to
+// actually write to disk. `capture_buffer`'s actual stride must still match
+// sel->sel_input_channel_count -- the caller is responsible for stopping the recording first if
 // the live capture device's channel count has changed since it started (see the safety check in
-// main()).
-static void wav_recorder_write_block(WavRecorder *rec, const float *synth_buffer, const float *capture_buffer, int block_size) {
-    if (!rec->active) return;
+// main()). Pure arithmetic plus a wait-free ring push -- no I/O, safe to call every block from
+// the audio thread.
+static void wav_recorder_gather_block(RecordGatherState *sel, RecordEngine *eng, const float *synth_buffer, const float *capture_buffer, int block_size) {
+    if (!sel->active) return;
     static float frame_buf[BUFFER_SIZE * RECORD_MAX_CHANNELS];
-    int stride = rec->sel_input_channel_count;
-    if (rec->sel_downmix_stereo) {
+    int stride = sel->sel_input_channel_count;
+    if (sel->sel_downmix_stereo) {
         // n = how many signals get summed into EACH side (not the total signal count): the
         // synth output contributes exactly one signal per side (synth_L into L, synth_R into
         // R -- never both into the same side), and every selected raw input channel (mono)
         // contributes one signal to BOTH sides. So "Synth Output only" is a pure passthrough
         // (n=1, scale=1.0, no attenuation) rather than needlessly getting -3dB as if two
         // signals were being summed on each side when only one actually is.
-        int n = rec->sel_include_synth_output ? 1 : 0;
-        for (int c = 0; c < stride; c++) if (rec->sel_input_channel[c]) n++;
+        int n = sel->sel_include_synth_output ? 1 : 0;
+        for (int c = 0; c < stride; c++) if (sel->sel_input_channel[c]) n++;
         float scale = (n > 0) ? (1.0f / sqrtf((float)n)) : 1.0f;
         for (int i = 0; i < block_size; i++) {
             float l = 0.0f, r = 0.0f;
-            if (rec->sel_include_synth_output) { l += synth_buffer[i*2]; r += synth_buffer[i*2+1]; }
+            if (sel->sel_include_synth_output) { l += synth_buffer[i*2]; r += synth_buffer[i*2+1]; }
             for (int c = 0; c < stride; c++) {
-                if (rec->sel_input_channel[c]) { float s = capture_buffer[i*stride + c]; l += s; r += s; }
+                if (sel->sel_input_channel[c]) { float s = capture_buffer[i*stride + c]; l += s; r += s; }
             }
             frame_buf[i*2] = l * scale;
             frame_buf[i*2+1] = r * scale;
@@ -2419,16 +2536,74 @@ static void wav_recorder_write_block(WavRecorder *rec, const float *synth_buffer
     } else {
         for (int i = 0; i < block_size; i++) {
             int ch = 0;
-            if (rec->sel_include_synth_output) {
-                frame_buf[i*rec->channels + ch++] = synth_buffer[i*2];
-                frame_buf[i*rec->channels + ch++] = synth_buffer[i*2+1];
+            if (sel->sel_include_synth_output) {
+                frame_buf[i*sel->channels + ch++] = synth_buffer[i*2];
+                frame_buf[i*sel->channels + ch++] = synth_buffer[i*2+1];
             }
             for (int c = 0; c < stride; c++) {
-                if (rec->sel_input_channel[c]) frame_buf[i*rec->channels + ch++] = capture_buffer[i*stride + c];
+                if (sel->sel_input_channel[c]) frame_buf[i*sel->channels + ch++] = capture_buffer[i*stride + c];
             }
         }
     }
-    wav_recorder_write(rec, frame_buf, block_size);
+    record_ring_push(&eng->ring, frame_buf, (size_t)block_size * (size_t)sel->channels);
+}
+
+// Pops and writes everything currently available in the ring to *rec (if it's an active,
+// open recording) -- or just discards it (if not; e.g. a START is still in flight, or the
+// recording already stopped) so the ring's indices keep moving and a producer that's slightly
+// ahead of us doesn't spuriously see "full". Writer-thread-only.
+static void record_writer_drain(RecordEngine *eng, WavRecorder *rec) {
+    static float pop_buf[8192];
+    if (rec->active && rec->channels > 0) {
+        size_t chunk_frames = (sizeof(pop_buf) / sizeof(float)) / (size_t)rec->channels;
+        size_t max_floats = chunk_frames * (size_t)rec->channels;
+        size_t n;
+        while ((n = record_ring_pop(&eng->ring, pop_buf, max_floats)) > 0) {
+            wav_recorder_write(rec, pop_buf, (int)(n / (size_t)rec->channels));
+            atomic_store_explicit(&eng->frames_written, rec->frames_written, memory_order_relaxed);
+        }
+    } else {
+        while (record_ring_pop(&eng->ring, pop_buf, sizeof(pop_buf) / sizeof(float)) > 0) {}
+    }
+}
+
+// Entry point for the dedicated recording writer thread -- owns the ONLY WavRecorder instance
+// that ever touches a real FILE*. Polls for a command every RECORD_WRITER_POLL_MS via nanosleep
+// (rather than being condvar-signaled from the audio thread) specifically to avoid putting even
+// a brief mutex/futex wait on the audio thread's side of the handshake; the audio thread's only
+// synchronization primitives are the wait-free ring and plain atomic loads/stores.
+#define RECORD_WRITER_POLL_MS 5
+static void *record_writer_thread_main(void *arg) {
+    RecordEngine *eng = (RecordEngine *)arg;
+    WavRecorder rec = {0};
+
+    for (;;) {
+        int cmd = atomic_exchange_explicit(&eng->command, RECORD_CMD_NONE, memory_order_acquire);
+        if (cmd == RECORD_CMD_START) {
+            if (rec.active) wav_recorder_stop(&rec); // shouldn't happen, but never leak a handle
+            bool ok = wav_recorder_start(&rec, eng->cmd_path, eng->cmd_include_synth_output, eng->cmd_downmix_stereo,
+                                          eng->cmd_input_channel_enable, eng->cmd_input_channel_count);
+            atomic_store_explicit(&eng->frames_written, 0, memory_order_relaxed);
+            if (!ok) atomic_store_explicit(&eng->start_failed, true, memory_order_relaxed);
+            atomic_store_explicit(&eng->is_active, rec.active, memory_order_release);
+        } else if (cmd == RECORD_CMD_STOP) {
+            if (rec.active) wav_recorder_stop(&rec);
+            atomic_store_explicit(&eng->is_active, false, memory_order_release);
+        }
+
+        record_writer_drain(eng, &rec);
+
+        bool shutdown_requested = atomic_load_explicit(&eng->shutdown, memory_order_acquire);
+        if (shutdown_requested && atomic_load_explicit(&eng->command, memory_order_acquire) == RECORD_CMD_NONE) {
+            record_writer_drain(eng, &rec); // final catch-all in case the audio thread pushed between our drain and observing shutdown
+            if (rec.active) wav_recorder_stop(&rec);
+            break;
+        }
+
+        struct timespec poll_delay = { .tv_sec = 0, .tv_nsec = RECORD_WRITER_POLL_MS * 1000L * 1000L };
+        nanosleep(&poll_delay, NULL);
+    }
+    return NULL;
 }
 
 // Status feedback sent back over the same socket the GUI sends control packets on (see
@@ -2471,9 +2646,21 @@ int main() {
     snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
     float applied_audio_latency_ms = active_knobs.audio_latency_ms;
 
-    WavRecorder recorder = {0};
+    // Recording engine: `record_ring`/writer thread state must be static -- RecordEngine embeds
+    // a RECORD_RING_CAPACITY(1<<22)-float ring buffer (16MB), far too large for main()'s stack.
+    // The writer thread is started once here and lives for the process's whole lifetime; the
+    // audio thread only ever talks to it through record_engine's atomics/ring (see the
+    // REALTIME SAFETY comment above the WAV recording section).
+    static RecordEngine record_engine;
+    memset(&record_engine, 0, sizeof(record_engine));
+    bool record_writer_thread_ok = (pthread_create(&record_engine.thread, NULL, record_writer_thread_main, &record_engine) == 0);
+    if (!record_writer_thread_ok) {
+        fprintf(stderr, "[record] failed to start writer thread -- recording will be unavailable this session\n");
+    }
+    RecordGatherState record_gather = {0};
     bool applied_record_enable = false;
     int recorder_input_channels_at_start = 0; // detected_input_channels when recording began, for the mid-take device-change safety check
+    uint64_t record_last_reported_drops = 0;
 
     snd_seq_t *seq_handle;
     int seq_err = snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
@@ -2604,31 +2791,77 @@ int main() {
         // above. A device change mid-take that alters detected_input_channels would desync the
         // raw capture buffer's stride from what the open file committed to at start -- safer to
         // stop cleanly than silently scramble the channel interleaving.
-        if (recorder.active && detected_input_channels != recorder_input_channels_at_start) {
+        //
+        // Everything here is bounded, non-blocking work: this thread only computes the
+        // gather/downmix arithmetic and issues atomic commands/ring pushes to the writer thread
+        // (record_engine, started once above) -- it never touches a FILE* itself. See the
+        // REALTIME SAFETY comment above the WAV recording section for why.
+        if (record_gather.active && detected_input_channels != recorder_input_channels_at_start) {
             fprintf(stderr, "[record] input device channel count changed mid-recording -- stopping for safety\n");
-            wav_recorder_stop(&recorder);
+            atomic_store_explicit(&record_engine.command, RECORD_CMD_STOP, memory_order_release);
+            record_gather.active = false;
         }
-        bool want_recording = active_knobs.record_enable != 0.0f;
+        bool want_recording = record_writer_thread_ok && active_knobs.record_enable != 0.0f;
         if (want_recording && !applied_record_enable) {
-            if (wav_recorder_start(&recorder, active_knobs.record_path, active_knobs.record_include_synth_output != 0.0f,
-                                    active_knobs.record_downmix_stereo != 0.0f, active_knobs.record_input_channel_enable, detected_input_channels)) {
+            bool sel_include_synth_output = active_knobs.record_include_synth_output != 0.0f;
+            bool sel_downmix_stereo = active_knobs.record_downmix_stereo != 0.0f;
+            bool sel_input_channel[RECORD_MAX_CHANNELS];
+            for (int c = 0; c < RECORD_MAX_CHANNELS; c++) sel_input_channel[c] = (c < detected_input_channels) && (active_knobs.record_input_channel_enable[c] != 0.0f);
+            int channels = wav_recorder_compute_channels(sel_include_synth_output, sel_downmix_stereo, sel_input_channel, detected_input_channels);
+
+            if (channels <= 0) {
+                fprintf(stderr, "[record] cannot start: no channels selected\n");
+                atomic_store_explicit(&record_engine.start_failed, true, memory_order_relaxed);
+            } else {
+                // Publish the command's parameters BEFORE the atomic release-store of `command`
+                // below -- see RecordEngine's comment on why that ordering makes these plain
+                // writes safely visible to the writer thread.
+                snprintf(record_engine.cmd_path, sizeof(record_engine.cmd_path), "%s", active_knobs.record_path);
+                record_engine.cmd_include_synth_output = sel_include_synth_output;
+                record_engine.cmd_downmix_stereo = sel_downmix_stereo;
+                record_engine.cmd_input_channel_count = detected_input_channels;
+                for (int c = 0; c < RECORD_MAX_CHANNELS; c++) record_engine.cmd_input_channel_enable[c] = sel_input_channel[c];
+
+                record_gather.sel_include_synth_output = sel_include_synth_output;
+                record_gather.sel_downmix_stereo = sel_downmix_stereo;
+                record_gather.sel_input_channel_count = detected_input_channels;
+                for (int c = 0; c < RECORD_MAX_CHANNELS; c++) record_gather.sel_input_channel[c] = sel_input_channel[c];
+                record_gather.channels = channels;
+                record_gather.active = true;
                 recorder_input_channels_at_start = detected_input_channels;
-                fprintf(stderr, "[record] started: '%s', %d channel(s)%s\n", active_knobs.record_path, recorder.channels,
-                        recorder.sel_downmix_stereo ? " (downmixed)" : "");
+
+                atomic_store_explicit(&record_engine.start_failed, false, memory_order_relaxed);
+                atomic_store_explicit(&record_engine.command, RECORD_CMD_START, memory_order_release);
+                fprintf(stderr, "[record] start requested: '%s', %d channel(s)%s\n", active_knobs.record_path, channels,
+                        sel_downmix_stereo ? " (downmixed)" : "");
             }
         } else if (!want_recording && applied_record_enable) {
-            wav_recorder_stop(&recorder);
+            atomic_store_explicit(&record_engine.command, RECORD_CMD_STOP, memory_order_release);
+            record_gather.active = false;
         }
         applied_record_enable = want_recording;
-        if (recorder.active) wav_recorder_write_block(&recorder, buffer, capture_buffer, block_size);
+        if (record_gather.active) wav_recorder_gather_block(&record_gather, &record_engine, buffer, capture_buffer, block_size);
+
+        // DIAGNOSTIC: mirrors [perf]/[voices]/[audio] above -- reported at most once per status
+        // tick (not every block) so a sustained stall doesn't spam stderr, same rationale as
+        // those. A rising count means the writer thread can't keep up with disk I/O in real
+        // time; the audio thread itself is never at risk (dropped samples come out of the
+        // *recording*, never the live output).
+        uint64_t record_dropped_now = atomic_load_explicit(&record_engine.ring.dropped_samples, memory_order_relaxed);
+        if (record_dropped_now != record_last_reported_drops) {
+            fprintf(stderr, "[record] writer thread falling behind -- %llu sample(s) dropped so far (disk too slow to keep up in real time)\n",
+                    (unsigned long long)record_dropped_now);
+            record_last_reported_drops = record_dropped_now;
+        }
 
         vu_decimator++;
         if (client_fd >= 0 && vu_decimator >= 12) {
+            bool engine_active = atomic_load_explicit(&record_engine.is_active, memory_order_acquire);
             EngineStatus status = {
                 .peak = block_peak,
-                .is_recording = recorder.active ? 1.0f : 0.0f,
-                .elapsed_seconds = recorder.active ? (recorder.frames_written / (float)SAMPLE_RATE) : 0.0f,
-                .record_error = (want_recording && !recorder.active) ? 1.0f : 0.0f,
+                .is_recording = engine_active ? 1.0f : 0.0f,
+                .elapsed_seconds = engine_active ? (atomic_load_explicit(&record_engine.frames_written, memory_order_relaxed) / (float)SAMPLE_RATE) : 0.0f,
+                .record_error = atomic_load_explicit(&record_engine.start_failed, memory_order_relaxed) ? 1.0f : 0.0f,
                 .detected_input_channels = (float)detected_input_channels,
             };
             send(client_fd, &status, sizeof(status), 0);
@@ -2636,7 +2869,14 @@ int main() {
         }
         write_audio_block(pcm_handle, buffer, block_size, active_voices_count, render_ms);
     }
-    wav_recorder_stop(&recorder); // flush/finalize a still-running take on shutdown
+    // Flush/finalize a still-running take on shutdown: signal the writer thread to stop (if a
+    // recording was active) and to exit, then join it so its final fclose actually happens
+    // before the process exits.
+    if (record_gather.active) atomic_store_explicit(&record_engine.command, RECORD_CMD_STOP, memory_order_release);
+    if (record_writer_thread_ok) {
+        atomic_store_explicit(&record_engine.shutdown, true, memory_order_release);
+        pthread_join(record_engine.thread, NULL);
+    }
     if (client_fd >= 0) close(client_fd);
     if (server_fd >= 0) close(server_fd);
     unlink(socket_path);
