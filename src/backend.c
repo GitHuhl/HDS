@@ -141,6 +141,24 @@ typedef struct {
 // already provides an equivalent crossfade, and exposing both would just be two knobs doing the
 // same job. See run_fx_density3().
 #define FX_TYPE_DENSITY3 3
+// Ported from Airwindows StereoChorus (MIT license). A stereo-widened flanger/chorus: two
+// independently LFO-swept delay reads (deliberately phase-offset between L/R) into a single
+// integer-quantized ring buffer, plus an "air" comb-filter stage restoring some of the top end a
+// short modulated delay naturally smears away. param[0] Speed, param[1] Depth. See
+// run_fx_stereochorus().
+#define FX_TYPE_STEREOCHORUS 4
+// Ported from Airwindows StereoDoubler (MIT license). A granular micro-pitch detuner: 8
+// simultaneous delay-read "voices" per channel at slightly different (and, between L/R,
+// oppositely-signed) speeds, crossfade-spliced between whichever pair conflicts least whenever
+// one wraps, avoiding the audible clicks a naive single-tap pitch shifter would produce.
+// param[0] Detune (trim direction/amount, split oppositely between L and R), param[1] Dry/Wet
+// (this effect's own internal crossfade). Kept as its own control here -- unlike Density3's,
+// which was dropped as redundant with the slot's generic `mix` -- because this is one of only
+// two params the original exposes at all (matching Ensemble's 2-knob shape rather than
+// Density3's 3), and because doubling/detuning effects are conventionally dialed in as their own
+// self-contained mix, independent of whatever the slot's outer Mix knob is doing. See
+// run_fx_stereodoubler().
+#define FX_TYPE_STEREODOUBLER 5
 #define FX_SLOT_PARAM_COUNT 8
 typedef struct {
     float fx_type;
@@ -1374,6 +1392,416 @@ static void run_fx_density3(FXSlotEngine *engine, const FXSlotParams *params, fl
     *r = inputSampleR;
 }
 
+// --- FX_TYPE_STEREOCHORUS: ported from Airwindows StereoChorus (MIT license) ---
+// Two independent LFO-swept delay reads (L and R start their sweep phase at different points --
+// pi/2.7 vs pi -- so they never modulate in lockstep, widening the stereo image) into a single
+// ring buffer quantized to roughly 24-bit integer resolution (the original stores samples as
+// `int`, not float/double -- an intentional part of this effect's character, ported as-is), plus
+// an "air" comb-filter stage that restores some of the top end a short modulated delay's linear
+// interpolation naturally smears away.
+typedef struct {
+    int pL[65536], pR[65536];
+    float sweepL, sweepR;
+    int gcount;
+    float airPrevL, airEvenL, airOddL, airFactorL;
+    float airPrevR, airEvenR, airOddR, airFactorR;
+    bool flip;
+    float lastRefL[7], lastRefR[7];
+    int cycle, cycle_end;
+    uint32_t fpdL, fpdR;
+} FxStereoChorusState;
+
+static void run_fx_stereochorus(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxStereoChorusState *st = (FxStereoChorusState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxStereoChorusState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+        st->sweepL = (float)(M_PI / 2.7);
+        st->sweepR = (float)M_PI;
+        int cycle_end = SAMPLE_RATE / 44100; if (cycle_end < 1) cycle_end = 1; if (cycle_end > 4) cycle_end = 4;
+        st->cycle_end = cycle_end;
+        st->fpdL = (uint32_t)rand(); while (st->fpdL < 16386) st->fpdL = (uint32_t)rand();
+        st->fpdR = (uint32_t)rand(); while (st->fpdR < 16386) st->fpdR = (uint32_t)rand();
+    }
+    if (st->cycle > st->cycle_end - 1) st->cycle = st->cycle_end - 1;
+
+    // param[0] Speed, param[1] Depth -- both 0..1 (see the FX_TYPE_STEREOCHORUS comment above).
+    // This exact speed/depth curve is ported straight from the original: speed stays very small
+    // across the whole knob range (a tenth-power curve), so depth (which divides by speed)
+    // naturally gets large at low Speed settings -- that's intentional/original behavior, not a
+    // bug, and stays safely within pL/pR's bounds (see the defensive clamp below regardless).
+    float a = fmaxf(0.0f, fminf(1.0f, params->param[0]));
+    float b = fmaxf(0.0f, fminf(1.0f, params->param[1]));
+    float speed = powf(0.32f + (a / 6.0f), 10.0f);
+    float depth = (b / 60.0f) / speed;
+    float tupi = (float)(M_PI * 2.0);
+
+    float inputSampleL = *l, inputSampleR = *r;
+    if (fabsf(inputSampleL) < 1.18e-23f) inputSampleL = (float)st->fpdL * 1.18e-17f;
+    if (fabsf(inputSampleR) < 1.18e-23f) inputSampleR = (float)st->fpdR * 1.18e-17f;
+
+    st->cycle++;
+    if (st->cycle == st->cycle_end) {
+        st->airFactorL = st->airPrevL - inputSampleL;
+        if (st->flip) { st->airEvenL += st->airFactorL; st->airOddL -= st->airFactorL; st->airFactorL = st->airEvenL; }
+        else { st->airOddL += st->airFactorL; st->airEvenL -= st->airFactorL; st->airFactorL = st->airOddL; }
+        st->airOddL = (st->airOddL - ((st->airOddL - st->airEvenL) / 256.0f)) / 1.0001f;
+        st->airEvenL = (st->airEvenL - ((st->airEvenL - st->airOddL) / 256.0f)) / 1.0001f;
+        st->airPrevL = inputSampleL;
+        inputSampleL += st->airFactorL;
+
+        st->airFactorR = st->airPrevR - inputSampleR;
+        if (st->flip) { st->airEvenR += st->airFactorR; st->airOddR -= st->airFactorR; st->airFactorR = st->airEvenR; }
+        else { st->airOddR += st->airFactorR; st->airEvenR -= st->airFactorR; st->airFactorR = st->airOddR; }
+        st->airOddR = (st->airOddR - ((st->airOddR - st->airEvenR) / 256.0f)) / 1.0001f;
+        st->airEvenR = (st->airEvenR - ((st->airEvenR - st->airOddR) / 256.0f)) / 1.0001f;
+        st->airPrevR = inputSampleR;
+        inputSampleR += st->airFactorR;
+        st->flip = !st->flip;
+
+        int tempL = 0, tempR = 0;
+        if (st->gcount < 1 || st->gcount > 32760) st->gcount = 32760;
+
+        int count = st->gcount;
+        st->pL[count + 32760] = st->pL[count] = (int)(inputSampleL * 8388352.0f);
+        float offsetL = depth + (depth * sinf(st->sweepL));
+        count += (int)floorf(offsetL);
+        if (count < 0) count = 0;
+        if (count > 65533) count = 65533; // defensive: keep well inside pL[]/pR[]
+        tempL += (int)((float)st->pL[count] * (1.0f - (offsetL - floorf(offsetL))));
+        tempL += st->pL[count + 1];
+        tempL += (int)((float)st->pL[count + 2] * (offsetL - floorf(offsetL)));
+        tempL -= (int)(((float)(st->pL[count] - st->pL[count + 1]) - (float)(st->pL[count + 1] - st->pL[count + 2])) / 50.0f);
+
+        count = st->gcount;
+        st->pR[count + 32760] = st->pR[count] = (int)(inputSampleR * 8388352.0f);
+        float offsetR = depth + (depth * sinf(st->sweepR));
+        count += (int)floorf(offsetR);
+        if (count < 0) count = 0;
+        if (count > 65533) count = 65533;
+        tempR += (int)((float)st->pR[count] * (1.0f - (offsetR - floorf(offsetR))));
+        tempR += st->pR[count + 1];
+        tempR += (int)((float)st->pR[count + 2] * (offsetR - floorf(offsetR)));
+        tempR -= (int)(((float)(st->pR[count] - st->pR[count + 1]) - (float)(st->pR[count + 1] - st->pR[count + 2])) / 50.0f);
+
+        st->sweepL += speed; st->sweepR += speed;
+        if (st->sweepL > tupi) st->sweepL -= tupi;
+        if (st->sweepR > tupi) st->sweepR -= tupi;
+        st->gcount--;
+
+        inputSampleL = (float)tempL / 16776704.0f;
+        inputSampleR = (float)tempR / 16776704.0f;
+
+        // Downsampling-ladder reconstruction -- see run_fx_ensemble's identical pattern/comment.
+        // At this engine's fixed 48kHz, cycle_end is always 1, so this degenerates to
+        // lastRefL[0]=inputSampleL every call; kept generic in case SAMPLE_RATE ever changes.
+        if (st->cycle_end == 4) {
+            st->lastRefL[0] = st->lastRefL[4];
+            st->lastRefL[2] = (st->lastRefL[0] + inputSampleL) * 0.5f;
+            st->lastRefL[1] = (st->lastRefL[0] + st->lastRefL[2]) * 0.5f;
+            st->lastRefL[3] = (st->lastRefL[2] + inputSampleL) * 0.5f;
+            st->lastRefL[4] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[4];
+            st->lastRefR[2] = (st->lastRefR[0] + inputSampleR) * 0.5f;
+            st->lastRefR[1] = (st->lastRefR[0] + st->lastRefR[2]) * 0.5f;
+            st->lastRefR[3] = (st->lastRefR[2] + inputSampleR) * 0.5f;
+            st->lastRefR[4] = inputSampleR;
+        } else if (st->cycle_end == 3) {
+            st->lastRefL[0] = st->lastRefL[3];
+            st->lastRefL[2] = (st->lastRefL[0] + st->lastRefL[0] + inputSampleL) / 3.0f;
+            st->lastRefL[1] = (st->lastRefL[0] + inputSampleL + inputSampleL) / 3.0f;
+            st->lastRefL[3] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[3];
+            st->lastRefR[2] = (st->lastRefR[0] + st->lastRefR[0] + inputSampleR) / 3.0f;
+            st->lastRefR[1] = (st->lastRefR[0] + inputSampleR + inputSampleR) / 3.0f;
+            st->lastRefR[3] = inputSampleR;
+        } else if (st->cycle_end == 2) {
+            st->lastRefL[0] = st->lastRefL[2];
+            st->lastRefL[1] = (st->lastRefL[0] + inputSampleL) * 0.5f;
+            st->lastRefL[2] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[2];
+            st->lastRefR[1] = (st->lastRefR[0] + inputSampleR) * 0.5f;
+            st->lastRefR[2] = inputSampleR;
+        } else {
+            st->lastRefL[0] = inputSampleL;
+            st->lastRefR[0] = inputSampleR;
+        }
+        st->cycle = 0;
+        inputSampleL = st->lastRefL[st->cycle];
+        inputSampleR = st->lastRefR[st->cycle];
+    } else {
+        inputSampleL = st->lastRefL[st->cycle];
+        inputSampleR = st->lastRefR[st->cycle];
+    }
+
+    int expon;
+    frexpf(inputSampleL, &expon);
+    st->fpdL ^= st->fpdL << 13; st->fpdL ^= st->fpdL >> 17; st->fpdL ^= st->fpdL << 5;
+    inputSampleL += (((float)st->fpdL - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+    frexpf(inputSampleR, &expon);
+    st->fpdR ^= st->fpdR << 13; st->fpdR ^= st->fpdR >> 17; st->fpdR ^= st->fpdR << 5;
+    inputSampleR += (((float)st->fpdR - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+
+    *l = inputSampleL;
+    *r = inputSampleR;
+}
+
+// --- FX_TYPE_STEREODOUBLER: ported from Airwindows StereoDoubler (MIT license) ---
+// A granular micro-pitch detuner. 8 simultaneous delay-read "voices" per channel walk through a
+// ring buffer at slightly different speeds (L and R detuned in opposite directions from Detune),
+// each voice wrapping back to the buffer start at a different moment; whenever one wraps, this
+// crossfade-splices to whichever OTHER voice is currently closest in value (`bestsplice`) rather
+// than jumping straight back, hiding the seam that would otherwise click. The "air" comb-filter
+// stage and downsampling-ladder reconstruction are the same techniques used in
+// run_fx_stereochorus above.
+typedef struct {
+    float pL[5001], pR[5001];
+    int gcountL, lastcountL, gcountR, lastcountR;
+    float trackingL[8], tempL[8], positionL[8], lastpositionL[8];
+    float trackingR[8], tempR[8], positionR[8], lastpositionR[8];
+    int activeL, bestspliceL, activeR, bestspliceR;
+    float airPrevL, airEvenL, airOddL, airFactorL;
+    float airPrevR, airEvenR, airOddR, airFactorR;
+    bool flip;
+    float lastRefL[7], lastRefR[7];
+    int cycle, cycle_end;
+    uint32_t fpdL, fpdR;
+} FxStereoDoublerState;
+
+// This effect's `width` (the ring buffer span the 8 voices walk around) is a fixed constant in
+// the original -- never actually configurable at runtime despite the original tracking a
+// "did width change" flag for it -- so its one-time position-ladder setup happens here, at
+// state-allocation time, instead of being checked on every call.
+#define STEREODOUBLER_WIDTH 2300
+
+static void run_fx_stereodoubler(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxStereoDoublerState *st = (FxStereoDoublerState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxStereoDoublerState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+        int w = STEREODOUBLER_WIDTH;
+        st->positionL[0] = 0; st->positionL[1] = (float)(w / 3); st->positionL[2] = (float)((w / 3) * 2);
+        st->positionL[3] = (float)(w / 5); st->positionL[4] = (float)((w / 5) * 2); st->positionL[5] = (float)((w / 5) * 3);
+        st->positionL[6] = (float)((w / 5) * 4); st->positionL[7] = (float)(w / 2);
+        st->positionR[0] = 0; st->positionR[1] = (float)(w / 3); st->positionR[2] = (float)((w / 3) * 2);
+        st->positionR[3] = (float)(w / 5); st->positionR[4] = (float)((w / 5) * 2); st->positionR[5] = (float)((w / 5) * 3);
+        st->positionR[6] = (float)((w / 5) * 4); st->positionR[7] = (float)(w / 2);
+        int cycle_end = SAMPLE_RATE / 44100; if (cycle_end < 1) cycle_end = 1; if (cycle_end > 4) cycle_end = 4;
+        st->cycle_end = cycle_end;
+        st->fpdL = (uint32_t)rand(); while (st->fpdL < 16386) st->fpdL = (uint32_t)rand();
+        st->fpdR = (uint32_t)rand(); while (st->fpdR < 16386) st->fpdR = (uint32_t)rand();
+    }
+    if (st->cycle > st->cycle_end - 1) st->cycle = st->cycle_end - 1;
+    int width = STEREODOUBLER_WIDTH;
+
+    // param[0] Detune, param[1] Dry/Wet -- both 0..1 (see the FX_TYPE_STEREODOUBLER comment
+    // above for why Dry/Wet stays its own control here, unlike Density3's).
+    float a = fmaxf(0.0f, fminf(1.0f, params->param[0]));
+    float wet = fmaxf(0.0f, fminf(1.0f, params->param[1]));
+    float trim = (a * 2.0f) - 1.0f;
+    trim *= fabsf(trim);
+    trim /= 40.0f;
+    float speedL = trim + 1.0f;
+    float speedR = (-trim) + 1.0f;
+    if (speedL < 0.0f) speedL = 0.0f;
+    if (speedR < 0.0f) speedR = 0.0f;
+    float adjust = 1100.0f;
+
+    float inputSampleL = *l, inputSampleR = *r;
+    if (fabsf(inputSampleL) < 1.18e-23f) inputSampleL = (float)st->fpdL * 1.18e-17f;
+    if (fabsf(inputSampleR) < 1.18e-23f) inputSampleR = (float)st->fpdR * 1.18e-17f;
+
+    st->cycle++;
+    if (st->cycle == st->cycle_end) {
+        float drySampleL = inputSampleL, drySampleR = inputSampleR;
+
+        st->airFactorL = st->airPrevL - inputSampleL;
+        if (st->flip) { st->airEvenL += st->airFactorL; st->airOddL -= st->airFactorL; st->airFactorL = st->airEvenL; }
+        else { st->airOddL += st->airFactorL; st->airEvenL -= st->airFactorL; st->airFactorL = st->airOddL; }
+        st->airOddL = (st->airOddL - ((st->airOddL - st->airEvenL) / 256.0f)) / 1.0001f;
+        st->airEvenL = (st->airEvenL - ((st->airEvenL - st->airOddL) / 256.0f)) / 1.0001f;
+        st->airPrevL = inputSampleL;
+        inputSampleL += st->airFactorL;
+
+        st->airFactorR = st->airPrevR - inputSampleR;
+        if (st->flip) { st->airEvenR += st->airFactorR; st->airOddR -= st->airFactorR; st->airFactorR = st->airEvenR; }
+        else { st->airOddR += st->airFactorR; st->airEvenR -= st->airFactorR; st->airFactorR = st->airOddR; }
+        st->airOddR = (st->airOddR - ((st->airOddR - st->airEvenR) / 256.0f)) / 1.0001f;
+        st->airEvenR = (st->airEvenR - ((st->airEvenR - st->airOddR) / 256.0f)) / 1.0001f;
+        st->airPrevR = inputSampleR;
+        inputSampleR += st->airFactorR;
+        st->flip = !st->flip;
+
+        st->gcountL++; st->gcountR++;
+        for (int c = 0; c < 8; c++) { st->positionL[c] += speedL; st->positionR[c] += speedR; }
+
+        int gplusL = st->gcountL + (int)adjust;
+        int lastplusL = st->lastcountL + (int)adjust;
+        if (gplusL > width) gplusL -= width;
+        if (lastplusL > width) lastplusL -= width;
+
+        int gplusR = st->gcountR + (int)adjust;
+        int lastplusR = st->lastcountR + (int)adjust;
+        if (gplusR > width) gplusR -= width;
+        if (lastplusR > width) lastplusR -= width;
+
+        if (st->trackingL[st->activeL] == 0.0f) {
+            float posplusL = st->positionL[st->activeL] + adjust;
+            float lastposplusL = st->lastpositionL[st->activeL] + adjust;
+            if (posplusL > (float)width) posplusL -= (float)width;
+            if (lastposplusL > (float)width) lastposplusL -= (float)width;
+            if ((gplusL > st->positionL[st->activeL]) && (lastplusL < st->lastpositionL[st->activeL])) st->trackingL[st->activeL] = 1.0f;
+            if ((posplusL > (float)st->gcountL) && (lastposplusL < (float)st->lastcountL)) st->trackingL[st->activeL] = 1.0f;
+        }
+        if (st->trackingR[st->activeR] == 0.0f) {
+            float posplusR = st->positionR[st->activeR] + adjust;
+            float lastposplusR = st->lastpositionR[st->activeR] + adjust;
+            if (posplusR > (float)width) posplusR -= (float)width;
+            if (lastposplusR > (float)width) lastposplusR -= (float)width;
+            if ((gplusR > st->positionR[st->activeR]) && (lastplusR < st->lastpositionR[st->activeR])) st->trackingR[st->activeR] = 1.0f;
+            if ((posplusR > (float)st->gcountR) && (lastposplusR < (float)st->lastcountR)) st->trackingR[st->activeR] = 1.0f;
+        }
+
+        for (int c = 0; c < 8; c++) {
+            if (st->positionL[c] > (float)width) st->positionL[c] -= (float)width;
+            if (st->positionR[c] > (float)width) st->positionR[c] -= (float)width;
+            st->lastpositionL[c] = st->positionL[c];
+            st->lastpositionR[c] = st->positionR[c];
+        }
+        if (st->gcountL < 0 || st->gcountL > width) st->gcountL -= width;
+        st->lastcountL = st->gcountL;
+        if (st->gcountR < 0 || st->gcountR > width) st->gcountR -= width;
+        st->lastcountR = st->gcountR;
+        // bcountL/bcountR are provably bounded to [0, width] by the wrap-check just above
+        // (gcountL only ever grows by exactly 1 per cycle, caught and pulled back by `width` the
+        // moment it exceeds it), so bcountL+width stays safely inside pL[5001] on its own; this
+        // clamp is a true last-resort backstop only (matching the original's own array-size
+        // headroom), never expected to actually trigger in normal operation.
+        int bcountL = st->gcountL, bcountR = st->gcountR;
+        if (bcountL < 0) bcountL = 0;
+        if (bcountL > width) bcountL = width;
+        if (bcountR < 0) bcountR = 0;
+        if (bcountR > width) bcountR = width;
+
+        st->pL[bcountL + width] = st->pL[bcountL] = inputSampleL;
+        st->pR[bcountR + width] = st->pR[bcountR] = inputSampleR;
+
+        for (int c = 0; c < 8; c++) {
+            // positionL[c]/positionR[c] are wrapped into [0, width] just above too, so base+2
+            // naturally stays well inside pL[5001]'s 2*width+401 headroom -- same backstop-only
+            // rationale as bcountL/bcountR.
+            int base = (int)floorf(st->positionL[c]);
+            if (base < 0) base = 0;
+            if (base > 4998) base = 4998;
+            st->tempL[c] = st->pL[base] * (1.0f - (st->positionL[c] - (float)base));
+            st->tempL[c] += st->pL[base + 1];
+            st->tempL[c] += st->pL[base + 2] * (st->positionL[c] - (float)base);
+            st->tempL[c] -= ((st->pL[base] - st->pL[base + 1]) - (st->pL[base + 1] - st->pL[base + 2])) / 50.0f;
+            st->tempL[c] /= 2.0f;
+
+            base = (int)floorf(st->positionR[c]);
+            if (base < 0) base = 0;
+            if (base > 4998) base = 4998;
+            st->tempR[c] = st->pR[base] * (1.0f - (st->positionR[c] - (float)base));
+            st->tempR[c] += st->pR[base + 1];
+            st->tempR[c] += st->pR[base + 2] * (st->positionR[c] - (float)base);
+            st->tempR[c] -= ((st->pR[base] - st->pR[base + 1]) - (st->pR[base + 1] - st->pR[base + 2])) / 50.0f;
+            st->tempR[c] /= 2.0f;
+        }
+
+        if (st->trackingL[st->activeL] > 0.0f) {
+            float crossfade = sinf(st->trackingL[st->bestspliceL] * 1.57f);
+            inputSampleL = (st->tempL[st->activeL] * crossfade) + (st->tempL[st->bestspliceL] * (1.0f - crossfade));
+            for (int c = 0; c < 8; c++) {
+                float depthv = 0.5f - fabsf(st->tempL[st->activeL] - st->tempL[c]);
+                if (depthv > 0.0f && c != st->activeL) { st->trackingL[c] -= (depthv / adjust); st->bestspliceL = c; }
+            }
+            float bestyetL = 1.0f;
+            for (int c = 0; c < 8; c++) if (st->trackingL[c] < bestyetL && c != st->activeL) { st->bestspliceL = c; bestyetL = st->trackingL[c]; }
+            if (st->trackingL[st->bestspliceL] < 0.0f) {
+                for (int c = 0; c < 8; c++) st->trackingL[c] = 1.0f;
+                st->activeL = st->bestspliceL;
+                st->trackingL[st->activeL] = 0.0f;
+            }
+        } else {
+            inputSampleL = st->tempL[st->activeL];
+        }
+
+        if (st->trackingR[st->activeR] > 0.0f) {
+            float crossfade = sinf(st->trackingR[st->bestspliceR] * 1.57f);
+            inputSampleR = (st->tempR[st->activeR] * crossfade) + (st->tempR[st->bestspliceR] * (1.0f - crossfade));
+            for (int c = 0; c < 8; c++) {
+                float depthv = 0.5f - fabsf(st->tempR[st->activeR] - st->tempR[c]);
+                if (depthv > 0.0f && c != st->activeR) { st->trackingR[c] -= (depthv / adjust); st->bestspliceR = c; }
+            }
+            float bestyetR = 1.0f;
+            for (int c = 0; c < 8; c++) if (st->trackingR[c] < bestyetR && c != st->activeR) { st->bestspliceR = c; bestyetR = st->trackingR[c]; }
+            if (st->trackingR[st->bestspliceR] < 0.0f) {
+                for (int c = 0; c < 8; c++) st->trackingR[c] = 1.0f;
+                st->activeR = st->bestspliceR;
+                st->trackingR[st->activeR] = 0.0f;
+            }
+        } else {
+            inputSampleR = st->tempR[st->activeR];
+        }
+
+        inputSampleL = (inputSampleL * wet) + (drySampleL * (1.0f - wet));
+        inputSampleR = (inputSampleR * wet) + (drySampleR * (1.0f - wet));
+
+        // Downsampling-ladder reconstruction -- see run_fx_ensemble's identical pattern/comment.
+        if (st->cycle_end == 4) {
+            st->lastRefL[0] = st->lastRefL[4];
+            st->lastRefL[2] = (st->lastRefL[0] + inputSampleL) * 0.5f;
+            st->lastRefL[1] = (st->lastRefL[0] + st->lastRefL[2]) * 0.5f;
+            st->lastRefL[3] = (st->lastRefL[2] + inputSampleL) * 0.5f;
+            st->lastRefL[4] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[4];
+            st->lastRefR[2] = (st->lastRefR[0] + inputSampleR) * 0.5f;
+            st->lastRefR[1] = (st->lastRefR[0] + st->lastRefR[2]) * 0.5f;
+            st->lastRefR[3] = (st->lastRefR[2] + inputSampleR) * 0.5f;
+            st->lastRefR[4] = inputSampleR;
+        } else if (st->cycle_end == 3) {
+            st->lastRefL[0] = st->lastRefL[3];
+            st->lastRefL[2] = (st->lastRefL[0] + st->lastRefL[0] + inputSampleL) / 3.0f;
+            st->lastRefL[1] = (st->lastRefL[0] + inputSampleL + inputSampleL) / 3.0f;
+            st->lastRefL[3] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[3];
+            st->lastRefR[2] = (st->lastRefR[0] + st->lastRefR[0] + inputSampleR) / 3.0f;
+            st->lastRefR[1] = (st->lastRefR[0] + inputSampleR + inputSampleR) / 3.0f;
+            st->lastRefR[3] = inputSampleR;
+        } else if (st->cycle_end == 2) {
+            st->lastRefL[0] = st->lastRefL[2];
+            st->lastRefL[1] = (st->lastRefL[0] + inputSampleL) * 0.5f;
+            st->lastRefL[2] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[2];
+            st->lastRefR[1] = (st->lastRefR[0] + inputSampleR) * 0.5f;
+            st->lastRefR[2] = inputSampleR;
+        } else {
+            st->lastRefL[0] = inputSampleL;
+            st->lastRefR[0] = inputSampleR;
+        }
+        st->cycle = 0;
+        inputSampleL = st->lastRefL[st->cycle];
+        inputSampleR = st->lastRefR[st->cycle];
+    } else {
+        inputSampleL = st->lastRefL[st->cycle];
+        inputSampleR = st->lastRefR[st->cycle];
+    }
+
+    int expon;
+    frexpf(inputSampleL, &expon);
+    st->fpdL ^= st->fpdL << 13; st->fpdL ^= st->fpdL >> 17; st->fpdL ^= st->fpdL << 5;
+    inputSampleL += (((float)st->fpdL - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+    frexpf(inputSampleR, &expon);
+    st->fpdR ^= st->fpdR << 13; st->fpdR ^= st->fpdR >> 17; st->fpdR ^= st->fpdR << 5;
+    inputSampleR += (((float)st->fpdR - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+
+    *l = inputSampleL;
+    *r = inputSampleR;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -1417,6 +1845,8 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
             case FX_TYPE_ENSEMBLE: run_fx_ensemble(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
             case FX_TYPE_CREAMCOAT: run_fx_creamcoat(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
             case FX_TYPE_DENSITY3: run_fx_density3(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+            case FX_TYPE_STEREOCHORUS: run_fx_stereochorus(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+            case FX_TYPE_STEREODOUBLER: run_fx_stereodoubler(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
             case FX_TYPE_OFF:
             default:
                 break; // pass-through

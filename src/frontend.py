@@ -105,6 +105,16 @@ FX_TYPE_METADATA = [
         # No Dry/Wet param here -- the slot's generic Mix knob already does that job; see the
         # FX_TYPE_DENSITY3 comment in backend.c.
     ]},
+    {"name": "StereoChorus", "params": [
+        # Defaults 30/30 rather than the original plugin's raw 0/0 init -- at Depth=0 this
+        # effect is a silent no-op (no modulation at all), a poor first impression.
+        {"label": "Speed", "range": (0, 100), "default": 30},
+        {"label": "Depth", "range": (0, 100), "default": 30},
+    ]},
+    {"name": "StereoDoubler", "params": [
+        {"label": "Detune", "range": (0, 100), "default": 60},
+        {"label": "Dry/Wet", "range": (0, 100), "default": 60},
+    ]},
 ]
 
 def _list_alsa_devices(list_cmd):

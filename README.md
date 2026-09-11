@@ -243,7 +243,7 @@ switchable; input enable/gain) is summed in just before the FX bus, so it
 passes through the same 12 slots as the synth's own voices. Each slot has
 a generic 8-param bank + mix + bypass (`process_fx_chain()` in
 `backend.c`); most slot types are still an unimplemented pass-through,
-ready for more effects to be ported into the dispatch switch. Three are
+ready for more effects to be ported into the dispatch switch. Five are
 implemented so far, all ported from Airwindows (MIT license):
 
 - **Ensemble** — a 12-tap fixed-delay ensemble/chorus (not a reverb: no
@@ -267,6 +267,28 @@ implemented so far, all ported from Airwindows (MIT license):
   Dry/Wet param here — the slot's generic Mix knob already does that job,
   so exposing both would just be two controls doing the same thing (see
   the `FX_TYPE_DENSITY3` comment in `backend.c`).
+- **StereoChorus** — a stereo-widened flanger/chorus: two independently
+  LFO-swept delay reads (L and R start their sweep at different phases,
+  so they never modulate in lockstep) into an integer-quantized ring
+  buffer, plus the same "air" comb-filter stage (see below) restoring
+  some of the top end a short modulated delay's interpolation smears
+  away. Params: Speed and Depth.
+- **StereoDoubler** — a granular micro-pitch detuner: 8 simultaneous
+  delay-read "voices" per channel walking at slightly different (and,
+  between L/R, oppositely-signed) speeds, crossfade-spliced between
+  whichever pair conflicts least whenever one wraps, avoiding the
+  audible clicks a naive single-tap pitch shifter would produce. Params:
+  Detune and Dry/Wet (kept as its own control here, unlike Density3's —
+  see the `FX_TYPE_STEREODOUBLER` comment in `backend.c` for why).
+
+  StereoChorus and StereoDoubler share an "air" comb-filter stage
+  (compensating for the top-end loss a modulated/interpolated delay
+  read causes) and a downsampling-ladder reconstruction technique for
+  CPU savings at higher sample rates, both also used in `run_fx_ensemble`
+  above — all three originate from the same family of Airwindows
+  plugins and share this DNA. At this engine's fixed 48kHz, the ladder
+  is always a no-op (`cycle_end` computes to 1), but is kept generic in
+  case `SAMPLE_RATE` ever changes.
 
 Adding a new effect means: a `FX_TYPE_*` define + its processing function
 + a case in `process_fx_chain()`'s switch (`backend.c`), and a matching
