@@ -45,6 +45,9 @@ RECORD_PATH_LEN = 256
 # UI yet -- the frontend always sends tempo_marker_count=0 -- but the wire layout still reserves
 # this many (time, bpm) marker slots so a future editor doesn't need another breaking change.
 TEMPO_MARKER_MAX = 16
+# Sample Bank: must match MAX_SAMPLE_SLOTS / SAMPLE_PATH_LEN in backend.c exactly.
+MAX_SAMPLE_SLOTS = 16
+SAMPLE_PATH_LEN = 256
 
 # CreamCoat's 17 "Select" room-size presets, in order -- text taken verbatim from the original
 # plugin's own per-case comments (e.g. "5 to 51 ms, 96 seat room").
@@ -273,6 +276,20 @@ class WaveformVisualizer(QWidget):
                 path.lineTo(margin + duty, h - margin)
                 path.lineTo(margin + draw_w, h - margin)
                 path.lineTo(margin + draw_w, mid_y)
+            elif self.waveform_type == 7:  # Sample (DFD playback) -- a small clip/bar icon,
+                # visually distinct from Noise's jagged random line, to suggest a fixed recorded
+                # waveform rather than a live-generated one.
+                bar_heights = [0.3, 0.7, 1.0, 0.5, 0.8, 0.4]
+                bar_w = draw_w / (len(bar_heights) * 1.6)
+                for i, frac in enumerate(bar_heights):
+                    bar_h = (h - margin * 2) * frac
+                    x = margin + i * (draw_w / len(bar_heights))
+                    path.moveTo(x, mid_y - bar_h / 2)
+                    path.lineTo(x, mid_y + bar_h / 2)
+                    path.moveTo(x, mid_y - bar_h / 2)
+                    path.lineTo(x + bar_w, mid_y - bar_h / 2)
+                    path.moveTo(x, mid_y + bar_h / 2)
+                    path.lineTo(x + bar_w, mid_y + bar_h / 2)
 
         painter.drawPath(path)
 class PotentiometerKnob(QWidget):
@@ -907,6 +924,7 @@ class SynthGui(QWidget):
         self.tab_fx = QWidget()
         self.tab_audio = QWidget()
         self.tab_recording = QWidget()
+        self.tab_samples = QWidget()
 
         # ----------------------------------------------------
         # GLOBAL CONTROLS: live in the always-visible left sidebar (not a tab) so Program,
@@ -1122,7 +1140,7 @@ class SynthGui(QWidget):
         v1_strip.addWidget(self.vco1_vis, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.vco1_combo = QComboBox()
-        self.vco1_combo.addItems(["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse"])
+        self.vco1_combo.addItems(["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample"])
         v1_strip.addWidget(self.vco1_combo)
 
         # Pulse Width is a direct sub-parameter of the Shape choice (only meaningful when Shape
@@ -1232,7 +1250,7 @@ class SynthGui(QWidget):
         v2_strip.addWidget(self.vco2_vis, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.vco2_combo = QComboBox()
-        self.vco2_combo.addItems(["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse"])
+        self.vco2_combo.addItems(["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample"])
         self.vco2_combo.setCurrentIndex(3)
         v2_strip.addWidget(self.vco2_combo)
 
@@ -2229,6 +2247,81 @@ class SynthGui(QWidget):
         self._update_record_button_enabled()
 
         # ----------------------------------------------------
+        # SAMPLES TAB CONTENT -- deliberately minimal: a flat bank of MAX_SAMPLE_SLOTS (file path,
+        # root note) pairs, loaded into an Osc's Shape once it's set to "Sample" (find_nearest_
+        # sample_slot in backend.c picks whichever loaded slot's root note is closest to the
+        # played note). This is NOT the real per-note/velocity zone mapping UI (the future
+        # Mapping tab, merging keyboard_gui5.py) -- that's explicitly deferred until the DFD
+        # engine itself (WAVE_SAMPLE/render_sample_osc) is proven solid. This tab exists only so
+        # the engine can actually be loaded and played from the GUI in the meantime.
+        # ----------------------------------------------------
+        samples_outer_lay = QVBoxLayout(self.tab_samples)
+        samples_outer_lay.setContentsMargins(6, 6, 6, 6)
+        samples_outer_lay.setSpacing(6)
+
+        samples_header = QLabel(
+            "Load WAV files into the Sample Bank, then set an oscillator's Shape (Play tab) to \"Sample\". "
+            "A played note uses whichever loaded slot's Root Note is closest — no zone editing yet."
+        )
+        samples_header.setStyleSheet("font-size: 9px; color: #888;")
+        samples_header.setWordWrap(True)
+        samples_outer_lay.addWidget(samples_header)
+
+        samples_scroll = QScrollArea()
+        samples_scroll.setWidgetResizable(True)
+        samples_scroll_content = QWidget()
+        samples_grid = QGridLayout(samples_scroll_content)
+        samples_grid.setSpacing(4)
+        samples_grid.setContentsMargins(2, 2, 2, 2)
+
+        header_row = 0
+        for col, text in enumerate(["Slot", "Root Note", "File", ""]):
+            lbl = QLabel(f"<b>{text}</b>")
+            lbl.setStyleSheet("font-size: 10px;")
+            samples_grid.addWidget(lbl, header_row, col)
+
+        self.sample_slot_root_note_spins = []
+        self.sample_slot_path_fields = []
+        self.sample_slot_paths = [""] * MAX_SAMPLE_SLOTS
+        for slot_idx in range(MAX_SAMPLE_SLOTS):
+            row = header_row + 1 + slot_idx
+            samples_grid.addWidget(QLabel(str(slot_idx)), row, 0)
+
+            root_spin = QSpinBox()
+            root_spin.setRange(0, 127)
+            root_spin.setValue(60)
+            root_spin.setFixedWidth(56)
+            root_spin.setToolTip("MIDI note number this sample plays back at its recorded pitch (60 = Middle C).")
+            samples_grid.addWidget(root_spin, row, 1)
+            self.sample_slot_root_note_spins.append(root_spin)
+
+            path_field = QLineEdit("")
+            path_field.setReadOnly(True)
+            path_field.setPlaceholderText("(empty — slot not loaded)")
+            path_field.setStyleSheet("color: #00adb5; background-color: #1e1e24; font-size: 10px; padding: 2px;")
+            samples_grid.addWidget(path_field, row, 2)
+            self.sample_slot_path_fields.append(path_field)
+
+            btns_row = QHBoxLayout()
+            btn_browse = QPushButton("Browse…")
+            btn_browse.setFixedHeight(22)
+            btn_browse.clicked.connect(lambda checked, i=slot_idx: self._pick_sample_slot_file(i))
+            btns_row.addWidget(btn_browse)
+            btn_clear = QPushButton("Clear")
+            btn_clear.setFixedHeight(22)
+            btn_clear.clicked.connect(lambda checked, i=slot_idx: self._clear_sample_slot(i))
+            btns_row.addWidget(btn_clear)
+            btns_container = QWidget()
+            btns_container.setLayout(btns_row)
+            samples_grid.addWidget(btns_container, row, 3)
+
+            root_spin.valueChanged.connect(self.transmit_knob_packet)
+
+        samples_grid.setColumnStretch(2, 1)
+        samples_scroll.setWidget(samples_scroll_content)
+        samples_outer_lay.addWidget(samples_scroll, stretch=1)
+
+        # ----------------------------------------------------
         # ASSEMBLE AND ANCHOR TOUCH DECK TO ROOT LAYOUT
         # ----------------------------------------------------
         self.tab_widget.addTab(self.tab_play, "Play")
@@ -2238,6 +2331,7 @@ class SynthGui(QWidget):
         self.tab_widget.addTab(self.tab_fx, "FX")
         self.tab_widget.addTab(self.tab_audio, "Audio")
         self.tab_widget.addTab(self.tab_recording, "Recording")
+        self.tab_widget.addTab(self.tab_samples, "Samples")
 
         outer_layout.addWidget(self.tab_widget, stretch=5)
         self.setLayout(outer_layout)
@@ -2340,6 +2434,21 @@ class SynthGui(QWidget):
         if folder:
             self.record_folder = folder
             self.record_folder_field.setText(folder)
+
+    def _pick_sample_slot_file(self, slot_idx):
+        start_dir = os.path.dirname(self.sample_slot_paths[slot_idx]) if self.sample_slot_paths[slot_idx] else os.path.expanduser("~")
+        path, _ = QFileDialog.getOpenFileName(self, f"Load Sample — Slot {slot_idx}", start_dir, "WAV files (*.wav)")
+        if path:
+            self.sample_slot_paths[slot_idx] = path
+            self.sample_slot_path_fields[slot_idx].setText(os.path.basename(path))
+            self.sample_slot_path_fields[slot_idx].setToolTip(path)
+            self.transmit_knob_packet()
+
+    def _clear_sample_slot(self, slot_idx):
+        self.sample_slot_paths[slot_idx] = ""
+        self.sample_slot_path_fields[slot_idx].setText("")
+        self.sample_slot_path_fields[slot_idx].setToolTip("")
+        self.transmit_knob_packet()
 
     def _generate_record_filename(self):
         os.makedirs(self.record_folder, exist_ok=True)
@@ -2692,6 +2801,12 @@ class SynthGui(QWidget):
         packet_list.extend([0.0] * TEMPO_MARKER_MAX)  # tempo_marker_time[]
         packet_list.extend([0.0] * TEMPO_MARKER_MAX)  # tempo_marker_bpm[]
 
+        # Sample Bank (+16 items): root note per slot, paired with the fixed-width file path
+        # strings packed at the very end (below) -- see sample_slot_root_note[]/sample_slot_path[]
+        # in backend.c. Empty path = slot not loaded, regardless of what root note is sitting here.
+        for slot_idx in range(MAX_SAMPLE_SLOTS):
+            packet_list.append(float(self.sample_slot_root_note_spins[slot_idx].value()))
+
         # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
         # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
         # + 1 (filter_a_mode) + 4 (filter_a) + 1 (filter_a_multi_routing) + 12 (filter_a_multi[3] * 4)
@@ -2703,19 +2818,28 @@ class SynthGui(QWidget):
         # + 2 (ext in enable/gain) + 132 (12 FX slots * 11) + 1 (fx_routing_mode) + 2 (pb range)
         # + 1 (sustain polarity) + 1 (audio latency) + 1 (polyphony) + 1 (block size)
         # + 19 (recording: enable/synth-output/downmix + 16 channel enables)
-        # + 34 (tempo: tempo_bpm + tempo_marker_count + 16 marker times + 16 marker bpms) = 372
-        # floats, followed by 4 fixed strings (not floats): output_device, input_device,
-        # midi_device (64 bytes each), then record_path (256 bytes -- a real filesystem path
-        # needs more room than an ALSA device name).
+        # + 34 (tempo: tempo_bpm + tempo_marker_count + 16 marker times + 16 marker bpms)
+        # + 16 (sample_slot_root_note[MAX_SAMPLE_SLOTS]) = 388
+        # floats, followed by 5 fixed strings (not floats): output_device, input_device,
+        # midi_device (64 bytes each), record_path (256 bytes -- a real filesystem path needs
+        # more room than an ALSA device name), then sample_slot_path[] -- MAX_SAMPLE_SLOTS
+        # SAMPLE_PATH_LEN-byte strings packed back to back as one flat 4096-byte blob, exactly
+        # matching sample_slot_path[MAX_SAMPLE_SLOTS][SAMPLE_PATH_LEN]'s C layout (char has no
+        # alignment padding, so the flat concatenation below lines up struct-for-struct).
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
+        sample_paths_blob = b"".join(
+            self.sample_slot_paths[slot_idx].encode("utf-8")[:SAMPLE_PATH_LEN - 1].ljust(SAMPLE_PATH_LEN, b"\x00")
+            for slot_idx in range(MAX_SAMPLE_SLOTS)
+        )
         binary_packet = struct.pack(
-            f"372f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s",
+            f"388f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s{MAX_SAMPLE_SLOTS * SAMPLE_PATH_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
             _encode_device_name(midi_wire_value),
             self._current_record_path.encode("utf-8")[:RECORD_PATH_LEN - 1],
+            sample_paths_blob,
         )
         if self.sock is not None:
             try: self.sock.sendall(binary_packet)

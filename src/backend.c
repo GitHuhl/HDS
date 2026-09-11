@@ -48,6 +48,22 @@
 // Programmable tempo: hard ceiling on how many (time, bpm) tempo markers the tempo-map can hold
 // at once -- see the Tempo section on SynthSharedControls and compute_current_tempo_bpm().
 #define TEMPO_MARKER_MAX 16
+// DFD (direct-from-disk) sample playback: how many sample files can be loaded/mapped at once.
+// Deliberately small for now -- this is the minimal wire-protocol shape needed to load and test
+// WAVE_SAMPLE end to end; the real per-note/velocity zone mapping (SFZ-style) is future work, not
+// this pass. See the Sample Bank section on SynthSharedControls.
+#define MAX_SAMPLE_SLOTS 16
+#define SAMPLE_PATH_LEN 256
+// How many voices/oscillators can be actively DFD-streaming at once, independent of MAX_VOICES --
+// a fixed pool (like hd10's own MAX_VOICES=64) rather than one ring buffer per SynthVoice
+// oscillator slot, since embedding a ring buffer per voice would reserve its ~256KB for every one
+// of MAX_VOICES(256)*2 oscillators whether or not that voice ever plays a sample. See
+// SampleStream/g_sample_streams.
+#define MAX_SAMPLE_STREAMS 32
+#define SAMPLE_RING_SIZE (1 << 15) // 32768 frames per channel -- matches the DFD engine this was ported from
+#define SAMPLE_RING_MASK (SAMPLE_RING_SIZE - 1)
+#define SAMPLE_XFADE_SIZE 1024
+#define SAMPLE_PRE_ROLL_LIMIT 7200 // frames cached in RAM per loaded sample for zero-latency note-on (~150ms @ 48kHz)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
@@ -77,7 +93,8 @@ typedef enum {
     WAVE_SINE,
     WAVE_UNISON_SAW,
     WAVE_NOISE,
-    WAVE_PULSE  // appended (not inserted) so existing saved patches' numeric shape indices don't shift
+    WAVE_PULSE, // appended (not inserted) so existing saved patches' numeric shape indices don't shift
+    WAVE_SAMPLE // DFD-streamed multisample playback -- see render_sample_osc()/SampleStream. Also appended.
 } WaveType;
 
 // Sub Oscillator waveform choices. Deliberately a separate, smaller enum from WaveType -- the
@@ -232,6 +249,14 @@ typedef struct {
 // (+34 floats) -- see compute_current_tempo_bpm() and the Tempo section below. No new string
 // fields. New total: 372 float items + 448 string bytes. The Python side's struct.pack format
 // changes from "338f64s64s64s256s" to "372f64s64s64s256s".
+// BREAKING CHANGE (DFD sample playback / WAVE_SAMPLE): added sample_slot_root_note[
+// MAX_SAMPLE_SLOTS=16] (+16 floats) and one new trailing fixed string block,
+// sample_slot_path[MAX_SAMPLE_SLOTS][SAMPLE_PATH_LEN=256] (appended after record_path -- packs
+// as one flat 4096-byte blob, string bytes go from 448 to 4544) -- see load_sample_slot()/the
+// live-reload check in main(). This is deliberately the minimal wire shape needed to load and
+// test WAVE_SAMPLE end to end (see MAX_SAMPLE_SLOTS's comment) -- NOT the real per-note/velocity
+// zone mapping system, which is future work. New total: 388 float items + 4544 string bytes. The
+// Python side's struct.pack format changes from "372f64s64s64s256s" to "388f64s64s64s256s4096s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -447,6 +472,17 @@ typedef struct {
     float tempo_marker_time[TEMPO_MARKER_MAX]; // seconds since engine start
     float tempo_marker_bpm[TEMPO_MARKER_MAX];
 
+    // --- Sample Bank (DFD/WAVE_SAMPLE) ---
+    // Minimal loadable sample slots -- just enough to load and test WAVE_SAMPLE oscillator
+    // playback end to end (see MAX_SAMPLE_SLOTS's comment). Root note pairs with the matching
+    // entry in sample_slot_path[] (below, with the other trailing strings). main() detects a
+    // live change to a slot's path (compared against what it last loaded, same convention as the
+    // device-name live-reload checks) and calls load_sample_slot() on the audio thread -- see
+    // the DFD sample playback section above handle_note_on(). This is NOT per-note/velocity zone
+    // mapping (a single slot plays pitch-shifted across the whole keyboard, nearest-root-note
+    // wins between multiple loaded slots) -- that's future work for a Mapping tab.
+    float sample_slot_root_note[MAX_SAMPLE_SLOTS];
+
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
     // it last opened each stream with, and closes/reopens that stream on a live change via
@@ -468,6 +504,12 @@ typedef struct {
     // The frontend regenerates this to a fresh timestamped filename in the chosen Recordings
     // folder after every stop, so consecutive takes never collide/overwrite.
     char record_path[RECORD_PATH_LEN];
+
+    // Sample Bank file paths, paired with sample_slot_root_note[] above. Empty string = slot not
+    // loaded. A genuine 2D array of MAX_SAMPLE_SLOTS fixed SAMPLE_PATH_LEN-byte strings, laid out
+    // (char has alignment 1, so no padding) exactly like one flat SAMPLE_PATH_LEN*MAX_SAMPLE_SLOTS
+    // byte blob -- see the Python side's struct.pack format, which packs/unpacks it as one "Ns" field.
+    char sample_slot_path[MAX_SAMPLE_SLOTS][SAMPLE_PATH_LEN];
 } SynthSharedControls;
 
 // Clamp the live polyphony/block-size controls into their hard array-allocation ceilings.
@@ -585,6 +627,20 @@ typedef struct {
     // is held (see handle_note_off/handle_sustain_release). Cleared on any fresh retrigger of
     // this voice slot, since a new note-on makes whatever was pending before moot.
     bool sustain_pending;
+
+    // DFD (direct-from-disk) sample playback state, one per oscillator -- see render_sample_osc()
+    // and the SampleStream pool below. Only meaningful when vco1_shape/vco2_shape == WAVE_SAMPLE;
+    // otherwise vco*_sample_stream stays -1 and these are untouched. This voice OWNS the playback
+    // position (where in the sample we are); the SampleStream it points at owns the actual ring
+    // buffer/file handle (shared, disk-thread-managed resources drawn from a fixed pool -- see
+    // MAX_SAMPLE_STREAMS).
+    int vco1_sample_stream;   // index into g_sample_streams[], or -1 if none claimed
+    double vco1_sample_ptr;   // absolute frame position into the sample (pre-roll array while
+                               // vco1_sample_preroll, then the disk-streamed ring buffer after)
+    bool vco1_sample_preroll;
+    int vco2_sample_stream;
+    double vco2_sample_ptr;
+    bool vco2_sample_preroll;
 } SynthVoice;
 // FIXED: Restored 'p->s' to reference sustain data properties correctly
 void tick_adsr(ADSR *env, const PackEGParams *p, int mode) {
@@ -2038,6 +2094,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->tempo_bpm = 120.0f; // a common, neutral default tempo
     knobs->tempo_marker_count = 0.0f; // no tempo map programmed -- tempo_bpm alone applies
     for (int t = 0; t < TEMPO_MARKER_MAX; t++) { knobs->tempo_marker_time[t] = 0.0f; knobs->tempo_marker_bpm[t] = 0.0f; }
+    for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) { knobs->sample_slot_root_note[s] = 60.0f; knobs->sample_slot_path[s][0] = '\0'; }
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -2057,6 +2114,8 @@ static void init_voice(SynthVoice *voice) {
     voice->noise_tilt_lp = 0.0f;
     voice->sub_phase = (float)rand()/RAND_MAX; voice->sub_tri_state = 0.0f;
     for(int e=0; e<ASSIGNABLE_EG_COUNT; e++) { voice->assign_eg[e].state = STATE_IDLE; voice->assign_eg[e].current_level = 0.0f; voice->assign_eg[e].release_level = 0.0f; }
+    voice->vco1_sample_stream = -1; voice->vco1_sample_ptr = 0.0; voice->vco1_sample_preroll = false;
+    voice->vco2_sample_stream = -1; voice->vco2_sample_ptr = 0.0; voice->vco2_sample_preroll = false;
 }
 // Rolls a randomized glide-time multiplier for Mono Legato: 1.0 = no variation. glide_random_pct
 // (0-100) controls how far the multiplier can wander from 1.0 in either direction; floored well
@@ -2115,6 +2174,488 @@ static void mono_stack_remove(MonoNoteStack *stack, int note) {
         }
     }
 }
+
+// --- DFD (direct-from-disk) sample playback: WAVE_SAMPLE oscillator source ---
+//
+// A loaded .wav's audio data is far too large to keep resident in RAM (a multi-second sample at
+// 48kHz/stereo/float is tens of MB), so instead: the first SAMPLE_PRE_ROLL_LIMIT frames are
+// decoded into RAM once at load time (a few hundred KB, giving zero-latency note-on), and
+// everything after that streams from disk in real time on a dedicated thread into a lock-free
+// ring buffer -- the SAME architecture, and the same realtime-safety rationale, as the WAV
+// recorder above: fopen/fseek/fread are all blocking-time-unbounded, and this engine's main loop
+// paces live audio output via blocking ALSA writes that cannot tolerate a stall. The audio
+// thread here only ever does bounded, allocation-free work: a wait-free ring read plus linear
+// interpolation (render_sample_osc), exactly mirroring record_ring_push/record_ring_pop's role
+// in the recording engine. Ownership follows the identical convention: the disk thread is the
+// ONLY thing that ever opens/reads/closes a FILE* or writes into a ring buffer; the audio thread
+// only ever reads a ring buffer and publishes tiny atomic start/stop commands.
+//
+// This is deliberately the minimal shape needed to get WAVE_SAMPLE working correctly end to end
+// through HDS's own mature EG/filter/LFO/mod-matrix/FX-bus pipeline (see render_sample_osc's
+// comment) -- it is NOT the real per-note/velocity zone mapping system (SFZ-style), which is
+// explicitly future work once this engine itself is proven solid.
+
+// One loaded sample file's metadata plus its RAM pre-roll cache. Loaded via load_sample_slot(),
+// called from the audio thread only when the corresponding wire-protocol sample-slot path
+// actually changes (see the live-reload check in main()) -- never touched by the disk thread.
+typedef struct {
+    bool loaded;
+    char file_path[SAMPLE_PATH_LEN];
+    int root_note;               // MIDI note this sample plays back at its native (unpitched) rate
+    unsigned int data_start_offset;
+    unsigned int total_frames;
+    unsigned short num_channels;
+    unsigned short bits_per_sample;
+    unsigned short audio_format; // WAV fmt tag: 1 = PCM integer, 3 = IEEE float
+    unsigned int pre_roll_frames;
+    unsigned int loop_start, loop_end;
+    bool loop_enabled;
+    float *pre_roll_l;
+    float *pre_roll_r;
+} SampleSlot;
+
+static SampleSlot g_sample_slots[MAX_SAMPLE_SLOTS];
+
+#define SAMPLE_CHECK_READ(ptr, size, count, stream) \
+    do { if (fread(ptr, size, count, stream) != (size_t)(count)) { fclose(stream); return false; } } while (0)
+
+// Parses a standard RIFF/WAVE header (skipping any unrecognized chunks rather than assuming a
+// fixed layout), accepts PCM (16/24/32-bit int) or IEEE float (32-bit) data, and caches the
+// first pre_roll_frames frames into RAM as float -1..1. Only the first two channels of a
+// multichannel file are read (render_sample_osc downmixes to mono anyway -- see its comment);
+// any further channels are skipped, not left to desync subsequent frame reads. Loop points
+// default to a generic 40%-85% span of the sample -- a placeholder until real per-sample loop
+// point editing exists in a future Mapping tab.
+static bool load_sample_slot(int index, const char *path, int root_note) {
+    if (index < 0 || index >= MAX_SAMPLE_SLOTS) return false;
+    SampleSlot *slot = &g_sample_slots[index];
+
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[sample] failed to open '%s': %s\n", path, strerror(errno)); return false; }
+
+    char chunk_id[4];
+    fseek(f, 12, SEEK_SET);
+    SAMPLE_CHECK_READ(chunk_id, 1, 4, f);
+    while (strncmp(chunk_id, "fmt ", 4) != 0) {
+        unsigned int chunk_size;
+        SAMPLE_CHECK_READ(&chunk_size, 4, 1, f);
+        fseek(f, chunk_size, SEEK_CUR);
+        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return false; }
+    }
+
+    unsigned int subchunk1_size; unsigned short audio_format, num_channels;
+    unsigned int sample_rate, byte_rate; unsigned short block_align, bits_per_sample;
+    SAMPLE_CHECK_READ(&subchunk1_size, 4, 1, f);
+    SAMPLE_CHECK_READ(&audio_format, 2, 1, f);
+    SAMPLE_CHECK_READ(&num_channels, 2, 1, f);
+    SAMPLE_CHECK_READ(&sample_rate, 4, 1, f);
+    SAMPLE_CHECK_READ(&byte_rate, 4, 1, f);
+    SAMPLE_CHECK_READ(&block_align, 2, 1, f);
+    SAMPLE_CHECK_READ(&bits_per_sample, 2, 1, f);
+    (void)sample_rate; (void)byte_rate; (void)block_align;
+
+    if (audio_format != 1 && audio_format != 3) {
+        fprintf(stderr, "[sample] '%s': unsupported WAV format tag %u (need 1=PCM or 3=float)\n", path, audio_format);
+        fclose(f); return false;
+    }
+    if (audio_format == 1 && bits_per_sample != 16 && bits_per_sample != 24 && bits_per_sample != 32) {
+        fprintf(stderr, "[sample] '%s': unsupported %u-bit PCM\n", path, bits_per_sample);
+        fclose(f); return false;
+    }
+    if (audio_format == 3 && bits_per_sample != 32) {
+        fprintf(stderr, "[sample] '%s': float WAV must be 32-bit\n", path);
+        fclose(f); return false;
+    }
+    if (subchunk1_size > 16) fseek(f, subchunk1_size - 16, SEEK_CUR);
+
+    SAMPLE_CHECK_READ(chunk_id, 1, 4, f);
+    while (strncmp(chunk_id, "data", 4) != 0) {
+        unsigned int chunk_size;
+        SAMPLE_CHECK_READ(&chunk_size, 4, 1, f);
+        fseek(f, chunk_size, SEEK_CUR);
+        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return false; }
+    }
+    unsigned int data_size;
+    SAMPLE_CHECK_READ(&data_size, 4, 1, f);
+
+    int bytes_per_sample = bits_per_sample / 8;
+    unsigned int total_frames = data_size / (unsigned int)(num_channels * bytes_per_sample);
+
+    // Free whatever this slot held before -- a live reload (the GUI pointing this slot at a new
+    // file) replaces the cache outright. This runs on the audio thread, same as every other live
+    // wire-protocol change (device switches, etc.) -- see the live-reload check in main().
+    free(slot->pre_roll_l); free(slot->pre_roll_r);
+    slot->loaded = false;
+
+    snprintf(slot->file_path, SAMPLE_PATH_LEN, "%s", path);
+    slot->root_note = root_note;
+    slot->total_frames = total_frames;
+    slot->num_channels = num_channels;
+    slot->bits_per_sample = bits_per_sample;
+    slot->audio_format = audio_format;
+    slot->data_start_offset = (unsigned int)ftell(f);
+    slot->loop_enabled = true;
+    slot->loop_start = (unsigned int)(total_frames * 0.40);
+    slot->loop_end = (unsigned int)(total_frames * 0.85);
+    if (slot->loop_end >= total_frames) slot->loop_end = (total_frames > 5) ? total_frames - 5 : 0;
+    if (slot->loop_start >= slot->loop_end) slot->loop_start = 0;
+
+    unsigned int pre_roll_frames = (total_frames < SAMPLE_PRE_ROLL_LIMIT) ? total_frames : SAMPLE_PRE_ROLL_LIMIT;
+    slot->pre_roll_frames = pre_roll_frames;
+    slot->pre_roll_l = calloc((size_t)pre_roll_frames + 2, sizeof(float)); // +2: render_sample_osc reads one frame ahead
+    slot->pre_roll_r = calloc((size_t)pre_roll_frames + 2, sizeof(float));
+    if (!slot->pre_roll_l || !slot->pre_roll_r) { fclose(f); return false; }
+
+    short raw16; int raw32; float fsamp = 0.0f; unsigned char b24[3];
+    for (unsigned int i = 0; i < pre_roll_frames; i++) {
+        if (audio_format == 1) {
+            if (bits_per_sample == 16) { SAMPLE_CHECK_READ(&raw16, 2, 1, f); fsamp = (float)raw16 / 32768.0f; }
+            else if (bits_per_sample == 24) { SAMPLE_CHECK_READ(b24, 1, 3, f); int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fsamp = (float)v / 2147483648.0f; }
+            else { SAMPLE_CHECK_READ(&raw32, 4, 1, f); fsamp = (float)raw32 / 2147483648.0f; }
+        } else { SAMPLE_CHECK_READ(&fsamp, 4, 1, f); }
+        slot->pre_roll_l[i] = fsamp;
+
+        if (num_channels >= 2) {
+            if (audio_format == 1) {
+                if (bits_per_sample == 16) { SAMPLE_CHECK_READ(&raw16, 2, 1, f); fsamp = (float)raw16 / 32768.0f; }
+                else if (bits_per_sample == 24) { SAMPLE_CHECK_READ(b24, 1, 3, f); int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fsamp = (float)v / 2147483648.0f; }
+                else { SAMPLE_CHECK_READ(&raw32, 4, 1, f); fsamp = (float)raw32 / 2147483648.0f; }
+            } else { SAMPLE_CHECK_READ(&fsamp, 4, 1, f); }
+            slot->pre_roll_r[i] = fsamp;
+            if (num_channels > 2) fseek(f, (long)(num_channels - 2) * bytes_per_sample, SEEK_CUR);
+        } else {
+            slot->pre_roll_r[i] = fsamp;
+        }
+    }
+    fclose(f);
+    slot->loaded = true;
+    fprintf(stderr, "[sample] loaded slot %d: '%s' (%u frames, root note %d)\n", index, path, total_frames, root_note);
+    return true;
+}
+
+// A fixed pool of "currently streaming from disk" slots (see MAX_SAMPLE_STREAMS's comment on
+// why this is a pool, not one embedded per voice/oscillator). A voice's oscillator claims one at
+// note-on (if its shape is WAVE_SAMPLE) and releases it once that oscillator's amp envelope goes
+// idle -- see claim_sample_stream/release_sample_stream and their call sites in handle_note_on/
+// render_audio_block. Ownership mirrors RecordEngine/RecordRing exactly: the disk thread is the
+// ONLY thing that ever opens/reads/closes disk_file_handle or writes into the ring buffer; the
+// audio thread is the sole consumer (read_ptr, advanced by render_sample_osc). Start/stop is the
+// same tiny atomic command handshake used there -- the audio thread publishes a command, the
+// disk thread performs the actual I/O.
+typedef enum { SAMPLE_CMD_NONE = 0, SAMPLE_CMD_START, SAMPLE_CMD_STOP } SampleStreamCommand;
+
+typedef struct {
+    bool in_use;         // audio-thread-owned: is this pool entry currently claimed by a voice
+    _Atomic int slot_index; // which g_sample_slots[] entry -- set by the audio thread before
+                     // publishing START, read by the disk thread when it processes that command
+                     // (same handoff convention as RecordEngine.cmd_path). Atomic rather than
+                     // plain: the release-store on `command` right after this write normally
+                     // makes a plain field safe to read (standard release/acquire handoff), but a
+                     // pool slot can be released and reclaimed again before the disk thread gets
+                     // to run at all -- a THIRD claim's write can then land while the disk thread
+                     // is mid-read of the SECOND claim's value, which a plain int can't survive
+                     // race-free even though it's a rare timing window in practice. Atomic closes
+                     // that gap outright (no tearing, no UB) rather than relying on how unlikely
+                     // the window is.
+
+    float ring_l[SAMPLE_RING_SIZE];
+    float ring_r[SAMPLE_RING_SIZE];
+    _Atomic unsigned int write_ptr; // disk thread only
+    _Atomic unsigned int read_ptr;  // reset to 0 once by the disk thread at START (a new session
+                                     // begins there); owned by the audio thread from then on, but
+                                     // the disk thread also reads it (to compute free ring space)
+                                     // -- hence atomic, not plain.
+
+    _Atomic int command;              // SampleStreamCommand
+    FILE *disk_file_handle;           // disk-thread-owned exclusively
+    unsigned int disk_read_frame_pos; // disk-thread-owned: how far into the source file it's read
+    int active_slot_index;            // disk-thread-owned: private copy of slot_index, captured
+                                       // only once, at the instant the disk thread actually
+                                       // consumes SAMPLE_CMD_START (that read of slot_index IS
+                                       // properly synchronized, via the atomic acquire-exchange on
+                                       // `command` pairing with the audio thread's release-store
+                                       // in claim_sample_stream). Every other place the disk
+                                       // thread needs to know which slot it's streaming uses this
+                                       // copy instead of re-reading the audio-thread-owned
+                                       // `slot_index` field directly -- that plain field is only
+                                       // ever safe to read at the moment of consuming START; on
+                                       // every other loop pass (ordinary ongoing streaming, cmd ==
+                                       // NONE) there is no synchronization at all protecting it,
+                                       // so a fast release+reclaim of the same pool slot could
+                                       // have the audio thread overwrite it out from under an
+                                       // in-flight disk-thread read (caught by ThreadSanitizer).
+} SampleStream;
+
+static SampleStream g_sample_streams[MAX_SAMPLE_STREAMS];
+static pthread_t g_sample_disk_thread;
+static _Atomic bool g_sample_disk_thread_shutdown = false;
+
+// Claims a free pool slot for a NEW stream session (audio-thread only, called from
+// handle_note_on). Returns -1 if the pool is exhausted -- a real possibility if someone tries to
+// play more simultaneous WAVE_SAMPLE oscillators than MAX_SAMPLE_STREAMS; the caller treats -1
+// as "this oscillator stays silent until a slot frees up," never a crash.
+static int claim_sample_stream(int slot_index) {
+    for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
+        if (!g_sample_streams[i].in_use) {
+            g_sample_streams[i].in_use = true;
+            atomic_store_explicit(&g_sample_streams[i].slot_index, slot_index, memory_order_relaxed);
+            atomic_store_explicit(&g_sample_streams[i].command, SAMPLE_CMD_START, memory_order_release);
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Releases a claimed stream back to the pool (audio-thread only) and tells the disk thread to
+// close its file. Safe to call even if a STOP is already pending/being processed.
+static void release_sample_stream(int stream_index) {
+    if (stream_index < 0 || stream_index >= MAX_SAMPLE_STREAMS) return;
+    atomic_store_explicit(&g_sample_streams[stream_index].command, SAMPLE_CMD_STOP, memory_order_release);
+    g_sample_streams[stream_index].in_use = false;
+}
+
+static void *sample_disk_thread_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        bool work_done = false;
+        for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
+            SampleStream *st = &g_sample_streams[i];
+
+            int cmd = atomic_exchange_explicit(&st->command, SAMPLE_CMD_NONE, memory_order_acquire);
+            if (cmd == SAMPLE_CMD_START) {
+                if (st->disk_file_handle) { fclose(st->disk_file_handle); st->disk_file_handle = NULL; }
+                // This is the ONE place slot_index is safe to read: the acquire-exchange above
+                // pairs with claim_sample_stream's release-store of `command`, which happens
+                // after it writes slot_index -- so this read is guaranteed to see that write.
+                // Captured into active_slot_index (disk-thread-owned) for every later use this
+                // session, rather than re-reading the audio-thread-owned field again.
+                st->active_slot_index = atomic_load_explicit(&st->slot_index, memory_order_acquire);
+                SampleSlot *slot = (st->active_slot_index >= 0 && st->active_slot_index < MAX_SAMPLE_SLOTS) ? &g_sample_slots[st->active_slot_index] : NULL;
+                if (slot && slot->loaded) {
+                    st->disk_file_handle = fopen(slot->file_path, "rb");
+                    st->disk_read_frame_pos = slot->pre_roll_frames;
+                }
+                atomic_store_explicit(&st->write_ptr, 0, memory_order_relaxed);
+                atomic_store_explicit(&st->read_ptr, 0, memory_order_release);
+                work_done = true;
+            } else if (cmd == SAMPLE_CMD_STOP) {
+                if (st->disk_file_handle) { fclose(st->disk_file_handle); st->disk_file_handle = NULL; }
+                work_done = true;
+            }
+
+            if (!st->disk_file_handle) continue;
+            SampleSlot *slot = &g_sample_slots[st->active_slot_index];
+            int bytes_per_frame_unit = slot->bits_per_sample / 8;
+            int bytes_per_frame = bytes_per_frame_unit * slot->num_channels;
+
+            unsigned int r_ptr = atomic_load_explicit(&st->read_ptr, memory_order_acquire);
+            unsigned int w_ptr = atomic_load_explicit(&st->write_ptr, memory_order_relaxed);
+            unsigned int filled = (w_ptr - r_ptr) & SAMPLE_RING_MASK;
+            unsigned int free_space = SAMPLE_RING_SIZE - 1 - filled;
+            if (free_space < (unsigned int)BUFFER_SIZE) continue; // plenty already buffered -- nothing to do this pass
+
+            if (slot->loop_enabled && st->disk_read_frame_pos >= slot->loop_end) {
+                st->disk_read_frame_pos = slot->loop_start;
+            } else if (!slot->loop_enabled && st->disk_read_frame_pos >= slot->total_frames) {
+                continue; // nothing left to stream -- render_sample_osc handles end-of-sample itself
+            }
+
+            long byte_offset = (long)slot->data_start_offset + (long)st->disk_read_frame_pos * bytes_per_frame;
+            fseek(st->disk_file_handle, byte_offset, SEEK_SET);
+
+            unsigned int chunk = (free_space < (unsigned int)BUFFER_SIZE) ? free_space : (unsigned int)BUFFER_SIZE;
+            for (unsigned int c = 0; c < chunk; c++) {
+                if (slot->loop_enabled && st->disk_read_frame_pos >= slot->loop_end) {
+                    st->disk_read_frame_pos = slot->loop_start;
+                    byte_offset = (long)slot->data_start_offset + (long)st->disk_read_frame_pos * bytes_per_frame;
+                    fseek(st->disk_file_handle, byte_offset, SEEK_SET);
+                }
+                if (st->disk_read_frame_pos >= slot->total_frames) break;
+
+                float fl = 0.0f, fr = 0.0f; short raw16; int raw32; unsigned char b24[3];
+                if (slot->audio_format == 1) {
+                    if (slot->bits_per_sample == 16) {
+                        if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) break;
+                        fl = (float)raw16 / 32768.0f;
+                        if (slot->num_channels >= 2) { if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) break; fr = (float)raw16 / 32768.0f; } else fr = fl;
+                    } else if (slot->bits_per_sample == 24) {
+                        if (fread(b24, 1, 3, st->disk_file_handle) != 3) break;
+                        int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fl = (float)v / 2147483648.0f;
+                        if (slot->num_channels >= 2) { if (fread(b24, 1, 3, st->disk_file_handle) != 3) break; v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fr = (float)v / 2147483648.0f; } else fr = fl;
+                    } else {
+                        if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) break;
+                        fl = (float)raw32 / 2147483648.0f;
+                        if (slot->num_channels >= 2) { if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) break; fr = (float)raw32 / 2147483648.0f; } else fr = fl;
+                    }
+                } else {
+                    if (fread(&fl, 4, 1, st->disk_file_handle) != 1) break;
+                    if (slot->num_channels >= 2) { if (fread(&fr, 4, 1, st->disk_file_handle) != 1) break; } else fr = fl;
+                }
+                if (slot->num_channels > 2) fseek(st->disk_file_handle, (long)(slot->num_channels - 2) * bytes_per_frame_unit, SEEK_CUR);
+
+                unsigned int w = atomic_load_explicit(&st->write_ptr, memory_order_relaxed);
+                st->ring_l[w & SAMPLE_RING_MASK] = fl;
+                st->ring_r[w & SAMPLE_RING_MASK] = fr;
+                atomic_store_explicit(&st->write_ptr, w + 1, memory_order_release);
+                st->disk_read_frame_pos++;
+            }
+            work_done = true;
+        }
+
+        if (atomic_load_explicit(&g_sample_disk_thread_shutdown, memory_order_acquire)) break;
+        if (!work_done) { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); } // 1ms idle poll
+    }
+    return NULL;
+}
+
+// Finds the loaded sample slot whose root note is closest to `note` -- a simple, deliberately
+// crude placeholder for real per-note/velocity zone mapping (see MAX_SAMPLE_SLOTS's comment).
+// Returns -1 if nothing is loaded at all.
+static int find_nearest_sample_slot(int note) {
+    int best = -1, best_dist = 999999;
+    for (int i = 0; i < MAX_SAMPLE_SLOTS; i++) {
+        if (!g_sample_slots[i].loaded) continue;
+        int dist = abs(g_sample_slots[i].root_note - note);
+        if (dist < best_dist) { best_dist = dist; best = i; }
+    }
+    return best;
+}
+
+// Starts (or restarts) an oscillator's sample playback for a fresh note -- releases whatever
+// stream it might already hold (a retrigger/voice-steal case) and claims a new one if
+// find_nearest_sample_slot finds something loaded. Leaves *stream_idx at -1 (silent) if nothing
+// is loaded or the stream pool is exhausted, rather than failing the whole note-on.
+static void start_sample_osc(int *stream_idx, double *ptr, bool *preroll, int note) {
+    if (*stream_idx >= 0) { release_sample_stream(*stream_idx); *stream_idx = -1; }
+    int slot = find_nearest_sample_slot(note);
+    *ptr = 0.0;
+    *preroll = true;
+    *stream_idx = (slot >= 0) ? claim_sample_stream(slot) : -1;
+}
+
+// Called once per active voice per sample from render_audio_block, right after the EG tick loop
+// -- if an oscillator's amp envelope has gone idle but it's still holding a claimed sample
+// stream, releases it. Idempotent (stream_index stays -1 afterward, so this is a cheap no-op on
+// every subsequent call) and cheap enough to run unconditionally.
+static void release_idle_sample_streams(SynthVoice *voice) {
+    if (voice->vco1_eg.state == STATE_IDLE && voice->vco1_sample_stream >= 0) {
+        release_sample_stream(voice->vco1_sample_stream);
+        voice->vco1_sample_stream = -1;
+    }
+    if (voice->vco2_eg.state == STATE_IDLE && voice->vco2_sample_stream >= 0) {
+        release_sample_stream(voice->vco2_sample_stream);
+        voice->vco2_sample_stream = -1;
+    }
+}
+
+// Drop-in mono waveform source for a WAVE_SAMPLE oscillator, mirroring lookup_osc_sample's role
+// (called once per voice per sample from render_audio_block; its return value flows into the
+// exact same amp-EG/pan/filter/FX pipeline every other oscillator uses -- that's the entire
+// point of this design, per the user's direction: adapt sample playback to HDS's existing mature
+// architecture, not bring in a parallel one). `hz` is the SAME fully-modulated frequency (fine
+// tune, pitch bend, every mod-matrix pitch destination, portamento) already computed for the
+// periodic oscillators -- sample playback rate is just that divided by the sample's own
+// root-note frequency, so pitch bend/vibrato/EG-to-pitch all work on a sample voice for free,
+// with zero duplicated pitch logic.
+//
+// Natively stereo samples are downmixed to mono here (L+R averaged) and re-panned through the
+// same Pan knob every other oscillator uses -- a deliberate simplification (a hard-panned stereo
+// drum loop would lose its native width) in exchange for reusing one consistent mono-oscillator-
+// then-pan pipeline everywhere, rather than threading a parallel stereo path through the whole
+// mixer/filter/FX chain for this one oscillator type.
+static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll_inout, float hz) {
+    if (*stream_idx < 0) return 0.0f;
+    SampleStream *stream = &g_sample_streams[*stream_idx];
+    if (!stream->in_use) { *stream_idx = -1; return 0.0f; } // reclaimed elsewhere -- defensive, shouldn't happen
+    SampleSlot *slot = &g_sample_slots[atomic_load_explicit(&stream->slot_index, memory_order_relaxed)];
+    if (!slot->loaded) return 0.0f;
+
+    float root_hz = 440.0f * powf(2.0f, (float)(slot->root_note - 69) / 12.0f);
+    float ratio = (root_hz > 1.0f) ? fmaxf(0.01f, hz / root_hz) : 1.0f;
+
+    double ptr = *ptr_inout;
+    bool preroll = *preroll_inout;
+    float out_l = 0.0f, out_r = 0.0f;
+
+    if (preroll) {
+        unsigned int int_ptr = (unsigned int)ptr;
+        if (int_ptr >= slot->pre_roll_frames) {
+            // Hand off to the ring buffer. Carry the fractional remainder across the boundary
+            // (rather than hard-resetting to 0.0) so pitched playback (ratio != 1.0) doesn't lose
+            // or duplicate a fraction of a sample here -- ring index 0 is exactly file frame
+            // pre_roll_frames (see sample_disk_thread_main's SAMPLE_CMD_START handler), so this
+            // stays sample-accurate with the pre-roll cache's own indexing.
+            preroll = false;
+            ptr -= (double)slot->pre_roll_frames;
+        } else {
+            // Last valid pre-roll index (pre_roll_frames - 1) has no real "next" sample in this
+            // cache -- pre_roll_l/r are only populated up to pre_roll_frames - 1 (the trailing +2
+            // calloc'd frames are zero-padding purely to make this interpolation read safe, not
+            // real audio). Hold flat there instead of interpolating toward that zero pad, which
+            // would otherwise dip the output toward silence right before the transition.
+            unsigned int next_idx = int_ptr + 1;
+            bool has_next = next_idx < slot->pre_roll_frames;
+            float next_l = has_next ? slot->pre_roll_l[next_idx] : slot->pre_roll_l[int_ptr];
+            float next_r = has_next ? slot->pre_roll_r[next_idx] : slot->pre_roll_r[int_ptr];
+            float frac = (float)(ptr - (double)int_ptr);
+            out_l = slot->pre_roll_l[int_ptr] + frac * (next_l - slot->pre_roll_l[int_ptr]);
+            out_r = slot->pre_roll_r[int_ptr] + frac * (next_r - slot->pre_roll_r[int_ptr]);
+            ptr += ratio;
+        }
+    }
+
+    if (!preroll) {
+        unsigned int r_ptr = atomic_load_explicit(&stream->read_ptr, memory_order_acquire);
+        unsigned int w_ptr = atomic_load_explicit(&stream->write_ptr, memory_order_acquire);
+        unsigned int available = (w_ptr - r_ptr) & SAMPLE_RING_MASK;
+
+        if (available < (unsigned int)(SAMPLE_XFADE_SIZE + 2)) {
+            if (!slot->loop_enabled) {
+                // Natural end of a non-looping sample -- release the stream cleanly rather than
+                // read past what's actually been written. A genuinely-behind disk thread on a
+                // LOOPING sample instead just holds silent below rather than tearing the voice
+                // down (vanishingly rare given the pre-roll head start and the ring's depth).
+                release_sample_stream(*stream_idx);
+                *stream_idx = -1;
+                *ptr_inout = ptr; *preroll_inout = preroll;
+                return 0.0f;
+            }
+            *ptr_inout = ptr; *preroll_inout = preroll;
+            return 0.0f;
+        }
+
+        unsigned int int_ptr = (unsigned int)ptr;
+        float frac = (float)(ptr - (double)int_ptr);
+        unsigned int idx0 = (r_ptr + int_ptr) & SAMPLE_RING_MASK;
+        unsigned int idx1 = (idx0 + 1) & SAMPLE_RING_MASK;
+
+        unsigned int frames_left = available - int_ptr;
+        if (slot->loop_enabled && frames_left <= (unsigned int)SAMPLE_XFADE_SIZE && frames_left > 1) {
+            float fade_in = (float)(SAMPLE_XFADE_SIZE - frames_left) / (float)SAMPLE_XFADE_SIZE;
+            float fade_out = 1.0f - fade_in;
+            unsigned int widx0 = (r_ptr + int_ptr + (unsigned int)SAMPLE_XFADE_SIZE) & SAMPLE_RING_MASK;
+            unsigned int widx1 = (widx0 + 1) & SAMPLE_RING_MASK;
+            float base_l = stream->ring_l[idx0] + frac * (stream->ring_l[idx1] - stream->ring_l[idx0]);
+            float wrap_l = stream->ring_l[widx0] + frac * (stream->ring_l[widx1] - stream->ring_l[widx0]);
+            out_l = base_l * fade_out + wrap_l * fade_in;
+            float base_r = stream->ring_r[idx0] + frac * (stream->ring_r[idx1] - stream->ring_r[idx0]);
+            float wrap_r = stream->ring_r[widx0] + frac * (stream->ring_r[widx1] - stream->ring_r[widx0]);
+            out_r = base_r * fade_out + wrap_r * fade_in;
+        } else {
+            out_l = stream->ring_l[idx0] + frac * (stream->ring_l[idx1] - stream->ring_l[idx0]);
+            out_r = stream->ring_r[idx0] + frac * (stream->ring_r[idx1] - stream->ring_r[idx0]);
+        }
+
+        ptr += ratio;
+        while (ptr >= 1.0) { ptr -= 1.0; r_ptr++; }
+        atomic_store_explicit(&stream->read_ptr, r_ptr, memory_order_release);
+    }
+
+    *ptr_inout = ptr;
+    *preroll_inout = preroll;
+    return (out_l + out_r) * 0.5f;
+}
+
 static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
     int slot = -1;
     if (poly_mode_active) {
@@ -2173,6 +2714,22 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         // integrator still need a fresh-note reset, same as Osc 1/2.
         voices[slot].sub_phase = 0.0f; voices[slot].sub_tri_state = 0.0f;
         voices[slot].glide_time_multiplier = 1.0f; // fresh note -- no glide happening, nothing to randomize
+
+        // WAVE_SAMPLE: (re)claim a DFD stream for whichever oscillator is currently set to it,
+        // and release any stream a stolen/retriggered voice was still holding from a previous
+        // note even if this new note doesn't need one -- see start_sample_osc()'s comment.
+        if ((WaveType)((int)knobs->vco1_shape) == WAVE_SAMPLE) {
+            start_sample_osc(&voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, note);
+        } else if (voices[slot].vco1_sample_stream >= 0) {
+            release_sample_stream(voices[slot].vco1_sample_stream);
+            voices[slot].vco1_sample_stream = -1;
+        }
+        if ((WaveType)((int)knobs->vco2_shape) == WAVE_SAMPLE) {
+            start_sample_osc(&voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, note);
+        } else if (voices[slot].vco2_sample_stream >= 0) {
+            release_sample_stream(voices[slot].vco2_sample_stream);
+            voices[slot].vco2_sample_stream = -1;
+        }
         for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voices[slot].fa_low[c][f][0]=0.0f; voices[slot].fa_low[c][f][1]=0.0f; voices[slot].fa_band[c][f][0]=0.0f; voices[slot].fa_band[c][f][1]=0.0f; } voices[slot].fb_low[c][0]=0.0f; voices[slot].fb_low[c][1]=0.0f; voices[slot].fb_band[c][0]=0.0f; voices[slot].fb_band[c][1]=0.0f; }
         for (int l = 0; l < LFO_COUNT; l++) { if (knobs->lfo[l].key_sync != 0.0f) global_lfo_phases[l] = 0.0f; }
 
@@ -2482,6 +3039,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 else if(e==2) tick_adsr(&voices[v].noise_eg, &knobs->eg[e], (int)knobs->eg_mode[e]);
                 else tick_adsr(&voices[v].assign_eg[e-3], &knobs->eg[e], (int)knobs->eg_mode[e]);
             }
+            release_idle_sample_streams(&voices[v]); // WAVE_SAMPLE: free any DFD stream this voice's oscillator(s) no longer need
 
             // Mono Legato glide randomization: each voice's own glide_time_multiplier (rerolled
             // per glide event in handle_note_on/off) scales the plain Glide Time knob, so
@@ -2627,10 +3185,12 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float dt1 = hz1 / (float)SAMPLE_RATE, dt2 = hz2 / (float)SAMPLE_RATE;
 
             float v2_out = 0.0f, v2_side_l = 0.0f, v2_side_r = 0.0f;
-            if ((WaveType)((int)knobs->vco2_shape) == WAVE_UNISON_SAW) v2_out = render_unison_saw(voices[v].vco2_unison_saw_phases, dt2, vco2_unison_detune_final, vco2_unison_pan_l, vco2_unison_pan_r, phase_offset2, &v2_side_l, &v2_side_r);
+            WaveType vco2_shape_now = (WaveType)((int)knobs->vco2_shape);
+            if (vco2_shape_now == WAVE_UNISON_SAW) v2_out = render_unison_saw(voices[v].vco2_unison_saw_phases, dt2, vco2_unison_detune_final, vco2_unison_pan_l, vco2_unison_pan_r, phase_offset2, &v2_side_l, &v2_side_r);
+            else if (vco2_shape_now == WAVE_SAMPLE) v2_out = render_sample_osc(&voices[v].vco2_sample_stream, &voices[v].vco2_sample_ptr, &voices[v].vco2_sample_preroll, hz2);
             else {
                 float vco2_read_phase = fmodf(voices[v].vco2_phase + phase_offset2, 1.0f); if (vco2_read_phase < 0.0f) vco2_read_phase += 1.0f;
-                v2_out = lookup_osc_sample((WaveType)((int)knobs->vco2_shape), vco2_read_phase, dt2, vco2_pulse_width_final / 100.0f, &voices[v].vco2_tri_state);
+                v2_out = lookup_osc_sample(vco2_shape_now, vco2_read_phase, dt2, vco2_pulse_width_final / 100.0f, &voices[v].vco2_tri_state);
             }
             float gain2 = (knobs->vco2_mute != 0.0f || knobs->vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco2_vol + mix_bal + mod_vco2_amp));
             float osc2_amp = gain2 * voices[v].vco2_eg.current_level;
@@ -2652,9 +3212,11 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float fm_phase = voices[v].vco1_phase + (v2_modulator * fmaxf(0.0f, knobs->fm_intensity + fm_mod));
             fm_phase = fmodf(fm_phase + phase_offset1, 1.0f); if (fm_phase < 0.0f) fm_phase += 1.0f;
             float v1_out = 0.0f, v1_side_l = 0.0f, v1_side_r = 0.0f;
-            bool osc1_is_unison_saw = (WaveType)((int)knobs->vco1_shape) == WAVE_UNISON_SAW;
+            WaveType vco1_shape_now = (WaveType)((int)knobs->vco1_shape);
+            bool osc1_is_unison_saw = vco1_shape_now == WAVE_UNISON_SAW;
             if (osc1_is_unison_saw) v1_out = render_unison_saw(voices[v].vco1_unison_saw_phases, dt1, vco1_unison_detune_final, vco1_unison_pan_l, vco1_unison_pan_r, phase_offset1, &v1_side_l, &v1_side_r);
-            else v1_out = lookup_osc_sample((WaveType)((int)knobs->vco1_shape), fm_phase, dt1, vco1_pulse_width_final / 100.0f, &voices[v].vco1_tri_state);
+            else if (vco1_shape_now == WAVE_SAMPLE) v1_out = render_sample_osc(&voices[v].vco1_sample_stream, &voices[v].vco1_sample_ptr, &voices[v].vco1_sample_preroll, hz1);
+            else v1_out = lookup_osc_sample(vco1_shape_now, fm_phase, dt1, vco1_pulse_width_final / 100.0f, &voices[v].vco1_tri_state);
             float gain1 = (knobs->vco1_mute != 0.0f || knobs->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco1_vol - mix_bal + mod_vco1_amp));
             float osc1_amp = gain1 * voices[v].vco1_eg.current_level;
 
@@ -3279,6 +3841,17 @@ int main() {
     int recorder_input_channels_at_start = 0; // detected_input_channels when recording began, for the mid-take device-change safety check
     uint64_t record_last_reported_drops = 0;
 
+    // Sample-streaming disk thread (DFD/WAVE_SAMPLE) -- same "started once, lives for the
+    // process's lifetime, talked to only via atomics" pattern as the recording writer thread
+    // above. g_sample_streams/g_sample_slots are static/global (not local here) since they're
+    // shared with handle_note_on/render_sample_osc, which don't have access to main()'s locals.
+    bool sample_disk_thread_ok = (pthread_create(&g_sample_disk_thread, NULL, sample_disk_thread_main, NULL) == 0);
+    if (!sample_disk_thread_ok) {
+        fprintf(stderr, "[sample] failed to start disk streaming thread -- WAVE_SAMPLE playback will be unavailable this session\n");
+    }
+    char applied_sample_slot_path[MAX_SAMPLE_SLOTS][SAMPLE_PATH_LEN];
+    for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) applied_sample_slot_path[s][0] = '\0';
+
     snd_seq_t *seq_handle;
     int seq_err = snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
     if (seq_err < 0) {
@@ -3344,6 +3917,23 @@ int main() {
             // under the old selection and rescan under the new one.
             midi_autoconnect_scan(seq_handle, our_midi_port, active_knobs.midi_device, &midi_sources);
             snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
+        }
+
+        // Sample Bank live-reload: same convention as the device-name checks above -- if a
+        // slot's path actually changed since we last loaded it, load it now. Empty path is a
+        // valid "no change"/"nothing here" state, not an error. This runs on the audio thread
+        // (load_sample_slot briefly blocks on file I/O -- reading just the header plus decoding
+        // the pre-roll cache, a one-time bounded cost only paid on an explicit load action, not
+        // every block -- exactly like opening an audio/MIDI device live already does above).
+        for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) {
+            if (strncmp(active_knobs.sample_slot_path[s], applied_sample_slot_path[s], SAMPLE_PATH_LEN) != 0) {
+                if (active_knobs.sample_slot_path[s][0] != '\0') {
+                    load_sample_slot(s, active_knobs.sample_slot_path[s], (int)active_knobs.sample_slot_root_note[s]);
+                } else {
+                    g_sample_slots[s].loaded = false;
+                }
+                snprintf(applied_sample_slot_path[s], SAMPLE_PATH_LEN, "%s", active_knobs.sample_slot_path[s]);
+            }
         }
 
         process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack, our_midi_port, &midi_sources, &midi_live);
@@ -3508,6 +4098,12 @@ int main() {
         atomic_store_explicit(&record_engine.shutdown, true, memory_order_release);
         pthread_join(record_engine.thread, NULL);
     }
+    if (sample_disk_thread_ok) {
+        atomic_store_explicit(&g_sample_disk_thread_shutdown, true, memory_order_release);
+        pthread_join(g_sample_disk_thread, NULL);
+    }
+    for (int s = 0; s < MAX_SAMPLE_STREAMS; s++) if (g_sample_streams[s].disk_file_handle) fclose(g_sample_streams[s].disk_file_handle);
+    for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) { free(g_sample_slots[s].pre_roll_l); free(g_sample_slots[s].pre_roll_r); }
     if (client_fd >= 0) close(client_fd);
     if (server_fd >= 0) close(server_fd);
     unlink(socket_path);

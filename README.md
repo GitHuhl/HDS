@@ -6,7 +6,8 @@ A digital synthesizer split into two processes:
   audio directly to a PCM device, captures external audio from an input
   device, and exposes every synth parameter over a Unix domain socket
   (`/tmp/synth.sock`) as a fixed-layout packed struct (`SynthSharedControls`,
-  338 floats + 3 device name strings + 1 file path string). Also streams
+  388 floats + 3 device name strings + 1 file path string + 1 flat sample-
+  path-bank blob). Also streams
   back a small status struct (`EngineStatus`: peak level, recording state/
   elapsed time/error, detected input channel count) over the same socket --
   used to be a bare peak float before the Recording tab needed live state
@@ -137,10 +138,63 @@ A digital synthesizer split into two processes:
   correctly defers note-off until the pedal lifts, in both poly and mono
   modes, without leaking a stale "pending release" into a note that gets
   retriggered while the pedal is still down.
+
+  **Sample playback** (`WAVE_SAMPLE`, a 5th oscillator Shape alongside Saw/
+  Square/Triangle/Sine/Unison Saw/Noise/Pulse on Osc 1/2) is direct-from-disk
+  (DFD) streaming, not a fully RAM-resident sampler: a small "pre-roll"
+  cache (up to `SAMPLE_PRE_ROLL_LIMIT` = 7200 frames, ~150ms) is read into
+  RAM synchronously at load time for zero-latency note-on, and everything
+  after that streams from disk in real time into a per-voice ring buffer
+  (`SampleStream.ring_l/ring_r`, `SAMPLE_RING_SIZE` = 32768 frames). Adapted
+  to this engine's own architecture rather than bringing in a separate one:
+  a `WAVE_SAMPLE` oscillator's output is just another mono float handed to
+  the exact same downstream amp-EG/pan/filter/mod-matrix/FX pipeline every
+  other oscillator uses, and its playback rate is the same fully-modulated
+  `hz` (fine tune, pitch bend, every mod-matrix pitch destination,
+  portamento) already computed for the periodic oscillators, divided by the
+  sample's own root-note frequency -- pitch bend/vibrato/EG-to-pitch all
+  work on a sample voice for free, with zero duplicated pitch logic. A
+  small fixed pool (`MAX_SAMPLE_STREAMS` = 32, well under `MAX_VOICES`)
+  is claimed by an oscillator at note-on and released once that oscillator's
+  own amp envelope reaches `STATE_IDLE` (`release_idle_sample_streams()`,
+  called once per active voice per block) -- mirroring how FX-slot state
+  and voice-stealing already work here, rather than embedding a ring buffer
+  per-voice-per-oscillator.
+
+  All disk I/O (`fopen`/`fseek`/`fread`/`fclose`) runs on a **dedicated
+  streaming thread** (`sample_disk_thread_main`), the same realtime-safety
+  discipline as the WAV recorder above: the audio thread only ever claims/
+  releases a pool slot and reads/advances a lock-free ring buffer (C11
+  `<stdatomic.h>`, acquire/release read/write indices); starting or
+  stopping a stream is the same tiny atomic command handshake
+  (`SAMPLE_CMD_START`/`STOP`, `atomic_exchange_explicit`) used for the
+  recorder's start/stop. A claimed pool slot's `slot_index` (which
+  `g_sample_slots[]` entry it's streaming) is itself atomic and captured
+  once into a disk-thread-private copy the instant `SAMPLE_CMD_START` is
+  consumed, rather than re-read from the audio-thread-owned field on every
+  later pass -- closing a real race a fast release-then-reclaim of the same
+  pool slot could otherwise hit (caught and fixed via `-fsanitize=thread`).
+  A loop region (`loop_start`/`loop_end`, defaulting to a generic 40%-85%
+  span) crossfades the tail of the ring into its start over
+  `SAMPLE_XFADE_SIZE` (1024) frames to avoid an audible seam; a non-looping
+  sample instead releases its stream cleanly at natural end-of-data. Only
+  the first two channels of a multichannel WAV are read (native stereo is
+  downmixed L+R to mono, then re-panned through the same Pan knob every
+  other oscillator uses); PCM 16/24/32-bit and 32-bit float WAV are
+  supported.
+
+  This is deliberately minimal groundwork, not the finished sampler:
+  `find_nearest_sample_slot()` picks whichever loaded slot's root note is
+  closest to the played note (one slot plays pitch-shifted across the
+  whole keyboard, not real per-note/velocity zone mapping), and there's no
+  program-save capability yet. Real zone mapping (a dedicated Mapping tab)
+  and program save/load are future work once this engine itself is proven
+  solid -- see the Samples tab below for the minimal loader that exists
+  today.
 - **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
   knobs and draggable ADSR envelope graphs, tabbed into Play / Filters /
-  LFOs / Envelopes / FX / Audio / Recording. Packs the same struct
-  (`struct.pack("338f64s64s64s256s", ...)`) and sends it over the socket
+  LFOs / Envelopes / FX / Audio / Recording / Samples. Packs the same struct
+  (`struct.pack("388f64s64s64s256s4096s", ...)`) and sends it over the socket
   whenever a control changes. If it can't connect to the backend it falls
   back to a mock mode so the UI still runs standalone.
 
@@ -154,6 +208,15 @@ A digital synthesizer split into two processes:
   elapsed time (or a failure message, e.g. nothing selected/unwritable
   folder, that also cleanly clears `record_enable` on the wire rather than
   leaving the button checked against a backend that already gave up).
+
+  The **Samples** tab is a deliberately minimal loader for the DFD sample
+  engine above: a flat bank of `MAX_SAMPLE_SLOTS` (16) rows, each a Root
+  Note spin box (0-127) and a Browse/Clear file picker (`*.wav`) writing
+  into `sample_slot_root_note[]`/`sample_slot_path[]`. Set an oscillator's
+  Shape (Play tab) to "Sample" and play -- whichever loaded slot's Root
+  Note is closest to the note played is what sounds. This is intentionally
+  not the real per-note/velocity zone-mapping UI (a future Mapping tab);
+  it exists only so the engine can be loaded and played from the GUI.
 
   The Audio tab's Performance group has three real, direct engine controls:
   **Polyphony** (a plain spin box, 1-256 voices, default 32), **Block Size**
@@ -216,7 +279,7 @@ A digital synthesizer split into two processes:
   window is taller than the content needs.
 
 Engine features: 2 main oscillators (Saw/Square/Triangle/Sine/Unison
-Saw/Noise/Pulse) with FM and hard sync, a dedicated sub oscillator and
+Saw/Noise/Pulse/Sample) with FM and hard sync, a dedicated sub oscillator and
 noise oscillator, a 2-filter (A/B) architecture where Filter A can itself
 be a 3-filter Multi engine, 9 envelope generators (Osc1/Osc2/Noise amp +
 6 assignable, each switchable between ADSR/AR/AD/ASR/AHD/DADSR/AHDSR, with
