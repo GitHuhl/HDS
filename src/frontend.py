@@ -1160,22 +1160,35 @@ class ScalablePianoKeyboard(QWidget):
 
     def resizeEvent(self, event):
         total_width, total_height = self.width(), self.height()
-        white_width = total_width / len(self.white_keys)
-        black_width, black_height, white_height = white_width * 0.65, int(total_height * 0.60), total_height
-        current_white_idx = 0
-        white_left_positions, grid_positions = {}, {}
+        black_height, white_height = int(total_height * 0.60), total_height
+
+        # Every note gets its own exclusive, contiguous x-range -- zero gap, zero overlap with
+        # its neighbors. A physically-realistic keyboard instead centers each black key over the
+        # SEAM between its two white neighbors, so its rect overhangs a sliver of each of their
+        # lanes too (correct for how a real piano looks, since a black key visually overhangs
+        # that seam) -- but that overlap is exactly what let a drop or drag near a boundary
+        # resolve to the wrong note here, since get_note_at_x checks black keys first and their
+        # rect could still contain an x that's really inside the white key's own full-width lane.
+        # A mapping grid needs unambiguous snapping more than it needs photorealism, so lanes are
+        # a strict left-to-right partition instead: black-key lanes stay narrower (0.65x) for the
+        # same visual distinction, just placed edge-to-edge rather than overlapping.
+        total_units = sum(0.65 if (n % 12) in self.black_key_offsets else 1.0 for n in range(128))
+        unit_width = total_width / total_units
+        grid_positions = {}
+        x = 0.0
+        for note in range(128):
+            w = (0.65 if (note % 12) in self.black_key_offsets else 1.0) * unit_width
+            left_pos = int(round(x))
+            right_pos = int(round(x + w))
+            grid_positions[note] = (left_pos, right_pos - left_pos)
+            x += w
+
         for key in self.white_keys:
-            left_pos = int(current_white_idx * white_width)
-            actual_w = int((current_white_idx + 1) * white_width) - left_pos
-            key.setGeometry(left_pos, 0, actual_w, white_height)
-            white_left_positions[key.note_number], grid_positions[key.note_number] = left_pos, (left_pos, actual_w)
-            current_white_idx += 1
+            left_pos, w = grid_positions[key.note_number]
+            key.setGeometry(left_pos, 0, w, white_height)
         for key in self.black_keys:
-            base_white_note = key.note_number - 1
-            if base_white_note in white_left_positions:
-                left_pos = (white_left_positions[base_white_note] + int(white_width)) - int(black_width / 2)
-                key.setGeometry(left_pos, 0, int(black_width), black_height)
-                grid_positions[key.note_number] = (left_pos, int(black_width))
+            left_pos, w = grid_positions[key.note_number]
+            key.setGeometry(left_pos, 0, w, black_height)
         for b_key in self.black_keys: b_key.raise_()
         if self.grid_widget: self.grid_widget.update_grid_layout(grid_positions)
 
