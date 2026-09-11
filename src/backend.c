@@ -3444,7 +3444,16 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         // process_fx_chain's own comment for the routing rationale.
         process_fx_chain(knobs->fx, fx_engine, (int)knobs->fx_routing_mode, &mixed_l, &mixed_r);
 
-        float f_l = mixed_l * knobs->master_volume * 0.15f, f_r = mixed_r * knobs->master_volume * 0.15f;
+        // No extra fixed headroom pad here beyond master_volume itself -- there used to be a
+        // hardcoded *0.15 (~-16.5dB) on top of it, left over from before the always-on limiter
+        // below existed (it dates back to this engine's very first commit; the limiter came
+        // later). That pad was this engine's ONLY protection against summing-related clipping
+        // at the time, but the limiter now does that job properly (instant-attack, smooth-
+        // release gain reduction, explicitly designed for "several voices lining up" and
+        // "12 FX slots summed in Parallel routing" -- see its own comment right below), making
+        // the old pad pure redundant attenuation: quietly cutting every patch by ~16.5dB more
+        // than master_volume alone would, for no remaining safety benefit.
+        float f_l = mixed_l * knobs->master_volume, f_r = mixed_r * knobs->master_volume;
 
         // Always-on master safety limiter: the hard clamp two lines below guarantees the DAC
         // never sees a sample outside [-ceiling, ceiling], but on its own that's brick-wall
