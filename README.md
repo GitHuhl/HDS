@@ -6,12 +6,23 @@ A digital synthesizer split into two processes:
   audio directly to a PCM device, captures external audio from an input
   device, and exposes every synth parameter over a Unix domain socket
   (`/tmp/synth.sock`) as a fixed-layout packed struct (`SynthSharedControls`,
-  315 floats + 3 device name strings). Also streams back a peak-level float
+  316 floats + 3 device name strings). Also streams back a peak-level float
   for the GUI's VU meter. The final output stage carries an always-on
   safety limiter (instant attack, ~50ms release) ahead of a hard clamp, so
   an overload (e.g. several voices lining up, or Parallel FX routing
   summing 12 hot slots) degrades to smooth gain reduction rather than
   brick-wall clipping.
+
+  Polyphony is `MAX_VOICES` = 96 (up from 64) for headroom on fast/dense
+  playing (supersaw chords, sustain pedal piling up release tails). Idle
+  voice slots are near-free -- the per-voice render loops skip a slot the
+  instant it goes fully silent -- so this only costs real CPU when that many
+  voices are simultaneously *active*. Output latency is set by the ALSA
+  buffer target in `open_pcm_stream()` (currently 25ms), not by the internal
+  render chunk size (`BUFFER_SIZE` = 128 samples, ~2.7ms) -- see the comment
+  there before changing either; there isn't a clearly safe margin to cut it
+  further without re-benchmarking worst-case per-block CPU cost on the
+  actual target hardware, especially now that polyphony has gone up.
 
   MIDI input auto-connects with no `aconnect` ever needed: at startup it
   scans ALSA sequencer clients and subscribes to every real (kernel-backed,
@@ -31,31 +42,52 @@ A digital synthesizer split into two processes:
   modes, without leaking a stale "pending release" into a note that gets
   retriggered while the pedal is still down.
 - **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
-  knobs and draggable ADSR envelope graphs, tabbed into Global / Play /
-  Filters / LFOs / Envelopes / FX / Audio. Packs the same struct
-  (`struct.pack("315f64s64s64s", ...)`) and sends it over the socket
+  knobs and draggable ADSR envelope graphs, tabbed into Play / Filters /
+  LFOs / Envelopes / FX / Audio. Packs the same struct
+  (`struct.pack("316f64s64s64s", ...)`) and sends it over the socket
   whenever a control changes. If it can't connect to the backend it falls
   back to a mock mode so the UI still runs standalone.
 
-  The Global tab has a Pitch Bend Range group (two spin boxes, up/down, not
-  pots -- an incremental control that reads out in semitones) and a Sustain
-  Pedal Polarity group (Normal/Inverted), both near the Mono/Poly switch.
-  Right-clicking any LFO's Depth pot (without dragging -- a right-click
-  *drag* still does the existing fine-adjustment gesture) opens a
-  "Modulation Source" menu: None, Mod Wheel, Breath, Foot Controller,
-  Expression, Channel Aftertouch, or a custom CC number, which scales that
-  LFO's output live off the chosen MIDI source.
+  There is no Global tab -- Program name/Load/Save, Poly/Mono Legato, Hard
+  Sync, Pitch Bend Range, Sustain Pedal Polarity, FM Depth, and Glide all
+  live in the always-visible left sidebar (above the Output/VU strip)
+  instead, since they're relevant no matter which tab is open. The Pitch
+  Bend Range group is two spin boxes, up/down, not pots -- an incremental
+  control that reads out in semitones. Right-clicking any LFO's Depth pot
+  (without dragging -- a right-click *drag* still does the existing
+  fine-adjustment gesture) opens a "Modulation Source" menu: None, Mod
+  Wheel, Breath, Foot Controller, Expression, Channel Aftertouch, or a
+  custom CC number, which scales that LFO's output live off the chosen
+  MIDI source.
+
+  Envelope Attack/Decay/Release pots use a logarithmic ("audio taper")
+  response (`PotentiometerKnob.setLogTaper`) instead of a linear one, and
+  their floor dropped from 5-10ms to 1ms -- turning the knob now spends most
+  of its travel on the fast end (1-50ms) where the resolution actually
+  matters, rather than spreading it evenly across the full 1-2000ms range.
+  The Oscillators/Amp-EGs panel on the Play tab is wrapped in a
+  `QScrollArea` (same pattern as the FX tab) so the window can be resized
+  narrower than that panel's natural width without clipping anything --
+  it scrolls instead of forcing the whole app wide.
 
 Engine features: 2 main oscillators (Saw/Square/Triangle/Sine/Unison
 Saw/Noise/Pulse) with FM and hard sync, a dedicated sub oscillator and
 noise oscillator, a 2-filter (A/B) architecture where Filter A can itself
-be a 3-filter legacy engine, 9 envelope generators (Osc1/Osc2/Noise amp +
+be a 3-filter Multi engine, 9 envelope generators (Osc1/Osc2/Noise amp +
 6 assignable, each switchable between ADSR/AR/AD/ASR/AHD/DADSR/AHDSR, with
 the Sustain stage chaseable in real time while a note is held), 4 LFOs
 (each with its own MIDI Modulation Source), and a shared mod matrix
 routing LFOs and assignable EGs to pitch, amp, pan, pulse width, filter
 cutoff/resonance, FM depth, phase, unison detune, and the noise/sub
 oscillators' own amp, pan, and tilt.
+
+Filter A and B combine via the Filter Routing Matrix (Filters tab): Series
+A->B, Series B->A (the same two filters, reversed order -- audibly
+identical to A->B for static cutoff/resonance since two LTI filter cascades
+commute, but genuinely different once either is modulated in real time), or
+Parallel with an adjustable Blend knob (0 = all A, 100 = all B, 50 = even --
+replacing the old fixed 50/50 sum). Filter A's own Multi mode additionally
+offers Series/Parallel/Split routing across its 3 internal filters.
 
 A 12-slot FX bus (`FX` tab) runs on the full stereo mix, after Filter A/B
 and before master volume, routable Series (each slot fed the previous

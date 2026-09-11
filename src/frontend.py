@@ -273,6 +273,13 @@ class PotentiometerKnob(QWidget):
         # Source" menu) without stealing the existing right-drag fine-adjustment gesture.
         self._context_menu_callback = None
 
+        # Logarithmic ("audio taper") response: off by default. When enabled via setLogTaper(),
+        # drag/wheel input is mapped through log space instead of linearly, so a knob spanning
+        # e.g. 1-2000ms gives dramatically finer control near the low end (where fast envelope
+        # times live) at the cost of coarser control near the high end -- the same taper real
+        # synth hardware uses for time/frequency pots. Requires min_value > 0.
+        self._log_taper = False
+
         self._fade_timer = QTimer(self)
         self._fade_timer.setSingleShot(True)
         self._fade_timer.timeout.connect(self._hide_popup)
@@ -284,6 +291,28 @@ class PotentiometerKnob(QWidget):
     def setContextMenuCallback(self, callback):
         """callback(global_pos: QPoint) is called on a plain right-click (no drag)."""
         self._context_menu_callback = callback
+
+    def setLogTaper(self, enabled=True):
+        self._log_taper = enabled
+
+    def _value_to_norm(self, value):
+        """Real value -> normalized [0,1] drag/wheel position, honoring the log taper."""
+        if not self._log_taper:
+            span = self._max_value - self._min_value
+            return 0.0 if span <= 0 else (value - self._min_value) / span
+        lo = max(1e-6, float(self._min_value))
+        hi = max(lo * 1.0001, float(self._max_value))
+        v = max(lo, min(hi, float(value)))
+        return math.log(v / lo) / math.log(hi / lo)
+
+    def _norm_to_value(self, t):
+        """Normalized [0,1] drag/wheel position -> real value, honoring the log taper."""
+        t = max(0.0, min(1.0, t))
+        if not self._log_taper:
+            return self._min_value + t * (self._max_value - self._min_value)
+        lo = max(1e-6, float(self._min_value))
+        hi = max(lo * 1.0001, float(self._max_value))
+        return lo * ((hi / lo) ** t)
 
     def setRange(self, min_val, max_val):
         self._min_value = min_val
@@ -324,8 +353,13 @@ class PotentiometerKnob(QWidget):
         global_pos = event.globalPosition()
         delta_y = self._drag_anchor_global.y() - global_pos.y()
         sensitivity = 150.0 / self._drag_sensitivity_scale
-        range_span = self._max_value - self._min_value
-        val_delta = int((delta_y / sensitivity) * range_span)
+        if self._log_taper:
+            t_start = self._value_to_norm(self._value_start_drag)
+            t_new = max(0.0, min(1.0, t_start + delta_y / sensitivity))
+            val_delta = int(round(self._norm_to_value(t_new))) - self._value_start_drag
+        else:
+            range_span = self._max_value - self._min_value
+            val_delta = int((delta_y / sensitivity) * range_span)
         if val_delta != 0:
             self.setValue(self._value_start_drag + val_delta)
             self._value_start_drag = self._current_value
@@ -388,13 +422,21 @@ class PotentiometerKnob(QWidget):
         self._hover_timer.stop()
         degrees = event.angleDelta().y() / 8
         steps = degrees / 15
-        range_span = self._max_value - self._min_value
 
-        delta = max(1, int(range_span * 0.02))
-        if steps > 0:
-            self.setValue(self._current_value + delta)
-        elif steps < 0:
-            self.setValue(self._current_value - delta)
+        if self._log_taper:
+            t = self._value_to_norm(self._current_value)
+            step_t = 0.02  # 2% of the log-taper range per wheel click
+            if steps > 0:
+                self.setValue(int(round(self._norm_to_value(t + step_t))))
+            elif steps < 0:
+                self.setValue(int(round(self._norm_to_value(t - step_t))))
+        else:
+            range_span = self._max_value - self._min_value
+            delta = max(1, int(range_span * 0.02))
+            if steps > 0:
+                self.setValue(self._current_value + delta)
+            elif steps < 0:
+                self.setValue(self._current_value - delta)
 
         self._fade_timer.start(500)
         event.accept()
@@ -633,19 +675,19 @@ class InteractiveADSREnvelope(QWidget):
         if tag == "start":
             self.attack_level = level_frac
         elif tag == "delay":
-            self.delay = max(0.005, (clamped_x - anchor_x) / scale_x)
+            self.delay = max(0.001, (clamped_x - anchor_x) / scale_x)
         elif tag == "attack":
-            self.attack = max(0.005, (clamped_x - anchor_x) / scale_x)
+            self.attack = max(0.001, (clamped_x - anchor_x) / scale_x)
             self.attack_peak = level_frac
         elif tag == "hold":
-            self.hold = max(0.005, (clamped_x - anchor_x) / scale_x)
+            self.hold = max(0.001, (clamped_x - anchor_x) / scale_x)
         elif tag == "decay":
-            self.decay = max(0.005, (clamped_x - anchor_x) / scale_x)
+            self.decay = max(0.001, (clamped_x - anchor_x) / scale_x)
             self.sustain = level_frac
         elif tag == "sustain":
             self.sustain = level_frac
         elif tag == "release":
-            self.release = max(0.005, (w - margin - clamped_x) / scale_x)
+            self.release = max(0.001, (w - margin - clamped_x) / scale_x)
 
         self.valuesChanged.emit(
             int(self.delay * 1000), int(self.hold * 1000), int(self.attack * 1000),
@@ -709,10 +751,10 @@ class ADSRPanel(QGroupBox):
 
         self.columns["D"], self.dials["D"], self.dly_readout = self._make_dial_column("Dly", (0, 1000), 0, " ms")
         self.columns["H"], self.dials["H"], self.hold_readout = self._make_dial_column("Hld", (0, 1000), 0, " ms")
-        self.columns["A"], self.dials["A"], self.a_readout = self._make_dial_column("A", attack_range_ms, 10, " ms")
-        self.columns["D_phase"], self.dials["D_phase"], self.d_readout = self._make_dial_column("Dec", decay_range_ms, 150, " ms")
+        self.columns["A"], self.dials["A"], self.a_readout = self._make_dial_column("A", attack_range_ms, 10, " ms", log_taper=True)
+        self.columns["D_phase"], self.dials["D_phase"], self.d_readout = self._make_dial_column("Dec", decay_range_ms, 150, " ms", log_taper=True)
         self.columns["S"], self.dials["S"], self.s_readout = self._make_dial_column("S", (0, 100), 80, "%")
-        self.columns["R"], self.dials["R"], self.r_readout = self._make_dial_column("R", release_range_ms, 300, " ms")
+        self.columns["R"], self.dials["R"], self.r_readout = self._make_dial_column("R", release_range_ms, 300, " ms", log_taper=True)
 
         outer.addLayout(self.get_dial_row())
         self.setLayout(outer)
@@ -727,7 +769,7 @@ class ADSRPanel(QGroupBox):
     def get_dial_row(self):
         return self.dial_row
 
-    def _make_dial_column(self, label_text, value_range, default_value, suffix):
+    def _make_dial_column(self, label_text, value_range, default_value, suffix, log_taper=False):
         box_container = QWidget()
         box = QVBoxLayout(box_container); box.setContentsMargins(0, 0, 0, 0); box.setSpacing(0)
         lbl = QLabel(label_text); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter); lbl.setStyleSheet("font-size: 9px; font-weight: bold;")
@@ -735,6 +777,8 @@ class ADSRPanel(QGroupBox):
 
         dial = PotentiometerKnob(f"{label_text}", self)
         dial.setRange(*value_range); dial.setValue(default_value)
+        if log_taper:
+            dial.setLogTaper(True)
         box.addWidget(dial, alignment=Qt.AlignmentFlag.AlignCenter)
 
         readout = QLabel(f"{default_value}{suffix}"); readout.setAlignment(Qt.AlignmentFlag.AlignCenter); readout.setStyleSheet("font-size: 8px;")
@@ -819,7 +863,6 @@ class SynthGui(QWidget):
         self.tab_widget.setStyleSheet("QTabBar::tab { font-size: 13px; font-weight: bold; padding: 12px 18px; }")
 
         # Create independent content views for our tab deck
-        self.tab_global = QWidget()
         self.tab_play = QWidget()  # Renamed from tab_oscillators to tab_play
         self.tab_filters = QWidget()
         self.tab_lfos = QWidget()
@@ -828,9 +871,12 @@ class SynthGui(QWidget):
         self.tab_audio = QWidget()
 
         # ----------------------------------------------------
-        # INDEPENDENT COMPONENT: GENERAL SYSTEM SHELL
+        # GLOBAL CONTROLS: live in the always-visible left sidebar (not a tab) so Program,
+        # Poly/Mono, Hard Sync, Pitch Bend Range, Sustain Polarity, FM, and Glide are reachable
+        # no matter which tab is open -- there used to be a dedicated Global tab, but with the
+        # Filter Routing Matrix moved onto the Filters tab (it's filter-specific, not global),
+        # everything else here fit naturally into the sidebar instead, so the tab was removed.
         # ----------------------------------------------------
-        global_outer_lay = QVBoxLayout(self.tab_global)
         global_group = QGroupBox("Global Configurations")
         global_layout = QVBoxLayout(); global_layout.setSpacing(4)
 
@@ -936,25 +982,9 @@ class SynthGui(QWidget):
         global_layout.addWidget(self.glide_random_dial, alignment=Qt.AlignmentFlag.AlignCenter)
         self.glide_random_readout = QLabel("0%"); self.glide_random_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         global_layout.addWidget(self.glide_random_readout)
-        global_layout.addSpacing(4)
-
-        routing_box = QGroupBox("Filter Routing Matrix")
-        routing_lay = QVBoxLayout(); routing_lay.setSpacing(2); routing_lay.setContentsMargins(4, 4, 4, 4)
-
-        header_row = QHBoxLayout()
-        header_row.addWidget(QLabel("Signal Mode:"))
-        header_row.addStretch()
-        routing_lay.addLayout(header_row)
-
-        self.filter_routing_mode = QComboBox()
-        self.filter_routing_mode.addItems(["Series (mixer -> A -> B)", "Parallel (A // B summed 50/50)"])
-        routing_lay.addWidget(self.filter_routing_mode)
-        routing_box.setLayout(routing_lay)
-        global_layout.addWidget(routing_box)
         global_layout.addStretch()
 
         global_group.setLayout(global_layout)
-        global_outer_lay.addWidget(global_group)
 
         # ----------------------------------------------------
         # MASTER OUTPUT STRIP
@@ -982,7 +1012,23 @@ class SynthGui(QWidget):
         vol_box.addWidget(self.master_vol, alignment=Qt.AlignmentFlag.AlignCenter); meters_strip.addLayout(vol_box)
         master_strip_lay.addLayout(meters_strip)
 
-        outer_layout.addWidget(master_strip_widget, stretch=1)
+        # Left sidebar: Global Configurations stacked above Output, always visible regardless of
+        # which tab is open. Wrapped in a vertical QScrollArea (same pattern as the FX tab and
+        # the Play tab's oscillator panel) since this column is now much taller than it used to
+        # be as a single "Output" strip -- this way a shorter window scrolls the sidebar instead
+        # of clipping it or forcing the whole app taller.
+        left_sidebar_content = QWidget()
+        left_sidebar_lay = QVBoxLayout(left_sidebar_content)
+        left_sidebar_lay.setContentsMargins(0, 0, 0, 0); left_sidebar_lay.setSpacing(6)
+        left_sidebar_lay.addWidget(global_group)
+        left_sidebar_lay.addWidget(master_strip_widget)
+        left_sidebar_lay.addStretch()
+
+        left_sidebar_scroll = QScrollArea()
+        left_sidebar_scroll.setWidgetResizable(True)
+        left_sidebar_scroll.setWidget(left_sidebar_content)
+        left_sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer_layout.addWidget(left_sidebar_scroll, stretch=1)
         # ----------------------------------------------------
         # PLAY TAB CONTENT (FORMERLY OSCILLATORS)
         # ----------------------------------------------------
@@ -1315,9 +1361,9 @@ class SynthGui(QWidget):
         amp_eg_lay.setContentsMargins(4, 6, 4, 6)
         amp_eg_lay.setSpacing(6)
 
-        self.vco1_amp_eg = ADSRPanel("Osc 1 Amp EG", (5, 1000), (5, 2000), (10, 2000))
-        self.vco2_amp_eg = ADSRPanel("Osc 2 Amp EG", (5, 1000), (5, 2000), (10, 2000))
-        self.noise_amp_eg = ADSRPanel("Noise Amp EG", (5, 1000), (5, 2000), (10, 2000))
+        self.vco1_amp_eg = ADSRPanel("Osc 1 Amp EG", (1, 1000), (1, 2000), (1, 2000))
+        self.vco2_amp_eg = ADSRPanel("Osc 2 Amp EG", (1, 1000), (1, 2000), (1, 2000))
+        self.noise_amp_eg = ADSRPanel("Noise Amp EG", (1, 1000), (1, 2000), (1, 2000))
 
         self.btn_sync_amp_eg = QPushButton("1\u21922")
         self.btn_sync_amp_eg.setFixedSize(30, 16)
@@ -1342,7 +1388,19 @@ class SynthGui(QWidget):
         amp_eg_group.setLayout(amp_eg_lay)
 
         osc_outer_lay.addWidget(amp_eg_group, stretch=6)
-        tab_osc_root_lay.addWidget(self.osc_prog_widget)
+
+        # The 4 oscillator strips + 3 amp EGs side by side have a real minimum width (each strip
+        # reserves room for its Unison/Pulse Width sub-panels even while hidden, so the layout
+        # doesn't jump when the Shape combo changes -- see _retain_hidden). Wrapping the whole
+        # thing in a QScrollArea (same pattern as the FX tab) lets the window/panel itself be
+        # resized/collapsed narrower than that without clipping anything -- it just scrolls
+        # horizontally instead of forcing the whole app wide.
+        self.osc_prog_scroll = QScrollArea()
+        self.osc_prog_scroll.setWidgetResizable(True)
+        self.osc_prog_scroll.setWidget(self.osc_prog_widget)
+        self.osc_prog_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.osc_prog_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        tab_osc_root_lay.addWidget(self.osc_prog_scroll)
 
         # Combi mode content placeholder
         self.osc_combi_widget = QWidget()
@@ -1355,7 +1413,7 @@ class SynthGui(QWidget):
         tab_osc_root_lay.addWidget(self.osc_combi_widget)
         self.osc_combi_widget.setVisible(False)
 
-        self.osc_prog_radio.toggled.connect(self.osc_prog_widget.setVisible)
+        self.osc_prog_radio.toggled.connect(self.osc_prog_scroll.setVisible)
         self.osc_combi_radio.toggled.connect(self.osc_combi_widget.setVisible)
         # ----------------------------------------------------
         # FILTERS TAB CONTENT (2-FILTER OVERHAUL)
@@ -1363,6 +1421,46 @@ class SynthGui(QWidget):
         filters_outer_lay = QVBoxLayout(self.tab_filters)
         filters_column = QVBoxLayout()
         filters_column.setSpacing(6)
+
+        # Filter Routing Matrix: governs how Filter A and Filter B combine (Series/Parallel) --
+        # filter-specific, so it lives here rather than in the Global sidebar.
+        routing_box = QGroupBox("Filter Routing Matrix")
+        routing_lay = QVBoxLayout(); routing_lay.setSpacing(2); routing_lay.setContentsMargins(4, 4, 4, 4)
+
+        routing_header_row = QHBoxLayout()
+        routing_header_row.addWidget(QLabel("Signal Mode:"))
+        routing_header_row.addStretch()
+        routing_lay.addLayout(routing_header_row)
+
+        self.filter_routing_mode = QComboBox()
+        self.filter_routing_mode.addItems([
+            "Series (mixer -> A -> B)",
+            "Series Reversed (mixer -> B -> A)",
+            "Parallel (A // B, blend below)",
+        ])
+        routing_lay.addWidget(self.filter_routing_mode)
+
+        # Blend only matters in Parallel mode -- in either Series mode the chain order alone
+        # decides which filter is heard last, so the knob is hidden rather than just disabled.
+        self.filter_ab_blend_box = QWidget()
+        blend_lay = QHBoxLayout(self.filter_ab_blend_box)
+        blend_lay.setContentsMargins(0, 4, 0, 0); blend_lay.setSpacing(6)
+        blend_lay.addWidget(QLabel("Blend:"))
+        blend_lay.addWidget(QLabel("A"))
+        self.filter_ab_blend_dial = PotentiometerKnob("A/B Blend", self)
+        self.filter_ab_blend_dial.setRange(0, 100)
+        self.filter_ab_blend_dial.setValue(50)
+        blend_lay.addWidget(self.filter_ab_blend_dial)
+        blend_lay.addWidget(QLabel("B"))
+        blend_lay.addStretch()
+        routing_lay.addWidget(self.filter_ab_blend_box)
+        self.filter_routing_mode.currentIndexChanged.connect(
+            lambda idx: self.filter_ab_blend_box.setVisible(idx == 2)
+        )
+        self.filter_ab_blend_box.setVisible(False)
+
+        routing_box.setLayout(routing_lay)
+        filters_column.addWidget(routing_box)
 
         # Container list definitions for loop compilation connections
         self.cutoff_dials, self.q_dials, self.vcf_poles, self.vcf_types = [], [], [], []
@@ -1375,7 +1473,7 @@ class SynthGui(QWidget):
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("<b>Engine Mode:</b>"))
         self.filter_a_mode_combo = QComboBox()
-        self.filter_a_mode_combo.addItems(["Normal (Single Filter Core)", "Multi (Legacy 3-Filter Cascade)"])
+        self.filter_a_mode_combo.addItems(["Normal (Single Filter Core)", "Multi (3-Filter Cascade)"])
         mode_row.addWidget(self.filter_a_mode_combo)
         mode_row.addStretch()
         filter_a_lay.addLayout(mode_row)
@@ -1411,7 +1509,7 @@ class SynthGui(QWidget):
         a_norm_lay.addWidget(QLabel("Type:")); a_norm_lay.addWidget(v_type_a0)
         a_stack_lay.addWidget(self.filter_a_normal_view)
 
-        # Filter A Sub-Widget: Legacy Multi (Deploys 3 distinct blocks inside a sub-grid)
+        # Filter A Sub-Widget: Multi engine (deploys 3 distinct filter blocks in a sub-grid)
         self.filter_a_multi_view = QWidget()
         a_mult_outer = QVBoxLayout(self.filter_a_multi_view)
         a_mult_outer.setContentsMargins(0, 4, 0, 4); a_mult_outer.setSpacing(4)
@@ -1631,7 +1729,7 @@ class SynthGui(QWidget):
         self.envelopes, self.eg_dest_combos, self.eg_intensity_dials = [], [], []
 
         for x in range(1, 7):
-            panel = ADSRPanel(f"EG {x}", (5, 1000), (5, 2000), (10, 2000))
+            panel = ADSRPanel(f"EG {x}", (1, 1000), (1, 2000), (1, 2000))
             panel.title_layout.addStretch()
 
             lbl_int = QLabel("<font color='#00adb5'>Int:</font>")
@@ -1854,7 +1952,6 @@ class SynthGui(QWidget):
         # ----------------------------------------------------
         # ASSEMBLE AND ANCHOR TOUCH DECK TO ROOT LAYOUT
         # ----------------------------------------------------
-        self.tab_widget.addTab(self.tab_global, "Global")
         self.tab_widget.addTab(self.tab_play, "Play")
         self.tab_widget.addTab(self.tab_filters, "Filters")
         self.tab_widget.addTab(self.tab_lfos, "LFOs")
@@ -2057,8 +2154,9 @@ class SynthGui(QWidget):
             packet_list.append(float(panel.attack_peak_pct))
 
         # --- Overhauled Filter Section Pack Strategy ---
-        # Add Filter A/B outer routing mode (+1 item)
+        # Add Filter A/B outer routing mode (+1 item) and its Parallel-mode blend (+1 item)
         packet_list.append(float(self.filter_routing_mode.currentIndex()))
+        packet_list.append(float(self.filter_ab_blend_dial.value()))
 
         # Add Filter A engine mode (+1 item)
         packet_list.append(float(self.filter_a_mode_combo.currentIndex()))
@@ -2194,20 +2292,20 @@ class SynthGui(QWidget):
         packet_list.append(1.0 if self.sustain_polarity_inverted.isChecked() else 0.0)
 
         # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
-        # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_a_mode)
-        # + 4 (filter_a) + 1 (filter_a_multi_routing) + 12 (filter_a_multi[3] * 4)
+        # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
+        # + 1 (filter_a_mode) + 4 (filter_a) + 1 (filter_a_multi_routing) + 12 (filter_a_multi[3] * 4)
         # + 4 (filter_b) + 28 (4 LFOs * 7, incl. phase offset + mod_source_cc)
         # + 6 (eg_intensity) + 6 (eg_dest_target) + 9 (eg_mode)
         # + 4 (unison saw width/detune) + 1 (mono glide randomization)
         # + 2 (vco1/vco2 mute) + 1 (hard sync) + 2 (vco1/vco2 phase offset)
         # + 2 (vco1/vco2 pulse width) + 4 (noise osc: vol/pan/mute/tilt) + 4 (sub osc: shape/vol/pan/mute)
         # + 2 (ext in enable/gain) + 132 (12 FX slots * 11) + 1 (fx_routing_mode) + 2 (pb range)
-        # + 1 (sustain polarity) = 315 floats, followed by 3 fixed 64-byte device name strings
+        # + 1 (sustain polarity) = 316 floats, followed by 3 fixed 64-byte device name strings
         # (not floats): output_device, input_device, midi_device.
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
         binary_packet = struct.pack(
-            f"315f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
+            f"316f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
@@ -2265,6 +2363,7 @@ def runtime_connect_and_bind(gui):
     gui.vco1_phase.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco2_phase.valueChanged.connect(gui.transmit_knob_packet)
     gui.filter_routing_mode.currentIndexChanged.connect(gui.transmit_knob_packet)
+    gui.filter_ab_blend_dial.valueChanged.connect(gui.transmit_knob_packet)
 
     # Active filter configuration bindings
     gui.filter_a_mode_combo.currentIndexChanged.connect(gui.transmit_knob_packet)

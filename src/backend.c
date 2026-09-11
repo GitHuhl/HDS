@@ -15,7 +15,20 @@
 
 #define SAMPLE_RATE 48000
 #define BUFFER_SIZE 128
-#define MAX_VOICES  64
+// Raised from 64 for headroom on fast/dense playing (supersaw chords, sustain pedal piling up
+// release tails, etc). Idle voice slots are near-free -- render_audio_block's per-voice loops
+// skip a slot the instant all three of its amp envelopes go STATE_IDLE -- so this only costs
+// real CPU when that many voices are simultaneously ACTIVE, not just allocated. Benchmarked
+// (scratchpad/bench_realistic.c) against a worst-case patch (Unison Saw on both oscillators +
+// Filter A Multi mode + Filter B + all LFOs/EGs modulating): even the OLD 64-voice ceiling
+// already exceeded this sandbox's real-time budget well before 64 active voices in that
+// worst case, so this is a genuine headroom increase for real chords/passages, not a change
+// that makes an already-safe margin worse -- but the sandbox this was benchmarked on may not
+// reflect the actual deployment machine's performance, so if you hear underruns/xruns under
+// heavy patches at high voice counts, that's a real signal to profile on the target hardware
+// and consider trimming per-voice cost (e.g. Multi filter mode, dual Unison Saw) rather than
+// lowering this back down reflexively.
+#define MAX_VOICES  96
 #define LFO_COUNT   4
 #define ASSIGNABLE_EG_COUNT 6  // EG 1-6 (in addition to Osc 1 Amp, Osc 2 Amp, Noise Osc Amp)
 #define ENV_COUNT   (3 + ASSIGNABLE_EG_COUNT)  // Osc 1 Amp, Osc 2 Amp, Noise Osc Amp, + assignable EGs
@@ -153,6 +166,11 @@ typedef struct {
 // grow from 4 to 6 elements (+2 floats each) -- total +22 floats. New total: 315 float items +
 // 192 string bytes. The Python side's struct.pack format changes from "293f64s64s64s" to
 // "315f64s64s64s".
+// BREAKING CHANGE (Filter A/B routing audit): filter_ab_routing_mode grew from a 2-way
+// Series/Parallel switch to a 3-way switch (0=Series A->B, 1=Series B->A [new], 2=Parallel
+// [was 1]), and Parallel's fixed 50/50 blend became the adjustable filter_ab_blend (+1 new
+// trailing float). New total: 316 float items + 192 string bytes. The Python side's
+// struct.pack format changes from "315f64s64s64s" to "316f64s64s64s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -173,15 +191,23 @@ typedef struct {
     PackEGParams eg[ENV_COUNT];
 
     // --- FILTER SECTION (overhauled): 4 oscillators -> mixer -> Filter A -> Filter B, with
-    // A and B routable in Series or Parallel with each other (23 floats total).
+    // A and B routable in Series (either order) or Parallel with each other (24 floats total).
     //
-    // Filter A / Filter B outer routing: 0 = Series (mixer -> A -> B -> output),
-    // 1 = Parallel (mixer -> A, mixer -> B independently, summed 50/50 -> output). (+1 float)
+    // Filter A / Filter B outer routing: 0 = Series A->B (mixer -> A -> B -> output),
+    // 1 = Series B->A (mixer -> B -> A -> output -- same two filters, reversed order, e.g. to
+    // put Filter A's Multi mode after Filter B instead of before it), 2 = Parallel (mixer -> A,
+    // mixer -> B independently, blended by filter_ab_blend -> output). (+1 float)
     float filter_ab_routing_mode;
 
+    // Parallel-mode blend between Filter A and Filter B's independent outputs: 0 = all A,
+    // 100 = all B, 50 (default) = even blend, matching the old fixed-50/50 behavior. Unused in
+    // either Series mode, where the chain order alone decides which filter is "heard last".
+    // (+1 float)
+    float filter_ab_blend;
+
     // Filter A: a single Normal filter by default. Switching filter_a_mode to 1 ("Multi")
-    // replaces it with the legacy 3-filter engine below instead of filter_a -- i.e. this is
-    // the old 3-filter-stack behavior, now scoped down to being one of Filter A's two modes.
+    // replaces it with the 3-filter Multi engine below instead of filter_a -- the original
+    // 3-filter-stack design, now scoped down to being one of Filter A's two modes.
     // (+1 float for the mode switch, +4 for filter_a's own params)
     float filter_a_mode; // 0 = Normal (uses filter_a below), 1 = Multi (uses filter_a_multi* below)
     FilterParams filter_a;
@@ -341,7 +367,7 @@ typedef struct {
     ADSR vco2_eg;
 
     // Filter A's SVF register banks: [channel: 0=L,1=R][unit: 3 "units", unit 0 used alone in
-    // Normal mode, all 3 used as the legacy engine in Multi mode][cascade stage: 2, 2nd stage
+    // Normal mode, all 3 used as the Multi engine in Multi mode][cascade stage: 2, 2nd stage
     // only used when a unit's slope is set to 4-pole]. Independent per-voice AND per-channel --
     // Filter A/B now run as two fully independent mono filters (one per stereo channel) so that
     // each oscillator's Pan placement survives the trip through the filters instead of being
@@ -504,7 +530,7 @@ static float run_svf_filter(float input, float cutoff_hz, float res_q, int filte
     return sig;
 }
 
-// Filter A's "Multi" mode: the legacy 3-filter engine, now scoped down to being one of Filter
+// Filter A's "Multi" mode: the original 3-filter engine, now scoped down to being one of Filter
 // A's two modes (see the FilterParams/filter_a_multi comments in the struct). Processes a
 // single channel (called once for L, once for R -- see render_audio_block); each channel keeps
 // its own independent state so panning survives filtering.
@@ -1256,7 +1282,8 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->portamento_time_ms = 150.0f; knobs->master_volume = 0.50f;
     knobs->vco1_pan = 0.0f; knobs->vco2_pan = 0.0f;
     knobs->vco1_fine_tune = 0.0f; knobs->vco2_pitch_offset = 0.0f; knobs->vco2_fine_tune = 0.0f;
-    knobs->filter_ab_routing_mode = 0.0f; // Series: mixer -> A -> B
+    knobs->filter_ab_routing_mode = 0.0f; // Series A->B: mixer -> A -> B
+    knobs->filter_ab_blend = 50.0f; // even blend, only used in Parallel mode
     knobs->filter_a_mode = 0.0f; // Normal (single filter)
     knobs->filter_a.cutoff = 800.0f; knobs->filter_a.res_q = 20.0f; knobs->filter_a.slope_poles = 0.0f; knobs->filter_a.filter_type = 1.0f;
     knobs->filter_a_multi_routing = 0.0f; // Series, matching the old default 3-filter behavior
@@ -1920,33 +1947,58 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float stage_in_l = vco1_l + vco2_l + sub_l + noise_l;
             float stage_in_r = vco1_r + vco2_r + sub_r + noise_r;
 
-            // --- Filter A: Normal (single filter) or Multi (legacy 3-filter engine). Run once
-            // per channel -- each channel keeps fully independent filter state (fa_low/fa_band's
-            // [channel] dimension) so stereo placement isn't lost going through the filter. ---
-            float a_out_l, a_out_r;
-            if ((int)knobs->filter_a_mode == 0) {
-                a_out_l = run_svf_filter(stage_in_l, knobs->filter_a.cutoff + filter_cutoff_mods[0], knobs->filter_a.res_q + filter_res_mods[0], (int)knobs->filter_a.filter_type, (int)knobs->filter_a.slope_poles, voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
-                a_out_r = run_svf_filter(stage_in_r, knobs->filter_a.cutoff + filter_cutoff_mods[0], knobs->filter_a.res_q + filter_res_mods[0], (int)knobs->filter_a.filter_type, (int)knobs->filter_a.slope_poles, voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
+            // --- Filter A/B: Filter A is Normal (single filter) or Multi (3-filter engine);
+            // Filter B is always a single Normal filter. Each runs once per channel -- every
+            // channel keeps fully independent filter state (fa_low/fa_band/fb_low/fb_band's
+            // [channel] dimension) so stereo placement isn't lost going through the filters.
+            //
+            // Only unit 0 and unit 2 of Filter A's Multi engine have a dedicated mod destination
+            // (see the comment by filter_cutoff_mods above) -- unit 1's mods are always 0.
+            float multi_cutoff_mods[3] = { filter_cutoff_mods[0], 0.0f, filter_cutoff_mods[2] };
+            float multi_res_mods[3] = { filter_res_mods[0], 0.0f, filter_res_mods[2] };
+
+            float a_out_l, a_out_r, b_out_l, b_out_r;
+            int ab_mode = (int)knobs->filter_ab_routing_mode; // 0=Series A->B, 1=Series B->A, 2=Parallel
+            if (ab_mode == 1) {
+                // Series B -> A: run B first on the raw mix, then A on B's output -- the same
+                // two filters as mode 0, just reversed, e.g. to put Filter A's Multi engine
+                // after Filter B instead of before it.
+                b_out_l = run_svf_filter(stage_in_l, knobs->filter_b.cutoff + filter_cutoff_mods[1], knobs->filter_b.res_q + filter_res_mods[1], (int)knobs->filter_b.filter_type, (int)knobs->filter_b.slope_poles, voices[v].fb_low[0], voices[v].fb_band[0]);
+                b_out_r = run_svf_filter(stage_in_r, knobs->filter_b.cutoff + filter_cutoff_mods[1], knobs->filter_b.res_q + filter_res_mods[1], (int)knobs->filter_b.filter_type, (int)knobs->filter_b.slope_poles, voices[v].fb_low[1], voices[v].fb_band[1]);
+                if ((int)knobs->filter_a_mode == 0) {
+                    a_out_l = run_svf_filter(b_out_l, knobs->filter_a.cutoff + filter_cutoff_mods[0], knobs->filter_a.res_q + filter_res_mods[0], (int)knobs->filter_a.filter_type, (int)knobs->filter_a.slope_poles, voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
+                    a_out_r = run_svf_filter(b_out_r, knobs->filter_a.cutoff + filter_cutoff_mods[0], knobs->filter_a.res_q + filter_res_mods[0], (int)knobs->filter_a.filter_type, (int)knobs->filter_a.slope_poles, voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
+                } else {
+                    a_out_l = run_filter_a_multi(b_out_l, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
+                    a_out_r = run_filter_a_multi(b_out_r, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
+                }
             } else {
-                // Only unit 0 and unit 2 have a dedicated mod destination (see the comment by
-                // filter_cutoff_mods above) -- unit 1's mods are always 0.
-                float multi_cutoff_mods[3] = { filter_cutoff_mods[0], 0.0f, filter_cutoff_mods[2] };
-                float multi_res_mods[3] = { filter_res_mods[0], 0.0f, filter_res_mods[2] };
-                a_out_l = run_filter_a_multi(stage_in_l, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
-                a_out_r = run_filter_a_multi(stage_in_r, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
+                // Series A -> B (0), or Parallel (2): run A first on the raw mix.
+                if ((int)knobs->filter_a_mode == 0) {
+                    a_out_l = run_svf_filter(stage_in_l, knobs->filter_a.cutoff + filter_cutoff_mods[0], knobs->filter_a.res_q + filter_res_mods[0], (int)knobs->filter_a.filter_type, (int)knobs->filter_a.slope_poles, voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
+                    a_out_r = run_svf_filter(stage_in_r, knobs->filter_a.cutoff + filter_cutoff_mods[0], knobs->filter_a.res_q + filter_res_mods[0], (int)knobs->filter_a.filter_type, (int)knobs->filter_a.slope_poles, voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
+                } else {
+                    a_out_l = run_filter_a_multi(stage_in_l, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
+                    a_out_r = run_filter_a_multi(stage_in_r, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
+                }
+                // Series: B fed from A's output. Parallel: B fed straight from the mixer, same as A.
+                float b_in_l = (ab_mode == 0) ? a_out_l : stage_in_l;
+                float b_in_r = (ab_mode == 0) ? a_out_r : stage_in_r;
+                b_out_l = run_svf_filter(b_in_l, knobs->filter_b.cutoff + filter_cutoff_mods[1], knobs->filter_b.res_q + filter_res_mods[1], (int)knobs->filter_b.filter_type, (int)knobs->filter_b.slope_poles, voices[v].fb_low[0], voices[v].fb_band[0]);
+                b_out_r = run_svf_filter(b_in_r, knobs->filter_b.cutoff + filter_cutoff_mods[1], knobs->filter_b.res_q + filter_res_mods[1], (int)knobs->filter_b.filter_type, (int)knobs->filter_b.slope_poles, voices[v].fb_low[1], voices[v].fb_band[1]);
             }
 
-            // --- Filter B: always a single Normal filter, also run once per channel ---
-            bool ab_series = (int)knobs->filter_ab_routing_mode == 0;
-            float b_in_l = ab_series ? a_out_l : stage_in_l; // Series: chained from A's output. Parallel: fed straight from the mixer, same as A.
-            float b_in_r = ab_series ? a_out_r : stage_in_r;
-            float b_out_l = run_svf_filter(b_in_l, knobs->filter_b.cutoff + filter_cutoff_mods[1], knobs->filter_b.res_q + filter_res_mods[1], (int)knobs->filter_b.filter_type, (int)knobs->filter_b.slope_poles, voices[v].fb_low[0], voices[v].fb_band[0]);
-            float b_out_r = run_svf_filter(b_in_r, knobs->filter_b.cutoff + filter_cutoff_mods[1], knobs->filter_b.res_q + filter_res_mods[1], (int)knobs->filter_b.filter_type, (int)knobs->filter_b.slope_poles, voices[v].fb_low[1], voices[v].fb_band[1]);
-
-            // --- Combine A and B: Series means B is simply the final stage; Parallel means both
-            // are heard side by side, summed evenly ---
-            mixed_l += ab_series ? b_out_l : (a_out_l + b_out_l) * 0.5f;
-            mixed_r += ab_series ? b_out_r : (a_out_r + b_out_r) * 0.5f;
+            // --- Combine A and B: either Series mode means whichever filter ran last is simply
+            // the final stage; Parallel means both are heard side by side, blended by
+            // filter_ab_blend (0=all A, 100=all B, 50=even -- matches the old fixed 50/50). ---
+            if (ab_mode == 2) {
+                float blend = fmaxf(0.0f, fminf(1.0f, knobs->filter_ab_blend / 100.0f));
+                mixed_l += a_out_l * (1.0f - blend) + b_out_l * blend;
+                mixed_r += a_out_r * (1.0f - blend) + b_out_r * blend;
+            } else {
+                mixed_l += (ab_mode == 1) ? a_out_l : b_out_l;
+                mixed_r += (ab_mode == 1) ? a_out_r : b_out_r;
+            }
         }
         // LFO Phase as a mod destination (targets 28-31): computed once per sample (not per
         // voice, since LFOs are one resource shared by every voice) from other LFOs' outputs and
@@ -2035,6 +2087,17 @@ static bool open_pcm_stream(const char *device_name, snd_pcm_stream_t stream, sn
         *handle = NULL;
         return false;
     }
+    // LATENCY: this 25000us (25ms) target -- not BUFFER_SIZE -- is what actually sets the
+    // floor on output latency. BUFFER_SIZE (128 samples = ~2.7ms) only controls how small the
+    // chunks are that we hand to ALSA each main-loop iteration (so a fresh MIDI event waits at
+    // most one block before it's reflected in the stream, plus small per-write syscall
+    // overhead) -- it does NOT change how deep the ALSA ring buffer itself is. Lowering this
+    // value shrinks the safety margin against underruns/xruns (audible crackling/dropouts)
+    // exactly when CPU load spikes hardest -- dense chords, heavy Unison Saw + Filter A Multi
+    // mode + lots of LFO/EG modulation, i.e. precisely the "fast supersaw" scenario MAX_VOICES
+    // was raised for. Do not lower this reflexively; if you do, re-benchmark worst-case CPU
+    // cost per block (see scratchpad bench_realistic.c from that MAX_VOICES change) against the
+    // new, smaller margin on the ACTUAL target hardware, not just in a dev sandbox.
     err = snd_pcm_set_params(*handle, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, SAMPLE_RATE, 1, 25000);
     if (err < 0) {
         fprintf(stderr, "%s device '%s' failed to configure: %s\n", stream == SND_PCM_STREAM_PLAYBACK ? "Output" : "Input", device_name, snd_strerror(err));
