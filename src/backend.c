@@ -1798,7 +1798,16 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float mod_sub_amp = 0.0f, mod_sub_pan = 0.0f;
 
             for (int l = 0; l < LFO_COUNT; l++) {
-                int target = (int)knobs->lfo[l].dest_target; float val = lfo_out[l];
+                int target = (int)knobs->lfo[l].dest_target;
+                // PERF: target 0 ("None") is the common case for any LFO not actually routed
+                // to a destination -- skip straight past the ~19-branch dispatch chain below
+                // instead of evaluating every one of them for nothing. This loop runs per
+                // ACTIVE voice per sample, so on a plain unmodulated patch this was burning a
+                // measurable chunk of every block's CPU budget on comparisons that could never
+                // match (found via real-world underrun diagnostics: a 33-voice plain sawtooth
+                // patch, no modulation configured at all, was already blowing the block budget).
+                if (target == 0) continue;
+                float val = lfo_out[l];
                 if (target == 1) mod_vco1_pitch += val * 1200.0f;
                 if (target == 2) mod_vco2_pitch += val * 1200.0f;
                 if (target == 3) { mod_vco1_pitch += val * 1200.0f; mod_vco2_pitch += val * 1200.0f; }
@@ -1831,7 +1840,11 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // not the corresponding LFO's destination -- the GUI already had a per-EG destination
             // dropdown, but it was never wired to anything back here.
             for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) {
-                int target = (int)knobs->eg_dest_target[e]; float val = voices[v].assign_eg[e].current_level * knobs->eg_intensity[e];
+                int target = (int)knobs->eg_dest_target[e];
+                // PERF: same early-out as the LFO loop above -- target 0 ("None") is the
+                // common case for an assignable EG not routed anywhere.
+                if (target == 0) continue;
+                float val = voices[v].assign_eg[e].current_level * knobs->eg_intensity[e];
                 if (target == 1) mod_vco1_pitch += val * 1200.0f;
                 if (target == 2) mod_vco2_pitch += val * 1200.0f;
                 if (target == 3) { mod_vco1_pitch += val * 1200.0f; mod_vco2_pitch += val * 1200.0f; }
