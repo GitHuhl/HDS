@@ -11,6 +11,7 @@
 #include <sys/un.h>
 #include <errno.h>
 #include <string.h>
+#include <stdint.h>
 
 #define SAMPLE_RATE 48000
 #define BUFFER_SIZE 128
@@ -88,6 +89,11 @@ typedef struct {
 // effect's own algorithm needs (a delay's time/feedback/tone, a reverb's size/damp/predelay,
 // etc.); each effect interprets its own subset however it needs to once ported in.
 #define FX_TYPE_OFF 0
+// Ported from Airwindows StereoEnsemble (MIT license). Not a reverb -- a 12-tap fixed-delay
+// ensemble/chorus (no feedback loop). param[0] = Depth (0..1, widens/lengthens the 12 delay
+// taps), param[1] = FX Level (0..1, this effect's OWN internal wet/dry balance -- separate
+// from and applied in addition to the slot's generic `mix` above). See run_fx_ensemble().
+#define FX_TYPE_ENSEMBLE 1
 #define FX_SLOT_PARAM_COUNT 8
 typedef struct {
     float fx_type;
@@ -475,6 +481,166 @@ static void reset_fx_engine(FXSlotEngine engine[FX_SLOT_COUNT]) {
     for (int s = 0; s < FX_SLOT_COUNT; s++) { engine[s].active_type = FX_TYPE_OFF; engine[s].state = NULL; }
 }
 
+// --- FX_TYPE_ENSEMBLE: ported from Airwindows StereoEnsemble (MIT license) ---
+// A 12-tap fixed-delay ensemble/chorus: 6 delay pairs (A/B, C/D, ... K/L), one tap of each pair
+// reading Left and the other reading Right, each pair's two lengths deliberately mismatched
+// (e.g. 7481 vs 7523 samples) so the two channels decorrelate into a wide stereo image, summed
+// with fixed per-tap gain weights. No feedback loop -- this is NOT a reverb.
+//
+// Buffer sizes are each exactly (base tap length + 10), matching the original header, giving
+// headroom over the largest length any tap can reach (base * ~0.9933, at Depth=1.0 -- see
+// delayfactor below).
+typedef struct {
+    float dA[7491], dB[7533];
+    float dC[5789], dD[5747];
+    float dE[4841], dF[4871];
+    float dG[3119], dH[3089];
+    float dI[2213], dJ[2223];
+    float dK[1337], dL[1331];
+
+    int oneA, oneB, oneC, oneD, oneE, oneF;
+    int oneG, oneH, oneI, oneJ, oneK, oneL;
+    int maxdelayA, maxdelayB, maxdelayC, maxdelayD, maxdelayE, maxdelayF;
+    int maxdelayG, maxdelayH, maxdelayI, maxdelayJ, maxdelayK, maxdelayL;
+
+    // Downsampling ladder: the original plugin only actually renders a fresh ensemble sample
+    // every cycle_end samples (1 at 44.1/48k, up to 4 at 176/192k) to save CPU at high sample
+    // rates, interpolating the skipped samples from lastRef*. cycle_end is derived once from
+    // SAMPLE_RATE (a compile-time constant here) and never changes again for this slot's life.
+    float lastRefL[7], lastRefR[7];
+    int cycle;
+    int cycle_end;
+
+    uint32_t fpdL, fpdR;
+} FxEnsembleState;
+
+static void run_fx_ensemble(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxEnsembleState *st = (FxEnsembleState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxEnsembleState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+        st->oneA = st->oneB = st->oneC = st->oneD = st->oneE = st->oneF = 1;
+        st->oneG = st->oneH = st->oneI = st->oneJ = st->oneK = st->oneL = 1;
+        int cycle_end = SAMPLE_RATE / 44100; if (cycle_end < 1) cycle_end = 1; if (cycle_end > 4) cycle_end = 4;
+        st->cycle_end = cycle_end;
+        st->fpdL = (uint32_t)rand(); while (st->fpdL < 16386) st->fpdL = (uint32_t)rand();
+        st->fpdR = (uint32_t)rand(); while (st->fpdR < 16386) st->fpdR = (uint32_t)rand();
+    }
+
+    // param[0] = Depth, param[1] = FX Level -- both 0..1 (see the FX_TYPE_ENSEMBLE comment above).
+    float depth = fmaxf(0.0f, fminf(1.0f, params->param[0]));
+    float outlevel = fmaxf(0.0f, fminf(1.0f, params->param[1]));
+
+    float delayfactor = 0.66f + (depth / 3.0f);
+    float dryL = 1.0f - (outlevel * 0.65f);
+    float dryR = dryL;
+
+    st->maxdelayA = (int)(7481.0f * delayfactor); st->maxdelayB = (int)(7523.0f * delayfactor);
+    st->maxdelayC = (int)(5779.0f * delayfactor); st->maxdelayD = (int)(5737.0f * delayfactor);
+    st->maxdelayE = (int)(4831.0f * delayfactor); st->maxdelayF = (int)(4861.0f * delayfactor);
+    st->maxdelayG = (int)(3109.0f * delayfactor); st->maxdelayH = (int)(3079.0f * delayfactor);
+    st->maxdelayI = (int)(2203.0f * delayfactor); st->maxdelayJ = (int)(2213.0f * delayfactor);
+    st->maxdelayK = (int)(1327.0f * delayfactor); st->maxdelayL = (int)(1321.0f * delayfactor);
+    if (st->cycle > st->cycle_end - 1) st->cycle = st->cycle_end - 1;
+
+    float inputSampleL = *l, inputSampleR = *r;
+    // Anti-denormal: substitute a tiny noise floor instead of an actual all-zero/near-zero
+    // sample, so the delay lines never carry a denormal float (which can be very slow on some
+    // CPUs without flush-to-zero enabled).
+    if (fabsf(inputSampleL) < 1.18e-23f) inputSampleL = (float)st->fpdL * 1.18e-17f;
+    if (fabsf(inputSampleR) < 1.18e-23f) inputSampleR = (float)st->fpdR * 1.18e-17f;
+
+    st->cycle++;
+    if (st->cycle == st->cycle_end) {
+        float drySampleL = inputSampleL, drySampleR = inputSampleR;
+        float outL = 0.0f, outR = 0.0f, temp = 0.0f;
+
+        st->dA[st->oneA] = inputSampleL; st->oneA--; if (st->oneA < 0 || st->oneA > st->maxdelayA) st->oneA = st->maxdelayA;
+        temp = st->dA[st->oneA]; outL += temp * 0.75f;
+        st->dB[st->oneB] = inputSampleR; st->oneB--; if (st->oneB < 0 || st->oneB > st->maxdelayB) st->oneB = st->maxdelayB;
+        temp = st->dB[st->oneB]; outR += temp * 0.15f;
+
+        st->dC[st->oneC] = inputSampleL; st->oneC--; if (st->oneC < 0 || st->oneC > st->maxdelayC) st->oneC = st->maxdelayC;
+        temp = st->dC[st->oneC]; outL += temp * 0.15f;
+        st->dD[st->oneD] = inputSampleR; st->oneD--; if (st->oneD < 0 || st->oneD > st->maxdelayD) st->oneD = st->maxdelayD;
+        temp = st->dD[st->oneD]; outR += temp * 0.75f;
+
+        st->dE[st->oneE] = inputSampleL; st->oneE--; if (st->oneE < 0 || st->oneE > st->maxdelayE) st->oneE = st->maxdelayE;
+        temp = st->dE[st->oneE]; outL += temp * 0.63f;
+        st->dF[st->oneF] = inputSampleR; st->oneF--; if (st->oneF < 0 || st->oneF > st->maxdelayF) st->oneF = st->maxdelayF;
+        temp = st->dF[st->oneF]; outR += temp * 0.27f;
+
+        st->dG[st->oneG] = inputSampleL; st->oneG--; if (st->oneG < 0 || st->oneG > st->maxdelayG) st->oneG = st->maxdelayG;
+        temp = st->dG[st->oneG]; outL += temp * 0.27f;
+        st->dH[st->oneH] = inputSampleR; st->oneH--; if (st->oneH < 0 || st->oneH > st->maxdelayH) st->oneH = st->maxdelayH;
+        temp = st->dH[st->oneH]; outR += temp * 0.63f;
+
+        st->dI[st->oneI] = inputSampleL; st->oneI--; if (st->oneI < 0 || st->oneI > st->maxdelayI) st->oneI = st->maxdelayI;
+        temp = st->dI[st->oneI]; outL += temp * 0.48f;
+        st->dJ[st->oneJ] = inputSampleR; st->oneJ--; if (st->oneJ < 0 || st->oneJ > st->maxdelayJ) st->oneJ = st->maxdelayJ;
+        temp = st->dJ[st->oneJ]; outR += temp * 0.32f;
+
+        st->dK[st->oneK] = inputSampleL; st->oneK--; if (st->oneK < 0 || st->oneK > st->maxdelayK) st->oneK = st->maxdelayK;
+        temp = st->dK[st->oneK]; outL += temp * 0.32f;
+        st->dL[st->oneL] = inputSampleR; st->oneL--; if (st->oneL < 0 || st->oneL > st->maxdelayL) st->oneL = st->maxdelayL;
+        temp = st->dL[st->oneL]; outR += temp * 0.48f;
+
+        inputSampleL = (outL * outlevel) + (drySampleL * dryL);
+        inputSampleR = (outR * outlevel) + (drySampleR * dryR);
+
+        if (st->cycle_end == 4) {
+            st->lastRefL[0] = st->lastRefL[4];
+            st->lastRefL[2] = (st->lastRefL[0] + inputSampleL) * 0.5f;
+            st->lastRefL[1] = (st->lastRefL[0] + st->lastRefL[2]) * 0.5f;
+            st->lastRefL[3] = (st->lastRefL[2] + inputSampleL) * 0.5f;
+            st->lastRefL[4] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[4];
+            st->lastRefR[2] = (st->lastRefR[0] + inputSampleR) * 0.5f;
+            st->lastRefR[1] = (st->lastRefR[0] + st->lastRefR[2]) * 0.5f;
+            st->lastRefR[3] = (st->lastRefR[2] + inputSampleR) * 0.5f;
+            st->lastRefR[4] = inputSampleR;
+        } else if (st->cycle_end == 3) {
+            st->lastRefL[0] = st->lastRefL[3];
+            st->lastRefL[2] = (st->lastRefL[0] + st->lastRefL[0] + inputSampleL) / 3.0f;
+            st->lastRefL[1] = (st->lastRefL[0] + inputSampleL + inputSampleL) / 3.0f;
+            st->lastRefL[3] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[3];
+            st->lastRefR[2] = (st->lastRefR[0] + st->lastRefR[0] + inputSampleR) / 3.0f;
+            st->lastRefR[1] = (st->lastRefR[0] + inputSampleR + inputSampleR) / 3.0f;
+            st->lastRefR[3] = inputSampleR;
+        } else if (st->cycle_end == 2) {
+            st->lastRefL[0] = st->lastRefL[2];
+            st->lastRefL[1] = (st->lastRefL[0] + inputSampleL) * 0.5f;
+            st->lastRefL[2] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[2];
+            st->lastRefR[1] = (st->lastRefR[0] + inputSampleR) * 0.5f;
+            st->lastRefR[2] = inputSampleR;
+        } else {
+            st->lastRefL[0] = inputSampleL;
+            st->lastRefR[0] = inputSampleR;
+        }
+        st->cycle = 0;
+        inputSampleL = st->lastRefL[st->cycle];
+        inputSampleR = st->lastRefR[st->cycle];
+    } else {
+        inputSampleL = st->lastRefL[st->cycle];
+        inputSampleR = st->lastRefR[st->cycle];
+    }
+
+    // 32-bit-float dither, scaled relative to each sample's own magnitude (frexpf's exponent).
+    int expon;
+    frexpf(inputSampleL, &expon);
+    st->fpdL ^= st->fpdL << 13; st->fpdL ^= st->fpdL >> 17; st->fpdL ^= st->fpdL << 5;
+    inputSampleL += (((float)st->fpdL - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+    frexpf(inputSampleR, &expon);
+    st->fpdR ^= st->fpdR << 13; st->fpdR ^= st->fpdR >> 17; st->fpdR ^= st->fpdR << 5;
+    inputSampleR += (((float)st->fpdR - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+
+    *l = inputSampleL;
+    *r = inputSampleR;
+}
+
 // Runs the FX_SLOT_COUNT-slot serial FX bus in place on one stereo sample. Called once per
 // sample (not per voice) on the fully summed mix -- see render_audio_block, where this sits
 // after all voices (and the external input) have been added together, and before
@@ -499,7 +665,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
         float dry_l = *l, dry_r = *r;
         float wet_l = dry_l, wet_r = dry_r;
         switch (type) {
-            // case FX_TYPE_DELAY: run_fx_delay(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+            case FX_TYPE_ENSEMBLE: run_fx_ensemble(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
             case FX_TYPE_OFF:
             default:
                 break; // pass-through

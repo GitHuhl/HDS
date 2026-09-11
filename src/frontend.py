@@ -30,6 +30,20 @@ AUDIO_DEVICE_NAME_LEN = 64
 FX_SLOT_COUNT = 12
 FX_SLOT_PARAM_COUNT = 8
 
+# Per-FX-type control metadata: index must match FX_TYPE_* in backend.c exactly. Every param
+# dial always transmits as (raw dial value / 100.0) -- see transmit_knob_packet -- so a param
+# meant to reach the backend as 0.0-1.0 gets a 0-100 range here, and one meant as -1.0..1.0
+# gets -100..100. Slots use only the first len(params) dials; the rest are hidden (see
+# _apply_fx_slot_type). Add a new effect's entry here (name + its real params) the same time
+# its FX_TYPE_* case is added to backend.c's process_fx_chain -- the two must stay in step.
+FX_TYPE_METADATA = [
+    {"name": "Off", "params": []},
+    {"name": "Ensemble", "params": [
+        {"label": "Depth", "range": (0, 100), "default": 50},
+        {"label": "FX Level", "range": (0, 100), "default": 100},
+    ]},
+]
+
 def _list_alsa_devices(list_cmd):
     """Best-effort enumeration of ALSA PCM device names via `aplay -L` / `arecord -L`. Falls
     back to just ["default"] if the tool isn't installed, times out, or returns nothing -- the
@@ -1504,7 +1518,10 @@ class SynthGui(QWidget):
         fx_scroll_lay.setSpacing(3)
         fx_scroll_lay.setContentsMargins(2, 2, 2, 2)
 
-        self.fx_type_combos, self.fx_mix_dials, self.fx_bypass_buttons, self.fx_param_dials = [], [], [], []
+        self.fx_type_combos, self.fx_mix_dials, self.fx_bypass_buttons = [], [], []
+        # Per-slot lists of the 8 generic param widgets, so _apply_fx_slot_type can relabel,
+        # re-range, and show/hide them once a slot's Type is known.
+        self.fx_param_dials, self.fx_param_labels, self.fx_param_columns = [], [], []
 
         for slot_idx in range(FX_SLOT_COUNT):
             slot_box = QGroupBox(f"FX {slot_idx + 1}")
@@ -1514,27 +1531,31 @@ class SynthGui(QWidget):
             slot_lay.setContentsMargins(4, 2, 4, 2)
 
             type_combo = QComboBox()
-            # Only "Off" exists for now -- each ported effect gets appended here (and a
-            # matching FX_TYPE_* case in the backend's process_fx_chain switch) without
-            # disturbing this slot's other settings or its position in the chain.
-            type_combo.addItems(["Off"])
+            # Each entry here has a matching FX_TYPE_* case in the backend's process_fx_chain
+            # switch and an entry in FX_TYPE_METADATA -- the three must stay in step.
+            type_combo.addItems([entry["name"] for entry in FX_TYPE_METADATA])
             type_combo.setFixedWidth(80)
             type_combo.setStyleSheet("font-size: 9px;")
             slot_lay.addWidget(type_combo)
             self.fx_type_combos.append(type_combo)
 
-            param_dials = []
+            param_dials, param_labels, param_columns = [], [], []
             for p_idx in range(FX_SLOT_PARAM_COUNT):
-                p_col = QVBoxLayout(); p_col.setSpacing(0)
+                p_col_widget = QWidget()
+                p_col = QVBoxLayout(p_col_widget); p_col.setContentsMargins(0, 0, 0, 0); p_col.setSpacing(0)
                 p_lbl = QLabel(f"P{p_idx + 1}"); p_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter); p_lbl.setStyleSheet("font-size: 7px;")
                 p_col.addWidget(p_lbl)
                 p_dial = PotentiometerKnob(f"FX {slot_idx + 1} P{p_idx + 1}", self)
                 p_dial.setRange(-100, 100)
                 p_dial.setValue(0)
                 p_col.addWidget(p_dial, alignment=Qt.AlignmentFlag.AlignCenter)
-                slot_lay.addLayout(p_col)
+                slot_lay.addWidget(p_col_widget)
                 param_dials.append(p_dial)
+                param_labels.append(p_lbl)
+                param_columns.append(p_col_widget)
             self.fx_param_dials.append(param_dials)
+            self.fx_param_labels.append(param_labels)
+            self.fx_param_columns.append(param_columns)
 
             mix_col = QVBoxLayout(); mix_col.setSpacing(0)
             mix_col.addWidget(QLabel("Mix"), alignment=Qt.AlignmentFlag.AlignCenter)
@@ -1554,6 +1575,7 @@ class SynthGui(QWidget):
             self.fx_bypass_buttons.append(bypass_btn)
 
             fx_scroll_lay.addWidget(slot_box)
+            self._apply_fx_slot_type(slot_idx, 0) # start on "Off": no params shown
 
         fx_scroll_lay.addStretch()
         fx_scroll.setWidget(fx_scroll_content)
@@ -1679,6 +1701,29 @@ class SynthGui(QWidget):
             }
             panel.set_state(state)
             self.eg_dest_combos[i].setCurrentIndex(random.randint(0, self.eg_dest_combos[i].count() - 1))
+
+    def _apply_fx_slot_type(self, slot_idx, type_index):
+        """Reconfigures one FX slot's 8 generic param dials for the effect Type just selected:
+        relabels/re-ranges/shows the dials that effect actually uses (per FX_TYPE_METADATA) and
+        hides the rest, so the UI never shows knobs that don't do anything for the current
+        effect. Dial values are reset to that param's default -- a generic dial's raw number
+        under one effect type has no meaningful relationship to what it'd mean under another."""
+        entry = FX_TYPE_METADATA[type_index] if 0 <= type_index < len(FX_TYPE_METADATA) else FX_TYPE_METADATA[0]
+        params = entry["params"]
+        dials = self.fx_param_dials[slot_idx]
+        labels = self.fx_param_labels[slot_idx]
+        columns = self.fx_param_columns[slot_idx]
+        for p_idx in range(FX_SLOT_PARAM_COUNT):
+            if p_idx < len(params):
+                spec = params[p_idx]
+                labels[p_idx].setText(spec["label"])
+                dials[p_idx].blockSignals(True)
+                dials[p_idx].setRange(*spec["range"])
+                dials[p_idx].setValue(spec["default"])
+                dials[p_idx].blockSignals(False)
+                columns[p_idx].setVisible(True)
+            else:
+                columns[p_idx].setVisible(False)
 
     def refresh_audio_devices(self):
         """Re-scans ALSA device names, preserving whatever's currently selected/typed if it's
@@ -1851,11 +1896,15 @@ class SynthGui(QWidget):
         packet_list.append(1.0 if self.ext_in_enable.isChecked() else 0.0)
         packet_list.append(float(self.ext_in_gain_dial.value()) / 100.0)
 
-        # FX Bus: 12 slots * (1 type + 8 params + 1 mix + 1 bypass) = 132 items
+        # FX Bus: 12 slots * (1 type + 8 params + 1 mix + 1 bypass) = 132 items. Every param
+        # dial always sends value/100.0 -- a 0-100-range dial (per FX_TYPE_METADATA) reaches
+        # the backend as 0.0-1.0, a -100..100 one as -1.0..1.0. Mix itself stays 0-100 raw
+        # (backend divides it by 100 on its own side, matching how master_volume-style knobs
+        # are packed elsewhere in this function).
         for slot_idx in range(FX_SLOT_COUNT):
             packet_list.append(float(self.fx_type_combos[slot_idx].currentIndex()))
             for p_dial in self.fx_param_dials[slot_idx]:
-                packet_list.append(float(p_dial.value()))
+                packet_list.append(float(p_dial.value()) / 100.0)
             packet_list.append(float(self.fx_mix_dials[slot_idx].value()))
             packet_list.append(1.0 if self.fx_bypass_buttons[slot_idx].isChecked() else 0.0)
 
@@ -1962,6 +2011,12 @@ def runtime_connect_and_bind(gui):
 
     # FX Bus: 12 slots, each wired the same way
     for slot_idx in range(FX_SLOT_COUNT):
+        # Reconfigure the slot's param dials (labels/ranges/defaults/visibility) BEFORE
+        # transmitting, so a Type change sends the new effect's actual default params rather
+        # than whatever the previous effect's dials happened to be sitting at.
+        gui.fx_type_combos[slot_idx].currentIndexChanged.connect(
+            lambda idx_cb, i=slot_idx: gui._apply_fx_slot_type(i, idx_cb)
+        )
         gui.fx_type_combos[slot_idx].currentIndexChanged.connect(gui.transmit_knob_packet)
         for p_dial in gui.fx_param_dials[slot_idx]:
             p_dial.valueChanged.connect(gui.transmit_knob_packet)

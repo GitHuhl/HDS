@@ -29,10 +29,22 @@ A 12-slot serial FX bus (`FX` tab) runs on the full stereo mix, after
 Filter A/B and before master volume. External audio (`Audio` tab: output/
 input device selection, live-switchable; input enable/gain) is summed in
 just before the FX bus, so it passes through the same 12 slots as the
-synth's own voices. Every slot is currently a pass-through (`process_fx_chain()`
-in `backend.c`) — the routing, wire protocol, and per-slot generic
-parameter bank (8 params + mix + bypass) are in place, waiting on real
-effect algorithms to be ported into the dispatch switch.
+synth's own voices. Each slot has a generic 8-param bank + mix + bypass
+(`process_fx_chain()` in `backend.c`); most slot types are still an
+unimplemented pass-through, ready for more effects to be ported into the
+dispatch switch. One is implemented so far:
+
+- **Ensemble** — a 12-tap fixed-delay ensemble/chorus (not a reverb: no
+  feedback loop), ported from Airwindows' StereoEnsemble (MIT license).
+  Params: Depth (widens/lengthens the delay taps) and FX Level (the
+  effect's own internal wet/dry balance, independent of the slot's
+  generic Mix knob).
+
+Adding a new effect means: a `FX_TYPE_*` define + its processing function
++ a case in `process_fx_chain()`'s switch (`backend.c`), and a matching
+entry in `FX_TYPE_METADATA` (`frontend.py`) giving its real param count,
+labels, and ranges — the frontend uses that to relabel/show only the
+knobs a given effect actually uses instead of 8 generic "P1..P8" dials.
 
 ## Build & run
 
