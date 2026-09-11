@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 
 #define SAMPLE_RATE 48000
 #define BUFFER_SIZE 128
@@ -1401,7 +1402,30 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         // -- an audible click, not just a modulation glitch, since the noise oscillator is a
         // real sound source. noise_eg must be idle too before a voice counts as free.
         for (int v = 0; v < MAX_VOICES; v++) { if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE && voices[v].noise_eg.state == STATE_IDLE) { slot = v; break; } }
-        if (slot == -1) slot = 0;
+        if (slot == -1) {
+            // Polyphony ceiling hit (MAX_VOICES simultaneously active voices) -- every slot is
+            // busy. FIXED: this used to unconditionally steal slot 0, resetting whatever was
+            // playing there regardless of how audible it currently was -- a hard, audible
+            // click/cutoff on an arbitrary note, every time. Instead, steal the voice a
+            // listener is least likely to notice disappearing: prefer one already in RELEASE
+            // (fading out on its own) with the lowest combined level, and only fall back to a
+            // still-sustaining/attacking voice (by lowest level) if literally none are
+            // releasing.
+            float best_score = 1e30f; // lower = safer to steal
+            for (int v = 0; v < MAX_VOICES; v++) {
+                float level = voices[v].vco1_eg.current_level + voices[v].vco2_eg.current_level + voices[v].noise_eg.current_level;
+                bool releasing = (voices[v].vco1_eg.state == STATE_RELEASE || voices[v].vco2_eg.state == STATE_RELEASE || voices[v].noise_eg.state == STATE_RELEASE);
+                // A releasing voice always beats a non-releasing one regardless of level --
+                // it's already fading out by the player's own intent (key lifted), so cutting
+                // it a little early reads as natural rather than as a glitch.
+                float score = releasing ? level : (level + 1000.0f);
+                if (score < best_score) { best_score = score; slot = v; }
+            }
+            // DIAGNOSTIC: confirms whether you're actually hitting the polyphony ceiling at
+            // all -- if this never prints, MAX_VOICES isn't the thing to look at for an
+            // underrun/glitch you're chasing.
+            fprintf(stderr, "[voices] polyphony ceiling hit (%d active) -- stole slot %d (score %.4f)\n", MAX_VOICES, slot, best_score);
+        }
     } else { slot = 0; }
 
     float target_hz = 440.0f * powf(2.0f, (note - 69) / 12.0f);
@@ -2058,7 +2082,13 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     }
     return peak;
 }
-static void write_audio_block(snd_pcm_t *pcm_handle, const float *buffer, snd_pcm_uframes_t frame_count) {
+// DIAGNOSTIC: active_voices_count and render_ms are purely informational (see their computation
+// in main()'s loop) -- passed through just so an actual ALSA underrun/xrun can be reported
+// alongside what the engine was doing at that exact moment, instead of a bare ALSA error with
+// no way to tell whether it was a CPU-load problem (too many active voices / too expensive a
+// patch to render in time) or something unrelated (OS scheduling jitter, another process,
+// a flaky USB audio interface, etc).
+static void write_audio_block(snd_pcm_t *pcm_handle, const float *buffer, snd_pcm_uframes_t frame_count, int active_voices_count, double render_ms) {
     // Guards the pathological case where even the fallback-to-last-known-good reopen in main()
     // failed (e.g. a USB audio interface was physically unplugged) -- silently drop this block
     // rather than crash; main() will keep retrying the device on the next control packet.
@@ -2066,7 +2096,11 @@ static void write_audio_block(snd_pcm_t *pcm_handle, const float *buffer, snd_pc
     snd_pcm_uframes_t written = 0;
     while (written < frame_count && g_synth_running) {
         snd_pcm_sframes_t res = snd_pcm_writei(pcm_handle, buffer + (written * 2), frame_count - written);
-        if (res < 0) { res = snd_pcm_recover(pcm_handle, res, 0); if (res < 0) break; }
+        if (res < 0) {
+            fprintf(stderr, "[audio] ALSA underrun/xrun (%s) -- %d active voices, last render_audio_block took %.3fms\n",
+                    snd_strerror((int)res), active_voices_count, render_ms);
+            res = snd_pcm_recover(pcm_handle, res, 0); if (res < 0) break;
+        }
         else { written += res; }
     }
 }
@@ -2202,12 +2236,32 @@ int main() {
             }
         }
 
+        // DIAGNOSTIC: cheap (MAX_VOICES simple state checks, negligible next to the render
+        // itself) count of currently-active voices, purely to report alongside any underrun/
+        // over-budget warning below -- see the comment on write_audio_block.
+        int active_voices_count = 0;
+        for (int v = 0; v < MAX_VOICES; v++) {
+            if (voices[v].vco1_eg.state != STATE_IDLE || voices[v].vco2_eg.state != STATE_IDLE || voices[v].noise_eg.state != STATE_IDLE) active_voices_count++;
+        }
+
         float buffer[BUFFER_SIZE * 2];
+        struct timespec render_t0, render_t1;
+        clock_gettime(CLOCK_MONOTONIC, &render_t0);
         float block_peak = render_audio_block(voices, &active_knobs, global_lfo_phases, capture_buffer, &midi_live, buffer);
+        clock_gettime(CLOCK_MONOTONIC, &render_t1);
+        double render_ms = (render_t1.tv_sec - render_t0.tv_sec) * 1000.0 + (render_t1.tv_nsec - render_t0.tv_nsec) / 1e6;
+        double budget_ms = (BUFFER_SIZE / (double)SAMPLE_RATE) * 1000.0;
+        // DIAGNOSTIC: if rendering this block alone took longer than the block's own real-time
+        // budget, that's a root cause an ALSA underrun can be pinned on directly, independent of
+        // whatever else might be going on in the OS -- the engine itself couldn't keep up.
+        if (render_ms > budget_ms) {
+            fprintf(stderr, "[perf] render_audio_block took %.3fms (budget %.3fms) with %d active voices -- too slow, will cause underruns\n",
+                    render_ms, budget_ms, active_voices_count);
+        }
 
         vu_decimator++;
         if (client_fd >= 0 && vu_decimator >= 12) { send(client_fd, &block_peak, sizeof(float), 0); vu_decimator = 0; }
-        write_audio_block(pcm_handle, buffer, BUFFER_SIZE);
+        write_audio_block(pcm_handle, buffer, BUFFER_SIZE, active_voices_count, render_ms);
     }
     if (client_fd >= 0) close(client_fd);
     if (server_fd >= 0) close(server_fd);
