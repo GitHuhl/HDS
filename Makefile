@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -O2 -Wall -Wextra -std=c11
+CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
 LDLIBS := -lasound -lm
 
 BIN := synth_engine

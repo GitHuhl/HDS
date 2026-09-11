@@ -18,6 +18,8 @@
 #define LFO_COUNT   4
 #define ENV_COUNT   7  // Osc 1 Amp, Osc 2 Amp, Noise Osc Amp, + EG 1-4
 #define UNISON_SAW_VOICES 7
+#define FX_SLOT_COUNT 12
+#define AUDIO_DEVICE_NAME_LEN 64
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
@@ -77,6 +79,24 @@ typedef struct {
     float filter_type;  // 0 = Off (bypass -- passes the signal through unfiltered), 1 = Low Pass, 2 = High Pass, 3 = Band Pass
 } FilterParams;
 
+// A single FX bus slot's parameters. FX_SLOT_COUNT of these run in series (slot 0 first) on
+// the master stereo bus -- see the FX section comment on SynthSharedControls and
+// process_fx_chain() for the routing and dispatch. fx_type is a generic float index rather
+// than its own enum for now: 0 is the only defined value (Off/bypass, a pure pass-through),
+// deliberately left open so each ported effect can claim the next index without touching the
+// wire layout. param[] is an intentionally generic bank -- headroom for whatever a given
+// effect's own algorithm needs (a delay's time/feedback/tone, a reverb's size/damp/predelay,
+// etc.); each effect interprets its own subset however it needs to once ported in.
+#define FX_TYPE_OFF 0
+#define FX_SLOT_PARAM_COUNT 8
+typedef struct {
+    float fx_type;
+    float param[FX_SLOT_PARAM_COUNT];
+    float mix;     // 0-100, dry/wet blend applied uniformly around whatever the slot does
+    float bypass;  // 0/1, hard bypass (distinct from Off -- keeps the slot's state alive so
+                    // flipping it back on mid-note doesn't lose e.g. a delay's buffered tail)
+} FXSlotParams;
+
 // PACKET STRUCT: This is the exact byte layout the Python GUI packs.
 // BREAKING CHANGE (4-oscillator architecture): the envelope count grew from 6 to 7 (a new
 // dedicated Noise Osc Amp envelope was inserted as eg[2]/eg_mode[2], pushing the old EG 1-4
@@ -85,12 +105,18 @@ typedef struct {
 // wire change.
 // BREAKING CHANGE (filter overhaul): the old flat "3 stacked filters + 1 routing mode" section
 // (13 floats) was replaced by a 2-filter (A/B) architecture (23 floats) -- see the comment right
-// above the filter fields in this struct for the full layout. New total: 151 float items:
+// above the filter fields in this struct for the full layout. Running total after that change
+// was 151 float items:
 // 13 (baseline) + 56 (7 EGs * 8 params incl. attack start/peak level) + 23 (Filter A/B section, see below)
 // + 24 (4 LFOs * 6, incl. phase offset) + 4 (EG intensity) + 4 (EG dest target) + 7 (EG mode)
 // + 4 (unison saw width/detune) + 1 (mono glide randomization) + 2 (vco1/vco2 mute, decoupled from FM)
 // + 1 (hard sync) + 2 (vco1/vco2 phase offset)
 // + 2 (vco1/vco2 pulse width) + 4 (noise osc: vol/pan/mute/tilt) + 4 (sub osc: shape/vol/pan/mute) = 151
+// BREAKING CHANGE (FX bus + external input + device selection): added 2 floats (ext_in_enable,
+// ext_in_gain) + 132 floats (FX_SLOT_COUNT=12 slots * 11 floats each: fx_type, 8 generic params,
+// mix, bypass) + 2 fixed 64-byte device name strings (output_device, input_device -- not
+// floats; see AUDIO_DEVICE_NAME_LEN). New total: 285 float items + 128 string bytes. The
+// Python side's struct.pack format changes from "151f" to "285f64s64s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -197,6 +223,30 @@ typedef struct {
     float sub_vol;
     float sub_pan;
     float sub_mute;
+
+    // --- FX Bus + External Input Architecture ---
+
+    // External Audio Input: a live-captured signal (see setup/read in main()) summed directly
+    // into the same post-voice stereo bus the FX chain runs on -- so external audio passes
+    // through all FX_SLOT_COUNT slots exactly like the synth's own voices do, by design. No
+    // pan control here: capture is taken as an already-stereo L/R pair and passed through as-is
+    // rather than re-panned from mono.
+    float ext_in_enable;
+    float ext_in_gain;
+
+    // FX Bus: FX_SLOT_COUNT slots run in series on the summed stereo mix (voices + external
+    // input), after Filter A/B (which stay per-voice) and before master_volume -- see
+    // process_fx_chain(). Each ported effect fills in its own case in that function's dispatch
+    // switch; until then every slot is a pass-through (see FX_TYPE_OFF).
+    FXSlotParams fx[FX_SLOT_COUNT];
+
+    // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
+    // "hw:1,0"), always null-terminated. main() compares these against whichever device name
+    // it last opened each stream with, and closes/reopens that stream on a live change via
+    // open_pcm_stream(). Deliberately plain fixed-size char buffers rather than more float
+    // items: a device name is text, not a knob value.
+    char output_device[AUDIO_DEVICE_NAME_LEN];
+    char input_device[AUDIO_DEVICE_NAME_LEN];
 } SynthSharedControls;
 typedef struct {
     EnvelopeState state;
@@ -313,7 +363,20 @@ void tick_adsr(ADSR *env, const PackEGParams *p, int mode) {
                 env->state = (mode == 2 || mode == 4) ? STATE_IDLE : STATE_SUSTAIN;
             }
             break;
-        case STATE_SUSTAIN: break;
+        case STATE_SUSTAIN:
+            // Realtime sustain control: continuously chase the live Sustain knob (over a
+            // ~15ms time constant, so moving it doesn't zipper/click) instead of freezing at
+            // whatever level Decay left it at -- lets Sustain be ridden like a pedal while a
+            // note is held, with no need to retrigger.
+            // AR (mode 1) is excluded: its sustain_level is pinned to 0 purely for
+            // release-ramp bookkeeping (see above) -- AR has no real sustain segment, it must
+            // stay frozen at Peak Level (where Attack left it) until Release fires, not chase
+            // down to 0.
+            if (mode != 1) {
+                float sustain_chase_rate = 1.0f - expf(-1.0f / (0.015f * SAMPLE_RATE));
+                env->current_level += (env->sustain_level - env->current_level) * sustain_chase_rate;
+            }
+            break;
         case STATE_RELEASE:
             env->current_level -= env->release_rate;
             if (env->current_level <= 0.0f) { env->current_level = 0.0f; env->state = STATE_IDLE; }
@@ -395,6 +458,55 @@ static float run_filter_a_multi(float in, int routing, const FilterParams multi[
         float u1 = run_svf_filter(in, multi[1].cutoff + cutoff_mods[1], multi[1].res_q + res_mods[1], (int)multi[1].filter_type, (int)multi[1].slope_poles, low[1], band[1]);
         float blended = (u0 + u1) * 0.5f;
         return run_svf_filter(blended, multi[2].cutoff + cutoff_mods[2], multi[2].res_q + res_mods[2], (int)multi[2].filter_type, (int)multi[2].slope_poles, low[2], band[2]);
+    }
+}
+
+// Persistent per-slot engine state for the FX bus -- deliberately kept OUT of the wire struct
+// (SynthSharedControls only carries each slot's user-facing params). `state` is an opaque
+// pointer each effect owns entirely: allocated on first use and freed whenever the slot's type
+// changes, so a ported effect can size/shape its own private buffers (e.g. a delay line) freely
+// without anything here needing to know what they look like.
+typedef struct {
+    int active_type;
+    void *state;
+} FXSlotEngine;
+
+static void reset_fx_engine(FXSlotEngine engine[FX_SLOT_COUNT]) {
+    for (int s = 0; s < FX_SLOT_COUNT; s++) { engine[s].active_type = FX_TYPE_OFF; engine[s].state = NULL; }
+}
+
+// Runs the FX_SLOT_COUNT-slot serial FX bus in place on one stereo sample. Called once per
+// sample (not per voice) on the fully summed mix -- see render_audio_block, where this sits
+// after all voices (and the external input) have been added together, and before
+// master_volume is applied. Ported effects land as new cases in the inner switch; each one
+// reads/writes its own fx_engine[s].state (lazily allocating it on first call after a type
+// change) and is responsible for freeing it if it allocated anything, via a matching branch in
+// the "type changed" block below. Until effects are ported in, every fx_type other than Off is
+// unreached and simply passes the dry signal through unchanged, same as Off.
+static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], float *l, float *r) {
+    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+        int type = (int)fx_params[s].fx_type;
+        if (type != fx_engine[s].active_type) {
+            // Type changed live -- release whatever the previous effect had allocated. (No
+            // per-type free() branches exist yet since no effect has been ported in; add one
+            // here alongside each new case below if that effect allocates its own state.)
+            free(fx_engine[s].state);
+            fx_engine[s].state = NULL;
+            fx_engine[s].active_type = type;
+        }
+        if (fx_params[s].bypass != 0.0f || type == FX_TYPE_OFF) continue;
+
+        float dry_l = *l, dry_r = *r;
+        float wet_l = dry_l, wet_r = dry_r;
+        switch (type) {
+            // case FX_TYPE_DELAY: run_fx_delay(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+            case FX_TYPE_OFF:
+            default:
+                break; // pass-through
+        }
+        float mix = fmaxf(0.0f, fminf(100.0f, fx_params[s].mix)) / 100.0f;
+        *l = dry_l * (1.0f - mix) + wet_l * mix;
+        *r = dry_r * (1.0f - mix) + wet_r * mix;
     }
 }
 
@@ -497,7 +609,14 @@ static void poll_control_socket(int server_fd, int *client_fd, char *packet_buf,
     ssize_t bytes_received = recv(*client_fd, packet_buf + *bytes_so_far, sizeof(SynthSharedControls) - *bytes_so_far, 0);
     if (bytes_received > 0) {
         *bytes_so_far += (size_t)bytes_received;
-        if (*bytes_so_far == sizeof(SynthSharedControls)) { memcpy(knobs, packet_buf, sizeof(SynthSharedControls)); *bytes_so_far = 0; }
+        if (*bytes_so_far == sizeof(SynthSharedControls)) {
+            memcpy(knobs, packet_buf, sizeof(SynthSharedControls));
+            // Defensive: guarantee null-termination regardless of what the GUI actually sent,
+            // since these two fields get handed straight to snd_pcm_open() as C strings.
+            knobs->output_device[AUDIO_DEVICE_NAME_LEN - 1] = '\0';
+            knobs->input_device[AUDIO_DEVICE_NAME_LEN - 1] = '\0';
+            *bytes_so_far = 0;
+        }
     } else if (bytes_received == 0 || (bytes_received < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
         close(*client_fd); *client_fd = -1; *bytes_so_far = 0;
     }
@@ -532,6 +651,16 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->sub_shape = (float)SUB_SQUARE; knobs->sub_vol = 0.0f; knobs->sub_pan = 0.0f; knobs->sub_mute = 0.0f;
     // Noise Osc Amp envelope lives at eg[2]/eg_mode[2] and was covered by the generic
     // `for(int e=0; e<ENV_COUNT; e++)` default-fill loop above -- nothing extra needed here.
+
+    knobs->ext_in_enable = 0.0f; knobs->ext_in_gain = 1.0f;
+    for (int f = 0; f < FX_SLOT_COUNT; f++) {
+        knobs->fx[f].fx_type = FX_TYPE_OFF;
+        for (int p = 0; p < FX_SLOT_PARAM_COUNT; p++) knobs->fx[f].param[p] = 0.0f;
+        knobs->fx[f].mix = 100.0f; // fully wet once a real effect is assigned to this slot
+        knobs->fx[f].bypass = 0.0f;
+    }
+    snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
+    snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
 }
 
 static void init_voice(SynthVoice *voice) {
@@ -596,7 +725,11 @@ static void mono_stack_remove(MonoNoteStack *stack, int note) {
 static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
     int slot = -1;
     if (poly_mode_active) {
-        for (int v = 0; v < MAX_VOICES; v++) { if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE) { slot = v; break; } }
+        // BUG FIX: this used to only check vco1_eg/vco2_eg, so a voice whose noise_eg was
+        // still audibly releasing (Noise Osc Amp envelope) could get stolen and reset mid-tail
+        // -- an audible click, not just a modulation glitch, since the noise oscillator is a
+        // real sound source. noise_eg must be idle too before a voice counts as free.
+        for (int v = 0; v < MAX_VOICES; v++) { if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE && voices[v].noise_eg.state == STATE_IDLE) { slot = v; break; } }
         if (slot == -1) slot = 0;
     } else { slot = 0; }
 
@@ -686,7 +819,7 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
         snd_seq_free_event(ev);
     }
 }
-static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], float *out_buffer) {
+static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], const float *ext_in_buffer, float *out_buffer) {
     float peak = 0.0f;
     // Each oscillator is panned to stereo AT THE MIXER, before the signal reaches Filter A/B --
     // Filter A/B then run as two fully independent mono filters (one per channel, see fa_low/
@@ -716,6 +849,12 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // per-voice one). Function-local static is safe here -- this program runs one synth engine
     // instance on a single audio thread.
     static float lfo_phase_mod_state[LFO_COUNT] = {0.0f};
+
+    // FX bus engine state: persists across calls (and across FX_TYPE changes -- see
+    // process_fx_chain) for the same "single synth engine instance" reason as above.
+    static FXSlotEngine fx_engine[FX_SLOT_COUNT];
+    static bool fx_engine_initialized = false;
+    if (!fx_engine_initialized) { reset_fx_engine(fx_engine); fx_engine_initialized = true; }
 
     for (int i = 0; i < BUFFER_SIZE; i++) {
         float mixed_l = 0.0f, mixed_r = 0.0f;
@@ -960,13 +1099,31 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         }
         for (int l = 0; l < LFO_COUNT; l++) lfo_phase_mod_state[l] = new_lfo_phase_mod[l];
 
+        // External Audio Input: summed in here, after every voice but before the FX bus, so it
+        // passes through the same FX_SLOT_COUNT chain the synth's own signal does. Taken as an
+        // already-stereo pair straight from the capture buffer -- no per-voice-style panning,
+        // see the ext_in_gain/ext_in_enable comment on the struct.
+        if (knobs->ext_in_enable != 0.0f) {
+            mixed_l += ext_in_buffer[i*2] * knobs->ext_in_gain;
+            mixed_r += ext_in_buffer[i*2+1] * knobs->ext_in_gain;
+        }
+
+        // FX Bus: runs last, on the fully summed mix, before master_volume -- see
+        // process_fx_chain's own comment for the routing rationale.
+        process_fx_chain(knobs->fx, fx_engine, &mixed_l, &mixed_r);
+
         float f_l = mixed_l * knobs->master_volume * 0.15f, f_r = mixed_r * knobs->master_volume * 0.15f;
         out_buffer[i*2] = fmaxf(-0.98f, fminf(0.98f, f_l)); out_buffer[i*2+1] = fmaxf(-0.98f, fminf(0.98f, f_r));
-        if (fabsf(f_l) > peak) peak = fabsf(f_l); if (fabsf(f_r) > peak) peak = fabsf(f_r);
+        if (fabsf(f_l) > peak) peak = fabsf(f_l);
+        if (fabsf(f_r) > peak) peak = fabsf(f_r);
     }
     return peak;
 }
 static void write_audio_block(snd_pcm_t *pcm_handle, const float *buffer, snd_pcm_uframes_t frame_count) {
+    // Guards the pathological case where even the fallback-to-last-known-good reopen in main()
+    // failed (e.g. a USB audio interface was physically unplugged) -- silently drop this block
+    // rather than crash; main() will keep retrying the device on the next control packet.
+    if (!pcm_handle) return;
     snd_pcm_uframes_t written = 0;
     while (written < frame_count && g_synth_running) {
         snd_pcm_sframes_t res = snd_pcm_writei(pcm_handle, buffer + (written * 2), frame_count - written);
@@ -975,16 +1132,62 @@ static void write_audio_block(snd_pcm_t *pcm_handle, const float *buffer, snd_pc
     }
 }
 
+// (Re)opens a stereo float PCM stream by ALSA device name, closing *handle first if it was
+// already open. Used both at startup and whenever the Audio tab's device fields change live
+// (see main()'s loop) -- a single place so open/configure/error-reporting can't drift between
+// the two call sites.
+// BUG FIX: the original startup code never checked snd_pcm_open()/snd_pcm_set_params()'s
+// return values at all -- an unavailable "default" device (no sound card, no PulseAudio/ALSA
+// routing) left pcm_handle uninitialized/unusable and the very first snd_pcm_writei() call
+// would segfault or hang instead of failing with a clear message.
+static bool open_pcm_stream(const char *device_name, snd_pcm_stream_t stream, snd_pcm_t **handle) {
+    if (*handle) { snd_pcm_close(*handle); *handle = NULL; }
+    int err = snd_pcm_open(handle, device_name, stream, 0);
+    if (err < 0) {
+        fprintf(stderr, "%s device '%s' failed to open: %s\n", stream == SND_PCM_STREAM_PLAYBACK ? "Output" : "Input", device_name, snd_strerror(err));
+        *handle = NULL;
+        return false;
+    }
+    err = snd_pcm_set_params(*handle, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, SAMPLE_RATE, 1, 25000);
+    if (err < 0) {
+        fprintf(stderr, "%s device '%s' failed to configure: %s\n", stream == SND_PCM_STREAM_PLAYBACK ? "Output" : "Input", device_name, snd_strerror(err));
+        snd_pcm_close(*handle);
+        *handle = NULL;
+        return false;
+    }
+    return true;
+}
+
 int main() {
     const char *socket_path = "/tmp/synth.sock"; int client_fd = -1;
     signal(SIGINT, handle_sigint);
     int server_fd = setup_control_socket(socket_path); if (server_fd < 0) return 1;
 
     SynthSharedControls active_knobs; init_default_controls(&active_knobs);
-    snd_pcm_t *pcm_handle; snd_pcm_open(&pcm_handle, "default", SND_PCM_STREAM_PLAYBACK, 0);
-    snd_pcm_set_params(pcm_handle, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, SAMPLE_RATE, 1, 25000);
 
-    snd_seq_t *seq_handle; snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
+    snd_pcm_t *pcm_handle = NULL;
+    if (!open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle)) {
+        fprintf(stderr, "Cannot continue without an output device.\n");
+        close(server_fd); unlink(socket_path); return 1;
+    }
+    char applied_output_device[AUDIO_DEVICE_NAME_LEN];
+    snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
+
+    // External Audio Input: best-effort. Unlike output, a capture device failing to open isn't
+    // fatal -- external input just stays silent (ext_in_enable has nothing to mix in) until a
+    // working device name is picked from the Audio tab.
+    snd_pcm_t *pcm_capture_handle = NULL;
+    open_pcm_stream(active_knobs.input_device, SND_PCM_STREAM_CAPTURE, &pcm_capture_handle);
+    char applied_input_device[AUDIO_DEVICE_NAME_LEN];
+    snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
+
+    snd_seq_t *seq_handle;
+    int seq_err = snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
+    if (seq_err < 0) {
+        fprintf(stderr, "MIDI sequencer failed to open: %s\n", snd_strerror(seq_err));
+        snd_pcm_close(pcm_handle); if (pcm_capture_handle) snd_pcm_close(pcm_capture_handle);
+        close(server_fd); unlink(socket_path); return 1;
+    }
     snd_seq_set_client_name(seq_handle, "YourSynth Socket Engine");
     snd_seq_create_simple_port(seq_handle, "Input", SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE, SND_SEQ_PORT_TYPE_MIDI_GENERIC);
 
@@ -998,15 +1201,50 @@ int main() {
         poll_control_socket(server_fd, &client_fd, socket_packet_buffer, &control_bytes_received, &active_knobs);
         bool poly_mode_active = (active_knobs.is_polyphonic != 0.0f);
 
+        // Live device switching: the Audio tab writes these as plain fields on the same control
+        // packet as every other knob. Only reopen the stream whose name actually changed.
+        if (strncmp(active_knobs.output_device, applied_output_device, AUDIO_DEVICE_NAME_LEN) != 0) {
+            if (open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle)) {
+                snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
+            } else {
+                // Failed -- fall back to the last device that was actually working rather than
+                // leaving pcm_handle NULL, and stop retrying this same bad name every block.
+                open_pcm_stream(applied_output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle);
+                snprintf(active_knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", applied_output_device);
+            }
+        }
+        if (strncmp(active_knobs.input_device, applied_input_device, AUDIO_DEVICE_NAME_LEN) != 0) {
+            open_pcm_stream(active_knobs.input_device, SND_PCM_STREAM_CAPTURE, &pcm_capture_handle); // best-effort
+            snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
+        }
+
         process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack);
+
+        // Read one block of external input. Silence (the zero-init) if there's no working
+        // capture device, or a read comes back short/broken -- external input degrading to
+        // silence should never be able to stall or crash the synth's own audio output.
+        float capture_buffer[BUFFER_SIZE * 2] = {0.0f};
+        if (pcm_capture_handle) {
+            snd_pcm_sframes_t got = snd_pcm_readi(pcm_capture_handle, capture_buffer, BUFFER_SIZE);
+            if (got < 0) {
+                snd_pcm_recover(pcm_capture_handle, (int)got, 0);
+            } else if ((snd_pcm_uframes_t)got < BUFFER_SIZE) {
+                memset(capture_buffer + (got * 2), 0, (BUFFER_SIZE - (size_t)got) * 2 * sizeof(float));
+            }
+        }
+
         float buffer[BUFFER_SIZE * 2];
-        float block_peak = render_audio_block(voices, &active_knobs, global_lfo_phases, buffer);
+        float block_peak = render_audio_block(voices, &active_knobs, global_lfo_phases, capture_buffer, buffer);
 
         vu_decimator++;
         if (client_fd >= 0 && vu_decimator >= 12) { send(client_fd, &block_peak, sizeof(float), 0); vu_decimator = 0; }
         write_audio_block(pcm_handle, buffer, BUFFER_SIZE);
     }
-    if (client_fd >= 0) close(client_fd); if (server_fd >= 0) close(server_fd);
-    unlink(socket_path); snd_seq_close(seq_handle); snd_pcm_close(pcm_handle);
+    if (client_fd >= 0) close(client_fd);
+    if (server_fd >= 0) close(server_fd);
+    unlink(socket_path);
+    snd_seq_close(seq_handle);
+    snd_pcm_close(pcm_handle);
+    if (pcm_capture_handle) snd_pcm_close(pcm_capture_handle);
     return 0;
 }

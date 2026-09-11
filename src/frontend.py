@@ -3,9 +3,11 @@ import socket
 import struct
 import math
 import random
+import subprocess
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
-                             QSlider, QPushButton, QProgressBar, QSpinBox, QLineEdit, QCheckBox)
+                             QSlider, QPushButton, QProgressBar, QSpinBox, QLineEdit, QCheckBox,
+                             QScrollArea)
 from PyQt6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor
 from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal
 
@@ -21,6 +23,33 @@ def _retain_hidden(widget):
     policy.setRetainSizeWhenHidden(True)
     widget.setSizePolicy(policy)
     return widget
+
+# Device name byte width must match AUDIO_DEVICE_NAME_LEN in backend.c exactly.
+AUDIO_DEVICE_NAME_LEN = 64
+# FX bus geometry must match FX_SLOT_COUNT / FX_SLOT_PARAM_COUNT in backend.c exactly.
+FX_SLOT_COUNT = 12
+FX_SLOT_PARAM_COUNT = 8
+
+def _list_alsa_devices(list_cmd):
+    """Best-effort enumeration of ALSA PCM device names via `aplay -L` / `arecord -L`. Falls
+    back to just ["default"] if the tool isn't installed, times out, or returns nothing -- the
+    combo box is still editable text either way, so "default" is always a safe starting point."""
+    names = []
+    try:
+        result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=2)
+        # `aplay -L`/`arecord -L` list one device name per unindented line, with indented
+        # description lines following each -- only the unindented lines are device names.
+        names = [line for line in result.stdout.splitlines() if line and not line[0].isspace()]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if "default" in names:
+        names.remove("default")
+    return ["default"] + names
+
+def _encode_device_name(name):
+    """Pack a device name into the fixed AUDIO_DEVICE_NAME_LEN-byte, null-terminated field the
+    backend's struct expects. Truncates to fit rather than overflowing the fixed-size C buffer."""
+    return name.encode("utf-8", errors="replace")[:AUDIO_DEVICE_NAME_LEN - 1].ljust(AUDIO_DEVICE_NAME_LEN, b"\x00")
 
 class ResetSlider(QSlider):
     """Vertical volume slider that resets to a default value when double-clicked."""
@@ -702,6 +731,8 @@ class SynthGui(QWidget):
         self.tab_filters = QWidget()
         self.tab_lfos = QWidget()
         self.tab_egs = QWidget()
+        self.tab_fx = QWidget()
+        self.tab_audio = QWidget()
 
         # ----------------------------------------------------
         # INDEPENDENT COMPONENT: GENERAL SYSTEM SHELL
@@ -1455,6 +1486,147 @@ class SynthGui(QWidget):
         eg_outer_lay.addWidget(eg_group)
 
         # ----------------------------------------------------
+        # FX TAB CONTENT (12-slot serial FX bus -- runs on the full mix, post-filter,
+        # pre-master-volume, and after the external input has been summed in; see
+        # process_fx_chain() in backend.c)
+        # ----------------------------------------------------
+        fx_outer_lay = QVBoxLayout(self.tab_fx)
+        fx_outer_lay.setContentsMargins(4, 4, 4, 4)
+
+        fx_header = QLabel("<b>FX Bus</b> — 12 slots in series, applied to the full mix (synth + External Input)")
+        fx_header.setStyleSheet("font-size: 10px; color: #888; padding: 2px;")
+        fx_outer_lay.addWidget(fx_header)
+
+        fx_scroll = QScrollArea()
+        fx_scroll.setWidgetResizable(True)
+        fx_scroll_content = QWidget()
+        fx_scroll_lay = QVBoxLayout(fx_scroll_content)
+        fx_scroll_lay.setSpacing(3)
+        fx_scroll_lay.setContentsMargins(2, 2, 2, 2)
+
+        self.fx_type_combos, self.fx_mix_dials, self.fx_bypass_buttons, self.fx_param_dials = [], [], [], []
+
+        for slot_idx in range(FX_SLOT_COUNT):
+            slot_box = QGroupBox(f"FX {slot_idx + 1}")
+            slot_box.setStyleSheet("QGroupBox { font-size: 10px; font-weight: bold; }")
+            slot_lay = QHBoxLayout(slot_box)
+            slot_lay.setSpacing(4)
+            slot_lay.setContentsMargins(4, 2, 4, 2)
+
+            type_combo = QComboBox()
+            # Only "Off" exists for now -- each ported effect gets appended here (and a
+            # matching FX_TYPE_* case in the backend's process_fx_chain switch) without
+            # disturbing this slot's other settings or its position in the chain.
+            type_combo.addItems(["Off"])
+            type_combo.setFixedWidth(80)
+            type_combo.setStyleSheet("font-size: 9px;")
+            slot_lay.addWidget(type_combo)
+            self.fx_type_combos.append(type_combo)
+
+            param_dials = []
+            for p_idx in range(FX_SLOT_PARAM_COUNT):
+                p_col = QVBoxLayout(); p_col.setSpacing(0)
+                p_lbl = QLabel(f"P{p_idx + 1}"); p_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter); p_lbl.setStyleSheet("font-size: 7px;")
+                p_col.addWidget(p_lbl)
+                p_dial = PotentiometerKnob(f"FX {slot_idx + 1} P{p_idx + 1}", self)
+                p_dial.setRange(-100, 100)
+                p_dial.setValue(0)
+                p_col.addWidget(p_dial, alignment=Qt.AlignmentFlag.AlignCenter)
+                slot_lay.addLayout(p_col)
+                param_dials.append(p_dial)
+            self.fx_param_dials.append(param_dials)
+
+            mix_col = QVBoxLayout(); mix_col.setSpacing(0)
+            mix_col.addWidget(QLabel("Mix"), alignment=Qt.AlignmentFlag.AlignCenter)
+            mix_dial = PotentiometerKnob(f"FX {slot_idx + 1} Mix", self)
+            mix_dial.setRange(0, 100)
+            mix_dial.setValue(100)
+            mix_col.addWidget(mix_dial, alignment=Qt.AlignmentFlag.AlignCenter)
+            slot_lay.addLayout(mix_col)
+            self.fx_mix_dials.append(mix_dial)
+
+            bypass_btn = QPushButton("By")
+            bypass_btn.setCheckable(True)
+            bypass_btn.setFixedSize(22, 22)
+            bypass_btn.setStyleSheet("QPushButton { font-size: 8px; } QPushButton:checked { background-color: #b58900; color: black; }")
+            bypass_btn.setToolTip("Bypass this slot (keeps its state alive -- e.g. a delay's tail -- unlike switching Type to Off)")
+            slot_lay.addWidget(bypass_btn)
+            self.fx_bypass_buttons.append(bypass_btn)
+
+            fx_scroll_lay.addWidget(slot_box)
+
+        fx_scroll_lay.addStretch()
+        fx_scroll.setWidget(fx_scroll_content)
+        fx_outer_lay.addWidget(fx_scroll)
+
+        # ----------------------------------------------------
+        # AUDIO TAB CONTENT (device selection + external input)
+        # ----------------------------------------------------
+        audio_outer_lay = QVBoxLayout(self.tab_audio)
+        audio_outer_lay.setContentsMargins(6, 6, 6, 6)
+        audio_outer_lay.setSpacing(6)
+
+        device_box = QGroupBox("Audio Devices")
+        device_lay = QVBoxLayout()
+        device_lay.setSpacing(6)
+
+        out_row = QHBoxLayout()
+        out_row.addWidget(QLabel("Output:"))
+        self.output_device_combo = QComboBox()
+        self.output_device_combo.setEditable(True)
+        self.output_device_combo.addItems(_list_alsa_devices(["aplay", "-L"]))
+        out_row.addWidget(self.output_device_combo, stretch=1)
+        device_lay.addLayout(out_row)
+
+        in_row = QHBoxLayout()
+        in_row.addWidget(QLabel("Input:"))
+        self.input_device_combo = QComboBox()
+        self.input_device_combo.setEditable(True)
+        self.input_device_combo.addItems(_list_alsa_devices(["arecord", "-L"]))
+        in_row.addWidget(self.input_device_combo, stretch=1)
+        device_lay.addLayout(in_row)
+
+        refresh_row = QHBoxLayout()
+        self.btn_refresh_devices = QPushButton("Rescan Devices")
+        self.btn_refresh_devices.setFixedHeight(24)
+        refresh_row.addWidget(self.btn_refresh_devices)
+        refresh_row.addStretch()
+        device_lay.addLayout(refresh_row)
+        self.btn_refresh_devices.clicked.connect(self.refresh_audio_devices)
+
+        device_note = QLabel("Changing a device applies live — the backend closes and reopens that stream.")
+        device_note.setStyleSheet("font-size: 9px; color: #888;")
+        device_note.setWordWrap(True)
+        device_lay.addWidget(device_note)
+
+        device_box.setLayout(device_lay)
+        audio_outer_lay.addWidget(device_box)
+
+        ext_in_box = QGroupBox("External Audio Input")
+        ext_in_lay = QHBoxLayout()
+        ext_in_lay.setSpacing(8)
+
+        self.ext_in_enable = QCheckBox("Enable")
+        ext_in_lay.addWidget(self.ext_in_enable)
+
+        gain_col = QVBoxLayout(); gain_col.setSpacing(0)
+        gain_col.addWidget(QLabel("Gain"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.ext_in_gain_dial = PotentiometerKnob("Input Gain", self)
+        self.ext_in_gain_dial.setRange(0, 200)
+        self.ext_in_gain_dial.setValue(100)
+        gain_col.addWidget(self.ext_in_gain_dial, alignment=Qt.AlignmentFlag.AlignCenter)
+        ext_in_lay.addLayout(gain_col)
+
+        ext_in_note = QLabel("Routed into the same FX bus as the synth's own voices — passes through all 12 FX slots.")
+        ext_in_note.setStyleSheet("font-size: 9px; color: #888;")
+        ext_in_note.setWordWrap(True)
+        ext_in_lay.addWidget(ext_in_note, stretch=1)
+
+        ext_in_box.setLayout(ext_in_lay)
+        audio_outer_lay.addWidget(ext_in_box)
+        audio_outer_lay.addStretch()
+
+        # ----------------------------------------------------
         # ASSEMBLE AND ANCHOR TOUCH DECK TO ROOT LAYOUT
         # ----------------------------------------------------
         self.tab_widget.addTab(self.tab_global, "Global")
@@ -1462,6 +1634,8 @@ class SynthGui(QWidget):
         self.tab_widget.addTab(self.tab_filters, "Filters")
         self.tab_widget.addTab(self.tab_lfos, "LFOs")
         self.tab_widget.addTab(self.tab_egs, "Envelopes")
+        self.tab_widget.addTab(self.tab_fx, "FX")
+        self.tab_widget.addTab(self.tab_audio, "Audio")
 
         outer_layout.addWidget(self.tab_widget, stretch=5)
         self.setLayout(outer_layout)
@@ -1505,6 +1679,17 @@ class SynthGui(QWidget):
             }
             panel.set_state(state)
             self.eg_dest_combos[i].setCurrentIndex(random.randint(0, self.eg_dest_combos[i].count() - 1))
+
+    def refresh_audio_devices(self):
+        """Re-scans ALSA device names, preserving whatever's currently selected/typed if it's
+        still present (or just keeping the typed text if it isn't a scanned name at all)."""
+        for combo, list_cmd in ((self.output_device_combo, ["aplay", "-L"]), (self.input_device_combo, ["arecord", "-L"])):
+            current_text = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(_list_alsa_devices(list_cmd))
+            combo.setCurrentText(current_text)
+            combo.blockSignals(False)
 
     def connect_to_backend(self):
         try:
@@ -1654,9 +1839,36 @@ class SynthGui(QWidget):
         packet_list.append(float(self.sub_pan.value()) / 100.0)
         packet_list.append(1.0 if self.sub_mute.isChecked() else 0.0)
 
-        # UNIFIED 151f CONTRACT VERIFICATION
-        # 13 + 56 + 1 + 1 + 4 + 1 + 12 + 4 + 24 + 4 + 4 + 7 + 4 + 1 + 2 + 1 + 2 + 10 = 151
-        binary_packet = struct.pack("151f", *packet_list)
+        # --- FX Bus + External Input architecture additions ---
+        # This is the 151f contract's first breaking change since the 4-oscillator overhaul --
+        # everything above this point is untouched, everything below is new. Order here MUST
+        # match SynthSharedControls in backend.c field-for-field: ext_in_enable/gain, then
+        # FX_SLOT_COUNT slots (each fx_type, FX_SLOT_PARAM_COUNT params, mix, bypass), then the
+        # two fixed-width device name strings, packed last since struct.pack keeps fixed-size
+        # string fields at the end of the format string.
+
+        # External Audio Input: enable, gain (+2 items)
+        packet_list.append(1.0 if self.ext_in_enable.isChecked() else 0.0)
+        packet_list.append(float(self.ext_in_gain_dial.value()) / 100.0)
+
+        # FX Bus: 12 slots * (1 type + 8 params + 1 mix + 1 bypass) = 132 items
+        for slot_idx in range(FX_SLOT_COUNT):
+            packet_list.append(float(self.fx_type_combos[slot_idx].currentIndex()))
+            for p_dial in self.fx_param_dials[slot_idx]:
+                packet_list.append(float(p_dial.value()))
+            packet_list.append(float(self.fx_mix_dials[slot_idx].value()))
+            packet_list.append(1.0 if self.fx_bypass_buttons[slot_idx].isChecked() else 0.0)
+
+        # UNIFIED CONTRACT VERIFICATION
+        # 151 (baseline through 4-osc additions) + 2 (ext in) + 132 (12 FX slots * 11) = 285
+        # floats, followed by 2 fixed 64-byte device name strings (not floats).
+        # 13 + 56 + 1 + 1 + 4 + 1 + 12 + 4 + 24 + 4 + 4 + 7 + 4 + 1 + 2 + 1 + 2 + 10 + 2 + 132 = 285
+        binary_packet = struct.pack(
+            f"285f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
+            *packet_list,
+            _encode_device_name(self.output_device_combo.currentText()),
+            _encode_device_name(self.input_device_combo.currentText()),
+        )
         if self.sock is not None:
             try: self.sock.sendall(binary_packet)
             except socket.error: self.sock = None
@@ -1747,6 +1959,20 @@ def runtime_connect_and_bind(gui):
         gui.lfo_phase_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.lfo_sync_combos[idx].currentIndexChanged.connect(gui.transmit_knob_packet)
         gui.lfo_dest_combos[idx].currentIndexChanged.connect(gui.transmit_knob_packet)
+
+    # FX Bus: 12 slots, each wired the same way
+    for slot_idx in range(FX_SLOT_COUNT):
+        gui.fx_type_combos[slot_idx].currentIndexChanged.connect(gui.transmit_knob_packet)
+        for p_dial in gui.fx_param_dials[slot_idx]:
+            p_dial.valueChanged.connect(gui.transmit_knob_packet)
+        gui.fx_mix_dials[slot_idx].valueChanged.connect(gui.transmit_knob_packet)
+        gui.fx_bypass_buttons[slot_idx].toggled.connect(gui.transmit_knob_packet)
+
+    # External Audio Input + Audio device selection
+    gui.ext_in_enable.toggled.connect(gui.transmit_knob_packet)
+    gui.ext_in_gain_dial.valueChanged.connect(gui.transmit_knob_packet)
+    gui.output_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
+    gui.input_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
 
     # Initialize separate telemetry thread loop for VU meter updates
     gui.vu_timer = QTimer()
