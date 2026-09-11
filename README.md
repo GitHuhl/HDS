@@ -32,13 +32,20 @@ just before the FX bus, so it passes through the same 12 slots as the
 synth's own voices. Each slot has a generic 8-param bank + mix + bypass
 (`process_fx_chain()` in `backend.c`); most slot types are still an
 unimplemented pass-through, ready for more effects to be ported into the
-dispatch switch. One is implemented so far:
+dispatch switch. Two are implemented so far, both ported from Airwindows
+(MIT license):
 
 - **Ensemble** — a 12-tap fixed-delay ensemble/chorus (not a reverb: no
-  feedback loop), ported from Airwindows' StereoEnsemble (MIT license).
-  Params: Depth (widens/lengthens the delay taps) and FX Level (the
-  effect's own internal wet/dry balance, independent of the slot's
-  generic Mix knob).
+  feedback loop). Params: Depth (widens/lengthens the delay taps) and
+  FX Level (the effect's own internal wet/dry balance, independent of
+  the slot's generic Mix knob).
+- **CreamCoat** — a genuine reverb: a 4-stage, 16-line Householder
+  feedback delay network run at a reduced, continuously variable internal
+  rate with a bezier-curve reconstruction back to full sample rate. Params:
+  Select (17 room-size presets), Regen (feedback amount), DeRez (tank
+  downsample rate — a character control, not just a CPU knob), Predelay,
+  and Wetness (also its own internal blend, not a crossfade — see the
+  comment in `run_fx_creamcoat`).
 
 Adding a new effect means: a `FX_TYPE_*` define + its processing function
 + a case in `process_fx_chain()`'s switch (`backend.c`), and a matching

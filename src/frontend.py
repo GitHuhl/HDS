@@ -42,6 +42,13 @@ FX_TYPE_METADATA = [
         {"label": "Depth", "range": (0, 100), "default": 50},
         {"label": "FX Level", "range": (0, 100), "default": 100},
     ]},
+    {"name": "CreamCoat", "params": [
+        {"label": "Select", "range": (0, 100), "default": 50},
+        {"label": "Regen", "range": (0, 100), "default": 50},
+        {"label": "DeRez", "range": (0, 100), "default": 100},
+        {"label": "Predelay", "range": (0, 100), "default": 0},
+        {"label": "Wetness", "range": (0, 100), "default": 25},
+    ]},
 ]
 
 def _list_alsa_devices(list_cmd):

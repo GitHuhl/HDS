@@ -94,6 +94,11 @@ typedef struct {
 // taps), param[1] = FX Level (0..1, this effect's OWN internal wet/dry balance -- separate
 // from and applied in addition to the slot's generic `mix` above). See run_fx_ensemble().
 #define FX_TYPE_ENSEMBLE 1
+// Ported from Airwindows CreamCoat (MIT license). A genuine reverb (16-line Householder FDN).
+// param[0] Select (room preset, 0..1 -> 17 presets), param[1] Regen (feedback, 0..1),
+// param[2] DeRez (tank downsample rate, 0..1), param[3] Predelay (0..1), param[4] Wetness
+// (0..1 -- NOT a crossfade, see run_fx_creamcoat's comment). See run_fx_creamcoat().
+#define FX_TYPE_CREAMCOAT 2
 #define FX_SLOT_PARAM_COUNT 8
 typedef struct {
     float fx_type;
@@ -641,6 +646,378 @@ static void run_fx_ensemble(FXSlotEngine *engine, const FXSlotParams *params, fl
     *r = inputSampleR;
 }
 
+// --- FX_TYPE_CREAMCOAT: ported from Airwindows CreamCoat (MIT license) ---
+// A genuine reverb (unlike Ensemble above): a 4-stage, 4-way Householder feedback delay
+// network -- 16 delay lines (A-P), each of the two stereo channels using all 16 physical delay
+// lengths but reading/writing them in a different rotation per stage, so L and R decorrelate
+// while still sharing one set of tuned lengths. The network runs at a continuously variable,
+// reduced internal "tank" rate (DeRez) and reconstructs a full-rate output via a 3-point
+// bezier-style blend of the tank's last few ticks (the bez_* fields below -- ported from the
+// original's bez[] array, named here for readability, same meaning/order).
+// param[0] Select: 17 room-size presets (delay lengths swapped live on change, mid-tank-content
+//   reset but feedback/reconstruction state deliberately left alone, matching the original).
+// param[1] Regen: feedback amount. param[2] DeRez: tank downsample rate (1.0 = full rate/
+//   quality; lower = grittier, more aliased tank, an intentional character control, not just a
+//   CPU knob). param[3] Predelay. param[4] Wetness: NOT a crossfade -- 0.5 is both dry and wet
+//   at full strength (see the original's own comment, kept below), so raising it adds reverb
+//   level without pulling back the dry signal.
+#define CREAMCOAT_PREDELAY 15000
+// Compile-time max length for each of the 16 delay lines (+5 headroom, matching the original
+// header). The runtime length actually in use (shortA..shortP below) depends on the Select
+// preset and is always within these maximums.
+#define CC_KA 350
+#define CC_KB 1710
+#define CC_KC 1610
+#define CC_KD 835
+#define CC_KE 700
+#define CC_KF 1260
+#define CC_KG 1110
+#define CC_KH 1768
+#define CC_KI 280
+#define CC_KJ 2645
+#define CC_KK 1410
+#define CC_KL 1175
+#define CC_KM 12
+#define CC_KN 3110
+#define CC_KO 120
+#define CC_KP 2370
+
+// 17 room-size presets (Select), each giving all 16 delay-line lengths in A..P order --
+// transcribed as-is from the original's switch/case table.
+static const int CREAMCOAT_PRESETS[17][16] = {
+    {65,124,83,180,200,291,108,189,73,410,479,310,11,928,23,654},
+    {114,205,498,195,205,318,143,254,64,721,512,324,11,782,26,394},
+    {118,272,292,145,200,241,204,504,50,678,424,412,11,1124,47,766},
+    {19,474,301,275,260,321,371,571,50,410,697,414,11,986,47,522},
+    {112,387,452,289,173,476,321,593,73,343,829,91,11,1055,43,862},
+    {60,368,295,272,210,284,326,830,125,236,737,486,11,1178,75,902},
+    {73,311,472,251,134,509,393,591,124,1070,340,525,11,1367,75,816},
+    {159,518,514,165,275,494,296,667,75,1101,116,414,11,1261,79,998},
+    {41,741,274,59,306,332,291,767,42,881,959,422,11,1237,45,958},
+    {251,437,783,189,130,272,244,761,128,1190,320,491,11,1409,58,455},
+    {316,510,1087,349,359,74,79,1269,34,693,749,511,11,1751,93,403},
+    {254,651,845,316,373,267,182,857,215,1535,1127,315,11,1649,97,829},
+    {113,101,673,357,340,229,278,1008,265,1890,155,267,11,2233,116,600},
+    {218,1058,862,505,297,580,532,1387,120,576,1409,473,11,1991,76,685},
+    {78,760,982,528,445,1128,130,708,22,2144,354,1169,11,2782,58,1515},
+    {330,107,1110,371,620,143,1014,1763,184,2068,1406,595,11,2639,33,1594},
+    {336,1660,386,623,693,1079,891,1574,24,2641,1239,775,11,3104,55,2366},
+};
+
+typedef struct {
+    float aAL[CC_KA+5], aBL[CC_KB+5], aCL[CC_KC+5], aDL[CC_KD+5];
+    float aEL[CC_KE+5], aFL[CC_KF+5], aGL[CC_KG+5], aHL[CC_KH+5];
+    float aIL[CC_KI+5], aJL[CC_KJ+5], aKL[CC_KK+5], aLL[CC_KL+5];
+    float aML[CC_KM+5], aNL[CC_KN+5], aOL[CC_KO+5], aPL[CC_KP+5];
+
+    float aAR[CC_KA+5], aBR[CC_KB+5], aCR[CC_KC+5], aDR[CC_KD+5];
+    float aER[CC_KE+5], aFR[CC_KF+5], aGR[CC_KG+5], aHR[CC_KH+5];
+    float aIR[CC_KI+5], aJR[CC_KJ+5], aKR[CC_KK+5], aLR[CC_KL+5];
+    float aMR[CC_KM+5], aNR[CC_KN+5], aOR[CC_KO+5], aPR[CC_KP+5];
+
+    float aZL[CREAMCOAT_PREDELAY+5], aZR[CREAMCOAT_PREDELAY+5];
+
+    float feedbackAL, feedbackBL, feedbackCL, feedbackDL;
+    float feedbackDR, feedbackHR, feedbackLR, feedbackPR;
+
+    int countAL, countBL, countCL, countDL, countEL, countFL, countGL, countHL;
+    int countIL, countJL, countKL, countLL, countML, countNL, countOL, countPL;
+    int countAR, countBR, countCR, countDR, countER, countFR, countGR, countHR;
+    int countIR, countJR, countKR, countLR, countMR, countNR, countOR, countPR;
+    int countZ;
+
+    int shortA, shortB, shortC, shortD, shortE, shortF, shortG, shortH;
+    int shortI, shortJ, shortK, shortL, shortM, shortN, shortO, shortP;
+    int prevclearcoat;
+
+    // Bezier-curve tank-rate reconstruction state (ported from the original's bez[] array,
+    // indices bez_AL..bez_cycle -- flattened into named fields here for readability, same
+    // meaning/order otherwise).
+    float bez_AL, bez_AR, bez_BL, bez_BR, bez_CL, bez_CR;
+    float bez_InL, bez_InR, bez_UnInL, bez_UnInR, bez_SampL, bez_SampR;
+    float bez_cycle;
+
+    uint32_t fpdL, fpdR;
+} FxCreamCoatState;
+
+static void run_fx_creamcoat(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxCreamCoatState *st = (FxCreamCoatState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxCreamCoatState));
+        engine->state = st;
+        if (!st) return;
+        st->countAL = st->countBL = st->countCL = st->countDL = 1;
+        st->countEL = st->countFL = st->countGL = st->countHL = 1;
+        st->countIL = st->countJL = st->countKL = st->countLL = 1;
+        st->countML = st->countNL = st->countOL = st->countPL = 1;
+        st->countAR = st->countBR = st->countCR = st->countDR = 1;
+        st->countER = st->countFR = st->countGR = st->countHR = 1;
+        st->countIR = st->countJR = st->countKR = st->countLR = 1;
+        st->countMR = st->countNR = st->countOR = st->countPR = 1;
+        st->countZ = 1;
+        st->prevclearcoat = -1;
+        // Matches the original constructor's bez[bez_cycle] = 1.0 (all other bez[] slots 0) --
+        // combined with "+= derez" happening before the tick check every call, this guarantees
+        // the very first sample processed triggers an initial tank tick.
+        st->bez_cycle = 1.0f;
+        st->fpdL = (uint32_t)rand(); while (st->fpdL < 16386) st->fpdL = (uint32_t)rand();
+        st->fpdR = (uint32_t)rand(); while (st->fpdR < 16386) st->fpdR = (uint32_t)rand();
+    }
+
+    float A = fmaxf(0.0f, fminf(1.0f, params->param[0])); // Select
+    float B = fmaxf(0.0f, fminf(1.0f, params->param[1])); // Regen
+    float C = fmaxf(0.0f, fminf(1.0f, params->param[2])); // DeRez
+    float D = fmaxf(0.0f, fminf(1.0f, params->param[3])); // Predelay
+    float E = fmaxf(0.0f, fminf(1.0f, params->param[4])); // Wetness
+
+    float overallscale = (float)SAMPLE_RATE / 44100.0f;
+
+    int clearcoat = (int)(A * 16.999f);
+    if (clearcoat != st->prevclearcoat) {
+        // Room preset changed live: clear the 16 delay lines' content and their L/R counters
+        // (matching the original exactly) -- but deliberately NOT the feedback/bez/predelay
+        // state, same scope the original resets, presumably so the transition isn't a hard mute.
+        memset(st->aAL, 0, sizeof(st->aAL)); memset(st->aAR, 0, sizeof(st->aAR));
+        memset(st->aBL, 0, sizeof(st->aBL)); memset(st->aBR, 0, sizeof(st->aBR));
+        memset(st->aCL, 0, sizeof(st->aCL)); memset(st->aCR, 0, sizeof(st->aCR));
+        memset(st->aDL, 0, sizeof(st->aDL)); memset(st->aDR, 0, sizeof(st->aDR));
+        memset(st->aEL, 0, sizeof(st->aEL)); memset(st->aER, 0, sizeof(st->aER));
+        memset(st->aFL, 0, sizeof(st->aFL)); memset(st->aFR, 0, sizeof(st->aFR));
+        memset(st->aGL, 0, sizeof(st->aGL)); memset(st->aGR, 0, sizeof(st->aGR));
+        memset(st->aHL, 0, sizeof(st->aHL)); memset(st->aHR, 0, sizeof(st->aHR));
+        memset(st->aIL, 0, sizeof(st->aIL)); memset(st->aIR, 0, sizeof(st->aIR));
+        memset(st->aJL, 0, sizeof(st->aJL)); memset(st->aJR, 0, sizeof(st->aJR));
+        memset(st->aKL, 0, sizeof(st->aKL)); memset(st->aKR, 0, sizeof(st->aKR));
+        memset(st->aLL, 0, sizeof(st->aLL)); memset(st->aLR, 0, sizeof(st->aLR));
+        memset(st->aML, 0, sizeof(st->aML)); memset(st->aMR, 0, sizeof(st->aMR));
+        memset(st->aNL, 0, sizeof(st->aNL)); memset(st->aNR, 0, sizeof(st->aNR));
+        memset(st->aOL, 0, sizeof(st->aOL)); memset(st->aOR, 0, sizeof(st->aOR));
+        memset(st->aPL, 0, sizeof(st->aPL)); memset(st->aPR, 0, sizeof(st->aPR));
+        st->countAL = st->countBL = st->countCL = st->countDL = 1;
+        st->countEL = st->countFL = st->countGL = st->countHL = 1;
+        st->countIL = st->countJL = st->countKL = st->countLL = 1;
+        st->countML = st->countNL = st->countOL = st->countPL = 1;
+        st->countAR = st->countBR = st->countCR = st->countDR = 1;
+        st->countER = st->countFR = st->countGR = st->countHR = 1;
+        st->countIR = st->countJR = st->countKR = st->countLR = 1;
+        st->countMR = st->countNR = st->countOR = st->countPR = 1;
+        const int *preset = CREAMCOAT_PRESETS[clearcoat];
+        st->shortA = preset[0];  st->shortB = preset[1];  st->shortC = preset[2];  st->shortD = preset[3];
+        st->shortE = preset[4];  st->shortF = preset[5];  st->shortG = preset[6];  st->shortH = preset[7];
+        st->shortI = preset[8];  st->shortJ = preset[9];  st->shortK = preset[10]; st->shortL = preset[11];
+        st->shortM = preset[12]; st->shortN = preset[13]; st->shortO = preset[14]; st->shortP = preset[15];
+        st->prevclearcoat = clearcoat;
+    }
+
+    float regen = (1.0f - powf(1.0f - B, 2.0f)) * 0.0625f;
+    float derez = C / overallscale;
+    if (derez < 0.0005f) derez = 0.0005f;
+    if (derez > 1.0f) derez = 1.0f;
+    derez = 1.0f / (float)((int)(1.0f / derez)); // hard-locks derez to exact subdivisions of 1.0
+    int adjPredelay = (int)(CREAMCOAT_PREDELAY * D * derez);
+    float wet = E * 2.0f;
+    float dry = 2.0f - wet;
+    if (wet > 1.0f) wet = 1.0f; else wet *= wet;
+    if (wet < 0.0f) wet = 0.0f;
+    if (dry > 1.0f) dry = 1.0f;
+    if (dry < 0.0f) dry = 0.0f;
+    // This reverb submixes at 50% full dry AND full wet, not crossfaded -- so it can sit on a
+    // send/submix without cutting the dry signal back as Wetness is raised (see param[4] doc
+    // above). Ported verbatim from the original's own comment.
+
+    float inputSampleL = *l, inputSampleR = *r;
+    if (fabsf(inputSampleL) < 1.18e-23f) inputSampleL = (float)st->fpdL * 1.18e-17f;
+    if (fabsf(inputSampleR) < 1.18e-23f) inputSampleR = (float)st->fpdR * 1.18e-17f;
+    float drySampleL = inputSampleL, drySampleR = inputSampleR;
+
+    st->bez_cycle += derez;
+    st->bez_SampL += ((inputSampleL + st->bez_InL) * derez);
+    st->bez_SampR += ((inputSampleR + st->bez_InR) * derez);
+    st->bez_InL = inputSampleL; st->bez_InR = inputSampleR;
+
+    if (st->bez_cycle > 1.0f) { // hit the end point -- run one reverb-tank tick
+        st->bez_cycle = 0.0f;
+
+        // Predelay (operates at tank rate -- see adjPredelay's derivation above).
+        st->aZL[st->countZ] = st->bez_SampL;
+        st->aZR[st->countZ] = st->bez_SampR;
+        st->countZ++; if (st->countZ < 0 || st->countZ > adjPredelay) st->countZ = 0;
+        st->bez_SampL = st->aZL[st->countZ - ((st->countZ > adjPredelay) ? adjPredelay + 1 : 0)];
+        st->bez_SampR = st->aZR[st->countZ - ((st->countZ > adjPredelay) ? adjPredelay + 1 : 0)];
+
+        // Stage 0: input + feedback taps.
+        st->aAL[st->countAL] = (st->bez_SampL + st->bez_UnInL) + (st->feedbackAL * regen);
+        st->aBL[st->countBL] = (st->bez_SampL + st->bez_UnInL) + (st->feedbackBL * regen);
+        st->aCL[st->countCL] = (st->bez_SampL + st->bez_UnInL) + (st->feedbackCL * regen);
+        st->aDL[st->countDL] = (st->bez_SampL + st->bez_UnInL) + (st->feedbackDL * regen);
+        st->bez_UnInL = st->bez_SampL;
+
+        st->aDR[st->countDR] = (st->bez_SampR + st->bez_UnInR) + (st->feedbackDR * regen);
+        st->aHR[st->countHR] = (st->bez_SampR + st->bez_UnInR) + (st->feedbackHR * regen);
+        st->aLR[st->countLR] = (st->bez_SampR + st->bez_UnInR) + (st->feedbackLR * regen);
+        st->aPR[st->countPR] = (st->bez_SampR + st->bez_UnInR) + (st->feedbackPR * regen);
+        st->bez_UnInR = st->bez_SampR;
+
+        st->countAL++; if (st->countAL < 0 || st->countAL > st->shortA) st->countAL = 0;
+        st->countBL++; if (st->countBL < 0 || st->countBL > st->shortB) st->countBL = 0;
+        st->countCL++; if (st->countCL < 0 || st->countCL > st->shortC) st->countCL = 0;
+        st->countDL++; if (st->countDL < 0 || st->countDL > st->shortD) st->countDL = 0;
+
+        st->countDR++; if (st->countDR < 0 || st->countDR > st->shortD) st->countDR = 0;
+        st->countHR++; if (st->countHR < 0 || st->countHR > st->shortH) st->countHR = 0;
+        st->countLR++; if (st->countLR < 0 || st->countLR > st->shortL) st->countLR = 0;
+        st->countPR++; if (st->countPR < 0 || st->countPR > st->shortP) st->countPR = 0;
+
+        float outAL = st->aAL[st->countAL - ((st->countAL > st->shortA) ? st->shortA + 1 : 0)];
+        float outBL = st->aBL[st->countBL - ((st->countBL > st->shortB) ? st->shortB + 1 : 0)];
+        float outCL = st->aCL[st->countCL - ((st->countCL > st->shortC) ? st->shortC + 1 : 0)];
+        float outDL = st->aDL[st->countDL - ((st->countDL > st->shortD) ? st->shortD + 1 : 0)];
+
+        float outDR = st->aDR[st->countDR - ((st->countDR > st->shortD) ? st->shortD + 1 : 0)];
+        float outHR = st->aHR[st->countHR - ((st->countHR > st->shortH) ? st->shortH + 1 : 0)];
+        float outLR = st->aLR[st->countLR - ((st->countLR > st->shortL) ? st->shortL + 1 : 0)];
+        float outPR = st->aPR[st->countPR - ((st->countPR > st->shortP) ? st->shortP + 1 : 0)];
+
+        // Stage 1: 4-way Householder reflection.
+        st->aEL[st->countEL] = outAL - (outBL + outCL + outDL);
+        st->aFL[st->countFL] = outBL - (outAL + outCL + outDL);
+        st->aGL[st->countGL] = outCL - (outAL + outBL + outDL);
+        st->aHL[st->countHL] = outDL - (outAL + outBL + outCL);
+
+        st->aCR[st->countCR] = outDR - (outHR + outLR + outPR);
+        st->aGR[st->countGR] = outHR - (outDR + outLR + outPR);
+        st->aKR[st->countKR] = outLR - (outDR + outHR + outPR);
+        st->aOR[st->countOR] = outPR - (outDR + outHR + outLR);
+
+        st->countEL++; if (st->countEL < 0 || st->countEL > st->shortE) st->countEL = 0;
+        st->countFL++; if (st->countFL < 0 || st->countFL > st->shortF) st->countFL = 0;
+        st->countGL++; if (st->countGL < 0 || st->countGL > st->shortG) st->countGL = 0;
+        st->countHL++; if (st->countHL < 0 || st->countHL > st->shortH) st->countHL = 0;
+
+        st->countCR++; if (st->countCR < 0 || st->countCR > st->shortC) st->countCR = 0;
+        st->countGR++; if (st->countGR < 0 || st->countGR > st->shortG) st->countGR = 0;
+        st->countKR++; if (st->countKR < 0 || st->countKR > st->shortK) st->countKR = 0;
+        st->countOR++; if (st->countOR < 0 || st->countOR > st->shortO) st->countOR = 0;
+
+        float outEL = st->aEL[st->countEL - ((st->countEL > st->shortE) ? st->shortE + 1 : 0)];
+        float outFL = st->aFL[st->countFL - ((st->countFL > st->shortF) ? st->shortF + 1 : 0)];
+        float outGL = st->aGL[st->countGL - ((st->countGL > st->shortG) ? st->shortG + 1 : 0)];
+        float outHL = st->aHL[st->countHL - ((st->countHL > st->shortH) ? st->shortH + 1 : 0)];
+
+        float outCR = st->aCR[st->countCR - ((st->countCR > st->shortC) ? st->shortC + 1 : 0)];
+        float outGR = st->aGR[st->countGR - ((st->countGR > st->shortG) ? st->shortG + 1 : 0)];
+        float outKR = st->aKR[st->countKR - ((st->countKR > st->shortK) ? st->shortK + 1 : 0)];
+        float outOR = st->aOR[st->countOR - ((st->countOR > st->shortO) ? st->shortO + 1 : 0)];
+
+        // Stage 2.
+        st->aIL[st->countIL] = outEL - (outFL + outGL + outHL);
+        st->aJL[st->countJL] = outFL - (outEL + outGL + outHL);
+        st->aKL[st->countKL] = outGL - (outEL + outFL + outHL);
+        st->aLL[st->countLL] = outHL - (outEL + outFL + outGL);
+
+        st->aBR[st->countBR] = outCR - (outGR + outKR + outOR);
+        st->aFR[st->countFR] = outGR - (outCR + outKR + outOR);
+        st->aJR[st->countJR] = outKR - (outCR + outGR + outOR);
+        st->aNR[st->countNR] = outOR - (outCR + outGR + outKR);
+
+        st->countIL++; if (st->countIL < 0 || st->countIL > st->shortI) st->countIL = 0;
+        st->countJL++; if (st->countJL < 0 || st->countJL > st->shortJ) st->countJL = 0;
+        st->countKL++; if (st->countKL < 0 || st->countKL > st->shortK) st->countKL = 0;
+        st->countLL++; if (st->countLL < 0 || st->countLL > st->shortL) st->countLL = 0;
+
+        st->countBR++; if (st->countBR < 0 || st->countBR > st->shortB) st->countBR = 0;
+        st->countFR++; if (st->countFR < 0 || st->countFR > st->shortF) st->countFR = 0;
+        st->countJR++; if (st->countJR < 0 || st->countJR > st->shortJ) st->countJR = 0;
+        st->countNR++; if (st->countNR < 0 || st->countNR > st->shortN) st->countNR = 0;
+
+        float outIL = st->aIL[st->countIL - ((st->countIL > st->shortI) ? st->shortI + 1 : 0)];
+        float outJL = st->aJL[st->countJL - ((st->countJL > st->shortJ) ? st->shortJ + 1 : 0)];
+        float outKL = st->aKL[st->countKL - ((st->countKL > st->shortK) ? st->shortK + 1 : 0)];
+        float outLL = st->aLL[st->countLL - ((st->countLL > st->shortL) ? st->shortL + 1 : 0)];
+
+        float outBR = st->aBR[st->countBR - ((st->countBR > st->shortB) ? st->shortB + 1 : 0)];
+        float outFR = st->aFR[st->countFR - ((st->countFR > st->shortF) ? st->shortF + 1 : 0)];
+        float outJR = st->aJR[st->countJR - ((st->countJR > st->shortJ) ? st->shortJ + 1 : 0)];
+        float outNR = st->aNR[st->countNR - ((st->countNR > st->shortN) ? st->shortN + 1 : 0)];
+
+        // Stage 3.
+        st->aML[st->countML] = outIL - (outJL + outKL + outLL);
+        st->aNL[st->countNL] = outJL - (outIL + outKL + outLL);
+        st->aOL[st->countOL] = outKL - (outIL + outJL + outLL);
+        st->aPL[st->countPL] = outLL - (outIL + outJL + outKL);
+
+        st->aAR[st->countAR] = outBR - (outFR + outJR + outNR);
+        st->aER[st->countER] = outFR - (outBR + outJR + outNR);
+        st->aIR[st->countIR] = outJR - (outBR + outFR + outNR);
+        st->aMR[st->countMR] = outNR - (outBR + outFR + outJR);
+
+        st->countML++; if (st->countML < 0 || st->countML > st->shortM) st->countML = 0;
+        st->countNL++; if (st->countNL < 0 || st->countNL > st->shortN) st->countNL = 0;
+        st->countOL++; if (st->countOL < 0 || st->countOL > st->shortO) st->countOL = 0;
+        st->countPL++; if (st->countPL < 0 || st->countPL > st->shortP) st->countPL = 0;
+
+        st->countAR++; if (st->countAR < 0 || st->countAR > st->shortA) st->countAR = 0;
+        st->countER++; if (st->countER < 0 || st->countER > st->shortE) st->countER = 0;
+        st->countIR++; if (st->countIR < 0 || st->countIR > st->shortI) st->countIR = 0;
+        st->countMR++; if (st->countMR < 0 || st->countMR > st->shortM) st->countMR = 0;
+
+        float outML = st->aML[st->countML - ((st->countML > st->shortM) ? st->shortM + 1 : 0)];
+        float outNL = st->aNL[st->countNL - ((st->countNL > st->shortN) ? st->shortN + 1 : 0)];
+        float outOL = st->aOL[st->countOL - ((st->countOL > st->shortO) ? st->shortO + 1 : 0)];
+        float outPL = st->aPL[st->countPL - ((st->countPL > st->shortP) ? st->shortP + 1 : 0)];
+
+        float outAR = st->aAR[st->countAR - ((st->countAR > st->shortA) ? st->shortA + 1 : 0)];
+        float outER = st->aER[st->countER - ((st->countER > st->shortE) ? st->shortE + 1 : 0)];
+        float outIR = st->aIR[st->countIR - ((st->countIR > st->shortI) ? st->shortI + 1 : 0)];
+        float outMR = st->aMR[st->countMR - ((st->countMR > st->shortM) ? st->shortM + 1 : 0)];
+
+        // Final Householder stage -> next tick's feedback taps.
+        st->feedbackAL = outML - (outNL + outOL + outPL);
+        st->feedbackDR = outAR - (outER + outIR + outMR);
+        st->feedbackBL = outNL - (outML + outOL + outPL);
+        st->feedbackHR = outER - (outAR + outIR + outMR);
+        st->feedbackCL = outOL - (outML + outNL + outPL);
+        st->feedbackLR = outIR - (outAR + outER + outMR);
+        st->feedbackDL = outPL - (outML + outNL + outOL);
+        st->feedbackPR = outMR - (outAR + outER + outIR);
+
+        // Final combined sum of outputs, corrected for Householder gain and averaging.
+        inputSampleL = (outML + outNL + outOL + outPL) / 32.0f;
+        inputSampleR = (outAR + outER + outIR + outMR) / 32.0f;
+
+        st->bez_CL = st->bez_BL; st->bez_BL = st->bez_AL; st->bez_AL = inputSampleL; st->bez_SampL = 0.0f;
+        st->bez_CR = st->bez_BR; st->bez_BR = st->bez_AR; st->bez_AR = inputSampleR; st->bez_SampR = 0.0f;
+    }
+
+    // 3-point bezier-style reconstruction of the tank's last few ticks into a full-rate signal.
+    float CBL = (st->bez_CL * (1.0f - st->bez_cycle)) + (st->bez_BL * st->bez_cycle);
+    float CBR = (st->bez_CR * (1.0f - st->bez_cycle)) + (st->bez_BR * st->bez_cycle);
+    float BAL = (st->bez_BL * (1.0f - st->bez_cycle)) + (st->bez_AL * st->bez_cycle);
+    float BAR = (st->bez_BR * (1.0f - st->bez_cycle)) + (st->bez_AR * st->bez_cycle);
+    float CBAL = (st->bez_BL + (CBL * (1.0f - st->bez_cycle)) + (BAL * st->bez_cycle)) * 0.125f;
+    float CBAR = (st->bez_BR + (CBR * (1.0f - st->bez_cycle)) + (BAR * st->bez_cycle)) * 0.125f;
+    float outSampleL = CBAL, outSampleR = CBAR;
+
+    outSampleL = fmaxf(-1.0f, fminf(1.0f, outSampleL));
+    outSampleR = fmaxf(-1.0f, fminf(1.0f, outSampleR));
+
+    if (wet < 1.0f) { outSampleL *= wet; outSampleR *= wet; }
+    if (dry < 1.0f) { drySampleL *= dry; drySampleR *= dry; }
+    outSampleL += drySampleL;
+    outSampleR += drySampleR;
+
+    int expon;
+    frexpf(outSampleL, &expon);
+    st->fpdL ^= st->fpdL << 13; st->fpdL ^= st->fpdL >> 17; st->fpdL ^= st->fpdL << 5;
+    outSampleL += (((float)st->fpdL - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+    frexpf(outSampleR, &expon);
+    st->fpdR ^= st->fpdR << 13; st->fpdR ^= st->fpdR >> 17; st->fpdR ^= st->fpdR << 5;
+    outSampleR += (((float)st->fpdR - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+
+    *l = outSampleL;
+    *r = outSampleR;
+}
+
 // Runs the FX_SLOT_COUNT-slot serial FX bus in place on one stereo sample. Called once per
 // sample (not per voice) on the fully summed mix -- see render_audio_block, where this sits
 // after all voices (and the external input) have been added together, and before
@@ -666,6 +1043,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
         float wet_l = dry_l, wet_r = dry_r;
         switch (type) {
             case FX_TYPE_ENSEMBLE: run_fx_ensemble(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+            case FX_TYPE_CREAMCOAT: run_fx_creamcoat(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
             case FX_TYPE_OFF:
             default:
                 break; // pass-through
