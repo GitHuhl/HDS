@@ -35,6 +35,14 @@
 #define UNISON_SAW_VOICES 7
 #define FX_SLOT_COUNT 12
 #define AUDIO_DEVICE_NAME_LEN 64
+// Recording: hard ceiling on how many raw input channels can be captured/selected at once
+// (generous for a class-compliant multichannel interface -- 2/4/8 are the common real cases).
+// Also doubles as the channel count actually requested when opening the capture PCM stream --
+// see query_device_channel_count()/open_pcm_stream() in main().
+#define RECORD_MAX_CHANNELS 16
+// Fixed-size output path buffer for the WAV recorder -- bigger than AUDIO_DEVICE_NAME_LEN since
+// a real filesystem path (not just an ALSA device name) needs the room.
+#define RECORD_PATH_LEN 256
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
@@ -180,6 +188,12 @@ typedef struct {
 // Size controls -- see effective_voice_limit()/effective_block_size(). New total: 319 float
 // items + 192 string bytes. The Python side's struct.pack format changes from "317f64s64s64s"
 // to "319f64s64s64s".
+// BREAKING CHANGE (Recording tab): added record_enable, record_include_synth_output,
+// record_downmix_stereo, record_input_channel_enable[RECORD_MAX_CHANNELS=16] (+19 floats) and
+// one new trailing fixed string, record_path[RECORD_PATH_LEN=256] (appended after midi_device,
+// so string bytes go from 192 to 448) -- see the WavRecorder functions/the recording block in
+// main(). New total: 338 float items + 448 string bytes. The Python side's struct.pack format
+// changes from "319f64s64s64s" to "338f64s64s64s256s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -358,6 +372,26 @@ typedef struct {
     // Size control.
     float block_size_frames;
 
+    // --- Recording (Recording tab) ---
+    // Edge-triggered start/stop: 0->1 opens record_path and begins writing, 1->0 finalizes and
+    // closes the file. See the WavRecorder functions and the recording block in main().
+    float record_enable;
+    // Include the synth's own final post-FX stereo output (exactly what's going to the DAC,
+    // including any processed External Input already summed into that bus -- see ext_in_enable)
+    // as two of the recorded channels.
+    float record_include_synth_output;
+    // 0 = write every selected channel as its own channel in a genuine multichannel WAV file.
+    // 1 = sum every selected channel equally into a single L/R stereo pair instead (scaled down
+    // to avoid clipping -- see the downmix code in main()).
+    float record_downmix_stereo;
+    // Per-channel record enable for the RAW input device capture (independent of
+    // ext_in_enable/ext_in_gain -- this taps the capture stream directly, not the synth's
+    // internal stereo mix, so it works even with no notes playing: "just a recorder for a
+    // class-compliant device"). Only the first N entries matter, where N is whatever
+    // query_device_channel_count() last detected for the current input_device (see
+    // detected_input_channels in the status feedback the backend sends back).
+    float record_input_channel_enable[RECORD_MAX_CHANNELS];
+
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
     // it last opened each stream with, and closes/reopens that stream on a live change via
@@ -373,6 +407,12 @@ typedef struct {
     // (as shown in the Audio tab's MIDI dropdown) to connect to instead of auto-detecting --
     // still reconnects automatically if that same-named device is unplugged and replugged.
     char midi_device[AUDIO_DEVICE_NAME_LEN];
+
+    // Full filesystem path (not an ALSA device name, hence the bigger buffer than
+    // AUDIO_DEVICE_NAME_LEN) the recorder writes to on the next record_enable 0->1 transition.
+    // The frontend regenerates this to a fresh timestamped filename in the chosen Recordings
+    // folder after every stop, so consecutive takes never collide/overwrite.
+    char record_path[RECORD_PATH_LEN];
 } SynthSharedControls;
 
 // Clamp the live polyphony/block-size controls into their hard array-allocation ceilings.
@@ -1323,6 +1363,7 @@ static void poll_control_socket(int server_fd, int *client_fd, char *packet_buf,
             knobs->output_device[AUDIO_DEVICE_NAME_LEN - 1] = '\0';
             knobs->input_device[AUDIO_DEVICE_NAME_LEN - 1] = '\0';
             knobs->midi_device[AUDIO_DEVICE_NAME_LEN - 1] = '\0';
+            knobs->record_path[RECORD_PATH_LEN - 1] = '\0';
             *bytes_so_far = 0;
         }
     } else if (bytes_received == 0 || (bytes_received < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
@@ -1374,6 +1415,11 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->audio_latency_ms = 25.0f; // matches the old hardcoded 25ms target -- no behavior change by default
     knobs->active_voice_limit = 32.0f; // matches the last-measured-safe default -- live-adjustable from here
     knobs->block_size_frames = 128.0f; // matches the old hardcoded BUFFER_SIZE -- no behavior change by default
+    knobs->record_enable = 0.0f;
+    knobs->record_include_synth_output = 1.0f;
+    knobs->record_downmix_stereo = 0.0f;
+    for (int c = 0; c < RECORD_MAX_CHANNELS; c++) knobs->record_input_channel_enable[c] = 0.0f;
+    knobs->record_path[0] = '\0';
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -2180,15 +2226,41 @@ static void write_audio_block(snd_pcm_t *pcm_handle, const float *buffer, snd_pc
     }
 }
 
-// (Re)opens a stereo float PCM stream by ALSA device name, closing *handle first if it was
-// already open. Used both at startup and whenever the Audio tab's device fields change live
-// (see main()'s loop) -- a single place so open/configure/error-reporting can't drift between
-// the two call sites.
+// Queries how many capture channels an ALSA device actually offers (opens it briefly just to
+// ask, then closes it again -- ALSA has no "ask without opening" API). Used to size the raw
+// capture stream/buffer for the Recording tab's per-channel checkboxes: "checkboxes per channel
+// detected" needs a real detected count, not a guess. Falls back to 2 (plain stereo) on any
+// failure -- an unopenable device will fail again, loudly, when open_pcm_stream() itself tries.
+static int query_device_channel_count(const char *device_name) {
+    snd_pcm_t *probe = NULL;
+    if (snd_pcm_open(&probe, device_name, SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK) < 0) return 2;
+    snd_pcm_hw_params_t *hw_params = NULL;
+    int result = 2;
+    if (snd_pcm_hw_params_malloc(&hw_params) >= 0) {
+        if (snd_pcm_hw_params_any(probe, hw_params) >= 0) {
+            unsigned int max_channels = 2;
+            if (snd_pcm_hw_params_get_channels_max(hw_params, &max_channels) >= 0) {
+                if (max_channels < 1) max_channels = 1;
+                if (max_channels > (unsigned int)RECORD_MAX_CHANNELS) max_channels = (unsigned int)RECORD_MAX_CHANNELS;
+                result = (int)max_channels;
+            }
+        }
+        snd_pcm_hw_params_free(hw_params);
+    }
+    snd_pcm_close(probe);
+    return result;
+}
+
+// (Re)opens a float PCM stream by ALSA device name, closing *handle first if it was already
+// open. Used both at startup and whenever the Audio tab's device fields change live (see
+// main()'s loop) -- a single place so open/configure/error-reporting can't drift between the
+// call sites. `channels` is 2 for the (always-stereo) output stream, and whatever
+// query_device_channel_count() detected for the capture stream -- see the Recording tab.
 // BUG FIX: the original startup code never checked snd_pcm_open()/snd_pcm_set_params()'s
 // return values at all -- an unavailable "default" device (no sound card, no PulseAudio/ALSA
 // routing) left pcm_handle uninitialized/unusable and the very first snd_pcm_writei() call
 // would segfault or hang instead of failing with a clear message.
-static bool open_pcm_stream(const char *device_name, snd_pcm_stream_t stream, snd_pcm_t **handle, float latency_ms) {
+static bool open_pcm_stream(const char *device_name, snd_pcm_stream_t stream, snd_pcm_t **handle, float latency_ms, int channels) {
     if (*handle) { snd_pcm_close(*handle); *handle = NULL; }
     int err = snd_pcm_open(handle, device_name, stream, 0);
     if (err < 0) {
@@ -2208,7 +2280,7 @@ static bool open_pcm_stream(const char *device_name, snd_pcm_stream_t stream, sn
     // that depends on the target hardware's own headroom, not something to freeze at one value
     // for every machine this ever runs on.
     unsigned int latency_us = (unsigned int)fmaxf(1000.0f, latency_ms * 1000.0f);
-    err = snd_pcm_set_params(*handle, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, SAMPLE_RATE, 1, latency_us);
+    err = snd_pcm_set_params(*handle, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, (unsigned int)channels, SAMPLE_RATE, 1, latency_us);
     if (err < 0) {
         fprintf(stderr, "%s device '%s' failed to configure: %s\n", stream == SND_PCM_STREAM_PLAYBACK ? "Output" : "Input", device_name, snd_strerror(err));
         snd_pcm_close(*handle);
@@ -2218,6 +2290,159 @@ static bool open_pcm_stream(const char *device_name, snd_pcm_stream_t stream, sn
     return true;
 }
 
+// --- WAV recording (Recording tab) ---
+//
+// Writes 32-bit float PCM (WAVE_FORMAT_IEEE_FLOAT, format tag 3) -- matches the engine's own
+// native sample format exactly, so no int conversion/dithering is needed, and is natively
+// readable by every modern DAW/editor (Audacity, REAPER, ffmpeg, etc). RIFF/data/fact chunk
+// sizes are written as placeholders and patched in on stop, once the real length is known.
+typedef struct {
+    FILE *file;
+    int channels;
+    uint32_t frames_written;
+    bool active;
+    long data_size_offset;  // ftell() position of the "data" chunk's 4-byte size field
+    long fact_count_offset; // ftell() position of the "fact" chunk's 4-byte sample-count field
+
+    // Channel selection is frozen at record-start time from the live knobs, and used for every
+    // block written until the recording stops -- so toggling a checkbox mid-take can't desync
+    // the interleaving the file header already committed to. Start a new recording to pick up
+    // a changed selection.
+    bool sel_include_synth_output;
+    bool sel_downmix_stereo;
+    bool sel_input_channel[RECORD_MAX_CHANNELS];
+    int sel_input_channel_count; // detected_input_channels at record-start, for indexing capture_buffer's stride
+} WavRecorder;
+
+static void wav_write_u32(FILE *f, uint32_t v) { uint8_t b[4] = { (uint8_t)v, (uint8_t)(v>>8), (uint8_t)(v>>16), (uint8_t)(v>>24) }; fwrite(b, 1, 4, f); }
+static void wav_write_u16(FILE *f, uint16_t v) { uint8_t b[2] = { (uint8_t)v, (uint8_t)(v>>8) }; fwrite(b, 1, 2, f); }
+
+// Computes the selected channel count and freezes the selection into *rec, opens the WAV file,
+// and writes its header. Returns false (leaving *rec untouched, still inactive) if nothing is
+// selected or the file can't be opened -- the caller should treat either as "did not start."
+static bool wav_recorder_start(WavRecorder *rec, const char *path, bool include_synth_output, bool downmix_stereo, const float *input_channel_enable, int input_channel_count) {
+    int selected = include_synth_output ? 2 : 0;
+    for (int c = 0; c < input_channel_count; c++) if (input_channel_enable[c] != 0.0f) selected++;
+    if (selected <= 0) { fprintf(stderr, "[record] cannot start: no channels selected\n"); return false; }
+    int channels = downmix_stereo ? 2 : selected;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "[record] failed to open '%s' for writing: %s\n", path, strerror(errno)); return false; }
+
+    fwrite("RIFF", 1, 4, f); wav_write_u32(f, 0); // total size, patched on stop
+    fwrite("WAVE", 1, 4, f);
+
+    fwrite("fmt ", 1, 4, f); wav_write_u32(f, 18); // fmt chunk body size (extended, cbSize=0)
+    wav_write_u16(f, 3);                            // wFormatTag: IEEE float
+    wav_write_u16(f, (uint16_t)channels);
+    wav_write_u32(f, SAMPLE_RATE);
+    wav_write_u32(f, (uint32_t)(SAMPLE_RATE * channels * 4)); // avg bytes/sec
+    wav_write_u16(f, (uint16_t)(channels * 4));                // block align
+    wav_write_u16(f, 32);                                       // bits per sample
+    wav_write_u16(f, 0);                                        // cbSize
+
+    fwrite("fact", 1, 4, f); wav_write_u32(f, 4);
+    rec->fact_count_offset = ftell(f);
+    wav_write_u32(f, 0); // total frames, patched on stop
+
+    fwrite("data", 1, 4, f);
+    rec->data_size_offset = ftell(f);
+    wav_write_u32(f, 0); // data byte count, patched on stop
+
+    rec->file = f;
+    rec->channels = channels;
+    rec->frames_written = 0;
+    rec->active = true;
+    rec->sel_include_synth_output = include_synth_output;
+    rec->sel_downmix_stereo = downmix_stereo;
+    for (int c = 0; c < RECORD_MAX_CHANNELS; c++) rec->sel_input_channel[c] = (c < input_channel_count) && (input_channel_enable[c] != 0.0f);
+    rec->sel_input_channel_count = input_channel_count;
+    return true;
+}
+
+static void wav_recorder_write(WavRecorder *rec, const float *interleaved, int num_frames) {
+    if (!rec->active || num_frames <= 0) return;
+    fwrite(interleaved, sizeof(float), (size_t)num_frames * (size_t)rec->channels, rec->file);
+    rec->frames_written += (uint32_t)num_frames;
+}
+
+static void wav_recorder_stop(WavRecorder *rec) {
+    if (!rec->active) return;
+    long final_size = ftell(rec->file);
+    uint32_t data_bytes = rec->frames_written * (uint32_t)rec->channels * 4;
+
+    fseek(rec->file, 4, SEEK_SET);
+    wav_write_u32(rec->file, (uint32_t)(final_size - 8)); // RIFF chunk size excludes "RIFF"+size itself
+
+    fseek(rec->file, rec->fact_count_offset, SEEK_SET);
+    wav_write_u32(rec->file, rec->frames_written);
+
+    fseek(rec->file, rec->data_size_offset, SEEK_SET);
+    wav_write_u32(rec->file, data_bytes);
+
+    fclose(rec->file);
+    rec->file = NULL;
+    rec->active = false;
+    fprintf(stderr, "[record] stopped: %u frames (%.2fs), %d channel(s)\n", rec->frames_written, rec->frames_written / (float)SAMPLE_RATE, rec->channels);
+}
+
+// Gathers one block's worth of frames from the synth's own post-FX stereo output and the raw
+// N-channel capture buffer, per the SELECTION FROZEN AT RECORD-START (rec->sel_* -- not the
+// live knobs, so a checkbox toggled mid-take can't desync the file's already-committed channel
+// layout), and writes them. `capture_buffer`'s actual stride must still match
+// rec->sel_input_channel_count -- the caller is responsible for stopping the recording first if
+// the live capture device's channel count has changed since it started (see the safety check in
+// main()).
+static void wav_recorder_write_block(WavRecorder *rec, const float *synth_buffer, const float *capture_buffer, int block_size) {
+    if (!rec->active) return;
+    static float frame_buf[BUFFER_SIZE * RECORD_MAX_CHANNELS];
+    int stride = rec->sel_input_channel_count;
+    if (rec->sel_downmix_stereo) {
+        // n = how many signals get summed into EACH side (not the total signal count): the
+        // synth output contributes exactly one signal per side (synth_L into L, synth_R into
+        // R -- never both into the same side), and every selected raw input channel (mono)
+        // contributes one signal to BOTH sides. So "Synth Output only" is a pure passthrough
+        // (n=1, scale=1.0, no attenuation) rather than needlessly getting -3dB as if two
+        // signals were being summed on each side when only one actually is.
+        int n = rec->sel_include_synth_output ? 1 : 0;
+        for (int c = 0; c < stride; c++) if (rec->sel_input_channel[c]) n++;
+        float scale = (n > 0) ? (1.0f / sqrtf((float)n)) : 1.0f;
+        for (int i = 0; i < block_size; i++) {
+            float l = 0.0f, r = 0.0f;
+            if (rec->sel_include_synth_output) { l += synth_buffer[i*2]; r += synth_buffer[i*2+1]; }
+            for (int c = 0; c < stride; c++) {
+                if (rec->sel_input_channel[c]) { float s = capture_buffer[i*stride + c]; l += s; r += s; }
+            }
+            frame_buf[i*2] = l * scale;
+            frame_buf[i*2+1] = r * scale;
+        }
+    } else {
+        for (int i = 0; i < block_size; i++) {
+            int ch = 0;
+            if (rec->sel_include_synth_output) {
+                frame_buf[i*rec->channels + ch++] = synth_buffer[i*2];
+                frame_buf[i*rec->channels + ch++] = synth_buffer[i*2+1];
+            }
+            for (int c = 0; c < stride; c++) {
+                if (rec->sel_input_channel[c]) frame_buf[i*rec->channels + ch++] = capture_buffer[i*stride + c];
+            }
+        }
+    }
+    wav_recorder_write(rec, frame_buf, block_size);
+}
+
+// Status feedback sent back over the same socket the GUI sends control packets on (see
+// vu_decimator below) -- used to be a bare peak float; grew into this small fixed struct so the
+// Recording tab can show live state (is a take actually running, how long, did the last start
+// attempt fail) and the detected input channel count without a second connection.
+typedef struct {
+    float peak;
+    float is_recording;
+    float elapsed_seconds;
+    float record_error;
+    float detected_input_channels;
+} EngineStatus;
+
 int main() {
     const char *socket_path = "/tmp/synth.sock"; int client_fd = -1;
     signal(SIGINT, handle_sigint);
@@ -2226,7 +2451,7 @@ int main() {
     SynthSharedControls active_knobs; init_default_controls(&active_knobs);
 
     snd_pcm_t *pcm_handle = NULL;
-    if (!open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms)) {
+    if (!open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, 2)) {
         fprintf(stderr, "Cannot continue without an output device.\n");
         close(server_fd); unlink(socket_path); return 1;
     }
@@ -2235,12 +2460,20 @@ int main() {
 
     // External Audio Input: best-effort. Unlike output, a capture device failing to open isn't
     // fatal -- external input just stays silent (ext_in_enable has nothing to mix in) until a
-    // working device name is picked from the Audio tab.
+    // working device name is picked from the Audio tab. Opened with however many channels
+    // query_device_channel_count() detects -- see the Recording tab's per-channel checkboxes --
+    // not hardcoded stereo, so a class-compliant multichannel interface's extra inputs are
+    // actually reachable, not just its first two.
     snd_pcm_t *pcm_capture_handle = NULL;
-    open_pcm_stream(active_knobs.input_device, SND_PCM_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms);
+    int detected_input_channels = query_device_channel_count(active_knobs.input_device);
+    open_pcm_stream(active_knobs.input_device, SND_PCM_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels);
     char applied_input_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
     float applied_audio_latency_ms = active_knobs.audio_latency_ms;
+
+    WavRecorder recorder = {0};
+    bool applied_record_enable = false;
+    int recorder_input_channels_at_start = 0; // detected_input_channels when recording began, for the mid-take device-change safety check
 
     snd_seq_t *seq_handle;
     int seq_err = snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
@@ -2281,17 +2514,20 @@ int main() {
         // snd_pcm_set_params' latency target can only be applied at stream-open time.
         bool latency_changed = active_knobs.audio_latency_ms != applied_audio_latency_ms;
         if (latency_changed || strncmp(active_knobs.output_device, applied_output_device, AUDIO_DEVICE_NAME_LEN) != 0) {
-            if (open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms)) {
+            if (open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, 2)) {
                 snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
             } else {
                 // Failed -- fall back to the last device that was actually working rather than
                 // leaving pcm_handle NULL, and stop retrying this same bad name every block.
-                open_pcm_stream(applied_output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms);
+                open_pcm_stream(applied_output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, 2);
                 snprintf(active_knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", applied_output_device);
             }
         }
         if (latency_changed || strncmp(active_knobs.input_device, applied_input_device, AUDIO_DEVICE_NAME_LEN) != 0) {
-            open_pcm_stream(active_knobs.input_device, SND_PCM_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms); // best-effort
+            // Re-detect channel count too -- a device switch can mean a completely different
+            // interface with a different channel count, not just a renamed same one.
+            detected_input_channels = query_device_channel_count(active_knobs.input_device);
+            open_pcm_stream(active_knobs.input_device, SND_PCM_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels); // best-effort
             snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
         }
         if (latency_changed) applied_audio_latency_ms = active_knobs.audio_latency_ms;
@@ -2311,17 +2547,32 @@ int main() {
         // actually read/written/rendered this iteration.
         int block_size = effective_block_size(&active_knobs);
 
-        // Read one block of external input. Silence (the zero-init) if there's no working
-        // capture device, or a read comes back short/broken -- external input degrading to
-        // silence should never be able to stall or crash the synth's own audio output.
-        float capture_buffer[BUFFER_SIZE * 2] = {0.0f};
+        // Read one block of external input, ALL detected_input_channels of it -- interleaved,
+        // stride detected_input_channels per frame (not always 2 anymore; see
+        // query_device_channel_count()). Silence (the zero-init) if there's no working capture
+        // device, or a read comes back short/broken -- external input degrading to silence
+        // should never be able to stall or crash the synth's own audio output.
+        static float capture_buffer[BUFFER_SIZE * RECORD_MAX_CHANNELS];
+        memset(capture_buffer, 0, sizeof(float) * (size_t)block_size * (size_t)detected_input_channels);
         if (pcm_capture_handle) {
             snd_pcm_sframes_t got = snd_pcm_readi(pcm_capture_handle, capture_buffer, block_size);
             if (got < 0) {
                 snd_pcm_recover(pcm_capture_handle, (int)got, 0);
             } else if ((snd_pcm_uframes_t)got < (snd_pcm_uframes_t)block_size) {
-                memset(capture_buffer + (got * 2), 0, ((size_t)block_size - (size_t)got) * 2 * sizeof(float));
+                memset(capture_buffer + ((size_t)got * (size_t)detected_input_channels), 0,
+                       ((size_t)block_size - (size_t)got) * (size_t)detected_input_channels * sizeof(float));
             }
+        }
+
+        // The synth's own FX-mixing "External Input" feature (ext_in_enable/ext_in_gain) only
+        // ever wants a plain stereo pair -- always channels 0/1 of whatever the capture device
+        // provides, extracted here so render_audio_block's signature/logic can stay exactly the
+        // plain-stereo shape it's always been, regardless of how many channels are actually
+        // being captured for the Recording tab.
+        static float ext_in_stereo[BUFFER_SIZE * 2];
+        for (int i = 0; i < block_size; i++) {
+            ext_in_stereo[i*2]   = capture_buffer[i*detected_input_channels + 0];
+            ext_in_stereo[i*2+1] = (detected_input_channels > 1) ? capture_buffer[i*detected_input_channels + 1] : capture_buffer[i*detected_input_channels + 0];
         }
 
         // DIAGNOSTIC: cheap (active_voice_limit simple state checks, negligible next to the
@@ -2336,7 +2587,7 @@ int main() {
         float buffer[BUFFER_SIZE * 2];
         struct timespec render_t0, render_t1;
         clock_gettime(CLOCK_MONOTONIC, &render_t0);
-        float block_peak = render_audio_block(voices, &active_knobs, global_lfo_phases, capture_buffer, &midi_live, buffer);
+        float block_peak = render_audio_block(voices, &active_knobs, global_lfo_phases, ext_in_stereo, &midi_live, buffer);
         clock_gettime(CLOCK_MONOTONIC, &render_t1);
         double render_ms = (render_t1.tv_sec - render_t0.tv_sec) * 1000.0 + (render_t1.tv_nsec - render_t0.tv_nsec) / 1e6;
         double budget_ms = (block_size / (double)SAMPLE_RATE) * 1000.0;
@@ -2348,10 +2599,44 @@ int main() {
                     render_ms, budget_ms, block_size, active_voices_count);
         }
 
+        // --- Recording (Recording tab) ---
+        // Edge-triggered start/stop on record_enable, exactly like the device-switch checks
+        // above. A device change mid-take that alters detected_input_channels would desync the
+        // raw capture buffer's stride from what the open file committed to at start -- safer to
+        // stop cleanly than silently scramble the channel interleaving.
+        if (recorder.active && detected_input_channels != recorder_input_channels_at_start) {
+            fprintf(stderr, "[record] input device channel count changed mid-recording -- stopping for safety\n");
+            wav_recorder_stop(&recorder);
+        }
+        bool want_recording = active_knobs.record_enable != 0.0f;
+        if (want_recording && !applied_record_enable) {
+            if (wav_recorder_start(&recorder, active_knobs.record_path, active_knobs.record_include_synth_output != 0.0f,
+                                    active_knobs.record_downmix_stereo != 0.0f, active_knobs.record_input_channel_enable, detected_input_channels)) {
+                recorder_input_channels_at_start = detected_input_channels;
+                fprintf(stderr, "[record] started: '%s', %d channel(s)%s\n", active_knobs.record_path, recorder.channels,
+                        recorder.sel_downmix_stereo ? " (downmixed)" : "");
+            }
+        } else if (!want_recording && applied_record_enable) {
+            wav_recorder_stop(&recorder);
+        }
+        applied_record_enable = want_recording;
+        if (recorder.active) wav_recorder_write_block(&recorder, buffer, capture_buffer, block_size);
+
         vu_decimator++;
-        if (client_fd >= 0 && vu_decimator >= 12) { send(client_fd, &block_peak, sizeof(float), 0); vu_decimator = 0; }
+        if (client_fd >= 0 && vu_decimator >= 12) {
+            EngineStatus status = {
+                .peak = block_peak,
+                .is_recording = recorder.active ? 1.0f : 0.0f,
+                .elapsed_seconds = recorder.active ? (recorder.frames_written / (float)SAMPLE_RATE) : 0.0f,
+                .record_error = (want_recording && !recorder.active) ? 1.0f : 0.0f,
+                .detected_input_channels = (float)detected_input_channels,
+            };
+            send(client_fd, &status, sizeof(status), 0);
+            vu_decimator = 0;
+        }
         write_audio_block(pcm_handle, buffer, block_size, active_voices_count, render_ms);
     }
+    wav_recorder_stop(&recorder); // flush/finalize a still-running take on shutdown
     if (client_fd >= 0) close(client_fd);
     if (server_fd >= 0) close(server_fd);
     unlink(socket_path);

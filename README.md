@@ -6,8 +6,11 @@ A digital synthesizer split into two processes:
   audio directly to a PCM device, captures external audio from an input
   device, and exposes every synth parameter over a Unix domain socket
   (`/tmp/synth.sock`) as a fixed-layout packed struct (`SynthSharedControls`,
-  319 floats + 3 device name strings). Also streams back a peak-level float
-  for the GUI's VU meter. The final output stage carries an always-on
+  338 floats + 3 device name strings + 1 file path string). Also streams
+  back a small status struct (`EngineStatus`: peak level, recording state/
+  elapsed time/error, detected input channel count) over the same socket --
+  used to be a bare peak float before the Recording tab needed live state
+  back from the engine. The final output stage carries an always-on
   safety limiter (instant attack, ~50ms release) ahead of a hard clamp, so
   an overload (e.g. several voices lining up, or Parallel FX routing
   summing 12 hot slots) degrades to smooth gain reduction rather than
@@ -54,6 +57,34 @@ A digital synthesizer split into two processes:
   buffer is (the real floor on output latency), Block Size is how many
   frames get rendered and handed to ALSA per main-loop iteration.
 
+  **Recording** (`Recording` tab) writes 32-bit float WAV (`WavRecorder` in
+  backend.c -- IEEE float format tag, so no int conversion/dithering, and
+  natively readable by any modern DAW/editor). Two source kinds, freely
+  combinable in one take: the synth's own final post-FX stereo output
+  (which already includes any processed External Input once `ext_in_enable`
+  is on -- they're the same signal by the time either is "processed"), and
+  raw per-channel taps directly off whatever the currently-selected Input
+  device provides (independent of `ext_in_enable` -- works as a plain
+  multichannel recorder for a class-compliant interface with no notes
+  playing at all). The capture stream itself is opened with however many
+  channels `query_device_channel_count()` detects for that device (not
+  hardcoded stereo), so a multichannel interface's extra inputs are
+  actually reachable, not just its first two -- `render_audio_block`'s own
+  External Input FX-mixing still only ever uses channels 0/1 of that
+  capture, extracted into a plain stereo buffer before the call so its
+  signature/logic never had to change. Selected channels combine into
+  either a genuine multichannel WAV (one file channel per selected source)
+  or a stereo downmix (every selected channel summed equally into L/R,
+  gain-normalized by `1/sqrt(n)` where `n` is signals-per-side, so
+  recording just the synth output alone is a pure unscaled passthrough
+  rather than needlessly getting -3dB as if something were being summed).
+  The channel *selection* is frozen at record-start time
+  (`WavRecorder.sel_*`) -- toggling a checkbox mid-take can't desync an
+  already-open file's committed channel layout; start a new recording to
+  pick up a changed selection. A capture-device channel-count change mid-
+  recording (e.g. switching Input devices) stops the take automatically
+  rather than silently scrambling the interleaving.
+
   MIDI input auto-connects with no `aconnect` ever needed: at startup it
   scans ALSA sequencer clients and subscribes to every real (kernel-backed,
   not "Midi Through") MIDI source found, and stays subscribed to the ALSA
@@ -73,10 +104,21 @@ A digital synthesizer split into two processes:
   retriggered while the pedal is still down.
 - **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
   knobs and draggable ADSR envelope graphs, tabbed into Play / Filters /
-  LFOs / Envelopes / FX / Audio. Packs the same struct
-  (`struct.pack("319f64s64s64s", ...)`) and sends it over the socket
+  LFOs / Envelopes / FX / Audio / Recording. Packs the same struct
+  (`struct.pack("338f64s64s64s256s", ...)`) and sends it over the socket
   whenever a control changes. If it can't connect to the backend it falls
   back to a mock mode so the UI still runs standalone.
+
+  The **Recording** tab: a "Synth Output" checkbox, a grid of "In N"
+  checkboxes rebuilt live to match whatever channel count the backend's
+  status feedback reports for the current Input device, a Multichannel/
+  Stereo Downmix radio choice, a Recordings-folder picker (default
+  `~/HDS_Recordings`, browsable), and a Record/Stop toggle. Pressing
+  Record generates a fresh `HDS_<timestamp>.wav` path in that folder --
+  consecutive takes never collide -- and the status line shows live
+  elapsed time (or a failure message, e.g. nothing selected/unwritable
+  folder, that also cleanly clears `record_enable` on the wire rather than
+  leaving the button checked against a backend that already gave up).
 
   The Audio tab's Performance group has three real, direct engine controls:
   **Polyphony** (a plain spin box, 1-256 voices, default 32), **Block Size**

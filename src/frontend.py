@@ -1,14 +1,16 @@
 import sys
+import os
 import socket
 import struct
 import math
 import random
 import subprocess
 import re
+from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
                              QSlider, QPushButton, QProgressBar, QSpinBox, QLineEdit, QCheckBox,
-                             QScrollArea, QMenu, QInputDialog)
+                             QScrollArea, QMenu, QInputDialog, QFileDialog, QGridLayout)
 from PyQt6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor, QAction
 from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal
 
@@ -36,6 +38,9 @@ FX_SLOT_PARAM_COUNT = 8
 # in backend.c for why this isn't just one fixed number anymore.
 MAX_VOICES_HARD_LIMIT = 256
 BUFFER_SIZE_HARD_LIMIT = 1024
+# Recording tab: must match RECORD_MAX_CHANNELS / RECORD_PATH_LEN in backend.c exactly.
+RECORD_MAX_CHANNELS = 16
+RECORD_PATH_LEN = 256
 
 # CreamCoat's 17 "Select" room-size presets, in order -- text taken verbatim from the original
 # plugin's own per-case comments (e.g. "5 to 51 ms, 96 seat room").
@@ -856,6 +861,8 @@ class SynthGui(QWidget):
         self.server_address = '/tmp/synth.sock'
         self.sock = None
         self.mock_mode = False
+        self._status_recv_buf = b""  # accumulates partial reads of the EngineStatus struct below
+        self._last_detected_input_channels = -1
         self.connect_to_backend()
 
         # The master outer structural layout
@@ -875,6 +882,7 @@ class SynthGui(QWidget):
         self.tab_egs = QWidget()
         self.tab_fx = QWidget()
         self.tab_audio = QWidget()
+        self.tab_recording = QWidget()
 
         # ----------------------------------------------------
         # GLOBAL CONTROLS: live in the always-visible left sidebar (not a tab) so Program,
@@ -2056,6 +2064,120 @@ class SynthGui(QWidget):
         audio_outer_lay.addStretch()
 
         # ----------------------------------------------------
+        # RECORDING TAB CONTENT -- this is also an FX processor: loopback the synth's own
+        # post-FX output (which already includes any processed External Input, once
+        # ext_in_enable is on -- they're the same signal once mixed) to disk, AND/OR use the
+        # currently-selected Input device as a plain multichannel recorder in its own right
+        # (raw capture, independent of ext_in_enable -- works with no notes playing at all).
+        # Writes 32-bit float WAV via the backend's WavRecorder -- see record_enable/
+        # record_include_synth_output/record_downmix_stereo/record_input_channel_enable/
+        # record_path in backend.c.
+        # ----------------------------------------------------
+        recording_outer_lay = QVBoxLayout(self.tab_recording)
+        recording_outer_lay.setContentsMargins(6, 6, 6, 6)
+        recording_outer_lay.setSpacing(6)
+
+        rec_header = QLabel(
+            "Record the synth's own output, raw channels from the Input device (Audio tab), or both together — "
+            "to a genuine multichannel WAV file or downmixed to stereo."
+        )
+        rec_header.setStyleSheet("font-size: 9px; color: #888;")
+        rec_header.setWordWrap(True)
+        recording_outer_lay.addWidget(rec_header)
+
+        sources_box = QGroupBox("Sources")
+        sources_lay = QVBoxLayout()
+        sources_lay.setSpacing(6)
+
+        self.record_synth_output_cb = QCheckBox("Synth Output (post-FX, L/R)")
+        self.record_synth_output_cb.setChecked(True)
+        self.record_synth_output_cb.setToolTip(
+            "The final stereo mix, exactly what's going to the DAC -- already includes any\n"
+            "processed External Input (Audio tab) once that's enabled, since it's summed in\n"
+            "before the FX bus. There's no way to record 'just the synth' vs 'just the\n"
+            "processed external input' separately once they've been mixed and processed."
+        )
+        sources_lay.addWidget(self.record_synth_output_cb)
+
+        input_channels_label = QLabel("<b>Raw Input Channels</b> (direct from the Input device, Audio tab — works with no notes playing)")
+        input_channels_label.setStyleSheet("font-size: 10px;")
+        input_channels_label.setWordWrap(True)
+        sources_lay.addWidget(input_channels_label)
+
+        self.record_channels_container = QWidget()
+        self.record_channels_grid = QGridLayout(self.record_channels_container)
+        self.record_channels_grid.setContentsMargins(12, 0, 0, 0)
+        self.record_channels_grid.setSpacing(4)
+        sources_lay.addWidget(self.record_channels_container)
+        self.record_input_channel_cbs = []
+
+        self.record_channels_detect_label = QLabel("Detecting input channels…")
+        self.record_channels_detect_label.setStyleSheet("font-size: 9px; color: #888;")
+        sources_lay.addWidget(self.record_channels_detect_label)
+
+        sources_box.setLayout(sources_lay)
+        recording_outer_lay.addWidget(sources_box)
+
+        output_box = QGroupBox("Output")
+        output_lay = QVBoxLayout()
+        output_lay.setSpacing(6)
+
+        mode_row = QHBoxLayout()
+        self.record_mode_multichannel = QRadioButton("Multichannel WAV")
+        self.record_mode_multichannel.setChecked(True)
+        self.record_mode_multichannel.setToolTip("Every selected channel becomes its own channel in one WAV file.")
+        self.record_mode_downmix = QRadioButton("Stereo Downmix")
+        self.record_mode_downmix.setToolTip("Every selected channel is summed equally into a single L/R pair.")
+        mode_row.addWidget(self.record_mode_multichannel)
+        mode_row.addWidget(self.record_mode_downmix)
+        mode_row.addStretch()
+        output_lay.addLayout(mode_row)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Folder:"))
+        self.record_folder = os.path.expanduser("~/HDS_Recordings")
+        self.record_folder_field = QLineEdit(self.record_folder)
+        self.record_folder_field.setReadOnly(True)
+        self.record_folder_field.setStyleSheet("color: #00adb5; background-color: #1e1e24; font-size: 10px; padding: 3px;")
+        folder_row.addWidget(self.record_folder_field, stretch=1)
+        self.btn_browse_record_folder = QPushButton("Browse…")
+        self.btn_browse_record_folder.setFixedHeight(24)
+        folder_row.addWidget(self.btn_browse_record_folder)
+        output_lay.addLayout(folder_row)
+
+        folder_note = QLabel("Each take is named HDS_<timestamp>.wav in this folder, so consecutive takes never collide.")
+        folder_note.setStyleSheet("font-size: 9px; color: #888;")
+        folder_note.setWordWrap(True)
+        output_lay.addWidget(folder_note)
+
+        output_box.setLayout(output_lay)
+        recording_outer_lay.addWidget(output_box)
+
+        control_row = QHBoxLayout()
+        self.record_toggle_btn = QPushButton("● Record")
+        self.record_toggle_btn.setCheckable(True)
+        self.record_toggle_btn.setFixedHeight(36)
+        self.record_toggle_btn.setStyleSheet(
+            "QPushButton { font-size: 13px; font-weight: bold; } "
+            "QPushButton:checked { background-color: #b00020; color: white; }"
+        )
+        control_row.addWidget(self.record_toggle_btn)
+
+        self.record_status_label = QLabel("Not recording")
+        self.record_status_label.setStyleSheet("color: #888; font-size: 11px;")
+        control_row.addWidget(self.record_status_label, stretch=1)
+        recording_outer_lay.addLayout(control_row)
+
+        recording_outer_lay.addStretch()
+
+        self._current_record_path = ""
+        self.btn_browse_record_folder.clicked.connect(self._pick_record_folder)
+        self.record_toggle_btn.toggled.connect(self._on_record_toggled)
+        for cb in (self.record_synth_output_cb,):
+            cb.toggled.connect(self._update_record_button_enabled)
+        self._update_record_button_enabled()
+
+        # ----------------------------------------------------
         # ASSEMBLE AND ANCHOR TOUCH DECK TO ROOT LAYOUT
         # ----------------------------------------------------
         self.tab_widget.addTab(self.tab_play, "Play")
@@ -2064,6 +2186,7 @@ class SynthGui(QWidget):
         self.tab_widget.addTab(self.tab_egs, "Envelopes")
         self.tab_widget.addTab(self.tab_fx, "FX")
         self.tab_widget.addTab(self.tab_audio, "Audio")
+        self.tab_widget.addTab(self.tab_recording, "Recording")
 
         outer_layout.addWidget(self.tab_widget, stretch=5)
         self.setLayout(outer_layout)
@@ -2161,6 +2284,71 @@ class SynthGui(QWidget):
             combo.setCurrentText(current_text)
             combo.blockSignals(False)
 
+    def _pick_record_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Recordings Folder", self.record_folder)
+        if folder:
+            self.record_folder = folder
+            self.record_folder_field.setText(folder)
+
+    def _generate_record_filename(self):
+        os.makedirs(self.record_folder, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        return os.path.join(self.record_folder, f"HDS_{stamp}.wav")
+
+    def _update_record_button_enabled(self, *_args):
+        any_source = self.record_synth_output_cb.isChecked() or any(cb.isChecked() for cb in self.record_input_channel_cbs)
+        # Don't yank the button out from under an in-progress recording just because every
+        # source got unchecked live -- only gate the ability to START a new one.
+        if not self.record_toggle_btn.isChecked():
+            self.record_toggle_btn.setEnabled(any_source)
+
+    def _on_record_toggled(self, checked):
+        if checked:
+            self._current_record_path = self._generate_record_filename()
+            self.record_status_label.setText(f"Starting… {os.path.basename(self._current_record_path)}")
+            self.record_status_label.setStyleSheet("color: #b58900; font-weight: bold;")
+        self.transmit_knob_packet()
+
+    def _rebuild_record_channel_checkboxes(self, n):
+        while self.record_channels_grid.count():
+            item = self.record_channels_grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+        self.record_input_channel_cbs = []
+        cols = 4
+        for i in range(n):
+            cb = QCheckBox(f"In {i + 1}")
+            cb.toggled.connect(self._update_record_button_enabled)
+            cb.toggled.connect(self.transmit_knob_packet)
+            self.record_channels_grid.addWidget(cb, i // cols, i % cols)
+            self.record_input_channel_cbs.append(cb)
+        device_name = self.input_device_combo.currentText() if hasattr(self, "input_device_combo") else ""
+        self.record_channels_detect_label.setText(f"Detected {n} channel(s) on '{device_name}'." if n else "No input channels detected.")
+        self._update_record_button_enabled()
+
+    def _update_recording_status(self, is_recording, elapsed_seconds, record_error, detected_channels):
+        if detected_channels > 0 and detected_channels != self._last_detected_input_channels:
+            self._last_detected_input_channels = detected_channels
+            self._rebuild_record_channel_checkboxes(min(detected_channels, RECORD_MAX_CHANNELS))
+
+        if record_error:
+            self.record_status_label.setText("Recording failed to start — check the folder/channels and try again.")
+            self.record_status_label.setStyleSheet("color: #ff5555; font-weight: bold;")
+            if self.record_toggle_btn.isChecked():
+                self.record_toggle_btn.blockSignals(True)
+                self.record_toggle_btn.setChecked(False)
+                self.record_toggle_btn.blockSignals(False)
+                self.transmit_knob_packet() # actually tell the backend to clear record_enable too
+        elif is_recording:
+            mins, secs = divmod(int(elapsed_seconds), 60)
+            name = os.path.basename(self._current_record_path) if self._current_record_path else ""
+            self.record_status_label.setText(f"● Recording {name} — {mins:02d}:{secs:02d}")
+            self.record_status_label.setStyleSheet("color: #ff5555; font-weight: bold;")
+        elif not self.record_toggle_btn.isChecked():
+            self.record_status_label.setText("Not recording")
+            self.record_status_label.setStyleSheet("color: #888;")
+
     def _mod_source_label(self, cc_value):
         for label, val in self._MOD_SOURCE_PRESETS:
             if val == cc_value:
@@ -2212,14 +2400,35 @@ class SynthGui(QWidget):
             self.mock_mode = True; self.sock = None
             print("--- WORKING IN MOCK GUI MODE ---")
 
-    def listen_for_vu_frames(self):
-        if self.sock is not None and not self.mock_mode:
-            try:
-                data = self.sock.recv(4)
-                if len(data) == 4:
-                    vu_peak_value = struct.unpack("f", data)
-                    self.vu_meter.setValue(int(max(0, min(100, vu_peak_value[0] * 100.0))))
-            except (socket.error, BlockingIOError): pass
+    # EngineStatus wire format: 5 floats (peak, is_recording, elapsed_seconds, record_error,
+    # detected_input_channels) -- must match the EngineStatus struct backend.c sends back over
+    # the same socket the control packet goes out on. Used to be a bare 4-byte peak float; grew
+    # into this once the Recording tab needed live state back from the engine (is a take
+    # actually running, how long, did the last start attempt fail, how many channels does the
+    # current input device actually have).
+    _STATUS_FORMAT = "5f"
+    _STATUS_SIZE = struct.calcsize(_STATUS_FORMAT)
+
+    def listen_for_status_frames(self):
+        if self.sock is None or self.mock_mode:
+            return
+        try:
+            # Drain whatever's available -- a stream socket can deliver less (or, coalesced,
+            # more) than one struct per recv(), so accumulate across calls like the backend's
+            # own poll_control_socket() does for the control packet, rather than assuming a
+            # single recv() lines up with a single struct.
+            chunk = self.sock.recv(4096)
+            if chunk:
+                self._status_recv_buf += chunk
+        except (socket.error, BlockingIOError):
+            pass
+        while len(self._status_recv_buf) >= self._STATUS_SIZE:
+            peak, is_recording, elapsed_seconds, record_error, detected_channels = struct.unpack(
+                self._STATUS_FORMAT, self._status_recv_buf[:self._STATUS_SIZE]
+            )
+            self._status_recv_buf = self._status_recv_buf[self._STATUS_SIZE:]
+            self.vu_meter.setValue(int(max(0, min(100, peak * 100.0))))
+            self._update_recording_status(bool(is_recording), elapsed_seconds, bool(record_error), int(detected_channels))
     def transmit_knob_packet(self):
         glide_ms = self.glide_dial.value()
         self.glide_readout.setText(f"{glide_ms} ms")
@@ -2410,6 +2619,14 @@ class SynthGui(QWidget):
         block_size = self._BLOCK_SIZE_PRESETS[bs_idx] if 0 <= bs_idx < len(self._BLOCK_SIZE_PRESETS) else 128
         packet_list.append(float(block_size))
 
+        # Recording (+19 items: enable, include-synth-output, downmix, 16 per-channel enables)
+        packet_list.append(1.0 if self.record_toggle_btn.isChecked() else 0.0)
+        packet_list.append(1.0 if self.record_synth_output_cb.isChecked() else 0.0)
+        packet_list.append(1.0 if self.record_mode_downmix.isChecked() else 0.0)
+        for idx in range(RECORD_MAX_CHANNELS):
+            checked = idx < len(self.record_input_channel_cbs) and self.record_input_channel_cbs[idx].isChecked()
+            packet_list.append(1.0 if checked else 0.0)
+
         # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
         # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
         # + 1 (filter_a_mode) + 4 (filter_a) + 1 (filter_a_multi_routing) + 12 (filter_a_multi[3] * 4)
@@ -2419,17 +2636,20 @@ class SynthGui(QWidget):
         # + 2 (vco1/vco2 mute) + 1 (hard sync) + 2 (vco1/vco2 phase offset)
         # + 2 (vco1/vco2 pulse width) + 4 (noise osc: vol/pan/mute/tilt) + 4 (sub osc: shape/vol/pan/mute)
         # + 2 (ext in enable/gain) + 132 (12 FX slots * 11) + 1 (fx_routing_mode) + 2 (pb range)
-        # + 1 (sustain polarity) + 1 (audio latency) + 1 (polyphony) + 1 (block size) = 319
-        # floats, followed by 3 fixed 64-byte device name strings (not floats): output_device,
-        # input_device, midi_device.
+        # + 1 (sustain polarity) + 1 (audio latency) + 1 (polyphony) + 1 (block size)
+        # + 19 (recording: enable/synth-output/downmix + 16 channel enables) = 338 floats,
+        # followed by 4 fixed strings (not floats): output_device, input_device, midi_device
+        # (64 bytes each), then record_path (256 bytes -- a real filesystem path needs more room
+        # than an ALSA device name).
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
         binary_packet = struct.pack(
-            f"319f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
+            f"338f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
             _encode_device_name(midi_wire_value),
+            self._current_record_path.encode("utf-8")[:RECORD_PATH_LEN - 1],
         )
         if self.sock is not None:
             try: self.sock.sendall(binary_packet)
@@ -2552,11 +2772,18 @@ def runtime_connect_and_bind(gui):
     gui.audio_latency_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
     gui.polyphony_spin.valueChanged.connect(gui.transmit_knob_packet)
     gui.block_size_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+
+    # Recording tab: the toggle button itself and per-channel checkboxes are wired at
+    # construction time (they also need to update UI state, not just retransmit); these two
+    # just need to retransmit on change.
+    gui.record_synth_output_cb.toggled.connect(gui.transmit_knob_packet)
+    gui.record_mode_multichannel.toggled.connect(gui.transmit_knob_packet)
+    gui.record_mode_downmix.toggled.connect(gui.transmit_knob_packet)
     gui.midi_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
 
     # Initialize separate telemetry thread loop for VU meter updates
     gui.vu_timer = QTimer()
-    gui.vu_timer.timeout.connect(gui.listen_for_vu_frames)
+    gui.vu_timer.timeout.connect(gui.listen_for_status_frames)
     gui.vu_timer.start(25)
 
     # Broadcast early configuration packet on boot
