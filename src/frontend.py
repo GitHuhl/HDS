@@ -1702,8 +1702,16 @@ class SynthGui(QWidget):
             self.lfo_dest_combos.append(d_combo)
             lfo_layout.addLayout(lfo_row)
 
+        # Without a trailing stretch, a bare QVBoxLayout given more height than its content
+        # needs (e.g. because another tab, like FX, forces the window taller) spreads that
+        # leftover space roughly evenly between every row instead of leaving it below the last
+        # one -- reading as the title floating in the middle of a mostly-empty box with the LFO
+        # rows pushed toward the bottom. Pinning both the inner content and the outer group box
+        # to the top fixes that at both levels.
+        lfo_layout.addStretch()
         lfo_group.setLayout(lfo_layout)
         lfo_outer_lay.addWidget(lfo_group)
+        lfo_outer_lay.addStretch()
         # ----------------------------------------------------
         # EGs TAB CONTENT
         # ----------------------------------------------------
@@ -1752,8 +1760,19 @@ class SynthGui(QWidget):
             eg_layout.addWidget(panel)
             self.envelopes.append(panel)
 
+        eg_layout.addStretch()
         eg_group.setLayout(eg_layout)
-        eg_outer_lay.addWidget(eg_group)
+
+        # 6 full ADSRPanels (each with its own graph + dial row) stacked vertically with no
+        # scroll wrap used to force a huge minimum window height (~1139px measured) regardless
+        # of which tab was actually open -- QTabWidget sizes itself to fit the LARGEST tab, not
+        # just the active one. Same QScrollArea fix as the Play tab's oscillator panel and the
+        # FX tab: lets the window be resized/shrunk freely, scrolling this tab's content instead
+        # of dictating the whole app's minimum size.
+        eg_scroll = QScrollArea()
+        eg_scroll.setWidgetResizable(True)
+        eg_scroll.setWidget(eg_group)
+        eg_outer_lay.addWidget(eg_scroll)
 
         # ----------------------------------------------------
         # FX TAB CONTENT (12-slot serial FX bus -- runs on the full mix, post-filter,
@@ -1886,6 +1905,33 @@ class SynthGui(QWidget):
         in_row.addWidget(self.input_device_combo, stretch=1)
         device_lay.addLayout(in_row)
 
+        # Latency: a friendly stand-in for the raw ALSA buffer/period sizing -- deliberately not
+        # exposed as bare millisecond/frame-count fields, to keep the appliance feel. This is a
+        # real, useful knob though, not just a placebo: it's a safety-margin/responsiveness
+        # tradeoff for exactly the kind of marginal, occasional CPU overrun that shows up as an
+        # audible underrun/crackle under a heavy patch or high note count -- see
+        # audio_latency_ms in backend.c. It does NOT fix a genuinely sustained overload (too
+        # many voices, too expensive a patch, consistently over budget); for that, the fix is
+        # a lighter patch or fewer voices, not a bigger buffer.
+        latency_row = QHBoxLayout()
+        latency_row.addWidget(QLabel("Latency:"))
+        self.audio_latency_combo = QComboBox()
+        self._LATENCY_PRESETS = [
+            ("Snappy (15ms)", 15.0),
+            ("Normal (25ms)", 25.0),
+            ("Safe (50ms)", 50.0),
+            ("Extra Safe (100ms)", 100.0),
+        ]
+        self.audio_latency_combo.addItems([label for label, _ in self._LATENCY_PRESETS])
+        self.audio_latency_combo.setCurrentIndex(1) # Normal (25ms), matches the backend default
+        self.audio_latency_combo.setToolTip(
+            "Bigger = more forgiving of an occasional slow block (dense chords/heavy patches)\n"
+            "at the cost of added delay between playing a note and hearing it.\n"
+            "If you're hearing crackling/dropouts under heavy playing, try Safe or Extra Safe."
+        )
+        latency_row.addWidget(self.audio_latency_combo, stretch=1)
+        device_lay.addLayout(latency_row)
+
         refresh_row = QHBoxLayout()
         self.btn_refresh_devices = QPushButton("Rescan Devices")
         self.btn_refresh_devices.setFixedHeight(24)
@@ -1894,7 +1940,7 @@ class SynthGui(QWidget):
         device_lay.addLayout(refresh_row)
         self.btn_refresh_devices.clicked.connect(self.refresh_audio_devices)
 
-        device_note = QLabel("Changing a device applies live — the backend closes and reopens that stream.")
+        device_note = QLabel("Changing a device or the Latency setting applies live — the backend closes and reopens the stream(s).")
         device_note.setStyleSheet("font-size: 9px; color: #888;")
         device_note.setWordWrap(True)
         device_lay.addWidget(device_note)
@@ -2291,6 +2337,11 @@ class SynthGui(QWidget):
         # Sustain pedal polarity: 0 = Normal, 1 = Inverted (+1 item)
         packet_list.append(1.0 if self.sustain_polarity_inverted.isChecked() else 0.0)
 
+        # Audio latency, ms (+1 item) -- friendly preset dropdown, see audio_latency_ms in backend.c
+        latency_idx = self.audio_latency_combo.currentIndex()
+        latency_ms = self._LATENCY_PRESETS[latency_idx][1] if 0 <= latency_idx < len(self._LATENCY_PRESETS) else 25.0
+        packet_list.append(float(latency_ms))
+
         # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
         # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
         # + 1 (filter_a_mode) + 4 (filter_a) + 1 (filter_a_multi_routing) + 12 (filter_a_multi[3] * 4)
@@ -2300,12 +2351,12 @@ class SynthGui(QWidget):
         # + 2 (vco1/vco2 mute) + 1 (hard sync) + 2 (vco1/vco2 phase offset)
         # + 2 (vco1/vco2 pulse width) + 4 (noise osc: vol/pan/mute/tilt) + 4 (sub osc: shape/vol/pan/mute)
         # + 2 (ext in enable/gain) + 132 (12 FX slots * 11) + 1 (fx_routing_mode) + 2 (pb range)
-        # + 1 (sustain polarity) = 316 floats, followed by 3 fixed 64-byte device name strings
-        # (not floats): output_device, input_device, midi_device.
+        # + 1 (sustain polarity) + 1 (audio latency) = 317 floats, followed by 3 fixed 64-byte
+        # device name strings (not floats): output_device, input_device, midi_device.
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
         binary_packet = struct.pack(
-            f"316f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
+            f"317f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
@@ -2429,6 +2480,7 @@ def runtime_connect_and_bind(gui):
     gui.ext_in_gain_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.output_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
     gui.input_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
+    gui.audio_latency_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
     gui.midi_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
 
     # Initialize separate telemetry thread loop for VU meter updates

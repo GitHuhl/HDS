@@ -16,20 +16,22 @@
 
 #define SAMPLE_RATE 48000
 #define BUFFER_SIZE 128
-// Raised from 64 for headroom on fast/dense playing (supersaw chords, sustain pedal piling up
-// release tails, etc). Idle voice slots are near-free -- render_audio_block's per-voice loops
-// skip a slot the instant all three of its amp envelopes go STATE_IDLE -- so this only costs
-// real CPU when that many voices are simultaneously ACTIVE, not just allocated. Benchmarked
-// (scratchpad/bench_realistic.c) against a worst-case patch (Unison Saw on both oscillators +
-// Filter A Multi mode + Filter B + all LFOs/EGs modulating): even the OLD 64-voice ceiling
-// already exceeded this sandbox's real-time budget well before 64 active voices in that
-// worst case, so this is a genuine headroom increase for real chords/passages, not a change
-// that makes an already-safe margin worse -- but the sandbox this was benchmarked on may not
-// reflect the actual deployment machine's performance, so if you hear underruns/xruns under
-// heavy patches at high voice counts, that's a real signal to profile on the target hardware
-// and consider trimming per-voice cost (e.g. Multi filter mode, dual Unison Saw) rather than
-// lowering this back down reflexively.
-#define MAX_VOICES  96
+// This was raised to 96 (from 64) for headroom on fast/dense playing, then brought back down
+// to 32 after real hardware measurements (via the underrun diagnostics on write_audio_block/
+// handle_note_on) showed the ACTUAL target machine's render_audio_block already exceeds its
+// per-block real-time budget (2.667ms at BUFFER_SIZE=128/48kHz) at just 33-36 active voices --
+// on a plain, unmodulated sawtooth patch with no FX engaged, i.e. close to the cheapest
+// possible thing this engine can render. That number only gets worse once FX slots or actual
+// LFO/EG modulation routing are in use (FX processing is a fixed per-block cost on top of the
+// per-voice ones; a routed mod source skips the target==0 fast path added alongside this
+// change and pays full per-voice cost again). 32 leaves real margin below that measured
+// failure point rather than treating voice-stealing (see handle_note_on) as a rare edge case.
+// Idle voice slots are still near-free -- the per-voice loops skip a slot once all three of its
+// amp envelopes go STATE_IDLE -- so this cost only applies to genuinely ACTIVE voices. If you
+// want to push this back up, the honest way is with the same diagnostics: confirm on the real
+// target hardware, under real patches (FX + modulation engaged, not just a bare sawtooth), not
+// by raising the number and hoping.
+#define MAX_VOICES  32
 #define LFO_COUNT   4
 #define ASSIGNABLE_EG_COUNT 6  // EG 1-6 (in addition to Osc 1 Amp, Osc 2 Amp, Noise Osc Amp)
 #define ENV_COUNT   (3 + ASSIGNABLE_EG_COUNT)  // Osc 1 Amp, Osc 2 Amp, Noise Osc Amp, + assignable EGs
@@ -172,6 +174,9 @@ typedef struct {
 // [was 1]), and Parallel's fixed 50/50 blend became the adjustable filter_ab_blend (+1 new
 // trailing float). New total: 316 float items + 192 string bytes. The Python side's
 // struct.pack format changes from "315f64s64s64s" to "316f64s64s64s".
+// BREAKING CHANGE (adjustable audio latency): added audio_latency_ms (+1 float), the Audio
+// tab's Latency control -- see open_pcm_stream(). New total: 317 float items + 192 string
+// bytes. The Python side's struct.pack format changes from "316f64s64s64s" to "317f64s64s64s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -320,6 +325,16 @@ typedef struct {
     // sustain pedal), 1 = Inverted (for the rare pedal wired backwards, sending 0 when
     // pressed). See handle_sustain_pedal_change()/the CC64 handling in process_midi_input.
     float sustain_pedal_polarity;
+
+    // Requested ALSA output/input buffer depth, in milliseconds (passed straight through as
+    // snd_pcm_set_params's `latency` argument in open_pcm_stream() -- see the comment there).
+    // This is the actual floor on output latency (NOT BUFFER_SIZE, which only controls the
+    // internal render chunk size). Default 25ms. Raising it doesn't fix a genuine CPU-throughput
+    // shortfall (a block that consistently takes too long to render will eventually underrun no
+    // matter how deep the buffer is) -- it buys a bigger safety cushion against occasional,
+    // marginal overruns (a block that only sometimes takes a little too long) at the cost of
+    // added latency. See the Audio tab's Latency control.
+    float audio_latency_ms;
 
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
@@ -1317,6 +1332,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->fx_routing_mode = 0.0f; // Series
     knobs->pb_range_up = 2.0f; knobs->pb_range_down = 2.0f; // standard +/-2 semitone default
     knobs->sustain_pedal_polarity = 0.0f; // Normal
+    knobs->audio_latency_ms = 25.0f; // matches the old hardcoded 25ms target -- no behavior change by default
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -2126,7 +2142,7 @@ static void write_audio_block(snd_pcm_t *pcm_handle, const float *buffer, snd_pc
 // return values at all -- an unavailable "default" device (no sound card, no PulseAudio/ALSA
 // routing) left pcm_handle uninitialized/unusable and the very first snd_pcm_writei() call
 // would segfault or hang instead of failing with a clear message.
-static bool open_pcm_stream(const char *device_name, snd_pcm_stream_t stream, snd_pcm_t **handle) {
+static bool open_pcm_stream(const char *device_name, snd_pcm_stream_t stream, snd_pcm_t **handle, float latency_ms) {
     if (*handle) { snd_pcm_close(*handle); *handle = NULL; }
     int err = snd_pcm_open(handle, device_name, stream, 0);
     if (err < 0) {
@@ -2134,18 +2150,19 @@ static bool open_pcm_stream(const char *device_name, snd_pcm_stream_t stream, sn
         *handle = NULL;
         return false;
     }
-    // LATENCY: this 25000us (25ms) target -- not BUFFER_SIZE -- is what actually sets the
-    // floor on output latency. BUFFER_SIZE (128 samples = ~2.7ms) only controls how small the
-    // chunks are that we hand to ALSA each main-loop iteration (so a fresh MIDI event waits at
-    // most one block before it's reflected in the stream, plus small per-write syscall
-    // overhead) -- it does NOT change how deep the ALSA ring buffer itself is. Lowering this
-    // value shrinks the safety margin against underruns/xruns (audible crackling/dropouts)
-    // exactly when CPU load spikes hardest -- dense chords, heavy Unison Saw + Filter A Multi
-    // mode + lots of LFO/EG modulation, i.e. precisely the "fast supersaw" scenario MAX_VOICES
-    // was raised for. Do not lower this reflexively; if you do, re-benchmark worst-case CPU
-    // cost per block (see scratchpad bench_realistic.c from that MAX_VOICES change) against the
-    // new, smaller margin on the ACTUAL target hardware, not just in a dev sandbox.
-    err = snd_pcm_set_params(*handle, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, SAMPLE_RATE, 1, 25000);
+    // LATENCY: this target -- not BUFFER_SIZE -- is what actually sets the floor on output
+    // latency. BUFFER_SIZE (128 samples = ~2.7ms) only controls how small the chunks are that
+    // we hand to ALSA each main-loop iteration (so a fresh MIDI event waits at most one block
+    // before it's reflected in the stream, plus small per-write syscall overhead) -- it does
+    // NOT change how deep the ALSA ring buffer itself is. Lowering latency_ms shrinks the
+    // safety margin against underruns/xruns (audible crackling/dropouts) exactly when CPU load
+    // spikes hardest -- dense chords, heavy Unison Saw + Filter A Multi mode + lots of LFO/EG
+    // modulation. It's user-adjustable (SynthSharedControls.audio_latency_ms, the Audio tab's
+    // Latency control) specifically because that safety/responsiveness tradeoff is a real one
+    // that depends on the target hardware's own headroom, not something to freeze at one value
+    // for every machine this ever runs on.
+    unsigned int latency_us = (unsigned int)fmaxf(1000.0f, latency_ms * 1000.0f);
+    err = snd_pcm_set_params(*handle, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, SAMPLE_RATE, 1, latency_us);
     if (err < 0) {
         fprintf(stderr, "%s device '%s' failed to configure: %s\n", stream == SND_PCM_STREAM_PLAYBACK ? "Output" : "Input", device_name, snd_strerror(err));
         snd_pcm_close(*handle);
@@ -2163,7 +2180,7 @@ int main() {
     SynthSharedControls active_knobs; init_default_controls(&active_knobs);
 
     snd_pcm_t *pcm_handle = NULL;
-    if (!open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle)) {
+    if (!open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms)) {
         fprintf(stderr, "Cannot continue without an output device.\n");
         close(server_fd); unlink(socket_path); return 1;
     }
@@ -2174,9 +2191,10 @@ int main() {
     // fatal -- external input just stays silent (ext_in_enable has nothing to mix in) until a
     // working device name is picked from the Audio tab.
     snd_pcm_t *pcm_capture_handle = NULL;
-    open_pcm_stream(active_knobs.input_device, SND_PCM_STREAM_CAPTURE, &pcm_capture_handle);
+    open_pcm_stream(active_knobs.input_device, SND_PCM_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms);
     char applied_input_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
+    float applied_audio_latency_ms = active_knobs.audio_latency_ms;
 
     snd_seq_t *seq_handle;
     int seq_err = snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
@@ -2213,20 +2231,24 @@ int main() {
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
         // packet as every other knob. Only reopen the stream whose name actually changed.
-        if (strncmp(active_knobs.output_device, applied_output_device, AUDIO_DEVICE_NAME_LEN) != 0) {
-            if (open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle)) {
+        // A latency change reopens BOTH streams (it's not tied to one device name), since
+        // snd_pcm_set_params' latency target can only be applied at stream-open time.
+        bool latency_changed = active_knobs.audio_latency_ms != applied_audio_latency_ms;
+        if (latency_changed || strncmp(active_knobs.output_device, applied_output_device, AUDIO_DEVICE_NAME_LEN) != 0) {
+            if (open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms)) {
                 snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
             } else {
                 // Failed -- fall back to the last device that was actually working rather than
                 // leaving pcm_handle NULL, and stop retrying this same bad name every block.
-                open_pcm_stream(applied_output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle);
+                open_pcm_stream(applied_output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms);
                 snprintf(active_knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", applied_output_device);
             }
         }
-        if (strncmp(active_knobs.input_device, applied_input_device, AUDIO_DEVICE_NAME_LEN) != 0) {
-            open_pcm_stream(active_knobs.input_device, SND_PCM_STREAM_CAPTURE, &pcm_capture_handle); // best-effort
+        if (latency_changed || strncmp(active_knobs.input_device, applied_input_device, AUDIO_DEVICE_NAME_LEN) != 0) {
+            open_pcm_stream(active_knobs.input_device, SND_PCM_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms); // best-effort
             snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
         }
+        if (latency_changed) applied_audio_latency_ms = active_knobs.audio_latency_ms;
         if (strncmp(active_knobs.midi_device, applied_midi_device, AUDIO_DEVICE_NAME_LEN) != 0) {
             // Selection changed live from the Audio tab -- drop whatever was auto-connected
             // under the old selection and rescan under the new one.

@@ -6,23 +6,42 @@ A digital synthesizer split into two processes:
   audio directly to a PCM device, captures external audio from an input
   device, and exposes every synth parameter over a Unix domain socket
   (`/tmp/synth.sock`) as a fixed-layout packed struct (`SynthSharedControls`,
-  316 floats + 3 device name strings). Also streams back a peak-level float
+  317 floats + 3 device name strings). Also streams back a peak-level float
   for the GUI's VU meter. The final output stage carries an always-on
   safety limiter (instant attack, ~50ms release) ahead of a hard clamp, so
   an overload (e.g. several voices lining up, or Parallel FX routing
   summing 12 hot slots) degrades to smooth gain reduction rather than
   brick-wall clipping.
 
-  Polyphony is `MAX_VOICES` = 96 (up from 64) for headroom on fast/dense
-  playing (supersaw chords, sustain pedal piling up release tails). Idle
-  voice slots are near-free -- the per-voice render loops skip a slot the
-  instant it goes fully silent -- so this only costs real CPU when that many
-  voices are simultaneously *active*. Output latency is set by the ALSA
-  buffer target in `open_pcm_stream()` (currently 25ms), not by the internal
-  render chunk size (`BUFFER_SIZE` = 128 samples, ~2.7ms) -- see the comment
-  there before changing either; there isn't a clearly safe margin to cut it
-  further without re-benchmarking worst-case per-block CPU cost on the
-  actual target hardware, especially now that polyphony has gone up.
+  Polyphony is `MAX_VOICES` = 32. This was raised to 96 for headroom on
+  fast/dense playing, then brought back down after real hardware testing
+  showed render_audio_block already exceeding its per-block real-time
+  budget at just 33-36 active voices on a plain, unmodulated, FX-off
+  patch -- close to the cheapest possible thing this engine renders. See
+  the comment on `MAX_VOICES` before raising it again: do it with the same
+  real-hardware measurement, not by picking a bigger number. Idle voice
+  slots are still near-free -- the per-voice render loops skip a slot the
+  instant it goes fully silent -- so this cost only applies to genuinely
+  active voices. Voice-stealing (once every slot is active) picks the
+  quietest/already-releasing voice instead of blindly resetting slot 0, so
+  hitting the ceiling degrades gracefully rather than clicking.
+
+  Every active voice's LFO/EG modulation dispatch now skips straight past
+  its ~19-branch destination-matching chain when that source isn't routed
+  anywhere (`dest_target == 0`/"None") instead of evaluating the whole
+  chain for nothing -- a real, measured (~6-10% per block) win on a plain
+  unmodulated patch, found via the same real-hardware profiling above.
+
+  Output latency is set by the ALSA buffer target in `open_pcm_stream()`
+  (`audio_latency_ms`, the Audio tab's Latency control -- default 25ms, not
+  the internal render chunk size `BUFFER_SIZE` = 128 samples/~2.7ms). Two
+  stderr-only diagnostics help tell a genuine CPU-throughput shortfall
+  apart from anything else: `[perf]` fires when a block itself took longer
+  to render than its own real-time budget (with active voice count), and
+  `[audio]` fires alongside any ALSA underrun/xrun snd_pcm_recover recovers
+  from, with the same context. `[voices]` fires from `handle_note_on`
+  whenever the polyphony ceiling is actually hit, to confirm whether
+  `MAX_VOICES` is even the relevant factor before touching it.
 
   MIDI input auto-connects with no `aconnect` ever needed: at startup it
   scans ALSA sequencer clients and subscribes to every real (kernel-backed,
@@ -44,9 +63,17 @@ A digital synthesizer split into two processes:
 - **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
   knobs and draggable ADSR envelope graphs, tabbed into Play / Filters /
   LFOs / Envelopes / FX / Audio. Packs the same struct
-  (`struct.pack("316f64s64s64s", ...)`) and sends it over the socket
+  (`struct.pack("317f64s64s64s", ...)`) and sends it over the socket
   whenever a control changes. If it can't connect to the backend it falls
   back to a mock mode so the UI still runs standalone.
+
+  The Audio tab has a Latency preset dropdown (Snappy/Normal/Safe/Extra
+  Safe, 15-100ms) -- a friendly stand-in for the raw ALSA buffer target,
+  kept as presets rather than a bare millisecond field to stay in the
+  appliance spirit. It's a real safety-margin/responsiveness tradeoff for
+  occasional, marginal CPU overruns, not a fix for a genuinely overloaded
+  patch (too many voices/too expensive a patch stays a "use fewer voices
+  or a lighter patch" problem, however big the buffer is).
 
   There is no Global tab -- Program name/Load/Save, Poly/Mono Legato, Hard
   Sync, Pitch Bend Range, Sustain Pedal Polarity, FM Depth, and Glide all
@@ -65,10 +92,17 @@ A digital synthesizer split into two processes:
   their floor dropped from 5-10ms to 1ms -- turning the knob now spends most
   of its travel on the fast end (1-50ms) where the resolution actually
   matters, rather than spreading it evenly across the full 1-2000ms range.
-  The Oscillators/Amp-EGs panel on the Play tab is wrapped in a
-  `QScrollArea` (same pattern as the FX tab) so the window can be resized
-  narrower than that panel's natural width without clipping anything --
-  it scrolls instead of forcing the whole app wide.
+  The Oscillators/Amp-EGs panel on the Play tab and the Envelopes tab's 6
+  ADSRPanels are both wrapped in a `QScrollArea` (same pattern as the FX
+  tab) so the window can be resized freely without clipping anything --
+  each panel scrolls instead of forcing the whole app to whatever size its
+  content needs. Without the Envelopes tab's wrap specifically, its 6
+  stacked panels forced a ~1139px minimum window height even while a
+  totally different tab was open, since QTabWidget sizes itself to fit its
+  largest tab, not just the active one. The LFO/Envelopes tab layouts also
+  pin their content to the top (a trailing `addStretch()`) instead of
+  letting Qt spread leftover vertical space evenly between rows when the
+  window is taller than the content needs.
 
 Engine features: 2 main oscillators (Saw/Square/Triangle/Sine/Unison
 Saw/Noise/Pulse) with FM and hard sync, a dedicated sub oscillator and
