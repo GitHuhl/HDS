@@ -1366,7 +1366,9 @@ class SampleLoopEditor(QWidget):
     """Waveform display + draggable loop-start/loop-end markers for the Mapping tab's currently
     selected zone. Decodes each zone's WAV file once (cached by path, purely for this picture --
     entirely separate from the backend's own DFD streaming/pre-roll cache) and sends loop_start/
-    loop_end back to the backend as fractions of the file's length whenever a marker moves."""
+    loop_end back to the backend as fractions of the file's length whenever a marker moves.
+    Dragging inside the shaded region (not on either marker) slides the whole loop, preserving
+    its length; scrolling anywhere over the widget resizes it symmetrically around its center."""
     def __init__(self, parent_window, parent=None):
         super().__init__(parent)
         self.parent_window = parent_window
@@ -1374,7 +1376,8 @@ class SampleLoopEditor(QWidget):
         self.setMouseTracking(True)
         self.zone = None
         self._peaks_cache = {}  # file_path -> (mins, maxs, total_frames) or None (decode failed)
-        self._drag_target = None  # "start" | "end" | None
+        self._drag_target = None  # "start" | "end" | "slide" | None
+        self._slide_click_offset = 0.0  # frac(click) - loop_start at drag start, only for "slide"
 
     def _get_peaks(self, path):
         if path not in self._peaks_cache:
@@ -1438,31 +1441,77 @@ class SampleLoopEditor(QWidget):
     def _marker_hit(self, x, frac):
         return abs(x - self._marker_x(frac)) < 6
 
+    def _closer_marker(self, frac):
+        return "start" if abs(frac - self.zone.loop_start) <= abs(frac - self.zone.loop_end) else "end"
+
     def mousePressEvent(self, event):
-        if self.zone is None or event.button() != Qt.MouseButton.LeftButton: return
+        if self.zone is None: return
         x = event.position().x()
-        if self._marker_hit(x, self.zone.loop_end): self._drag_target = "end"  # end marker checked
-        elif self._marker_hit(x, self.zone.loop_start): self._drag_target = "start"  # first, in case they overlap
-        else: self._drag_target = None
+        frac = self._x_to_frac(x)
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._marker_hit(x, self.zone.loop_end): self._drag_target = "end"  # end marker checked
+            elif self._marker_hit(x, self.zone.loop_start): self._drag_target = "start"  # first, in case they overlap
+            elif self.zone.loop_start < frac < self.zone.loop_end:
+                # Clicked inside the shaded region itself, not on either marker -- slide the whole
+                # loop, preserving its length. Remember the click's offset from loop_start so the
+                # grabbed point stays under the cursor instead of the region jumping to re-center.
+                self._drag_target = "slide"
+                self._slide_click_offset = frac - self.zone.loop_start
+            else:
+                self._drag_target = None
+        elif event.button() == Qt.MouseButton.RightButton:
+            # Right-click+drag anywhere -- inside the region, outside it, doesn't matter -- grabs
+            # whichever marker (start or end) is currently closer, a faster way to nudge whichever
+            # end you mean without having to land the cursor precisely on its thin marker line.
+            self._drag_target = self._closer_marker(frac)
 
     def mouseMoveEvent(self, event):
         if self.zone is None: return
         x = event.position().x()
         if self._drag_target is None:
-            near = self._marker_hit(x, self.zone.loop_start) or self._marker_hit(x, self.zone.loop_end)
-            self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor) if near else QCursor(Qt.CursorShape.ArrowCursor))
+            near_marker = self._marker_hit(x, self.zone.loop_start) or self._marker_hit(x, self.zone.loop_end)
+            inside_body = self.zone.loop_start < self._x_to_frac(x) < self.zone.loop_end
+            if near_marker: self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
+            elif inside_body: self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+            else: self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
             return
         frac = self._x_to_frac(x)
         min_gap = 0.002  # keep start strictly before end -- a visually tiny but real minimum gap
         if self._drag_target == "start":
             self.zone.loop_start = min(frac, self.zone.loop_end - min_gap)
-        else:
+        elif self._drag_target == "end":
             self.zone.loop_end = max(frac, self.zone.loop_start + min_gap)
+        else:  # "slide"
+            length = self.zone.loop_end - self.zone.loop_start
+            new_start = max(0.0, min(1.0 - length, frac - self._slide_click_offset))
+            self.zone.loop_start, self.zone.loop_end = new_start, new_start + length
         self.update()
         if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
 
     def mouseReleaseEvent(self, event):
         self._drag_target = None
+
+    def wheelEvent(self, event):
+        """Resizes the loop region symmetrically around its own center, one step per wheel notch
+        -- works whether the cursor is just hovering over the widget or a marker/slide drag is
+        already in progress, since this is an independent event from the mouse-button drags above."""
+        if self.zone is None: return
+        notches = event.angleDelta().y() / 120.0  # +1.0 per standard wheel click; fractional for trackpads
+        if notches == 0: return
+        step = 0.01 * notches  # 1% of the file's length per notch, applied to EACH side
+        min_gap = 0.002
+        new_start = max(0.0, self.zone.loop_start - step)
+        new_end = min(1.0, self.zone.loop_end + step)
+        if new_end - new_start < min_gap:
+            # Shrunk past the minimum -- collapse symmetrically around the center instead of
+            # letting start/end cross each other.
+            center = (self.zone.loop_start + self.zone.loop_end) / 2.0
+            new_start = max(0.0, min(1.0 - min_gap, center - min_gap / 2.0))
+            new_end = new_start + min_gap
+        self.zone.loop_start, self.zone.loop_end = new_start, new_end
+        self.update()
+        if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
+        event.accept()
 
 class ZoneInspectorPanel(QWidget):
     """Per-selected-zone controls for the Mapping tab: loop enable + the waveform/marker editor
