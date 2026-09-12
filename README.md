@@ -188,45 +188,72 @@ A digital synthesizer split into two processes:
   WAV are supported.
 
   Which loaded slot actually plays is real per-note/velocity zone mapping
-  (SFZ-style): each of the `MAX_SAMPLE_SLOTS` (16) slots is also a zone
-  (`min_note`/`max_note`, `min_velocity`/`max_velocity`, plus an
-  `unpitched` flag for DRUM/one-shot samples that should always play at
-  their native rate). `find_matching_sample_slot(note, velocity)` picks
-  whichever loaded slot's key range AND velocity range both cover the
-  note -- a note outside every zone is silent, not "nearest root note
-  always plays something." Overlapping zones resolve to the smallest
-  (most specific) match. The zone fields are cheap plain data, applied to
-  `g_sample_slots[]` every block regardless of whether a slot's file path
-  itself changed (`apply_sample_slot_zone_metadata()`), so dragging a
-  zone's key/velocity range in the Mapping tab takes effect immediately
-  without re-loading the file. This depends on the engine actually
-  tracking MIDI velocity, which nothing here did before it (not even
-  amp/filter response for the periodic oscillators): note-on velocity is
-  now captured per voice (`SynthVoice.midi_velocity`) and threaded through
-  `handle_note_on`; mono mode's held-note fallback stack
-  (`MonoNoteStack`) carries each stacked note's own velocity too, so
-  falling back to an earlier still-held key restores that key's velocity
-  rather than leaking whichever note was struck last.
+  (SFZ-style): every loaded slot is also a zone (`min_note`/`max_note`,
+  `min_velocity`/`max_velocity`, plus an `unpitched` flag for DRUM/one-shot
+  samples that should always play at their native rate).
+  `find_matching_sample_slot(note, velocity)` picks whichever loaded slot's
+  key range AND velocity range both cover the note -- a note outside every
+  zone is silent, not "nearest root note always plays something."
+  Overlapping zones resolve to the smallest (most specific) match. This
+  depends on the engine actually tracking MIDI velocity, which nothing here
+  did before it (not even amp/filter response for the periodic
+  oscillators): note-on velocity is now captured per voice
+  (`SynthVoice.midi_velocity`) and threaded through `handle_note_on`; mono
+  mode's held-note fallback stack (`MonoNoteStack`) carries each stacked
+  note's own velocity too, so falling back to an earlier still-held key
+  restores that key's velocity rather than leaking whichever note was
+  struck last.
 
   Several slots sharing a **round-robin group** (`round_robin_group`, 0 =
-  independent) and an equally-specific matching zone cycle through each
-  other one hit at a time instead of the same one always winning --
-  `find_matching_sample_slot()` collects every tied-most-specific match,
-  then rotates through whichever group the first (lowest-index) candidate
-  belongs to via a small per-group hit counter, falling back to the
-  original deterministic lowest-index behavior for an ungrouped tie so
-  nothing changes for anyone not opting in. Loop points/enable and
-  round-robin grouping travel as fractions/plain flags in the wire
-  protocol and are applied every block the same way the rest of a zone's
-  metadata is, independent of the DFD file-load path. There's still no
-  program-save capability -- that remains future work once this and the
-  rest of the engine are proven solid together.
+  independent, up to `MAX_ROUND_ROBIN_GROUPS` = 256 distinct groups) and an
+  equally-specific matching zone cycle through each other one hit at a time
+  instead of the same one always winning -- `find_matching_sample_slot()`
+  collects every tied-most-specific match (tie-broken by lowest `zone_id`,
+  not raw array position), then rotates through whichever group the first
+  candidate belongs to via a small per-group hit counter, falling back to
+  the original deterministic behavior for an ungrouped tie so nothing
+  changes for anyone not opting in. There's still no program-save
+  capability -- that remains future work once this and the rest of the
+  engine are proven solid together.
+
+  **The Sample Bank has no product-facing cap on zone count** -- a
+  multisample instrument with thousands of zones is exactly as valid as one
+  with three. This works because the catalog lives entirely off
+  `SynthSharedControls` (the fixed struct every other knob rides, resent in
+  full on every unrelated control change): it travels instead over its own
+  dedicated, event-driven Unix socket (`/tmp/synth_samples.sock`, see
+  `setup_sample_catalog_socket()`/`poll_sample_catalog_socket()`), carrying
+  two incremental message types -- `ZONE_OP_UPSERT` (add-or-update one or
+  more zones by a stable `zone_id`, the frontend's own ever-incrementing,
+  never-reused counter) and `ZONE_OP_REMOVE` (delete by `zone_id`) -- so
+  editing one zone stays cheap even with thousands mapped, and every other
+  knob's own packet shrinks back down as a side effect. `g_sample_slots[]`
+  is one large array (`SAMPLE_SLOT_CAPACITY` = 100,000, ~34MB) preallocated
+  once at startup and never resized: `sample_disk_thread_main()`
+  dereferences into it directly with no lock, relying on its base address
+  never moving for the process's whole life, so true `realloc()`-based
+  growth would be a genuine use-after-free race against that thread rather
+  than a style choice -- a fixed-but-huge ceiling sidesteps that
+  entirely. Removed zones are tombstoned (`SampleSlot.active = false`), not
+  compacted or reused, avoiding any need to reason about recycling a slot a
+  streaming voice might still reference. Loading a WAV is still a blocking
+  call on the audio thread, but throttled rather than done inline: a newly
+  added or path-changed zone queues into `g_pending_loads[]` (audio-thread-
+  only, no cross-thread synchronization needed), drained at
+  `SAMPLE_LOADS_PER_BLOCK` (1) per block -- bounding the worst case added
+  latency to "one file's blocking I/O," the same worst case already
+  accepted before this. A zone whose queued load is still pending when a
+  `ZONE_OP_REMOVE` for it arrives is left alone by the drain once it
+  finally runs (checked via `.active`), rather than resurrecting a
+  just-removed slot.
 - **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
   knobs and draggable ADSR envelope graphs, tabbed into Play / Filters /
   LFOs / Envelopes / FX / Audio / Recording / Mapping. Packs the same struct
-  (`struct.pack("532f64s64s64s256s4096s", ...)`) and sends it over the socket
-  whenever a control changes. If it can't connect to the backend it falls
-  back to a mock mode so the UI still runs standalone.
+  (`struct.pack("372f64s64s64s256s", ...)`) and sends it over the socket
+  whenever a control changes; the Mapping tab's Sample Bank zones ride a
+  second, separate socket instead (see below) rather than this one. If it
+  can't connect to the backend it falls back to a mock mode so the UI still
+  runs standalone.
 
   The **Recording** tab: a "Synth Output" checkbox, a grid of "In N"
   checkboxes rebuilt live to match whatever channel count the backend's
@@ -248,14 +275,16 @@ A digital synthesizer split into two processes:
   A Root Key dropdown (128 notes + "DRUM (Unpitched)") sets the selected
   zone's own pitch-reference note independent of its key range. Every
   edit is live -- no separate "Apply" step, same convention as every
-  other control in this file -- driving `sample_slot_root_note[]`/
-  `min_note[]`/`max_note[]`/`min_velocity[]`/`max_velocity[]`/
-  `unpitched[]`/`path[]` directly (`SamplerMappingGrid`, adapted from a
-  standalone prototype into this file's real backend instead of that
-  prototype's `print()`-based stubs). Up to `MAX_SAMPLE_SLOTS` (16) zones
-  at once, tracked past that with a status line and a graceful refusal
-  rather than a crash. Set an oscillator's Shape (Play tab) to "Sample"
-  and play. Each note's own lane (in both the grid above and the
+  other control in this file -- but instead of riding the shared knob
+  packet, each edit calls `transmit_zone_upsert()`/`transmit_zone_remove()`
+  (`SamplerMappingGrid`, adapted from a standalone prototype into this
+  file's real backend instead of that prototype's `print()`-based stubs),
+  sending only the zone(s) actually touched over the dedicated catalog
+  socket. No cap on how many zones can exist at once -- each is identified
+  by its own stable `zone_id` (an ever-incrementing counter,
+  `SampleZone.zone_id`), not a fixed backend slot index. Set an
+  oscillator's Shape (Play tab) to "Sample" and play. Each note's own lane
+  (in both the grid above and the
   reference keyboard below it) is a strict, non-overlapping partition of
   the available width, not a physically-realistic key shape that
   overhangs its neighbors -- a real piano's black keys visually overhang

@@ -126,9 +126,14 @@ RECORD_PATH_LEN = 256
 # UI yet -- the frontend always sends tempo_marker_count=0 -- but the wire layout still reserves
 # this many (time, bpm) marker slots so a future editor doesn't need another breaking change.
 TEMPO_MARKER_MAX = 16
-# Sample Bank: must match MAX_SAMPLE_SLOTS / SAMPLE_PATH_LEN in backend.c exactly.
-MAX_SAMPLE_SLOTS = 16
+# Sample Bank: the zone catalog itself has no product-facing cap (see SAMPLE_SLOT_CAPACITY's
+# comment in backend.c) and travels over its own dedicated socket -- see transmit_zone_upsert()/
+# transmit_zone_remove(). SAMPLE_PATH_LEN is still a per-path length bound, must match backend.c
+# exactly. MAX_ROUND_ROBIN_GROUPS is a real, small, legitimately-boundable UI concept (how many
+# independent round-robin groups can exist at once), unrelated to catalog size -- must match
+# backend.c exactly.
 SAMPLE_PATH_LEN = 256
+MAX_ROUND_ROBIN_GROUPS = 256
 
 # CreamCoat's 17 "Select" room-size presets, in order -- text taken verbatim from the original
 # plugin's own per-case comments (e.g. "5 to 51 ms, 96 seat room").
@@ -979,15 +984,16 @@ class ADSRPanel(QGroupBox):
 # MAPPING TAB -- Sample Bank zone editor. Adapted from a standalone prototype the same author
 # provided (a drag-and-drop key-range/velocity-range zone grid + a scaled piano keyboard), wired
 # here into the real backend instead of the prototype's print()-based stubs: every zone edit
-# (drop, drag/resize, delete, root-key change) calls transmit_knob_packet() the same way every
-# other live control in this file does, and each SampleZone is synced 1:1 to a backend slot
-# (sample_slot_root_note[]/min_note[]/max_note[]/min_velocity[]/max_velocity[]/unpitched[]/path[]
-# in backend.c) by its own slot_index -- see SynthGui.transmit_knob_packet's Sample Bank section.
+# (drop, drag/resize, delete, root-key change) calls transmit_zone_upsert()/transmit_zone_remove()
+# -- a dedicated, event-driven socket, NOT transmit_knob_packet() -- and each SampleZone is synced
+# to the backend's g_sample_slots[] catalog by its own stable zone_id (see ZONE_OP_UPSERT/
+# ZONE_OP_REMOVE in backend.c), not by array position -- the catalog itself has no product-facing
+# cap (see SAMPLE_SLOT_CAPACITY's comment in backend.c).
 # ==========================================================================================
 class SampleZone:
     """One loaded sample mapped across a key range and a velocity range -- one entry in the
-    Sample Bank, synced to a backend slot (sample_slot_*[slot_index]) by slot_index."""
-    def __init__(self, file_path, note_number, slot_index):
+    Sample Bank, synced to the backend's catalog by its own stable zone_id."""
+    def __init__(self, file_path, note_number, zone_id):
         self.file_path = file_path
         self.filename = os.path.basename(file_path)
         self.root_note = note_number   # lower bound of the key range
@@ -996,7 +1002,7 @@ class SampleZone:
         self.max_velocity = 90
         self.is_selected = False
         self.key_center = note_number  # pitch reference note; -1 = DRUM (unpitched)
-        self.slot_index = slot_index   # which backend Sample Bank slot (0..MAX_SAMPLE_SLOTS-1) this is
+        self.zone_id = zone_id  # stable identity for ZONE_OP_UPSERT/ZONE_OP_REMOVE, never reused
         # Loop points as fractions (0.0-1.0) of the file's own length -- whole-file by default,
         # least surprising for a freshly dropped, not-yet-edited sample (see SampleLoopEditor).
         self.loop_start = 0.0
@@ -1034,6 +1040,7 @@ class SamplerMappingGrid(QWidget):
         self.key_geometries = {}
         self.black_key_offsets = {1, 3, 6, 8, 10}
         self.sample_zones = []
+        self._next_zone_id = 1  # ever-incrementing, never reused/recycled -- see SampleZone.zone_id
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -1071,23 +1078,18 @@ class SamplerMappingGrid(QWidget):
     def dragEnterEvent(self, e): e.acceptProposedAction() if e.mimeData().hasUrls() else None
     def dragMoveEvent(self, e): e.acceptProposedAction() if e.mimeData().hasUrls() else None
 
-    def _next_free_slot_index(self):
-        used = {z.slot_index for z in self.sample_zones}
-        for i in range(MAX_SAMPLE_SLOTS):
-            if i not in used: return i
-        return -1
-
     def add_zone_at_note(self, file_path, note_number):
-        """Creates a new zone for file_path at note_number, if a Sample Bank slot is free.
-        Shared by drag-and-drop and the "+ Add Sample" fallback button."""
-        slot_index = self._next_free_slot_index()
-        if slot_index < 0:
-            if self.parent_window: self.parent_window.set_mapping_status(f"Sample Bank full ({MAX_SAMPLE_SLOTS}/{MAX_SAMPLE_SLOTS}) — delete a zone to add another.", error=True)
-            return False
-        self.sample_zones.append(SampleZone(file_path, note_number, slot_index))
-        if self.parent_window: self.parent_window.set_mapping_status(None)
+        """Creates a new zone for file_path at note_number -- no cap on how many zones can exist
+        (see SAMPLE_SLOT_CAPACITY's comment in backend.c). Shared by drag-and-drop and the
+        "+ Add Sample" fallback button. Keeps its bool return since dropEvent still consumes it."""
+        zone_id = self._next_zone_id
+        self._next_zone_id += 1
+        zone = SampleZone(file_path, note_number, zone_id)
+        self.sample_zones.append(zone)
+        if self.parent_window:
+            self.parent_window.set_mapping_status(None)
+            self.parent_window.transmit_zone_upsert([zone])
         self.update()
-        if self.parent_window: self.parent_window.transmit_knob_packet()
         return True
 
     def dropEvent(self, e):
@@ -1103,15 +1105,15 @@ class SamplerMappingGrid(QWidget):
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            initial_count = len(self.sample_zones)
+            removed_ids = [z.zone_id for z in self.sample_zones if z.is_selected]
             self.sample_zones = [z for z in self.sample_zones if not z.is_selected]
-            if len(self.sample_zones) != initial_count:
+            if removed_ids:
                 if self.parent_window:
                     self.parent_window.synchronize_root_key_dropdown(None)
                     self.parent_window.sync_loop_editor_to_zone(None)
                     self.parent_window.set_mapping_status(None)
                 self.update()
-                if self.parent_window: self.parent_window.transmit_knob_packet()
+                if self.parent_window: self.parent_window.transmit_zone_remove(removed_ids)
         else:
             super().keyPressEvent(event)
 
@@ -1183,7 +1185,7 @@ class SamplerMappingGrid(QWidget):
                 if 0 <= (sr + n_off) < 128 and 0 <= (sm + n_off) < 128: zone.root_note, zone.max_note = sr + n_off, sm + n_off
                 if 0 <= (smin - v_off) <= 127 and 0 <= (smax - v_off) <= 127: zone.min_velocity, zone.max_velocity = smin - v_off, smax - v_off
         self.update()
-        if self.parent_window: self.parent_window.transmit_knob_packet()
+        if self.parent_window: self.parent_window.transmit_zone_upsert(list(self.zone_start_snapshots.keys()))
 
     def mouseReleaseEvent(self, event):
         self.active_zone, self.drag_mode = None, None
@@ -1220,7 +1222,7 @@ class SamplerMappingGrid(QWidget):
         cascade_offset = {}
         for members in group_members.values():
             if len(members) > 1:
-                for idx, zone in enumerate(sorted(members, key=lambda z: z.slot_index)):
+                for idx, zone in enumerate(sorted(members, key=lambda z: z.zone_id)):
                     cascade_offset[id(zone)] = idx * 9
 
         for zone in self.sample_zones:
@@ -1443,7 +1445,7 @@ class SampleLoopEditor(QWidget):
         else:
             self.zone.loop_end = max(frac, self.zone.loop_start + min_gap)
         self.update()
-        if self.parent_window: self.parent_window.transmit_knob_packet()
+        if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
 
     def mouseReleaseEvent(self, event):
         self._drag_target = None
@@ -1474,7 +1476,7 @@ class ZoneInspectorPanel(QWidget):
 
         header.addWidget(QLabel("Round-Robin Group:"))
         self.round_robin_spin = QSpinBox()
-        self.round_robin_spin.setRange(0, MAX_SAMPLE_SLOTS)
+        self.round_robin_spin.setRange(0, MAX_ROUND_ROBIN_GROUPS)
         self.round_robin_spin.setSpecialValueText("None")
         self.round_robin_spin.setToolTip("0 = independent zone. Give two or more overlapping zones the same non-zero\ngroup number to cycle through them on successive hits instead of always\nplaying the same one -- e.g. several velocity-matched snare hit variations.")
         self.round_robin_spin.valueChanged.connect(self._on_round_robin_changed)
@@ -1510,13 +1512,13 @@ class ZoneInspectorPanel(QWidget):
         if self.zone is None: return
         self.zone.loop_enabled = checked
         self.waveform.update()
-        if self.parent_window: self.parent_window.transmit_knob_packet()
+        if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
 
     def _on_round_robin_changed(self, value):
         if self.zone is None: return
         self.zone.round_robin_group = value
         if self.parent_window: self.parent_window.mapping_grid.update()  # redraw group badges
-        if self.parent_window: self.parent_window.transmit_knob_packet()
+        if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
 
 class SynthGui(QWidget):
     def __init__(self):
@@ -1525,7 +1527,9 @@ class SynthGui(QWidget):
         self.setGeometry(30, 30, 1350, 680)  # Height reduced from 950 to 680 since window footprint is optimized
 
         self.server_address = '/tmp/synth.sock'
+        self.zone_catalog_server_address = '/tmp/synth_samples.sock'
         self.sock = None
+        self.zone_catalog_sock = None
         self.mock_mode = False
         self._status_recv_buf = b""  # accumulates partial reads of the EngineStatus struct below
         self._last_detected_input_channels = -1
@@ -2876,8 +2880,8 @@ class SynthGui(QWidget):
         # keyboard to map it, drag a zone's body to move it or an edge to resize its key/velocity
         # range, right-click-free click to preview a key. Every edit here is live (no separate
         # "Apply" step) -- same convention as every other control in this file, see
-        # SamplerMappingGrid's mouseMoveEvent/dropEvent/keyPressEvent. Up to MAX_SAMPLE_SLOTS
-        # (16) zones at once; each is synced to its own backend slot by SampleZone.slot_index.
+        # SamplerMappingGrid's mouseMoveEvent/dropEvent/keyPressEvent. No cap on how many zones
+        # can exist; each is synced to the backend's catalog by its own stable SampleZone.zone_id.
         # ----------------------------------------------------
         mapping_outer_lay = QVBoxLayout(self.tab_mapping)
         mapping_outer_lay.setContentsMargins(6, 6, 6, 6)
@@ -3049,11 +3053,11 @@ class SynthGui(QWidget):
             self.mapping_grid.add_zone_at_note(path, 60)
 
     def set_mapping_status(self, message, error=False):
-        """Status line under the Mapping tab's top bar -- used for the Sample Bank full warning
-        and cleared (shows the live zone count instead) once that's no longer the case."""
+        """Status line under the Mapping tab's top bar -- shows the live zone count by default
+        (no ceiling to report against -- the catalog has no product-facing cap)."""
         if message is None:
             n = len(self.mapping_grid.sample_zones)
-            message = f"Sample Bank: {n}/{MAX_SAMPLE_SLOTS} zones"
+            message = f"Sample Bank: {n} zone{'s' if n != 1 else ''}"
             error = False
         self.mapping_status_label.setText(message)
         self.mapping_status_label.setStyleSheet(f"font-size: 10px; color: {'#ff5555' if error else '#888'};")
@@ -3077,14 +3081,14 @@ class SynthGui(QWidget):
     def _on_root_key_selection_changed(self, index):
         if index == -1: return
         target_value = self.root_key_box.itemData(index)
-        updated = False
+        changed_zones = []
         for zone in self.mapping_grid.sample_zones:
             if zone.is_selected:
                 zone.key_center = target_value
-                updated = True
-        if updated:
+                changed_zones.append(zone)
+        if changed_zones:
             self.mapping_grid.update()
-            self.transmit_knob_packet()
+            self.transmit_zone_upsert(changed_zones)
 
     def _generate_record_filename(self):
         os.makedirs(self.record_folder, exist_ok=True)
@@ -3197,6 +3201,16 @@ class SynthGui(QWidget):
         except socket.error:
             self.mock_mode = True; self.sock = None
             print("--- WORKING IN MOCK GUI MODE ---")
+
+        # Sample Bank catalog socket: a second, independent connection -- best-effort, same mock-
+        # mode convention as the control socket above. Its own outbound-only sender (blocking is
+        # fine: these messages are small and only sent on an explicit Mapping tab edit, never on
+        # the audio-adjacent poll path the control socket's status reads use).
+        try:
+            self.zone_catalog_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.zone_catalog_sock.connect(self.zone_catalog_server_address)
+        except socket.error:
+            self.zone_catalog_sock = None
 
     # EngineStatus wire format: 5 floats (peak, is_recording, elapsed_seconds, record_error,
     # detected_input_channels) -- must match the EngineStatus struct backend.c sends back over
@@ -3437,47 +3451,11 @@ class SynthGui(QWidget):
         packet_list.extend([0.0] * TEMPO_MARKER_MAX)  # tempo_marker_time[]
         packet_list.extend([0.0] * TEMPO_MARKER_MAX)  # tempo_marker_bpm[]
 
-        # Sample Bank (+96 items): the Mapping tab's zones, one backend slot per SampleZone.slot_index
-        # -- root note (key center; DRUM sends 60 as a placeholder since sample_slot_unpitched
-        # forces playback rate to 1.0 regardless), key range, velocity range, and the unpitched
-        # flag, paired with the fixed-width file path strings packed at the very end (below). A
-        # slot with no zone (empty path) sends the harmless full-range defaults -- see
-        # sample_slot_root_note[]/min_note[]/max_note[]/min_velocity[]/max_velocity[]/unpitched[]/
-        # path[] in backend.c and find_matching_sample_slot(). Empty path = slot not loaded,
-        # regardless of what the other fields say.
-        #
-        # IMPORTANT: the C struct is struct-of-arrays (all 16 root notes, THEN all 16 min notes,
-        # THEN all 16 max notes, ...), not array-of-structs (root/min/max/... per slot, repeated)
-        # -- so this must build six separate MAX_SAMPLE_SLOTS-long lists and extend() them in
-        # field-declaration order, matching sample_slot_root_note[]/min_note[]/etc.'s actual
-        # memory layout exactly, not group each slot's own fields together.
-        zone_by_slot = {z.slot_index: z for z in self.mapping_grid.sample_zones}
-        root_notes, min_notes, max_notes, min_vels, max_vels, unpitched_flags = [], [], [], [], [], []
-        loop_starts, loop_ends, loop_enableds, rr_groups, sample_slot_paths = [], [], [], [], []
-        for slot_idx in range(MAX_SAMPLE_SLOTS):
-            zone = zone_by_slot.get(slot_idx)
-            if zone is None:
-                root_notes.append(60.0); min_notes.append(0.0); max_notes.append(127.0)
-                min_vels.append(0.0); max_vels.append(127.0); unpitched_flags.append(0.0)
-                loop_starts.append(0.0); loop_ends.append(1.0); loop_enableds.append(1.0); rr_groups.append(0.0)
-                sample_slot_paths.append("")
-            else:
-                is_drum = (zone.key_center == -1)
-                root_notes.append(60.0 if is_drum else float(zone.key_center))
-                min_notes.append(float(zone.root_note))   # key range lower bound
-                max_notes.append(float(zone.max_note))    # key range upper bound
-                min_vels.append(float(zone.min_velocity))
-                max_vels.append(float(zone.max_velocity))
-                unpitched_flags.append(1.0 if is_drum else 0.0)
-                loop_starts.append(float(zone.loop_start))
-                loop_ends.append(float(zone.loop_end))
-                loop_enableds.append(1.0 if zone.loop_enabled else 0.0)
-                rr_groups.append(float(zone.round_robin_group))
-                sample_slot_paths.append(zone.file_path)
-        packet_list.extend(root_notes); packet_list.extend(min_notes); packet_list.extend(max_notes)
-        packet_list.extend(min_vels); packet_list.extend(max_vels); packet_list.extend(unpitched_flags)
-        packet_list.extend(loop_starts); packet_list.extend(loop_ends); packet_list.extend(loop_enableds)
-        packet_list.extend(rr_groups)
+        # Sample Bank: NOT part of this packet -- the Mapping tab's zone catalog travels over its
+        # own dedicated, event-driven socket instead (see transmit_zone_upsert()/
+        # transmit_zone_remove()), sent only when the catalog itself actually changes, not
+        # broadcast in full on every unrelated knob turn like everything above. See
+        # SAMPLE_SLOT_CAPACITY's comment in backend.c for why.
 
         # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
         # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
@@ -3490,38 +3468,80 @@ class SynthGui(QWidget):
         # + 2 (ext in enable/gain) + 132 (12 FX slots * 11) + 1 (fx_routing_mode) + 2 (pb range)
         # + 1 (sustain polarity) + 1 (audio latency) + 1 (polyphony) + 1 (block size)
         # + 19 (recording: enable/synth-output/downmix + 16 channel enables)
-        # + 34 (tempo: tempo_bpm + tempo_marker_count + 16 marker times + 16 marker bpms)
-        # + 96 (sample bank: 6 floats * MAX_SAMPLE_SLOTS[16] -- root_note, min_note, max_note,
-        #   min_velocity, max_velocity, unpitched)
-        # + 64 (sample bank cont'd: 4 floats * MAX_SAMPLE_SLOTS[16] -- loop_start, loop_end,
-        #   loop_enabled, round_robin_group) = 532
-        # floats, followed by 5 fixed strings (not floats): output_device, input_device,
+        # + 34 (tempo: tempo_bpm + tempo_marker_count + 16 marker times + 16 marker bpms) = 372
+        # floats, followed by 4 fixed strings (not floats): output_device, input_device,
         # midi_device (64 bytes each), record_path (256 bytes -- a real filesystem path needs
-        # more room than an ALSA device name), then sample_slot_path[] -- MAX_SAMPLE_SLOTS
-        # SAMPLE_PATH_LEN-byte strings packed back to back as one flat 4096-byte blob, exactly
-        # matching sample_slot_path[MAX_SAMPLE_SLOTS][SAMPLE_PATH_LEN]'s C layout (char has no
-        # alignment padding, so the flat concatenation below lines up struct-for-struct).
+        # more room than an ALSA device name). The Sample Bank's own file paths travel over the
+        # separate catalog socket instead (see transmit_zone_upsert()).
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
-        sample_paths_blob = b"".join(
-            sample_slot_paths[slot_idx].encode("utf-8")[:SAMPLE_PATH_LEN - 1].ljust(SAMPLE_PATH_LEN, b"\x00")
-            for slot_idx in range(MAX_SAMPLE_SLOTS)
-        )
         binary_packet = struct.pack(
-            f"532f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s{MAX_SAMPLE_SLOTS * SAMPLE_PATH_LEN}s",
+            f"372f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
             _encode_device_name(midi_wire_value),
             self._current_record_path.encode("utf-8")[:RECORD_PATH_LEN - 1],
-            sample_paths_blob,
         )
         if self.sock is not None:
             try: self.sock.sendall(binary_packet)
             except socket.error: self.sock = None
 
+    # --- Sample Bank catalog socket: a second, dedicated, event-driven Unix socket carrying only
+    # ZONE_OP_UPSERT/ZONE_OP_REMOVE messages (see the matching comment block above
+    # process_zone_catalog_message() in backend.c). Wire shape: a 5-byte header (1-byte opcode,
+    # 4-byte record count, host byte order) followed by `count` fixed-size records -- a
+    # ZoneRecordWire per zone for UPSERT, a plain int32 zone_id for REMOVE.
+    _ZONE_OP_UPSERT = 1
+    _ZONE_OP_REMOVE = 2
+    # zone_id (i) + 10 floats (root_note, min_note, max_note, min_velocity, max_velocity,
+    # unpitched, loop_start, loop_end, loop_enabled, round_robin_group) + path (SAMPLE_PATH_LEN
+    # bytes) -- must match ZoneRecordWire/ZONE_RECORD_WIRE_SIZE in backend.c field-for-field.
+    _ZONE_RECORD_FORMAT = f"=i10f{SAMPLE_PATH_LEN}s"  # "=" (no padding) since backend.c parses this field-by-field, not via a matching C struct memcpy
+
+    def _zone_to_wire_record(self, zone):
+        is_drum = (zone.key_center == -1)
+        root_note = 60.0 if is_drum else float(zone.key_center)  # DRUM sends 60 as a placeholder --
+        # sample_slot_unpitched forces playback rate to 1.0 regardless of this value.
+        return struct.pack(
+            self._ZONE_RECORD_FORMAT,
+            zone.zone_id,
+            root_note, float(zone.root_note), float(zone.max_note),
+            float(zone.min_velocity), float(zone.max_velocity),
+            1.0 if is_drum else 0.0,
+            float(zone.loop_start), float(zone.loop_end),
+            1.0 if zone.loop_enabled else 0.0,
+            float(zone.round_robin_group),
+            zone.file_path.encode("utf-8")[:SAMPLE_PATH_LEN - 1].ljust(SAMPLE_PATH_LEN, b"\x00"),
+        )
+
+    def transmit_zone_upsert(self, zones):
+        """Sends one ZONE_OP_UPSERT message covering exactly the given zones (never the whole
+        catalog) -- called from every Mapping tab edit site: drop, drag/resize, delete's sibling
+        add, loop-marker drag, root-key change, round-robin-group change."""
+        if self.zone_catalog_sock is None or not zones:
+            return
+        body = b"".join(self._zone_to_wire_record(z) for z in zones)
+        header = struct.pack("=Bi", self._ZONE_OP_UPSERT, len(zones))
+        try:
+            self.zone_catalog_sock.sendall(header + body)
+        except socket.error:
+            self.zone_catalog_sock = None
+
+    def transmit_zone_remove(self, zone_ids):
+        """Sends one ZONE_OP_REMOVE message covering exactly the given zone_ids."""
+        if self.zone_catalog_sock is None or not zone_ids:
+            return
+        body = b"".join(struct.pack("=i", zid) for zid in zone_ids)
+        header = struct.pack("=Bi", self._ZONE_OP_REMOVE, len(zone_ids))
+        try:
+            self.zone_catalog_sock.sendall(header + body)
+        except socket.error:
+            self.zone_catalog_sock = None
+
     def closeEvent(self, event):
         if self.sock is not None: self.sock.close()
+        if self.zone_catalog_sock is not None: self.zone_catalog_sock.close()
         event.accept()
 def runtime_connect_and_bind(gui):
     # Core global mode switches

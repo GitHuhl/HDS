@@ -48,14 +48,25 @@
 // Programmable tempo: hard ceiling on how many (time, bpm) tempo markers the tempo-map can hold
 // at once -- see the Tempo section on SynthSharedControls and compute_current_tempo_bpm().
 #define TEMPO_MARKER_MAX 16
-// DFD (direct-from-disk) sample playback: how many sample zones (Mapping tab) can be loaded at
-// once. Deliberately kept at its original minimal-pass size rather than raised in the same pass
-// that added real key/velocity zone matching -- each slot costs a fixed 256-byte path plus 5
-// floats on the wire, so raising this is a straightforward but separate follow-up once real
-// multisample instruments (many velocity-layered zones) need more than 16. See the Sample Bank
-// section on SynthSharedControls and find_matching_sample_slot().
-#define MAX_SAMPLE_SLOTS 16
+// DFD (direct-from-disk) sample playback: the Mapping tab's Sample Bank has no product-facing
+// cap on how many zones can be loaded -- the catalog now travels over its own dedicated,
+// event-driven socket (see setup_sample_catalog_socket()/poll_sample_catalog_socket()), not the
+// fixed SynthSharedControls struct, specifically so it can scale with a real multisample
+// instrument's zone count instead of a compile-time constant. g_sample_slots[] is still a single
+// preallocated-once array sized SAMPLE_SLOT_CAPACITY, though, rather than a realloc()'d/growable
+// one: sample_disk_thread_main() dereferences &g_sample_slots[index] directly with no lock, which
+// is only safe because that array's base address never moves for the life of the process --
+// letting it move (via realloc) while the disk thread concurrently reads from it would be a
+// genuine use-after-free race, not a style preference. SAMPLE_SLOT_CAPACITY is deliberately huge
+// (~34MB total at ~340 bytes/slot) so it is never the real constraint in practice, while keeping
+// the "never moves" safety property. See the Sample Bank section on SynthSharedControls and
+// find_matching_sample_slot().
+#define SAMPLE_SLOT_CAPACITY 100000
 #define SAMPLE_PATH_LEN 256
+// How many independent round-robin groups (Mapping tab's Round-Robin Group control) can exist at
+// once -- a real, small, legitimately-boundable UI concept (like MAX_VOICES/MAX_SAMPLE_STREAMS),
+// entirely unrelated to how many zones the Sample Bank can hold. See find_matching_sample_slot().
+#define MAX_ROUND_ROBIN_GROUPS 256
 // How many voices/oscillators can be actively DFD-streaming at once, independent of MAX_VOICES --
 // a fixed pool (like hd10's own MAX_VOICES=64) rather than one ring buffer per SynthVoice
 // oscillator slot, since embedding a ring buffer per voice would reserve its ~256KB for every one
@@ -286,6 +297,20 @@ typedef struct {
 // same one always winning -- see find_matching_sample_slot(). No new string fields. New total:
 // 532 float items + 4544 string bytes. The Python side's struct.pack format changes from
 // "468f64s64s64s256s4096s" to "532f64s64s64s256s4096s".
+// BREAKING CHANGE (uncapped Sample Bank): removed every sample_slot_* field and the
+// sample_slot_path[][] blob entirely -- the whole Sample Bank now travels over its own dedicated,
+// event-driven socket (see setup_sample_catalog_socket()/poll_sample_catalog_socket() and the
+// ZONE_OP_UPSERT/ZONE_OP_REMOVE messages), not this struct. It existed here only because the
+// catalog used to be capped at a small compile-time MAX_SAMPLE_SLOTS and could be broadcast in
+// full on every change like every other knob; a real multisample instrument's zone count has no
+// such product-facing cap now (see SAMPLE_SLOT_CAPACITY's comment), and resending thousands of
+// zones' worth of floats every time an unrelated filter knob moves was never sound design even
+// before the cap was lifted. apply_sample_slot_zone_metadata() and the MAX_SAMPLE_SLOTS-bounded
+// live-reload scan in main() are gone with it -- reconciliation now happens once per catalog
+// message, at receipt (or once a throttled deferred load completes), not every audio block. New
+// total: 372 float items + 448 string bytes (back to the shape just before the DFD/Sample Bank
+// work). The Python side's struct.pack format changes from "532f64s64s64s256s4096s" to
+// "372f64s64s64s256s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
@@ -502,39 +527,13 @@ typedef struct {
     float tempo_marker_bpm[TEMPO_MARKER_MAX];
 
     // --- Sample Bank (DFD/WAVE_SAMPLE) + Mapping tab zones ---
-    // Loadable sample slots, each a real key-range + velocity-range zone (SFZ-style). Root note
-    // pairs with the matching entry in sample_slot_path[] (below, with the other trailing
-    // strings). main() detects a live change to a slot's PATH (compared against what it last
-    // loaded, same convention as the device-name live-reload checks) and calls load_sample_slot()
-    // on the audio thread -- see the DFD sample playback section above handle_note_on(). The zone
-    // fields below (root note + key/velocity range) are cheap plain data, not file I/O, so they're
-    // applied to g_sample_slots[] every block regardless of whether the path itself changed --
-    // see apply_sample_slot_zone_metadata() in main(); this is also what makes dragging a zone's
-    // key/velocity range in the Mapping tab take effect immediately, without needing to re-browse
-    // the file. A note only sounds through a slot whose key range AND velocity range both cover it
-    // (find_matching_sample_slot()) -- a note outside every loaded zone is silent, real sampler
-    // behavior, not "nearest root note always plays something."
-    float sample_slot_root_note[MAX_SAMPLE_SLOTS];
-    float sample_slot_min_note[MAX_SAMPLE_SLOTS];
-    float sample_slot_max_note[MAX_SAMPLE_SLOTS];
-    float sample_slot_min_velocity[MAX_SAMPLE_SLOTS];
-    float sample_slot_max_velocity[MAX_SAMPLE_SLOTS];
-    float sample_slot_unpitched[MAX_SAMPLE_SLOTS]; // != 0 -- playback rate always 1.0 (the Mapping
-                                                     // tab's Root Key dropdown's "DRUM" entry)
-
-    // Loop points, as fractions (0.0-1.0) of the file's own total_frames, not absolute frame
-    // numbers -- the Mapping tab's waveform loop editor works in fractions of its own rendered
-    // waveform width, so it never needs to learn total_frames (backend-only, from the WAV header
-    // parse). See apply_sample_slot_zone_metadata()'s conversion back to real frame indices.
-    float sample_slot_loop_start[MAX_SAMPLE_SLOTS];
-    float sample_slot_loop_end[MAX_SAMPLE_SLOTS];
-    float sample_slot_loop_enabled[MAX_SAMPLE_SLOTS]; // != 0 -- loop; 0 -- one-shot, natural end
-                                                        // releases the stream (see render_sample_osc)
-
-    // Round-robin: slots sharing the same non-zero group id, whose zones both match a given
-    // (note, velocity), cycle through each other on successive hits instead of the same one
-    // always winning -- see find_matching_sample_slot(). 0 = independent zone (default).
-    float sample_slot_round_robin_group[MAX_SAMPLE_SLOTS];
+    // The Sample Bank itself (which files are loaded, their key/velocity zones, loop points,
+    // round-robin groups) is NOT part of this struct -- it travels over its own dedicated,
+    // event-driven socket instead (see setup_sample_catalog_socket()/poll_sample_catalog_socket()
+    // and the ZONE_OP_UPSERT/ZONE_OP_REMOVE messages), sent only when the catalog itself actually
+    // changes, not broadcast in full on every unrelated knob turn like the fields in this struct
+    // are. See g_sample_slots[]/find_matching_sample_slot() for the backend-side catalog, and the
+    // Mapping tab in frontend.py for the editor.
 
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
@@ -557,12 +556,6 @@ typedef struct {
     // The frontend regenerates this to a fresh timestamped filename in the chosen Recordings
     // folder after every stop, so consecutive takes never collide/overwrite.
     char record_path[RECORD_PATH_LEN];
-
-    // Sample Bank file paths, paired with sample_slot_root_note[] above. Empty string = slot not
-    // loaded. A genuine 2D array of MAX_SAMPLE_SLOTS fixed SAMPLE_PATH_LEN-byte strings, laid out
-    // (char has alignment 1, so no padding) exactly like one flat SAMPLE_PATH_LEN*MAX_SAMPLE_SLOTS
-    // byte blob -- see the Python side's struct.pack format, which packs/unpacks it as one "Ns" field.
-    char sample_slot_path[MAX_SAMPLE_SLOTS][SAMPLE_PATH_LEN];
 } SynthSharedControls;
 
 // Clamp the live polyphony/block-size controls into their hard array-allocation ceilings.
@@ -2152,23 +2145,8 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->tempo_bpm = 120.0f; // a common, neutral default tempo
     knobs->tempo_marker_count = 0.0f; // no tempo map programmed -- tempo_bpm alone applies
     for (int t = 0; t < TEMPO_MARKER_MAX; t++) { knobs->tempo_marker_time[t] = 0.0f; knobs->tempo_marker_bpm[t] = 0.0f; }
-    for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) {
-        knobs->sample_slot_root_note[s] = 60.0f;
-        knobs->sample_slot_path[s][0] = '\0';
-        // Full keyboard/velocity range by default -- an unmapped-but-loaded slot (no zone drawn
-        // yet in the Mapping tab) still plays everywhere, same as before zones existed.
-        knobs->sample_slot_min_note[s] = 0.0f;
-        knobs->sample_slot_max_note[s] = 127.0f;
-        knobs->sample_slot_min_velocity[s] = 0.0f;
-        knobs->sample_slot_max_velocity[s] = 127.0f;
-        knobs->sample_slot_unpitched[s] = 0.0f;
-        // Whole-file loop by default -- least surprising for a freshly dropped, not-yet-edited
-        // sample (no arbitrary mid-file jump the user hasn't seen/confirmed in the loop editor).
-        knobs->sample_slot_loop_start[s] = 0.0f;
-        knobs->sample_slot_loop_end[s] = 1.0f;
-        knobs->sample_slot_loop_enabled[s] = 1.0f;
-        knobs->sample_slot_round_robin_group[s] = 0.0f;
-    }
+    // No sample-bank defaults to fill here -- the Sample Bank isn't part of this struct anymore
+    // (see its own dedicated socket/g_sample_slots[]).
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -2292,6 +2270,12 @@ typedef struct {
     int round_robin_group; // 0 = independent zone; >0 = cycles with every other loaded, currently
                             // zone-matching slot sharing this same group id -- see
                             // find_matching_sample_slot()/g_round_robin_hit_count[].
+    int zone_id;  // stable identity assigned by the frontend, used to reconcile ZONE_OP_UPSERT/
+                  // ZONE_OP_REMOVE messages against this array -- see poll_sample_catalog_socket().
+    bool active;  // false = a tombstoned (removed) array position, permanently skipped; distinct
+                  // from `loaded`, which just means "this slot's file has been successfully
+                  // parsed" -- an active-but-not-yet-loaded slot is one whose load is still
+                  // sitting in the throttled pending-loads queue.
     unsigned int data_start_offset;
     unsigned int total_frames;
     unsigned short num_channels;
@@ -2304,7 +2288,14 @@ typedef struct {
     float *pre_roll_r;
 } SampleSlot;
 
-static SampleSlot g_sample_slots[MAX_SAMPLE_SLOTS];
+// A plain static array (not malloc'd/realloc'd) sized SAMPLE_SLOT_CAPACITY -- its base address
+// never moves for the life of the process, which sample_disk_thread_main() depends on (it
+// dereferences &g_sample_slots[index] directly, with no lock; see SAMPLE_SLOT_CAPACITY's
+// comment). g_sample_slot_count tracks the next append position; entries are append-only and
+// never compacted/reused after a ZONE_OP_REMOVE (see poll_sample_catalog_socket()) -- an
+// inactive (.active == false) entry is just permanently skipped everywhere.
+static SampleSlot g_sample_slots[SAMPLE_SLOT_CAPACITY];
+static int g_sample_slot_count = 0;
 
 #define SAMPLE_CHECK_READ(ptr, size, count, stream) \
     do { if (fread(ptr, size, count, stream) != (size_t)(count)) { fclose(stream); return false; } } while (0)
@@ -2313,11 +2304,12 @@ static SampleSlot g_sample_slots[MAX_SAMPLE_SLOTS];
 // fixed layout), accepts PCM (16/24/32-bit int) or IEEE float (32-bit) data, and caches the
 // first pre_roll_frames frames into RAM as float -1..1. Only the first two channels of a
 // multichannel file are read (render_sample_osc downmixes to mono anyway -- see its comment);
-// any further channels are skipped, not left to desync subsequent frame reads. Loop points
-// default to a generic 40%-85% span of the sample -- a placeholder until real per-sample loop
-// point editing exists in a future Mapping tab.
+// any further channels are skipped, not left to desync subsequent frame reads. Loop points are
+// reset to a safe "off, full-range" placeholder here -- the real per-zone loop points get
+// reapplied by the caller immediately after this returns (see poll_sample_catalog_socket()'s
+// throttled load drain), once total_frames (just parsed below) makes that conversion possible.
 static bool load_sample_slot(int index, const char *path, int root_note) {
-    if (index < 0 || index >= MAX_SAMPLE_SLOTS) return false;
+    if (index < 0 || index >= SAMPLE_SLOT_CAPACITY) return false;
     SampleSlot *slot = &g_sample_slots[index];
 
     FILE *f = fopen(path, "rb");
@@ -2384,12 +2376,12 @@ static bool load_sample_slot(int index, const char *path, int root_note) {
     slot->bits_per_sample = bits_per_sample;
     slot->audio_format = audio_format;
     slot->data_start_offset = (unsigned int)ftell(f);
-    // Loop points/enable are real per-zone data now (the Mapping tab's waveform loop editor),
-    // not computed here -- apply_sample_slot_zone_metadata() sets the real values from the wire
-    // immediately after this function returns (same call site in main(), same block), using
-    // total_frames just assigned above. These are just safe placeholders for the moment in
-    // between (and for any caller that loads a slot without ever calling that function, e.g. a
-    // test): no looping, full range, so a slot is never silently looped somewhere unintended.
+    // Loop points/enable are real per-zone data (the Mapping tab's waveform loop editor), not
+    // computed here -- the caller (poll_sample_catalog_socket()'s throttled load drain) applies
+    // the real values from the zone record it queued this load with, immediately after this
+    // function returns, using total_frames just assigned above. These are just safe placeholders
+    // for the moment in between (and for any caller that loads a slot directly, e.g. a test): no
+    // looping, full range, so a slot is never silently looped somewhere unintended.
     slot->loop_enabled = false;
     slot->loop_start = 0;
     slot->loop_end = total_frames;
@@ -2423,6 +2415,11 @@ static bool load_sample_slot(int index, const char *path, int root_note) {
     }
     fclose(f);
     slot->loaded = true;
+    // A successful load always un-tombstones the slot -- the catalog path (process_zone_catalog_
+    // message) already sets this before enqueueing, but load_sample_slot() is also a valid entry
+    // point on its own (tests, anything else loading a slot directly), and a loaded-but-inactive
+    // slot would otherwise silently never match in find_matching_sample_slot().
+    slot->active = true;
     fprintf(stderr, "[sample] loaded slot %d: '%s' (%u frames, root note %d)\n", index, path, total_frames, root_note);
     return true;
 }
@@ -2524,7 +2521,7 @@ static void *sample_disk_thread_main(void *arg) {
                 // Captured into active_slot_index (disk-thread-owned) for every later use this
                 // session, rather than re-reading the audio-thread-owned field again.
                 st->active_slot_index = atomic_load_explicit(&st->slot_index, memory_order_acquire);
-                SampleSlot *slot = (st->active_slot_index >= 0 && st->active_slot_index < MAX_SAMPLE_SLOTS) ? &g_sample_slots[st->active_slot_index] : NULL;
+                SampleSlot *slot = (st->active_slot_index >= 0 && st->active_slot_index < SAMPLE_SLOT_CAPACITY) ? &g_sample_slots[st->active_slot_index] : NULL;
                 if (slot && slot->loaded) {
                     st->disk_file_handle = fopen(slot->file_path, "rb");
                     st->disk_read_frame_pos = slot->pre_roll_frames;
@@ -2602,49 +2599,278 @@ static void *sample_disk_thread_main(void *arg) {
     return NULL;
 }
 
-// Copies the Mapping tab's zone metadata (key range, velocity range, root note) from the wire
-// into g_sample_slots[] -- cheap plain-data assignment, safe to run every block regardless of
-// whether a slot's file path changed (see the comment at its call site in main() and on
-// SampleSlot's zone fields). Runs even for a currently-unloaded slot; harmless (find_matching_
-// sample_slot already skips any slot with !loaded), and means a zone drawn before its sample
-// finishes loading is already in place the instant load_sample_slot flips loaded=true.
-static void apply_sample_slot_zone_metadata(const SynthSharedControls *knobs) {
-    for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) {
-        g_sample_slots[s].root_note = (int)knobs->sample_slot_root_note[s];
-        g_sample_slots[s].min_note = (int)knobs->sample_slot_min_note[s];
-        g_sample_slots[s].max_note = (int)knobs->sample_slot_max_note[s];
-        g_sample_slots[s].min_velocity = (int)knobs->sample_slot_min_velocity[s];
-        g_sample_slots[s].max_velocity = (int)knobs->sample_slot_max_velocity[s];
-        g_sample_slots[s].unpitched = knobs->sample_slot_unpitched[s] != 0.0f;
-        g_sample_slots[s].round_robin_group = (int)knobs->sample_slot_round_robin_group[s];
+// --- Sample Bank catalog protocol: a second, dedicated, event-driven socket ---
+//
+// The Mapping tab's zone catalog is sent over its own Unix socket (set up with the same
+// setup_control_socket() used for the knob-struct socket -- it's already generic, taking a path),
+// entirely separate from SynthSharedControls, and only when the catalog itself actually changes
+// (see the BREAKING CHANGE comment on SynthSharedControls for why). Two message types:
+//   ZONE_OP_UPSERT -- add-or-update one or more zones by zone_id (a drag/edit sends only the
+//     zone(s) actually touched, never the whole catalog; on fresh connect the frontend sends one
+//     UPSERT covering its entire current list, since this side's catalog starts empty).
+//   ZONE_OP_REMOVE -- delete one or more zones by zone_id.
+// Wire shape: a 5-byte header (1-byte opcode, 4-byte record count, host byte order -- both ends
+// run on the same machine) followed by `count` fixed-size records (a ZoneRecordWire per zone for
+// UPSERT, a plain int32 zone_id for REMOVE). poll_sample_catalog_socket() is a genuine two-phase
+// reader: accumulate the header first, THEN size a runtime body buffer from the header's count
+// (bounded by ZONE_MSG_MAX_COUNT, basic input validation against a corrupt/hostile message, not a
+// product-facing sample-count limit -- see SAMPLE_SLOT_CAPACITY's comment for that), accumulate
+// the body, process, reset -- unlike poll_control_socket()'s single fixed-size read, since this
+// message's size isn't known at compile time.
+typedef enum { ZONE_OP_UPSERT = 1, ZONE_OP_REMOVE = 2 } ZoneOp;
 
-        // Loop points travel as fractions (0.0-1.0) of the file's own total_frames, not absolute
-        // frame numbers -- the Mapping tab's waveform editor works in fractions of the rendered
-        // waveform's width, so it never needs to learn total_frames itself (that lives only on
-        // this side, from load_sample_slot's WAV header parse). Only meaningful once a file is
-        // actually loaded (total_frames > 0); left alone otherwise so a zone drawn before its
-        // sample finishes loading doesn't compute garbage against a zero-length file.
-        g_sample_slots[s].loop_enabled = knobs->sample_slot_loop_enabled[s] != 0.0f;
-        if (g_sample_slots[s].loaded && g_sample_slots[s].total_frames > 1) {
-            unsigned int total = g_sample_slots[s].total_frames;
-            float start_frac = fmaxf(0.0f, fminf(1.0f, knobs->sample_slot_loop_start[s]));
-            float end_frac = fmaxf(0.0f, fminf(1.0f, knobs->sample_slot_loop_end[s]));
-            unsigned int loop_start = (unsigned int)(start_frac * (float)(total - 1));
-            unsigned int loop_end = (unsigned int)(end_frac * (float)(total - 1));
-            // Enforce a minimum loop length of one full crossfade window -- a loop shorter than
-            // SAMPLE_XFADE_SIZE would have render_sample_osc's loop-splice crossfade (see its
-            // frames_left <= SAMPLE_XFADE_SIZE check) permanently active rather than a brief
-            // transition, which is audibly wrong (a constant blur) rather than just "a short
-            // loop." Clamped against total so this never pushes loop_end past the file itself.
-            unsigned int min_len = (unsigned int)SAMPLE_XFADE_SIZE;
-            if (total - 1 < min_len) min_len = (total > 1) ? total - 1 : 0; // degenerate tiny file
-            if (loop_end < loop_start + min_len) {
-                loop_end = loop_start + min_len;
-                if (loop_end > total - 1) { loop_end = total - 1; loop_start = (loop_end > min_len) ? loop_end - min_len : 0; }
-            }
-            g_sample_slots[s].loop_start = loop_start;
-            g_sample_slots[s].loop_end = loop_end;
+// One zone's fields, in wire order, parsed field-by-field below rather than memcpy'd onto this
+// struct directly -- that avoids any risk of a compiler-struct-padding mismatch between this side
+// and Python's struct.pack, which a raw memcpy over the two would be quietly vulnerable to.
+typedef struct {
+    int32_t zone_id;
+    float root_note, min_note, max_note, min_velocity, max_velocity;
+    float unpitched, loop_start, loop_end, loop_enabled, round_robin_group;
+    char path[SAMPLE_PATH_LEN];
+} ZoneRecordWire;
+#define ZONE_RECORD_WIRE_SIZE (4 + 10 * 4 + SAMPLE_PATH_LEN) // zone_id + 10 floats + path
+#define ZONE_MSG_MAX_COUNT 200000 // sanity ceiling on one message's claimed record count
+
+typedef struct {
+    int client_fd;
+    unsigned char header_buf[5];
+    size_t header_bytes;
+    unsigned char *body_buf;
+    size_t body_capacity;
+    size_t body_needed;
+    size_t body_bytes;
+    int opcode;
+    uint32_t count;
+} SampleCatalogConn;
+
+// A zone whose file needs (re)loading, queued rather than loaded immediately -- see
+// drain_pending_sample_loads()'s comment. A plain ring buffer, audio-thread-only (both the
+// enqueue and the drain run on main()'s single thread), so no cross-thread synchronization is
+// needed here at all, unlike the disk-streaming ring buffers elsewhere in this file.
+typedef struct {
+    int slot_index;
+    int zone_id; // carried through only for the error message if the load fails
+    char path[SAMPLE_PATH_LEN];
+    int root_note, min_note, max_note, min_velocity, max_velocity;
+    bool unpitched;
+    float loop_start_frac, loop_end_frac;
+    bool loop_enabled;
+    int round_robin_group;
+} PendingSampleLoad;
+#define PENDING_SAMPLE_LOAD_CAPACITY 4096
+static PendingSampleLoad g_pending_loads[PENDING_SAMPLE_LOAD_CAPACITY];
+static int g_pending_load_head = 0, g_pending_load_tail = 0, g_pending_load_count = 0;
+// How many queued sample loads (each a bounded, one-file blocking file-open+pre-roll-decode) the
+// audio thread will perform per block -- the throttle that keeps a large bulk-add from stalling
+// real-time audio in one long burst; see SAMPLE_SLOT_CAPACITY's comment for the accepted
+// trade-off (one genuinely slow file, e.g. a cold network mount, still stalls the whole audio
+// thread for its own load duration -- this bounds how many such stalls can pile up per block, not
+// how long any single one can take).
+#define SAMPLE_LOADS_PER_BLOCK 1
+
+static void enqueue_pending_sample_load(int slot_index, const ZoneRecordWire *rec) {
+    if (g_pending_load_count >= PENDING_SAMPLE_LOAD_CAPACITY) {
+        fprintf(stderr, "[samples] pending-load queue full -- dropping load for zone_id %d (re-send to retry)\n", rec->zone_id);
+        return;
+    }
+    PendingSampleLoad *p = &g_pending_loads[g_pending_load_tail];
+    p->slot_index = slot_index;
+    p->zone_id = rec->zone_id;
+    snprintf(p->path, SAMPLE_PATH_LEN, "%s", rec->path);
+    p->root_note = (int)rec->root_note;
+    p->min_note = (int)rec->min_note; p->max_note = (int)rec->max_note;
+    p->min_velocity = (int)rec->min_velocity; p->max_velocity = (int)rec->max_velocity;
+    p->unpitched = rec->unpitched != 0.0f;
+    p->loop_start_frac = rec->loop_start; p->loop_end_frac = rec->loop_end;
+    p->loop_enabled = rec->loop_enabled != 0.0f;
+    p->round_robin_group = (int)rec->round_robin_group;
+    g_pending_load_tail = (g_pending_load_tail + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
+    g_pending_load_count++;
+}
+
+// Converts loop-point fractions to real frame indices (shared by drain_pending_sample_loads() and
+// the "path unchanged" branch of an UPSERT, both of which need total_frames -- only known once a
+// file is actually loaded -- to do this conversion). Enforces a minimum loop length of one full
+// crossfade window, same reasoning as before: a loop shorter than SAMPLE_XFADE_SIZE would have
+// render_sample_osc's loop-splice crossfade permanently active instead of a brief transition.
+static void apply_loop_points(SampleSlot *slot, float start_frac, float end_frac) {
+    if (!slot->loaded || slot->total_frames <= 1) return;
+    unsigned int total = slot->total_frames;
+    start_frac = fmaxf(0.0f, fminf(1.0f, start_frac));
+    end_frac = fmaxf(0.0f, fminf(1.0f, end_frac));
+    unsigned int loop_start = (unsigned int)(start_frac * (float)(total - 1));
+    unsigned int loop_end = (unsigned int)(end_frac * (float)(total - 1));
+    unsigned int min_len = (unsigned int)SAMPLE_XFADE_SIZE;
+    if (total - 1 < min_len) min_len = (total > 1) ? total - 1 : 0; // degenerate tiny file
+    if (loop_end < loop_start + min_len) {
+        loop_end = loop_start + min_len;
+        if (loop_end > total - 1) { loop_end = total - 1; loop_start = (loop_end > min_len) ? loop_end - min_len : 0; }
+    }
+    slot->loop_start = loop_start;
+    slot->loop_end = loop_end;
+}
+
+// Drains up to SAMPLE_LOADS_PER_BLOCK pending loads per call (see its #define). Immediately
+// reapplies the queued zone record's loop points once total_frames is known post-load -- doing
+// this only at message-receipt time (like the old apply_sample_slot_zone_metadata() did every
+// block) would leave a sample that was still queued when its metadata arrived stuck on the
+// load-time placeholder loop points forever.
+static void drain_pending_sample_loads(void) {
+    for (int i = 0; i < SAMPLE_LOADS_PER_BLOCK && g_pending_load_count > 0; i++) {
+        PendingSampleLoad *p = &g_pending_loads[g_pending_load_head];
+        g_pending_load_head = (g_pending_load_head + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
+        g_pending_load_count--;
+
+        // A ZONE_OP_REMOVE can tombstone this slot_index while its load is still sitting in the
+        // queue (added, then removed again before its throttled turn comes up) -- the removal
+        // wins: skip the load rather than have load_sample_slot() resurrect a tombstoned slot by
+        // setting active back to true. Safe under the append-only invariant (a slot_index is
+        // never reused for a different zone_id), so this can only be the same zone this load was
+        // originally queued for.
+        if (!g_sample_slots[p->slot_index].active) continue;
+
+        if (load_sample_slot(p->slot_index, p->path, p->root_note)) {
+            SampleSlot *slot = &g_sample_slots[p->slot_index];
+            slot->min_note = p->min_note; slot->max_note = p->max_note;
+            slot->min_velocity = p->min_velocity; slot->max_velocity = p->max_velocity;
+            slot->unpitched = p->unpitched;
+            slot->round_robin_group = p->round_robin_group;
+            slot->loop_enabled = p->loop_enabled;
+            apply_loop_points(slot, p->loop_start_frac, p->loop_end_frac);
+        } else {
+            fprintf(stderr, "[samples] failed to load queued sample '%s' (zone_id %d)\n", p->path, p->zone_id);
+            g_sample_slots[p->slot_index].active = false;
         }
+    }
+}
+
+// Applies one ZONE_OP_UPSERT/ZONE_OP_REMOVE message's already-fully-accumulated body. `body` is
+// `count` back-to-back fixed-size records (ZoneRecordWire for UPSERT, a plain int32 zone_id for
+// REMOVE) -- see poll_sample_catalog_socket()'s comment for how it gets here.
+static void process_zone_catalog_message(int opcode, uint32_t count, const unsigned char *body) {
+    if (opcode == ZONE_OP_UPSERT) {
+        for (uint32_t i = 0; i < count; i++) {
+            const unsigned char *p = body + (size_t)i * ZONE_RECORD_WIRE_SIZE;
+            ZoneRecordWire rec;
+            size_t off = 0;
+            memcpy(&rec.zone_id, p + off, 4); off += 4;
+            float *floats = &rec.root_note; // root_note..round_robin_group are 10 consecutive floats
+            for (int f = 0; f < 10; f++) { memcpy(&floats[f], p + off, 4); off += 4; }
+            memcpy(rec.path, p + off, SAMPLE_PATH_LEN); off += SAMPLE_PATH_LEN;
+            rec.path[SAMPLE_PATH_LEN - 1] = '\0';
+
+            int found_index = -1;
+            for (int s = 0; s < g_sample_slot_count; s++) {
+                if (g_sample_slots[s].active && g_sample_slots[s].zone_id == rec.zone_id) { found_index = s; break; }
+            }
+
+            if (found_index < 0) {
+                // Brand new zone -- append. g_sample_slots is a plain static array (zero-
+                // initialized BSS), so a never-before-used position already has loaded=false,
+                // pre_roll_l/r=NULL, etc.; only zone_id/active need setting explicitly here.
+                if (g_sample_slot_count >= SAMPLE_SLOT_CAPACITY) {
+                    fprintf(stderr, "[samples] Sample Bank at its %d-zone capacity -- ignoring zone_id %d\n", SAMPLE_SLOT_CAPACITY, rec.zone_id);
+                    continue;
+                }
+                found_index = g_sample_slot_count++;
+                g_sample_slots[found_index].zone_id = rec.zone_id;
+                g_sample_slots[found_index].active = true;
+                enqueue_pending_sample_load(found_index, &rec);
+                continue;
+            }
+
+            SampleSlot *slot = &g_sample_slots[found_index];
+            if (strncmp(slot->file_path, rec.path, SAMPLE_PATH_LEN) != 0 || !slot->loaded) {
+                // Path changed (or a previous load of this same slot never finished/failed) --
+                // (re)queue rather than apply cheap fields in place.
+                enqueue_pending_sample_load(found_index, &rec);
+                continue;
+            }
+
+            // Path unchanged and already loaded: apply the cheap fields immediately, no reload.
+            slot->root_note = (int)rec.root_note;
+            slot->min_note = (int)rec.min_note; slot->max_note = (int)rec.max_note;
+            slot->min_velocity = (int)rec.min_velocity; slot->max_velocity = (int)rec.max_velocity;
+            slot->unpitched = rec.unpitched != 0.0f;
+            slot->round_robin_group = (int)rec.round_robin_group;
+            slot->loop_enabled = rec.loop_enabled != 0.0f;
+            apply_loop_points(slot, rec.loop_start, rec.loop_end);
+        }
+    } else if (opcode == ZONE_OP_REMOVE) {
+        for (uint32_t i = 0; i < count; i++) {
+            int32_t zone_id;
+            memcpy(&zone_id, body + (size_t)i * sizeof(int32_t), sizeof(int32_t));
+            for (int s = 0; s < g_sample_slot_count; s++) {
+                if (g_sample_slots[s].active && g_sample_slots[s].zone_id == zone_id) {
+                    g_sample_slots[s].active = false;
+                    g_sample_slots[s].loaded = false; // matches the pre-existing "empty path" unload behavior
+                    free(g_sample_slots[s].pre_roll_l); g_sample_slots[s].pre_roll_l = NULL;
+                    free(g_sample_slots[s].pre_roll_r); g_sample_slots[s].pre_roll_r = NULL;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static void reset_sample_catalog_conn_message(SampleCatalogConn *conn) {
+    conn->header_bytes = 0;
+    conn->body_needed = 0;
+    conn->body_bytes = 0;
+}
+
+static void poll_sample_catalog_socket(int server_fd, SampleCatalogConn *conn) {
+    if (conn->client_fd < 0) {
+        conn->client_fd = accept(server_fd, NULL, NULL);
+        if (conn->client_fd >= 0) {
+            int c_flags = fcntl(conn->client_fd, F_GETFL, 0);
+            fcntl(conn->client_fd, F_SETFL, c_flags | O_NONBLOCK);
+            reset_sample_catalog_conn_message(conn);
+        }
+        return;
+    }
+
+    if (conn->header_bytes < sizeof(conn->header_buf)) {
+        ssize_t n = recv(conn->client_fd, conn->header_buf + conn->header_bytes, sizeof(conn->header_buf) - conn->header_bytes, 0);
+        if (n > 0) {
+            conn->header_bytes += (size_t)n;
+            if (conn->header_bytes == sizeof(conn->header_buf)) {
+                conn->opcode = conn->header_buf[0];
+                uint32_t count; memcpy(&count, conn->header_buf + 1, 4);
+                conn->count = count;
+                if (conn->count > ZONE_MSG_MAX_COUNT) {
+                    fprintf(stderr, "[samples] rejecting catalog message with implausible record count %u\n", conn->count);
+                    close(conn->client_fd); conn->client_fd = -1;
+                    return;
+                }
+                size_t record_size = (conn->opcode == ZONE_OP_REMOVE) ? sizeof(int32_t) : ZONE_RECORD_WIRE_SIZE;
+                conn->body_needed = (size_t)conn->count * record_size;
+                if (conn->body_needed > conn->body_capacity) {
+                    free(conn->body_buf);
+                    conn->body_buf = malloc(conn->body_needed > 0 ? conn->body_needed : 1);
+                    conn->body_capacity = conn->body_needed;
+                }
+                conn->body_bytes = 0;
+                if (conn->body_needed == 0) {
+                    process_zone_catalog_message(conn->opcode, conn->count, conn->body_buf);
+                    reset_sample_catalog_conn_message(conn);
+                }
+            }
+        } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            close(conn->client_fd); conn->client_fd = -1;
+        }
+        return;
+    }
+
+    ssize_t n = recv(conn->client_fd, conn->body_buf + conn->body_bytes, conn->body_needed - conn->body_bytes, 0);
+    if (n > 0) {
+        conn->body_bytes += (size_t)n;
+        if (conn->body_bytes == conn->body_needed) {
+            process_zone_catalog_message(conn->opcode, conn->count, conn->body_buf);
+            reset_sample_catalog_conn_message(conn);
+        }
+    } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+        close(conn->client_fd); conn->client_fd = -1;
     }
 }
 
@@ -2652,7 +2878,7 @@ static void apply_sample_slot_zone_metadata(const SynthSharedControls *knobs) {
 // grouped", see SampleSlot.round_robin_group). Persists across calls the same way limiter_gain/
 // lfo_phase_mod_state do elsewhere in this file (one synth instance, one audio thread -- no
 // atomics needed, this is audio-thread-only state).
-static unsigned int g_round_robin_hit_count[MAX_SAMPLE_SLOTS + 1] = {0};
+static unsigned int g_round_robin_hit_count[MAX_ROUND_ROBIN_GROUPS + 1] = {0};
 
 // Finds the loaded sample slot whose zone (key range AND velocity range, both inclusive) covers
 // this (note, velocity) -- the real per-note/velocity mapping (SFZ-style): a note outside every
@@ -2663,39 +2889,61 @@ static unsigned int g_round_robin_hit_count[MAX_SAMPLE_SLOTS + 1] = {0};
 // round-robin variations all dropped at the exact same key+velocity range), slots sharing a
 // non-zero round_robin_group cycle through each other one hit at a time instead of the same one
 // always winning; an ungrouped tie (or a genuine unintentional overlap the user hasn't grouped)
-// keeps the original deterministic behavior of always picking the lowest slot index. Returns -1
-// if nothing loaded matches.
+// keeps the original deterministic behavior. Returns -1 if nothing loaded matches.
+//
+// Uses O(1) extra memory (three linear passes over the catalog) instead of building candidate/
+// group-member arrays sized to a compile-time constant, since the catalog no longer has one.
+// "First encountered while scanning in ascending array-index order" doubles as "lowest zone_id"
+// here because g_sample_slots is strictly append-only (see its own comment) -- array index order
+// and zone_id creation order are the same thing. That invariant would need revisiting if slot
+// reuse/compaction is ever added later.
 static int find_matching_sample_slot(int note, int velocity) {
-    int candidates[MAX_SAMPLE_SLOTS];
-    int candidate_count = 0;
     long best_area = -1; // -1 sentinel: "no candidate yet", distinct from a real zero-area zone
-    for (int i = 0; i < MAX_SAMPLE_SLOTS; i++) {
+    int first_best_idx = -1;
+    int tie_count = 0;
+    for (int i = 0; i < g_sample_slot_count; i++) {
         SampleSlot *slot = &g_sample_slots[i];
-        if (!slot->loaded) continue;
+        if (!slot->active || !slot->loaded) continue;
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
         long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
-        if (best_area < 0 || area < best_area) { best_area = area; candidate_count = 0; }
-        if (area == best_area) candidates[candidate_count++] = i;
+        if (best_area < 0 || area < best_area) { best_area = area; first_best_idx = i; tie_count = 1; }
+        else if (area == best_area) { tie_count++; }
     }
-    if (candidate_count == 0) return -1;
-    if (candidate_count == 1) return candidates[0];
+    if (tie_count == 0) return -1;
+    if (tie_count == 1) return first_best_idx;
 
-    int group = g_sample_slots[candidates[0]].round_robin_group;
-    if (group <= 0) return candidates[0];
+    int group = g_sample_slots[first_best_idx].round_robin_group;
+    if (group <= 0) return first_best_idx;
 
-    int group_members[MAX_SAMPLE_SLOTS];
     int member_count = 0;
-    for (int c = 0; c < candidate_count; c++) {
-        if (g_sample_slots[candidates[c]].round_robin_group == group) group_members[member_count++] = candidates[c];
+    for (int i = 0; i < g_sample_slot_count; i++) {
+        SampleSlot *slot = &g_sample_slots[i];
+        if (!slot->active || !slot->loaded) continue;
+        if (note < slot->min_note || note > slot->max_note) continue;
+        if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
+        long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
+        if (area == best_area && slot->round_robin_group == group) member_count++;
     }
-    if (member_count <= 1) return candidates[0];
+    if (member_count <= 1) return first_best_idx;
 
     int group_idx = group;
-    if (group_idx < 1) group_idx = 1; else if (group_idx > MAX_SAMPLE_SLOTS) group_idx = MAX_SAMPLE_SLOTS;
+    if (group_idx < 1) group_idx = 1; else if (group_idx > MAX_ROUND_ROBIN_GROUPS) group_idx = MAX_ROUND_ROBIN_GROUPS;
     unsigned int hit = g_round_robin_hit_count[group_idx]++;
-    int best = group_members[hit % (unsigned int)member_count];
-    return best;
+    unsigned int target_ordinal = hit % (unsigned int)member_count;
+    unsigned int ordinal = 0;
+    for (int i = 0; i < g_sample_slot_count; i++) {
+        SampleSlot *slot = &g_sample_slots[i];
+        if (!slot->active || !slot->loaded) continue;
+        if (note < slot->min_note || note > slot->max_note) continue;
+        if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
+        long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
+        if (area == best_area && slot->round_robin_group == group) {
+            if (ordinal == target_ordinal) return i;
+            ordinal++;
+        }
+    }
+    return first_best_idx; // unreachable given member_count > 0, but keeps the compiler happy
 }
 
 // Starts (or restarts) an oscillator's sample playback for a fresh note -- releases whatever
@@ -4043,8 +4291,18 @@ int main() {
     if (!sample_disk_thread_ok) {
         fprintf(stderr, "[sample] failed to start disk streaming thread -- WAVE_SAMPLE playback will be unavailable this session\n");
     }
-    char applied_sample_slot_path[MAX_SAMPLE_SLOTS][SAMPLE_PATH_LEN];
-    for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) applied_sample_slot_path[s][0] = '\0';
+
+    // Sample Bank catalog socket: a second, independent Unix socket carrying only
+    // ZONE_OP_UPSERT/ZONE_OP_REMOVE messages -- see the "Sample Bank catalog protocol" comment
+    // above setup_sample_catalog_socket()'s call site for why this is separate from the knob
+    // control socket. Reuses the same generic setup_control_socket(), just with a different path.
+    const char *sample_catalog_socket_path = "/tmp/synth_samples.sock";
+    int sample_catalog_server_fd = setup_control_socket(sample_catalog_socket_path);
+    if (sample_catalog_server_fd < 0) {
+        fprintf(stderr, "[samples] failed to open sample catalog socket -- Mapping tab zone updates will be unavailable this session\n");
+    }
+    SampleCatalogConn sample_catalog_conn = {0};
+    sample_catalog_conn.client_fd = -1;
 
     snd_seq_t *seq_handle;
     int seq_err = snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
@@ -4081,6 +4339,7 @@ int main() {
 
     while (g_synth_running) {
         poll_control_socket(server_fd, &client_fd, socket_packet_buffer, &control_bytes_received, &active_knobs);
+        if (sample_catalog_server_fd >= 0) poll_sample_catalog_socket(sample_catalog_server_fd, &sample_catalog_conn);
         bool poly_mode_active = (active_knobs.is_polyphonic != 0.0f);
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
@@ -4113,26 +4372,13 @@ int main() {
             snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
         }
 
-        // Sample Bank live-reload: same convention as the device-name checks above -- if a
-        // slot's path actually changed since we last loaded it, load it now. Empty path is a
-        // valid "no change"/"nothing here" state, not an error. This runs on the audio thread
-        // (load_sample_slot briefly blocks on file I/O -- reading just the header plus decoding
-        // the pre-roll cache, a one-time bounded cost only paid on an explicit load action, not
-        // every block -- exactly like opening an audio/MIDI device live already does above).
-        for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) {
-            if (strncmp(active_knobs.sample_slot_path[s], applied_sample_slot_path[s], SAMPLE_PATH_LEN) != 0) {
-                if (active_knobs.sample_slot_path[s][0] != '\0') {
-                    load_sample_slot(s, active_knobs.sample_slot_path[s], (int)active_knobs.sample_slot_root_note[s]);
-                } else {
-                    g_sample_slots[s].loaded = false;
-                }
-                snprintf(applied_sample_slot_path[s], SAMPLE_PATH_LEN, "%s", active_knobs.sample_slot_path[s]);
-            }
-        }
-        // Sample Bank zone metadata: cheap plain data (no file I/O), so applied every block
-        // regardless of whether the path itself changed -- this is what makes dragging a zone's
-        // key/velocity range in the Mapping tab take effect immediately, unlike a genuine reload.
-        apply_sample_slot_zone_metadata(&active_knobs);
+        // Sample Bank: reconciliation now happens once per ZONE_OP_UPSERT/ZONE_OP_REMOVE message
+        // (processed inline inside poll_sample_catalog_socket() above, at receipt), not every
+        // audio block -- see process_zone_catalog_message(). The one piece of work that genuinely
+        // can't happen at message-receipt time is finishing a load that got throttled into the
+        // pending-loads queue; that's drained here, at most SAMPLE_LOADS_PER_BLOCK entries per
+        // block (see its #define for the real-time trade-off this bounds).
+        drain_pending_sample_loads();
 
         process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack, our_midi_port, &midi_sources, &midi_live);
 
@@ -4301,7 +4547,7 @@ int main() {
         pthread_join(g_sample_disk_thread, NULL);
     }
     for (int s = 0; s < MAX_SAMPLE_STREAMS; s++) if (g_sample_streams[s].disk_file_handle) fclose(g_sample_streams[s].disk_file_handle);
-    for (int s = 0; s < MAX_SAMPLE_SLOTS; s++) { free(g_sample_slots[s].pre_roll_l); free(g_sample_slots[s].pre_roll_r); }
+    for (int s = 0; s < g_sample_slot_count; s++) { free(g_sample_slots[s].pre_roll_l); free(g_sample_slots[s].pre_roll_r); }
     if (client_fd >= 0) close(client_fd);
     if (server_fd >= 0) close(server_fd);
     unlink(socket_path);
