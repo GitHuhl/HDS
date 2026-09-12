@@ -1009,6 +1009,16 @@ class SampleZone:
         self.loop_end = 1.0
         self.loop_enabled = True
         self.round_robin_group = 0  # 0 = independent zone; >0 = cycles with same-group zones
+        # SFZ-style per-zone params (Zone Inspector's second control row), groundwork toward
+        # eventual SFZ import/export -- see backend.c's SampleSlot fields of the same names.
+        self.tune_cents = 0       # fine pitch offset in cents
+        self.gain_db = 0          # per-zone level trim in dB
+        self.pan = 0              # -100 (full left) .. 100 (full right), matches vco1_pan's own
+                                   # UI-unit convention -- divided by 100.0 only when packed onto
+                                   # the wire, ADDS to (doesn't override) the oscillator's own Pan
+                                   # knob on the backend side
+        self.start_offset = 0.0   # 0.0-1.0, where in the file playback begins
+        self.reverse = False      # plays the file/loop region backward
 
 class MidiKeyButton(QPushButton):
     """A single piano key on the Mapping tab's reference keyboard -- visual only (no MIDI is
@@ -1546,6 +1556,46 @@ class ZoneInspectorPanel(QWidget):
         header.addWidget(self.round_robin_spin)
         outer.addLayout(header)
 
+        # SFZ-style per-zone params row -- groundwork toward eventual SFZ import/export.
+        params_row = QHBoxLayout()
+        params_row.addWidget(QLabel("Tune:"))
+        self.tune_spin = QSpinBox()
+        self.tune_spin.setRange(-100, 100)
+        self.tune_spin.setSuffix(" c")
+        self.tune_spin.setToolTip("Fine pitch offset in cents, independent of the Root Key dropdown above.")
+        self.tune_spin.valueChanged.connect(self._on_tune_changed)
+        params_row.addWidget(self.tune_spin)
+
+        params_row.addWidget(QLabel("Gain:"))
+        self.gain_spin = QSpinBox()
+        self.gain_spin.setRange(-24, 12)
+        self.gain_spin.setSuffix(" dB")
+        self.gain_spin.setToolTip("Per-zone level trim -- useful for balancing round-robin/velocity-layer variations against each other.")
+        self.gain_spin.valueChanged.connect(self._on_gain_changed)
+        params_row.addWidget(self.gain_spin)
+
+        params_row.addWidget(QLabel("Pan:"))
+        self.pan_spin = QSpinBox()
+        self.pan_spin.setRange(-100, 100)
+        self.pan_spin.setToolTip("-100 (full left) .. 100 (full right). Adds to the oscillator's own Pan knob (Play tab), doesn't override it.")
+        self.pan_spin.valueChanged.connect(self._on_pan_changed)
+        params_row.addWidget(self.pan_spin)
+
+        params_row.addWidget(QLabel("Start Offset:"))
+        self.start_offset_spin = QSpinBox()
+        self.start_offset_spin.setRange(0, 100)
+        self.start_offset_spin.setSuffix(" %")
+        self.start_offset_spin.setToolTip("Where in the file playback begins, as a percentage of its length.")
+        self.start_offset_spin.valueChanged.connect(self._on_start_offset_changed)
+        params_row.addWidget(self.start_offset_spin)
+
+        self.reverse_cb = QCheckBox("Reverse")
+        self.reverse_cb.setToolTip("Plays the file (or loop region) backward.")
+        self.reverse_cb.toggled.connect(self._on_reverse_toggled)
+        params_row.addWidget(self.reverse_cb)
+        params_row.addStretch(1)
+        outer.addLayout(params_row)
+
         self.waveform = SampleLoopEditor(parent_window=parent_window)
         outer.addWidget(self.waveform)
 
@@ -1553,22 +1603,36 @@ class ZoneInspectorPanel(QWidget):
 
     def set_zone(self, zone):
         self.zone = zone
-        self.loop_enabled_cb.blockSignals(True)
-        self.round_robin_spin.blockSignals(True)
+        for w in (self.loop_enabled_cb, self.round_robin_spin, self.tune_spin, self.gain_spin,
+                  self.pan_spin, self.start_offset_spin, self.reverse_cb):
+            w.blockSignals(True)
         if zone is None:
             self.filename_label.setText("No zone selected")
             self.loop_enabled_cb.setChecked(True)
-            self.loop_enabled_cb.setEnabled(False)
             self.round_robin_spin.setValue(0)
-            self.round_robin_spin.setEnabled(False)
+            self.tune_spin.setValue(0)
+            self.gain_spin.setValue(0)
+            self.pan_spin.setValue(0)
+            self.start_offset_spin.setValue(0)
+            self.reverse_cb.setChecked(False)
+            for w in (self.loop_enabled_cb, self.round_robin_spin, self.tune_spin, self.gain_spin,
+                      self.pan_spin, self.start_offset_spin, self.reverse_cb):
+                w.setEnabled(False)
         else:
             self.filename_label.setText(zone.filename)
             self.loop_enabled_cb.setChecked(zone.loop_enabled)
-            self.loop_enabled_cb.setEnabled(True)
             self.round_robin_spin.setValue(zone.round_robin_group)
-            self.round_robin_spin.setEnabled(True)
-        self.loop_enabled_cb.blockSignals(False)
-        self.round_robin_spin.blockSignals(False)
+            self.tune_spin.setValue(zone.tune_cents)
+            self.gain_spin.setValue(zone.gain_db)
+            self.pan_spin.setValue(zone.pan)
+            self.start_offset_spin.setValue(int(round(zone.start_offset * 100)))
+            self.reverse_cb.setChecked(zone.reverse)
+            for w in (self.loop_enabled_cb, self.round_robin_spin, self.tune_spin, self.gain_spin,
+                      self.pan_spin, self.start_offset_spin, self.reverse_cb):
+                w.setEnabled(True)
+        for w in (self.loop_enabled_cb, self.round_robin_spin, self.tune_spin, self.gain_spin,
+                  self.pan_spin, self.start_offset_spin, self.reverse_cb):
+            w.blockSignals(False)
         self.waveform.set_zone(zone)
 
     def _on_loop_enabled_toggled(self, checked):
@@ -1581,6 +1645,41 @@ class ZoneInspectorPanel(QWidget):
         if self.zone is None: return
         self.zone.round_robin_group = value
         if self.parent_window: self.parent_window.mapping_grid.update()  # redraw group badges
+        if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
+
+    def _on_tune_changed(self, value):
+        if self.zone is None: return
+        self.zone.tune_cents = value
+        if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
+
+    def _on_gain_changed(self, value):
+        if self.zone is None: return
+        self.zone.gain_db = value
+        if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
+
+    def _on_pan_changed(self, value):
+        if self.zone is None: return
+        self.zone.pan = value
+        if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
+
+    def _on_start_offset_changed(self, value):
+        if self.zone is None: return
+        self.zone.start_offset = value / 100.0
+        if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
+
+    def _on_reverse_toggled(self, checked):
+        if self.zone is None: return
+        self.zone.reverse = checked
+        # A reverse zone left at the default start_offset=0.0 plays essentially nothing
+        # (immediate exhaustion at frame 0) -- a likely trap with no good backend-side fix, so
+        # raise it to the far end automatically the first time Reverse is turned on, purely as a
+        # UI convenience. Only when it's still untouched (0.0); never overrides a value the user
+        # already set, and toggling Reverse back off leaves whatever offset is there by then.
+        if checked and self.zone.start_offset == 0.0:
+            self.zone.start_offset = 1.0
+            self.start_offset_spin.blockSignals(True)
+            self.start_offset_spin.setValue(100)
+            self.start_offset_spin.blockSignals(False)
         if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
 
 class SynthGui(QWidget):
@@ -3560,7 +3659,7 @@ class SynthGui(QWidget):
     # zone_id (i) + 10 floats (root_note, min_note, max_note, min_velocity, max_velocity,
     # unpitched, loop_start, loop_end, loop_enabled, round_robin_group) + path (SAMPLE_PATH_LEN
     # bytes) -- must match ZoneRecordWire/ZONE_RECORD_WIRE_SIZE in backend.c field-for-field.
-    _ZONE_RECORD_FORMAT = f"=i10f{SAMPLE_PATH_LEN}s"  # "=" (no padding) since backend.c parses this field-by-field, not via a matching C struct memcpy
+    _ZONE_RECORD_FORMAT = f"=i15f{SAMPLE_PATH_LEN}s"  # "=" (no padding) since backend.c parses this field-by-field, not via a matching C struct memcpy
 
     def _zone_to_wire_record(self, zone):
         is_drum = (zone.key_center == -1)
@@ -3575,6 +3674,9 @@ class SynthGui(QWidget):
             float(zone.loop_start), float(zone.loop_end),
             1.0 if zone.loop_enabled else 0.0,
             float(zone.round_robin_group),
+            # SFZ-style per-zone params -- must match ZoneRecordWire's field order exactly.
+            float(zone.tune_cents), float(zone.gain_db), float(zone.pan) / 100.0,
+            float(zone.start_offset), 1.0 if zone.reverse else 0.0,
             zone.file_path.encode("utf-8")[:SAMPLE_PATH_LEN - 1].ljust(SAMPLE_PATH_LEN, b"\x00"),
         )
 

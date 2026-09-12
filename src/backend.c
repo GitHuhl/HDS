@@ -2276,6 +2276,19 @@ typedef struct {
                   // from `loaded`, which just means "this slot's file has been successfully
                   // parsed" -- an active-but-not-yet-loaded slot is one whose load is still
                   // sitting in the throttled pending-loads queue.
+    // --- SFZ-style per-zone params (Mapping tab's Zone Inspector), all read fresh from this live
+    // struct every render_sample_osc()/start_sample_osc() call, same convention as root_note/
+    // unpitched above -- see their call sites for exactly where each is applied.
+    float tune_cents;        // fine pitch offset in cents, applied on top of the root-note ratio
+                              // (and even when unpitched -- a nudge independent of pitch tracking)
+    float gain_db;           // per-zone level trim in dB, multiplies render_sample_osc's output
+    float pan;                // -1.0 (full left) .. 1.0 (full right), ADDS to the oscillator's own
+                              // vco1_pan/vco2_pan knob rather than overriding it -- see
+                              // sample_osc_zone_pan_offset()
+    float start_offset_frac; // 0.0-1.0, where in the file playback begins (in the travel
+                              // direction -- see `reverse` below); converted to a frame index once
+                              // at note-on by start_sample_osc(), not stored pre-converted here
+    bool reverse;             // plays the file/loop region backward -- see sample_disk_thread_main
     unsigned int data_start_offset;
     unsigned int total_frames;
     unsigned short num_channels;
@@ -2448,6 +2461,14 @@ typedef struct {
                      // race-free even though it's a rare timing window in practice. Atomic closes
                      // that gap outright (no tearing, no UB) rather than relying on how unlikely
                      // the window is.
+    _Atomic unsigned int start_frame; // which file frame to seed playback at -- computed ONCE by
+                     // start_sample_osc() (the only place that reads the live, mutable
+                     // SampleSlot.start_offset_frac) and handed across on this same claim, exactly
+                     // like slot_index above, rather than having the disk thread independently
+                     // re-derive it from start_offset_frac at some later, unsynchronized moment --
+                     // a live catalog edit landing in that gap would otherwise let the audio
+                     // thread's *ptr seed and the disk thread's disk_read_frame_pos seed disagree
+                     // about what ring index 0 means, an audible glitch on that one note.
 
     float ring_l[SAMPLE_RING_SIZE];
     float ring_r[SAMPLE_RING_SIZE];
@@ -2475,6 +2496,16 @@ typedef struct {
                                        // so a fast release+reclaim of the same pool slot could
                                        // have the audio thread overwrite it out from under an
                                        // in-flight disk-thread read (caught by ThreadSanitizer).
+    unsigned int active_start_frame;  // disk-thread-owned: private copy of start_frame, captured
+                                       // once at SAMPLE_CMD_START consumption, same reasoning and
+                                       // same synchronization as active_slot_index above.
+    bool disk_reverse_exhausted;      // disk-thread-owned only. Forward's "nothing left to
+                                       // stream" (disk_read_frame_pos >= total_frames) is self-
+                                       // sustaining forever once true, since pos only grows;
+                                       // reverse has no such natural resting state (pos can't go
+                                       // below 0), so this flag stands in for "already read frame
+                                       // 0 of a non-looping reverse zone, nothing further to give."
+                                       // Reset false on SAMPLE_CMD_START.
 } SampleStream;
 
 static SampleStream g_sample_streams[MAX_SAMPLE_STREAMS];
@@ -2485,11 +2516,12 @@ static _Atomic bool g_sample_disk_thread_shutdown = false;
 // handle_note_on). Returns -1 if the pool is exhausted -- a real possibility if someone tries to
 // play more simultaneous WAVE_SAMPLE oscillators than MAX_SAMPLE_STREAMS; the caller treats -1
 // as "this oscillator stays silent until a slot frees up," never a crash.
-static int claim_sample_stream(int slot_index) {
+static int claim_sample_stream(int slot_index, unsigned int start_frame) {
     for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
         if (!g_sample_streams[i].in_use) {
             g_sample_streams[i].in_use = true;
             atomic_store_explicit(&g_sample_streams[i].slot_index, slot_index, memory_order_relaxed);
+            atomic_store_explicit(&g_sample_streams[i].start_frame, start_frame, memory_order_relaxed);
             atomic_store_explicit(&g_sample_streams[i].command, SAMPLE_CMD_START, memory_order_release);
             return i;
         }
@@ -2515,16 +2547,24 @@ static void *sample_disk_thread_main(void *arg) {
             int cmd = atomic_exchange_explicit(&st->command, SAMPLE_CMD_NONE, memory_order_acquire);
             if (cmd == SAMPLE_CMD_START) {
                 if (st->disk_file_handle) { fclose(st->disk_file_handle); st->disk_file_handle = NULL; }
-                // This is the ONE place slot_index is safe to read: the acquire-exchange above
-                // pairs with claim_sample_stream's release-store of `command`, which happens
-                // after it writes slot_index -- so this read is guaranteed to see that write.
-                // Captured into active_slot_index (disk-thread-owned) for every later use this
-                // session, rather than re-reading the audio-thread-owned field again.
+                // This is the ONE place slot_index/start_frame are safe to read: the acquire-
+                // exchange above pairs with claim_sample_stream's release-store of `command`,
+                // which happens after it writes both -- so this read is guaranteed to see those
+                // writes. Captured into disk-thread-owned copies for every later use this
+                // session, rather than re-reading the audio-thread-owned fields again.
                 st->active_slot_index = atomic_load_explicit(&st->slot_index, memory_order_acquire);
+                st->active_start_frame = atomic_load_explicit(&st->start_frame, memory_order_acquire);
+                st->disk_reverse_exhausted = false;
                 SampleSlot *slot = (st->active_slot_index >= 0 && st->active_slot_index < SAMPLE_SLOT_CAPACITY) ? &g_sample_slots[st->active_slot_index] : NULL;
                 if (slot && slot->loaded) {
                     st->disk_file_handle = fopen(slot->file_path, "rb");
-                    st->disk_read_frame_pos = slot->pre_roll_frames;
+                    // Forward zones still get the pre-roll optimization (always covers frames
+                    // [0, pre_roll_frames)): if the requested start falls inside that window,
+                    // begin exactly at the existing pre_roll_frames boundary as before; otherwise
+                    // -- or for ANY reverse zone, which skips pre-roll entirely (see
+                    // start_sample_osc) -- begin exactly at the requested frame.
+                    st->disk_read_frame_pos = (!slot->reverse && st->active_start_frame <= slot->pre_roll_frames)
+                        ? slot->pre_roll_frames : st->active_start_frame;
                 }
                 atomic_store_explicit(&st->write_ptr, 0, memory_order_relaxed);
                 atomic_store_explicit(&st->read_ptr, 0, memory_order_release);
@@ -2545,50 +2585,119 @@ static void *sample_disk_thread_main(void *arg) {
             unsigned int free_space = SAMPLE_RING_SIZE - 1 - filled;
             if (free_space < (unsigned int)BUFFER_SIZE) continue; // plenty already buffered -- nothing to do this pass
 
-            if (slot->loop_enabled && st->disk_read_frame_pos >= slot->loop_end) {
-                st->disk_read_frame_pos = slot->loop_start;
-            } else if (!slot->loop_enabled && st->disk_read_frame_pos >= slot->total_frames) {
-                continue; // nothing left to stream -- render_sample_osc handles end-of-sample itself
-            }
-
-            long byte_offset = (long)slot->data_start_offset + (long)st->disk_read_frame_pos * bytes_per_frame;
-            fseek(st->disk_file_handle, byte_offset, SEEK_SET);
-
             unsigned int chunk = (free_space < (unsigned int)BUFFER_SIZE) ? free_space : (unsigned int)BUFFER_SIZE;
-            for (unsigned int c = 0; c < chunk; c++) {
+
+            if (slot->reverse) {
+                // --- Reverse read: parallel structure to the forward branch below, walking the
+                // file backward instead. disk_read_frame_pos means "the next frame to read," same
+                // convention as forward, just decreasing. Position updates are always decided by
+                // an EQUALITY check before any decrement, never by decrementing first and
+                // comparing after -- disk_read_frame_pos is unsigned, and decrementing it past 0
+                // wraps to a huge value that a `< loop_start` check would then never catch again
+                // (permanently stuck issuing a garbage fseek offset every pass thereafter).
+                if (st->disk_reverse_exhausted) continue; // nothing left to stream (non-looping, already hit frame 0)
+                for (unsigned int c = 0; c < chunk; c++) {
+                    // Per-frame seek -- unlike forward's batched sequential reads, successive
+                    // reverse frames are NOT contiguous with the previous read position, so each
+                    // one needs its own fseek. This thread already does blocking I/O by design;
+                    // more fseeks per frame is a real throughput cost under many concurrent
+                    // reverse voices, not a realtime-safety concern -- documented trade-off, not
+                    // optimized further here.
+                    long byte_offset = (long)slot->data_start_offset + (long)st->disk_read_frame_pos * bytes_per_frame;
+                    fseek(st->disk_file_handle, byte_offset, SEEK_SET);
+
+                    float fl = 0.0f, fr = 0.0f; short raw16; int raw32; unsigned char b24[3];
+                    bool ok = true;
+                    if (slot->audio_format == 1) {
+                        if (slot->bits_per_sample == 16) {
+                            if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) { ok = false; }
+                            else {
+                                fl = (float)raw16 / 32768.0f;
+                                if (slot->num_channels >= 2) { if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) ok = false; else fr = (float)raw16 / 32768.0f; } else fr = fl;
+                            }
+                        } else if (slot->bits_per_sample == 24) {
+                            if (fread(b24, 1, 3, st->disk_file_handle) != 3) { ok = false; }
+                            else {
+                                int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fl = (float)v / 2147483648.0f;
+                                if (slot->num_channels >= 2) { if (fread(b24, 1, 3, st->disk_file_handle) != 3) ok = false; else { v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fr = (float)v / 2147483648.0f; } } else fr = fl;
+                            }
+                        } else {
+                            if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) { ok = false; }
+                            else {
+                                fl = (float)raw32 / 2147483648.0f;
+                                if (slot->num_channels >= 2) { if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) ok = false; else fr = (float)raw32 / 2147483648.0f; } else fr = fl;
+                            }
+                        }
+                    } else {
+                        if (fread(&fl, 4, 1, st->disk_file_handle) != 1) { ok = false; }
+                        else if (slot->num_channels >= 2) { if (fread(&fr, 4, 1, st->disk_file_handle) != 1) ok = false; } else fr = fl;
+                    }
+                    if (!ok) break;
+
+                    unsigned int w = atomic_load_explicit(&st->write_ptr, memory_order_relaxed);
+                    st->ring_l[w & SAMPLE_RING_MASK] = fl;
+                    st->ring_r[w & SAMPLE_RING_MASK] = fr;
+                    atomic_store_explicit(&st->write_ptr, w + 1, memory_order_release);
+
+                    // Decide the NEXT position -- loop-wrap check first (correctly covers
+                    // loop_start == 0 too, since it's checked before the floor check below),
+                    // then the absolute floor (frame 0: either a genuine non-looping end, or a
+                    // reverse zone seeded outside its own loop region on the "wrong" side -- see
+                    // the Mapping tab's Start Offset documentation), then a normal decrement.
+                    if (slot->loop_enabled && st->disk_read_frame_pos == slot->loop_start) {
+                        st->disk_read_frame_pos = slot->loop_end - 1;
+                    } else if (st->disk_read_frame_pos == 0) {
+                        st->disk_reverse_exhausted = true;
+                        break;
+                    } else {
+                        st->disk_read_frame_pos--;
+                    }
+                }
+            } else {
                 if (slot->loop_enabled && st->disk_read_frame_pos >= slot->loop_end) {
                     st->disk_read_frame_pos = slot->loop_start;
-                    byte_offset = (long)slot->data_start_offset + (long)st->disk_read_frame_pos * bytes_per_frame;
-                    fseek(st->disk_file_handle, byte_offset, SEEK_SET);
+                } else if (!slot->loop_enabled && st->disk_read_frame_pos >= slot->total_frames) {
+                    continue; // nothing left to stream -- render_sample_osc handles end-of-sample itself
                 }
-                if (st->disk_read_frame_pos >= slot->total_frames) break;
 
-                float fl = 0.0f, fr = 0.0f; short raw16; int raw32; unsigned char b24[3];
-                if (slot->audio_format == 1) {
-                    if (slot->bits_per_sample == 16) {
-                        if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) break;
-                        fl = (float)raw16 / 32768.0f;
-                        if (slot->num_channels >= 2) { if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) break; fr = (float)raw16 / 32768.0f; } else fr = fl;
-                    } else if (slot->bits_per_sample == 24) {
-                        if (fread(b24, 1, 3, st->disk_file_handle) != 3) break;
-                        int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fl = (float)v / 2147483648.0f;
-                        if (slot->num_channels >= 2) { if (fread(b24, 1, 3, st->disk_file_handle) != 3) break; v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fr = (float)v / 2147483648.0f; } else fr = fl;
-                    } else {
-                        if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) break;
-                        fl = (float)raw32 / 2147483648.0f;
-                        if (slot->num_channels >= 2) { if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) break; fr = (float)raw32 / 2147483648.0f; } else fr = fl;
+                long byte_offset = (long)slot->data_start_offset + (long)st->disk_read_frame_pos * bytes_per_frame;
+                fseek(st->disk_file_handle, byte_offset, SEEK_SET);
+
+                for (unsigned int c = 0; c < chunk; c++) {
+                    if (slot->loop_enabled && st->disk_read_frame_pos >= slot->loop_end) {
+                        st->disk_read_frame_pos = slot->loop_start;
+                        byte_offset = (long)slot->data_start_offset + (long)st->disk_read_frame_pos * bytes_per_frame;
+                        fseek(st->disk_file_handle, byte_offset, SEEK_SET);
                     }
-                } else {
-                    if (fread(&fl, 4, 1, st->disk_file_handle) != 1) break;
-                    if (slot->num_channels >= 2) { if (fread(&fr, 4, 1, st->disk_file_handle) != 1) break; } else fr = fl;
-                }
-                if (slot->num_channels > 2) fseek(st->disk_file_handle, (long)(slot->num_channels - 2) * bytes_per_frame_unit, SEEK_CUR);
+                    if (st->disk_read_frame_pos >= slot->total_frames) break;
 
-                unsigned int w = atomic_load_explicit(&st->write_ptr, memory_order_relaxed);
-                st->ring_l[w & SAMPLE_RING_MASK] = fl;
-                st->ring_r[w & SAMPLE_RING_MASK] = fr;
-                atomic_store_explicit(&st->write_ptr, w + 1, memory_order_release);
-                st->disk_read_frame_pos++;
+                    float fl = 0.0f, fr = 0.0f; short raw16; int raw32; unsigned char b24[3];
+                    if (slot->audio_format == 1) {
+                        if (slot->bits_per_sample == 16) {
+                            if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) break;
+                            fl = (float)raw16 / 32768.0f;
+                            if (slot->num_channels >= 2) { if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) break; fr = (float)raw16 / 32768.0f; } else fr = fl;
+                        } else if (slot->bits_per_sample == 24) {
+                            if (fread(b24, 1, 3, st->disk_file_handle) != 3) break;
+                            int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fl = (float)v / 2147483648.0f;
+                            if (slot->num_channels >= 2) { if (fread(b24, 1, 3, st->disk_file_handle) != 3) break; v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fr = (float)v / 2147483648.0f; } else fr = fl;
+                        } else {
+                            if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) break;
+                            fl = (float)raw32 / 2147483648.0f;
+                            if (slot->num_channels >= 2) { if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) break; fr = (float)raw32 / 2147483648.0f; } else fr = fl;
+                        }
+                    } else {
+                        if (fread(&fl, 4, 1, st->disk_file_handle) != 1) break;
+                        if (slot->num_channels >= 2) { if (fread(&fr, 4, 1, st->disk_file_handle) != 1) break; } else fr = fl;
+                    }
+                    if (slot->num_channels > 2) fseek(st->disk_file_handle, (long)(slot->num_channels - 2) * bytes_per_frame_unit, SEEK_CUR);
+
+                    unsigned int w = atomic_load_explicit(&st->write_ptr, memory_order_relaxed);
+                    st->ring_l[w & SAMPLE_RING_MASK] = fl;
+                    st->ring_r[w & SAMPLE_RING_MASK] = fr;
+                    atomic_store_explicit(&st->write_ptr, w + 1, memory_order_release);
+                    st->disk_read_frame_pos++;
+                }
             }
             work_done = true;
         }
@@ -2626,9 +2735,12 @@ typedef struct {
     int32_t zone_id;
     float root_note, min_note, max_note, min_velocity, max_velocity;
     float unpitched, loop_start, loop_end, loop_enabled, round_robin_group;
+    // SFZ-style per-zone params (Mapping tab's Zone Inspector) -- see SampleSlot's own fields of
+    // the same names for what each does.
+    float tune_cents, gain_db, pan, start_offset_frac, reverse;
     char path[SAMPLE_PATH_LEN];
 } ZoneRecordWire;
-#define ZONE_RECORD_WIRE_SIZE (4 + 10 * 4 + SAMPLE_PATH_LEN) // zone_id + 10 floats + path
+#define ZONE_RECORD_WIRE_SIZE (4 + 15 * 4 + SAMPLE_PATH_LEN) // zone_id + 15 floats + path
 #define ZONE_MSG_MAX_COUNT 200000 // sanity ceiling on one message's claimed record count
 
 typedef struct {
@@ -2656,6 +2768,8 @@ typedef struct {
     float loop_start_frac, loop_end_frac;
     bool loop_enabled;
     int round_robin_group;
+    float tune_cents, gain_db, pan, start_offset_frac;
+    bool reverse;
 } PendingSampleLoad;
 #define PENDING_SAMPLE_LOAD_CAPACITY 4096
 static PendingSampleLoad g_pending_loads[PENDING_SAMPLE_LOAD_CAPACITY];
@@ -2684,6 +2798,9 @@ static void enqueue_pending_sample_load(int slot_index, const ZoneRecordWire *re
     p->loop_start_frac = rec->loop_start; p->loop_end_frac = rec->loop_end;
     p->loop_enabled = rec->loop_enabled != 0.0f;
     p->round_robin_group = (int)rec->round_robin_group;
+    p->tune_cents = rec->tune_cents; p->gain_db = rec->gain_db; p->pan = rec->pan;
+    p->start_offset_frac = rec->start_offset_frac;
+    p->reverse = rec->reverse != 0.0f;
     g_pending_load_tail = (g_pending_load_tail + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
     g_pending_load_count++;
 }
@@ -2737,6 +2854,9 @@ static void drain_pending_sample_loads(void) {
             slot->round_robin_group = p->round_robin_group;
             slot->loop_enabled = p->loop_enabled;
             apply_loop_points(slot, p->loop_start_frac, p->loop_end_frac);
+            slot->tune_cents = p->tune_cents; slot->gain_db = p->gain_db; slot->pan = p->pan;
+            slot->start_offset_frac = p->start_offset_frac;
+            slot->reverse = p->reverse;
         } else {
             fprintf(stderr, "[samples] failed to load queued sample '%s' (zone_id %d)\n", p->path, p->zone_id);
             g_sample_slots[p->slot_index].active = false;
@@ -2754,8 +2874,8 @@ static void process_zone_catalog_message(int opcode, uint32_t count, const unsig
             ZoneRecordWire rec;
             size_t off = 0;
             memcpy(&rec.zone_id, p + off, 4); off += 4;
-            float *floats = &rec.root_note; // root_note..round_robin_group are 10 consecutive floats
-            for (int f = 0; f < 10; f++) { memcpy(&floats[f], p + off, 4); off += 4; }
+            float *floats = &rec.root_note; // root_note..reverse are 15 consecutive floats
+            for (int f = 0; f < 15; f++) { memcpy(&floats[f], p + off, 4); off += 4; }
             memcpy(rec.path, p + off, SAMPLE_PATH_LEN); off += SAMPLE_PATH_LEN;
             rec.path[SAMPLE_PATH_LEN - 1] = '\0';
 
@@ -2795,6 +2915,9 @@ static void process_zone_catalog_message(int opcode, uint32_t count, const unsig
             slot->round_robin_group = (int)rec.round_robin_group;
             slot->loop_enabled = rec.loop_enabled != 0.0f;
             apply_loop_points(slot, rec.loop_start, rec.loop_end);
+            slot->tune_cents = rec.tune_cents; slot->gain_db = rec.gain_db; slot->pan = rec.pan;
+            slot->start_offset_frac = rec.start_offset_frac;
+            slot->reverse = rec.reverse != 0.0f;
         }
     } else if (opcode == ZONE_OP_REMOVE) {
         for (uint32_t i = 0; i < count; i++) {
@@ -2953,10 +3076,39 @@ static int find_matching_sample_slot(int note, int velocity) {
 // note-on.
 static void start_sample_osc(int *stream_idx, double *ptr, bool *preroll, int note, int velocity) {
     if (*stream_idx >= 0) { release_sample_stream(*stream_idx); *stream_idx = -1; }
-    int slot = find_matching_sample_slot(note, velocity);
-    *ptr = 0.0;
-    *preroll = true;
-    *stream_idx = (slot >= 0) ? claim_sample_stream(slot) : -1;
+    int slot_idx = find_matching_sample_slot(note, velocity);
+    unsigned int start_frame = 0;
+    if (slot_idx >= 0) {
+        SampleSlot *slot = &g_sample_slots[slot_idx];
+        // start_offset_frac is where in the file playback begins, in the travel direction (see
+        // SampleSlot.reverse's comment) -- computed ONCE here, on the audio thread, from the one
+        // live copy of this field, then handed to the disk thread atomically via
+        // claim_sample_stream (see SampleStream.start_frame's comment for why: independently
+        // re-deriving this on both threads from the same mutable field at two different,
+        // unsynchronized moments could disagree if a catalog edit landed in between).
+        float frac = fmaxf(0.0f, fminf(1.0f, slot->start_offset_frac));
+        start_frame = (unsigned int)(frac * (float)(slot->total_frames > 0 ? slot->total_frames - 1 : 0));
+        if (slot->reverse) {
+            // Reverse zones skip the pre-roll fast path entirely (it's only ever decoded forward
+            // from file frame 0, useless for a zone that wants to start near the end) -- go
+            // straight to ring consumption, accepting a brief real disk-catch-up latency window,
+            // the same class of trade-off already accepted elsewhere in this file.
+            *preroll = false;
+            *ptr = 0.0;
+        } else {
+            // Forward: if start_frame falls inside the pre-roll window, seed ptr there directly
+            // and let normal pre-roll interpolation proceed; otherwise seed ptr at EXACTLY the
+            // pre_roll_frames boundary so render_sample_osc's existing "ptr >= pre_roll_frames ->
+            // hand off to ring" logic fires on the very first call, against a ring the disk
+            // thread has ALSO been told (via start_frame) to start filling from start_frame.
+            *ptr = (double)(start_frame < slot->pre_roll_frames ? start_frame : slot->pre_roll_frames);
+            *preroll = true;
+        }
+    } else {
+        *ptr = 0.0;
+        *preroll = true;
+    }
+    *stream_idx = (slot_idx >= 0) ? claim_sample_stream(slot_idx, start_frame) : -1;
 }
 
 // Called once per active voice per sample from render_audio_block, right after the EG tick loop
@@ -3003,6 +3155,9 @@ static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll
         float root_hz = 440.0f * powf(2.0f, (float)(slot->root_note - 69) / 12.0f);
         ratio = (root_hz > 1.0f) ? fmaxf(0.01f, hz / root_hz) : 1.0f;
     }
+    // Per-zone fine tune (cents) -- applied even when unpitched, a nudge independent of the
+    // root-note-relative pitch tracking `unpitched` specifically disables.
+    if (slot->tune_cents != 0.0f) ratio *= powf(2.0f, slot->tune_cents / 1200.0f);
 
     double ptr = *ptr_inout;
     bool preroll = *preroll_inout;
@@ -3084,7 +3239,28 @@ static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll
 
     *ptr_inout = ptr;
     *preroll_inout = preroll;
-    return (out_l + out_r) * 0.5f;
+    float mono_out = (out_l + out_r) * 0.5f;
+    if (slot->gain_db != 0.0f) mono_out *= powf(10.0f, slot->gain_db / 20.0f);
+    return mono_out;
+}
+
+// Looks up the currently-claimed zone's own Pan setting for a WAVE_SAMPLE oscillator, so
+// render_audio_block's pan1/pan2 computation (which runs BEFORE render_sample_osc is called each
+// sample, since it also feeds the periodic-oscillator branches) can fold it in without needing
+// render_sample_osc itself to return anything beyond its plain mono sample. Mirrors
+// render_sample_osc's own stream->slot lookup exactly (same relaxed atomic read of slot_index) --
+// a small duplicated lookup rather than threading pan out through render_sample_osc's signature,
+// since that function is shared with the unison-saw/periodic-wave branches which depend on state
+// (fm_phase, phase_offset) not available until later in the per-voice loop; special-casing WAVE_
+// SAMPLE there to emit early would be a bigger, riskier change than this one small duplication.
+static float sample_osc_zone_pan_offset(int stream_idx) {
+    if (stream_idx < 0) return 0.0f;
+    SampleStream *stream = &g_sample_streams[stream_idx];
+    if (!stream->in_use) return 0.0f;
+    int slot_idx = atomic_load_explicit(&stream->slot_index, memory_order_relaxed);
+    if (slot_idx < 0 || slot_idx >= SAMPLE_SLOT_CAPACITY) return 0.0f;
+    SampleSlot *slot = &g_sample_slots[slot_idx];
+    return slot->loaded ? slot->pan : 0.0f;
 }
 
 static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], int note, int velocity, bool poly_mode_active, MonoNoteStack *mono_stack) {
@@ -3596,13 +3772,26 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float vco1_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco1_unison_saw_detune + mod_vco1_unison_detune));
             float vco2_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco2_unison_saw_detune + mod_vco2_unison_detune));
 
+            // Oscillator shapes, hoisted here (from their own call sites further below) purely so
+            // the Pan block right after can tell whether a WAVE_SAMPLE zone's own Pan setting
+            // should fold into the knob-based pan below -- both are plain reads of a knob value
+            // with no ordering dependency on anything between here and their old declaration
+            // sites, so hoisting is safe.
+            WaveType vco1_shape_now = (WaveType)((int)knobs->vco1_shape);
+            WaveType vco2_shape_now = (WaveType)((int)knobs->vco2_shape);
+
             // Pan (targets 32/33/37/40), base knob plus any modulation, clamped back into
             // [-1,1] -- computed per-voice/per-sample now that it's modulatable (see the
-            // comment where this used to be a per-block constant, above the voice loop).
-            float pan1_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan)) + 1.0f) * (M_PI / 4.0f));
-            float pan1_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan)) + 1.0f) * (M_PI / 4.0f));
-            float pan2_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan)) + 1.0f) * (M_PI / 4.0f));
-            float pan2_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan)) + 1.0f) * (M_PI / 4.0f));
+            // comment where this used to be a per-block constant, above the voice loop). A
+            // WAVE_SAMPLE oscillator's zone can carry its own Pan (Mapping tab's Zone Inspector),
+            // which ADDS to the oscillator's own knob here rather than overriding it -- see
+            // sample_osc_zone_pan_offset().
+            float zone_pan1 = (vco1_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(voices[v].vco1_sample_stream) : 0.0f;
+            float zone_pan2 = (vco2_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(voices[v].vco2_sample_stream) : 0.0f;
+            float pan1_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
+            float pan1_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
+            float pan2_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
+            float pan2_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
             float pan_noise_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->noise_pan + mod_noise_pan)) + 1.0f) * (M_PI / 4.0f));
             float pan_noise_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->noise_pan + mod_noise_pan)) + 1.0f) * (M_PI / 4.0f));
             float pan_sub_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->sub_pan + mod_sub_pan)) + 1.0f) * (M_PI / 4.0f));
@@ -3618,7 +3807,6 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float dt1 = hz1 / (float)SAMPLE_RATE, dt2 = hz2 / (float)SAMPLE_RATE;
 
             float v2_out = 0.0f, v2_side_l = 0.0f, v2_side_r = 0.0f;
-            WaveType vco2_shape_now = (WaveType)((int)knobs->vco2_shape);
             if (vco2_shape_now == WAVE_UNISON_SAW) v2_out = render_unison_saw(voices[v].vco2_unison_saw_phases, dt2, vco2_unison_detune_final, vco2_unison_pan_l, vco2_unison_pan_r, phase_offset2, &v2_side_l, &v2_side_r);
             else if (vco2_shape_now == WAVE_SAMPLE) v2_out = render_sample_osc(&voices[v].vco2_sample_stream, &voices[v].vco2_sample_ptr, &voices[v].vco2_sample_preroll, hz2);
             else {
@@ -3645,7 +3833,6 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float fm_phase = voices[v].vco1_phase + (v2_modulator * fmaxf(0.0f, knobs->fm_intensity + fm_mod));
             fm_phase = fmodf(fm_phase + phase_offset1, 1.0f); if (fm_phase < 0.0f) fm_phase += 1.0f;
             float v1_out = 0.0f, v1_side_l = 0.0f, v1_side_r = 0.0f;
-            WaveType vco1_shape_now = (WaveType)((int)knobs->vco1_shape);
             bool osc1_is_unison_saw = vco1_shape_now == WAVE_UNISON_SAW;
             if (osc1_is_unison_saw) v1_out = render_unison_saw(voices[v].vco1_unison_saw_phases, dt1, vco1_unison_detune_final, vco1_unison_pan_l, vco1_unison_pan_r, phase_offset1, &v1_side_l, &v1_side_r);
             else if (vco1_shape_now == WAVE_SAMPLE) v1_out = render_sample_osc(&voices[v].vco1_sample_stream, &voices[v].vco1_sample_ptr, &voices[v].vco1_sample_preroll, hz1);
