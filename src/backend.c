@@ -314,6 +314,28 @@ typedef struct {
 // total: 372 float items + 448 string bytes (back to the shape just before the DFD/Sample Bank
 // work). The Python side's struct.pack format changes from "532f64s64s64s256s4096s" to
 // "372f64s64s64s256s".
+// BREAKING CHANGE (4-oscillator architecture + FM algorithms + dual Hard Sync + 16 LFOs +
+// WavPack recording): a large consolidated pass, folding in the still-undocumented "Osc3 +
+// initial FM algorithm fields" WIP work (fm_algorithm/fm_depth_3_1/fm_depth_3_2 + vco3_shape/
+// fine_tune/pitch_offset/phase_offset/unison_saw_detune/unison_saw_width -- vco3_vol/pan/mute/
+// pulse_width already existed, renamed in place from the old dedicated Noise oscillator's
+// noise_vol/pan/mute/tilt, net 0 field-count change) together with this pass's own additions:
+// - Sub retired outright, replaced by Osc4 -- a full peer of Osc1/2/3. vco4_vol/pan/mute/
+//   pulse_width (4, net 0 vs the old sub_shape/vol/pan/mute) plus 6 brand-new identity fields
+//   (vco4_shape/fine_tune/pitch_offset/phase_offset/unison_saw_detune/unison_saw_width).
+// - 5 new FM depth fields (fm_depth_4_1/4_3/1_2/3_4/1_3) for the 12-algorithm FM system: +5.
+// - ENV_COUNT (4 + ASSIGNABLE_EG_COUNT) grew from 9 to 10 for Osc4's own fixed amp envelope:
+//   eg[ENV_COUNT] +8 floats, eg_mode[ENV_COUNT] +1 float: +9.
+// - hard_sync renamed hard_sync_mode (0=Off/1=Parallel/2=Serial) -- net 0 field-count change.
+// - LFO_COUNT went 4 -> 16: PackLfoParams lfo[LFO_COUNT] (7 fields/LFO) grows by 12 LFOs * 7:
+//   +84. New wave_type value 4 = Off; LFOs 3-16 run at a decimated control rate -- neither
+//   changes the wire layout, only what values/behavior an existing field carries.
+// - record_format (WAV/WavPack format selector, Recording tab): +1.
+// Total added: 6 (vco3 identity) + 6 (vco4 identity) + 5 (new FM depths) + 9 (ENV_COUNT 9->10)
+// + 84 (LFO_COUNT 4->16) + 1 (record_format) = 111, plus the WIP work's fm_algorithm/
+// fm_depth_3_1/fm_depth_3_2 (+3, that WIP commit never updated this comment) = 114 floats. No
+// new string fields. New total: 486 float items + 448 string bytes. The Python side's
+// struct.pack format changes from "372f64s64s64s256s" to "486f64s64s64s256s".
 typedef struct {
     // 13 Baseline Control Items
     float is_polyphonic;
