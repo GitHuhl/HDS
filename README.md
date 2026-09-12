@@ -383,10 +383,17 @@ A digital synthesizer split into two processes:
 
 Engine features: 2 main oscillators (Saw/Square/Triangle/Sine/Unison
 Saw/Noise/Pulse/Sample) with FM and hard sync -- both PolyBLEP-corrected
-against aliasing (Osc 1's BLEP window width tracks the true instantaneous
-phase velocity under FM instead of just the carrier's own nominal step, and
-a hard sync reset lands at the true fractional-sample instant Osc 1 wrapped
-rather than snapping to the next sample boundary) -- a dedicated sub oscillator and
+against aliasing. Osc 1's BLEP window width tracks the true instantaneous
+phase velocity under FM instead of just the carrier's own nominal step. Hard
+sync is alias-free on both timing and amplitude: Osc 2's phase (including
+each of its 7 Unison Saw detuned voices) resets to the true fractional-sample
+instant Osc 1 wrapped rather than snapping to the next sample boundary, and
+for Saw/Square/Pulse the instantaneous amplitude discontinuity that reset
+creates in Osc 2's own output is itself BLEP-corrected (split across the
+sample before and the sample after the sync instant) -- Triangle needs no
+such correction (its leaky integrator already smooths through an
+intentionally-untouched state across the reset) and Sine/Unison-Saw's own
+amplitude correction remain a possible future extension -- a dedicated sub oscillator and
 noise oscillator, a 2-filter (A/B) architecture where Filter A can itself
 be a 3-filter Multi engine, 9 envelope generators (Osc1/Osc2/Noise amp +
 6 assignable, each switchable between ADSR/AR/AD/ASR/AHD/DADSR/AHDSR, with

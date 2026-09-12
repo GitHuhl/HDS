@@ -644,6 +644,10 @@ typedef struct {
     float vco2_target_freq;
     float vco2_current_freq;
     float vco2_tri_state;
+    // "After" half of a hard-sync amplitude-discontinuity BLEP correction, carried one sample
+    // forward from the sample that detected the sync to the first sample rendered with the
+    // post-reset phase (Saw/Square/Pulse only -- see render_audio_block/sync_blep_shape_after).
+    float vco2_pending_sync_correction;
     float vco2_unison_saw_phases[UNISON_SAW_VOICES];
     ADSR vco2_eg;
 
@@ -2008,6 +2012,27 @@ float lookup_osc_sample(WaveType type, float phase, float dt, float pulse_width_
 // tone or level when width is 0 or the oscillator isn't set to Unison Saw.
 static const float UNISON_SAW_VOICE_SPREAD[UNISON_SAW_VOICES] = {-1.0f, -0.667f, -0.333f, 0.0f, 0.333f, 0.667f, 1.0f};
 
+// Per-voice effective phase increment for one of the 7 detuned unison voices, given the shared
+// base_dt/detune_cents -- extracted from render_unison_saw()'s own inline math so the hard-sync
+// reset logic in render_audio_block can reuse the exact same per-voice rate when it needs to
+// reset vco2_unison_saw_phases[] fractionally-accurately, instead of duplicating this formula.
+static inline float unison_saw_voice_dt(float base_dt, float detune_cents, int u) {
+    float voice_cents = UNISON_SAW_VOICE_SPREAD[u] * detune_cents;
+    return base_dt * powf(2.0f, voice_cents / 1200.0f);
+}
+
+// Generalizes poly_blep_step()'s two branches from "fixed height-2 jump positioned at the
+// oscillator's own phase-0 edge" to "arbitrary jump height, positioned at an externally-imposed
+// fractional-sample instant" -- used to BLEP-correct the amplitude discontinuity a hard sync
+// reset creates in Osc 2's output (see render_audio_block). t_wrap is the fraction of the
+// sample-to-sample interval at which the sync edge actually falls (0 = edge right after this
+// sample, 1 = edge right before the next). shape_before applies to the sample rendered with the
+// PRE-reset phase (this sample); shape_after applies to the sample rendered with the POST-reset
+// phase (next sample) -- both scaled by (jump height / 2) by the caller, matching how this
+// reduces to today's poly_blep_step()-based corrections for a natural height-2 edge.
+static inline float sync_blep_shape_before(float t_wrap) { float x = 1.0f - t_wrap; return x * x; }
+static inline float sync_blep_shape_after(float t_wrap) { return -(t_wrap * t_wrap); }
+
 // PERF: per-unison pan (cosf/sinf) only ever depends on the Width knob, which is constant
 // across an entire buffer -- it was previously recomputed from scratch inside render_unison_saw
 // on every single sample, for every voice, for both oscillators (up to 64 voices * 128 samples
@@ -2025,8 +2050,7 @@ static void compute_unison_saw_pan(float width_pct, float pan_l[UNISON_SAW_VOICE
 float render_unison_saw(float phases[UNISON_SAW_VOICES], float base_dt, float detune_cents, const float pan_l[UNISON_SAW_VOICES], const float pan_r[UNISON_SAW_VOICES], float phase_offset, float *out_l, float *out_r) {
     float sum_mono = 0.0f, sum_l = 0.0f, sum_r = 0.0f;
     for (int u = 0; u < UNISON_SAW_VOICES; u++) {
-        float voice_cents = UNISON_SAW_VOICE_SPREAD[u] * detune_cents;
-        float dt = base_dt * powf(2.0f, voice_cents / 1200.0f);
+        float dt = unison_saw_voice_dt(base_dt, detune_cents, u);
         // Phase Modulation shifts only the READ point in the cycle, not the stored accumulator
         // below -- so it never disturbs this voice's actual detune/pitch tracking.
         float read_phase = fmodf(phases[u] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
@@ -2161,7 +2185,7 @@ static void init_voice(SynthVoice *voice) {
     voice->midi_note = -1;
     voice->midi_velocity = 100;
     voice->vco1_phase = 0.0f; voice->vco1_target_freq = 0.0f; voice->vco1_current_freq = 0.0f; voice->vco1_tri_state = 0.0f; voice->vco1_prev_fm_phase = 0.0f;
-    voice->vco2_phase = 0.0f; voice->vco2_target_freq = 0.0f; voice->vco2_current_freq = 0.0f; voice->vco2_tri_state = 0.0f;
+    voice->vco2_phase = 0.0f; voice->vco2_target_freq = 0.0f; voice->vco2_current_freq = 0.0f; voice->vco2_tri_state = 0.0f; voice->vco2_pending_sync_correction = 0.0f;
     for(int u=0; u<UNISON_SAW_VOICES; u++) { voice->vco1_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco2_unison_saw_phases[u] = (float)rand()/RAND_MAX; }
     for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voice->fa_low[c][f][0]=0.0f; voice->fa_low[c][f][1]=0.0f; voice->fa_band[c][f][0]=0.0f; voice->fa_band[c][f][1]=0.0f; } voice->fb_low[c][0]=0.0f; voice->fb_low[c][1]=0.0f; voice->fb_band[c][0]=0.0f; voice->fb_band[c][1]=0.0f; }
     voice->glide_time_multiplier = 1.0f;
@@ -3330,7 +3354,7 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
 
     if (is_first_key_of_phrase) {
         voices[slot].vco1_phase = 0.0f; voices[slot].vco2_phase = 0.0f; voices[slot].vco1_prev_fm_phase = 0.0f;
-        voices[slot].vco1_tri_state = 0.0f; voices[slot].vco2_tri_state = 0.0f;
+        voices[slot].vco1_tri_state = 0.0f; voices[slot].vco2_tri_state = 0.0f; voices[slot].vco2_pending_sync_correction = 0.0f;
         voices[slot].vco1_current_freq = target_hz; voices[slot].vco2_current_freq = target_hz;
         // Sub Osc has no independent pitch state -- it derives its frequency from Osc 1's
         // fully-modulated freq every sample -- but its own phase accumulator and triangle
@@ -3821,12 +3845,47 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float hz2 = voices[v].vco2_current_freq * powf(2.0f, mod_vco2_pitch / 1200.0f);
             float dt1 = hz1 / (float)SAMPLE_RATE, dt2 = hz2 / (float)SAMPLE_RATE;
 
+            // Hoisted hard-sync wrap check: computed here (right after dt1/dt2, before either
+            // oscillator's audio for this sample is rendered) rather than at the bottom of the
+            // loop, so a sync-triggered discontinuity in Osc 2's output can be BLEP-corrected on
+            // THIS sample directly (the "before" half, applied below) as well as on next sample
+            // (the "after" half, carried forward via vco2_pending_sync_correction). This does NOT
+            // advance voices[v].vco1_phase yet -- that assignment stays at the bottom of the loop
+            // unchanged, since fm_phase below still needs the pre-advance value.
+            float vco1_phase_before = voices[v].vco1_phase;
+            float new_vco1_phase = vco1_phase_before + dt1;
+            bool do_sync = (knobs->hard_sync != 0.0f && new_vco1_phase >= 1.0f);
+            float t_wrap = do_sync ? fmaxf(0.0f, fminf(1.0f, (1.0f - vco1_phase_before) / dt1)) : 0.0f;
+
             float v2_out = 0.0f, v2_side_l = 0.0f, v2_side_r = 0.0f;
             if (vco2_shape_now == WAVE_UNISON_SAW) v2_out = render_unison_saw(voices[v].vco2_unison_saw_phases, dt2, vco2_unison_detune_final, vco2_unison_pan_l, vco2_unison_pan_r, phase_offset2, &v2_side_l, &v2_side_r);
             else if (vco2_shape_now == WAVE_SAMPLE) v2_out = render_sample_osc(&voices[v].vco2_sample_stream, &voices[v].vco2_sample_ptr, &voices[v].vco2_sample_preroll, hz2, &v2_side_l, &v2_side_r);
             else {
                 float vco2_read_phase = fmodf(voices[v].vco2_phase + phase_offset2, 1.0f); if (vco2_read_phase < 0.0f) vco2_read_phase += 1.0f;
                 v2_out = lookup_osc_sample(vco2_shape_now, vco2_read_phase, dt2, vco2_pulse_width_final / 100.0f, &voices[v].vco2_tri_state);
+
+                // Full alias-free hard sync (amplitude half -- the timing half is the t_wrap-based
+                // vco2_phase reset at the bottom of the loop). Consume any "after" correction left
+                // pending by a sync detected on the PREVIOUS sample, then, if THIS sample detects a
+                // new sync, BLEP-correct the discontinuity that reset will create: apply the
+                // "before" half here, stash the "after" half for next sample. Only Saw/Square/Pulse
+                // need this -- Triangle's leaky integrator already smooths through an untouched
+                // tri_state (see the bottom-of-loop comment), and Sine has no BLEP machinery to
+                // hook into.
+                v2_out += voices[v].vco2_pending_sync_correction;
+                voices[v].vco2_pending_sync_correction = 0.0f;
+                if (do_sync && (vco2_shape_now == WAVE_SAW || vco2_shape_now == WAVE_SQUARE || vco2_shape_now == WAVE_PULSE)) {
+                    float phase_at_sync = fmodf(voices[v].vco2_phase + t_wrap * dt2, 1.0f); if (phase_at_sync < 0.0f) phase_at_sync += 1.0f;
+                    float val_before, val_after;
+                    if (vco2_shape_now == WAVE_SAW) { val_before = phase_at_sync * 2.0f - 1.0f; val_after = -1.0f; }
+                    else {
+                        float duty2 = (vco2_shape_now == WAVE_SQUARE) ? 0.5f : fmaxf(0.02f, fminf(0.98f, vco2_pulse_width_final / 100.0f));
+                        val_before = (phase_at_sync < duty2) ? 1.0f : -1.0f; val_after = 1.0f;
+                    }
+                    float half_height = (val_after - val_before) * 0.5f;
+                    v2_out += half_height * sync_blep_shape_before(t_wrap);
+                    voices[v].vco2_pending_sync_correction = half_height * sync_blep_shape_after(t_wrap);
+                }
             }
             float gain2 = (knobs->vco2_mute != 0.0f || knobs->vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco2_vol + mix_bal + mod_vco2_amp));
             float osc2_amp = gain2 * voices[v].vco2_eg.current_level;
@@ -3913,24 +3972,31 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float noise_amp = noise_out * gain_noise * voices[v].noise_eg.current_level;
             float noise_l = noise_amp * pan_noise_l, noise_r = noise_amp * pan_noise_r;
 
-            float vco1_phase_before = voices[v].vco1_phase;
-            float new_vco1_phase = vco1_phase_before + dt1;
-            bool vco1_wrapped = new_vco1_phase >= 1.0f;
+            // vco1_phase_before/new_vco1_phase/do_sync/t_wrap were computed earlier (right after
+            // dt1/dt2), before either oscillator's audio for this sample was rendered -- see that
+            // comment for why. Only the actual phase mutations happen here.
             voices[v].vco1_phase = fmodf(new_vco1_phase, 1.0f);
             voices[v].vco2_phase = fmodf(voices[v].vco2_phase + dt2, 1.0f);
             voices[v].sub_phase = fmodf(voices[v].sub_phase + dt_sub, 1.0f);
-            if (knobs->hard_sync != 0.0f && vco1_wrapped) {
+            if (do_sync) {
                 // Sub-sample-accurate sync: reset Osc2's phase to where it would be if it had
                 // been snapped to exactly 0 at the true fractional-sample instant t_wrap (where
                 // Osc1 actually crossed 1.0), then continued advancing at rate dt2 for the
                 // remaining (1 - t_wrap) of this sample -- instead of a flat 0.0f, which
                 // quantizes the sync point to the next sample boundary and introduces phase
-                // jitter. vco1_wrapped guarantees vco1_phase_before < 1.0 <= new_vco1_phase, so
-                // dt1 > 0 here and the division is always well-defined.
-                float t_wrap = (1.0f - vco1_phase_before) / dt1;
-                t_wrap = fmaxf(0.0f, fminf(1.0f, t_wrap));
+                // jitter. The amplitude discontinuity this reset creates in Osc2's own output is
+                // separately BLEP-corrected above (Saw/Square/Pulse only); Triangle's tri_state is
+                // deliberately left untouched here so its leaky integrator smooths through the
+                // reset instead of snapping.
                 voices[v].vco2_phase = fmodf((1.0f - t_wrap) * dt2, 1.0f);
-                for (int u = 0; u < UNISON_SAW_VOICES; u++) voices[v].vco2_unison_saw_phases[u] = 0.0f;
+                // Unison Saw's 7 detuned phases get the same fractional-offset treatment now
+                // (previously a flat 0.0f each, the same timing-jitter bug just fixed for the
+                // plain-phase case above) -- each voice has its own effective rate, computed the
+                // same way render_unison_saw() computes it internally.
+                for (int u = 0; u < UNISON_SAW_VOICES; u++) {
+                    float voice_dt2 = unison_saw_voice_dt(dt2, vco2_unison_detune_final, u);
+                    voices[v].vco2_unison_saw_phases[u] = fmodf((1.0f - t_wrap) * voice_dt2, 1.0f);
+                }
             }
 
             // The "summer/mixer": all 4 oscillators combined into a stereo pair (each already
