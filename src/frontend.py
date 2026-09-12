@@ -8,12 +8,12 @@ import subprocess
 import re
 from datetime import datetime
 import numpy as np
-from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
                              QSlider, QPushButton, QProgressBar, QSpinBox, QLineEdit, QCheckBox,
                              QScrollArea, QMenu, QInputDialog, QFileDialog, QGridLayout)
-from PyQt6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor, QAction, QFont
-from PyQt6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, pyqtSignal
+from PySide6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor, QAction, QFont
+from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, Signal
 
 def _format_semitones_cents(total_cents):
     """Format a raw cents value as 'SS.CC st' (e.g. 2401 -> '24.01 st')."""
@@ -416,7 +416,7 @@ class WaveformVisualizer(QWidget):
 class PotentiometerKnob(QWidget):
     """Custom vector-drawn potentiometer style dial with drag, scrollwheel, click reset,
     a high-visibility pop-up readout, and a 500ms hover delay trigger to view values passively."""
-    valueChanged = pyqtSignal(int)
+    valueChanged = Signal(int)
 
     def __init__(self, label_hint="Value", parent=None):
         super().__init__(parent)
@@ -627,13 +627,13 @@ class PotentiometerKnob(QWidget):
     def _show_popup(self):
         if not self.isEnabled() or not self.isVisible():
             return
-        from PyQt6.QtWidgets import QToolTip
+        from PySide6.QtWidgets import QToolTip
         global_pos = self.mapToGlobal(QPointF(self.width() / 2, -15).toPoint())
         display_value = self.value_formatter(self._current_value) if self.value_formatter else str(self._current_value)
         QToolTip.showText(global_pos, f"{self._label_hint}: {display_value}", self)
 
     def _hide_popup(self):
-        from PyQt6.QtWidgets import QToolTip
+        from PySide6.QtWidgets import QToolTip
         QToolTip.hideText()
 
     def paintEvent(self, event):
@@ -664,7 +664,7 @@ class InteractiveADSREnvelope(QWidget):
     """Draws an envelope curve and lets the user drag its nodes based on the 7 active types.
     Attack Start Level is controlled by dragging the (0,0) node vertically; Attack Peak Level
     is controlled by dragging the attack node itself vertically."""
-    valuesChanged = pyqtSignal(int, int, int, int, int, int, int, int)
+    valuesChanged = Signal(int, int, int, int, int, int, int, int)
 
     def __init__(self, attack_range_ms, decay_range_ms, release_range_ms, parent=None):
         super().__init__(parent)
@@ -886,8 +886,8 @@ class ADSRPanel(QGroupBox):
     """A titled group box panel wrapper that physically shows, hides, and reorders knob
     columns on the screen so the visible knobs always read left-to-right in the same
     order as the letters in the selected envelope type's name."""
-    valuesChanged = pyqtSignal(int, int, int, int, int, int, int, int)
-    typeChanged = pyqtSignal(int)
+    valuesChanged = Signal(int, int, int, int, int, int, int, int)
+    typeChanged = Signal(int)
 
     def __init__(self, title_text, attack_range_ms, decay_range_ms, release_range_ms, parent=None):
         super().__init__("", parent)
