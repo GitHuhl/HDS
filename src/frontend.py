@@ -134,6 +134,29 @@ TEMPO_MARKER_MAX = 16
 # backend.c exactly.
 SAMPLE_PATH_LEN = 256
 MAX_ROUND_ROBIN_GROUPS = 256
+# 4-oscillator architecture: all 4 oscillators (Osc 1-4) share this exact shape palette --
+# must match WaveType in backend.c exactly (append-only order, "Off" last).
+OSC_SHAPE_NAMES = ["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample", "Off"]
+# LFO count: must match LFO_COUNT in backend.c exactly.
+LFO_COUNT = 16
+# FM Algorithm system: must match FM_ALGORITHM_COUNT/FM_ALGORITHMS in backend.c exactly. Each
+# entry names which depth dial(s) are relevant for that algorithm (used to show/hide the depth
+# knobs conditionally, mirroring the FX slot param show/hide pattern) -- "fm_intensity" is the
+# always-existing "2->1" depth (the old single FM Depth dial).
+FM_ALGORITHMS = [
+    {"name": "0: Classic (2→1)", "depths": ["fm_intensity"]},
+    {"name": "1: 3-Op Chain (3→2→1), Osc4 independent", "depths": ["fm_depth_3_2", "fm_intensity"]},
+    {"name": "2: 4-Op Chain (4→3→2→1)", "depths": ["fm_depth_4_3", "fm_depth_3_2", "fm_intensity"]},
+    {"name": "3: Dual Serial Pairs (4→3, 2→1)", "depths": ["fm_depth_4_3", "fm_intensity"]},
+    {"name": "4: Many-to-One into 1 (3→1, 4→1)", "depths": ["fm_depth_3_1", "fm_depth_4_1"]},
+    {"name": "5: One-to-Many from 3 (3→1, 3→2)", "depths": ["fm_depth_3_1", "fm_depth_3_2"]},
+    {"name": "6: Many-to-One into 2 (1→2, 3→2)", "depths": ["fm_depth_1_2", "fm_depth_3_2"]},
+    {"name": "7: 4→1 direct, Osc2/3 independent", "depths": ["fm_depth_4_1"]},
+    {"name": "8: Dual Independent Pairs (1→2, 3→4)", "depths": ["fm_depth_1_2", "fm_depth_3_4"]},
+    {"name": "9: 1→3→4, Osc2 independent", "depths": ["fm_depth_1_3", "fm_depth_3_4"]},
+    {"name": "10: Star (2/3/4 all → 1)", "depths": ["fm_intensity", "fm_depth_3_1", "fm_depth_4_1"]},
+    {"name": "11: All independent", "depths": []},
+]
 
 # CreamCoat's 17 "Select" room-size presets, in order -- text taken verbatim from the original
 # plugin's own per-case comments (e.g. "5 to 51 ms, 96 seat room").
@@ -316,6 +339,12 @@ class WaveformVisualizer(QWidget):
                 path.lineTo(margin + draw_w/2, h - margin)
                 path.lineTo(margin + draw_w, h - margin)
                 path.lineTo(margin + draw_w, mid_y)
+            elif self.waveform_type == 4:  # Off -- flat dashed line, same convention as the
+                # oscillator visualizer's own Off case.
+                pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                path.moveTo(margin, mid_y)
+                path.lineTo(margin + draw_w, mid_y)
         else:
             if self.waveform_type == 0:  # Saw Up
                 path.moveTo(margin, h - margin)
@@ -376,6 +405,12 @@ class WaveformVisualizer(QWidget):
                     path.lineTo(x + bar_w, mid_y - bar_h / 2)
                     path.moveTo(x, mid_y + bar_h / 2)
                     path.lineTo(x + bar_w, mid_y + bar_h / 2)
+            elif self.waveform_type == 8:  # Off -- a flat dashed line, distinct from any real
+                # waveform shape, signaling "nothing computed here."
+                pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                path.moveTo(margin, mid_y)
+                path.lineTo(margin + draw_w, mid_y)
 
         painter.drawPath(path)
 class PotentiometerKnob(QWidget):
@@ -1764,9 +1799,20 @@ class SynthGui(QWidget):
         global_layout.addWidget(self.mono_radio)
         global_layout.addSpacing(4)
 
-        self.hard_sync_checkbox = QCheckBox("Hard Sync")
-        self.hard_sync_checkbox.setToolTip("Osc 2 resets to phase 0 every time Osc 1 completes a cycle")
-        global_layout.addWidget(self.hard_sync_checkbox)
+        hard_sync_box = QGroupBox("Hard Sync")
+        hard_sync_lay = QVBoxLayout(); hard_sync_lay.setContentsMargins(4, 4, 4, 4)
+        self.hard_sync_combo = QComboBox()
+        self.hard_sync_combo.addItems(["Off", "Parallel", "Serial"])
+        self.hard_sync_combo.setToolTip(
+            "Off: no hard sync.\n"
+            "Parallel: Osc 1 resets Osc 2, 3, AND 4 independently -- each slave shares Osc 1's\n"
+            "fundamental but keeps its own shape/detune.\n"
+            "Serial: Osc 1 resets Osc 2, Osc 2's reset resets Osc 3, Osc 3's reset resets Osc 4 --\n"
+            "a cascading \"telephone game\" of phase truncation."
+        )
+        hard_sync_lay.addWidget(self.hard_sync_combo)
+        hard_sync_box.setLayout(hard_sync_lay)
+        global_layout.addWidget(hard_sync_box)
         global_layout.addSpacing(4)
 
         pb_box = QGroupBox("Pitch Bend Range")
@@ -1810,10 +1856,45 @@ class SynthGui(QWidget):
         global_layout.addWidget(sustain_box)
         global_layout.addSpacing(4)
 
-        global_layout.addWidget(QLabel("FM Depth"), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.fm_dial = PotentiometerKnob("FM Depth", self)
-        self.fm_dial.setRange(0, 200); self.fm_dial.setValue(0)
-        global_layout.addWidget(self.fm_dial, alignment=Qt.AlignmentFlag.AlignCenter)
+        # FM Algorithm system: a fixed, cycle-free set of 12 selectable 4-operator routing
+        # topologies (see FM_ALGORITHMS/render_fm_oscillator in backend.c). Algorithm 0
+        # ("Classic", 2->1 only) reproduces this synth's original fixed FM pair and stays the
+        # default. Only the depth dial(s) that algorithm actually uses are shown (mirroring the
+        # FX slot param show/hide pattern) -- fm_intensity is the always-existing "2->1" depth
+        # (the old single FM Depth dial), the other 7 are new.
+        fm_box = QGroupBox("FM Algorithm")
+        fm_lay = QVBoxLayout(); fm_lay.setContentsMargins(4, 4, 4, 4); fm_lay.setSpacing(4)
+        self.fm_algorithm_combo = QComboBox()
+        self.fm_algorithm_combo.addItems([alg["name"] for alg in FM_ALGORITHMS])
+        fm_lay.addWidget(self.fm_algorithm_combo)
+
+        self.fm_depth_dials = {}
+        self.fm_depth_rows = {}
+        _fm_depth_labels = {
+            "fm_intensity": "2→1",
+            "fm_depth_3_1": "3→1",
+            "fm_depth_3_2": "3→2",
+            "fm_depth_4_1": "4→1",
+            "fm_depth_4_3": "4→3",
+            "fm_depth_1_2": "1→2",
+            "fm_depth_3_4": "3→4",
+            "fm_depth_1_3": "1→3",
+        }
+        fm_depth_grid = QHBoxLayout(); fm_depth_grid.setSpacing(4)
+        for key, label in _fm_depth_labels.items():
+            row = QVBoxLayout(); row.setSpacing(0)
+            row.addWidget(QLabel(label), alignment=Qt.AlignmentFlag.AlignCenter)
+            dial = PotentiometerKnob(f"FM Depth {label}", self)
+            dial.setRange(0, 200); dial.setValue(0)
+            row.addWidget(dial, alignment=Qt.AlignmentFlag.AlignCenter)
+            row_widget = QWidget(); row_widget.setLayout(row)
+            _retain_hidden(row_widget)
+            fm_depth_grid.addWidget(row_widget)
+            self.fm_depth_dials[key] = dial
+            self.fm_depth_rows[key] = row_widget
+        fm_lay.addLayout(fm_depth_grid)
+        fm_box.setLayout(fm_lay)
+        global_layout.addWidget(fm_box)
 
         global_layout.addWidget(QLabel("Glide Time"), alignment=Qt.AlignmentFlag.AlignCenter)
         self.glide_dial = PotentiometerKnob("Glide", self)
@@ -1931,18 +2012,23 @@ class SynthGui(QWidget):
         v1_strip.addWidget(self.vco1_vis, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.vco1_combo = QComboBox()
-        self.vco1_combo.addItems(["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample"])
+        self.vco1_combo.addItems(OSC_SHAPE_NAMES)
         v1_strip.addWidget(self.vco1_combo)
 
-        # Pulse Width is a direct sub-parameter of the Shape choice (only meaningful when Shape
-        # is Pulse) -- kept right under Shape, not down by Volume, so it reads as part of "what
-        # this oscillator's wave looks like" rather than a mixing control.
+        # Dual-duty Pulse Width (Shape=Pulse) / Tilt (Shape=Noise) knob -- one physical knob/wire
+        # field serving both meanings (see backend.c's Tilt-noise unification). Label text
+        # switches between "Pulse Width" and "Tilt" based on the selected shape (wired below,
+        # alongside the other combo-driven visibility rules). Kept right under Shape, not down by
+        # Volume, so it reads as part of "what this oscillator's wave looks like" rather than a
+        # mixing control.
         self.vco1_pulse_box = QWidget()
         v1_pw_lay = QVBoxLayout(self.vco1_pulse_box)
         v1_pw_lay.setContentsMargins(0, 2, 0, 0)
-        v1_pw_lay.addWidget(QLabel("Pulse Width"), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.vco1_pulse_width = PotentiometerKnob("O1 Pulse Width", self)
-        self.vco1_pulse_width.setRange(2, 98)
+        self.vco1_pulse_label = QLabel("Pulse Width")
+        self.vco1_pulse_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v1_pw_lay.addWidget(self.vco1_pulse_label)
+        self.vco1_pulse_width = PotentiometerKnob("O1 Pulse Width/Tilt", self)
+        self.vco1_pulse_width.setRange(-100, 100)
         self.vco1_pulse_width.setValue(50)
         v1_pw_lay.addWidget(self.vco1_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
         _retain_hidden(self.vco1_pulse_box)
@@ -2041,19 +2127,20 @@ class SynthGui(QWidget):
         v2_strip.addWidget(self.vco2_vis, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.vco2_combo = QComboBox()
-        self.vco2_combo.addItems(["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample"])
+        self.vco2_combo.addItems(OSC_SHAPE_NAMES)
         self.vco2_combo.setCurrentIndex(3)
         v2_strip.addWidget(self.vco2_combo)
 
-        # Pulse Width is a direct sub-parameter of the Shape choice (only meaningful when Shape
-        # is Pulse) -- kept right under Shape, not down by Volume, so it reads as part of "what
-        # this oscillator's wave looks like" rather than a mixing control.
+        # Dual-duty Pulse Width (Shape=Pulse) / Tilt (Shape=Noise) knob -- see Osc 1's own
+        # comment above.
         self.vco2_pulse_box = QWidget()
         v2_pw_lay = QVBoxLayout(self.vco2_pulse_box)
         v2_pw_lay.setContentsMargins(0, 2, 0, 0)
-        v2_pw_lay.addWidget(QLabel("Pulse Width"), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.vco2_pulse_width = PotentiometerKnob("O2 Pulse Width", self)
-        self.vco2_pulse_width.setRange(2, 98)
+        self.vco2_pulse_label = QLabel("Pulse Width")
+        self.vco2_pulse_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v2_pw_lay.addWidget(self.vco2_pulse_label)
+        self.vco2_pulse_width = PotentiometerKnob("O2 Pulse Width/Tilt", self)
+        self.vco2_pulse_width.setRange(-100, 100)
         self.vco2_pulse_width.setValue(50)
         v2_pw_lay.addWidget(self.vco2_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
         _retain_hidden(self.vco2_pulse_box)
@@ -2142,82 +2229,231 @@ class SynthGui(QWidget):
         v2_strip.addLayout(v2_vol_layout)
         mixer_lay.addLayout(v2_strip)
 
-        # Noise Strip Configuration
-        noise_strip = QVBoxLayout()
-        noise_strip.setSpacing(4)
-        noise_strip.addWidget(QLabel("<b>Noise</b>"), alignment=Qt.AlignmentFlag.AlignCenter)
+        # Oscillator 3 Strip Configuration -- a full peer of Osc 1/2 (was the dedicated Noise
+        # oscillator; now selects its shape from the same OSC_SHAPE_NAMES palette, including Off).
+        v3_strip = QVBoxLayout()
+        v3_strip.setSpacing(4)
+        v3_strip.addWidget(QLabel("<b>Osc 3</b>"), alignment=Qt.AlignmentFlag.AlignCenter)
 
-        self.noise_vis = WaveformVisualizer()
-        self.noise_vis.set_waveform(5, is_lfo=False)
-        noise_strip.addWidget(self.noise_vis, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco3_vis = WaveformVisualizer()
+        v3_strip.addWidget(self.vco3_vis, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        noise_tilt_lay = QVBoxLayout()
-        noise_tilt_lay.addWidget(QLabel("Tilt"), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.noise_tilt = PotentiometerKnob("Noise Tilt", self)
-        self.noise_tilt.setRange(-100, 100)
-        self.noise_tilt.setValue(0)
-        noise_tilt_lay.addWidget(self.noise_tilt, alignment=Qt.AlignmentFlag.AlignCenter)
-        noise_strip.addLayout(noise_tilt_lay)
-        noise_strip.addStretch()
+        self.vco3_combo = QComboBox()
+        self.vco3_combo.addItems(OSC_SHAPE_NAMES)
+        self.vco3_combo.setCurrentIndex(5)  # Noise, matching the old dedicated Noise oscillator's default
+        v3_strip.addWidget(self.vco3_combo)
 
-        noise_vol_layout = QVBoxLayout()
-        noise_vol_layout.setSpacing(2)
-        noise_vol_layout.addWidget(QLabel("Vol:"), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.noise_vol = ResetSlider(Qt.Orientation.Vertical, 0)
-        self.noise_vol.setRange(0, 100)
-        self.noise_vol.setFixedHeight(80)
-        noise_vol_layout.addWidget(self.noise_vol, alignment=Qt.AlignmentFlag.AlignCenter)
+        # Dual-duty Pulse Width (Shape=Pulse) / Tilt (Shape=Noise) knob -- one physical knob/wire
+        # field serving both meanings, exactly like Osc 1/2's own pulse_width (see backend.c's
+        # Tilt-noise unification). Label text switches between "Pulse Width" and "Tilt" based on
+        # the selected shape (wired below, alongside the other combo-driven visibility rules).
+        self.vco3_pulse_box = QWidget()
+        v3_pw_lay = QVBoxLayout(self.vco3_pulse_box)
+        v3_pw_lay.setContentsMargins(0, 2, 0, 0)
+        self.vco3_pulse_label = QLabel("Tilt")
+        self.vco3_pulse_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v3_pw_lay.addWidget(self.vco3_pulse_label)
+        self.vco3_pulse_width = PotentiometerKnob("O3 Pulse Width/Tilt", self)
+        self.vco3_pulse_width.setRange(-100, 100)
+        self.vco3_pulse_width.setValue(0)
+        v3_pw_lay.addWidget(self.vco3_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
+        _retain_hidden(self.vco3_pulse_box)
+        v3_strip.addWidget(self.vco3_pulse_box)
 
-        self.noise_mute = QPushButton("M")
-        self.noise_mute.setCheckable(True)
-        self.noise_mute.setFixedSize(20, 20)
-        self.noise_mute.setStyleSheet("QPushButton:checked { background-color: red; color: white; }")
-        noise_vol_layout.addWidget(self.noise_mute, alignment=Qt.AlignmentFlag.AlignCenter)
+        v3_tune_block = QVBoxLayout()
+        v3_tune_block.addWidget(QLabel("Pitch Offset"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco3_pitch_offset = QSpinBox()
+        self.vco3_pitch_offset.setRange(-48, 48)
+        self.vco3_pitch_offset.setValue(0)
+        self.vco3_pitch_offset.setSuffix(" st")
+        self.vco3_pitch_offset.setStyleSheet("font-size: 10px; color: #00adb5; background-color: #2b2b36; font-weight: bold;")
+        self.vco3_pitch_offset.setFixedWidth(54)
+        v3_tune_block.addWidget(self.vco3_pitch_offset, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        self.noise_pan = PotentiometerKnob("Noise Pan", self)
-        self.noise_pan.setRange(-100, 100)
-        self.noise_pan.setValue(0)
-        noise_vol_layout.addWidget(self.noise_pan, alignment=Qt.AlignmentFlag.AlignCenter)
-        lbl_pn = QLabel("Pan"); lbl_pn.setAlignment(Qt.AlignmentFlag.AlignCenter); lbl_pn.setStyleSheet("font-size: 9px;")
-        noise_vol_layout.addWidget(lbl_pn)
-        noise_strip.addLayout(noise_vol_layout)
-        mixer_lay.addLayout(noise_strip)
-        # Sub Strip Configuration
-        sub_strip = QVBoxLayout()
-        sub_strip.setSpacing(4)
-        sub_strip.addWidget(QLabel("<b>Sub</b>"), alignment=Qt.AlignmentFlag.AlignCenter)
+        v3_fine_lay = QVBoxLayout()
+        v3_fine_lay.addWidget(QLabel("Fine"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco3_fine_tune = QSpinBox()
+        self.vco3_fine_tune.setRange(-100, 100)
+        self.vco3_fine_tune.setValue(0)
+        self.vco3_fine_tune.setSuffix(" c")
+        self.vco3_fine_tune.setStyleSheet("font-size: 10px; color: #00adb5; background-color: #2b2b36; font-weight: bold;")
+        self.vco3_fine_tune.setFixedWidth(54)
+        v3_fine_lay.addWidget(self.vco3_fine_tune, alignment=Qt.AlignmentFlag.AlignCenter)
+        v3_tune_block.addLayout(v3_fine_lay)
 
-        self.sub_vis = WaveformVisualizer()
-        sub_strip.addWidget(self.sub_vis, alignment=Qt.AlignmentFlag.AlignCenter)
+        v3_phase_lay = QVBoxLayout()
+        v3_phase_lay.addWidget(QLabel("Phase"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco3_phase = PotentiometerKnob("O3 Phase", self)
+        self.vco3_phase.setRange(0, 360)
+        self.vco3_phase.setValue(0)
+        v3_phase_lay.addWidget(self.vco3_phase, alignment=Qt.AlignmentFlag.AlignCenter)
+        v3_tune_block.addLayout(v3_phase_lay)
+        v3_strip.addLayout(v3_tune_block)
 
-        self.sub_combo = QComboBox()
-        self.sub_combo.addItems(["Saw", "Square", "Triangle", "Sine"])
-        self.sub_combo.setCurrentIndex(1)
-        sub_strip.addWidget(self.sub_combo)
-        sub_strip.addStretch()
+        self.vco3_unison_box = QWidget()
+        v3_unison_lay = QHBoxLayout(self.vco3_unison_box)
+        v3_unison_lay.setContentsMargins(0, 2, 0, 0)
+        v3_unison_lay.setSpacing(6)
 
-        sub_vol_layout = QVBoxLayout()
-        sub_vol_layout.setSpacing(2)
-        sub_vol_layout.addWidget(QLabel("Vol:"), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.sub_vol = ResetSlider(Qt.Orientation.Vertical, 0)
-        self.sub_vol.setRange(0, 100)
-        self.sub_vol.setFixedHeight(80)
-        sub_vol_layout.addWidget(self.sub_vol, alignment=Qt.AlignmentFlag.AlignCenter)
+        v3_unison_w_col = QVBoxLayout()
+        v3_unison_w_col.addWidget(QLabel("Width"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco3_unison_width = PotentiometerKnob("O3 Width", self)
+        self.vco3_unison_width.setRange(0, 100)
+        self.vco3_unison_width.setValue(50)
+        v3_unison_w_col.addWidget(self.vco3_unison_width, alignment=Qt.AlignmentFlag.AlignCenter)
+        v3_unison_lay.addLayout(v3_unison_w_col)
 
-        self.sub_mute = QPushButton("M")
-        self.sub_mute.setCheckable(True)
-        self.sub_mute.setFixedSize(20, 20)
-        self.sub_mute.setStyleSheet("QPushButton:checked { background-color: red; color: white; }")
-        sub_vol_layout.addWidget(self.sub_mute, alignment=Qt.AlignmentFlag.AlignCenter)
+        v3_unison_d_col = QVBoxLayout()
+        v3_unison_d_col.addWidget(QLabel("Detune"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco3_unison_detune = PotentiometerKnob("O3 Detune", self)
+        self.vco3_unison_detune.setRange(0, 4200)
+        self.vco3_unison_detune.setValue(25)
+        self.vco3_unison_detune.value_formatter = _format_semitones_cents
+        v3_unison_d_col.addWidget(self.vco3_unison_detune, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        self.sub_pan = PotentiometerKnob("Sub Pan", self)
-        self.sub_pan.setRange(-100, 100)
-        self.sub_pan.setValue(0)
-        sub_vol_layout.addWidget(self.sub_pan, alignment=Qt.AlignmentFlag.AlignCenter)
-        lbl_ps = QLabel("Pan"); lbl_ps.setAlignment(Qt.AlignmentFlag.AlignCenter); lbl_ps.setStyleSheet("font-size: 9px;")
-        sub_vol_layout.addWidget(lbl_ps)
-        sub_strip.addLayout(sub_vol_layout)
-        mixer_lay.addLayout(sub_strip)
+        self.vco3_unison_detune_readout = QLabel(_format_semitones_cents(25))
+        self.vco3_unison_detune_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.vco3_unison_detune_readout.setStyleSheet("font-size: 8px;")
+        v3_unison_d_col.addWidget(self.vco3_unison_detune_readout)
+        self.vco3_unison_detune.valueChanged.connect(lambda v: self.vco3_unison_detune_readout.setText(_format_semitones_cents(v)))
+        v3_unison_lay.addLayout(v3_unison_d_col)
+        _retain_hidden(self.vco3_unison_box)
+        v3_strip.addWidget(self.vco3_unison_box)
+
+        v3_vol_layout = QVBoxLayout()
+        v3_vol_layout.setSpacing(2)
+        v3_vol_layout.addWidget(QLabel("Vol:"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco3_vol = ResetSlider(Qt.Orientation.Vertical, 0)
+        self.vco3_vol.setRange(0, 100)
+        self.vco3_vol.setFixedHeight(80)
+        v3_vol_layout.addWidget(self.vco3_vol, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.vco3_mute = QPushButton("M")
+        self.vco3_mute.setCheckable(True)
+        self.vco3_mute.setFixedSize(20, 20)
+        self.vco3_mute.setStyleSheet("QPushButton:checked { background-color: red; color: white; }")
+        v3_vol_layout.addWidget(self.vco3_mute, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.vco3_pan = PotentiometerKnob("O3 Pan", self)
+        self.vco3_pan.setRange(-100, 100)
+        self.vco3_pan.setValue(0)
+        v3_vol_layout.addWidget(self.vco3_pan, alignment=Qt.AlignmentFlag.AlignCenter)
+        lbl_p3 = QLabel("Pan"); lbl_p3.setAlignment(Qt.AlignmentFlag.AlignCenter); lbl_p3.setStyleSheet("font-size: 9px;")
+        v3_vol_layout.addWidget(lbl_p3)
+        v3_strip.addLayout(v3_vol_layout)
+        mixer_lay.addLayout(v3_strip)
+
+        # Oscillator 4 Strip Configuration -- a full peer of Osc 1/2/3, replacing the old fixed
+        # "Sub" oscillator (which had no shape choice beyond Saw/Square/Triangle/Sine, no pitch
+        # controls of its own, and always tracked exactly one octave below Osc 1). Set
+        # vco4_pitch_offset to -12 to reproduce that old fixed-octave-down behavior manually.
+        v4_strip = QVBoxLayout()
+        v4_strip.setSpacing(4)
+        v4_strip.addWidget(QLabel("<b>Osc 4</b>"), alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.vco4_vis = WaveformVisualizer()
+        v4_strip.addWidget(self.vco4_vis, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.vco4_combo = QComboBox()
+        self.vco4_combo.addItems(OSC_SHAPE_NAMES)
+        self.vco4_combo.setCurrentIndex(8)  # Off by default -- silent until configured, like Sub's old vol=0 default
+        v4_strip.addWidget(self.vco4_combo)
+
+        self.vco4_pulse_box = QWidget()
+        v4_pw_lay = QVBoxLayout(self.vco4_pulse_box)
+        v4_pw_lay.setContentsMargins(0, 2, 0, 0)
+        self.vco4_pulse_label = QLabel("Pulse Width")
+        self.vco4_pulse_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v4_pw_lay.addWidget(self.vco4_pulse_label)
+        self.vco4_pulse_width = PotentiometerKnob("O4 Pulse Width/Tilt", self)
+        self.vco4_pulse_width.setRange(-100, 100)
+        self.vco4_pulse_width.setValue(50)
+        v4_pw_lay.addWidget(self.vco4_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
+        _retain_hidden(self.vco4_pulse_box)
+        v4_strip.addWidget(self.vco4_pulse_box)
+
+        v4_tune_block = QVBoxLayout()
+        v4_tune_block.addWidget(QLabel("Pitch Offset"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco4_pitch_offset = QSpinBox()
+        self.vco4_pitch_offset.setRange(-48, 48)
+        self.vco4_pitch_offset.setValue(-12)  # matches the old Sub's fixed octave-down, as a starting point
+        self.vco4_pitch_offset.setSuffix(" st")
+        self.vco4_pitch_offset.setStyleSheet("font-size: 10px; color: #00adb5; background-color: #2b2b36; font-weight: bold;")
+        self.vco4_pitch_offset.setFixedWidth(54)
+        v4_tune_block.addWidget(self.vco4_pitch_offset, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        v4_fine_lay = QVBoxLayout()
+        v4_fine_lay.addWidget(QLabel("Fine"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco4_fine_tune = QSpinBox()
+        self.vco4_fine_tune.setRange(-100, 100)
+        self.vco4_fine_tune.setValue(0)
+        self.vco4_fine_tune.setSuffix(" c")
+        self.vco4_fine_tune.setStyleSheet("font-size: 10px; color: #00adb5; background-color: #2b2b36; font-weight: bold;")
+        self.vco4_fine_tune.setFixedWidth(54)
+        v4_fine_lay.addWidget(self.vco4_fine_tune, alignment=Qt.AlignmentFlag.AlignCenter)
+        v4_tune_block.addLayout(v4_fine_lay)
+
+        v4_phase_lay = QVBoxLayout()
+        v4_phase_lay.addWidget(QLabel("Phase"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco4_phase = PotentiometerKnob("O4 Phase", self)
+        self.vco4_phase.setRange(0, 360)
+        self.vco4_phase.setValue(0)
+        v4_phase_lay.addWidget(self.vco4_phase, alignment=Qt.AlignmentFlag.AlignCenter)
+        v4_tune_block.addLayout(v4_phase_lay)
+        v4_strip.addLayout(v4_tune_block)
+
+        self.vco4_unison_box = QWidget()
+        v4_unison_lay = QHBoxLayout(self.vco4_unison_box)
+        v4_unison_lay.setContentsMargins(0, 2, 0, 0)
+        v4_unison_lay.setSpacing(6)
+
+        v4_unison_w_col = QVBoxLayout()
+        v4_unison_w_col.addWidget(QLabel("Width"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco4_unison_width = PotentiometerKnob("O4 Width", self)
+        self.vco4_unison_width.setRange(0, 100)
+        self.vco4_unison_width.setValue(50)
+        v4_unison_w_col.addWidget(self.vco4_unison_width, alignment=Qt.AlignmentFlag.AlignCenter)
+        v4_unison_lay.addLayout(v4_unison_w_col)
+
+        v4_unison_d_col = QVBoxLayout()
+        v4_unison_d_col.addWidget(QLabel("Detune"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco4_unison_detune = PotentiometerKnob("O4 Detune", self)
+        self.vco4_unison_detune.setRange(0, 4200)
+        self.vco4_unison_detune.setValue(25)
+        self.vco4_unison_detune.value_formatter = _format_semitones_cents
+        v4_unison_d_col.addWidget(self.vco4_unison_detune, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.vco4_unison_detune_readout = QLabel(_format_semitones_cents(25))
+        self.vco4_unison_detune_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.vco4_unison_detune_readout.setStyleSheet("font-size: 8px;")
+        v4_unison_d_col.addWidget(self.vco4_unison_detune_readout)
+        self.vco4_unison_detune.valueChanged.connect(lambda v: self.vco4_unison_detune_readout.setText(_format_semitones_cents(v)))
+        v4_unison_lay.addLayout(v4_unison_d_col)
+        _retain_hidden(self.vco4_unison_box)
+        v4_strip.addWidget(self.vco4_unison_box)
+
+        v4_vol_layout = QVBoxLayout()
+        v4_vol_layout.setSpacing(2)
+        v4_vol_layout.addWidget(QLabel("Vol:"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco4_vol = ResetSlider(Qt.Orientation.Vertical, 0)
+        self.vco4_vol.setRange(0, 100)
+        self.vco4_vol.setFixedHeight(80)
+        v4_vol_layout.addWidget(self.vco4_vol, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.vco4_mute = QPushButton("M")
+        self.vco4_mute.setCheckable(True)
+        self.vco4_mute.setFixedSize(20, 20)
+        self.vco4_mute.setStyleSheet("QPushButton:checked { background-color: red; color: white; }")
+        v4_vol_layout.addWidget(self.vco4_mute, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.vco4_pan = PotentiometerKnob("O4 Pan", self)
+        self.vco4_pan.setRange(-100, 100)
+        self.vco4_pan.setValue(0)
+        v4_vol_layout.addWidget(self.vco4_pan, alignment=Qt.AlignmentFlag.AlignCenter)
+        lbl_p4 = QLabel("Pan"); lbl_p4.setAlignment(Qt.AlignmentFlag.AlignCenter); lbl_p4.setStyleSheet("font-size: 9px;")
+        v4_vol_layout.addWidget(lbl_p4)
+        v4_strip.addLayout(v4_vol_layout)
+        mixer_lay.addLayout(v4_strip)
 
         mixer_group.setLayout(mixer_lay)
         osc_outer_lay.addWidget(mixer_group, stretch=4)
@@ -2229,7 +2465,8 @@ class SynthGui(QWidget):
 
         self.vco1_amp_eg = ADSRPanel("Osc 1 Amp EG", (1, 1000), (1, 2000), (1, 2000))
         self.vco2_amp_eg = ADSRPanel("Osc 2 Amp EG", (1, 1000), (1, 2000), (1, 2000))
-        self.noise_amp_eg = ADSRPanel("Noise Amp EG", (1, 1000), (1, 2000), (1, 2000))
+        self.vco3_amp_eg = ADSRPanel("Osc 3 Amp EG", (1, 1000), (1, 2000), (1, 2000))
+        self.vco4_amp_eg = ADSRPanel("Osc 4 Amp EG", (1, 1000), (1, 2000), (1, 2000))
 
         self.btn_sync_amp_eg = QPushButton("1\u21922")
         self.btn_sync_amp_eg.setFixedSize(30, 16)
@@ -2238,10 +2475,10 @@ class SynthGui(QWidget):
         self.vco1_amp_eg.title_layout.addWidget(self.btn_sync_amp_eg)
         self.btn_sync_amp_eg.clicked.connect(lambda: self.vco2_amp_eg.set_state(self.vco1_amp_eg.get_state()))
 
-        # Osc 2 and Noise have no sync button of their own -- reserve the exact same footprint
-        # in their title rows anyway so all three panels stay the same height/alignment instead
-        # of only Osc 1's row being taller.
-        for panel in (self.vco2_amp_eg, self.noise_amp_eg):
+        # Osc 2/3/4 have no sync button of their own -- reserve the exact same footprint in their
+        # title rows anyway so all four panels stay the same height/alignment instead of only
+        # Osc 1's row being taller.
+        for panel in (self.vco2_amp_eg, self.vco3_amp_eg, self.vco4_amp_eg):
             sync_btn_spacer = QWidget()
             sync_btn_spacer.setFixedSize(30, 16)
             _retain_hidden(sync_btn_spacer)
@@ -2250,7 +2487,8 @@ class SynthGui(QWidget):
 
         amp_eg_lay.addWidget(self.vco1_amp_eg)
         amp_eg_lay.addWidget(self.vco2_amp_eg)
-        amp_eg_lay.addWidget(self.noise_amp_eg)
+        amp_eg_lay.addWidget(self.vco3_amp_eg)
+        amp_eg_lay.addWidget(self.vco4_amp_eg)
         amp_eg_group.setLayout(amp_eg_lay)
 
         osc_outer_lay.addWidget(amp_eg_group, stretch=6)
@@ -2475,7 +2713,7 @@ class SynthGui(QWidget):
         self.lfo_phase_dials = []
         # Modulation Source (right-click on an LFO's Depth pot): -1.0 = None, 0.0-127.0 = that
         # MIDI CC number, 128.0 = channel aftertouch. Mirrors PackLfoParams.mod_source_cc.
-        self.lfo_mod_source_cc = [-1.0, -1.0, -1.0, -1.0]
+        self.lfo_mod_source_cc = [-1.0] * LFO_COUNT
         # Common Modulation Source choices offered on every LFO's right-click menu.
         self._MOD_SOURCE_PRESETS = [
             ("None", -1.0),
@@ -2503,19 +2741,25 @@ class SynthGui(QWidget):
             "Osc 1 Phase", "Osc 2 Phase", "O1 Unison Detune", "O2 Unison Detune",
             "LFO 1 Phase", "LFO 2 Phase", "LFO 3 Phase", "LFO 4 Phase",
             # Added for full oscillator/mixer coverage: pan (targets 32/33), pulse width
-            # (34/35, only audible when that oscillator's Shape is Pulse), and the Noise/Sub
-            # sources' own amp/pan/tilt (36-40) -- previously only reachable by hand.
+            # (34/35, only audible when that oscillator's Shape is Pulse), and Osc 3/4's own
+            # amp/pan/tilt (36-40, targets 36/37/38 were "Noise Amp/Pan/Tilt" and 39/40 were
+            # "Sub Amp/Pan" before Osc 3/4 became full peers -- same target numbers, relabeled).
             "Osc 1 Pan", "Osc 2 Pan", "Osc 1 Pulse Width", "Osc 2 Pulse Width",
-            "Noise Amp", "Noise Pan", "Noise Tilt", "Sub Amp", "Sub Pan",
+            "Osc 3 Amp", "Osc 3 Pan", "Osc 3 Tilt", "Osc 4 Amp", "Osc 4 Pan",
+            # Osc 3/4 pitch/phase/unison-detune + Osc 4 tilt (targets 41-47, appended -- see
+            # backend.c's render_audio_block dispatch loops).
+            "Osc 3 Pitch", "Osc 4 Pitch", "Osc 3 Phase", "Osc 4 Phase",
+            "Osc 3 Unison Detune", "Osc 4 Unison Detune", "Osc 4 Tilt",
         ]
 
-        for x in range(1, 5):
+        for x in range(1, LFO_COUNT + 1):
             lfo_row = QHBoxLayout()
             lfo_row.setSpacing(4)
             lfo_row.addWidget(QLabel(f"<b>LFO {x}</b>"))
 
             combo = QComboBox()
-            combo.addItems(["Tri", "Sine", "Saw", "Sq"])
+            combo.addItems(["Tri", "Sine", "Saw", "Sq", "Off"])
+            combo.setCurrentIndex(4)  # Off by default (per-user request: all 16 LFOs start bypassed)
             combo.setStyleSheet("font-size: 10px;")
             vis = WaveformVisualizer()
             self.lfo_visualizers.append(vis)
@@ -2576,8 +2820,12 @@ class SynthGui(QWidget):
         # to the top fixes that at both levels.
         lfo_layout.addStretch()
         lfo_group.setLayout(lfo_layout)
-        lfo_outer_lay.addWidget(lfo_group)
-        lfo_outer_lay.addStretch()
+        # 16 LFO rows don't fit in a fixed-height panel -- wrap in a QScrollArea (same pattern as
+        # the EG/FX tabs) so the window can still be resized/shrunk freely.
+        lfo_scroll = QScrollArea()
+        lfo_scroll.setWidgetResizable(True)
+        lfo_scroll.setWidget(lfo_group)
+        lfo_outer_lay.addWidget(lfo_scroll)
         # ----------------------------------------------------
         # EGs TAB CONTENT
         # ----------------------------------------------------
@@ -3015,6 +3263,18 @@ class SynthGui(QWidget):
         mode_row.addStretch()
         output_lay.addLayout(mode_row)
 
+        format_row = QHBoxLayout()
+        format_row.addWidget(QLabel("Format:"))
+        self.record_format_wav = QRadioButton("WAV")
+        self.record_format_wav.setChecked(True)
+        self.record_format_wav.setToolTip("32-bit float, lossless, larger files -- the widest-compatibility choice.")
+        self.record_format_wavpack = QRadioButton("WavPack (Recommended)")
+        self.record_format_wavpack.setToolTip("Lossless compression (~40-60% smaller than WAV), encoded off the realtime audio thread.")
+        format_row.addWidget(self.record_format_wav)
+        format_row.addWidget(self.record_format_wavpack)
+        format_row.addStretch()
+        output_lay.addLayout(format_row)
+
         folder_row = QHBoxLayout()
         folder_row.addWidget(QLabel("Folder:"))
         self.record_folder = os.path.expanduser("~/HDS_Recordings")
@@ -3027,7 +3287,7 @@ class SynthGui(QWidget):
         folder_row.addWidget(self.btn_browse_record_folder)
         output_lay.addLayout(folder_row)
 
-        folder_note = QLabel("Each take is named HDS_<timestamp>.wav in this folder, so consecutive takes never collide.")
+        folder_note = QLabel("Each take is named HDS_<timestamp>.wav (or .wv for WavPack) in this folder, so consecutive takes never collide.")
         folder_note.setStyleSheet("font-size: 9px; color: #888;")
         folder_note.setWordWrap(True)
         output_lay.addWidget(folder_note)
@@ -3129,25 +3389,37 @@ class SynthGui(QWidget):
         outer_layout.addWidget(self.tab_widget, stretch=5)
         self.setLayout(outer_layout)
 
-        # Connect visualizer hooks to drive static icon drawings
-        self.vco1_combo.currentIndexChanged.connect(lambda idx: self.vco1_vis.set_waveform(idx, is_lfo=False))
-        self.vco2_combo.currentIndexChanged.connect(lambda idx: self.vco2_vis.set_waveform(idx, is_lfo=False))
-        self.vco1_vis.set_waveform(self.vco1_combo.currentIndex(), is_lfo=False)
-        self.vco2_vis.set_waveform(self.vco2_combo.currentIndex(), is_lfo=False)
-        self.sub_combo.currentIndexChanged.connect(lambda idx: self.sub_vis.set_waveform(idx, is_lfo=False))
-        self.sub_vis.set_waveform(self.sub_combo.currentIndex(), is_lfo=False)
+        # Connect visualizer hooks to drive static icon drawings, and the Unison Saw/dual-duty
+        # Pulse-Width-or-Tilt boxes' visibility, identically for all 4 oscillators (they all share
+        # the exact same OSC_SHAPE_NAMES palette now).
+        UNISON_SAW_INDEX = OSC_SHAPE_NAMES.index("Unison Saw")
+        NOISE_INDEX = OSC_SHAPE_NAMES.index("Noise")
+        PULSE_INDEX = OSC_SHAPE_NAMES.index("Pulse")
 
-        UNISON_SAW_INDEX = 4
-        PULSE_INDEX = 6
-        self.vco1_combo.currentIndexChanged.connect(lambda idx: self.vco1_unison_box.setVisible(idx == UNISON_SAW_INDEX))
-        self.vco2_combo.currentIndexChanged.connect(lambda idx: self.vco2_unison_box.setVisible(idx == UNISON_SAW_INDEX))
-        self.vco1_unison_box.setVisible(self.vco1_combo.currentIndex() == UNISON_SAW_INDEX)
-        self.vco2_unison_box.setVisible(self.vco2_combo.currentIndex() == UNISON_SAW_INDEX)
+        def _wire_osc_strip(combo, vis, unison_box, pulse_box, pulse_label, pulse_knob):
+            def on_shape_changed(idx):
+                vis.set_waveform(idx, is_lfo=False)
+                unison_box.setVisible(idx == UNISON_SAW_INDEX)
+                pulse_box.setVisible(idx in (PULSE_INDEX, NOISE_INDEX))
+                if idx == NOISE_INDEX:
+                    pulse_label.setText("Tilt")
+                else:
+                    pulse_label.setText("Pulse Width")
+            combo.currentIndexChanged.connect(on_shape_changed)
+            on_shape_changed(combo.currentIndex())
 
-        self.vco1_combo.currentIndexChanged.connect(lambda idx: self.vco1_pulse_box.setVisible(idx == PULSE_INDEX))
-        self.vco2_combo.currentIndexChanged.connect(lambda idx: self.vco2_pulse_box.setVisible(idx == PULSE_INDEX))
-        self.vco1_pulse_box.setVisible(self.vco1_combo.currentIndex() == PULSE_INDEX)
-        self.vco2_pulse_box.setVisible(self.vco2_combo.currentIndex() == PULSE_INDEX)
+        _wire_osc_strip(self.vco1_combo, self.vco1_vis, self.vco1_unison_box, self.vco1_pulse_box, self.vco1_pulse_label, self.vco1_pulse_width)
+        _wire_osc_strip(self.vco2_combo, self.vco2_vis, self.vco2_unison_box, self.vco2_pulse_box, self.vco2_pulse_label, self.vco2_pulse_width)
+        _wire_osc_strip(self.vco3_combo, self.vco3_vis, self.vco3_unison_box, self.vco3_pulse_box, self.vco3_pulse_label, self.vco3_pulse_width)
+        _wire_osc_strip(self.vco4_combo, self.vco4_vis, self.vco4_unison_box, self.vco4_pulse_box, self.vco4_pulse_label, self.vco4_pulse_width)
+
+        # FM Algorithm: show only the depth dial(s) the selected algorithm actually uses.
+        def _on_fm_algorithm_changed(idx):
+            active_depths = set(FM_ALGORITHMS[idx]["depths"]) if 0 <= idx < len(FM_ALGORITHMS) else set()
+            for key, row_widget in self.fm_depth_rows.items():
+                row_widget.setVisible(key in active_depths)
+        self.fm_algorithm_combo.currentIndexChanged.connect(_on_fm_algorithm_changed)
+        _on_fm_algorithm_changed(self.fm_algorithm_combo.currentIndex())
     def randomize_assignable_egs(self):
         for i, panel in enumerate(self.envelopes):
             a_lo, a_hi = panel.dials["A"].value_range()
@@ -3339,7 +3611,8 @@ class SynthGui(QWidget):
     def _generate_record_filename(self):
         os.makedirs(self.record_folder, exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        return os.path.join(self.record_folder, f"HDS_{stamp}.wav")
+        ext = "wv" if self.record_format_wavpack.isChecked() else "wav"
+        return os.path.join(self.record_folder, f"HDS_{stamp}.{ext}")
 
     def _update_record_button_enabled(self, *_args):
         any_source = self.record_synth_output_cb.isChecked() or any(cb.isChecked() for cb in self.record_input_channel_cbs)
@@ -3498,7 +3771,7 @@ class SynthGui(QWidget):
         vassign = 1.0 if self.poly_radio.isChecked() else 0.0
         v1_shape = float(self.vco1_combo.currentIndex())
         v2_shape = float(self.vco2_combo.currentIndex())
-        fm = float(self.fm_dial.value()) / 100.0
+        fm = float(self.fm_depth_dials["fm_intensity"].value()) / 100.0
 
         # Raw layout mixing levels
         v1_vol = float(self.vco1_vol.value()) / 100.0
@@ -3515,9 +3788,9 @@ class SynthGui(QWidget):
         # Baseline header list: Maps 13 core parameter elements exactly
         packet_list = [vassign, v1_shape, v2_shape, fm, v1_vol, v2_vol, g_time, m_vol, v1_p, v2_p, v1_fine, v2_pitch, v2_fine]
 
-        # Pack 8 parameters (D, H, A, Dec, S, R, Attack Start, Attack Peak) for all 9 envelope instances (+72 items)
-        # Order matches C struct exactly: Osc 1 Amp, Osc 2 Amp, Noise Amp, then EG 1-6.
-        all_panels = [self.vco1_amp_eg, self.vco2_amp_eg, self.noise_amp_eg] + self.envelopes
+        # Pack 8 parameters (D, H, A, Dec, S, R, Attack Start, Attack Peak) for all 10 envelope
+        # instances (+80 items). Order matches C struct exactly: Osc 1-4 Amp, then EG 1-6.
+        all_panels = [self.vco1_amp_eg, self.vco2_amp_eg, self.vco3_amp_eg, self.vco4_amp_eg] + self.envelopes
         for panel in all_panels:
             packet_list.append(float(panel.dials["D"].value()))
             packet_list.append(float(panel.dials["H"].value()))
@@ -3557,8 +3830,8 @@ class SynthGui(QWidget):
         packet_list.append(float(self.q_dials[4].value()))
         packet_list.append(float(self.vcf_poles[4].currentIndex()))
         packet_list.append(float(self.vcf_types[4].currentIndex()))
-        # Add active LFO configurations (+28 items, incl. phase offset + mod source CC)
-        for idx in range(4):
+        # Add active LFO configurations (+112 items, incl. phase offset + mod source CC)
+        for idx in range(LFO_COUNT):
             lfo_hz = float(self.lfo_dials[idx].value()) / 10.0
             self.lfo_readouts[idx].setText(f"{lfo_hz:.1f} Hz")
             lfo_dp = float(self.lfo_depth_dials[idx].value()) / 100.0
@@ -3577,11 +3850,12 @@ class SynthGui(QWidget):
         for idx in range(6):
             packet_list.append(float(self.eg_dest_combos[idx].currentIndex()))
 
-        # Append the 9 active envelope mode selection indices (+9 items).
-        # Sequence matches C struct exactly: Osc 1 Amp, Osc 2 Amp, Noise Amp, then EG 1-6.
+        # Append the 10 active envelope mode selection indices (+10 items).
+        # Sequence matches C struct exactly: Osc 1-4 Amp, then EG 1-6.
         packet_list.append(float(self.vco1_amp_eg.combo_type.currentIndex()))
         packet_list.append(float(self.vco2_amp_eg.combo_type.currentIndex()))
-        packet_list.append(float(self.noise_amp_eg.combo_type.currentIndex()))
+        packet_list.append(float(self.vco3_amp_eg.combo_type.currentIndex()))
+        packet_list.append(float(self.vco4_amp_eg.combo_type.currentIndex()))
         for env in self.envelopes:
             packet_list.append(float(env.combo_type.currentIndex()))
         # Append the 4 Unison Saw shape controls (+4 items)
@@ -3597,8 +3871,8 @@ class SynthGui(QWidget):
         packet_list.append(1.0 if self.vco1_mute.isChecked() else 0.0)
         packet_list.append(1.0 if self.vco2_mute.isChecked() else 0.0)
 
-        # Hard Sync (+1 item)
-        packet_list.append(1.0 if self.hard_sync_checkbox.isChecked() else 0.0)
+        # Hard Sync mode: 0=Off, 1=Parallel, 2=Serial (+1 item)
+        packet_list.append(float(self.hard_sync_combo.currentIndex()))
 
         # Phase pots, degrees 0-360 (+2 items)
         packet_list.append(float(self.vco1_phase.value()))
@@ -3609,17 +3883,17 @@ class SynthGui(QWidget):
         packet_list.append(float(self.vco1_pulse_width.value()))
         packet_list.append(float(self.vco2_pulse_width.value()))
 
-        # Dedicated Noise Oscillator: vol, pan, mute, tilt (+4 items)
-        packet_list.append(float(self.noise_vol.value()) / 100.0)
-        packet_list.append(float(self.noise_pan.value()) / 100.0)
-        packet_list.append(1.0 if self.noise_mute.isChecked() else 0.0)
-        packet_list.append(float(self.noise_tilt.value()))
+        # Osc 3: vol, pan, mute, pulse-width-or-tilt (+4 items)
+        packet_list.append(float(self.vco3_vol.value()) / 100.0)
+        packet_list.append(float(self.vco3_pan.value()) / 100.0)
+        packet_list.append(1.0 if self.vco3_mute.isChecked() else 0.0)
+        packet_list.append(float(self.vco3_pulse_width.value()))
 
-        # Sub Oscillator: shape, vol, pan, mute (+4 items)
-        packet_list.append(float(self.sub_combo.currentIndex()))
-        packet_list.append(float(self.sub_vol.value()) / 100.0)
-        packet_list.append(float(self.sub_pan.value()) / 100.0)
-        packet_list.append(1.0 if self.sub_mute.isChecked() else 0.0)
+        # Osc 4: vol, pan, mute, pulse-width-or-tilt (+4 items)
+        packet_list.append(float(self.vco4_vol.value()) / 100.0)
+        packet_list.append(float(self.vco4_pan.value()) / 100.0)
+        packet_list.append(1.0 if self.vco4_mute.isChecked() else 0.0)
+        packet_list.append(float(self.vco4_pulse_width.value()))
 
         # --- FX Bus + External Input architecture additions ---
         # This is the 151f contract's first breaking change since the 4-oscillator overhaul --
@@ -3703,26 +3977,61 @@ class SynthGui(QWidget):
         # broadcast in full on every unrelated knob turn like everything above. See
         # SAMPLE_SLOT_CAPACITY's comment in backend.c for why.
 
+        # --- Osc 3 identity/tuning (+6 items): shape, fine tune, pitch offset, phase offset,
+        # unison detune/width. Must come after the Sample Bank comment above and before Osc 4's
+        # identical block, matching backend.c's SynthSharedControls field order exactly. ---
+        packet_list.append(float(self.vco3_combo.currentIndex()))
+        packet_list.append(float(self.vco3_fine_tune.value()))
+        packet_list.append(float(self.vco3_pitch_offset.value()))
+        packet_list.append(float(self.vco3_phase.value()))
+        packet_list.append(float(self.vco3_unison_detune.value()))
+        packet_list.append(float(self.vco3_unison_width.value()))
+
+        # --- Osc 4 identity/tuning (+6 items), mirrors Osc 3's block exactly. ---
+        packet_list.append(float(self.vco4_combo.currentIndex()))
+        packet_list.append(float(self.vco4_fine_tune.value()))
+        packet_list.append(float(self.vco4_pitch_offset.value()))
+        packet_list.append(float(self.vco4_phase.value()))
+        packet_list.append(float(self.vco4_unison_detune.value()))
+        packet_list.append(float(self.vco4_unison_width.value()))
+
+        # --- FM Algorithm system (+8 items): algorithm index, then every depth field in the
+        # exact order backend.c declares them. fm_intensity itself was already sent in the
+        # baseline header (position 4, the "2->1" depth, unchanged) -- these are only the NEW
+        # depth fields plus the algorithm selector. ---
+        packet_list.append(float(self.fm_algorithm_combo.currentIndex()))
+        packet_list.append(float(self.fm_depth_dials["fm_depth_3_1"].value()) / 100.0)
+        packet_list.append(float(self.fm_depth_dials["fm_depth_3_2"].value()) / 100.0)
+        packet_list.append(float(self.fm_depth_dials["fm_depth_4_1"].value()) / 100.0)
+        packet_list.append(float(self.fm_depth_dials["fm_depth_4_3"].value()) / 100.0)
+        packet_list.append(float(self.fm_depth_dials["fm_depth_1_2"].value()) / 100.0)
+        packet_list.append(float(self.fm_depth_dials["fm_depth_3_4"].value()) / 100.0)
+        packet_list.append(float(self.fm_depth_dials["fm_depth_1_3"].value()) / 100.0)
+
+        # Recording format: 0=WAV, 1=WavPack (+1 item)
+        packet_list.append(1.0 if self.record_format_wavpack.isChecked() else 0.0)
+
         # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
-        # 13 (baseline) + 72 (9 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
+        # 13 (baseline) + 80 (10 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
         # + 1 (filter_a_mode) + 4 (filter_a) + 1 (filter_a_multi_routing) + 12 (filter_a_multi[3] * 4)
-        # + 4 (filter_b) + 28 (4 LFOs * 7, incl. phase offset + mod_source_cc)
-        # + 6 (eg_intensity) + 6 (eg_dest_target) + 9 (eg_mode)
-        # + 4 (unison saw width/detune) + 1 (mono glide randomization)
-        # + 2 (vco1/vco2 mute) + 1 (hard sync) + 2 (vco1/vco2 phase offset)
-        # + 2 (vco1/vco2 pulse width) + 4 (noise osc: vol/pan/mute/tilt) + 4 (sub osc: shape/vol/pan/mute)
+        # + 4 (filter_b) + 112 (16 LFOs * 7, incl. phase offset + mod_source_cc)
+        # + 6 (eg_intensity) + 6 (eg_dest_target) + 10 (eg_mode)
+        # + 4 (unison saw width/detune, vco1/vco2 only) + 1 (mono glide randomization)
+        # + 2 (vco1/vco2 mute) + 1 (hard sync mode) + 2 (vco1/vco2 phase offset)
+        # + 2 (vco1/vco2 pulse width) + 4 (Osc 3: vol/pan/mute/pulse-or-tilt) + 4 (Osc 4: vol/pan/mute/pulse-or-tilt)
         # + 2 (ext in enable/gain) + 132 (12 FX slots * 11) + 1 (fx_routing_mode) + 2 (pb range)
         # + 1 (sustain polarity) + 1 (audio latency) + 1 (polyphony) + 1 (block size)
         # + 19 (recording: enable/synth-output/downmix + 16 channel enables)
-        # + 34 (tempo: tempo_bpm + tempo_marker_count + 16 marker times + 16 marker bpms) = 372
-        # floats, followed by 4 fixed strings (not floats): output_device, input_device,
-        # midi_device (64 bytes each), record_path (256 bytes -- a real filesystem path needs
-        # more room than an ALSA device name). The Sample Bank's own file paths travel over the
-        # separate catalog socket instead (see transmit_zone_upsert()).
+        # + 34 (tempo: tempo_bpm + tempo_marker_count + 16 marker times + 16 marker bpms)
+        # + 6 (Osc 3 identity) + 6 (Osc 4 identity) + 8 (FM algorithm + 7 new depths)
+        # + 1 (record_format) = 486 floats, followed by 4 fixed strings (not floats):
+        # output_device, input_device, midi_device (64 bytes each), record_path (256 bytes -- a
+        # real filesystem path needs more room than an ALSA device name). The Sample Bank's own
+        # file paths travel over the separate catalog socket instead (see transmit_zone_upsert()).
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
         binary_packet = struct.pack(
-            f"372f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s",
+            f"486f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s",
             *packet_list,
             _encode_device_name(self.output_device_combo.currentText()),
             _encode_device_name(self.input_device_combo.currentText()),
@@ -3796,7 +4105,7 @@ def runtime_connect_and_bind(gui):
     # Core global mode switches
     gui.poly_radio.toggled.connect(gui.transmit_knob_packet)
     gui.mono_radio.toggled.connect(gui.transmit_knob_packet)
-    gui.hard_sync_checkbox.toggled.connect(gui.transmit_knob_packet)
+    gui.hard_sync_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
     gui.pb_range_up_spin.valueChanged.connect(gui.transmit_knob_packet)
     gui.pb_range_down_spin.valueChanged.connect(gui.transmit_knob_packet)
     gui.sustain_polarity_normal.toggled.connect(gui.transmit_knob_packet)
@@ -3812,24 +4121,38 @@ def runtime_connect_and_bind(gui):
     gui.vco2_pan.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco1_mute.toggled.connect(gui.transmit_knob_packet)
     gui.vco2_mute.toggled.connect(gui.transmit_knob_packet)
-    gui.fm_dial.valueChanged.connect(gui.transmit_knob_packet)
+    for dial in gui.fm_depth_dials.values():
+        dial.valueChanged.connect(gui.transmit_knob_packet)
+    gui.fm_algorithm_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
     gui.glide_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.glide_random_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.tempo_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco1_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco2_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
 
-    # Dedicated Noise Oscillator
-    gui.noise_vol.valueChanged.connect(gui.transmit_knob_packet)
-    gui.noise_pan.valueChanged.connect(gui.transmit_knob_packet)
-    gui.noise_mute.toggled.connect(gui.transmit_knob_packet)
-    gui.noise_tilt.valueChanged.connect(gui.transmit_knob_packet)
+    # Oscillator 3 (full peer of Osc 1/2 now, was the dedicated Noise oscillator)
+    gui.vco3_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+    gui.vco3_vol.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco3_pan.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco3_mute.toggled.connect(gui.transmit_knob_packet)
+    gui.vco3_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco3_fine_tune.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco3_pitch_offset.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco3_phase.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco3_unison_width.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco3_unison_detune.valueChanged.connect(gui.transmit_knob_packet)
 
-    # Sub Oscillator
-    gui.sub_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
-    gui.sub_vol.valueChanged.connect(gui.transmit_knob_packet)
-    gui.sub_pan.valueChanged.connect(gui.transmit_knob_packet)
-    gui.sub_mute.toggled.connect(gui.transmit_knob_packet)
+    # Oscillator 4 (full peer of Osc 1/2/3 now, was the fixed Sub oscillator)
+    gui.vco4_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+    gui.vco4_vol.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco4_pan.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco4_mute.toggled.connect(gui.transmit_knob_packet)
+    gui.vco4_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco4_fine_tune.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco4_pitch_offset.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco4_phase.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco4_unison_width.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco4_unison_detune.valueChanged.connect(gui.transmit_knob_packet)
 
     # Detuning, pitch transposition, and basic phases
     gui.vco1_fine_tune.valueChanged.connect(gui.transmit_knob_packet)
@@ -3859,7 +4182,7 @@ def runtime_connect_and_bind(gui):
     gui.vco2_unison_detune.valueChanged.connect(gui.transmit_knob_packet)
 
     # Amplitude and matrix multi-envelope engines
-    all_egs = [gui.vco1_amp_eg, gui.vco2_amp_eg, gui.noise_amp_eg] + gui.envelopes
+    all_egs = [gui.vco1_amp_eg, gui.vco2_amp_eg, gui.vco3_amp_eg, gui.vco4_amp_eg] + gui.envelopes
     for eg in all_egs:
         eg.valuesChanged.connect(gui.transmit_knob_packet)
         eg.combo_type.currentIndexChanged.connect(gui.transmit_knob_packet)
@@ -3870,7 +4193,7 @@ def runtime_connect_and_bind(gui):
         dial.valueChanged.connect(gui.transmit_knob_packet)
 
     # Assignable LFO engines and small static vector visualizations
-    for idx in range(4):
+    for idx in range(LFO_COUNT):
         gui.lfo_combos[idx].currentIndexChanged.connect(gui.transmit_knob_packet)
         gui.lfo_combos[idx].currentIndexChanged.connect(
             lambda idx_cb, i=idx: gui.lfo_visualizers[i].set_waveform(idx_cb, is_lfo=True)
@@ -3914,6 +4237,8 @@ def runtime_connect_and_bind(gui):
     gui.record_synth_output_cb.toggled.connect(gui.transmit_knob_packet)
     gui.record_mode_multichannel.toggled.connect(gui.transmit_knob_packet)
     gui.record_mode_downmix.toggled.connect(gui.transmit_knob_packet)
+    gui.record_format_wav.toggled.connect(gui.transmit_knob_packet)
+    gui.record_format_wavpack.toggled.connect(gui.transmit_knob_packet)
     gui.midi_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
 
     # Initialize separate telemetry thread loop for VU meter updates

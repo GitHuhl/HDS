@@ -58,9 +58,16 @@ A digital synthesizer split into two processes:
   buffer is (the real floor on output latency), Block Size is how many
   frames get rendered and handed to ALSA per main-loop iteration.
 
-  **Recording** (`Recording` tab) writes 32-bit float WAV (`WavRecorder` in
-  backend.c -- IEEE float format tag, so no int conversion/dithering, and
-  natively readable by any modern DAW/editor). Two source kinds, freely
+  **Recording** (`Recording` tab) writes either 32-bit float WAV
+  (`WavRecorder` in backend.c -- IEEE float format tag, so no int
+  conversion/dithering, and natively readable by any modern DAW/editor) or
+  WavPack (`WavPackRecorder`, an additional lossless format alongside WAV,
+  ~40-60% smaller; converted to 24-bit PCM before encoding since WavPack --
+  like FLAC -- losslessly compresses integer PCM, not float), picked via
+  the Output section's Format radio buttons. Both formats reuse the exact
+  same realtime-safe ring/writer-thread architecture -- only the writer
+  thread's start/write/stop calls branch on the format, so there's no
+  additional realtime-thread exposure. Two source kinds, freely
   combinable in one take: the synth's own final post-FX stereo output
   (which already includes any processed External Input once `ext_in_enable`
   is on -- they're the same signal by the time either is "processed"), and
@@ -336,9 +343,10 @@ A digital synthesizer split into two processes:
   it's actually running on, watched via the backend's stderr diagnostics.
 
   There is no Global tab -- Program name/Load/Save, Poly/Mono Legato, Hard
-  Sync, Pitch Bend Range, Sustain Pedal Polarity, FM Depth, Glide, and
-  Tempo all live in the always-visible left sidebar (above the Output/VU
-  strip) instead, since they're relevant no matter which tab is open. The
+  Sync (a 3-way Off/Parallel/Serial control), Pitch Bend Range, Sustain
+  Pedal Polarity, the FM Algorithm section, Glide, and Tempo all live in
+  the always-visible left sidebar (above the Output/VU strip) instead,
+  since they're relevant no matter which tab is open. The
   Tempo knob (20-300 BPM, default 120) sets `tempo_bpm`; a small label
   under it mirrors the backend's own resolved value (`EngineStatus.
   tempo_bpm_live`, round-tripped over the same status socket as the VU
@@ -381,27 +389,43 @@ A digital synthesizer split into two processes:
   letting Qt spread leftover vertical space evenly between rows when the
   window is taller than the content needs.
 
-Engine features: 2 main oscillators (Saw/Square/Triangle/Sine/Unison
-Saw/Noise/Pulse/Sample) with FM and hard sync -- both PolyBLEP-corrected
-against aliasing. Osc 1's BLEP window width tracks the true instantaneous
-phase velocity under FM instead of just the carrier's own nominal step. Hard
-sync is alias-free on both timing and amplitude: Osc 2's phase (including
-each of its 7 Unison Saw detuned voices) resets to the true fractional-sample
-instant Osc 1 wrapped rather than snapping to the next sample boundary, and
-for Saw/Square/Pulse the instantaneous amplitude discontinuity that reset
-creates in Osc 2's own output is itself BLEP-corrected (split across the
-sample before and the sample after the sync instant) -- Triangle needs no
-such correction (its leaky integrator already smooths through an
-intentionally-untouched state across the reset) and Sine/Unison-Saw's own
-amplitude correction remain a possible future extension -- a dedicated sub oscillator and
-noise oscillator, a 2-filter (A/B) architecture where Filter A can itself
-be a 3-filter Multi engine, 9 envelope generators (Osc1/Osc2/Noise amp +
-6 assignable, each switchable between ADSR/AR/AD/ASR/AHD/DADSR/AHDSR, with
-the Sustain stage chaseable in real time while a note is held), 4 LFOs
-(each with its own MIDI Modulation Source), and a shared mod matrix
-routing LFOs and assignable EGs to pitch, amp, pan, pulse width, filter
-cutoff/resonance, FM depth, phase, unison detune, and the noise/sub
-oscillators' own amp, pan, and tilt.
+Engine features: **4 fully identical oscillators** (Osc 1-4, each with the
+same full shape palette -- Saw/Square/Triangle/Sine/Unison Saw/Noise/Pulse/
+Sample/**Off**), each with its own vol/pan/mute, fine tune, pitch offset,
+phase offset, and Unison Saw detune/width. **Off** is a genuine compute
+bypass (skips that oscillator's pan trig, waveform render, and mix
+entirely, not just a silent volume) -- a real CPU concern once every
+oscillator can independently be a full-featured voice. Selecting Noise
+gives every oscillator the same one-pole Tilt-color filter (a dual-duty
+knob that reads as Pulse Width under Shape=Pulse, or Tilt under
+Shape=Noise: -1 dark/low-passed, 0 flat white, +1 bright/high-passed).
+
+FM is a **12-algorithm system** (FM Algorithm section, left sidebar): a
+fixed, hand-verified-acyclic set of 4-operator routing topologies (not a
+general routing matrix, which risks cycles) -- Algorithm 0 ("Classic",
+Osc2->Osc1 only) reproduces the engine's original fixed FM pair exactly
+and stays the default; the other 11 range from simple chains and
+many-to-one stars to fully independent pairs. Only the depth knob(s) an
+algorithm actually uses are shown. Hard Sync is a 3-way control: Off,
+**Parallel** (Osc 1 resets Osc 2, 3, and 4 independently, each keeping its
+own shape/detune), or **Serial** (Osc 1 resets Osc 2, whose reset resets
+Osc 3, whose reset resets Osc 4 -- a cascading "telephone game" of phase
+truncation, where a stage still fires its own natural wrap if no upstream
+reset arrives that sample). Both FM and hard sync are fully
+PolyBLEP-corrected against aliasing, including through Off oscillators
+(phase bookkeeping never stops, only audible rendering does) and through a
+hard-synced oscillator that's simultaneously an FM carrier or modulator.
+
+Also: a 2-filter (A/B) architecture where Filter A can itself be a
+3-filter Multi engine, 10 envelope generators (Osc 1-4 amp + 6 assignable,
+each switchable between ADSR/AR/AD/ASR/AHD/DADSR/AHDSR, with the Sustain
+stage chaseable in real time while a note is held), **16 LFOs** (each with
+its own MIDI Modulation Source; LFOs 1-2 run at full audio rate, LFOs
+3-16 run at a decimated ~2kHz control rate with interpolation -- 16
+always-otherwise-running LFOs would otherwise cost as much CPU as 16 more
+oscillators), and a shared mod matrix routing LFOs and assignable EGs to
+pitch, amp, pan, pulse width/tilt, filter cutoff/resonance, phase, and
+unison detune on all 4 oscillators.
 
 Filter A and B combine via the Filter Routing Matrix (Filters tab): Series
 A->B, Series B->A (the same two filters, reversed order -- audibly
