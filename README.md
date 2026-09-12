@@ -382,7 +382,11 @@ A digital synthesizer split into two processes:
   window is taller than the content needs.
 
 Engine features: 2 main oscillators (Saw/Square/Triangle/Sine/Unison
-Saw/Noise/Pulse/Sample) with FM and hard sync, a dedicated sub oscillator and
+Saw/Noise/Pulse/Sample) with FM and hard sync -- both PolyBLEP-corrected
+against aliasing (Osc 1's BLEP window width tracks the true instantaneous
+phase velocity under FM instead of just the carrier's own nominal step, and
+a hard sync reset lands at the true fractional-sample instant Osc 1 wrapped
+rather than snapping to the next sample boundary) -- a dedicated sub oscillator and
 noise oscillator, a 2-filter (A/B) architecture where Filter A can itself
 be a 3-filter Multi engine, 9 envelope generators (Osc1/Osc2/Noise amp +
 6 assignable, each switchable between ADSR/AR/AD/ASR/AHD/DADSR/AHDSR, with

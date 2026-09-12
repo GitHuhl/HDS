@@ -632,6 +632,11 @@ typedef struct {
     float vco1_target_freq;
     float vco1_current_freq;
     float vco1_tri_state;
+    // Previous sample's fully-computed fm_phase (post phase_offset1, post-wrap) -- used to
+    // derive the true instantaneous phase velocity under FM (phase modulation from Osc 2), so
+    // the PolyBLEP window width used for Osc 1's waveform lookup tracks the actual local phase
+    // derivative instead of just the carrier's own nominal dt1. See render_audio_block.
+    float vco1_prev_fm_phase;
     float vco1_unison_saw_phases[UNISON_SAW_VOICES];
     ADSR vco1_eg;
 
@@ -2155,7 +2160,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
 static void init_voice(SynthVoice *voice) {
     voice->midi_note = -1;
     voice->midi_velocity = 100;
-    voice->vco1_phase = 0.0f; voice->vco1_target_freq = 0.0f; voice->vco1_current_freq = 0.0f; voice->vco1_tri_state = 0.0f;
+    voice->vco1_phase = 0.0f; voice->vco1_target_freq = 0.0f; voice->vco1_current_freq = 0.0f; voice->vco1_tri_state = 0.0f; voice->vco1_prev_fm_phase = 0.0f;
     voice->vco2_phase = 0.0f; voice->vco2_target_freq = 0.0f; voice->vco2_current_freq = 0.0f; voice->vco2_tri_state = 0.0f;
     for(int u=0; u<UNISON_SAW_VOICES; u++) { voice->vco1_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco2_unison_saw_phases[u] = (float)rand()/RAND_MAX; }
     for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voice->fa_low[c][f][0]=0.0f; voice->fa_low[c][f][1]=0.0f; voice->fa_band[c][f][0]=0.0f; voice->fa_band[c][f][1]=0.0f; } voice->fb_low[c][0]=0.0f; voice->fb_low[c][1]=0.0f; voice->fb_band[c][0]=0.0f; voice->fb_band[c][1]=0.0f; }
@@ -3324,7 +3329,7 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
     bool is_first_key_of_phrase = poly_mode_active || (mono_stack->count == 0);
 
     if (is_first_key_of_phrase) {
-        voices[slot].vco1_phase = 0.0f; voices[slot].vco2_phase = 0.0f;
+        voices[slot].vco1_phase = 0.0f; voices[slot].vco2_phase = 0.0f; voices[slot].vco1_prev_fm_phase = 0.0f;
         voices[slot].vco1_tri_state = 0.0f; voices[slot].vco2_tri_state = 0.0f;
         voices[slot].vco1_current_freq = target_hz; voices[slot].vco2_current_freq = target_hz;
         // Sub Osc has no independent pitch state -- it derives its frequency from Osc 1's
@@ -3842,11 +3847,26 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
 
             float fm_phase = voices[v].vco1_phase + (v2_modulator * fmaxf(0.0f, knobs->fm_intensity + fm_mod));
             fm_phase = fmodf(fm_phase + phase_offset1, 1.0f); if (fm_phase < 0.0f) fm_phase += 1.0f;
+
+            // FM-aware PolyBLEP window width: dt1 alone is the CARRIER's nominal phase step, but
+            // under phase modulation the true instantaneous phase velocity at this sample also
+            // includes the modulator's own (fast-changing) contribution. Estimate it via the
+            // wrapped finite difference between this sample's and the previous sample's fully-
+            // computed fm_phase, mapped to the shortest signed distance around the unit circle.
+            // The 0.499f cap applies to the raw modulation-driven term ONLY, with the
+            // fmaxf(..., dt1) floor applied LAST -- so an unmodulated carrier (fm_intensity == 0,
+            // or any carrier pitch so high dt1 itself exceeds the cap) reproduces dt1 exactly,
+            // every sample, leaving existing unmodulated behavior provably unchanged.
+            float fm_phase_delta = fm_phase - voices[v].vco1_prev_fm_phase;
+            fm_phase_delta -= roundf(fm_phase_delta);
+            voices[v].vco1_prev_fm_phase = fm_phase;
+            float fm_dt1 = fmaxf(fminf(fabsf(fm_phase_delta), 0.499f), dt1);
+
             float v1_out = 0.0f, v1_side_l = 0.0f, v1_side_r = 0.0f;
             bool osc1_is_unison_saw = vco1_shape_now == WAVE_UNISON_SAW;
             if (osc1_is_unison_saw) v1_out = render_unison_saw(voices[v].vco1_unison_saw_phases, dt1, vco1_unison_detune_final, vco1_unison_pan_l, vco1_unison_pan_r, phase_offset1, &v1_side_l, &v1_side_r);
             else if (vco1_shape_now == WAVE_SAMPLE) v1_out = render_sample_osc(&voices[v].vco1_sample_stream, &voices[v].vco1_sample_ptr, &voices[v].vco1_sample_preroll, hz1, &v1_side_l, &v1_side_r);
-            else v1_out = lookup_osc_sample(vco1_shape_now, fm_phase, dt1, vco1_pulse_width_final / 100.0f, &voices[v].vco1_tri_state);
+            else v1_out = lookup_osc_sample(vco1_shape_now, fm_phase, fm_dt1, vco1_pulse_width_final / 100.0f, &voices[v].vco1_tri_state);
             float gain1 = (knobs->vco1_mute != 0.0f || knobs->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco1_vol - mix_bal + mod_vco1_amp));
             float osc1_amp = gain1 * voices[v].vco1_eg.current_level;
 
@@ -3893,13 +3913,23 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float noise_amp = noise_out * gain_noise * voices[v].noise_eg.current_level;
             float noise_l = noise_amp * pan_noise_l, noise_r = noise_amp * pan_noise_r;
 
-            float new_vco1_phase = voices[v].vco1_phase + dt1;
+            float vco1_phase_before = voices[v].vco1_phase;
+            float new_vco1_phase = vco1_phase_before + dt1;
             bool vco1_wrapped = new_vco1_phase >= 1.0f;
             voices[v].vco1_phase = fmodf(new_vco1_phase, 1.0f);
             voices[v].vco2_phase = fmodf(voices[v].vco2_phase + dt2, 1.0f);
             voices[v].sub_phase = fmodf(voices[v].sub_phase + dt_sub, 1.0f);
             if (knobs->hard_sync != 0.0f && vco1_wrapped) {
-                voices[v].vco2_phase = 0.0f;
+                // Sub-sample-accurate sync: reset Osc2's phase to where it would be if it had
+                // been snapped to exactly 0 at the true fractional-sample instant t_wrap (where
+                // Osc1 actually crossed 1.0), then continued advancing at rate dt2 for the
+                // remaining (1 - t_wrap) of this sample -- instead of a flat 0.0f, which
+                // quantizes the sync point to the next sample boundary and introduces phase
+                // jitter. vco1_wrapped guarantees vco1_phase_before < 1.0 <= new_vco1_phase, so
+                // dt1 > 0 here and the division is always well-defined.
+                float t_wrap = (1.0f - vco1_phase_before) / dt1;
+                t_wrap = fmaxf(0.0f, fminf(1.0f, t_wrap));
+                voices[v].vco2_phase = fmodf((1.0f - t_wrap) * dt2, 1.0f);
                 for (int u = 0; u < UNISON_SAW_VOICES; u++) voices[v].vco2_unison_saw_phases[u] = 0.0f;
             }
 
