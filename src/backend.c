@@ -32,7 +32,14 @@
 // these ceilings.
 #define BUFFER_SIZE 1024
 #define MAX_VOICES  256
-#define LFO_COUNT   4
+#define LFO_COUNT   16
+// LFOs 3-16 (0-indexed 2-15) run at a decimated control rate instead of full audio rate -- 16
+// LFOs are effectively 16 always-running oscillators, and most modulation uses don't need
+// audio-rate smoothness. Recomputed every LFO_DECIMATION_FACTOR samples (24 samples = 2kHz
+// effective control rate at 48kHz -- still ~80 recomputes/cycle even at a fast 25Hz LFO), with
+// linear interpolation between recompute points to avoid zipper noise. LFOs 1/2 (index 0/1) stay
+// full audio-rate, since they're the ones most likely used for audible-rate FM/AM effects.
+#define LFO_DECIMATION_FACTOR 24
 #define ASSIGNABLE_EG_COUNT 6  // EG 1-6 (in addition to Osc 1-4 Amp)
 #define ENV_COUNT   (4 + ASSIGNABLE_EG_COUNT)  // Osc 1 Amp, Osc 2 Amp, Osc 3 Amp, Osc 4 Amp, + assignable EGs
 #define UNISON_SAW_VOICES 7
@@ -3883,6 +3890,15 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // instance on a single audio thread.
     static float lfo_phase_mod_state[LFO_COUNT] = {0.0f};
 
+    // Control-rate decimation state for LFOs 3-16 (index 2-15) -- see LFO_DECIMATION_FACTOR's
+    // comment. counter cycles 0..LFO_DECIMATION_FACTOR-1; at 0, last_value/target_value/phase are
+    // all advanced by one full decimated step, then every sample in between linearly interpolates
+    // from last_value to target_value. Function-local static for the same single-instance reason
+    // as lfo_phase_mod_state above.
+    static int lfo_decim_counter[LFO_COUNT] = {0};
+    static float lfo_decim_last_value[LFO_COUNT] = {0.0f};
+    static float lfo_decim_target_value[LFO_COUNT] = {0.0f};
+
     // FX bus engine state: persists across calls (and across FX_TYPE changes -- see
     // process_fx_chain) for the same "single synth engine instance" reason as above.
     static FXSlotEngine fx_engine[FX_SLOT_COUNT];
@@ -3899,21 +3915,54 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         float mixed_l = 0.0f, mixed_r = 0.0f;
         float lfo_out[LFO_COUNT] = {0.0f};
         for (int l = 0; l < LFO_COUNT; l++) {
-            // Phase pot (0-360 degrees) plus any modulation, shifting only the read-phase used
-            // for this sample's waveform lookup -- the underlying running phase (advanced below)
-            // is never touched, so Rate/sync stay completely unaffected by this.
-            float phase_offset = fmodf((knobs->lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
-            float read_phase = fmodf(global_lfo_phases[l] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
-            // Modulation Source: scales this LFO's contribution by a live MIDI controller (e.g.
-            // gating vibrato depth with the mod wheel) on top of the plain Depth knob. Unassigned
-            // (-1, the default) is a pure no-op -- cc_source_scale stays 1.0.
-            int mod_src = (int)knobs->lfo[l].mod_source_cc;
-            float cc_source_scale = 1.0f;
-            if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
-            else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
-            lfo_out[l] = lookup_lfo_waveform((int)knobs->lfo[l].wave_type, read_phase) * knobs->lfo[l].mod_depth * cc_source_scale;
-            global_lfo_phases[l] += knobs->lfo[l].rate_hz / (float)SAMPLE_RATE;
-            if (global_lfo_phases[l] >= 1.0f) global_lfo_phases[l] -= 1.0f;
+            int wave_type = (int)knobs->lfo[l].wave_type;
+            // Off: complete compute bypass -- no phase_offset/mod_source_cc/waveform lookup, and
+            // no phase advance either (nothing else in this engine reads an LFO's raw phase, so
+            // freezing it is safe and avoids wasted work on an LFO nobody's listening to -- this
+            // is the actual CPU concern with 16 always-otherwise-running LFOs).
+            if (wave_type == 4) { lfo_out[l] = 0.0f; continue; }
+
+            if (l < 2) {
+                // LFOs 1/2: full audio-rate, unchanged from the original 4-LFO design.
+                // Phase pot (0-360 degrees) plus any modulation, shifting only the read-phase
+                // used for this sample's waveform lookup -- the underlying running phase
+                // (advanced below) is never touched, so Rate/sync stay completely unaffected.
+                float phase_offset = fmodf((knobs->lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
+                float read_phase = fmodf(global_lfo_phases[l] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
+                // Modulation Source: scales this LFO's contribution by a live MIDI controller
+                // (e.g. gating vibrato depth with the mod wheel) on top of the plain Depth knob.
+                // Unassigned (-1, the default) is a pure no-op -- cc_source_scale stays 1.0.
+                int mod_src = (int)knobs->lfo[l].mod_source_cc;
+                float cc_source_scale = 1.0f;
+                if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
+                else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
+                lfo_out[l] = lookup_lfo_waveform(wave_type, read_phase) * knobs->lfo[l].mod_depth * cc_source_scale;
+                global_lfo_phases[l] += knobs->lfo[l].rate_hz / (float)SAMPLE_RATE;
+                if (global_lfo_phases[l] >= 1.0f) global_lfo_phases[l] -= 1.0f;
+            } else {
+                // LFOs 3-16: control-rate decimated (see LFO_DECIMATION_FACTOR's comment). Only
+                // recompute the waveform/phase every LFO_DECIMATION_FACTOR samples; every sample
+                // in between linearly interpolates from the last recomputed value toward the new
+                // one, avoiding a zipper-noise step at each recompute boundary.
+                if (lfo_decim_counter[l] == 0) {
+                    lfo_decim_last_value[l] = lfo_decim_target_value[l];
+                    float phase_offset = fmodf((knobs->lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
+                    float read_phase = fmodf(global_lfo_phases[l] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
+                    int mod_src = (int)knobs->lfo[l].mod_source_cc;
+                    float cc_source_scale = 1.0f;
+                    if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
+                    else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
+                    lfo_decim_target_value[l] = lookup_lfo_waveform(wave_type, read_phase) * knobs->lfo[l].mod_depth * cc_source_scale;
+                    // Phase advances by DECIMATION_FACTOR steps at once, since we're about to
+                    // skip that many samples' worth of recomputation -- this keeps the LFO's
+                    // real-world rate correct despite only sampling it every 24th sample.
+                    global_lfo_phases[l] += (knobs->lfo[l].rate_hz / (float)SAMPLE_RATE) * (float)LFO_DECIMATION_FACTOR;
+                    if (global_lfo_phases[l] >= 1.0f) global_lfo_phases[l] = fmodf(global_lfo_phases[l], 1.0f);
+                }
+                float frac = (float)lfo_decim_counter[l] / (float)LFO_DECIMATION_FACTOR;
+                lfo_out[l] = lfo_decim_last_value[l] + (lfo_decim_target_value[l] - lfo_decim_last_value[l]) * frac;
+                lfo_decim_counter[l] = (lfo_decim_counter[l] + 1) % LFO_DECIMATION_FACTOR;
+            }
         }
 
         for (int v = 0; v < voice_limit; v++) {
