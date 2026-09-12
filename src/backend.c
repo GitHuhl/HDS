@@ -15,6 +15,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stddef.h>
 
 #define SAMPLE_RATE 48000
 // BUFFER_SIZE and MAX_VOICES are now hard CEILINGS for array allocation only -- how many
@@ -32,8 +33,8 @@
 #define BUFFER_SIZE 1024
 #define MAX_VOICES  256
 #define LFO_COUNT   4
-#define ASSIGNABLE_EG_COUNT 6  // EG 1-6 (in addition to Osc 1 Amp, Osc 2 Amp, Noise Osc Amp)
-#define ENV_COUNT   (3 + ASSIGNABLE_EG_COUNT)  // Osc 1 Amp, Osc 2 Amp, Noise Osc Amp, + assignable EGs
+#define ASSIGNABLE_EG_COUNT 6  // EG 1-6 (in addition to Osc 1-4 Amp)
+#define ENV_COUNT   (4 + ASSIGNABLE_EG_COUNT)  // Osc 1 Amp, Osc 2 Amp, Osc 3 Amp, Osc 4 Amp, + assignable EGs
 #define UNISON_SAW_VOICES 7
 #define FX_SLOT_COUNT 12
 #define AUDIO_DEVICE_NAME_LEN 64
@@ -107,17 +108,11 @@ typedef enum {
     WAVE_UNISON_SAW,
     WAVE_NOISE,
     WAVE_PULSE, // appended (not inserted) so existing saved patches' numeric shape indices don't shift
-    WAVE_SAMPLE // DFD-streamed multisample playback -- see render_sample_osc()/SampleStream. Also appended.
+    WAVE_SAMPLE, // DFD-streamed multisample playback -- see render_sample_osc()/SampleStream. Also appended.
+    WAVE_OFF // Compute-bypass: skips pan trig + render + mix for this oscillator. Phase still
+             // advances and its envelope still ticks (Hard Sync/FM and voice-idle logic depend on
+             // both staying live), so nothing downstream needs to special-case an Off oscillator.
 } WaveType;
-
-// Sub Oscillator waveform choices. Deliberately a separate, smaller enum from WaveType -- the
-// sub osc has no Unison Saw/Noise/Pulse option, so it can't reuse WaveType's numbering.
-typedef enum {
-    SUB_SAW,
-    SUB_SQUARE,
-    SUB_TRIANGLE,
-    SUB_SINE
-} SubWaveType;
 
 typedef struct {
     float d; float h; float a; float dec; float s; float r; float al; float pk;
@@ -393,8 +388,11 @@ typedef struct {
     float vco1_mute;
     float vco2_mute;
 
-    // Hard Sync: when enabled, Osc 2's phase is force-reset every time Osc 1 completes a cycle.
-    float hard_sync;
+    // Hard Sync: 0=Off, 1=Parallel (Osc 1 resets Osc 2, 3, AND 4 independently -- each slave
+    // shares Osc 1's fundamental but keeps its own shape/detune), 2=Serial (Osc 1 resets Osc 2,
+    // Osc 2's reset resets Osc 3, Osc 3's reset resets Osc 4 -- a cascading "telephone game" of
+    // phase truncation). See render_audio_block's do_sync/t_wrap blocks.
+    float hard_sync_mode;
 
     // Phase pot per oscillator (degrees, 0-360). Modulatable by LFO/EG via the mod matrix
     // (targets 24/25); the modulated result shifts only the oscillator's read-phase, never its
@@ -420,15 +418,15 @@ typedef struct {
     float vco3_mute;
     float vco3_pulse_width;
 
-    // Sub Oscillator: fixed exactly one octave below Osc 1. It has no pitch controls of its
-    // own -- it implicitly tracks Osc 1's fully-modulated frequency (fine tune, portamento,
-    // every LFO/EG pitch mod) by design, and shares Osc 1's amplitude envelope (vco1_eg)
-    // rather than getting its own, so it behaves as one fattened voice with Osc 1 rather than
-    // an independently-triggerable layer.
-    float sub_shape; // 0:Saw 1:Square 2:Triangle 3:Sine (SubWaveType)
-    float sub_vol;
-    float sub_pan;
-    float sub_mute;
+    // Osc 4: a full peer of Osc 1/2/3 in every respect (own shape/pitch/pan/phase/unison
+    // controls below, own amp envelope eg[3]/eg_mode[3]). Formerly a fixed "Sub Oscillator"
+    // locked one octave below Osc 1 with no controls of its own and sharing Osc 1's envelope;
+    // that automatic-lockstep behavior is gone, replaced by an explicit vco4_pitch_offset knob
+    // (set to -12 semitones to reproduce the old Sub behavior manually).
+    float vco4_vol;
+    float vco4_pan;
+    float vco4_mute;
+    float vco4_pulse_width; // dual-duty Pulse Width/Tilt, mirrors vco3_pulse_width
 
     // --- FX Bus + External Input Architecture ---
 
@@ -539,16 +537,28 @@ typedef struct {
     float vco3_unison_saw_detune;
     float vco3_unison_saw_width;
 
-    // --- FM Algorithm system: a fixed, cycle-free set of selectable 3-operator routing
-    // topologies (see the table in render_audio_block/apply_fm_phase's callers) -- NOT a general
-    // routing matrix, to keep every topology provably acyclic. fm_intensity (existing field,
-    // above) keeps its exact existing meaning (edge Osc2->Osc1) in every algorithm that uses that
-    // edge; these 3 new depths cover the remaining possible edges. Algorithm 0 ("2->1, Classic")
-    // reproduces today's exact behavior (Osc3 fully uninvolved) and is the default. ---
-    float fm_algorithm; // 0-5, see the algorithm table
+    // --- Osc 4 identity/tuning (appended), mirrors the Osc 3 block above exactly -- replaces
+    // the old fixed Sub Oscillator entirely. vco4_vol/pan/mute/pulse_width already exist above. ---
+    float vco4_shape; // WaveType, full palette -- matches vco1/2/3_shape
+    float vco4_fine_tune; // cents
+    float vco4_pitch_offset; // semitones (set to -12 to reproduce the old Sub's fixed octave-down)
+    float vco4_phase_offset; // degrees
+    float vco4_unison_saw_detune;
+    float vco4_unison_saw_width;
+
+    // --- FM Algorithm system: a fixed, cycle-free set of selectable 4-operator routing
+    // topologies (see FM_ALGORITHMS/render_fm_oscillator) -- NOT a general routing matrix, to
+    // keep every topology provably acyclic. fm_intensity (existing field, above) keeps its exact
+    // existing meaning (edge Osc2->Osc1) in every algorithm that uses that edge. Algorithm 0
+    // ("Classic", 2->1 only) reproduces today's exact behavior and is the default. ---
+    float fm_algorithm; // 0-11, see FM_ALGORITHMS
     float fm_depth_3_1; // Osc3 -> Osc1
     float fm_depth_3_2; // Osc3 -> Osc2
-    float fm_depth_2_3; // Osc2 -> Osc3
+    float fm_depth_4_1; // Osc4 -> Osc1
+    float fm_depth_4_3; // Osc4 -> Osc3
+    float fm_depth_1_2; // Osc1 -> Osc2
+    float fm_depth_3_4; // Osc3 -> Osc4
+    float fm_depth_1_3; // Osc1 -> Osc3
 
     // --- Sample Bank (DFD/WAVE_SAMPLE) + Mapping tab zones ---
     // The Sample Bank itself (which files are loaded, their key/velocity zones, loop points,
@@ -687,6 +697,15 @@ typedef struct {
     float vco3_unison_saw_phases[UNISON_SAW_VOICES];
     ADSR vco3_eg;
 
+    float vco4_phase;
+    float vco4_target_freq;
+    float vco4_current_freq;
+    float vco4_tri_state;
+    float vco4_prev_fm_phase;
+    float vco4_pending_sync_correction; // Osc4 is a hard-sync slave too -- see vco2's own field
+    float vco4_unison_saw_phases[UNISON_SAW_VOICES];
+    ADSR vco4_eg;
+
     // Filter A's SVF register banks: [channel: 0=L,1=R][unit: 3 "units", unit 0 used alone in
     // Normal mode, all 3 used as the Multi engine in Multi mode][cascade stage: 2, 2nd stage
     // only used when a unit's slope is set to 4-pole]. Independent per-voice AND per-channel --
@@ -704,18 +723,12 @@ typedef struct {
     ADSR assign_eg[ASSIGNABLE_EG_COUNT];
 
     // One-pole tilt-filter low-pass state, one per oscillator now that Tilt-shaped noise is
-    // available on any of the 3 (see render_audio_block's tilt branch). vco3_eg (Osc 3's amp
-    // envelope, was the dedicated Noise oscillator's) is declared above, alongside vco3's other
-    // per-oscillator state.
+    // available on all 4 (see render_audio_block's tilt branch). vco3_eg/vco4_eg (Osc 3/4's amp
+    // envelopes) are declared above, alongside their other per-oscillator state.
     float vco1_tilt_lp;
     float vco2_tilt_lp;
     float vco3_tilt_lp;
-
-    // Sub Oscillator: its own running phase (base_dt is derived each sample from Osc 1's fully
-    // modulated frequency, halved) and its own triangle integrator state, kept separate from
-    // vco1_tri_state so the two don't corrupt each other's triangle-wave integration.
-    float sub_phase;
-    float sub_tri_state;
+    float vco4_tilt_lp;
 
     // Mono Legato glide time randomization: rerolled each time this voice starts an actual
     // pitch glide (an overlapping legato note, or falling back to a still-held note on release).
@@ -743,6 +756,9 @@ typedef struct {
     int vco3_sample_stream;
     double vco3_sample_ptr;
     bool vco3_sample_preroll;
+    int vco4_sample_stream;
+    double vco4_sample_ptr;
+    bool vco4_sample_preroll;
 } SynthVoice;
 // FIXED: Restored 'p->s' to reference sustain data properties correctly
 void tick_adsr(ADSR *env, const PackEGParams *p, int mode) {
@@ -830,17 +846,6 @@ static float band_limited_pulse(float phase, float dt, float duty_frac) {
     float n = (phase < duty_frac) ? 1.0f : -1.0f; n += poly_blep_step(phase, dt);
     float pf = phase + (1.0f - duty_frac); if (pf >= 1.0f) pf -= 1.0f;
     return n - poly_blep_step(pf, dt);
-}
-
-// Sub Osc reuses the same core wave rendering as Osc 1/2 -- this just maps its smaller
-// SubWaveType enum onto the matching WaveType cases (Saw/Square/Triangle/Sine only).
-static WaveType sub_wave_to_osc_wave(int sub_shape) {
-    switch ((SubWaveType)sub_shape) {
-        case SUB_SAW: return WAVE_SAW;
-        case SUB_SQUARE: return WAVE_SQUARE;
-        case SUB_TRIANGLE: return WAVE_TRIANGLE;
-        case SUB_SINE: default: return WAVE_SINE;
-    }
 }
 
 // Runs one logical filter for a single sample: a State-Variable Filter (SVF) core (Low/High/
@@ -2181,17 +2186,23 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->vco2_unison_saw_detune = 25.0f; knobs->vco2_unison_saw_width = 50.0f;
     knobs->mono_glide_random = 0.0f;
     knobs->vco1_mute = 0.0f; knobs->vco2_mute = 0.0f;
-    knobs->hard_sync = 0.0f;
+    knobs->hard_sync_mode = 0.0f;
     knobs->vco1_phase_offset = 0.0f; knobs->vco2_phase_offset = 0.0f;
 
     knobs->vco1_pulse_width = 50.0f; knobs->vco2_pulse_width = 50.0f;
     knobs->vco3_vol = 0.0f; knobs->vco3_pan = 0.0f; knobs->vco3_mute = 0.0f; knobs->vco3_pulse_width = 0.0f;
     knobs->vco3_shape = (float)WAVE_NOISE; knobs->vco3_fine_tune = 0.0f; knobs->vco3_pitch_offset = 0.0f;
     knobs->vco3_phase_offset = 0.0f; knobs->vco3_unison_saw_detune = 25.0f; knobs->vco3_unison_saw_width = 50.0f;
-    knobs->fm_algorithm = 0.0f; knobs->fm_depth_3_1 = 0.0f; knobs->fm_depth_3_2 = 0.0f; knobs->fm_depth_2_3 = 0.0f;
-    knobs->sub_shape = (float)SUB_SQUARE; knobs->sub_vol = 0.0f; knobs->sub_pan = 0.0f; knobs->sub_mute = 0.0f;
-    // Osc 3 Amp envelope lives at eg[2]/eg_mode[2] and was covered by the generic
-    // `for(int e=0; e<ENV_COUNT; e++)` default-fill loop above -- nothing extra needed here.
+    knobs->vco4_vol = 0.0f; knobs->vco4_pan = 0.0f; knobs->vco4_mute = 0.0f; knobs->vco4_pulse_width = 50.0f;
+    knobs->vco4_shape = (float)WAVE_OFF; knobs->vco4_fine_tune = 0.0f; knobs->vco4_pitch_offset = 0.0f;
+    knobs->vco4_phase_offset = 0.0f; knobs->vco4_unison_saw_detune = 25.0f; knobs->vco4_unison_saw_width = 50.0f;
+    knobs->fm_algorithm = 0.0f;
+    knobs->fm_depth_3_1 = 0.0f; knobs->fm_depth_3_2 = 0.0f;
+    knobs->fm_depth_4_1 = 0.0f; knobs->fm_depth_4_3 = 0.0f;
+    knobs->fm_depth_1_2 = 0.0f; knobs->fm_depth_3_4 = 0.0f; knobs->fm_depth_1_3 = 0.0f;
+    // Osc 3/4 Amp envelopes live at eg[2]/eg[3] (and eg_mode[2]/eg_mode[3]) and were covered by
+    // the generic `for(int e=0; e<ENV_COUNT; e++)` default-fill loop above -- nothing extra
+    // needed here.
 
     // ext_in_gain defaults to 0.0 (silence/-inf), not unity: an upstream mic pre or interface
     // could already be set hot, and External Input must never be able to burst into the FX bus
@@ -2232,19 +2243,21 @@ static void init_voice(SynthVoice *voice) {
     voice->vco1_phase = 0.0f; voice->vco1_target_freq = 0.0f; voice->vco1_current_freq = 0.0f; voice->vco1_tri_state = 0.0f; voice->vco1_prev_fm_phase = 0.0f;
     voice->vco2_phase = 0.0f; voice->vco2_target_freq = 0.0f; voice->vco2_current_freq = 0.0f; voice->vco2_tri_state = 0.0f; voice->vco2_prev_fm_phase = 0.0f; voice->vco2_pending_sync_correction = 0.0f;
     voice->vco3_phase = 0.0f; voice->vco3_target_freq = 0.0f; voice->vco3_current_freq = 0.0f; voice->vco3_tri_state = 0.0f; voice->vco3_prev_fm_phase = 0.0f; voice->vco3_pending_sync_correction = 0.0f;
-    for(int u=0; u<UNISON_SAW_VOICES; u++) { voice->vco1_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco2_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco3_unison_saw_phases[u] = (float)rand()/RAND_MAX; }
+    voice->vco4_phase = 0.0f; voice->vco4_target_freq = 0.0f; voice->vco4_current_freq = 0.0f; voice->vco4_tri_state = 0.0f; voice->vco4_prev_fm_phase = 0.0f; voice->vco4_pending_sync_correction = 0.0f;
+    for(int u=0; u<UNISON_SAW_VOICES; u++) { voice->vco1_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco2_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco3_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco4_unison_saw_phases[u] = (float)rand()/RAND_MAX; }
     for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voice->fa_low[c][f][0]=0.0f; voice->fa_low[c][f][1]=0.0f; voice->fa_band[c][f][0]=0.0f; voice->fa_band[c][f][1]=0.0f; } voice->fb_low[c][0]=0.0f; voice->fb_low[c][1]=0.0f; voice->fb_band[c][0]=0.0f; voice->fb_band[c][1]=0.0f; }
     voice->glide_time_multiplier = 1.0f;
     voice->sustain_pending = false;
     voice->vco1_eg.state = STATE_IDLE; voice->vco1_eg.current_level = 0.0f; voice->vco1_eg.release_level = 0.0f;
     voice->vco2_eg.state = STATE_IDLE; voice->vco2_eg.current_level = 0.0f; voice->vco2_eg.release_level = 0.0f;
     voice->vco3_eg.state = STATE_IDLE; voice->vco3_eg.current_level = 0.0f; voice->vco3_eg.release_level = 0.0f;
-    voice->vco1_tilt_lp = 0.0f; voice->vco2_tilt_lp = 0.0f; voice->vco3_tilt_lp = 0.0f;
-    voice->sub_phase = (float)rand()/RAND_MAX; voice->sub_tri_state = 0.0f;
+    voice->vco4_eg.state = STATE_IDLE; voice->vco4_eg.current_level = 0.0f; voice->vco4_eg.release_level = 0.0f;
+    voice->vco1_tilt_lp = 0.0f; voice->vco2_tilt_lp = 0.0f; voice->vco3_tilt_lp = 0.0f; voice->vco4_tilt_lp = 0.0f;
     for(int e=0; e<ASSIGNABLE_EG_COUNT; e++) { voice->assign_eg[e].state = STATE_IDLE; voice->assign_eg[e].current_level = 0.0f; voice->assign_eg[e].release_level = 0.0f; }
     voice->vco1_sample_stream = -1; voice->vco1_sample_ptr = 0.0; voice->vco1_sample_preroll = false;
     voice->vco2_sample_stream = -1; voice->vco2_sample_ptr = 0.0; voice->vco2_sample_preroll = false;
     voice->vco3_sample_stream = -1; voice->vco3_sample_ptr = 0.0; voice->vco3_sample_preroll = false;
+    voice->vco4_sample_stream = -1; voice->vco4_sample_ptr = 0.0; voice->vco4_sample_preroll = false;
 }
 // Rolls a randomized glide-time multiplier for Mono Legato: 1.0 = no variation. glide_random_pct
 // (0-100) controls how far the multiplier can wander from 1.0 in either direction; floored well
@@ -3200,6 +3213,14 @@ static void release_idle_sample_streams(SynthVoice *voice) {
         release_sample_stream(voice->vco2_sample_stream);
         voice->vco2_sample_stream = -1;
     }
+    if (voice->vco3_eg.state == STATE_IDLE && voice->vco3_sample_stream >= 0) {
+        release_sample_stream(voice->vco3_sample_stream);
+        voice->vco3_sample_stream = -1;
+    }
+    if (voice->vco4_eg.state == STATE_IDLE && voice->vco4_sample_stream >= 0) {
+        release_sample_stream(voice->vco4_sample_stream);
+        voice->vco4_sample_stream = -1;
+    }
 }
 
 // Drop-in mono waveform source for a WAVE_SAMPLE oscillator, mirroring lookup_osc_sample's role
@@ -3330,6 +3351,157 @@ static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll
     return (out_l + out_r) * 0.5f;
 }
 
+// Renders one oscillator (any of Osc 1-4) for one voice for one sample, generalizing what used
+// to be separate Osc1-only (FM carrier) / Osc2-only (FM modulator + hard-sync slave) code into a
+// single shared path all 4 oscillators run through identically. `modulator_sum` is the sum of
+// every incoming FM edge's (source oscillator's own modulator output * that edge's depth) for
+// THIS oscillator this sample -- 0.0f when nothing feeds it (e.g. an independent operator, or
+// any oscillator under FM Algorithm 11 "All independent"), in which case this call reproduces
+// that oscillator's plain unmodulated output bit-for-bit: the phase-delta-based adaptive BLEP
+// width collapses to exactly `dt` every sample (see the fmaxf(...,dt) floor below, applied
+// last -- the same proof shape as the original Osc1-only fm_dt1), matching lookup_osc_sample's
+// own dt exactly. `do_sync`/`t_wrap` is this oscillator's own hard-sync trigger this sample
+// (always false/0 with hard_sync_mode Off, or for a sync master, which is never called with
+// do_sync=true for itself). `unison_pan_l/r` and `unison_saw_phases` are only read when
+// shape==WAVE_UNISON_SAW; `sample_stream/ptr/preroll` only when shape==WAVE_SAMPLE.
+// `pulse_or_tilt_input` is the oscillator's own dual-duty Pulse-Width/Tilt knob value already
+// summed with any modulation, in its ORIGINAL knob range ([2,98] for Pulse Width percent or
+// [-100,100] for Tilt) -- this function applies the /100 scaling itself so callers never need to
+// know which of the two meanings currently applies.
+static float render_fm_oscillator(
+    WaveType shape, float own_phase, float dt, float phase_offset, float modulator_sum,
+    float *prev_fm_phase, float pulse_or_tilt_input, float *tri_state, float *tilt_lp,
+    float noise_tilt_coeff, float unison_saw_phases[UNISON_SAW_VOICES], float unison_detune_final,
+    const float unison_pan_l[UNISON_SAW_VOICES], const float unison_pan_r[UNISON_SAW_VOICES],
+    int *sample_stream, double *sample_ptr, bool *sample_preroll, float hz,
+    bool do_sync, float t_wrap, float *pending_sync_correction,
+    float *out_side_l, float *out_side_r)
+{
+    if (shape == WAVE_UNISON_SAW) {
+        return render_unison_saw(unison_saw_phases, dt, unison_detune_final, unison_pan_l, unison_pan_r, phase_offset, out_side_l, out_side_r);
+    }
+    if (shape == WAVE_SAMPLE) {
+        return render_sample_osc(sample_stream, sample_ptr, sample_preroll, hz, out_side_l, out_side_r);
+    }
+
+    float mod_phase = own_phase + modulator_sum;
+    mod_phase = fmodf(mod_phase + phase_offset, 1.0f); if (mod_phase < 0.0f) mod_phase += 1.0f;
+
+    // FM-aware adaptive PolyBLEP window width, generalized from the original Osc1-only fm_dt1:
+    // the wrapped finite difference between this sample's and the previous sample's fully-
+    // computed mod_phase estimates the true instantaneous phase velocity under modulation, capped
+    // at 0.499f (raw modulation term only) with the fmaxf(...,dt) floor applied LAST.
+    float phase_delta = mod_phase - *prev_fm_phase;
+    phase_delta -= roundf(phase_delta);
+    *prev_fm_phase = mod_phase;
+    float adaptive_dt = fmaxf(fminf(fabsf(phase_delta), 0.499f), dt);
+
+    if (shape == WAVE_NOISE) {
+        // Tilt-shaped noise (unified across all 4 oscillators -- see the Tilt-noise decision):
+        // white noise through a one-pole low-pass; tilt_frac in [-1,1] crossfades low-passed
+        // (dark, -1) against its high-passed complement (bright/hissy, +1), 0 = flat white
+        // (low+high sums back to the original signal, unity gain).
+        float white = (((float)rand() / (float)RAND_MAX) * 2.0f) - 1.0f;
+        *tilt_lp += noise_tilt_coeff * (white - *tilt_lp);
+        float tilt_high = white - *tilt_lp;
+        float tilt_frac = fmaxf(-1.0f, fminf(1.0f, pulse_or_tilt_input / 100.0f));
+        *out_side_l = *out_side_r = 0.0f;
+        return *tilt_lp * (1.0f - tilt_frac) + tilt_high * (1.0f + tilt_frac);
+    }
+
+    float out = lookup_osc_sample(shape, mod_phase, adaptive_dt, pulse_or_tilt_input / 100.0f, tri_state);
+
+    // Full alias-free hard sync amplitude correction (Saw/Square/Pulse only), generalized from
+    // the original Osc2-only block -- see that block's own original comment (still present on
+    // the mixer's history) for the full derivation. Consumes any "after" correction left pending
+    // by a sync detected on the PREVIOUS sample, then, if THIS sample detects a new sync,
+    // BLEP-corrects the discontinuity that reset will create.
+    out += *pending_sync_correction;
+    *pending_sync_correction = 0.0f;
+    if (do_sync && (shape == WAVE_SAW || shape == WAVE_SQUARE || shape == WAVE_PULSE)) {
+        float phase_at_sync = fmodf(own_phase + t_wrap * dt, 1.0f); if (phase_at_sync < 0.0f) phase_at_sync += 1.0f;
+        float val_before, val_after;
+        if (shape == WAVE_SAW) { val_before = phase_at_sync * 2.0f - 1.0f; val_after = -1.0f; }
+        else {
+            float duty = (shape == WAVE_SQUARE) ? 0.5f : fmaxf(0.02f, fminf(0.98f, pulse_or_tilt_input / 100.0f));
+            val_before = (phase_at_sync < duty) ? 1.0f : -1.0f; val_after = 1.0f;
+        }
+        float half_height = (val_after - val_before) * 0.5f;
+        out += half_height * sync_blep_shape_before(t_wrap);
+        *pending_sync_correction = half_height * sync_blep_shape_after(t_wrap);
+    }
+    *out_side_l = out; *out_side_r = out; // no independent side-channel outside Unison Saw/Sample
+    return out;
+}
+
+// --- FM Algorithm system: a fixed, hand-verified-acyclic set of 12 selectable 4-operator FM
+// routing topologies -- deliberately NOT a general routing matrix (which risks cycles no fixed
+// per-sample ordering could resolve) and NOT a DX7-style feedback/self-modulation trick
+// (unnecessary complexity at only 4 operators). Oscillator indices below are 0-based (0=Osc1,
+// 1=Osc2, 2=Osc3, 3=Osc4). Algorithm 0 ("Classic") is byte-identical to this engine's original
+// fixed Osc2->Osc1 FM pair and stays the default. Each row's `render_order` MUST list every
+// edge's `from_osc` before its `to_osc` (verified once at startup by
+// assert_fm_algorithms_acyclic(), below) -- the dispatch loop in render_audio_block walks
+// render_order in order, and for each oscillator sums its incoming edges' (already-rendered
+// source's modulator output * depth) before rendering that oscillator itself. ---
+typedef struct {
+    int from_osc;
+    int to_osc;
+    size_t depth_offset; // offsetof(SynthSharedControls, fm_intensity/fm_depth_*)
+} FmEdge;
+
+typedef struct {
+    int render_order[4];
+    int edge_count;
+    FmEdge edges[3];
+} FmAlgorithm;
+
+#define FM_ALGORITHM_COUNT 12
+static const FmAlgorithm FM_ALGORITHMS[FM_ALGORITHM_COUNT] = {
+    // 0: Classic (default) -- 2->1
+    { {1,0,2,3}, 1, { {1,0, offsetof(SynthSharedControls, fm_intensity)} } },
+    // 1: 3-Op Chain, Osc4 independent -- 3->2->1
+    { {2,1,0,3}, 2, { {2,1, offsetof(SynthSharedControls, fm_depth_3_2)}, {1,0, offsetof(SynthSharedControls, fm_intensity)} } },
+    // 2: 4-Op Chain -- 4->3->2->1
+    { {3,2,1,0}, 3, { {3,2, offsetof(SynthSharedControls, fm_depth_4_3)}, {2,1, offsetof(SynthSharedControls, fm_depth_3_2)}, {1,0, offsetof(SynthSharedControls, fm_intensity)} } },
+    // 3: Dual Serial Pairs -- 4->3, 2->1
+    { {3,2,1,0}, 2, { {3,2, offsetof(SynthSharedControls, fm_depth_4_3)}, {1,0, offsetof(SynthSharedControls, fm_intensity)} } },
+    // 4: Many-to-One into 1 -- 3->1, 4->1
+    { {2,3,0,1}, 2, { {2,0, offsetof(SynthSharedControls, fm_depth_3_1)}, {3,0, offsetof(SynthSharedControls, fm_depth_4_1)} } },
+    // 5: One-to-Many from 3 -- 3->1, 3->2
+    { {2,0,1,3}, 2, { {2,0, offsetof(SynthSharedControls, fm_depth_3_1)}, {2,1, offsetof(SynthSharedControls, fm_depth_3_2)} } },
+    // 6: Many-to-One into 2 -- 1->2, 3->2
+    { {0,2,1,3}, 2, { {0,1, offsetof(SynthSharedControls, fm_depth_1_2)}, {2,1, offsetof(SynthSharedControls, fm_depth_3_2)} } },
+    // 7: 4->1 direct, 2/3 independent
+    { {3,0,1,2}, 1, { {3,0, offsetof(SynthSharedControls, fm_depth_4_1)} } },
+    // 8: Dual Independent Pairs -- 1->2, 3->4
+    { {0,1,2,3}, 2, { {0,1, offsetof(SynthSharedControls, fm_depth_1_2)}, {2,3, offsetof(SynthSharedControls, fm_depth_3_4)} } },
+    // 9: 1->3->4, Osc2 independent
+    { {0,2,3,1}, 2, { {0,2, offsetof(SynthSharedControls, fm_depth_1_3)}, {2,3, offsetof(SynthSharedControls, fm_depth_3_4)} } },
+    // 10: Star: 2/3/4 all into 1
+    { {1,2,3,0}, 3, { {1,0, offsetof(SynthSharedControls, fm_intensity)}, {2,0, offsetof(SynthSharedControls, fm_depth_3_1)}, {3,0, offsetof(SynthSharedControls, fm_depth_4_1)} } },
+    // 11: All independent
+    { {0,1,2,3}, 0, { {0,0,0}, {0,0,0}, {0,0,0} } },
+};
+
+// Debug-only startup sanity check (see main()): confirms every algorithm row's edges only ever
+// point from an earlier render_order slot to a later one -- a bad hand-edited row would otherwise
+// silently read a not-yet-rendered oscillator's stale modulator_output from the previous sample
+// instead of failing loudly.
+static void assert_fm_algorithms_acyclic(void) {
+    for (int a = 0; a < FM_ALGORITHM_COUNT; a++) {
+        const FmAlgorithm *alg = &FM_ALGORITHMS[a];
+        int position[4];
+        for (int slot = 0; slot < 4; slot++) position[alg->render_order[slot]] = slot;
+        for (int e = 0; e < alg->edge_count; e++) {
+            if (position[alg->edges[e].from_osc] >= position[alg->edges[e].to_osc]) {
+                fprintf(stderr, "[fm] FATAL: FM_ALGORITHMS[%d] edge %d->%d violates render order\n", a, alg->edges[e].from_osc, alg->edges[e].to_osc);
+                abort();
+            }
+        }
+    }
+}
+
 // Looks up the currently-claimed zone's own Pan setting for a WAVE_SAMPLE oscillator, so
 // render_audio_block's pan1/pan2 computation (which runs BEFORE render_sample_osc is called each
 // sample, since it also feeds the periodic-oscillator branches) can fold it in without needing
@@ -3357,7 +3529,7 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         // -- an audible click, not just a modulation glitch, since Osc 3 is a
         // real sound source. vco3_eg must be idle too before a voice counts as free.
         int voice_limit = effective_voice_limit(knobs);
-        for (int v = 0; v < voice_limit; v++) { if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE && voices[v].vco3_eg.state == STATE_IDLE) { slot = v; break; } }
+        for (int v = 0; v < voice_limit; v++) { if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE && voices[v].vco3_eg.state == STATE_IDLE && voices[v].vco4_eg.state == STATE_IDLE) { slot = v; break; } }
         if (slot == -1) {
             // Polyphony ceiling hit (active_voice_limit simultaneously active voices) -- every
             // slot is busy. FIXED: this used to unconditionally steal slot 0, resetting
@@ -3369,8 +3541,8 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
             // releasing.
             float best_score = 1e30f; // lower = safer to steal
             for (int v = 0; v < voice_limit; v++) {
-                float level = voices[v].vco1_eg.current_level + voices[v].vco2_eg.current_level + voices[v].vco3_eg.current_level;
-                bool releasing = (voices[v].vco1_eg.state == STATE_RELEASE || voices[v].vco2_eg.state == STATE_RELEASE || voices[v].vco3_eg.state == STATE_RELEASE);
+                float level = voices[v].vco1_eg.current_level + voices[v].vco2_eg.current_level + voices[v].vco3_eg.current_level + voices[v].vco4_eg.current_level;
+                bool releasing = (voices[v].vco1_eg.state == STATE_RELEASE || voices[v].vco2_eg.state == STATE_RELEASE || voices[v].vco3_eg.state == STATE_RELEASE || voices[v].vco4_eg.state == STATE_RELEASE);
                 // A releasing voice always beats a non-releasing one regardless of level --
                 // it's already fading out by the player's own intent (key lifted), so cutting
                 // it a little early reads as natural rather than as a glitch.
@@ -3389,6 +3561,8 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
     voices[slot].midi_velocity = velocity;
     voices[slot].vco1_target_freq = target_hz;
     voices[slot].vco2_target_freq = target_hz;
+    voices[slot].vco3_target_freq = target_hz;
+    voices[slot].vco4_target_freq = target_hz;
     // Any note-on onto this slot makes a previously-deferred sustain release moot -- either the
     // slot was stolen from a sustain-pending voice (about to be fully reset below regardless),
     // or this is a fresh key that has nothing to do with whatever the pedal was holding.
@@ -3400,13 +3574,12 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
     bool is_first_key_of_phrase = poly_mode_active || (mono_stack->count == 0);
 
     if (is_first_key_of_phrase) {
-        voices[slot].vco1_phase = 0.0f; voices[slot].vco2_phase = 0.0f; voices[slot].vco1_prev_fm_phase = 0.0f;
-        voices[slot].vco1_tri_state = 0.0f; voices[slot].vco2_tri_state = 0.0f; voices[slot].vco2_pending_sync_correction = 0.0f;
+        voices[slot].vco1_phase = 0.0f; voices[slot].vco2_phase = 0.0f; voices[slot].vco3_phase = 0.0f; voices[slot].vco4_phase = 0.0f;
+        voices[slot].vco1_prev_fm_phase = 0.0f; voices[slot].vco3_prev_fm_phase = 0.0f; voices[slot].vco4_prev_fm_phase = 0.0f;
+        voices[slot].vco1_tri_state = 0.0f; voices[slot].vco2_tri_state = 0.0f; voices[slot].vco3_tri_state = 0.0f; voices[slot].vco4_tri_state = 0.0f;
+        voices[slot].vco2_pending_sync_correction = 0.0f; voices[slot].vco3_pending_sync_correction = 0.0f; voices[slot].vco4_pending_sync_correction = 0.0f;
         voices[slot].vco1_current_freq = target_hz; voices[slot].vco2_current_freq = target_hz;
-        // Sub Osc has no independent pitch state -- it derives its frequency from Osc 1's
-        // fully-modulated freq every sample -- but its own phase accumulator and triangle
-        // integrator still need a fresh-note reset, same as Osc 1/2.
-        voices[slot].sub_phase = 0.0f; voices[slot].sub_tri_state = 0.0f;
+        voices[slot].vco3_current_freq = target_hz; voices[slot].vco4_current_freq = target_hz;
         voices[slot].glide_time_multiplier = 1.0f; // fresh note -- no glide happening, nothing to randomize
 
         // WAVE_SAMPLE: (re)claim a DFD stream for whichever oscillator is currently set to it,
@@ -3424,6 +3597,18 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
             release_sample_stream(voices[slot].vco2_sample_stream);
             voices[slot].vco2_sample_stream = -1;
         }
+        if ((WaveType)((int)knobs->vco3_shape) == WAVE_SAMPLE) {
+            start_sample_osc(&voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, note, velocity);
+        } else if (voices[slot].vco3_sample_stream >= 0) {
+            release_sample_stream(voices[slot].vco3_sample_stream);
+            voices[slot].vco3_sample_stream = -1;
+        }
+        if ((WaveType)((int)knobs->vco4_shape) == WAVE_SAMPLE) {
+            start_sample_osc(&voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, note, velocity);
+        } else if (voices[slot].vco4_sample_stream >= 0) {
+            release_sample_stream(voices[slot].vco4_sample_stream);
+            voices[slot].vco4_sample_stream = -1;
+        }
         for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voices[slot].fa_low[c][f][0]=0.0f; voices[slot].fa_low[c][f][1]=0.0f; voices[slot].fa_band[c][f][0]=0.0f; voices[slot].fa_band[c][f][1]=0.0f; } voices[slot].fb_low[c][0]=0.0f; voices[slot].fb_low[c][1]=0.0f; voices[slot].fb_band[c][0]=0.0f; voices[slot].fb_band[c][1]=0.0f; }
         for (int l = 0; l < LFO_COUNT; l++) { if (knobs->lfo[l].key_sync != 0.0f) global_lfo_phases[l] = 0.0f; }
 
@@ -3431,13 +3616,14 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         voices[slot].vco1_eg.current_level = (m0 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[0].al / 100.0f));
         int m1 = (int)knobs->eg_mode[1]; voices[slot].vco2_eg.state = (m1 == 5) ? STATE_DELAY : STATE_ATTACK;
         voices[slot].vco2_eg.current_level = (m1 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[1].al / 100.0f));
-        // Osc 3 Amp envelope: eg[2]/eg_mode[2]. (Sub Osc deliberately has no envelope of
-        // its own here -- it shares vco1_eg, already retriggered above.)
+        // Osc 3/4 Amp envelopes: eg[2]/eg_mode[2] and eg[3]/eg_mode[3].
         int mn = (int)knobs->eg_mode[2]; voices[slot].vco3_eg.state = (mn == 5) ? STATE_DELAY : STATE_ATTACK;
         voices[slot].vco3_eg.current_level = (mn == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[2].al / 100.0f));
+        int m3 = (int)knobs->eg_mode[3]; voices[slot].vco4_eg.state = (m3 == 5) ? STATE_DELAY : STATE_ATTACK;
+        voices[slot].vco4_eg.current_level = (m3 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[3].al / 100.0f));
         for(int e=0; e<ASSIGNABLE_EG_COUNT; e++) {
-            int me = (int)knobs->eg_mode[3 + e]; voices[slot].assign_eg[e].state = (me == 5) ? STATE_DELAY : STATE_ATTACK;
-            voices[slot].assign_eg[e].current_level = (me == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[3 + e].al / 100.0f));
+            int me = (int)knobs->eg_mode[4 + e]; voices[slot].assign_eg[e].state = (me == 5) ? STATE_DELAY : STATE_ATTACK;
+            voices[slot].assign_eg[e].current_level = (me == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[4 + e].al / 100.0f));
         }
     } else {
         // An overlapping legato note: this is an actual audible glide, so reroll its time.
@@ -3453,6 +3639,7 @@ static void trigger_voice_release(SynthVoice *voice) {
     voice->vco1_eg.release_level = voice->vco1_eg.current_level; voice->vco1_eg.state = STATE_RELEASE;
     voice->vco2_eg.release_level = voice->vco2_eg.current_level; voice->vco2_eg.state = STATE_RELEASE;
     voice->vco3_eg.release_level = voice->vco3_eg.current_level; voice->vco3_eg.state = STATE_RELEASE;
+    voice->vco4_eg.release_level = voice->vco4_eg.current_level; voice->vco4_eg.state = STATE_RELEASE;
     for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) { voice->assign_eg[e].release_level = voice->assign_eg[e].current_level; voice->assign_eg[e].state = STATE_RELEASE; }
 }
 
@@ -3480,6 +3667,8 @@ static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knob
         voices[0].midi_velocity = mono_stack->velocities[mono_stack->count - 1];
         voices[0].vco1_target_freq = target_hz;
         voices[0].vco2_target_freq = target_hz;
+        voices[0].vco3_target_freq = target_hz;
+        voices[0].vco4_target_freq = target_hz;
         // Falling back to a still-held note is also a real audible glide -- reroll its time too.
         voices[0].glide_time_multiplier = roll_glide_multiplier(knobs->mono_glide_random);
         // Falling back to a still-held note never retriggers or releases -- the sound never stopped.
@@ -3667,8 +3856,12 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // every voice, for both oscillators. See compute_unison_saw_pan's comment for the numbers.
     float vco1_unison_pan_l[UNISON_SAW_VOICES], vco1_unison_pan_r[UNISON_SAW_VOICES];
     float vco2_unison_pan_l[UNISON_SAW_VOICES], vco2_unison_pan_r[UNISON_SAW_VOICES];
+    float vco3_unison_pan_l[UNISON_SAW_VOICES], vco3_unison_pan_r[UNISON_SAW_VOICES];
+    float vco4_unison_pan_l[UNISON_SAW_VOICES], vco4_unison_pan_r[UNISON_SAW_VOICES];
     compute_unison_saw_pan(knobs->vco1_unison_saw_width, vco1_unison_pan_l, vco1_unison_pan_r);
     compute_unison_saw_pan(knobs->vco2_unison_saw_width, vco2_unison_pan_l, vco2_unison_pan_r);
+    compute_unison_saw_pan(knobs->vco3_unison_saw_width, vco3_unison_pan_l, vco3_unison_pan_r);
+    compute_unison_saw_pan(knobs->vco4_unison_saw_width, vco4_unison_pan_l, vco4_unison_pan_r);
 
     // Noise Osc's tilt-color filter: a simple one-pole low/high split with a fixed ~800Hz pivot,
     // linearly crossfaded by the Tilt knob. The coefficient depends only on SAMPLE_RATE and the
@@ -3724,15 +3917,14 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         }
 
         for (int v = 0; v < voice_limit; v++) {
-            // Sub Osc has no idle-check of its own -- it's silent whenever Osc 1's own amp
-            // envelope (which it shares) is silent, so it doesn't need to factor in here.
-            if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE && voices[v].vco3_eg.state == STATE_IDLE) continue;
+            if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE && voices[v].vco3_eg.state == STATE_IDLE && voices[v].vco4_eg.state == STATE_IDLE) continue;
 
             for(int e=0; e<ENV_COUNT; e++) {
                 if(e==0) tick_adsr(&voices[v].vco1_eg, &knobs->eg[e], (int)knobs->eg_mode[e]);
                 else if(e==1) tick_adsr(&voices[v].vco2_eg, &knobs->eg[e], (int)knobs->eg_mode[e]);
                 else if(e==2) tick_adsr(&voices[v].vco3_eg, &knobs->eg[e], (int)knobs->eg_mode[e]);
-                else tick_adsr(&voices[v].assign_eg[e-3], &knobs->eg[e], (int)knobs->eg_mode[e]);
+                else if(e==3) tick_adsr(&voices[v].vco4_eg, &knobs->eg[e], (int)knobs->eg_mode[e]);
+                else tick_adsr(&voices[v].assign_eg[e-4], &knobs->eg[e], (int)knobs->eg_mode[e]);
             }
             release_idle_sample_streams(&voices[v]); // WAVE_SAMPLE: free any DFD stream this voice's oscillator(s) no longer need
 
@@ -3743,8 +3935,12 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float portamento_coefficient = 1.0f - expf(-1.0f / ((effective_glide_ms / 1000.0f) * SAMPLE_RATE));
             voices[v].vco1_current_freq += (voices[v].vco1_target_freq - voices[v].vco1_current_freq) * portamento_coefficient;
             voices[v].vco2_current_freq += (voices[v].vco2_target_freq - voices[v].vco2_current_freq) * portamento_coefficient;
+            voices[v].vco3_current_freq += (voices[v].vco3_target_freq - voices[v].vco3_current_freq) * portamento_coefficient;
+            voices[v].vco4_current_freq += (voices[v].vco4_target_freq - voices[v].vco4_current_freq) * portamento_coefficient;
 
             float mod_vco1_pitch = knobs->vco1_fine_tune + pb_bend_cents, mod_vco2_pitch = knobs->vco2_fine_tune + (knobs->vco2_pitch_offset * 100.0f) + pb_bend_cents;
+            float mod_vco3_pitch = knobs->vco3_fine_tune + (knobs->vco3_pitch_offset * 100.0f) + pb_bend_cents;
+            float mod_vco4_pitch = knobs->vco4_fine_tune + (knobs->vco4_pitch_offset * 100.0f) + pb_bend_cents;
             float mod_vco1_amp = 0.0f, mod_vco2_amp = 0.0f, fm_mod = 0.0f, mix_bal = 0.0f;
             // Filter cutoff/resonance mod destinations (targets 8-13), 3 slots each:
             //   slot 0 (targets 8/9)   = Filter A's PRIMARY filter: filter_a when Normal, or
@@ -3764,17 +3960,17 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // oscillator currently reads from, without touching its actual running phase
             // accumulator (that distinction matters -- it keeps pitch, hard sync, and portamento
             // completely unaffected by phase modulation).
-            float mod_vco1_phase = 0.0f, mod_vco2_phase = 0.0f;
+            float mod_vco1_phase = 0.0f, mod_vco2_phase = 0.0f, mod_vco3_phase = 0.0f, mod_vco4_phase = 0.0f;
             // Unison Saw Detune Width as a mod destination (new).
-            float mod_vco1_unison_detune = 0.0f, mod_vco2_unison_detune = 0.0f;
-            // Pan/Pulse Width/Noise/Sub as mod destinations (targets 32-40 -- see the
+            float mod_vco1_unison_detune = 0.0f, mod_vco2_unison_detune = 0.0f, mod_vco3_unison_detune = 0.0f, mod_vco4_unison_detune = 0.0f;
+            // Pan/Pulse Width/Noise/Sub as mod destinations (targets 32-48 -- see the
             // matrix_shared_routes comment in frontend.py for the full list). Pan mods are
             // applied directly (same convention as Phase); the rest get a scale factor sized so
             // a unity-depth LFO/EG sweeps the whole musically useful range.
             float mod_vco1_pan = 0.0f, mod_vco2_pan = 0.0f;
             float mod_vco1_pulse_width = 0.0f, mod_vco2_pulse_width = 0.0f;
             float mod_vco3_amp = 0.0f, mod_vco3_pan = 0.0f, mod_vco3_tilt = 0.0f;
-            float mod_sub_amp = 0.0f, mod_sub_pan = 0.0f;
+            float mod_vco4_amp = 0.0f, mod_vco4_pan = 0.0f, mod_vco4_tilt = 0.0f;
 
             for (int l = 0; l < LFO_COUNT; l++) {
                 int target = (int)knobs->lfo[l].dest_target;
@@ -3811,8 +4007,15 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 if (target == 36) mod_vco3_amp += val;
                 if (target == 37) mod_vco3_pan += val;
                 if (target == 38) mod_vco3_tilt += val * 100.0f;
-                if (target == 39) mod_sub_amp += val;
-                if (target == 40) mod_sub_pan += val;
+                if (target == 39) mod_vco4_amp += val;
+                if (target == 40) mod_vco4_pan += val;
+                if (target == 41) mod_vco3_pitch += val * 1200.0f;
+                if (target == 42) mod_vco4_pitch += val * 1200.0f;
+                if (target == 43) mod_vco3_phase += val;
+                if (target == 44) mod_vco4_phase += val;
+                if (target == 45) mod_vco3_unison_detune += val * 2000.0f;
+                if (target == 46) mod_vco4_unison_detune += val * 2000.0f;
+                if (target == 47) mod_vco4_tilt += val * 100.0f;
             }
 
             // FIXED: each assignable EG now routes using its own destination combo (eg_dest_target),
@@ -3845,18 +4048,29 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 if (target == 36) mod_vco3_amp += val;
                 if (target == 37) mod_vco3_pan += val;
                 if (target == 38) mod_vco3_tilt += val * 100.0f;
-                if (target == 39) mod_sub_amp += val;
-                if (target == 40) mod_sub_pan += val;
+                if (target == 39) mod_vco4_amp += val;
+                if (target == 40) mod_vco4_pan += val;
+                if (target == 41) mod_vco3_pitch += val * 1200.0f;
+                if (target == 42) mod_vco4_pitch += val * 1200.0f;
+                if (target == 43) mod_vco3_phase += val;
+                if (target == 44) mod_vco4_phase += val;
+                if (target == 45) mod_vco3_unison_detune += val * 2000.0f;
+                if (target == 46) mod_vco4_unison_detune += val * 2000.0f;
+                if (target == 47) mod_vco4_tilt += val * 100.0f;
             }
 
             // Phase pot (0-360 degrees) plus any modulation, converted to a 0..1 fractional-cycle
             // offset. Wrapped defensively since modulation can push it negative or past 1.
             float phase_offset1 = fmodf((knobs->vco1_phase_offset / 360.0f) + mod_vco1_phase, 1.0f); if (phase_offset1 < 0.0f) phase_offset1 += 1.0f;
             float phase_offset2 = fmodf((knobs->vco2_phase_offset / 360.0f) + mod_vco2_phase, 1.0f); if (phase_offset2 < 0.0f) phase_offset2 += 1.0f;
+            float phase_offset3 = fmodf((knobs->vco3_phase_offset / 360.0f) + mod_vco3_phase, 1.0f); if (phase_offset3 < 0.0f) phase_offset3 += 1.0f;
+            float phase_offset4 = fmodf((knobs->vco4_phase_offset / 360.0f) + mod_vco4_phase, 1.0f); if (phase_offset4 < 0.0f) phase_offset4 += 1.0f;
 
             // Unison Saw Detune Width, base knob plus any modulation, clamped back into its valid range.
             float vco1_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco1_unison_saw_detune + mod_vco1_unison_detune));
             float vco2_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco2_unison_saw_detune + mod_vco2_unison_detune));
+            float vco3_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco3_unison_saw_detune + mod_vco3_unison_detune));
+            float vco4_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco4_unison_saw_detune + mod_vco4_unison_detune));
 
             // Oscillator shapes, hoisted here (from their own call sites further below) purely so
             // the Pan block right after can tell whether a WAVE_SAMPLE zone's own Pan setting
@@ -3865,197 +4079,262 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // sites, so hoisting is safe.
             WaveType vco1_shape_now = (WaveType)((int)knobs->vco1_shape);
             WaveType vco2_shape_now = (WaveType)((int)knobs->vco2_shape);
+            WaveType vco3_shape_now = (WaveType)((int)knobs->vco3_shape);
+            WaveType vco4_shape_now = (WaveType)((int)knobs->vco4_shape);
+            // WAVE_OFF: skip pan trig + render + mix for this oscillator entirely (phase advance
+            // and envelope ticking stay unconditional -- see the WAVE_OFF decision's rationale).
+            bool osc1_off = vco1_shape_now == WAVE_OFF, osc2_off = vco2_shape_now == WAVE_OFF;
+            bool osc3_off = vco3_shape_now == WAVE_OFF, osc4_off = vco4_shape_now == WAVE_OFF;
 
             // Pan (targets 32/33/37/40), base knob plus any modulation, clamped back into
             // [-1,1] -- computed per-voice/per-sample now that it's modulatable (see the
             // comment where this used to be a per-block constant, above the voice loop). A
             // WAVE_SAMPLE oscillator's zone can carry its own Pan (Mapping tab's Zone Inspector),
             // which ADDS to the oscillator's own knob here rather than overriding it -- see
-            // sample_osc_zone_pan_offset().
+            // sample_osc_zone_pan_offset(). Off oscillators skip the trig calls entirely (left at
+            // 0.0f -- unused, since their render/mix is skipped too).
             float zone_pan1 = (vco1_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(voices[v].vco1_sample_stream) : 0.0f;
             float zone_pan2 = (vco2_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(voices[v].vco2_sample_stream) : 0.0f;
-            float pan1_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
-            float pan1_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
-            float pan2_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
-            float pan2_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
-            float pan3_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan + mod_vco3_pan)) + 1.0f) * (M_PI / 4.0f));
-            float pan3_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan + mod_vco3_pan)) + 1.0f) * (M_PI / 4.0f));
-            float pan_sub_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->sub_pan + mod_sub_pan)) + 1.0f) * (M_PI / 4.0f));
-            float pan_sub_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->sub_pan + mod_sub_pan)) + 1.0f) * (M_PI / 4.0f));
+            float zone_pan3 = (vco3_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(voices[v].vco3_sample_stream) : 0.0f;
+            float zone_pan4 = (vco4_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(voices[v].vco4_sample_stream) : 0.0f;
+            float pan1_l = 0.0f, pan1_r = 0.0f, pan2_l = 0.0f, pan2_r = 0.0f;
+            float pan3_l = 0.0f, pan3_r = 0.0f, pan4_l = 0.0f, pan4_r = 0.0f;
+            if (!osc1_off) {
+                pan1_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
+                pan1_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
+            }
+            if (!osc2_off) {
+                pan2_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
+                pan2_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
+            }
+            if (!osc3_off) {
+                pan3_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
+                pan3_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
+            }
+            if (!osc4_off) {
+                pan4_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
+                pan4_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
+            }
 
-            // Pulse Width (targets 34/35), base knob plus any modulation, clamped into the same
-            // [2,98] range band_limited_pulse already expects (see lookup_osc_sample).
-            float vco1_pulse_width_final = fmaxf(2.0f, fminf(98.0f, knobs->vco1_pulse_width + mod_vco1_pulse_width));
-            float vco2_pulse_width_final = fmaxf(2.0f, fminf(98.0f, knobs->vco2_pulse_width + mod_vco2_pulse_width));
+            // Pulse Width/Tilt (targets 34/35/38/47), base knob plus any modulation. Dual-duty:
+            // clamped to [2,98] (percent duty) when the shape is Pulse, or [-100,100] (tilt
+            // amount) when the shape is Noise -- the same range render_fm_oscillator's Noise
+            // branch expects (it divides by 100 itself). Any other shape doesn't consume this
+            // value at all, so the exact clamp choice there is moot.
+            float vco1_pulse_width_final = (vco1_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->vco1_pulse_width + mod_vco1_pulse_width)) : fmaxf(2.0f, fminf(98.0f, knobs->vco1_pulse_width + mod_vco1_pulse_width));
+            float vco2_pulse_width_final = (vco2_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->vco2_pulse_width + mod_vco2_pulse_width)) : fmaxf(2.0f, fminf(98.0f, knobs->vco2_pulse_width + mod_vco2_pulse_width));
+            float vco3_pulse_width_final = (vco3_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->vco3_pulse_width + mod_vco3_tilt)) : fmaxf(2.0f, fminf(98.0f, knobs->vco3_pulse_width + mod_vco3_tilt));
+            float vco4_pulse_width_final = (vco4_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->vco4_pulse_width + mod_vco4_tilt)) : fmaxf(2.0f, fminf(98.0f, knobs->vco4_pulse_width + mod_vco4_tilt));
 
             float hz1 = voices[v].vco1_current_freq * powf(2.0f, mod_vco1_pitch / 1200.0f);
             float hz2 = voices[v].vco2_current_freq * powf(2.0f, mod_vco2_pitch / 1200.0f);
+            float hz3 = voices[v].vco3_current_freq * powf(2.0f, mod_vco3_pitch / 1200.0f);
+            float hz4 = voices[v].vco4_current_freq * powf(2.0f, mod_vco4_pitch / 1200.0f);
             float dt1 = hz1 / (float)SAMPLE_RATE, dt2 = hz2 / (float)SAMPLE_RATE;
+            float dt3 = hz3 / (float)SAMPLE_RATE, dt4 = hz4 / (float)SAMPLE_RATE;
 
-            // Hoisted hard-sync wrap check: computed here (right after dt1/dt2, before either
-            // oscillator's audio for this sample is rendered) rather than at the bottom of the
-            // loop, so a sync-triggered discontinuity in Osc 2's output can be BLEP-corrected on
-            // THIS sample directly (the "before" half, applied below) as well as on next sample
-            // (the "after" half, carried forward via vco2_pending_sync_correction). This does NOT
-            // advance voices[v].vco1_phase yet -- that assignment stays at the bottom of the loop
-            // unchanged, since fm_phase below still needs the pre-advance value.
+            // Hard Sync: 0=Off, 1=Parallel, 2=Serial (see hard_sync_mode's own comment). Computed
+            // here (right after dt1-4, before any oscillator's audio for this sample is rendered)
+            // so a sync-triggered discontinuity can be BLEP-corrected on THIS sample (the
+            // "before" half, inside render_fm_oscillator) as well as on next sample (the "after"
+            // half, carried forward via each slave's own pending_sync_correction). Does NOT
+            // advance any voices[v].vcoN_phase yet -- that stays at the bottom of the loop, since
+            // the FM render loop below still needs every oscillator's pre-advance phase. Osc 1 is
+            // always the sync master in both topologies -- it is never itself reset.
+            int hard_sync_mode = (int)knobs->hard_sync_mode;
             float vco1_phase_before = voices[v].vco1_phase;
             float new_vco1_phase = vco1_phase_before + dt1;
-            bool do_sync = (knobs->hard_sync != 0.0f && new_vco1_phase >= 1.0f);
-            float t_wrap = do_sync ? fmaxf(0.0f, fminf(1.0f, (1.0f - vco1_phase_before) / dt1)) : 0.0f;
+            bool do_sync1 = (hard_sync_mode != 0 && new_vco1_phase >= 1.0f);
+            float t_wrap1 = do_sync1 ? fmaxf(0.0f, fminf(1.0f, (1.0f - vco1_phase_before) / dt1)) : 0.0f;
 
-            float v2_out = 0.0f, v2_side_l = 0.0f, v2_side_r = 0.0f;
-            if (vco2_shape_now == WAVE_UNISON_SAW) v2_out = render_unison_saw(voices[v].vco2_unison_saw_phases, dt2, vco2_unison_detune_final, vco2_unison_pan_l, vco2_unison_pan_r, phase_offset2, &v2_side_l, &v2_side_r);
-            else if (vco2_shape_now == WAVE_SAMPLE) v2_out = render_sample_osc(&voices[v].vco2_sample_stream, &voices[v].vco2_sample_ptr, &voices[v].vco2_sample_preroll, hz2, &v2_side_l, &v2_side_r);
-            else {
-                float vco2_read_phase = fmodf(voices[v].vco2_phase + phase_offset2, 1.0f); if (vco2_read_phase < 0.0f) vco2_read_phase += 1.0f;
-                v2_out = lookup_osc_sample(vco2_shape_now, vco2_read_phase, dt2, vco2_pulse_width_final / 100.0f, &voices[v].vco2_tri_state);
+            bool do_sync2 = false, do_sync3 = false, do_sync4 = false;
+            float t_wrap2 = 0.0f, t_wrap3 = 0.0f, t_wrap4 = 0.0f;
+            if (hard_sync_mode == 1) {
+                // Parallel: every slave shares Osc 1's exact do_sync/t_wrap, independent of its
+                // own frequency -- Osc 1 fully dictates every reset.
+                do_sync2 = do_sync1; t_wrap2 = t_wrap1;
+                do_sync3 = do_sync1; t_wrap3 = t_wrap1;
+                do_sync4 = do_sync1; t_wrap4 = t_wrap1;
+            } else if (hard_sync_mode == 2) {
+                // Serial: 1->2->3->4 cascade. Each stage inherits its upstream neighbor's exact
+                // t_wrap when the upstream synced this sample (the cascade is one physical
+                // instant propagating down); otherwise it still fires on its OWN natural wrap
+                // when its own phase independently crosses 1.0 this sample. Inherited sync always
+                // takes priority over a coincidental same-sample natural wrap (a deliberate,
+                // documented simplification).
+                float vco2_phase_before = voices[v].vco2_phase;
+                bool own_sync2 = (vco2_phase_before + dt2) >= 1.0f;
+                float own_t_wrap2 = own_sync2 ? fmaxf(0.0f, fminf(1.0f, (1.0f - vco2_phase_before) / dt2)) : 0.0f;
+                do_sync2 = do_sync1 || own_sync2;
+                t_wrap2 = do_sync1 ? t_wrap1 : own_t_wrap2;
 
-                // Full alias-free hard sync (amplitude half -- the timing half is the t_wrap-based
-                // vco2_phase reset at the bottom of the loop). Consume any "after" correction left
-                // pending by a sync detected on the PREVIOUS sample, then, if THIS sample detects a
-                // new sync, BLEP-correct the discontinuity that reset will create: apply the
-                // "before" half here, stash the "after" half for next sample. Only Saw/Square/Pulse
-                // need this -- Triangle's leaky integrator already smooths through an untouched
-                // tri_state (see the bottom-of-loop comment), and Sine has no BLEP machinery to
-                // hook into.
-                v2_out += voices[v].vco2_pending_sync_correction;
-                voices[v].vco2_pending_sync_correction = 0.0f;
-                if (do_sync && (vco2_shape_now == WAVE_SAW || vco2_shape_now == WAVE_SQUARE || vco2_shape_now == WAVE_PULSE)) {
-                    float phase_at_sync = fmodf(voices[v].vco2_phase + t_wrap * dt2, 1.0f); if (phase_at_sync < 0.0f) phase_at_sync += 1.0f;
-                    float val_before, val_after;
-                    if (vco2_shape_now == WAVE_SAW) { val_before = phase_at_sync * 2.0f - 1.0f; val_after = -1.0f; }
-                    else {
-                        float duty2 = (vco2_shape_now == WAVE_SQUARE) ? 0.5f : fmaxf(0.02f, fminf(0.98f, vco2_pulse_width_final / 100.0f));
-                        val_before = (phase_at_sync < duty2) ? 1.0f : -1.0f; val_after = 1.0f;
-                    }
-                    float half_height = (val_after - val_before) * 0.5f;
-                    v2_out += half_height * sync_blep_shape_before(t_wrap);
-                    voices[v].vco2_pending_sync_correction = half_height * sync_blep_shape_after(t_wrap);
-                }
+                float vco3_phase_before = voices[v].vco3_phase;
+                bool own_sync3 = (vco3_phase_before + dt3) >= 1.0f;
+                float own_t_wrap3 = own_sync3 ? fmaxf(0.0f, fminf(1.0f, (1.0f - vco3_phase_before) / dt3)) : 0.0f;
+                do_sync3 = do_sync2 || own_sync3;
+                t_wrap3 = do_sync2 ? t_wrap2 : own_t_wrap3;
+
+                float vco4_phase_before = voices[v].vco4_phase;
+                bool own_sync4 = (vco4_phase_before + dt4) >= 1.0f;
+                float own_t_wrap4 = own_sync4 ? fmaxf(0.0f, fminf(1.0f, (1.0f - vco4_phase_before) / dt4)) : 0.0f;
+                do_sync4 = do_sync3 || own_sync4;
+                t_wrap4 = do_sync3 ? t_wrap3 : own_t_wrap4;
             }
-            float gain2 = (knobs->vco2_mute != 0.0f || knobs->vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco2_vol + mix_bal + mod_vco2_amp));
-            float osc2_amp = gain2 * voices[v].vco2_eg.current_level;
 
-            // FIXED: FM now modulates Osc 1 with Osc 2's actual post-modulated signal -- its own
-            // volume/mute, its own amplitude-modulation routing, and its own amplitude envelope
-            // all shape the modulator before it reaches Osc 1, matching how FM synthesis normally
-            // works (a modulator's envelope directly shapes the resulting brightness over time).
-            // Previously this used the bare raw waveform sample, so muting Osc 2 or being in a
-            // silent part of its envelope had no effect on the FM sound at all.
-            // Deliberately excludes mix_bal (a final-mix-only balance control) AND vco2_mute
-            // (muting Osc 2's audible output must not silence it as an FM modulator -- that's the
-            // whole point of using Osc 2 purely as a modulator). Still responds to the plain
-            // volume knob at 0, matching classic FM operator behavior where Level and modulation
-            // depth are coupled.
-            float gain2_for_fm = (knobs->vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco2_vol + mod_vco2_amp));
-            float v2_modulator = v2_out * gain2_for_fm * voices[v].vco2_eg.current_level;
+            // --- FM Algorithm dispatch: renders all 4 oscillators in the selected algorithm's
+            // render_order, accumulating each oscillator's own modulator output (its rendered
+            // signal * its own vol-based gain, ignoring mute -- see render_fm_oscillator's
+            // caller-side gain comment, generalized from the original Osc2-only gain2_for_fm) so
+            // any later-rendered oscillator can be fed by it via that algorithm's edges. Algorithm
+            // 0 ("Classic") reproduces this engine's original fixed Osc2->Osc1 FM pair exactly. ---
+            float vco1_dummy_sync_correction = 0.0f; // Osc1 is never a hard-sync slave, so it has no real pending_sync_correction field
+            WaveType shape_arr[4] = { vco1_shape_now, vco2_shape_now, vco3_shape_now, vco4_shape_now };
+            float own_phase_arr[4] = { voices[v].vco1_phase, voices[v].vco2_phase, voices[v].vco3_phase, voices[v].vco4_phase };
+            float dt_arr[4] = { dt1, dt2, dt3, dt4 };
+            float phase_offset_arr[4] = { phase_offset1, phase_offset2, phase_offset3, phase_offset4 };
+            float pulse_or_tilt_arr[4] = { vco1_pulse_width_final, vco2_pulse_width_final, vco3_pulse_width_final, vco4_pulse_width_final };
+            float unison_detune_arr[4] = { vco1_unison_detune_final, vco2_unison_detune_final, vco3_unison_detune_final, vco4_unison_detune_final };
+            float hz_arr[4] = { hz1, hz2, hz3, hz4 };
+            bool do_sync_arr[4] = { false, do_sync2, do_sync3, do_sync4 };
+            float t_wrap_arr[4] = { 0.0f, t_wrap2, t_wrap3, t_wrap4 };
+            float *prev_fm_phase_ptr[4] = { &voices[v].vco1_prev_fm_phase, &voices[v].vco2_prev_fm_phase, &voices[v].vco3_prev_fm_phase, &voices[v].vco4_prev_fm_phase };
+            float *tri_state_ptr[4] = { &voices[v].vco1_tri_state, &voices[v].vco2_tri_state, &voices[v].vco3_tri_state, &voices[v].vco4_tri_state };
+            float *tilt_lp_ptr[4] = { &voices[v].vco1_tilt_lp, &voices[v].vco2_tilt_lp, &voices[v].vco3_tilt_lp, &voices[v].vco4_tilt_lp };
+            float *unison_phases_ptr[4] = { voices[v].vco1_unison_saw_phases, voices[v].vco2_unison_saw_phases, voices[v].vco3_unison_saw_phases, voices[v].vco4_unison_saw_phases };
+            const float *unison_pan_l_ptr[4] = { vco1_unison_pan_l, vco2_unison_pan_l, vco3_unison_pan_l, vco4_unison_pan_l };
+            const float *unison_pan_r_ptr[4] = { vco1_unison_pan_r, vco2_unison_pan_r, vco3_unison_pan_r, vco4_unison_pan_r };
+            int *sample_stream_ptr[4] = { &voices[v].vco1_sample_stream, &voices[v].vco2_sample_stream, &voices[v].vco3_sample_stream, &voices[v].vco4_sample_stream };
+            double *sample_ptr_ptr[4] = { &voices[v].vco1_sample_ptr, &voices[v].vco2_sample_ptr, &voices[v].vco3_sample_ptr, &voices[v].vco4_sample_ptr };
+            bool *sample_preroll_ptr[4] = { &voices[v].vco1_sample_preroll, &voices[v].vco2_sample_preroll, &voices[v].vco3_sample_preroll, &voices[v].vco4_sample_preroll };
+            float *pending_sync_correction_ptr[4] = { &vco1_dummy_sync_correction, &voices[v].vco2_pending_sync_correction, &voices[v].vco3_pending_sync_correction, &voices[v].vco4_pending_sync_correction };
 
-            float fm_phase = voices[v].vco1_phase + (v2_modulator * fmaxf(0.0f, knobs->fm_intensity + fm_mod));
-            fm_phase = fmodf(fm_phase + phase_offset1, 1.0f); if (fm_phase < 0.0f) fm_phase += 1.0f;
+            // Vol-based gain used ONLY for FM modulator scaling (ignores mute, matching the
+            // original gain2_for_fm's "muting the sound must not silence the FM modulator"
+            // design). Osc1/Osc2 deliberately exclude mix_bal here too (a final-mix-only control).
+            float gain_for_fm_arr[4] = {
+                (knobs->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco1_vol + mod_vco1_amp)),
+                (knobs->vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco2_vol + mod_vco2_amp)),
+                (knobs->vco3_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco3_vol + mod_vco3_amp)),
+                (knobs->vco4_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco4_vol + mod_vco4_amp)),
+            };
+            float eg_level_arr[4] = { voices[v].vco1_eg.current_level, voices[v].vco2_eg.current_level, voices[v].vco3_eg.current_level, voices[v].vco4_eg.current_level };
 
-            // FM-aware PolyBLEP window width: dt1 alone is the CARRIER's nominal phase step, but
-            // under phase modulation the true instantaneous phase velocity at this sample also
-            // includes the modulator's own (fast-changing) contribution. Estimate it via the
-            // wrapped finite difference between this sample's and the previous sample's fully-
-            // computed fm_phase, mapped to the shortest signed distance around the unit circle.
-            // The 0.499f cap applies to the raw modulation-driven term ONLY, with the
-            // fmaxf(..., dt1) floor applied LAST -- so an unmodulated carrier (fm_intensity == 0,
-            // or any carrier pitch so high dt1 itself exceeds the cap) reproduces dt1 exactly,
-            // every sample, leaving existing unmodulated behavior provably unchanged.
-            float fm_phase_delta = fm_phase - voices[v].vco1_prev_fm_phase;
-            fm_phase_delta -= roundf(fm_phase_delta);
-            voices[v].vco1_prev_fm_phase = fm_phase;
-            float fm_dt1 = fmaxf(fminf(fabsf(fm_phase_delta), 0.499f), dt1);
+            int fm_algorithm_idx = (int)knobs->fm_algorithm;
+            if (fm_algorithm_idx < 0) fm_algorithm_idx = 0;
+            if (fm_algorithm_idx >= FM_ALGORITHM_COUNT) fm_algorithm_idx = FM_ALGORITHM_COUNT - 1;
+            const FmAlgorithm *alg = &FM_ALGORITHMS[fm_algorithm_idx];
 
-            float v1_out = 0.0f, v1_side_l = 0.0f, v1_side_r = 0.0f;
-            bool osc1_is_unison_saw = vco1_shape_now == WAVE_UNISON_SAW;
-            if (osc1_is_unison_saw) v1_out = render_unison_saw(voices[v].vco1_unison_saw_phases, dt1, vco1_unison_detune_final, vco1_unison_pan_l, vco1_unison_pan_r, phase_offset1, &v1_side_l, &v1_side_r);
-            else if (vco1_shape_now == WAVE_SAMPLE) v1_out = render_sample_osc(&voices[v].vco1_sample_stream, &voices[v].vco1_sample_ptr, &voices[v].vco1_sample_preroll, hz1, &v1_side_l, &v1_side_r);
-            else v1_out = lookup_osc_sample(vco1_shape_now, fm_phase, fm_dt1, vco1_pulse_width_final / 100.0f, &voices[v].vco1_tri_state);
-            float gain1 = (knobs->vco1_mute != 0.0f || knobs->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco1_vol - mix_bal + mod_vco1_amp));
-            float osc1_amp = gain1 * voices[v].vco1_eg.current_level;
+            float osc_out[4] = {0.0f, 0.0f, 0.0f, 0.0f}, osc_side_l[4] = {0.0f, 0.0f, 0.0f, 0.0f}, osc_side_r[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float modulator_output[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int slot = 0; slot < 4; slot++) {
+                int osc = alg->render_order[slot];
+                if (shape_arr[osc] == WAVE_OFF) { *pending_sync_correction_ptr[osc] = 0.0f; continue; } // WAVE_OFF: skip render entirely (phase advances unconditionally below)
+                float modulator_sum = 0.0f;
+                for (int e = 0; e < alg->edge_count; e++) {
+                    if (alg->edges[e].to_osc != osc) continue;
+                    int src = alg->edges[e].from_osc;
+                    float depth = *(const float*)((const char*)knobs + alg->edges[e].depth_offset);
+                    if (alg->edges[e].depth_offset == offsetof(SynthSharedControls, fm_intensity)) depth += fm_mod;
+                    depth = fmaxf(0.0f, depth);
+                    modulator_sum += modulator_output[src] * depth;
+                }
+                osc_out[osc] = render_fm_oscillator(
+                    shape_arr[osc], own_phase_arr[osc], dt_arr[osc], phase_offset_arr[osc], modulator_sum,
+                    prev_fm_phase_ptr[osc], pulse_or_tilt_arr[osc], tri_state_ptr[osc], tilt_lp_ptr[osc],
+                    noise_tilt_coeff, unison_phases_ptr[osc], unison_detune_arr[osc],
+                    unison_pan_l_ptr[osc], unison_pan_r_ptr[osc],
+                    sample_stream_ptr[osc], sample_ptr_ptr[osc], sample_preroll_ptr[osc], hz_arr[osc],
+                    do_sync_arr[osc], t_wrap_arr[osc], pending_sync_correction_ptr[osc],
+                    &osc_side_l[osc], &osc_side_r[osc]);
+                modulator_output[osc] = osc_out[osc] * gain_for_fm_arr[osc] * eg_level_arr[osc];
+            }
 
             // --- Stereo mixer: each oscillator is panned to L/R here, before anything reaches
             // the filters, so its placement survives filtering (Filter A/B run as two
-            // independent mono filters, one per channel -- see the fa_low/fb_low state). Osc
-            // 1/2's Unison Saw mode already produces a real stereo pair from its own internal
-            // unison spread (v1_side_l/r, v2_side_l/r) -- that's used directly as the
-            // oscillator's L/R image, with its Pan knob then applied as an overall balance
-            // shift on top of that existing width, rather than collapsing it to mono first. A
-            // WAVE_SAMPLE oscillator playing a genuinely stereo file gets the exact same
-            // treatment (render_sample_osc's own out_l/out_r, which are trivially equal for a
-            // mono file, so this changes nothing there) -- a hard-panned stereo drum loop or pad
-            // keeps its real width instead of being downmixed. ---
-            bool osc2_is_unison_saw = (WaveType)((int)knobs->vco2_shape) == WAVE_UNISON_SAW;
-            bool osc1_uses_side_channel = osc1_is_unison_saw || vco1_shape_now == WAVE_SAMPLE;
-            bool osc2_uses_side_channel = osc2_is_unison_saw || vco2_shape_now == WAVE_SAMPLE;
-            float vco1_l = (osc1_uses_side_channel ? v1_side_l : v1_out) * osc1_amp * pan1_l;
-            float vco1_r = (osc1_uses_side_channel ? v1_side_r : v1_out) * osc1_amp * pan1_r;
-            float vco2_l = (osc2_uses_side_channel ? v2_side_l : v2_out) * osc2_amp * pan2_l;
-            float vco2_r = (osc2_uses_side_channel ? v2_side_r : v2_out) * osc2_amp * pan2_r;
+            // independent mono filters, one per channel -- see the fa_low/fb_low state). Unison
+            // Saw/Sample's own internal stereo pair (side_l/r) is used directly as the
+            // oscillator's L/R image, with its Pan knob then applied as an overall balance shift
+            // on top of that existing width, rather than collapsing it to mono first. A WAVE_OFF
+            // oscillator naturally contributes exactly 0 here (its pan was never computed above,
+            // staying 0.0f, and its osc_out/side stay 0.0f too since render was skipped). ---
+            bool osc_uses_side[4] = {
+                shape_arr[0] == WAVE_UNISON_SAW || shape_arr[0] == WAVE_SAMPLE,
+                shape_arr[1] == WAVE_UNISON_SAW || shape_arr[1] == WAVE_SAMPLE,
+                shape_arr[2] == WAVE_UNISON_SAW || shape_arr[2] == WAVE_SAMPLE,
+                shape_arr[3] == WAVE_UNISON_SAW || shape_arr[3] == WAVE_SAMPLE,
+            };
+            float gain_audible_arr[4] = {
+                (knobs->vco1_mute != 0.0f || knobs->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco1_vol - mix_bal + mod_vco1_amp)),
+                (knobs->vco2_mute != 0.0f || knobs->vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco2_vol + mix_bal + mod_vco2_amp)),
+                (knobs->vco3_mute != 0.0f || knobs->vco3_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco3_vol + mod_vco3_amp)),
+                (knobs->vco4_mute != 0.0f || knobs->vco4_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco4_vol + mod_vco4_amp)),
+            };
+            float pan_l_arr[4] = { pan1_l, pan2_l, pan3_l, pan4_l };
+            float pan_r_arr[4] = { pan1_r, pan2_r, pan3_r, pan4_r };
+            float osc_l[4], osc_r[4];
+            for (int osc = 0; osc < 4; osc++) {
+                float amp = gain_audible_arr[osc] * eg_level_arr[osc];
+                osc_l[osc] = (osc_uses_side[osc] ? osc_side_l[osc] : osc_out[osc]) * amp * pan_l_arr[osc];
+                osc_r[osc] = (osc_uses_side[osc] ? osc_side_r[osc] : osc_out[osc]) * amp * pan_r_arr[osc];
+            }
 
-            // Sub Oscillator: exactly one octave below Osc 1, derived from hz1 (already fully
-            // modulated -- fine tune, portamento, every LFO/EG pitch mod, all included) so it
-            // implicitly tracks everything Osc 1's pitch does with zero pitch controls of its own.
-            float dt_sub = (hz1 * 0.5f) / (float)SAMPLE_RATE;
-            float sub_out = lookup_osc_sample(sub_wave_to_osc_wave((int)knobs->sub_shape), voices[v].sub_phase, dt_sub, 0.5f, &voices[v].sub_tri_state);
-            float gain_sub = (knobs->sub_mute != 0.0f || knobs->sub_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->sub_vol + mod_sub_amp));
-            // Shares Osc 1's own amp envelope by design (see the struct comment) rather than a
-            // separate one -- it's meant to always move exactly in lockstep with Osc 1.
-            float sub_amp = sub_out * gain_sub * voices[v].vco1_eg.current_level;
-            float sub_l = sub_amp * pan_sub_l, sub_r = sub_amp * pan_sub_r;
-
-            // Osc 3: today still hardcoded to always be Noise-shaped (the old dedicated Noise
-            // oscillator's exact behavior, just renamed onto vco3_* identifiers) -- white noise
-            // through a simple one-pole tilt-color filter (see noise_tilt_coeff above). tilt_frac
-            // in [-1,1]: -1 leans fully on the low-passed component (dark), 0 is flat white
-            // (low+high == the original signal, unity gain), +1 leans fully on the high
-            // (complementary) component (bright/hissy).
-            // TODO (in progress, see the "3 Oscillators + Sub" plan): Osc 3 is not yet a full
-            // peer of Osc 1/2 -- it doesn't yet read vco3_shape, doesn't run through
-            // render_fm_oscillator, isn't a Hard Sync slave, and Osc 1/2 don't yet get
-            // Tilt-shaped noise of their own. That wiring is the remaining work.
-            float white = (((float)rand() / (float)RAND_MAX) * 2.0f) - 1.0f;
-            voices[v].vco3_tilt_lp += noise_tilt_coeff * (white - voices[v].vco3_tilt_lp);
-            float vco3_tilt_high = white - voices[v].vco3_tilt_lp;
-            float vco3_tilt_frac = fmaxf(-1.0f, fminf(1.0f, (knobs->vco3_pulse_width + mod_vco3_tilt) / 100.0f));
-            float vco3_out = voices[v].vco3_tilt_lp * (1.0f - vco3_tilt_frac) + vco3_tilt_high * (1.0f + vco3_tilt_frac);
-            float gain3 = (knobs->vco3_mute != 0.0f || knobs->vco3_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco3_vol + mod_vco3_amp));
-            float osc3_amp = vco3_out * gain3 * voices[v].vco3_eg.current_level;
-            float vco3_l = osc3_amp * pan3_l, vco3_r = osc3_amp * pan3_r;
-
-            // vco1_phase_before/new_vco1_phase/do_sync/t_wrap were computed earlier (right after
-            // dt1/dt2), before either oscillator's audio for this sample was rendered -- see that
-            // comment for why. Only the actual phase mutations happen here.
+            // Phase advance (unconditional, even for WAVE_OFF -- phase bookkeeping stays live so
+            // Hard Sync/FM keep working through an Off oscillator with zero special-casing).
+            // do_syncN/t_wrapN were computed earlier, before any oscillator's audio for this
+            // sample was rendered -- see that comment for why. Only the actual phase mutations
+            // happen here.
             voices[v].vco1_phase = fmodf(new_vco1_phase, 1.0f);
             voices[v].vco2_phase = fmodf(voices[v].vco2_phase + dt2, 1.0f);
-            voices[v].sub_phase = fmodf(voices[v].sub_phase + dt_sub, 1.0f);
-            if (do_sync) {
-                // Sub-sample-accurate sync: reset Osc2's phase to where it would be if it had
-                // been snapped to exactly 0 at the true fractional-sample instant t_wrap (where
-                // Osc1 actually crossed 1.0), then continued advancing at rate dt2 for the
-                // remaining (1 - t_wrap) of this sample -- instead of a flat 0.0f, which
-                // quantizes the sync point to the next sample boundary and introduces phase
-                // jitter. The amplitude discontinuity this reset creates in Osc2's own output is
-                // separately BLEP-corrected above (Saw/Square/Pulse only); Triangle's tri_state is
-                // deliberately left untouched here so its leaky integrator smooths through the
-                // reset instead of snapping.
-                voices[v].vco2_phase = fmodf((1.0f - t_wrap) * dt2, 1.0f);
-                // Unison Saw's 7 detuned phases get the same fractional-offset treatment now
-                // (previously a flat 0.0f each, the same timing-jitter bug just fixed for the
-                // plain-phase case above) -- each voice has its own effective rate, computed the
-                // same way render_unison_saw() computes it internally.
+            voices[v].vco3_phase = fmodf(voices[v].vco3_phase + dt3, 1.0f);
+            voices[v].vco4_phase = fmodf(voices[v].vco4_phase + dt4, 1.0f);
+            // Sub-sample-accurate sync: reset each slave's phase to where it would be if it had
+            // been snapped to exactly 0 at the true fractional-sample instant t_wrap, then
+            // continued advancing at its own rate for the remaining (1 - t_wrap) of this sample --
+            // instead of a flat 0.0f, which quantizes the sync point to the next sample boundary
+            // and introduces phase jitter. The amplitude discontinuity this reset creates is
+            // separately BLEP-corrected inside render_fm_oscillator (Saw/Square/Pulse only);
+            // Triangle's tri_state is deliberately left untouched so its leaky integrator smooths
+            // through the reset instead of snapping.
+            // Whenever a slave's phase is reset, its own prev_fm_phase tracking (used by
+            // render_fm_oscillator's FM-aware adaptive BLEP width) must be rebased to match --
+            // otherwise the next sample's finite-difference sees the reset itself as a huge
+            // "modulator" jump and spuriously widens that oscillator's BLEP window, even with
+            // zero incoming FM. Rebasing to the same mod_phase formula render_fm_oscillator uses
+            // makes next sample's delta collapse to ~0 (when unmodulated and phase_offset is
+            // unchanged), so the fmaxf(...,dt) floor gives back exactly dt -- provably identical
+            // to a plain (non-adaptive) dt, matching this oscillator's pre-FM-algorithm behavior.
+            if (do_sync2) {
+                voices[v].vco2_phase = fmodf((1.0f - t_wrap2) * dt2, 1.0f);
                 for (int u = 0; u < UNISON_SAW_VOICES; u++) {
-                    float voice_dt2 = unison_saw_voice_dt(dt2, vco2_unison_detune_final, u);
-                    voices[v].vco2_unison_saw_phases[u] = fmodf((1.0f - t_wrap) * voice_dt2, 1.0f);
+                    float voice_dt = unison_saw_voice_dt(dt2, vco2_unison_detune_final, u);
+                    voices[v].vco2_unison_saw_phases[u] = fmodf((1.0f - t_wrap2) * voice_dt, 1.0f);
                 }
+                float rebased2 = fmodf(voices[v].vco2_phase + phase_offset2, 1.0f); if (rebased2 < 0.0f) rebased2 += 1.0f;
+                voices[v].vco2_prev_fm_phase = rebased2;
+            }
+            if (do_sync3) {
+                voices[v].vco3_phase = fmodf((1.0f - t_wrap3) * dt3, 1.0f);
+                for (int u = 0; u < UNISON_SAW_VOICES; u++) {
+                    float voice_dt = unison_saw_voice_dt(dt3, vco3_unison_detune_final, u);
+                    voices[v].vco3_unison_saw_phases[u] = fmodf((1.0f - t_wrap3) * voice_dt, 1.0f);
+                }
+                float rebased3 = fmodf(voices[v].vco3_phase + phase_offset3, 1.0f); if (rebased3 < 0.0f) rebased3 += 1.0f;
+                voices[v].vco3_prev_fm_phase = rebased3;
+            }
+            if (do_sync4) {
+                voices[v].vco4_phase = fmodf((1.0f - t_wrap4) * dt4, 1.0f);
+                for (int u = 0; u < UNISON_SAW_VOICES; u++) {
+                    float voice_dt = unison_saw_voice_dt(dt4, vco4_unison_detune_final, u);
+                    voices[v].vco4_unison_saw_phases[u] = fmodf((1.0f - t_wrap4) * voice_dt, 1.0f);
+                }
+                float rebased4 = fmodf(voices[v].vco4_phase + phase_offset4, 1.0f); if (rebased4 < 0.0f) rebased4 += 1.0f;
+                voices[v].vco4_prev_fm_phase = rebased4;
             }
 
             // The "summer/mixer": all 4 oscillators combined into a stereo pair (each already
             // panned above), THEN that stereo signal goes into Filter A -> Filter B.
-            float stage_in_l = vco1_l + vco2_l + sub_l + vco3_l;
-            float stage_in_r = vco1_r + vco2_r + sub_r + vco3_r;
+            float stage_in_l = osc_l[0] + osc_l[1] + osc_l[2] + osc_l[3];
+            float stage_in_r = osc_r[0] + osc_r[1] + osc_r[2] + osc_r[3];
 
             // --- Filter A/B: Filter A is Normal (single filter) or Multi (3-filter engine);
             // Filter B is always a single Normal filter. Each runs once per channel -- every
@@ -4592,6 +4871,7 @@ typedef struct {
 } EngineStatus;
 
 int main() {
+    assert_fm_algorithms_acyclic();
     const char *socket_path = "/tmp/synth.sock"; int client_fd = -1;
     signal(SIGINT, handle_sigint);
     int server_fd = setup_control_socket(socket_path); if (server_fd < 0) return 1;
