@@ -3136,17 +3136,19 @@ static void release_idle_sample_streams(SynthVoice *voice) {
 // root-note frequency, so pitch bend/vibrato/EG-to-pitch all work on a sample voice for free,
 // with zero duplicated pitch logic.
 //
-// Natively stereo samples are downmixed to mono here (L+R averaged) and re-panned through the
-// same Pan knob every other oscillator uses -- a deliberate simplification (a hard-panned stereo
-// drum loop would lose its native width) in exchange for reusing one consistent mono-oscillator-
-// then-pan pipeline everywhere, rather than threading a parallel stereo path through the whole
-// mixer/filter/FX chain for this one oscillator type.
-static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll_inout, float hz) {
-    if (*stream_idx < 0) return 0.0f;
+// A natively stereo file's real L/R pair is also handed back via the optional out_l/out_r
+// pointers (NULL if the caller doesn't want them), exactly mirroring render_unison_saw's
+// side_l/side_r convention -- the mono return value stays available for FM-modulator use and
+// mono-file callers. The pre-roll cache and ring buffer already track L and R completely
+// independently end to end (interpolation, loop-splice crossfade, everything); mono is only
+// ever collapsed at the very last step here, so a stereo drum loop or pad keeps its real width
+// instead of being downmixed, the same fix WAVE_UNISON_SAW's own stereo image needed earlier.
+static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll_inout, float hz, float *out_l_ptr, float *out_r_ptr) {
+    if (*stream_idx < 0) { if (out_l_ptr) *out_l_ptr = 0.0f; if (out_r_ptr) *out_r_ptr = 0.0f; return 0.0f; }
     SampleStream *stream = &g_sample_streams[*stream_idx];
-    if (!stream->in_use) { *stream_idx = -1; return 0.0f; } // reclaimed elsewhere -- defensive, shouldn't happen
+    if (!stream->in_use) { *stream_idx = -1; if (out_l_ptr) *out_l_ptr = 0.0f; if (out_r_ptr) *out_r_ptr = 0.0f; return 0.0f; } // reclaimed elsewhere -- defensive, shouldn't happen
     SampleSlot *slot = &g_sample_slots[atomic_load_explicit(&stream->slot_index, memory_order_relaxed)];
-    if (!slot->loaded) return 0.0f;
+    if (!slot->loaded) { if (out_l_ptr) *out_l_ptr = 0.0f; if (out_r_ptr) *out_r_ptr = 0.0f; return 0.0f; }
 
     float ratio;
     if (slot->unpitched) {
@@ -3204,9 +3206,13 @@ static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll
                 release_sample_stream(*stream_idx);
                 *stream_idx = -1;
                 *ptr_inout = ptr; *preroll_inout = preroll;
+                if (out_l_ptr) *out_l_ptr = 0.0f;
+                if (out_r_ptr) *out_r_ptr = 0.0f;
                 return 0.0f;
             }
             *ptr_inout = ptr; *preroll_inout = preroll;
+            if (out_l_ptr) *out_l_ptr = 0.0f;
+            if (out_r_ptr) *out_r_ptr = 0.0f;
             return 0.0f;
         }
 
@@ -3239,9 +3245,13 @@ static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll
 
     *ptr_inout = ptr;
     *preroll_inout = preroll;
-    float mono_out = (out_l + out_r) * 0.5f;
-    if (slot->gain_db != 0.0f) mono_out *= powf(10.0f, slot->gain_db / 20.0f);
-    return mono_out;
+    if (slot->gain_db != 0.0f) {
+        float gain_mult = powf(10.0f, slot->gain_db / 20.0f);
+        out_l *= gain_mult; out_r *= gain_mult;
+    }
+    if (out_l_ptr) *out_l_ptr = out_l;
+    if (out_r_ptr) *out_r_ptr = out_r;
+    return (out_l + out_r) * 0.5f;
 }
 
 // Looks up the currently-claimed zone's own Pan setting for a WAVE_SAMPLE oscillator, so
@@ -3808,7 +3818,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
 
             float v2_out = 0.0f, v2_side_l = 0.0f, v2_side_r = 0.0f;
             if (vco2_shape_now == WAVE_UNISON_SAW) v2_out = render_unison_saw(voices[v].vco2_unison_saw_phases, dt2, vco2_unison_detune_final, vco2_unison_pan_l, vco2_unison_pan_r, phase_offset2, &v2_side_l, &v2_side_r);
-            else if (vco2_shape_now == WAVE_SAMPLE) v2_out = render_sample_osc(&voices[v].vco2_sample_stream, &voices[v].vco2_sample_ptr, &voices[v].vco2_sample_preroll, hz2);
+            else if (vco2_shape_now == WAVE_SAMPLE) v2_out = render_sample_osc(&voices[v].vco2_sample_stream, &voices[v].vco2_sample_ptr, &voices[v].vco2_sample_preroll, hz2, &v2_side_l, &v2_side_r);
             else {
                 float vco2_read_phase = fmodf(voices[v].vco2_phase + phase_offset2, 1.0f); if (vco2_read_phase < 0.0f) vco2_read_phase += 1.0f;
                 v2_out = lookup_osc_sample(vco2_shape_now, vco2_read_phase, dt2, vco2_pulse_width_final / 100.0f, &voices[v].vco2_tri_state);
@@ -3835,7 +3845,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float v1_out = 0.0f, v1_side_l = 0.0f, v1_side_r = 0.0f;
             bool osc1_is_unison_saw = vco1_shape_now == WAVE_UNISON_SAW;
             if (osc1_is_unison_saw) v1_out = render_unison_saw(voices[v].vco1_unison_saw_phases, dt1, vco1_unison_detune_final, vco1_unison_pan_l, vco1_unison_pan_r, phase_offset1, &v1_side_l, &v1_side_r);
-            else if (vco1_shape_now == WAVE_SAMPLE) v1_out = render_sample_osc(&voices[v].vco1_sample_stream, &voices[v].vco1_sample_ptr, &voices[v].vco1_sample_preroll, hz1);
+            else if (vco1_shape_now == WAVE_SAMPLE) v1_out = render_sample_osc(&voices[v].vco1_sample_stream, &voices[v].vco1_sample_ptr, &voices[v].vco1_sample_preroll, hz1, &v1_side_l, &v1_side_r);
             else v1_out = lookup_osc_sample(vco1_shape_now, fm_phase, dt1, vco1_pulse_width_final / 100.0f, &voices[v].vco1_tri_state);
             float gain1 = (knobs->vco1_mute != 0.0f || knobs->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco1_vol - mix_bal + mod_vco1_amp));
             float osc1_amp = gain1 * voices[v].vco1_eg.current_level;
@@ -3846,12 +3856,18 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // 1/2's Unison Saw mode already produces a real stereo pair from its own internal
             // unison spread (v1_side_l/r, v2_side_l/r) -- that's used directly as the
             // oscillator's L/R image, with its Pan knob then applied as an overall balance
-            // shift on top of that existing width, rather than collapsing it to mono first. ---
+            // shift on top of that existing width, rather than collapsing it to mono first. A
+            // WAVE_SAMPLE oscillator playing a genuinely stereo file gets the exact same
+            // treatment (render_sample_osc's own out_l/out_r, which are trivially equal for a
+            // mono file, so this changes nothing there) -- a hard-panned stereo drum loop or pad
+            // keeps its real width instead of being downmixed. ---
             bool osc2_is_unison_saw = (WaveType)((int)knobs->vco2_shape) == WAVE_UNISON_SAW;
-            float vco1_l = (osc1_is_unison_saw ? v1_side_l : v1_out) * osc1_amp * pan1_l;
-            float vco1_r = (osc1_is_unison_saw ? v1_side_r : v1_out) * osc1_amp * pan1_r;
-            float vco2_l = (osc2_is_unison_saw ? v2_side_l : v2_out) * osc2_amp * pan2_l;
-            float vco2_r = (osc2_is_unison_saw ? v2_side_r : v2_out) * osc2_amp * pan2_r;
+            bool osc1_uses_side_channel = osc1_is_unison_saw || vco1_shape_now == WAVE_SAMPLE;
+            bool osc2_uses_side_channel = osc2_is_unison_saw || vco2_shape_now == WAVE_SAMPLE;
+            float vco1_l = (osc1_uses_side_channel ? v1_side_l : v1_out) * osc1_amp * pan1_l;
+            float vco1_r = (osc1_uses_side_channel ? v1_side_r : v1_out) * osc1_amp * pan1_r;
+            float vco2_l = (osc2_uses_side_channel ? v2_side_l : v2_out) * osc2_amp * pan2_l;
+            float vco2_r = (osc2_uses_side_channel ? v2_side_r : v2_out) * osc2_amp * pan2_r;
 
             // Sub Oscillator: exactly one octave below Osc 1, derived from hz1 (already fully
             // modulated -- fine tune, portamento, every LFO/EG pitch mod, all included) so it

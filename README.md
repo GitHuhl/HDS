@@ -182,10 +182,23 @@ A digital synthesizer split into two processes:
   permanently active instead of a brief transition; `loop_enabled` (also
   per-zone) turned off makes it a genuine one-shot that releases its
   stream cleanly at natural end-of-data instead of looping at all -- e.g.
-  drum hits. Only the first two channels of a multichannel WAV are read
-  (native stereo is downmixed L+R to mono, then re-panned through the same
-  Pan knob every other oscillator uses); PCM 16/24/32-bit and 32-bit float
-  WAV are supported.
+  drum hits. Only the first two channels of a multichannel WAV are read;
+  PCM 16/24/32-bit and 32-bit float WAV are supported.
+
+  A genuinely stereo file keeps its real L/R width instead of being
+  downmixed -- the pre-roll cache and DFD ring buffer already track L and R
+  completely independently end to end (interpolation, loop-splice
+  crossfade, everything), so `render_sample_osc()` hands its real stereo
+  pair back via optional `out_l`/`out_r` pointers, exactly mirroring
+  `render_unison_saw()`'s own `side_l`/`side_r` convention (its mono return
+  value stays available for FM-modulator use). `render_audio_block()`
+  treats a stereo `WAVE_SAMPLE` zone the same way it already treats Unison
+  Saw for the stereo-vs-mono mixer selection: the file's own L/R image is
+  used directly, with the oscillator's Pan knob (plus any per-zone Pan, see
+  the Mapping tab's Zone Inspector) applied as an overall balance shift on
+  top of that width rather than collapsing it to mono first -- a mono file
+  degenerates to the exact same math as before (L and R are trivially
+  identical), so nothing changes there.
 
   Which loaded slot actually plays is real per-note/velocity zone mapping
   (SFZ-style): every loaded slot is also a zone (`min_note`/`max_note`,
