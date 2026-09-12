@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
+#include <wavpack/wavpack.h>
 
 #define SAMPLE_RATE 48000
 // BUFFER_SIZE and MAX_VOICES are now hard CEILINGS for array allocation only -- how many
@@ -597,6 +598,13 @@ typedef struct {
     // The frontend regenerates this to a fresh timestamped filename in the chosen Recordings
     // folder after every stop, so consecutive takes never collide/overwrite.
     char record_path[RECORD_PATH_LEN];
+
+    // Recording format: 0=WAV (32-bit float, lossless, larger files), 1=WavPack (lossless
+    // compression, ~40-60% smaller, converted to 24-bit PCM before encoding since WavPack -- like
+    // FLAC -- losslessly compresses integer PCM, not float). Frozen into the writer thread's
+    // RecordEngine.cmd_record_format at the same record-start edge as record_path, so a change
+    // mid-take never desyncs an already-open file. See wavpack_recorder_*/WavPackRecorder.
+    float record_format;
 } SynthSharedControls;
 
 // Clamp the live polyphony/block-size controls into their hard array-allocation ceilings.
@@ -2234,6 +2242,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->record_downmix_stereo = 0.0f;
     for (int c = 0; c < RECORD_MAX_CHANNELS; c++) knobs->record_input_channel_enable[c] = 0.0f;
     knobs->record_path[0] = '\0';
+    knobs->record_format = 0.0f; // WAV
     knobs->tempo_bpm = 120.0f; // a common, neutral default tempo
     knobs->tempo_marker_count = 0.0f; // no tempo map programmed -- tempo_bpm alone applies
     for (int t = 0; t < TEMPO_MARKER_MAX; t++) { knobs->tempo_marker_time[t] = 0.0f; knobs->tempo_marker_bpm[t] = 0.0f; }
@@ -4759,6 +4768,107 @@ static void wav_recorder_stop(WavRecorder *rec) {
     fprintf(stderr, "[record] stopped: %u frames (%.2fs), %d channel(s)\n", rec->frames_written, rec->frames_written / (float)SAMPLE_RATE, rec->channels);
 }
 
+// --- WavPack recording: an additional lossless format alongside WAV, reusing the exact same
+// RecordRing/writer-thread architecture unchanged -- same wait-free push from the audio thread,
+// same writer-thread-only file I/O discipline as WavRecorder above. WavPack (like FLAC)
+// losslessly compresses integer PCM, not float, so incoming float samples are converted to
+// 24-bit (packed in int32_t) just before handing them to the encoder. Uses libwavpack's
+// callback-based block output (WavpackOpenFileOutput) rather than the RIFF-style
+// open-now/backpatch-on-stop approach WAV uses -- WavPack's own format has no equivalent
+// backpatch step, so the encoder is simply flushed and closed on stop. ---
+typedef struct {
+    WavpackContext *ctx;
+    FILE *file;
+    int channels;
+    uint32_t frames_written;
+    bool active;
+    bool sel_include_synth_output;
+    bool sel_downmix_stereo;
+    bool sel_input_channel[RECORD_MAX_CHANNELS];
+    int sel_input_channel_count;
+} WavPackRecorder;
+
+// libwavpack's WavpackBlockOutput callback: just appends the encoder's already-formatted block
+// bytes to our file. Writer-thread-only (the encoder calls this synchronously from inside
+// WavpackPackSamples/WavpackFlushSamples, both called only from the writer thread).
+static int wavpack_block_output(void *id, void *data, int32_t bcount) {
+    FILE *f = (FILE *)id;
+    return fwrite(data, 1, (size_t)bcount, f) == (size_t)bcount;
+}
+
+static bool wavpack_recorder_start(WavPackRecorder *rec, const char *path, bool include_synth_output, bool downmix_stereo, const bool *input_channel_enable, int input_channel_count) {
+    int channels = wav_recorder_compute_channels(include_synth_output, downmix_stereo, input_channel_enable, input_channel_count);
+    if (channels <= 0) { fprintf(stderr, "[record] cannot start (WavPack): no channels selected\n"); return false; }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "[record] failed to open '%s' for writing: %s\n", path, strerror(errno)); return false; }
+
+    WavpackContext *ctx = WavpackOpenFileOutput(wavpack_block_output, f, NULL);
+    if (!ctx) { fprintf(stderr, "[record] WavpackOpenFileOutput failed\n"); fclose(f); return false; }
+
+    WavpackConfig config; memset(&config, 0, sizeof(config));
+    config.bytes_per_sample = 3;   // 24-bit PCM, packed 3 bytes/sample into each int32_t
+    config.bits_per_sample = 24;
+    config.num_channels = channels;
+    config.sample_rate = SAMPLE_RATE;
+
+    // (uint32_t)-1 total_samples signals "length not known in advance" (this is a live, streamed
+    // recording of unknown duration) -- WavPack supports this the same way its CLI does when
+    // encoding from a pipe/stdin.
+    if (!WavpackSetConfiguration(ctx, &config, (uint32_t)-1) || !WavpackPackInit(ctx)) {
+        fprintf(stderr, "[record] WavPack configuration/init failed: %s\n", WavpackGetErrorMessage(ctx));
+        WavpackCloseFile(ctx); fclose(f); return false;
+    }
+
+    rec->ctx = ctx;
+    rec->file = f;
+    rec->channels = channels;
+    rec->frames_written = 0;
+    rec->active = true;
+    rec->sel_include_synth_output = include_synth_output;
+    rec->sel_downmix_stereo = downmix_stereo;
+    for (int c = 0; c < RECORD_MAX_CHANNELS; c++) rec->sel_input_channel[c] = (c < input_channel_count) && input_channel_enable[c];
+    rec->sel_input_channel_count = input_channel_count;
+    return true;
+}
+
+static void wavpack_recorder_write(WavPackRecorder *rec, const float *interleaved, int num_frames) {
+    if (!rec->active || num_frames <= 0) return;
+    static int32_t pcm_buf[8192];
+    int total_values = num_frames * rec->channels;
+    int max_values = (int)(sizeof(pcm_buf) / sizeof(pcm_buf[0]));
+    // Chunk defensively in case a single drain hands us more than pcm_buf can hold at once (the
+    // writer thread's own pop_buf is already this size, so in practice this never loops more
+    // than once, but there's no reason to assume that ordering holds forever).
+    int offset = 0;
+    while (offset < total_values) {
+        int chunk_values = total_values - offset; if (chunk_values > max_values) chunk_values = max_values;
+        // Round down to a whole number of frames so a chunk boundary never splits one frame's
+        // channels across two WavpackPackSamples calls.
+        chunk_values -= chunk_values % rec->channels;
+        if (chunk_values <= 0) break;
+        for (int i = 0; i < chunk_values; i++) {
+            float s = interleaved[offset + i];
+            if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
+            pcm_buf[i] = (int32_t)(s * 8388607.0f); // 24-bit signed full scale (2^23 - 1)
+        }
+        WavpackPackSamples(rec->ctx, pcm_buf, (uint32_t)(chunk_values / rec->channels));
+        offset += chunk_values;
+    }
+    rec->frames_written += (uint32_t)num_frames;
+}
+
+static void wavpack_recorder_stop(WavPackRecorder *rec) {
+    if (!rec->active) return;
+    WavpackFlushSamples(rec->ctx);
+    WavpackCloseFile(rec->ctx);
+    rec->ctx = NULL;
+    fclose(rec->file);
+    rec->file = NULL;
+    rec->active = false;
+    fprintf(stderr, "[record] stopped (WavPack): %u frames (%.2fs), %d channel(s)\n", rec->frames_written, rec->frames_written / (float)SAMPLE_RATE, rec->channels);
+}
+
 // Audio-thread-side mirror of a WavRecorder's selection (NOT its file state -- the audio thread
 // never touches a FILE*). Set synchronously on the record-start edge from the same live knobs
 // the writer thread's copy is derived from, via the identical wav_recorder_compute_channels(), so
@@ -4794,6 +4904,7 @@ typedef struct {
     bool cmd_downmix_stereo;
     bool cmd_input_channel_enable[RECORD_MAX_CHANNELS];
     int cmd_input_channel_count;
+    int cmd_record_format; // RecordFormat: 0=WAV, 1=WavPack
 
     // Writer thread -> audio thread status, polled for the GUI's EngineStatus feedback.
     _Atomic bool is_active;
@@ -4848,55 +4959,69 @@ static void wav_recorder_gather_block(RecordGatherState *sel, RecordEngine *eng,
     record_ring_push(&eng->ring, frame_buf, (size_t)block_size * (size_t)sel->channels);
 }
 
-// Pops and writes everything currently available in the ring to *rec (if it's an active,
-// open recording) -- or just discards it (if not; e.g. a START is still in flight, or the
-// recording already stopped) so the ring's indices keep moving and a producer that's slightly
-// ahead of us doesn't spuriously see "full". Writer-thread-only.
-static void record_writer_drain(RecordEngine *eng, WavRecorder *rec) {
+// Pops and writes everything currently available in the ring to whichever recorder is active
+// (at most one of rec/wprec is ever active at a time -- only one file is open per take) -- or
+// just discards it (if neither is active; e.g. a START is still in flight, or the recording
+// already stopped) so the ring's indices keep moving and a producer that's slightly ahead of us
+// doesn't spuriously see "full". Writer-thread-only.
+static void record_writer_drain(RecordEngine *eng, WavRecorder *rec, WavPackRecorder *wprec) {
     static float pop_buf[8192];
-    if (rec->active && rec->channels > 0) {
-        size_t chunk_frames = (sizeof(pop_buf) / sizeof(float)) / (size_t)rec->channels;
-        size_t max_floats = chunk_frames * (size_t)rec->channels;
+    int channels = rec->active ? rec->channels : (wprec->active ? wprec->channels : 0);
+    if (channels > 0) {
+        size_t chunk_frames = (sizeof(pop_buf) / sizeof(float)) / (size_t)channels;
+        size_t max_floats = chunk_frames * (size_t)channels;
         size_t n;
         while ((n = record_ring_pop(&eng->ring, pop_buf, max_floats)) > 0) {
-            wav_recorder_write(rec, pop_buf, (int)(n / (size_t)rec->channels));
-            atomic_store_explicit(&eng->frames_written, rec->frames_written, memory_order_relaxed);
+            int num_frames = (int)(n / (size_t)channels);
+            if (rec->active) { wav_recorder_write(rec, pop_buf, num_frames); atomic_store_explicit(&eng->frames_written, rec->frames_written, memory_order_relaxed); }
+            else { wavpack_recorder_write(wprec, pop_buf, num_frames); atomic_store_explicit(&eng->frames_written, wprec->frames_written, memory_order_relaxed); }
         }
     } else {
         while (record_ring_pop(&eng->ring, pop_buf, sizeof(pop_buf) / sizeof(float)) > 0) {}
     }
 }
 
-// Entry point for the dedicated recording writer thread -- owns the ONLY WavRecorder instance
-// that ever touches a real FILE*. Polls for a command every RECORD_WRITER_POLL_MS via nanosleep
-// (rather than being condvar-signaled from the audio thread) specifically to avoid putting even
-// a brief mutex/futex wait on the audio thread's side of the handshake; the audio thread's only
-// synchronization primitives are the wait-free ring and plain atomic loads/stores.
+// Entry point for the dedicated recording writer thread -- owns the ONLY WavRecorder/
+// WavPackRecorder instances that ever touch a real FILE*. Polls for a command every
+// RECORD_WRITER_POLL_MS via nanosleep (rather than being condvar-signaled from the audio thread)
+// specifically to avoid putting even a brief mutex/futex wait on the audio thread's side of the
+// handshake; the audio thread's only synchronization primitives are the wait-free ring and plain
+// atomic loads/stores.
 #define RECORD_WRITER_POLL_MS 5
 static void *record_writer_thread_main(void *arg) {
     RecordEngine *eng = (RecordEngine *)arg;
     WavRecorder rec = {0};
+    WavPackRecorder wprec = {0};
 
     for (;;) {
         int cmd = atomic_exchange_explicit(&eng->command, RECORD_CMD_NONE, memory_order_acquire);
         if (cmd == RECORD_CMD_START) {
             if (rec.active) wav_recorder_stop(&rec); // shouldn't happen, but never leak a handle
-            bool ok = wav_recorder_start(&rec, eng->cmd_path, eng->cmd_include_synth_output, eng->cmd_downmix_stereo,
-                                          eng->cmd_input_channel_enable, eng->cmd_input_channel_count);
+            if (wprec.active) wavpack_recorder_stop(&wprec);
+            bool ok;
+            if (eng->cmd_record_format == 1) {
+                ok = wavpack_recorder_start(&wprec, eng->cmd_path, eng->cmd_include_synth_output, eng->cmd_downmix_stereo,
+                                             eng->cmd_input_channel_enable, eng->cmd_input_channel_count);
+            } else {
+                ok = wav_recorder_start(&rec, eng->cmd_path, eng->cmd_include_synth_output, eng->cmd_downmix_stereo,
+                                         eng->cmd_input_channel_enable, eng->cmd_input_channel_count);
+            }
             atomic_store_explicit(&eng->frames_written, 0, memory_order_relaxed);
             if (!ok) atomic_store_explicit(&eng->start_failed, true, memory_order_relaxed);
-            atomic_store_explicit(&eng->is_active, rec.active, memory_order_release);
+            atomic_store_explicit(&eng->is_active, rec.active || wprec.active, memory_order_release);
         } else if (cmd == RECORD_CMD_STOP) {
             if (rec.active) wav_recorder_stop(&rec);
+            if (wprec.active) wavpack_recorder_stop(&wprec);
             atomic_store_explicit(&eng->is_active, false, memory_order_release);
         }
 
-        record_writer_drain(eng, &rec);
+        record_writer_drain(eng, &rec, &wprec);
 
         bool shutdown_requested = atomic_load_explicit(&eng->shutdown, memory_order_acquire);
         if (shutdown_requested && atomic_load_explicit(&eng->command, memory_order_acquire) == RECORD_CMD_NONE) {
-            record_writer_drain(eng, &rec); // final catch-all in case the audio thread pushed between our drain and observing shutdown
+            record_writer_drain(eng, &rec, &wprec); // final catch-all in case the audio thread pushed between our drain and observing shutdown
             if (rec.active) wav_recorder_stop(&rec);
+            if (wprec.active) wavpack_recorder_stop(&wprec);
             break;
         }
 
@@ -5164,6 +5289,7 @@ int main() {
                 record_engine.cmd_include_synth_output = sel_include_synth_output;
                 record_engine.cmd_downmix_stereo = sel_downmix_stereo;
                 record_engine.cmd_input_channel_count = detected_input_channels;
+                record_engine.cmd_record_format = (int)active_knobs.record_format;
                 for (int c = 0; c < RECORD_MAX_CHANNELS; c++) record_engine.cmd_input_channel_enable[c] = sel_input_channel[c];
 
                 record_gather.sel_include_synth_output = sel_include_synth_output;

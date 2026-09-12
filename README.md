@@ -475,8 +475,9 @@ knobs a given effect actually uses instead of 8 generic "P1..P8" dials.
 
 ## Build & run
 
-Requires ALSA dev headers (`libasound2-dev` on Debian/Ubuntu) and Python 3
-with PyQt6 and numpy (the Mapping tab's waveform display).
+Requires ALSA dev headers (`libasound2-dev` on Debian/Ubuntu), WavPack dev
+headers (`libwavpack-dev`, for the Recording tab's WavPack format option),
+and Python 3 with PyQt6 and numpy (the Mapping tab's waveform display).
 
 ```sh
 make                    # builds ./synth_engine
