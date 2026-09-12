@@ -2739,6 +2739,28 @@ class SynthGui(QWidget):
             slot_lay.addWidget(bypass_btn)
             self.fx_bypass_buttons.append(bypass_btn)
 
+            # Reorder: these move the slot's whole configuration (type/params/mix/bypass) to the
+            # neighboring position -- the row widgets themselves never move, only the values they
+            # hold, so nothing else about the slot's wiring/signal connections needs to change.
+            # Fixed at construction time since a button's own row index never changes: slot 0 has
+            # no Up, the last slot has no Down.
+            reorder_col = QVBoxLayout(); reorder_col.setSpacing(1)
+            up_btn = QPushButton("▲")
+            up_btn.setFixedSize(16, 16)
+            up_btn.setStyleSheet("QPushButton { font-size: 8px; padding: 0px; }")
+            up_btn.setToolTip("Move this slot up (swaps with the slot above -- Series routing processes top to bottom)")
+            up_btn.setEnabled(slot_idx > 0)
+            up_btn.clicked.connect(lambda checked=False, i=slot_idx: self._swap_fx_slots(i, i - 1))
+            down_btn = QPushButton("▼")
+            down_btn.setFixedSize(16, 16)
+            down_btn.setStyleSheet("QPushButton { font-size: 8px; padding: 0px; }")
+            down_btn.setToolTip("Move this slot down (swaps with the slot below -- Series routing processes top to bottom)")
+            down_btn.setEnabled(slot_idx < FX_SLOT_COUNT - 1)
+            down_btn.clicked.connect(lambda checked=False, i=slot_idx: self._swap_fx_slots(i, i + 1))
+            reorder_col.addWidget(up_btn)
+            reorder_col.addWidget(down_btn)
+            slot_lay.addLayout(reorder_col)
+
             fx_scroll_lay.addWidget(slot_box)
             self._apply_fx_slot_type(slot_idx, 0) # start on "Off": no params shown
 
@@ -3100,7 +3122,7 @@ class SynthGui(QWidget):
         self.tab_widget.addTab(self.tab_lfos, "LFOs")
         self.tab_widget.addTab(self.tab_egs, "Envelopes")
         self.tab_widget.addTab(self.tab_fx, "FX")
-        self.tab_widget.addTab(self.tab_audio, "Audio")
+        self.tab_widget.addTab(self.tab_audio, "Devices")
         self.tab_widget.addTab(self.tab_recording, "Recording")
         self.tab_widget.addTab(self.tab_mapping, "Mapping")
 
@@ -3184,6 +3206,68 @@ class SynthGui(QWidget):
                 dials[p_idx].setVisible(False)
                 combos[p_idx].setVisible(False)
                 columns[p_idx].setVisible(False)
+
+    def _fx_slot_snapshot(self, slot_idx):
+        """Captures everything that makes up one FX slot's configuration -- type, all 8 params
+        (as whichever representation, dial value or combo index, that type actually uses), mix,
+        and bypass -- so it can be moved wholesale to another slot position by _swap_fx_slots."""
+        type_idx = self.fx_type_combos[slot_idx].currentIndex()
+        entry = FX_TYPE_METADATA[type_idx] if 0 <= type_idx < len(FX_TYPE_METADATA) else FX_TYPE_METADATA[0]
+        params_meta = entry["params"]
+        params = []
+        for p_idx in range(FX_SLOT_PARAM_COUNT):
+            spec = params_meta[p_idx] if p_idx < len(params_meta) else None
+            if spec is not None and spec.get("type") == "choice":
+                params.append(("combo", self.fx_param_combos[slot_idx][p_idx].currentIndex()))
+            else:
+                params.append(("dial", self.fx_param_dials[slot_idx][p_idx].value()))
+        return {
+            "type_idx": type_idx,
+            "params": params,
+            "mix": self.fx_mix_dials[slot_idx].value(),
+            "bypass": self.fx_bypass_buttons[slot_idx].isChecked(),
+        }
+
+    def _fx_slot_restore(self, slot_idx, snapshot):
+        """Writes a snapshot from _fx_slot_snapshot into slot_idx's widgets -- relabels/re-ranges
+        the param widgets for the snapshot's type first (same reconfiguration a manual Type change
+        triggers), THEN sets the actual values, so a moved effect keeps its real settings instead
+        of resetting to that type's defaults."""
+        self.fx_type_combos[slot_idx].blockSignals(True)
+        self.fx_type_combos[slot_idx].setCurrentIndex(snapshot["type_idx"])
+        self.fx_type_combos[slot_idx].blockSignals(False)
+        self._apply_fx_slot_type(slot_idx, snapshot["type_idx"])
+        for p_idx, (kind, value) in enumerate(snapshot["params"]):
+            if kind == "combo":
+                combo = self.fx_param_combos[slot_idx][p_idx]
+                combo.blockSignals(True)
+                combo.setCurrentIndex(value)
+                combo.blockSignals(False)
+            else:
+                dial = self.fx_param_dials[slot_idx][p_idx]
+                dial.blockSignals(True)
+                dial.setValue(value)
+                dial.blockSignals(False)
+        self.fx_mix_dials[slot_idx].blockSignals(True)
+        self.fx_mix_dials[slot_idx].setValue(snapshot["mix"])
+        self.fx_mix_dials[slot_idx].blockSignals(False)
+        self.fx_bypass_buttons[slot_idx].blockSignals(True)
+        self.fx_bypass_buttons[slot_idx].setChecked(snapshot["bypass"])
+        self.fx_bypass_buttons[slot_idx].blockSignals(False)
+
+    def _swap_fx_slots(self, a, b):
+        """Moves slot a's whole configuration to slot b's position and vice versa -- the row
+        widgets stay put (so nothing about their signal wiring changes), only the values they
+        hold move. Series routing processes slots strictly by array position, so this alone is
+        what makes reordering actually change processing order once retransmitted; Parallel
+        routing sums all slots so order is a no-op for it either way."""
+        if not (0 <= a < FX_SLOT_COUNT and 0 <= b < FX_SLOT_COUNT):
+            return
+        snap_a = self._fx_slot_snapshot(a)
+        snap_b = self._fx_slot_snapshot(b)
+        self._fx_slot_restore(a, snap_b)
+        self._fx_slot_restore(b, snap_a)
+        self.transmit_knob_packet()
 
     def refresh_audio_devices(self):
         """Re-scans ALSA audio + MIDI device names, preserving whatever's currently selected if
