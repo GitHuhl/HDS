@@ -4384,6 +4384,35 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
 
     int voice_limit = effective_voice_limit(knobs);
     int block_size = effective_block_size(knobs);
+
+    // Portamento glide coefficient, per voice: depends only on knobs->portamento_time_ms (a
+    // knob, block-invariant) and voices[v].glide_time_multiplier (per-voice, but only rerolled at
+    // a glide event in handle_note_on/off -- called once per block from main()'s loop, never
+    // mid-block) -- so, same as the EG rates above, this only needs computing once per block, not
+    // once per voice per SAMPLE. It was previously recomputed (with an expf() call) on every
+    // sample for every active voice regardless of whether a glide was even in progress -- for a
+    // held note between glide events that's potentially millions of samples of pure waste.
+    float portamento_coeff[MAX_VOICES];
+    for (int v = 0; v < voice_limit; v++) {
+        float effective_glide_ms = fmaxf(1.0f, knobs->portamento_time_ms * voices[v].glide_time_multiplier);
+        portamento_coeff[v] = 1.0f - expf(-1.0f / ((effective_glide_ms / 1000.0f) * SAMPLE_RATE));
+    }
+
+    // Static-pan fallback: pan1_l/r..pan4_l/r (below, per voice per sample) reduce to just
+    // knobs->vcoN_pan -- the same value for every voice, every sample -- whenever nothing is
+    // actively modulating that oscillator's pan (mod_vcoN_pan == 0, the common case) and it isn't
+    // a WAVE_SAMPLE oscillator carrying its own zone pan offset. Precomputed once per block so the
+    // per-voice per-sample loop can skip the cosf/sinf pair entirely in that case instead of
+    // recomputing an unchanged angle up to MAX_VOICES x block_size times for nothing.
+    float static_pan_angle1 = (fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+    float static_pan_angle2 = (fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+    float static_pan_angle3 = (fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+    float static_pan_angle4 = (fmaxf(-1.0f, fminf(1.0f, knobs->vco4_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+    float static_pan1_l = cosf(static_pan_angle1), static_pan1_r = sinf(static_pan_angle1);
+    float static_pan2_l = cosf(static_pan_angle2), static_pan2_r = sinf(static_pan_angle2);
+    float static_pan3_l = cosf(static_pan_angle3), static_pan3_r = sinf(static_pan_angle3);
+    float static_pan4_l = cosf(static_pan_angle4), static_pan4_r = sinf(static_pan_angle4);
+
     for (int i = 0; i < block_size; i++) {
         float mixed_l = 0.0f, mixed_r = 0.0f;
         float lfo_out[LFO_COUNT] = {0.0f};
@@ -4463,9 +4492,9 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
 
             // Mono Legato glide randomization: each voice's own glide_time_multiplier (rerolled
             // per glide event in handle_note_on/off) scales the plain Glide Time knob, so
-            // successive legato glides don't all take exactly the same amount of time.
-            float effective_glide_ms = fmaxf(1.0f, knobs->portamento_time_ms * voices[v].glide_time_multiplier);
-            float portamento_coefficient = 1.0f - expf(-1.0f / ((effective_glide_ms / 1000.0f) * SAMPLE_RATE));
+            // successive legato glides don't all take exactly the same amount of time. See
+            // portamento_coeff[]'s own comment above (once per block, not once per sample).
+            float portamento_coefficient = portamento_coeff[v];
             voices[v].vco1_current_freq += (voices[v].vco1_target_freq - voices[v].vco1_current_freq) * portamento_coefficient;
             voices[v].vco2_current_freq += (voices[v].vco2_target_freq - voices[v].vco2_current_freq) * portamento_coefficient;
             voices[v].vco3_current_freq += (voices[v].vco3_target_freq - voices[v].vco3_current_freq) * portamento_coefficient;
@@ -4642,21 +4671,36 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float zone_pan4 = (vco4_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(voices[v].vco4_sample_stream) : 0.0f;
             float pan1_l = 0.0f, pan1_r = 0.0f, pan2_l = 0.0f, pan2_r = 0.0f;
             float pan3_l = 0.0f, pan3_r = 0.0f, pan4_l = 0.0f, pan4_r = 0.0f;
+            // Fall back to the once-per-block static angle (see its own comment above) whenever
+            // nothing is actually contributing on top of the plain Pan knob this sample -- skips
+            // the cosf/sinf pair entirely in the common (unmodulated) case.
             if (!osc1_off) {
-                pan1_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
-                pan1_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
+                if (mod_vco1_pan == 0.0f && zone_pan1 == 0.0f) { pan1_l = static_pan1_l; pan1_r = static_pan1_r; }
+                else {
+                    pan1_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
+                    pan1_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
+                }
             }
             if (!osc2_off) {
-                pan2_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
-                pan2_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
+                if (mod_vco2_pan == 0.0f && zone_pan2 == 0.0f) { pan2_l = static_pan2_l; pan2_r = static_pan2_r; }
+                else {
+                    pan2_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
+                    pan2_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
+                }
             }
             if (!osc3_off) {
-                pan3_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
-                pan3_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
+                if (mod_vco3_pan == 0.0f && zone_pan3 == 0.0f) { pan3_l = static_pan3_l; pan3_r = static_pan3_r; }
+                else {
+                    pan3_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
+                    pan3_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
+                }
             }
             if (!osc4_off) {
-                pan4_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
-                pan4_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
+                if (mod_vco4_pan == 0.0f && zone_pan4 == 0.0f) { pan4_l = static_pan4_l; pan4_r = static_pan4_r; }
+                else {
+                    pan4_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
+                    pan4_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
+                }
             }
 
             // Pulse Width/Tilt (targets 34/35/38/47), base knob plus any modulation. Dual-duty:
