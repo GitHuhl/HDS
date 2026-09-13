@@ -742,10 +742,6 @@ typedef struct {
     float current_level;
     float delay_timer;
     float hold_timer;
-    float attack_rate;
-    float decay_rate;
-    float sustain_level;
-    float release_rate;
     float release_level; // level captured at the instant note-off triggers release; release ramps from here to 0
 } ADSR;
 
@@ -856,56 +852,89 @@ typedef struct {
     bool vco4_sample_preroll;
 } SynthVoice;
 // FIXED: Restored 'p->s' to reference sustain data properties correctly
-void tick_adsr(ADSR *env, const PackEGParams *p, int mode) {
-    env->env_type = mode;
-    env->sustain_level = (mode == 1 || mode == 2 || mode == 4) ? 0.0f : (p->s / 100.0f);
+// Everything tick_adsr() needs BESIDES the envelope instance's own dynamic state (current_level/
+// state/timers/release_level) -- all of it derived purely from one EG *config* (a PackEGParams +
+// its mode), which is shared by every voice's own instance of that same EG slot. These values can
+// only change in response to an OSC message drained between blocks, never mid-block -- so
+// compute_eg_derived_rates() is called once per EG config per BLOCK (see render_audio_block),
+// not once per VOICE per SAMPLE the way this used to be computed inline inside tick_adsr() itself.
+// With up to MAX_VOICES voices x ENV_COUNT=10 envelopes each, that redundancy (several fmaxf/
+// fminf clamps and divisions, recomputed identically for every voice sharing the same EG slot)
+// was a real, measured bottleneck that scaled directly with polyphony -- confirmed the dominant
+// single cost in a profile of a plain two-oscillator patch at moderate voice counts, well before
+// oscillator/filter work alone would explain any strain.
+typedef struct {
+    int mode;
+    float atk_level;
+    float peak_level;
+    float sustain_level;
+    float attack_rate;
+    float decay_rate;
+    float release_rate_per_level; // multiply by env->release_level for the actual release decrement
+    float t_dly;
+    float t_hld;
+} EGDerivedRates;
+
+static void compute_eg_derived_rates(const PackEGParams *p, int mode, EGDerivedRates *out) {
+    out->mode = mode;
+    out->sustain_level = (mode == 1 || mode == 2 || mode == 4) ? 0.0f : (p->s / 100.0f);
     // Attack Start Level: the level the envelope *starts at* the instant a new note triggers it
     // (set in handle_note_on), before Attack ramps up toward Peak Level. At 0 (the default) this
     // is a plain envelope; raising it adds an instant "click"/punch. Controlled only via the
     // draggable (0,0) node in the GUI, not a dedicated knob.
-    float atk_level = fmaxf(0.0f, fminf(1.0f, p->al / 100.0f));
+    out->atk_level = fmaxf(0.0f, fminf(1.0f, p->al / 100.0f));
     // Attack Peak Level: the level Attack ramps *up to* (100% is the classic full-swing default).
     // Controlled via the same peak node's vertical drag that already sets Attack time (x).
-    float peak_level = fmaxf(0.0f, fminf(1.0f, p->pk / 100.0f));
+    out->peak_level = fmaxf(0.0f, fminf(1.0f, p->pk / 100.0f));
 
-    float t_dly = (mode == 5) ? fmaxf(0.001f, p->d / 1000.0f) : 0.0f;
-    float t_hld = (mode == 4 || mode == 6) ? fmaxf(0.001f, p->h / 1000.0f) : 0.0f;
+    out->t_dly = (mode == 5) ? fmaxf(0.001f, p->d / 1000.0f) : 0.0f;
+    out->t_hld = (mode == 4 || mode == 6) ? fmaxf(0.001f, p->h / 1000.0f) : 0.0f;
     float t_att = fmaxf(0.001f, p->a / 1000.0f);
     float t_dec = fmaxf(0.001f, p->dec / 1000.0f);
     float t_rel = fmaxf(0.001f, p->r / 1000.0f);
 
     // Attack climbs from its (possibly nonzero) start level up to Peak Level.
-    env->attack_rate = fmaxf(0.0f, peak_level - atk_level) / (t_att * SAMPLE_RATE);
-    env->decay_rate = fmaxf(0.0f, peak_level - env->sustain_level) / (t_dec * SAMPLE_RATE);
-    // FIXED: release now ramps from the level captured at the moment note-off fired
-    // (release_level), not from sustain_level. Previously this was always 0 for any mode
-    // whose sustain_level is 0 (AR, AD, AHD), so those envelopes never released.
-    env->release_rate = env->release_level / (t_rel * SAMPLE_RATE);
+    out->attack_rate = fmaxf(0.0f, out->peak_level - out->atk_level) / (t_att * SAMPLE_RATE);
+    out->decay_rate = fmaxf(0.0f, out->peak_level - out->sustain_level) / (t_dec * SAMPLE_RATE);
+    // FIXED (kept from the pre-refactor version): release ramps from the level captured at the
+    // moment note-off fired (release_level, per-instance), not from sustain_level. Previously
+    // this was always 0 for any mode whose sustain_level is 0 (AR, AD, AHD), so those envelopes
+    // never released. release_rate_per_level is the knob-derived part only; the per-instance
+    // multiply by release_level happens in tick_adsr() below.
+    out->release_rate_per_level = 1.0f / (t_rel * SAMPLE_RATE);
+}
 
+// Advances one envelope INSTANCE by one sample, using its EG config's precomputed rates (see
+// compute_eg_derived_rates()/EGDerivedRates above) -- the only per-instance work left is the
+// state-machine step itself (a handful of adds/compares), no clamps/divides/transcendentals.
+// sustain_chase_rate is passed in rather than recomputed here since it's a pure function of
+// SAMPLE_RATE (not even knob-dependent) -- see its own one-time computation in render_audio_block.
+void tick_adsr(ADSR *env, const EGDerivedRates *r, float sustain_chase_rate) {
+    env->env_type = r->mode;
     switch (env->state) {
         case STATE_IDLE: break;
         case STATE_DELAY:
             env->delay_timer += 1.0f / SAMPLE_RATE;
-            if (env->delay_timer >= t_dly) { env->state = STATE_ATTACK; env->delay_timer = 0.0f; }
+            if (env->delay_timer >= r->t_dly) { env->state = STATE_ATTACK; env->delay_timer = 0.0f; }
             break;
         case STATE_ATTACK:
-            env->current_level += env->attack_rate;
-            if (env->current_level >= peak_level) {
-                env->current_level = peak_level;
-                if (t_hld > 0.0f) { env->state = STATE_HOLD; env->hold_timer = 0.0f; }
-                else { env->state = (mode == 1 || mode == 3) ? STATE_SUSTAIN : STATE_DECAY; }
+            env->current_level += r->attack_rate;
+            if (env->current_level >= r->peak_level) {
+                env->current_level = r->peak_level;
+                if (r->t_hld > 0.0f) { env->state = STATE_HOLD; env->hold_timer = 0.0f; }
+                else { env->state = (r->mode == 1 || r->mode == 3) ? STATE_SUSTAIN : STATE_DECAY; }
             }
             break;
         case STATE_HOLD:
-            env->current_level = peak_level;
+            env->current_level = r->peak_level;
             env->hold_timer += 1.0f / SAMPLE_RATE;
-            if (env->hold_timer >= t_hld) { env->state = STATE_DECAY; env->hold_timer = 0.0f; }
+            if (env->hold_timer >= r->t_hld) { env->state = STATE_DECAY; env->hold_timer = 0.0f; }
             break;
         case STATE_DECAY:
-            env->current_level -= env->decay_rate;
-            if (env->current_level <= env->sustain_level) {
-                env->current_level = env->sustain_level;
-                env->state = (mode == 2 || mode == 4) ? STATE_IDLE : STATE_SUSTAIN;
+            env->current_level -= r->decay_rate;
+            if (env->current_level <= r->sustain_level) {
+                env->current_level = r->sustain_level;
+                env->state = (r->mode == 2 || r->mode == 4) ? STATE_IDLE : STATE_SUSTAIN;
             }
             break;
         case STATE_SUSTAIN:
@@ -917,13 +946,12 @@ void tick_adsr(ADSR *env, const PackEGParams *p, int mode) {
             // release-ramp bookkeeping (see above) -- AR has no real sustain segment, it must
             // stay frozen at Peak Level (where Attack left it) until Release fires, not chase
             // down to 0.
-            if (mode != 1) {
-                float sustain_chase_rate = 1.0f - expf(-1.0f / (0.015f * SAMPLE_RATE));
-                env->current_level += (env->sustain_level - env->current_level) * sustain_chase_rate;
+            if (r->mode != 1) {
+                env->current_level += (r->sustain_level - env->current_level) * sustain_chase_rate;
             }
             break;
         case STATE_RELEASE:
-            env->current_level -= env->release_rate;
+            env->current_level -= env->release_level * r->release_rate_per_level;
             if (env->current_level <= 0.0f) { env->current_level = 0.0f; env->state = STATE_IDLE; }
             break;
     }
@@ -4336,6 +4364,24 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         if (src >= 0 && src < SOURCE_COUNT) source_has_fx_slots[src] = true;
     }
 
+    // Envelope rates: one EGDerivedRates per EG *config* (ENV_COUNT of them), shared by every
+    // voice's own instance of that EG -- see compute_eg_derived_rates()'s own comment for why
+    // this moved here (once per block) instead of being recomputed inside tick_adsr() itself
+    // (once per voice per sample -- a redundancy that scaled directly, and expensively, with
+    // both polyphony and envelope count).
+    EGDerivedRates eg_rates[ENV_COUNT];
+    for (int e = 0; e < ENV_COUNT; e++) {
+        compute_eg_derived_rates(&knobs->eg[e], (int)knobs->eg_mode[e], &eg_rates[e]);
+    }
+    // Sustain-chase rate: not even knob-dependent (a pure function of SAMPLE_RATE), so computed
+    // exactly once for the life of the process rather than once per block.
+    static float eg_sustain_chase_rate;
+    static bool eg_sustain_chase_rate_initialized = false;
+    if (!eg_sustain_chase_rate_initialized) {
+        eg_sustain_chase_rate = 1.0f - expf(-1.0f / (0.015f * SAMPLE_RATE));
+        eg_sustain_chase_rate_initialized = true;
+    }
+
     int voice_limit = effective_voice_limit(knobs);
     int block_size = effective_block_size(knobs);
     for (int i = 0; i < block_size; i++) {
@@ -4407,11 +4453,11 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE && voices[v].vco3_eg.state == STATE_IDLE && voices[v].vco4_eg.state == STATE_IDLE) continue;
 
             for(int e=0; e<ENV_COUNT; e++) {
-                if(e==0) tick_adsr(&voices[v].vco1_eg, &knobs->eg[e], (int)knobs->eg_mode[e]);
-                else if(e==1) tick_adsr(&voices[v].vco2_eg, &knobs->eg[e], (int)knobs->eg_mode[e]);
-                else if(e==2) tick_adsr(&voices[v].vco3_eg, &knobs->eg[e], (int)knobs->eg_mode[e]);
-                else if(e==3) tick_adsr(&voices[v].vco4_eg, &knobs->eg[e], (int)knobs->eg_mode[e]);
-                else tick_adsr(&voices[v].assign_eg[e-4], &knobs->eg[e], (int)knobs->eg_mode[e]);
+                if(e==0) tick_adsr(&voices[v].vco1_eg, &eg_rates[e], eg_sustain_chase_rate);
+                else if(e==1) tick_adsr(&voices[v].vco2_eg, &eg_rates[e], eg_sustain_chase_rate);
+                else if(e==2) tick_adsr(&voices[v].vco3_eg, &eg_rates[e], eg_sustain_chase_rate);
+                else if(e==3) tick_adsr(&voices[v].vco4_eg, &eg_rates[e], eg_sustain_chase_rate);
+                else tick_adsr(&voices[v].assign_eg[e-4], &eg_rates[e], eg_sustain_chase_rate);
             }
             release_idle_sample_streams(&voices[v]); // WAVE_SAMPLE: free any DFD stream this voice's oscillator(s) no longer need
 
@@ -4623,10 +4669,14 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float vco3_pulse_width_final = (vco3_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->vco3_pulse_width + mod_vco3_tilt)) : fmaxf(2.0f, fminf(98.0f, knobs->vco3_pulse_width + mod_vco3_tilt));
             float vco4_pulse_width_final = (vco4_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->vco4_pulse_width + mod_vco4_tilt)) : fmaxf(2.0f, fminf(98.0f, knobs->vco4_pulse_width + mod_vco4_tilt));
 
-            float hz1 = voices[v].vco1_current_freq * powf(2.0f, mod_vco1_pitch / 1200.0f);
-            float hz2 = voices[v].vco2_current_freq * powf(2.0f, mod_vco2_pitch / 1200.0f);
-            float hz3 = voices[v].vco3_current_freq * powf(2.0f, mod_vco3_pitch / 1200.0f);
-            float hz4 = voices[v].vco4_current_freq * powf(2.0f, mod_vco4_pitch / 1200.0f);
+            // Skip the powf() call entirely when there's nothing to bend by (no fine-tune/pitch
+            // knob offset, no pitch bend, no live pitch modulation routed here) -- the overwhelmingly
+            // common case for a basic patch, where powf(2, 0) would just compute 1.0 the expensive
+            // way. A real, measured per-voice-per-sample cost that scales directly with polyphony.
+            float hz1 = (mod_vco1_pitch != 0.0f) ? voices[v].vco1_current_freq * powf(2.0f, mod_vco1_pitch / 1200.0f) : voices[v].vco1_current_freq;
+            float hz2 = (mod_vco2_pitch != 0.0f) ? voices[v].vco2_current_freq * powf(2.0f, mod_vco2_pitch / 1200.0f) : voices[v].vco2_current_freq;
+            float hz3 = (mod_vco3_pitch != 0.0f) ? voices[v].vco3_current_freq * powf(2.0f, mod_vco3_pitch / 1200.0f) : voices[v].vco3_current_freq;
+            float hz4 = (mod_vco4_pitch != 0.0f) ? voices[v].vco4_current_freq * powf(2.0f, mod_vco4_pitch / 1200.0f) : voices[v].vco4_current_freq;
             float dt1 = hz1 / (float)SAMPLE_RATE, dt2 = hz2 / (float)SAMPLE_RATE;
             float dt3 = hz3 / (float)SAMPLE_RATE, dt4 = hz4 / (float)SAMPLE_RATE;
 
