@@ -46,6 +46,18 @@
 #define ENV_COUNT   (4 + ASSIGNABLE_EG_COUNT)  // Osc 1 Amp, Osc 2 Amp, Osc 3 Amp, Osc 4 Amp, + assignable EGs
 #define UNISON_SAW_VOICES 7
 #define FX_SLOT_COUNT 12
+// Multi-source/multi-output audio routing: EXT_IN_PAIR_COUNT mirrors RECORD_MAX_CHANNELS/2 (the
+// capture side's own existing channel ceiling, see RECORD_MAX_CHANNELS below) -- each pair p reads
+// capture channels 2p/2p+1 as one independently enable/gain/routable stereo source, generalizing
+// what used to be a single hardcoded-to-channels-0/1 ext_in tap. SOURCE_COUNT is 1 (the Program --
+// today's single patch; a future multi-Program "Combi" mode would add more source ids here without
+// changing this model) plus every ext-in pair. OUTPUT_MAX_CHANNELS/OUTPUT_PAIR_MAX mirror the same
+// ceiling on the OUTPUT side, symmetric with the input side's existing RECORD_MAX_CHANNELS -- see
+// query_output_device_channel_count()/open_pcm_stream() in main().
+#define EXT_IN_PAIR_COUNT 8
+#define SOURCE_COUNT (1 + EXT_IN_PAIR_COUNT)
+#define OUTPUT_MAX_CHANNELS 16
+#define OUTPUT_PAIR_MAX (OUTPUT_MAX_CHANNELS / 2)
 #define AUDIO_DEVICE_NAME_LEN 64
 // Recording: hard ceiling on how many raw input channels can be captured/selected at once
 // (generous for a class-compliant multichannel interface -- 2/4/8 are the common real cases).
@@ -200,7 +212,21 @@ typedef struct {
     float mix;     // 0-100, dry/wet blend applied uniformly around whatever the slot does
     float bypass;  // 0/1, hard bypass (distinct from Off -- keeps the slot's state alive so
                     // flipping it back on mid-note doesn't lose e.g. a delay's buffered tail)
+    // Multi-source routing (appended): which source (0 = Program, 1..EXT_IN_PAIR_COUNT = ext-in
+    // pair) feeds this slot -- see process_fx_chain()'s source_id parameter. Default 0 (Program)
+    // reproduces today's exact behavior (every slot processing the one shared Program mix) when
+    // no ext-in sources are in use.
+    float fx_source;
 } FXSlotParams;
+
+// One source's assignment onto the hardware output pairs -- a many-to-many grid (a source can
+// feed multiple output pairs at once, e.g. Program to both a main mix and a monitor/cue pair).
+// Wrapped in its own struct (rather than a bare 2D array directly on SynthSharedControls) purely
+// so the existing OSC_NESTED macro -- which addresses an array-of-structs' own array field via
+// offsetof -- applies unmodified; see OSC_PARAMS[]'s "/hds/routing/%d/out/%d" entry.
+typedef struct {
+    float enable[OUTPUT_PAIR_MAX];
+} SourceRouting;
 
 // PACKET STRUCT: This is the exact byte layout the Python GUI packs.
 // BREAKING CHANGE (4-oscillator architecture): the envelope count grew from 6 to 7 (a new
@@ -459,26 +485,37 @@ typedef struct {
     float vco4_mute;
     float vco4_pulse_width; // dual-duty Pulse Width/Tilt, mirrors vco3_pulse_width
 
-    // --- FX Bus + External Input Architecture ---
+    // --- FX Bus + Multi-Source Routing Architecture ---
 
-    // External Audio Input: a live-captured signal (see setup/read in main()) summed directly
-    // into the same post-voice stereo bus the FX chain runs on -- so external audio passes
-    // through all FX_SLOT_COUNT slots exactly like the synth's own voices do, by design. No
-    // pan control here: capture is taken as an already-stereo L/R pair and passed through as-is
-    // rather than re-panned from mono.
-    float ext_in_enable;
-    float ext_in_gain;
+    // External Audio Input, per stereo pair (appended: generalized from a single hardcoded-to-
+    // capture-channels-0/1 tap into EXT_IN_PAIR_COUNT independently enable/gain/routable stereo
+    // sources -- pair p reads capture channels 2p/2p+1). Each pair is its own routable source (see
+    // fx[].fx_source/source_routing below) -- no pan control here, same as before: capture is
+    // taken as an already-stereo L/R pair and passed through as-is rather than re-panned from mono.
+    float ext_in_enable[EXT_IN_PAIR_COUNT];
+    float ext_in_gain[EXT_IN_PAIR_COUNT];
 
-    // FX Bus: FX_SLOT_COUNT slots on the summed stereo mix (voices + external input), after
-    // Filter A/B (which stay per-voice) and before master_volume -- see process_fx_chain(). Each
-    // ported effect fills in its own case in that function's dispatch switch; until then every
-    // slot is a pass-through (see FX_TYPE_OFF).
+    // FX Bus: FX_SLOT_COUNT slots, each now assigned to one source (fx[].fx_source, 0=Program,
+    // 1..EXT_IN_PAIR_COUNT=an ext-in pair) rather than implicitly processing one shared mix --
+    // see process_fx_chain()'s source_id parameter. Each ported effect fills in its own case in
+    // that function's dispatch switch; until then every slot is a pass-through (see FX_TYPE_OFF).
     FXSlotParams fx[FX_SLOT_COUNT];
 
-    // FX Bus routing: 0 = Series (mixer -> slot0 -> slot1 -> ... -> slot11 -> output, each
-    // slot fed the previous slot's output), 1 = Parallel (every slot fed the SAME pre-FX input
-    // independently, all 12 outputs summed and averaged -- see process_fx_chain()).
-    float fx_routing_mode;
+    // FX Bus routing, per source (appended: generalized from one tab-wide switch into one
+    // Series/Parallel choice per source, applying only to that source's own assigned slots): 0 =
+    // Series (that source's slots run in array order, each fed the previous one's output), 1 =
+    // Parallel (every one of that source's slots fed the SAME pre-FX input independently, their
+    // outputs summed and averaged -- see process_fx_chain()).
+    float fx_source_routing_mode[SOURCE_COUNT];
+
+    // Multi-output hardware routing: which physical output pair(s) each source's final signal (its
+    // dry bus if it owns no FX slots, or the result of its own Series/Parallel chain above) lands
+    // on -- a many-to-many grid, since a source can feed multiple output pairs at once (e.g.
+    // Program to both a main mix and a monitor/cue pair). source_routing[0] is the Program;
+    // source_routing[1..EXT_IN_PAIR_COUNT] are the ext-in pairs, same indexing as ext_in_enable/
+    // fx_source above. See render_audio_block's per-output-pair summing and the always-on limiter,
+    // which moved from once-per-block to once-per-output-pair to match.
+    SourceRouting source_routing[SOURCE_COUNT];
 
     // Pitch Bend range, in semitones, applied equally to both oscillators. Separately
     // specifiable up/down since real-world PB ranges are often asymmetric (e.g. a guitar-style
@@ -2032,26 +2069,47 @@ static void run_fx_stereodoubler(FXSlotEngine *engine, const FXSlotParams *param
 // changed" block below. Until effects are ported in, every fx_type other than Off is unreached
 // and simply passes the dry signal through unchanged, same as Off.
 //
-// routing_mode selects how the 12 slots combine (see fx_routing_mode's comment on
-// SynthSharedControls): 0 = Series, each slot fed the previous slot's output, *l/*r updated in
-// place after every slot. 1 = Parallel, every slot fed the SAME original dry input
-// independently (an Off/bypassed slot in Parallel contributes its own unprocessed dry copy,
-// same convention as run_filter_a_multi's Parallel routing), all 12 results summed and
-// averaged into *l/*r at the end.
-static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, float *l, float *r) {
+// routing_mode selects how source_id's OWN assigned slots combine (see fx_source_routing_mode's
+// comment on SynthSharedControls): 0 = Series, each of this source's slots fed the previous one's
+// output (in physical slot-array order -- a slot not assigned to this source is simply skipped,
+// so Series order among a source's own slots is still exactly array order), *l/*r updated in
+// place after every owned slot. 1 = Parallel, every one of this source's slots fed the SAME
+// original dry input independently (an Off/bypassed slot in Parallel contributes its own
+// unprocessed dry copy, same convention as run_filter_a_multi's Parallel routing), all of this
+// source's results summed and averaged into *l/*r at the end -- averaged over however many slots
+// THIS source actually owns, not FX_SLOT_COUNT, so a source using only 1 or 2 slots in Parallel
+// isn't attenuated as if all 12 had participated. A source that owns zero slots (Series or
+// Parallel alike) is a correct no-op: *l/*r pass through unchanged.
+//
+// Called once per source per sample (not per voice) -- see render_audio_block, which loops this
+// over every source (Program + each ext-in pair) on that source's own dry bus, after all voices
+// have been summed (for the Program bus) and before that source's contribution is added into
+// whichever output pair(s) it's routed to. fx_engine[] stays indexed by physical slot id
+// regardless of which source owns a slot this block, so a slot's lazily-allocated DSP state
+// (e.g. a delay's buffered tail) survives a live source reassignment exactly like it already
+// survives a live bypass toggle.
+static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, float *l, float *r) {
     float parallel_in_l = *l, parallel_in_r = *r;
     float parallel_sum_l = 0.0f, parallel_sum_r = 0.0f;
+    int parallel_slot_count = 0;
 
     for (int s = 0; s < FX_SLOT_COUNT; s++) {
         int type = (int)fx_params[s].fx_type;
         if (type != fx_engine[s].active_type) {
-            // Type changed live -- release whatever the previous effect had allocated. (No
+            // Type changed live -- release whatever the previous effect had allocated. Runs
+            // regardless of which source owns this slot (a per-physical-slot bookkeeping task,
+            // not per-source): whichever source's call happens to run first this block catches
+            // the change; later calls for other sources see type == active_type already and
+            // no-op here, so this is safe to run on every source's pass over all 12 slots. (No
             // per-type free() branches exist yet since no effect has been ported in; add one
             // here alongside each new case below if that effect allocates its own state.)
             free(fx_engine[s].state);
             fx_engine[s].state = NULL;
             fx_engine[s].active_type = type;
         }
+
+        if ((int)fx_params[s].fx_source != source_id) continue; // not this source's slot
+        if (routing_mode == 1) parallel_slot_count++;
 
         float dry_l = (routing_mode == 0) ? *l : parallel_in_l;
         float dry_r = (routing_mode == 0) ? *r : parallel_in_r;
@@ -2081,10 +2139,12 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
         *r = out_r;
     }
 
-    if (routing_mode == 1) {
-        *l = parallel_sum_l / (float)FX_SLOT_COUNT;
-        *r = parallel_sum_r / (float)FX_SLOT_COUNT;
+    if (routing_mode == 1 && parallel_slot_count > 0) {
+        *l = parallel_sum_l / (float)parallel_slot_count;
+        *r = parallel_sum_r / (float)parallel_slot_count;
     }
+    // routing_mode == 1 with parallel_slot_count == 0: *l/*r already untouched (still the
+    // original dry input), which is the correct "this source owns no slots" passthrough.
 }
 
 float lookup_osc_sample(WaveType type, float phase, float dt, float pulse_width_frac, float *tri_integrator) {
@@ -2322,15 +2382,19 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/vco4/mute", vco4_mute),
     OSC_SCALAR("/hds/vco4/pulse_width", vco4_pulse_width),
 
-    OSC_SCALAR("/hds/ext_in/enable", ext_in_enable),
-    OSC_SCALAR("/hds/ext_in/gain", ext_in_gain),
+    OSC_ARRAY("/hds/ext_in/%d/enable", ext_in_enable, EXT_IN_PAIR_COUNT),
+    OSC_ARRAY("/hds/ext_in/%d/gain", ext_in_gain, EXT_IN_PAIR_COUNT),
 
     // --- FX Bus (fx[FX_SLOT_COUNT], FXSlotParams) ---
     OSC_SUBARRAY("/hds/fx/%d/type", fx, FXSlotParams, fx_type, FX_SLOT_COUNT),
     OSC_SUBARRAY("/hds/fx/%d/mix", fx, FXSlotParams, mix, FX_SLOT_COUNT),
     OSC_SUBARRAY("/hds/fx/%d/bypass", fx, FXSlotParams, bypass, FX_SLOT_COUNT),
+    OSC_SUBARRAY("/hds/fx/%d/source", fx, FXSlotParams, fx_source, FX_SLOT_COUNT),
     OSC_NESTED("/hds/fx/%d/param/%d", fx, FXSlotParams, param, FX_SLOT_COUNT, FX_SLOT_PARAM_COUNT),
-    OSC_SCALAR("/hds/fx_routing_mode", fx_routing_mode),
+    OSC_ARRAY("/hds/fx_routing/%d/mode", fx_source_routing_mode, SOURCE_COUNT),
+
+    // --- Multi-output hardware routing: which output pair(s) each source lands on ---
+    OSC_NESTED("/hds/routing/%d/out/%d", source_routing, SourceRouting, enable, SOURCE_COUNT, OUTPUT_PAIR_MAX),
 
     OSC_SCALAR("/hds/pb/range_up", pb_range_up),
     OSC_SCALAR("/hds/pb/range_down", pb_range_down),
@@ -2492,14 +2556,22 @@ static void init_default_controls(SynthSharedControls *knobs) {
     // the moment ext_in_enable goes live (e.g. right after this engine (re)starts, before the
     // frontend's own dial -- which also always inits to 0 -- has sent its first packet). The
     // user always has to bring this up manually.
-    knobs->ext_in_enable = 0.0f; knobs->ext_in_gain = 0.0f;
+    for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) { knobs->ext_in_enable[p] = 0.0f; knobs->ext_in_gain[p] = 0.0f; }
     for (int f = 0; f < FX_SLOT_COUNT; f++) {
         knobs->fx[f].fx_type = FX_TYPE_OFF;
         for (int p = 0; p < FX_SLOT_PARAM_COUNT; p++) knobs->fx[f].param[p] = 0.0f;
         knobs->fx[f].mix = 100.0f; // fully wet once a real effect is assigned to this slot
         knobs->fx[f].bypass = 0.0f;
+        knobs->fx[f].fx_source = 0.0f; // Program -- reproduces today's exact behavior by default
     }
-    knobs->fx_routing_mode = 0.0f; // Series
+    // Routing defaults: only the Program is routed anywhere (to output pair 0, i.e. today's only
+    // output pair), every ext-in pair unrouted, every source's own FX chain in Series -- this
+    // combination reproduces today's exact single-output-pair, Program-only behavior bit-for-bit.
+    for (int s = 0; s < SOURCE_COUNT; s++) {
+        knobs->fx_source_routing_mode[s] = 0.0f; // Series
+        for (int o = 0; o < OUTPUT_PAIR_MAX; o++) knobs->source_routing[s].enable[o] = 0.0f;
+    }
+    knobs->source_routing[0].enable[0] = 1.0f; // Program -> output pair 0 (today's only output)
     knobs->pb_range_up = 2.0f; knobs->pb_range_down = 2.0f; // standard +/-2 semitone default
     knobs->sustain_pedal_polarity = 0.0f; // Normal
     knobs->audio_latency_ms = 25.0f; // matches the old hardcoded 25ms target -- no behavior change by default
@@ -4166,7 +4238,7 @@ static inline int lfo_phase_target_index(int target) {
     if (target >= 72 && target <= 83) return target - 68;
     return -1;
 }
-static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], const float *ext_in_buffer, const MidiLiveState *midi_live, float *out_buffer) {
+static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer) {
     float peak = 0.0f;
     // Each oscillator is panned to stereo AT THE MIXER, before the signal reaches Filter A/B --
     // Filter A/B then run as two fully independent mono filters (one per channel, see fa_low/
@@ -4227,9 +4299,15 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     static bool fx_engine_initialized = false;
     if (!fx_engine_initialized) { reset_fx_engine(fx_engine); fx_engine_initialized = true; }
 
-    // Always-on master safety limiter gain -- see its use below, right before the final output
-    // clamp. Persists across calls for the same reason as the state above.
-    static float limiter_gain = 1.0f;
+    // Always-on master safety limiter gain, one per output pair (evaluated after every source
+    // routed to that pair has been summed in -- see its use below). Persists across calls for the
+    // same reason as the state above.
+    static float limiter_gain[OUTPUT_PAIR_MAX];
+    static bool limiter_gain_initialized = false;
+    if (!limiter_gain_initialized) {
+        for (int p = 0; p < OUTPUT_PAIR_MAX; p++) limiter_gain[p] = 1.0f;
+        limiter_gain_initialized = true;
+    }
 
     int voice_limit = effective_voice_limit(knobs);
     int block_size = effective_block_size(knobs);
@@ -4813,18 +4891,37 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             lfo_depth_mod_state[l] = new_lfo_depth_mod[l];
         }
 
-        // External Audio Input: summed in here, after every voice but before the FX bus, so it
-        // passes through the same FX_SLOT_COUNT chain the synth's own signal does. Taken as an
-        // already-stereo pair straight from the capture buffer -- no per-voice-style panning,
-        // see the ext_in_gain/ext_in_enable comment on the struct.
-        if (knobs->ext_in_enable != 0.0f) {
-            mixed_l += ext_in_buffer[i*2] * knobs->ext_in_gain;
-            mixed_r += ext_in_buffer[i*2+1] * knobs->ext_in_gain;
+        // --- Multi-source bus dispatch ---
+        // Source 0 (Program) is exactly mixed_l/r as computed above -- oscillators summed and run
+        // through Filter A/B together, untouched by any of this. Each external-input pair (source
+        // 1..EXT_IN_PAIR_COUNT) gets its own independent dry bus, tapped directly from its own
+        // pair of capture channels (2p/2p+1) -- generalizes what used to be a single hardcoded tap
+        // at capture channels 0/1, and is never summed into Program's own bus.
+        float bus_l[SOURCE_COUNT], bus_r[SOURCE_COUNT];
+        bus_l[0] = mixed_l;
+        bus_r[0] = mixed_r;
+        for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) {
+            int src = 1 + p;
+            bus_l[src] = 0.0f;
+            bus_r[src] = 0.0f;
+            if (knobs->ext_in_enable[p] != 0.0f && 2 * p < ext_in_channels) {
+                // If this pair's second channel doesn't exist (e.g. a mono capture device, or an
+                // odd channel count's last pair), duplicate the first into both L/R -- matches
+                // this engine's existing mono-capture-device convention exactly (see the old
+                // single-pair tap this generalizes, which did the same thing for channels 0/1).
+                float l = ext_in_buffer[i * ext_in_channels + 2 * p];
+                float r = (2 * p + 1 < ext_in_channels) ? ext_in_buffer[i * ext_in_channels + 2 * p + 1] : l;
+                bus_l[src] = l * knobs->ext_in_gain[p];
+                bus_r[src] = r * knobs->ext_in_gain[p];
+            }
         }
 
-        // FX Bus: runs last, on the fully summed mix, before master_volume -- see
-        // process_fx_chain's own comment for the routing rationale.
-        process_fx_chain(knobs->fx, fx_engine, (int)knobs->fx_routing_mode, &mixed_l, &mixed_r);
+        // FX Bus: each source runs its own chain independently, on its own bus -- see
+        // process_fx_chain's own comment for the routing rationale and the source_routing comment
+        // on SynthSharedControls for the bus/source model this generalizes to.
+        for (int src = 0; src < SOURCE_COUNT; src++) {
+            process_fx_chain(knobs->fx, fx_engine, (int)knobs->fx_source_routing_mode[src], src, &bus_l[src], &bus_r[src]);
+        }
 
         // No extra fixed headroom pad here beyond master_volume itself -- there used to be a
         // hardcoded *0.15 (~-16.5dB) on top of it, left over from before the always-on limiter
@@ -4835,30 +4932,69 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         // "12 FX slots summed in Parallel routing" -- see its own comment right below), making
         // the old pad pure redundant attenuation: quietly cutting every patch by ~16.5dB more
         // than master_volume alone would, for no remaining safety benefit.
-        float f_l = mixed_l * knobs->master_volume, f_r = mixed_r * knobs->master_volume;
+        // master_volume stays Program-only, applied here before Program's bus is summed into any
+        // output-pair accumulator -- ext-in pairs rely solely on their own per-pair gain above as
+        // their equivalent "volume" knob (unchanged from today's behavior).
+        bus_l[0] *= knobs->master_volume;
+        bus_r[0] *= knobs->master_volume;
 
-        // Always-on master safety limiter: the hard clamp two lines below guarantees the DAC
-        // never sees a sample outside [-ceiling, ceiling], but on its own that's brick-wall
-        // clipping -- ugly, harmonically harsh distortion on any over. This applies smooth gain
-        // reduction instead: instant attack (so a sudden peak -- e.g. several voices lining up,
-        // or 12 FX slots summed in Parallel routing -- still can never clip) but a short release
-        // so the reduction isn't audible as pumping on an isolated transient. Both channels
-        // always share one gain value so the stereo image isn't skewed.
-        const float limiter_ceiling = 0.98f;
-        float peak_now = fmaxf(fabsf(f_l), fabsf(f_r));
-        float needed_gain = (peak_now > limiter_ceiling) ? (limiter_ceiling / peak_now) : 1.0f;
-        if (needed_gain < limiter_gain) {
-            limiter_gain = needed_gain; // attack: instant, so THIS sample can never clip
-        } else {
-            float release_rate = 1.0f - expf(-1.0f / (0.050f * SAMPLE_RATE)); // ~50ms release
-            limiter_gain += (needed_gain - limiter_gain) * release_rate;
+        // Sum every source into whichever output pair(s) it's routed to -- many-to-many: a source
+        // can feed multiple pairs at once, several sources can share one pair.
+        float pair_l[OUTPUT_PAIR_MAX] = {0.0f}, pair_r[OUTPUT_PAIR_MAX] = {0.0f};
+        for (int src = 0; src < SOURCE_COUNT; src++) {
+            for (int p = 0; p < OUTPUT_PAIR_MAX; p++) {
+                if (knobs->source_routing[src].enable[p] != 0.0f) {
+                    pair_l[p] += bus_l[src];
+                    pair_r[p] += bus_r[src];
+                }
+            }
         }
-        f_l *= limiter_gain;
-        f_r *= limiter_gain;
 
-        out_buffer[i*2] = fmaxf(-limiter_ceiling, fminf(limiter_ceiling, f_l)); out_buffer[i*2+1] = fmaxf(-limiter_ceiling, fminf(limiter_ceiling, f_r));
-        if (fabsf(f_l) > peak) peak = fabsf(f_l);
-        if (fabsf(f_r) > peak) peak = fabsf(f_r);
+        // Always-on master safety limiter, now evaluated once per output pair (after every source
+        // routed to that pair has been summed in -- its whole purpose, the DAC never seeing an
+        // out-of-range sample, only makes sense evaluated after a pair's final sum, not per
+        // source). The hard clamp below guarantees the DAC never sees a sample outside
+        // [-ceiling, ceiling], but on its own that's brick-wall clipping -- ugly, harmonically
+        // harsh distortion on any over. This applies smooth gain reduction instead: instant attack
+        // (so a sudden peak -- e.g. several voices lining up, or 12 FX slots summed in Parallel
+        // routing -- still can never clip) but a short release so the reduction isn't audible as
+        // pumping on an isolated transient. Both channels of a given pair always share one gain
+        // value so the stereo image isn't skewed.
+        const float limiter_ceiling = 0.98f;
+        for (int p = 0; p < OUTPUT_PAIR_MAX; p++) {
+            float peak_now = fmaxf(fabsf(pair_l[p]), fabsf(pair_r[p]));
+            float needed_gain = (peak_now > limiter_ceiling) ? (limiter_ceiling / peak_now) : 1.0f;
+            if (needed_gain < limiter_gain[p]) {
+                limiter_gain[p] = needed_gain; // attack: instant, so THIS sample can never clip
+            } else {
+                float release_rate = 1.0f - expf(-1.0f / (0.050f * SAMPLE_RATE)); // ~50ms release
+                limiter_gain[p] += (needed_gain - limiter_gain[p]) * release_rate;
+            }
+            pair_l[p] *= limiter_gain[p];
+            pair_r[p] *= limiter_gain[p];
+        }
+
+        // Write each computed output pair into out_buffer, interleaved at output_channels stride --
+        // one real multichannel ALSA device opened wide (see query_output_device_channel_count()/
+        // open_pcm_stream() in main()), generalizing what used to be a single hardcoded stereo
+        // pair. output_channels==2 with only source_routing[0].enable[0] set (today's only
+        // default) reproduces the old single-stereo-output behavior bit-for-bit.
+        int output_pairs = output_channels / 2;
+        if (output_pairs > OUTPUT_PAIR_MAX) output_pairs = OUTPUT_PAIR_MAX;
+        for (int p = 0; p < output_pairs; p++) {
+            float l = fmaxf(-limiter_ceiling, fminf(limiter_ceiling, pair_l[p]));
+            float r = fmaxf(-limiter_ceiling, fminf(limiter_ceiling, pair_r[p]));
+            out_buffer[i * output_channels + 2 * p] = l;
+            out_buffer[i * output_channels + 2 * p + 1] = r;
+            if (fabsf(pair_l[p]) > peak) peak = fabsf(pair_l[p]);
+            if (fabsf(pair_r[p]) > peak) peak = fabsf(pair_r[p]);
+        }
+        // Any leftover channel(s) beyond the last full pair (an odd total channel count, or a
+        // pathological <2-channel device) have no pair partner in the source-routing model --
+        // left silent rather than guessing at a downmix.
+        for (int c = 2 * output_pairs; c < output_channels; c++) {
+            out_buffer[i * output_channels + c] = 0.0f;
+        }
     }
     return peak;
 }
@@ -4868,14 +5004,14 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
 // no way to tell whether it was a CPU-load problem (too many active voices / too expensive a
 // patch to render in time) or something unrelated (OS scheduling jitter, another process,
 // a flaky USB audio interface, etc).
-static void write_audio_block(snd_pcm_t *pcm_handle, const float *buffer, snd_pcm_uframes_t frame_count, int active_voices_count, double render_ms) {
+static void write_audio_block(snd_pcm_t *pcm_handle, const float *buffer, int channels, snd_pcm_uframes_t frame_count, int active_voices_count, double render_ms) {
     // Guards the pathological case where even the fallback-to-last-known-good reopen in main()
     // failed (e.g. a USB audio interface was physically unplugged) -- silently drop this block
     // rather than crash; main() will keep retrying the device on the next control packet.
     if (!pcm_handle) return;
     snd_pcm_uframes_t written = 0;
     while (written < frame_count && g_synth_running) {
-        snd_pcm_sframes_t res = snd_pcm_writei(pcm_handle, buffer + (written * 2), frame_count - written);
+        snd_pcm_sframes_t res = snd_pcm_writei(pcm_handle, buffer + (written * (size_t)channels), frame_count - written);
         if (res < 0) {
             fprintf(stderr, "[audio] ALSA underrun/xrun (%s) -- %d active voices, last render_audio_block took %.3fms\n",
                     snd_strerror((int)res), active_voices_count, render_ms);
@@ -4901,6 +5037,31 @@ static int query_device_channel_count(const char *device_name) {
             if (snd_pcm_hw_params_get_channels_max(hw_params, &max_channels) >= 0) {
                 if (max_channels < 1) max_channels = 1;
                 if (max_channels > (unsigned int)RECORD_MAX_CHANNELS) max_channels = (unsigned int)RECORD_MAX_CHANNELS;
+                result = (int)max_channels;
+            }
+        }
+        snd_pcm_hw_params_free(hw_params);
+    }
+    snd_pcm_close(probe);
+    return result;
+}
+
+// Symmetric with query_device_channel_count() above, but for the playback stream -- used to size
+// the output PCM stream/buffer for the multi-source routing model's output-pair grid (see
+// SynthSharedControls.source_routing and OUTPUT_PAIR_MAX): a class-compliant multichannel audio
+// interface's extra outputs need to actually be reachable, not just its first stereo pair. Falls
+// back to 2 (plain stereo) on any failure, same convention as the input side.
+static int query_output_device_channel_count(const char *device_name) {
+    snd_pcm_t *probe = NULL;
+    if (snd_pcm_open(&probe, device_name, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) return 2;
+    snd_pcm_hw_params_t *hw_params = NULL;
+    int result = 2;
+    if (snd_pcm_hw_params_malloc(&hw_params) >= 0) {
+        if (snd_pcm_hw_params_any(probe, hw_params) >= 0) {
+            unsigned int max_channels = 2;
+            if (snd_pcm_hw_params_get_channels_max(hw_params, &max_channels) >= 0) {
+                if (max_channels < 1) max_channels = 1;
+                if (max_channels > (unsigned int)OUTPUT_MAX_CHANNELS) max_channels = (unsigned int)OUTPUT_MAX_CHANNELS;
                 result = (int)max_channels;
             }
         }
@@ -5269,7 +5430,7 @@ typedef struct {
 // the live capture device's channel count has changed since it started (see the safety check in
 // main()). Pure arithmetic plus a wait-free ring push -- no I/O, safe to call every block from
 // the audio thread.
-static void wav_recorder_gather_block(RecordGatherState *sel, RecordEngine *eng, const float *synth_buffer, const float *capture_buffer, int block_size) {
+static void wav_recorder_gather_block(RecordGatherState *sel, RecordEngine *eng, const float *synth_buffer, int synth_channels, const float *capture_buffer, int block_size) {
     if (!sel->active) return;
     static float frame_buf[BUFFER_SIZE * RECORD_MAX_CHANNELS];
     int stride = sel->sel_input_channel_count;
@@ -5285,7 +5446,7 @@ static void wav_recorder_gather_block(RecordGatherState *sel, RecordEngine *eng,
         float scale = (n > 0) ? (1.0f / sqrtf((float)n)) : 1.0f;
         for (int i = 0; i < block_size; i++) {
             float l = 0.0f, r = 0.0f;
-            if (sel->sel_include_synth_output) { l += synth_buffer[i*2]; r += synth_buffer[i*2+1]; }
+            if (sel->sel_include_synth_output) { l += synth_buffer[i*synth_channels]; r += synth_buffer[i*synth_channels+1]; }
             for (int c = 0; c < stride; c++) {
                 if (sel->sel_input_channel[c]) { float s = capture_buffer[i*stride + c]; l += s; r += s; }
             }
@@ -5296,8 +5457,8 @@ static void wav_recorder_gather_block(RecordGatherState *sel, RecordEngine *eng,
         for (int i = 0; i < block_size; i++) {
             int ch = 0;
             if (sel->sel_include_synth_output) {
-                frame_buf[i*sel->channels + ch++] = synth_buffer[i*2];
-                frame_buf[i*sel->channels + ch++] = synth_buffer[i*2+1];
+                frame_buf[i*sel->channels + ch++] = synth_buffer[i*synth_channels];
+                frame_buf[i*sel->channels + ch++] = synth_buffer[i*synth_channels+1];
             }
             for (int c = 0; c < stride; c++) {
                 if (sel->sel_input_channel[c]) frame_buf[i*sel->channels + ch++] = capture_buffer[i*stride + c];
@@ -5391,10 +5552,11 @@ typedef struct {
     float elapsed_seconds;
     float record_error;
     float detected_input_channels;
+    float detected_output_channels;
     float tempo_bpm_live; // compute_current_tempo_bpm()'s result -- equals tempo_bpm whenever no tempo markers are programmed
 } EngineStatus;
 
-// Sends the GUI-status snapshot as one OSC bundle (one UDP datagram, 6 messages) to the reply
+// Sends the GUI-status snapshot as one OSC bundle (one UDP datagram, 7 messages) to the reply
 // address configured at startup. Fire-and-forget, same as the rest of this UDP-based protocol:
 // if nothing is listening on the reply port, lo_send_bundle simply has nowhere to deliver to --
 // a no-op, not an error, same as the old stream-socket's behavior whenever client_fd wasn't
@@ -5407,6 +5569,7 @@ static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
     m = lo_message_new(); lo_message_add_float(m, status->elapsed_seconds); lo_bundle_add_message(b, "/hds/status/elapsed_seconds", m);
     m = lo_message_new(); lo_message_add_float(m, status->record_error); lo_bundle_add_message(b, "/hds/status/record_error", m);
     m = lo_message_new(); lo_message_add_float(m, status->detected_input_channels); lo_bundle_add_message(b, "/hds/status/detected_input_channels", m);
+    m = lo_message_new(); lo_message_add_float(m, status->detected_output_channels); lo_bundle_add_message(b, "/hds/status/detected_output_channels", m);
     m = lo_message_new(); lo_message_add_float(m, status->tempo_bpm_live); lo_bundle_add_message(b, "/hds/status/tempo_bpm_live", m);
     lo_send_bundle(reply_addr, b);
     lo_bundle_free_recursive(b); // frees the bundle AND every message added to it
@@ -5447,8 +5610,13 @@ int main(int argc, char **argv) {
     lo_address osc_reply_addr = lo_address_new(osc_reply_host, osc_reply_port_str);
     fprintf(stderr, "[osc] listening on UDP port %d, status replies to %s:%d\n", osc_listen_port, osc_reply_host, osc_reply_port);
 
+    // Output: opened with however many channels query_output_device_channel_count() detects --
+    // see the multi-source routing model's output-pair grid (SynthSharedControls.source_routing)
+    // -- not hardcoded stereo, so a class-compliant multichannel interface's extra outputs are
+    // actually reachable, not just its first pair. Symmetric with the input side just below.
+    int detected_output_channels = query_output_device_channel_count(active_knobs.output_device);
     snd_pcm_t *pcm_handle = NULL;
-    if (!open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, 2)) {
+    if (!open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels)) {
         fprintf(stderr, "Cannot continue without an output device.\n");
         lo_address_free(osc_reply_addr); lo_server_free(osc_server); return 1;
     }
@@ -5545,18 +5713,22 @@ int main(int argc, char **argv) {
         // starve the audio thread's attention on nothing but failed reopen attempts.
         bool output_device_valid = active_knobs.output_device[0] != '\0';
         if (output_device_valid && (latency_changed || strncmp(active_knobs.output_device, applied_output_device, AUDIO_DEVICE_NAME_LEN) != 0)) {
-            if (open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, 2)) {
+            // Re-detect channel count too -- a device switch can mean a completely different
+            // interface with a different channel count, not just a renamed same one.
+            int candidate_output_channels = query_output_device_channel_count(active_knobs.output_device);
+            if (open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, candidate_output_channels)) {
+                detected_output_channels = candidate_output_channels;
                 snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
             } else {
                 // Failed -- fall back to the last device that was actually working rather than
                 // leaving pcm_handle NULL, and stop retrying this same bad name every block.
-                open_pcm_stream(applied_output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, 2);
+                open_pcm_stream(applied_output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels);
                 snprintf(active_knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", applied_output_device);
             }
         } else if (latency_changed) {
             // Latency-only change with no valid device name yet -- still worth reapplying to
             // whatever's already open rather than silently doing nothing.
-            open_pcm_stream(applied_output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, 2);
+            open_pcm_stream(applied_output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels);
         }
         bool input_device_valid = active_knobs.input_device[0] != '\0';
         if (input_device_valid && (latency_changed || strncmp(active_knobs.input_device, applied_input_device, AUDIO_DEVICE_NAME_LEN) != 0)) {
@@ -5617,17 +5789,6 @@ int main(int argc, char **argv) {
             }
         }
 
-        // The synth's own FX-mixing "External Input" feature (ext_in_enable/ext_in_gain) only
-        // ever wants a plain stereo pair -- always channels 0/1 of whatever the capture device
-        // provides, extracted here so render_audio_block's signature/logic can stay exactly the
-        // plain-stereo shape it's always been, regardless of how many channels are actually
-        // being captured for the Recording tab.
-        static float ext_in_stereo[BUFFER_SIZE * 2];
-        for (int i = 0; i < block_size; i++) {
-            ext_in_stereo[i*2]   = capture_buffer[i*detected_input_channels + 0];
-            ext_in_stereo[i*2+1] = (detected_input_channels > 1) ? capture_buffer[i*detected_input_channels + 1] : capture_buffer[i*detected_input_channels + 0];
-        }
-
         // DIAGNOSTIC: cheap (active_voice_limit simple state checks, negligible next to the
         // render itself) count of currently-active voices, purely to report alongside any
         // underrun/over-budget warning below -- see the comment on write_audio_block.
@@ -5637,10 +5798,13 @@ int main(int argc, char **argv) {
             if (voices[v].vco1_eg.state != STATE_IDLE || voices[v].vco2_eg.state != STATE_IDLE || voices[v].vco3_eg.state != STATE_IDLE) active_voices_count++;
         }
 
-        float buffer[BUFFER_SIZE * 2];
+        // Static + declared at the hard OUTPUT_MAX_CHANNELS ceiling, same convention as
+        // capture_buffer above -- only the first block_size*detected_output_channels floats are
+        // actually rendered/written this iteration.
+        static float buffer[BUFFER_SIZE * OUTPUT_MAX_CHANNELS];
         struct timespec render_t0, render_t1;
         clock_gettime(CLOCK_MONOTONIC, &render_t0);
-        float block_peak = render_audio_block(voices, &active_knobs, global_lfo_phases, ext_in_stereo, &midi_live, buffer);
+        float block_peak = render_audio_block(voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer);
         clock_gettime(CLOCK_MONOTONIC, &render_t1);
         double render_ms = (render_t1.tv_sec - render_t0.tv_sec) * 1000.0 + (render_t1.tv_nsec - render_t0.tv_nsec) / 1e6;
         double budget_ms = (block_size / (double)SAMPLE_RATE) * 1000.0;
@@ -5707,7 +5871,7 @@ int main(int argc, char **argv) {
             record_gather.active = false;
         }
         applied_record_enable = want_recording;
-        if (record_gather.active) wav_recorder_gather_block(&record_gather, &record_engine, buffer, capture_buffer, block_size);
+        if (record_gather.active) wav_recorder_gather_block(&record_gather, &record_engine, buffer, detected_output_channels, capture_buffer, block_size);
 
         // DIAGNOSTIC: mirrors [perf]/[voices]/[audio] above -- reported at most once per status
         // tick (not every block) so a sustained stall doesn't spam stderr, same rationale as
@@ -5730,12 +5894,13 @@ int main(int argc, char **argv) {
                 .elapsed_seconds = engine_active ? (atomic_load_explicit(&record_engine.frames_written, memory_order_relaxed) / (float)SAMPLE_RATE) : 0.0f,
                 .record_error = atomic_load_explicit(&record_engine.start_failed, memory_order_relaxed) ? 1.0f : 0.0f,
                 .detected_input_channels = (float)detected_input_channels,
+                .detected_output_channels = (float)detected_output_channels,
                 .tempo_bpm_live = current_tempo_bpm,
             };
             send_osc_status(osc_reply_addr, &status);
             vu_decimator = 0;
         }
-        write_audio_block(pcm_handle, buffer, block_size, active_voices_count, render_ms);
+        write_audio_block(pcm_handle, buffer, detected_output_channels, block_size, active_voices_count, render_ms);
         total_frames_rendered += (uint64_t)block_size;
     }
     // Flush/finalize a still-running take on shutdown: signal the writer thread to stop (if a
