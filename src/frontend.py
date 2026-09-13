@@ -1888,7 +1888,13 @@ class SynthGui(QWidget):
             dial.setRange(0, 200); dial.setValue(0)
             row.addWidget(dial, alignment=Qt.AlignmentFlag.AlignCenter)
             row_widget = QWidget(); row_widget.setLayout(row)
-            _retain_hidden(row_widget)
+            # Deliberately NOT _retain_hidden here, unlike the oscillator strips' Pulse/Unison
+            # boxes: those retain their footprint so switching Shape doesn't jerk that one
+            # strip's width, but at most 3 of these 8 depth knobs are ever visible at once (see
+            # FM_ALGORITHMS) and the left sidebar has horizontal scrolling disabled -- retaining
+            # all 8's width would permanently force the whole sidebar panel wide enough for 8
+            # knobs side by side. Left at Qt's default (hidden = 0 width) so the row only takes
+            # up space for whichever 1-3 knobs the selected algorithm actually shows.
             fm_depth_grid.addWidget(row_widget)
             self.fm_depth_dials[key] = dial
             self.fm_depth_rows[key] = row_widget
