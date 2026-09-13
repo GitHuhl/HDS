@@ -300,14 +300,33 @@ A digital synthesizer split into two processes:
   zone's own pitch-reference note independent of its key range. Every
   edit is live -- no separate "Apply" step, same convention as every
   other control in this file -- but instead of riding the shared knob
-  packet, each edit calls `transmit_zone_upsert()`/`transmit_zone_remove()`
+  bundle, each edit calls `transmit_zone_upsert()`/`transmit_zone_remove()`
   (`SamplerMappingGrid`, adapted from a standalone prototype into this
   file's real backend instead of that prototype's `print()`-based stubs),
-  sending only the zone(s) actually touched over the dedicated catalog
-  socket. No cap on how many zones can exist at once -- each is identified
-  by its own stable `zone_id` (an ever-incrementing counter,
-  `SampleZone.zone_id`), not a fixed backend slot index. Set an
-  oscillator's Shape (Play tab) to "Sample" and play. Each note's own lane
+  sending only the zone(s) actually touched as their own
+  `/hds/zone/upsert`/`/hds/zone/remove` OSC messages. No cap on how many
+  zones can exist at once -- each is identified by its own stable
+  `zone_id` (an ever-incrementing counter, `SampleZone.zone_id`), not a
+  fixed backend slot index. Set an oscillator's Shape (Play tab) to
+  "Sample" and play.
+
+  **Import SFZ...** bulk-populates the Sample Bank from an SFZ multisample
+  library instead of dragging in one `.wav` at a time -- parses the `.sfz`
+  file (including `#include`d sub-files), maps its opcodes onto the same
+  zone fields the grid above already edits (key/velocity range, loop
+  points, tune/gain/pan, start offset, round-robin group), and sends the
+  result through the exact same `transmit_zone_upsert()` path a manual
+  edit uses. Always additive, never replaces the existing bank. WAV
+  samples only (matching the DFD engine's own format support -- convert
+  anything else first); a region using `loop_mode=loop_sustain` imports as
+  a plain continuous loop (this engine has no release-triggered loop
+  exit), and `end=` (an independent one-shot truncation point) has no
+  equivalent here and is ignored -- both are surfaced in a warning dialog
+  after import, along with any samples that couldn't be found, rather than
+  silently dropped. See `_build_zones_from_sfz()`/`_parse_sfz()` in
+  `frontend.py` for the full opcode mapping.
+
+  Each note's own lane
   (in both the grid above and the
   reference keyboard below it) is a strict, non-overlapping partition of
   the available width, not a physically-realistic key shape that

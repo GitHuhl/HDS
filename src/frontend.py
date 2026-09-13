@@ -16,7 +16,7 @@ from pythonosc.osc_packet import OscPacket, ParseError as OscParseError
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
                              QSlider, QPushButton, QProgressBar, QSpinBox, QLineEdit, QCheckBox,
-                             QScrollArea, QMenu, QInputDialog, QFileDialog, QGridLayout)
+                             QScrollArea, QMenu, QInputDialog, QFileDialog, QGridLayout, QMessageBox)
 from PySide6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor, QAction, QFont
 from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, Signal
 
@@ -106,6 +106,347 @@ def _decode_wav_peaks(path, num_buckets=600):
         return mins, maxs, total_frames
     except (OSError, ValueError, struct.error):
         return None
+
+def _wav_total_frames(path):
+    """Cheap RIFF-header-only frame count -- shares _decode_wav_peaks()'s chunk-walking logic but
+    stops right after the fmt/data chunk headers instead of reading and decoding the actual audio.
+    Used by the SFZ importer, which needs total_frames (to convert loop_start=/loop_end=/offset=
+    from absolute sample frames to the 0.0-1.0 fractions SampleZone uses) for potentially hundreds
+    of regions -- decoding full peak data for each just to get a frame count would be wasteful.
+    Returns None if the file can't be opened or isn't a format we understand."""
+    try:
+        with open(path, "rb") as f:
+            riff = f.read(12)
+            if len(riff) < 12 or riff[0:4] != b"RIFF" or riff[8:12] != b"WAVE":
+                return None
+            fmt = None
+            data_size = None
+            while True:
+                header = f.read(8)
+                if len(header) < 8:
+                    break
+                chunk_id, chunk_size = header[0:4], struct.unpack("<I", header[4:8])[0]
+                if chunk_id == b"fmt ":
+                    fmt_bytes = f.read(chunk_size)
+                    _audio_format, num_channels, _sr, _br, _ba, bits_per_sample = struct.unpack("<HHIIHH", fmt_bytes[:16])
+                    fmt = (num_channels, bits_per_sample)
+                elif chunk_id == b"data":
+                    data_size = chunk_size
+                    break
+                else:
+                    f.seek(chunk_size, 1)
+        if fmt is None or data_size is None:
+            return None
+        num_channels, bits_per_sample = fmt
+        bytes_per_sample = bits_per_sample // 8
+        if num_channels < 1 or bytes_per_sample < 1:
+            return None
+        return data_size // (num_channels * bytes_per_sample)
+    except (OSError, ValueError, struct.error):
+        return None
+
+_SFZ_NOTE_LETTERS = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
+_SFZ_NOTE_NAME_RE = re.compile(r"^([a-gA-G])([#sSbB]?)(-?\d+)$")
+
+def _sfz_note_to_number(value):
+    """Parses an SFZ key opcode value as either a bare MIDI number ("60") or a note name
+    ("C4", "F#3", "Ab-1", "cs2" -- 's' is a common alternate spelling for sharp). Uses the same
+    C4=60 octave convention this file's own root_key_box already uses (octave = note//12 - 1),
+    which is the convention most SFZ libraries assume -- a library authored under the other
+    common convention (C3=60) will end up an octave off; a known, accepted limitation rather than
+    something auto-detected. Returns None if the value doesn't parse as either shape."""
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    m = _SFZ_NOTE_NAME_RE.match(value)
+    if not m:
+        return None
+    letter, accidental, octave_str = m.groups()
+    pitch_class = _SFZ_NOTE_LETTERS[letter.lower()]
+    if accidental.lower() in ("#", "s"):
+        pitch_class += 1
+    elif accidental.lower() == "b":
+        pitch_class -= 1
+    note = (int(octave_str) + 1) * 12 + pitch_class
+    return note if 0 <= note <= 127 else None
+
+_SFZ_TOKEN_RE = re.compile(r"<(\w+)>|([a-zA-Z_][a-zA-Z0-9_]*)=")
+
+def _parse_sfz(path, _visited=None):
+    """Parses an SFZ file (including #include'd sub-files) into a flat list of per-region opcode
+    dicts, with <global>/<group>/<master> inheritance already resolved (each region's dict starts
+    as a copy of whatever group dict was active, then applies its own opcodes on top -- last
+    value for a key wins, same as real SFZ). Also returns the <control> header's default_path=
+    (resolved relative to `path`'s own directory), used for sample path resolution.
+
+    Tokenization is the one genuinely tricky part of this format: opcodes are `key=value` pairs
+    where `value` can contain unescaped spaces (sample paths routinely do) and isn't quoted, so
+    this can't be a whitespace split -- each opcode's value is instead whatever text sits between
+    its own `=` and the START of the next opcode/header token, found by scanning for those token
+    boundaries directly rather than guessing where a value ends.
+
+    #define/$variable macro substitution is NOT supported (rarer, real added complexity) --
+    a region using it parses with the literal "$name" text still in its value, which will fail
+    path resolution or a later int()/float() conversion and be skipped with a warning by the
+    caller, not silently accepted or crashed on here.
+
+    Returns (regions, default_path) where regions is a list of {opcode: value_string} dicts.
+    """
+    if _visited is None:
+        _visited = set()
+    real_path = os.path.realpath(path)
+    if real_path in _visited:
+        return [], None  # #include cycle guard -- silently stop recursing, already-seen content
+    _visited.add(real_path)
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw_text = f.read()
+    except OSError:
+        return [], None
+
+    base_dir = os.path.dirname(os.path.abspath(path))
+
+    # Strip //-to-end-of-line comments before tokenizing. #include lines are blanked out here
+    # (not left in place) -- they contain no '=' or '<...>' the token scan below would recognize
+    # as a boundary, so left as-is their text would get swallowed into whichever opcode's value
+    # was still open, corrupting it (e.g. "volume=-9\n#include \"x.sfz\"" would otherwise become
+    # volume's literal value). #include is expanded separately, by directly re-scanning raw_text
+    # below, once this file's own regions/default_path are fully parsed.
+    lines = []
+    for line in raw_text.splitlines():
+        idx = line.find("//")
+        line = line[:idx] if idx >= 0 else line
+        if re.search(r'#include\s+"[^"]+"', line):
+            line = ""
+        lines.append(line)
+    text = "\n".join(lines)
+
+    control_opcodes = {}
+    global_opcodes = {}
+    group_opcodes = dict(global_opcodes)
+    regions = []
+    current_dict = None
+    last_key = None
+    last_value_start = None
+    default_path = None
+
+    def flush_value(end_pos):
+        nonlocal last_key
+        if last_key is not None and current_dict is not None:
+            current_dict[last_key] = text[last_value_start:end_pos].strip()
+        last_key = None
+
+    matches = list(_SFZ_TOKEN_RE.finditer(text))
+    for m in matches:
+        flush_value(m.start())
+        header, opcode_key = m.group(1), m.group(2)
+        if header is not None:
+            header = header.lower()
+            if header == "global":
+                global_opcodes = {}
+                current_dict = global_opcodes
+            elif header in ("group", "master"):
+                group_opcodes = dict(global_opcodes)
+                current_dict = group_opcodes
+            elif header == "region":
+                region_dict = dict(group_opcodes)
+                regions.append(region_dict)
+                current_dict = region_dict
+            elif header == "control":
+                current_dict = control_opcodes
+            else:
+                current_dict = {}  # unrecognized header (e.g. <curve>, <effect>) -- parsed but ignored
+        else:
+            last_key = opcode_key.lower()
+            last_value_start = m.end()
+    flush_value(len(text))
+
+    if "default_path" in control_opcodes:
+        default_path = os.path.join(base_dir, control_opcodes["default_path"].replace("\\", "/"))
+
+    # Expand any #include'd files now, inserting their regions where the include appeared. Since
+    # regions before/after an include already accumulated correctly above (the marker line has no
+    # '=' or '<...>' in it, so the tokenizer just ignores it), we only need to actually splice in
+    # the included regions themselves -- order relative to surrounding regions doesn't matter for
+    # this importer (round-robin grouping keys off group=/seq_length=, not file position).
+    for line in raw_text.splitlines():
+        m = re.search(r'#include\s+"([^"]+)"', line)
+        if m:
+            inc_path = os.path.join(base_dir, m.group(1).replace("\\", "/"))
+            inc_regions, inc_default_path = _parse_sfz(inc_path, _visited)
+            regions.extend(inc_regions)
+            if default_path is None:
+                default_path = inc_default_path
+
+    return regions, default_path
+
+def _resolve_sfz_sample_path(sample_value, sfz_dir, default_path):
+    """Resolves an SFZ region's sample= value to a real file on disk. Tries, in order: (1) as an
+    absolute path if it looks like one; (2) joined with default_path (the <control> header's
+    default_path=, already resolved relative to the .sfz file's own directory by _parse_sfz);
+    (3) joined with the .sfz file's own directory directly; (4) a case-insensitive filename match
+    within whichever of (2)/(3) resolved to an existing directory, for the common cross-platform
+    case-mismatch issue (many libraries are authored on Windows/macOS). Returns None if nothing
+    matches -- the caller skips that region with a warning rather than failing the whole import."""
+    normalized = sample_value.replace("\\", "/")
+    if os.path.isabs(normalized) and os.path.isfile(normalized):
+        return normalized
+    candidates = []
+    if default_path:
+        candidates.append(os.path.join(default_path, normalized))
+    candidates.append(os.path.join(sfz_dir, normalized))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    for candidate in candidates:
+        directory = os.path.dirname(candidate)
+        target_name = os.path.basename(candidate).lower()
+        try:
+            for entry in os.listdir(directory):
+                if entry.lower() == target_name:
+                    return os.path.join(directory, entry)
+        except OSError:
+            continue
+    return None
+
+def _sfz_frame_to_frac(frame_str, total_frames):
+    """SFZ loop_start=/loop_end=/offset= are absolute sample frames; SampleZone wants a 0.0-1.0
+    fraction of total_frames -- the exact inverse of apply_loop_points()'s frac*(total-1) in
+    backend.c. Returns None if frame_str doesn't parse as a number."""
+    try:
+        frame = float(frame_str)
+    except ValueError:
+        return None
+    if total_frames <= 1:
+        return 0.0
+    return max(0.0, min(1.0, frame / (total_frames - 1)))
+
+def _build_zones_from_sfz(path, zone_id_start):
+    """Converts one parsed SFZ file into (zones, warnings) -- a list of fully-populated
+    SampleZone objects (not yet appended to any mapping_grid, kept testable standalone) plus a
+    list of human-readable warning strings for anything skipped or simplified. See the opcode ->
+    SampleZone mapping table in the SFZ import plan for the full rationale on each field."""
+    regions, default_path = _parse_sfz(path)
+    sfz_dir = os.path.dirname(os.path.abspath(path))
+    zones = []
+    warnings = []
+    missing_samples = 0
+    loop_sustain_count = 0
+    end_ignored_count = 0
+    define_usage_count = 0
+    round_robin_ids = {}  # SFZ group= value -> compacted small int, only for regions with seq_length
+    next_zone_id = zone_id_start
+
+    for region in regions:
+        sample_value = region.get("sample")
+        if not sample_value:
+            continue  # a region with no sample= isn't a playable zone at all
+        if "$" in sample_value:
+            define_usage_count += 1
+        resolved_path = _resolve_sfz_sample_path(sample_value, sfz_dir, default_path)
+        if resolved_path is None or not resolved_path.lower().endswith(".wav"):
+            missing_samples += 1
+            continue
+        total_frames = _wav_total_frames(resolved_path)
+        if total_frames is None or total_frames < 1:
+            missing_samples += 1
+            continue
+
+        # key=/lokey=/hikey=/pitch_keycenter= -- key= is shorthand for all three at once, but
+        # never overrides an opcode the region separately specifies.
+        key_shorthand = region.get("key")
+        lokey_raw = region.get("lokey", key_shorthand)
+        hikey_raw = region.get("hikey", key_shorthand)
+        keycenter_raw = region.get("pitch_keycenter", region.get("lokey", key_shorthand))
+        lokey = _sfz_note_to_number(lokey_raw) if lokey_raw is not None else None
+        hikey = _sfz_note_to_number(hikey_raw) if hikey_raw is not None else None
+        keycenter = _sfz_note_to_number(keycenter_raw) if keycenter_raw is not None else None
+        if lokey is None or hikey is None:
+            missing_samples += 1  # no usable key range -- can't place this zone at all
+            continue
+        if keycenter is None:
+            keycenter = lokey
+
+        zone = SampleZone(resolved_path, lokey, next_zone_id)
+        next_zone_id += 1
+        zone.root_note = lokey
+        zone.max_note = hikey
+        try:
+            pitch_keytrack = float(region.get("pitch_keytrack", "100"))
+        except ValueError:
+            pitch_keytrack = 100.0
+        zone.key_center = -1 if pitch_keytrack == 0.0 else keycenter
+
+        def _int_opt(key, default):
+            try:
+                return int(float(region[key]))
+            except (KeyError, ValueError):
+                return default
+        zone.min_velocity = max(0, min(127, _int_opt("lovel", 0)))
+        zone.max_velocity = max(0, min(127, _int_opt("hivel", 127)))
+
+        loop_mode = region.get("loop_mode", "").strip().lower()
+        if loop_mode == "loop_sustain":
+            zone.loop_enabled = True
+            loop_sustain_count += 1
+        elif loop_mode == "loop_continuous":
+            zone.loop_enabled = True
+        elif loop_mode in ("no_loop", "one_shot"):
+            zone.loop_enabled = False
+        # else: opcode absent -- leave SampleZone's own default (whole-file, loop enabled)
+
+        if "loop_start" in region:
+            frac = _sfz_frame_to_frac(region["loop_start"], total_frames)
+            if frac is not None:
+                zone.loop_start = frac
+        if "loop_end" in region:
+            frac = _sfz_frame_to_frac(region["loop_end"], total_frames)
+            if frac is not None:
+                zone.loop_end = frac
+        if "offset" in region:
+            frac = _sfz_frame_to_frac(region["offset"], total_frames)
+            if frac is not None:
+                zone.start_offset = frac
+        if "end" in region:
+            end_ignored_count += 1  # no independent one-shot truncation point in HDS -- see plan
+
+        def _float_opt(key, default):
+            try:
+                return float(region[key])
+            except (KeyError, ValueError):
+                return default
+        zone.tune_cents = _float_opt("tune", _float_opt("pitch", 0.0))
+        zone.gain_db = _float_opt("volume", 0.0)
+        zone.pan = _float_opt("pan", 0.0)
+        zone.reverse = region.get("direction", "").strip().lower() == "reverse"
+
+        # Round-robin: group= is overloaded in SFZ (also used for unrelated choke/polyphony
+        # groups) -- only treat it as round-robin when seq_length is actually present, and
+        # compact each distinct qualifying group= value into a small sequential id, since SFZ's
+        # own group numbers can collide across unrelated articulations in the same file.
+        if "seq_length" in region and "group" in region:
+            sfz_group = region["group"]
+            if sfz_group not in round_robin_ids:
+                round_robin_ids[sfz_group] = len(round_robin_ids) + 1
+            zone.round_robin_group = round_robin_ids[sfz_group]
+
+        zones.append(zone)
+
+    if missing_samples:
+        warnings.append(f"{missing_samples} region(s) skipped (sample not found, not a .wav, or missing a usable key range)")
+    if loop_sustain_count:
+        warnings.append(f"{loop_sustain_count} region(s) used loop_mode=loop_sustain, imported as loop_continuous (no release-triggered loop exit in this engine)")
+    if end_ignored_count:
+        warnings.append(f"{end_ignored_count} region(s) used end=, which has no equivalent here and was ignored (loop points/natural end of file still apply)")
+    if define_usage_count:
+        warnings.append(f"{define_usage_count} region(s) appear to use #define/$variable substitution (not supported) -- their sample path may be wrong")
+
+    return zones, warnings
 
 # Distinct badge colors for round-robin groups 1, 2, 3, ... (cycles if there are more groups
 # than colors -- purely cosmetic, doesn't affect which group a zone actually belongs to).
@@ -3380,6 +3721,11 @@ class SynthGui(QWidget):
         btn_add_sample.clicked.connect(self._pick_and_add_sample)
         mapping_top_bar.addWidget(btn_add_sample)
 
+        btn_import_sfz = QPushButton("Import SFZ…")
+        btn_import_sfz.setToolTip("Bulk-adds zones from an SFZ multisample library (.wav samples only). Adds to the existing Sample Bank -- never replaces it.")
+        btn_import_sfz.clicked.connect(self._pick_and_import_sfz)
+        mapping_top_bar.addWidget(btn_import_sfz)
+
         mapping_top_bar.addStretch()
         self.mapping_status_label = QLabel("")
         self.mapping_status_label.setStyleSheet("font-size: 10px; color: #888;")
@@ -3591,6 +3937,25 @@ class SynthGui(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "Add Sample", os.path.expanduser("~"), "WAV files (*.wav)")
         if path:
             self.mapping_grid.add_zone_at_note(path, 60)
+
+    def _pick_and_import_sfz(self):
+        """Bulk-populates the Sample Bank from an SFZ multisample library -- see
+        _build_zones_from_sfz()/_parse_sfz() for the parsing/mapping. Always additive (matches
+        every other zone-creation path in this tab): existing zones are never removed or
+        replaced. Sends every new zone in one transmit_zone_upsert() call."""
+        path, _ = QFileDialog.getOpenFileName(self, "Import SFZ", os.path.expanduser("~"), "SFZ files (*.sfz)")
+        if not path:
+            return
+        zones, warnings = _build_zones_from_sfz(path, self.mapping_grid._next_zone_id)
+        if zones:
+            self.mapping_grid._next_zone_id += len(zones)
+            self.mapping_grid.sample_zones.extend(zones)
+            self.mapping_grid.update()
+            self.transmit_zone_upsert(zones)
+        filename = os.path.basename(path)
+        self.set_mapping_status(f"Imported {len(zones)} zone(s) from {filename}" if zones else f"Imported 0 zones from {filename}", error=not zones)
+        if warnings:
+            QMessageBox.warning(self, "SFZ Import", f"Imported {len(zones)} zone(s) from {filename}, with some issues:\n\n" + "\n".join(f"- {w}" for w in warnings))
 
     def set_mapping_status(self, message, error=False):
         """Status line under the Mapping tab's top bar -- shows the live zone count by default
