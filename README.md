@@ -10,7 +10,7 @@ A digital synthesizer split into two processes:
   `OSC_PARAMS[]`), rather than a fixed-layout packed struct sent as one
   positional binary blob. Also streams back a small status struct
   (`EngineStatus`: peak level, recording state/elapsed time/error, detected
-  input channel count) as an OSC bundle to a configured reply address --
+  input/output channel counts) as an OSC bundle to a configured reply address --
   see "Control protocol: OSC" under Build & run. The final output stage
   carries an always-on
   safety limiter (instant attack, ~50ms release) ahead of a hard clamp, so
@@ -69,19 +69,17 @@ A digital synthesizer split into two processes:
   same realtime-safe ring/writer-thread architecture -- only the writer
   thread's start/write/stop calls branch on the format, so there's no
   additional realtime-thread exposure. Two source kinds, freely
-  combinable in one take: the synth's own final post-FX stereo output
-  (which already includes any processed External Input once `ext_in_enable`
-  is on -- they're the same signal by the time either is "processed"), and
+  combinable in one take: the Program's own final post-FX output (output
+  pair 0 specifically -- see "Multi-source/multi-output audio routing"
+  below; External Input pairs are their own independent sources and are
+  NOT automatically folded into this unless explicitly routed there), and
   raw per-channel taps directly off whatever the currently-selected Input
-  device provides (independent of `ext_in_enable` -- works as a plain
-  multichannel recorder for a class-compliant interface with no notes
-  playing at all). The capture stream itself is opened with however many
-  channels `query_device_channel_count()` detects for that device (not
-  hardcoded stereo), so a multichannel interface's extra inputs are
-  actually reachable, not just its first two -- `render_audio_block`'s own
-  External Input FX-mixing still only ever uses channels 0/1 of that
-  capture, extracted into a plain stereo buffer before the call so its
-  signature/logic never had to change. Selected channels combine into
+  device provides (independent of any `ext_in_enable[p]` -- works as a
+  plain multichannel recorder for a class-compliant interface with no
+  notes playing at all). The capture stream itself is opened with however
+  many channels `query_device_channel_count()` detects for that device
+  (not hardcoded stereo), so a multichannel interface's extra inputs are
+  actually reachable, not just its first two. Selected channels combine into
   either a genuine multichannel WAV (one file channel per selected source)
   or a stereo downmix (every selected channel summed equally into L/R,
   gain-normalized by `1/sqrt(n)` where `n` is signals-per-side, so
@@ -460,17 +458,35 @@ Parallel with an adjustable Blend knob (0 = all A, 100 = all B, 50 = even --
 replacing the old fixed 50/50 sum). Filter A's own Multi mode additionally
 offers Series/Parallel/Split routing across its 3 internal filters.
 
-A 12-slot FX bus (`FX` tab) runs on the full stereo mix, after Filter A/B
-and before master volume, routable Series (each slot fed the previous
-slot's output) or Parallel (every slot fed the same input independently,
-all 12 summed and averaged) via the routing button at the top of the tab.
-External audio (`Audio` tab: output/input device selection, live-
-switchable; input enable/gain) is summed in just before the FX bus, so it
-passes through the same 12 slots as the synth's own voices. Each slot has
-a generic 8-param bank + mix + bypass (`process_fx_chain()` in
-`backend.c`); most slot types are still an unimplemented pass-through,
-ready for more effects to be ported into the dispatch switch. Five are
-implemented so far, all ported from Airwindows (MIT license):
+**Multi-source/multi-output audio routing** (`Routing` tab, plus each FX
+slot's own Source combo on the `FX` tab): the routable units are the
+Program (the single patch's own post-Filter-A/B mix -- oscillators are
+always summed and run through Filter A/B together; that internal path is
+never split apart by any of this) and up to 8 independent External Input
+pairs, each tapping its own pair of capture channels (pair *p* = capture
+channels `2p`/`2p+1`) with its own Enable/Gain. Each of the 12 FX slots
+(`FX` tab) is assigned to exactly one of these 9 sources (`fx_source` --
+default: Program, reproducing a single-source bus if nothing else is
+configured), and Series/Parallel routing is a per-source choice (a
+source's own assigned slots run in array order in Series, or are all fed
+the same pre-FX input and averaged in Parallel -- the averaging divides by
+however many slots that source actually owns, not a fixed 12). A source
+with no slots assigned is a dry passthrough. Each source's final signal
+(post its own FX chain) can then be routed to one or more hardware output
+pairs on the `Routing` tab's many-to-many grid -- a source can feed
+several pairs at once, and several sources can share one pair, summed
+together. Output is opened with however many channels
+`query_output_device_channel_count()` detects (mirroring the input side's
+`query_device_channel_count()`), not hardcoded stereo, so a class-
+compliant multichannel interface's extra outputs are reachable, not just
+its first pair. The always-on safety limiter (see above) is evaluated once
+per output pair, after every source routed there has been summed in, not
+once per block. `process_fx_chain()` in `backend.c` implements the
+per-source slot dispatch; each slot still has the same generic 8-param
+bank + mix + bypass it always did. Most slot types are still an
+unimplemented pass-through, ready for more effects to be ported into the
+dispatch switch. Five are implemented so far, all ported from Airwindows
+(MIT license):
 
 - **Ensemble** — a 12-tap fixed-delay ensemble/chorus (not a reverb: no
   feedback loop). Params: Depth (widens/lengthens the delay taps) and
