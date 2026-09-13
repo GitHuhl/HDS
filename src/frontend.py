@@ -468,6 +468,13 @@ AUDIO_DEVICE_NAME_LEN = 64
 # FX bus geometry must match FX_SLOT_COUNT / FX_SLOT_PARAM_COUNT in backend.c exactly.
 FX_SLOT_COUNT = 12
 FX_SLOT_PARAM_COUNT = 8
+# Multi-source/multi-output audio routing: must match EXT_IN_PAIR_COUNT/SOURCE_COUNT/
+# OUTPUT_PAIR_MAX in backend.c exactly. Source id 0 = Program, 1..EXT_IN_PAIR_COUNT = ext-in
+# pairs -- see the bus/source model comment on SynthSharedControls in backend.c.
+EXT_IN_PAIR_COUNT = 8
+SOURCE_COUNT = 1 + EXT_IN_PAIR_COUNT
+OUTPUT_PAIR_MAX = 8
+SOURCE_NAMES = ["Program"] + [f"Ext In {p + 1}" for p in range(EXT_IN_PAIR_COUNT)]
 # Hard array-allocation ceilings -- must match MAX_VOICES / BUFFER_SIZE in backend.c exactly.
 # The ACTUAL live polyphony/block size are user-adjustable (Audio tab) up to these ceilings;
 # see active_voice_limit/block_size_frames and effective_voice_limit()/effective_block_size()
@@ -2113,6 +2120,7 @@ class SynthGui(QWidget):
         self.tab_lfos = QWidget()
         self.tab_egs = QWidget()
         self.tab_fx = QWidget()
+        self.tab_routing = QWidget()
         self.tab_audio = QWidget()
         self.tab_recording = QWidget()
         self.tab_mapping = QWidget()
@@ -3385,19 +3393,35 @@ class SynthGui(QWidget):
         fx_header_row.addWidget(fx_header)
         fx_header_row.addStretch()
 
-        self.fx_routing_btn = QPushButton("Series")
-        self.fx_routing_btn.setCheckable(True)
-        self.fx_routing_btn.setFixedSize(90, 22)
-        self.fx_routing_btn.setStyleSheet("font-size: 10px; font-weight: bold;")
-        self.fx_routing_btn.setToolTip(
-            "Series: mixer -> slot 1 -> slot 2 -> ... -> slot 12 -> output.\n"
-            "Parallel: every slot fed the same input independently, all 12 summed and averaged."
-        )
-        self.fx_routing_btn.toggled.connect(
-            lambda checked: self.fx_routing_btn.setText("Parallel" if checked else "Series")
-        )
-        fx_header_row.addWidget(self.fx_routing_btn)
         fx_outer_lay.addLayout(fx_header_row)
+
+        # Series/Parallel is now a per-source choice (each source's OWN assigned slots run in
+        # Series or Parallel independently of every other source) rather than one tab-wide
+        # switch -- see fx_source_routing_mode[SOURCE_COUNT] in backend.c. One small toggle per
+        # source, laid out in a compact grid since there are 9 of them (Program + 8 ext-in pairs).
+        routing_box = QGroupBox("FX Routing Mode (per source)")
+        routing_box.setStyleSheet("QGroupBox { font-size: 9px; font-weight: bold; }")
+        routing_grid = QGridLayout(routing_box)
+        routing_grid.setSpacing(3)
+        self.fx_source_routing_btns = []
+        routing_cols = 3
+        for src in range(SOURCE_COUNT):
+            btn = QPushButton(f"{SOURCE_NAMES[src]}: Series")
+            btn.setCheckable(True)
+            btn.setFixedSize(140, 20)
+            btn.setStyleSheet("font-size: 9px;")
+            btn.setToolTip(
+                "Series: this source's own assigned slots run in array order, each fed the\n"
+                "previous one's output.\n"
+                "Parallel: this source's own assigned slots all fed the same input independently,\n"
+                "summed and averaged."
+            )
+            btn.toggled.connect(
+                lambda checked, s=src, b=btn: b.setText(f"{SOURCE_NAMES[s]}: {'Parallel' if checked else 'Series'}")
+            )
+            routing_grid.addWidget(btn, src // routing_cols, src % routing_cols)
+            self.fx_source_routing_btns.append(btn)
+        fx_outer_lay.addWidget(routing_box)
 
         fx_scroll = QScrollArea()
         fx_scroll.setWidgetResizable(True)
@@ -3407,6 +3431,10 @@ class SynthGui(QWidget):
         fx_scroll_lay.setContentsMargins(2, 2, 2, 2)
 
         self.fx_type_combos, self.fx_mix_dials, self.fx_bypass_buttons = [], [], []
+        # Which source (Program or an ext-in pair) feeds each slot -- see fx_source on
+        # FXSlotParams in backend.c. Mirrors fx_type_combos in every way that matters for
+        # snapshot/restore/swap (a slot's source assignment moves with it on reorder).
+        self.fx_source_combos = []
         # Per-slot lists of the 8 generic param widgets, so _apply_fx_slot_type can relabel,
         # re-range/re-populate, and show/hide them once a slot's Type is known. Each param
         # position carries BOTH a knob and a combo (only one shown at a time) so a discrete
@@ -3428,6 +3456,14 @@ class SynthGui(QWidget):
             type_combo.setStyleSheet("font-size: 9px;")
             slot_lay.addWidget(type_combo)
             self.fx_type_combos.append(type_combo)
+
+            source_combo = QComboBox()
+            source_combo.addItems(SOURCE_NAMES)
+            source_combo.setFixedWidth(70)
+            source_combo.setStyleSheet("font-size: 9px;")
+            source_combo.setToolTip("Which source (Program or an external-input pair) feeds this slot")
+            slot_lay.addWidget(source_combo)
+            self.fx_source_combos.append(source_combo)
 
             param_dials, param_combos, param_labels, param_columns = [], [], [], []
             for p_idx in range(FX_SLOT_PARAM_COUNT):
@@ -3498,6 +3534,96 @@ class SynthGui(QWidget):
         fx_scroll_lay.addStretch()
         fx_scroll.setWidget(fx_scroll_content)
         fx_outer_lay.addWidget(fx_scroll)
+
+        # ----------------------------------------------------
+        # ROUTING TAB CONTENT: which sources (Program + each ext-in pair) feed which hardware
+        # output pair(s) -- a many-to-many grid, since a source can feed multiple output pairs at
+        # once and several sources can share one pair. See source_routing/ext_in_enable/
+        # ext_in_gain on SynthSharedControls in backend.c. The output-pair COLUMNS are rebuilt
+        # (shown/hidden) from /hds/status/detected_output_channels, mirroring the Recording tab's
+        # _rebuild_record_channel_checkboxes() pattern (which rebuilds ROWS from
+        # detected_input_channels) -- same idiom, transposed.
+        # ----------------------------------------------------
+        routing_outer_lay = QVBoxLayout(self.tab_routing)
+        routing_outer_lay.setContentsMargins(6, 6, 6, 6)
+        routing_outer_lay.setSpacing(6)
+
+        routing_header = QLabel(
+            "Each source's own FX-processed signal can be sent to one or more hardware output "
+            "pairs. Ext In pairs also need Enable + Gain here before anything reaches them at all "
+            "(gain always starts at -inf on launch, regardless of what it was last set to)."
+        )
+        routing_header.setStyleSheet("font-size: 9px; color: #888;")
+        routing_header.setWordWrap(True)
+        routing_outer_lay.addWidget(routing_header)
+
+        routing_scroll = QScrollArea()
+        routing_scroll.setWidgetResizable(True)
+        routing_content = QWidget()
+        self.routing_grid = QGridLayout(routing_content)
+        self.routing_grid.setSpacing(4)
+        self.routing_grid.setContentsMargins(4, 4, 4, 4)
+
+        # Column layout: 0=Source label, 1=Enable, 2=Gain, 3..3+OUTPUT_PAIR_MAX-1 = one checkbox
+        # per output pair. Header row (row 0) is built once; the "Out N" column headers are
+        # created for every possible pair up to OUTPUT_PAIR_MAX and shown/hidden by
+        # _rebuild_routing_output_columns() as detected_output_channels changes live.
+        self.routing_grid.addWidget(QLabel("<b>Source</b>"), 0, 0)
+        self.routing_grid.addWidget(QLabel("<b>Enable</b>"), 0, 1)
+        self.routing_grid.addWidget(QLabel("<b>Gain</b>"), 0, 2)
+        self.routing_output_col_headers = []
+        for p in range(OUTPUT_PAIR_MAX):
+            hdr = QLabel(f"Out {p + 1}")
+            hdr.setStyleSheet("font-size: 9px;")
+            hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.routing_grid.addWidget(hdr, 0, 3 + p)
+            self.routing_output_col_headers.append(hdr)
+
+        self.routing_ext_in_enable_cbs = []
+        self.routing_ext_in_gain_dials = []
+        self.routing_output_pair_cbs = []  # [source_idx][pair_idx] -> QCheckBox
+        for src in range(SOURCE_COUNT):
+            row = src + 1
+            self.routing_grid.addWidget(QLabel(SOURCE_NAMES[src]), row, 0)
+            if src == 0:
+                # Program has no enable/gain of its own here -- it's always live (master_volume
+                # lives on the main page); only its output routing is configured on this tab.
+                self.routing_ext_in_enable_cbs.append(None)
+                self.routing_ext_in_gain_dials.append(None)
+            else:
+                enable_cb = QCheckBox()
+                self.routing_grid.addWidget(enable_cb, row, 1)
+                self.routing_ext_in_enable_cbs.append(enable_cb)
+                gain_dial = PotentiometerKnob(f"{SOURCE_NAMES[src]} Gain", self)
+                gain_dial.setRange(0, 200)
+                # Always starts at -inf (silence), never at unity -- an upstream mic pre/interface
+                # can be left at any gain, and there must be no chance of a burst hitting the FX
+                # bus the instant Enable is checked. The user always has to manually bring this up.
+                gain_dial.setValue(0)
+                gain_dial.value_formatter = lambda v: "-inf dB" if v <= 0 else f"{v}%"
+                self.routing_grid.addWidget(gain_dial, row, 2)
+                self.routing_ext_in_gain_dials.append(gain_dial)
+
+            pair_cbs = []
+            for p in range(OUTPUT_PAIR_MAX):
+                pair_cb = QCheckBox()
+                pair_cb.setToolTip(f"Route {SOURCE_NAMES[src]} to output pair {p + 1}")
+                self.routing_grid.addWidget(pair_cb, row, 3 + p, alignment=Qt.AlignmentFlag.AlignCenter)
+                pair_cbs.append(pair_cb)
+            self.routing_output_pair_cbs.append(pair_cbs)
+
+        # Default: Program -> output pair 1, matching backend init_default_controls()'s default
+        # (today's only output pair) -- everything else starts unrouted/disabled, same as the
+        # backend's own defaults, so a freshly-launched frontend doesn't fight a running backend
+        # over what the "current" state is.
+        self.routing_output_pair_cbs[0][0].setChecked(True)
+
+        routing_content.setLayout(self.routing_grid)
+        routing_scroll.setWidget(routing_content)
+        routing_outer_lay.addWidget(routing_scroll)
+
+        self._last_detected_output_channels = -1
+        self._rebuild_routing_output_columns(1)  # 1 pair (today's stereo-only default) until status arrives
 
         # ----------------------------------------------------
         # AUDIO TAB CONTENT (device selection + external input)
@@ -3644,36 +3770,6 @@ class SynthGui(QWidget):
         midi_box.setLayout(midi_lay)
         audio_outer_lay.addWidget(midi_box)
 
-        ext_in_box = QGroupBox("External Audio Input")
-        ext_in_lay = QHBoxLayout()
-        ext_in_lay.setSpacing(8)
-
-        self.ext_in_enable = QCheckBox("Enable")
-        ext_in_lay.addWidget(self.ext_in_enable)
-
-        gain_col = QVBoxLayout(); gain_col.setSpacing(0)
-        gain_col.addWidget(QLabel("Gain"), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.ext_in_gain_dial = PotentiometerKnob("Input Gain", self)
-        self.ext_in_gain_dial.setRange(0, 200)
-        # Always starts at -inf (silence), never at unity -- an upstream mic pre/interface can be
-        # left at any gain, and there must be no chance of a burst hitting the FX bus the instant
-        # Enable is checked. The user always has to manually bring this up themselves.
-        self.ext_in_gain_dial.setValue(0)
-        self.ext_in_gain_dial.value_formatter = lambda v: "-inf dB" if v <= 0 else f"{v}%"
-        gain_col.addWidget(self.ext_in_gain_dial, alignment=Qt.AlignmentFlag.AlignCenter)
-        ext_in_lay.addLayout(gain_col)
-
-        ext_in_note = QLabel(
-            "Routed into the same FX bus as the synth's own voices — passes through all 12 FX slots.\n"
-            "Gain always starts at -inf on launch, regardless of what it was last set to — bring it "
-            "up manually after Enable, rather than risk a burst from a hot upstream mic pre."
-        )
-        ext_in_note.setStyleSheet("font-size: 9px; color: #888;")
-        ext_in_note.setWordWrap(True)
-        ext_in_lay.addWidget(ext_in_note, stretch=1)
-
-        ext_in_box.setLayout(ext_in_lay)
-        audio_outer_lay.addWidget(ext_in_box)
         audio_outer_lay.addStretch()
 
         # ----------------------------------------------------
@@ -3870,6 +3966,7 @@ class SynthGui(QWidget):
         self.tab_widget.addTab(self.tab_lfos, "LFOs")
         self.tab_widget.addTab(self.tab_egs, "Envelopes")
         self.tab_widget.addTab(self.tab_fx, "FX")
+        self.tab_widget.addTab(self.tab_routing, "Routing")
         self.tab_widget.addTab(self.tab_audio, "Devices")
         self.tab_widget.addTab(self.tab_recording, "Recording")
         self.tab_widget.addTab(self.tab_mapping, "Mapping")
@@ -3983,6 +4080,7 @@ class SynthGui(QWidget):
                 params.append(("dial", self.fx_param_dials[slot_idx][p_idx].value()))
         return {
             "type_idx": type_idx,
+            "source_idx": self.fx_source_combos[slot_idx].currentIndex(),
             "params": params,
             "mix": self.fx_mix_dials[slot_idx].value(),
             "bypass": self.fx_bypass_buttons[slot_idx].isChecked(),
@@ -3997,6 +4095,9 @@ class SynthGui(QWidget):
         self.fx_type_combos[slot_idx].setCurrentIndex(snapshot["type_idx"])
         self.fx_type_combos[slot_idx].blockSignals(False)
         self._apply_fx_slot_type(slot_idx, snapshot["type_idx"])
+        self.fx_source_combos[slot_idx].blockSignals(True)
+        self.fx_source_combos[slot_idx].setCurrentIndex(snapshot["source_idx"])
+        self.fx_source_combos[slot_idx].blockSignals(False)
         for p_idx, (kind, value) in enumerate(snapshot["params"]):
             if kind == "combo":
                 combo = self.fx_param_combos[slot_idx][p_idx]
@@ -4135,6 +4236,20 @@ class SynthGui(QWidget):
             self.record_status_label.setText(f"Starting… {os.path.basename(self._current_record_path)}")
             self.record_status_label.setStyleSheet("color: #b58900; font-weight: bold;")
         self.transmit_knob_packet()
+
+    def _rebuild_routing_output_columns(self, n_pairs):
+        """Shows/hides the Routing tab's output-pair columns (header label + every source's
+        checkbox in that column) to match n_pairs = detected_output_channels // 2 -- unlike the
+        Recording tab's per-channel checkboxes (which are destroyed/recreated since the count
+        drives which raw channel index a checkbox even means), an output-pair checkbox's meaning
+        never changes, so it's simplest and safest to just show/hide it (never resetting whatever
+        was checked) rather than replace it."""
+        n_pairs = max(0, min(n_pairs, OUTPUT_PAIR_MAX))
+        for p in range(OUTPUT_PAIR_MAX):
+            visible = p < n_pairs
+            self.routing_output_col_headers[p].setVisible(visible)
+            for src in range(SOURCE_COUNT):
+                self.routing_output_pair_cbs[src][p].setVisible(visible)
 
     def _rebuild_record_channel_checkboxes(self, n):
         while self.record_channels_grid.count():
@@ -4348,14 +4463,15 @@ class SynthGui(QWidget):
         self.mock_mode = True  # flips to False the first time a real status bundle arrives
         print(f"OSC client -> {OSC_HOST}:{OSC_SEND_PORT}, status listener on {OSC_RECV_PORT}")
 
-    # Status feedback: 6 /hds/status/* messages (peak, is_recording, elapsed_seconds,
-    # record_error, detected_input_channels, tempo_bpm_live) sent as one OSC bundle -- see
-    # send_osc_status() in backend.c. Each incoming UDP datagram is already one complete OSC
-    # packet (bundle or single message), so unlike the old stream-socket read there's no partial-
-    # message reassembly to do here at all.
+    # Status feedback: 7 /hds/status/* messages (peak, is_recording, elapsed_seconds,
+    # record_error, detected_input_channels, detected_output_channels, tempo_bpm_live) sent as
+    # one OSC bundle -- see send_osc_status() in backend.c. Each incoming UDP datagram is already
+    # one complete OSC packet (bundle or single message), so unlike the old stream-socket read
+    # there's no partial-message reassembly to do here at all.
     _STATUS_ADDRESSES = (
         "/hds/status/peak", "/hds/status/is_recording", "/hds/status/elapsed_seconds",
-        "/hds/status/record_error", "/hds/status/detected_input_channels", "/hds/status/tempo_bpm_live",
+        "/hds/status/record_error", "/hds/status/detected_input_channels",
+        "/hds/status/detected_output_channels", "/hds/status/tempo_bpm_live",
     )
 
     def listen_for_status_frames(self):
@@ -4386,6 +4502,11 @@ class SynthGui(QWidget):
                     bool(values["/hds/status/record_error"]),
                     int(values["/hds/status/detected_input_channels"]),
                 )
+            if "/hds/status/detected_output_channels" in values:
+                out_channels = int(values["/hds/status/detected_output_channels"])
+                if out_channels > 0 and out_channels != self._last_detected_output_channels:
+                    self._last_detected_output_channels = out_channels
+                    self._rebuild_routing_output_columns(min(out_channels // 2, OUTPUT_PAIR_MAX))
             if "/hds/status/tempo_bpm_live" in values:
                 self.tempo_live_readout.setText(f"engine: {values['/hds/status/tempo_bpm_live']:.1f} BPM")
 
@@ -4563,11 +4684,18 @@ class SynthGui(QWidget):
         add_f("/hds/vco4/mute", 1.0 if self.vco4_mute.isChecked() else 0.0)
         add_f("/hds/vco4/pulse_width", self.vco4_pulse_width.value())
 
-        # External Audio Input: enable, gain
-        add_f("/hds/ext_in/enable", 1.0 if self.ext_in_enable.isChecked() else 0.0)
-        add_f("/hds/ext_in/gain", self.ext_in_gain_dial.value() / 100.0)
+        # External Audio Input: enable + gain per ext-in pair (Routing tab).
+        for p in range(EXT_IN_PAIR_COUNT):
+            src = p + 1
+            add_f(f"/hds/ext_in/{p}/enable", 1.0 if self.routing_ext_in_enable_cbs[src].isChecked() else 0.0)
+            add_f(f"/hds/ext_in/{p}/gain", self.routing_ext_in_gain_dials[src].value() / 100.0)
 
-        # FX Bus: 12 slots, each type + 8 params + mix + bypass. A plain dial always sends
+        # Multi-output hardware routing: which output pair(s) each source feeds (Routing tab).
+        for src in range(SOURCE_COUNT):
+            for p in range(OUTPUT_PAIR_MAX):
+                add_f(f"/hds/routing/{src}/out/{p}", 1.0 if self.routing_output_pair_cbs[src][p].isChecked() else 0.0)
+
+        # FX Bus: 12 slots, each type + source + 8 params + mix + bypass. A plain dial always sends
         # value/100.0 -- a 0-100-range dial (per FX_TYPE_METADATA) reaches the backend as
         # 0.0-1.0, a -100..100 one as -1.0..1.0. A "choice" param instead sends (selected index /
         # (option count - 1)) -- see FX_TYPE_METADATA's own comment on that convention. Mix
@@ -4575,6 +4703,7 @@ class SynthGui(QWidget):
         for slot_idx in range(FX_SLOT_COUNT):
             type_idx = self.fx_type_combos[slot_idx].currentIndex()
             add_f(f"/hds/fx/{slot_idx}/type", type_idx)
+            add_f(f"/hds/fx/{slot_idx}/source", float(self.fx_source_combos[slot_idx].currentIndex()))
             entry = FX_TYPE_METADATA[type_idx] if 0 <= type_idx < len(FX_TYPE_METADATA) else FX_TYPE_METADATA[0]
             params_meta = entry["params"]
             for p_idx in range(FX_SLOT_PARAM_COUNT):
@@ -4589,8 +4718,9 @@ class SynthGui(QWidget):
             add_f(f"/hds/fx/{slot_idx}/mix", self.fx_mix_dials[slot_idx].value())
             add_f(f"/hds/fx/{slot_idx}/bypass", 1.0 if self.fx_bypass_buttons[slot_idx].isChecked() else 0.0)
 
-        # FX Bus routing: 0 = Series, 1 = Parallel
-        add_f("/hds/fx_routing_mode", 1.0 if self.fx_routing_btn.isChecked() else 0.0)
+        # FX Bus routing: 0 = Series, 1 = Parallel -- now per-source (see SOURCE_COUNT).
+        for src in range(SOURCE_COUNT):
+            add_f(f"/hds/fx_routing/{src}/mode", 1.0 if self.fx_source_routing_btns[src].isChecked() else 0.0)
 
         # Pitch Bend range, up/down, semitones
         add_f("/hds/pb/range_up", self.pb_range_up_spin.value())
@@ -4857,17 +4987,25 @@ def runtime_connect_and_bind(gui):
             lambda idx_cb, i=slot_idx: gui._apply_fx_slot_type(i, idx_cb)
         )
         gui.fx_type_combos[slot_idx].currentIndexChanged.connect(gui.transmit_knob_packet)
+        gui.fx_source_combos[slot_idx].currentIndexChanged.connect(gui.transmit_knob_packet)
         for p_dial in gui.fx_param_dials[slot_idx]:
             p_dial.valueChanged.connect(gui.transmit_knob_packet)
         for p_combo in gui.fx_param_combos[slot_idx]:
             p_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
         gui.fx_mix_dials[slot_idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.fx_bypass_buttons[slot_idx].toggled.connect(gui.transmit_knob_packet)
-    gui.fx_routing_btn.toggled.connect(gui.transmit_knob_packet)
+    for btn in gui.fx_source_routing_btns:
+        btn.toggled.connect(gui.transmit_knob_packet)
 
-    # External Audio Input + Audio device selection
-    gui.ext_in_enable.toggled.connect(gui.transmit_knob_packet)
-    gui.ext_in_gain_dial.valueChanged.connect(gui.transmit_knob_packet)
+    # Routing tab: per-pair ext-in enable/gain + the source x output-pair grid
+    for src in range(1, SOURCE_COUNT):
+        gui.routing_ext_in_enable_cbs[src].toggled.connect(gui.transmit_knob_packet)
+        gui.routing_ext_in_gain_dials[src].valueChanged.connect(gui.transmit_knob_packet)
+    for src in range(SOURCE_COUNT):
+        for p in range(OUTPUT_PAIR_MAX):
+            gui.routing_output_pair_cbs[src][p].toggled.connect(gui.transmit_knob_packet)
+
+    # Audio device selection
     gui.output_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
     gui.input_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
     gui.audio_latency_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
