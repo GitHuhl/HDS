@@ -4,14 +4,15 @@ A digital synthesizer split into two processes:
 
 - **`src/backend.c`** — the DSP/audio engine. Plain C against ALSA: renders
   audio directly to a PCM device, captures external audio from an input
-  device, and exposes every synth parameter over a Unix domain socket
-  (`/tmp/synth.sock`) as a fixed-layout packed struct (`SynthSharedControls`,
-  532 floats + 3 device name strings + 1 file path string + 1 flat sample-
-  path-bank blob). Also streams
-  back a small status struct (`EngineStatus`: peak level, recording state/
-  elapsed time/error, detected input channel count) over the same socket --
-  used to be a bare peak float before the Recording tab needed live state
-  back from the engine. The final output stage carries an always-on
+  device, and exposes every synth parameter over OSC (Open Sound Control,
+  via `liblo`, plain UDP) -- every parameter addressed by name (e.g.
+  `/hds/vco1/shape`), written directly into `SynthSharedControls` (see
+  `OSC_PARAMS[]`), rather than a fixed-layout packed struct sent as one
+  positional binary blob. Also streams back a small status struct
+  (`EngineStatus`: peak level, recording state/elapsed time/error, detected
+  input channel count) as an OSC bundle to a configured reply address --
+  see "Control protocol: OSC" under Build & run. The final output stage
+  carries an always-on
   safety limiter (instant attack, ~50ms release) ahead of a hard clamp, so
   an overload (e.g. several voices lining up, or Parallel FX routing
   summing 12 hot slots) degrades to smooth gain reduction rather than
@@ -239,15 +240,14 @@ A digital synthesizer split into two processes:
   **The Sample Bank has no product-facing cap on zone count** -- a
   multisample instrument with thousands of zones is exactly as valid as one
   with three. This works because the catalog lives entirely off
-  `SynthSharedControls` (the fixed struct every other knob rides, resent in
-  full on every unrelated control change): it travels instead over its own
-  dedicated, event-driven Unix socket (`/tmp/synth_samples.sock`, see
-  `setup_sample_catalog_socket()`/`poll_sample_catalog_socket()`), carrying
-  two incremental message types -- `ZONE_OP_UPSERT` (add-or-update one or
-  more zones by a stable `zone_id`, the frontend's own ever-incrementing,
-  never-reused counter) and `ZONE_OP_REMOVE` (delete by `zone_id`) -- so
-  editing one zone stays cheap even with thousands mapped, and every other
-  knob's own packet shrinks back down as a side effect. `g_sample_slots[]`
+  `SynthSharedControls` (which every other knob's own OSC message writes
+  into): it travels instead over its own two dedicated OSC addresses --
+  `/hds/zone/upsert` (add-or-update one zone by a stable `zone_id`, the
+  frontend's own ever-incrementing, never-reused counter -- see
+  `zone_upsert_handler()`) and `/hds/zone/remove` (delete by `zone_id`,
+  see `zone_remove_handler()`) -- so editing one zone stays cheap even with
+  thousands mapped: one OSC message per touched zone, not a resend of the
+  whole catalog. `g_sample_slots[]`
   is one large array (`SAMPLE_SLOT_CAPACITY` = 100,000, ~34MB) preallocated
   once at startup and never resized: `sample_disk_thread_main()`
   dereferences into it directly with no lock, relying on its base address
@@ -266,14 +266,15 @@ A digital synthesizer split into two processes:
   `ZONE_OP_REMOVE` for it arrives is left alone by the drain once it
   finally runs (checked via `.active`), rather than resurrecting a
   just-removed slot.
-- **`src/frontend.py`** — a PyQt6 control surface. Custom-drawn potentiometer
-  knobs and draggable ADSR envelope graphs, tabbed into Play / Filters /
-  LFOs / Envelopes / FX / Audio / Recording / Mapping. Packs the same struct
-  (`struct.pack("372f64s64s64s256s", ...)`) and sends it over the socket
-  whenever a control changes; the Mapping tab's Sample Bank zones ride a
-  second, separate socket instead (see below) rather than this one. If it
-  can't connect to the backend it falls back to a mock mode so the UI still
-  runs standalone.
+- **`src/frontend.py`** — a PySide6 control surface predating the backend's
+  switch to OSC (see "Control protocol: OSC" under Build & run) and **not
+  updated to speak it** -- it still packs a positional binary struct and
+  sends it over a Unix domain socket the backend no longer listens on, so
+  it can no longer control the backend at all; it always falls back to its
+  standalone mock mode now. Kept in the repo as a reference for the custom
+  potentiometer/ADSR-graph widgets and the Play / Filters / LFOs /
+  Envelopes / FX / Audio / Recording / Mapping tab layout, pending a
+  rewrite (or replacement) as an OSC-native controller.
 
   The **Recording** tab: a "Synth Output" checkbox, a grid of "In N"
   checkboxes rebuilt live to match whatever channel count the backend's
@@ -501,15 +502,37 @@ knobs a given effect actually uses instead of 8 generic "P1..P8" dials.
 
 Requires ALSA dev headers (`libasound2-dev` on Debian/Ubuntu), WavPack dev
 headers (`libwavpack-dev`, for the Recording tab's WavPack format option),
-and Python 3 with PyQt6 and numpy (the Mapping tab's waveform display).
+and liblo dev headers (`liblo-dev`, the OSC control protocol -- see below).
 
 ```sh
 make                    # builds ./synth_engine
-pip install -r requirements.txt
-
 ./synth_engine &        # start the audio/MIDI engine
-python3 src/frontend.py # start the GUI (connects over /tmp/synth.sock)
 ```
 
-The backend must be running before (or while) the frontend starts for a
-live connection; otherwise the frontend runs in mock mode.
+### Control protocol: OSC
+
+The backend is controlled entirely over OSC (Open Sound Control), via a
+plain UDP `lo_server` -- every parameter is addressed by name (e.g.
+`/hds/vco1/shape`, `/hds/eg/3/attack`, `/hds/fx/0/param/2`), not by a
+positional byte offset in a shared struct. This replaced an earlier
+Unix-socket protocol that packed every control into one big binary blob at
+a fixed byte position; a single misplaced field in that scheme could
+silently corrupt unrelated data (as happened once with `record_format`).
+Addressing every parameter by name instead makes that whole bug class
+impossible: a wrong field name is a compile error, not a silent miswrite.
+
+- `--osc-listen-port <port>` (default `9000`) -- incoming control messages
+  (every knob, plus `/hds/zone/upsert`/`/hds/zone/remove` for the Sample
+  Bank catalog).
+- `--osc-reply-host <host>` / `--osc-reply-port <port>` (default
+  `127.0.0.1`/`9001`) -- where periodic `/hds/status/*` feedback (VU peak,
+  recording state, detected input channel count, live tempo) is sent.
+
+See the `OSC_PARAMS[]` table and its surrounding comment in `backend.c`
+for the full address list. Any OSC-capable tool or library (TouchOSC, Max/
+MSP, Pure Data, `python-osc`, `liblo` itself) can act as a controller --
+**`src/frontend.py` (PySide6 GUI) has NOT been updated to this protocol
+and can no longer control the backend**; it predates this change and is
+kept in the repo only as a reference for the old design and the DSP-facing
+constant names it documents. A new OSC-native frontend is expected to
+replace it.

@@ -1,6 +1,6 @@
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
-LDLIBS := -lasound -lm -lpthread -lwavpack
+LDLIBS := -lasound -lm -lpthread -lwavpack -llo
 
 BIN := synth_engine
 SRC := src/backend.c

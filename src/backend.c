@@ -17,6 +17,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <wavpack/wavpack.h>
+#include <lo/lo.h>
 
 #define SAMPLE_RATE 48000
 // BUFFER_SIZE and MAX_VOICES are now hard CEILINGS for array allocation only -- how many
@@ -59,7 +60,7 @@
 #define TEMPO_MARKER_MAX 16
 // DFD (direct-from-disk) sample playback: the Mapping tab's Sample Bank has no product-facing
 // cap on how many zones can be loaded -- the catalog now travels over its own dedicated,
-// event-driven socket (see setup_sample_catalog_socket()/poll_sample_catalog_socket()), not the
+// event-driven socket (see zone_upsert_handler()/zone_remove_handler()), not the
 // fixed SynthSharedControls struct, specifically so it can scale with a real multisample
 // instrument's zone count instead of a compile-time constant. g_sample_slots[] is still a single
 // preallocated-once array sized SAMPLE_SLOT_CAPACITY, though, rather than a realloc()'d/growable
@@ -302,7 +303,7 @@ typedef struct {
 // "468f64s64s64s256s4096s" to "532f64s64s64s256s4096s".
 // BREAKING CHANGE (uncapped Sample Bank): removed every sample_slot_* field and the
 // sample_slot_path[][] blob entirely -- the whole Sample Bank now travels over its own dedicated,
-// event-driven socket (see setup_sample_catalog_socket()/poll_sample_catalog_socket() and the
+// event-driven socket (see zone_upsert_handler()/zone_remove_handler() and the
 // ZONE_OP_UPSERT/ZONE_OP_REMOVE messages), not this struct. It existed here only because the
 // catalog used to be capped at a small compile-time MAX_SAMPLE_SLOTS and could be broadcast in
 // full on every change like every other knob; a real multisample instrument's zone count has no
@@ -607,7 +608,7 @@ typedef struct {
     // --- Sample Bank (DFD/WAVE_SAMPLE) + Mapping tab zones ---
     // The Sample Bank itself (which files are loaded, their key/velocity zones, loop points,
     // round-robin groups) is NOT part of this struct -- it travels over its own dedicated,
-    // event-driven socket instead (see setup_sample_catalog_socket()/poll_sample_catalog_socket()
+    // event-driven socket instead (see zone_upsert_handler()/zone_remove_handler()
     // and the ZONE_OP_UPSERT/ZONE_OP_REMOVE messages), sent only when the catalog itself actually
     // changes, not broadcast in full on every unrelated knob turn like the fields in this struct
     // are. See g_sample_slots[]/find_matching_sample_slot() for the backend-side catalog, and the
@@ -2169,43 +2170,262 @@ float lookup_lfo_waveform(int type, float phase) {
         default: return (phase < 0.5f) ? (phase * 4.0f) - 1.0f : 3.0f - (phase * 4.0f);
     }
 }
-static int setup_control_socket(const char *socket_path) {
-    unlink(socket_path);
-    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (server_fd < 0) return -1;
-    int flags = fcntl(server_fd, F_GETFL, 0);
-    fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
-    struct sockaddr_un local_addr;
-    memset(&local_addr, 0, sizeof(struct sockaddr_un));
-    local_addr.sun_family = AF_UNIX;
-    strncpy(local_addr.sun_path, socket_path, sizeof(local_addr.sun_path) - 1);
-    if (bind(server_fd, (struct sockaddr *)&local_addr, sizeof(struct sockaddr_un)) < 0) { close(server_fd); return -1; }
-    listen(server_fd, 5); return server_fd;
+// ============================================================================
+// OSC Control Protocol
+// ============================================================================
+// Replaces the old raw-memcpy-of-a-486-float-blob Unix-socket protocol with OSC (Open Sound
+// Control, via liblo): every parameter is addressed by name (e.g. "/hds/vco1/shape"), not by
+// byte position. This eliminates an entire bug class structurally rather than by hand-kept
+// discipline -- a misplaced/mis-ordered field can no longer silently corrupt unrelated data the
+// way record_format's wrong struct position once did (it landed 4 bytes into the string region
+// and collapsed record_path to an empty string on every recording attempt). Every table entry
+// below uses offsetof(SynthSharedControls, ...) directly, so a typo'd field name is a COMPILE
+// ERROR, not a silent runtime miswrite -- the core safety property this redesign is for.
+//
+// Transport: plain UDP via a single non-threaded lo_server, polled once per audio block from
+// main()'s loop (see the "while (lo_server_recv_noblock(...))" call site) -- deliberately NOT
+// lo_server_thread, preserving the existing invariant that only main()'s own thread ever touches
+// active_knobs/g_sample_slots, no new locking required. Incoming control listens on
+// --osc-listen-port (default 9000); outgoing status (see send_osc_status()) goes to
+// --osc-reply-host/--osc-reply-port (default 127.0.0.1:9001) -- two independent, explicitly
+// configured ports, matching how real OSC tools (TouchOSC, Max, Pd, python-osc) already expect
+// to be wired up, rather than "reply to whoever last sent a message."
+
+typedef enum { OSC_KIND_FLOAT, OSC_KIND_STRING } OscParamKind;
+
+// One row = one address template. A plain scalar has num_indices=0 (address matched verbatim).
+// A single-index array (e.g. one LFO property across all LFO_COUNT LFOs) has num_indices=1:
+// `address` contains one "%d", `stride` is sizeof(one array element), `count` is the valid
+// index range. The one genuinely nested case (FX slot param banks, fx[FX_SLOT_COUNT].
+// param[FX_SLOT_PARAM_COUNT]) has num_indices=2: `address` contains two "%d"s, `stride`/`count`
+// index the outer array, `stride2`/`count2` index the inner one.
+typedef struct {
+    const char *address;
+    size_t base_offset;
+    size_t stride;
+    int count;
+    int num_indices;
+    size_t stride2;
+    int count2;
+    OscParamKind kind;
+    size_t str_len; // OSC_KIND_STRING only: size of the fixed char buffer, for safe truncation
+} OscParamEntry;
+
+#define OSC_SCALAR(addr, field) \
+    { addr, offsetof(SynthSharedControls, field), 0, 1, 0, 0, 0, OSC_KIND_FLOAT, 0 }
+#define OSC_ARRAY(addr, field, cnt) \
+    { addr, offsetof(SynthSharedControls, field), sizeof(((SynthSharedControls *)0)->field[0]), cnt, 1, 0, 0, OSC_KIND_FLOAT, 0 }
+#define OSC_SUBARRAY(addr, arrfield, subtype, subfield, cnt) \
+    { addr, offsetof(SynthSharedControls, arrfield) + offsetof(subtype, subfield), sizeof(((SynthSharedControls *)0)->arrfield[0]), cnt, 1, 0, 0, OSC_KIND_FLOAT, 0 }
+#define OSC_NESTED(addr, arrfield, subtype, subfield, cnt1, cnt2) \
+    { addr, offsetof(SynthSharedControls, arrfield) + offsetof(subtype, subfield), sizeof(((SynthSharedControls *)0)->arrfield[0]), cnt1, 2, sizeof(float), cnt2, OSC_KIND_FLOAT, 0 }
+#define OSC_STRING(addr, field, len) \
+    { addr, offsetof(SynthSharedControls, field), 0, 1, 0, 0, 0, OSC_KIND_STRING, len }
+
+static const OscParamEntry OSC_PARAMS[] = {
+    // --- Baseline ---
+    OSC_SCALAR("/hds/is_polyphonic", is_polyphonic),
+    OSC_SCALAR("/hds/vco1/shape", vco1_shape),
+    OSC_SCALAR("/hds/vco2/shape", vco2_shape),
+    OSC_SCALAR("/hds/fm/intensity", fm_intensity),
+    OSC_SCALAR("/hds/vco1/vol", vco1_vol),
+    OSC_SCALAR("/hds/vco2/vol", vco2_vol),
+    OSC_SCALAR("/hds/portamento_time_ms", portamento_time_ms),
+    OSC_SCALAR("/hds/master_volume", master_volume),
+    OSC_SCALAR("/hds/vco1/pan", vco1_pan),
+    OSC_SCALAR("/hds/vco2/pan", vco2_pan),
+    OSC_SCALAR("/hds/vco1/fine_tune", vco1_fine_tune),
+    OSC_SCALAR("/hds/vco2/pitch_offset", vco2_pitch_offset),
+    OSC_SCALAR("/hds/vco2/fine_tune", vco2_fine_tune),
+
+    // --- Envelopes (eg[ENV_COUNT], PackEGParams: d=delay h=hold a=attack dec=decay s=sustain
+    // r=release al=attack_start_pct pk=attack_peak_pct -- see tick_adsr()) ---
+    OSC_SUBARRAY("/hds/eg/%d/delay", eg, PackEGParams, d, ENV_COUNT),
+    OSC_SUBARRAY("/hds/eg/%d/hold", eg, PackEGParams, h, ENV_COUNT),
+    OSC_SUBARRAY("/hds/eg/%d/attack", eg, PackEGParams, a, ENV_COUNT),
+    OSC_SUBARRAY("/hds/eg/%d/decay", eg, PackEGParams, dec, ENV_COUNT),
+    OSC_SUBARRAY("/hds/eg/%d/sustain", eg, PackEGParams, s, ENV_COUNT),
+    OSC_SUBARRAY("/hds/eg/%d/release", eg, PackEGParams, r, ENV_COUNT),
+    OSC_SUBARRAY("/hds/eg/%d/attack_start_pct", eg, PackEGParams, al, ENV_COUNT),
+    OSC_SUBARRAY("/hds/eg/%d/attack_peak_pct", eg, PackEGParams, pk, ENV_COUNT),
+    OSC_ARRAY("/hds/eg/%d/topology_mode", eg_mode, ENV_COUNT),
+
+    // --- Filter A/B ---
+    OSC_SCALAR("/hds/filter/ab_routing_mode", filter_ab_routing_mode),
+    OSC_SCALAR("/hds/filter/ab_blend", filter_ab_blend),
+    OSC_SCALAR("/hds/filter/a/mode", filter_a_mode),
+    OSC_SCALAR("/hds/filter/a/cutoff", filter_a.cutoff),
+    OSC_SCALAR("/hds/filter/a/res_q", filter_a.res_q),
+    OSC_SCALAR("/hds/filter/a/slope", filter_a.slope_poles),
+    OSC_SCALAR("/hds/filter/a/type", filter_a.filter_type),
+    OSC_SCALAR("/hds/filter/a_multi/routing", filter_a_multi_routing),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3),
+    OSC_SCALAR("/hds/filter/b/cutoff", filter_b.cutoff),
+    OSC_SCALAR("/hds/filter/b/res_q", filter_b.res_q),
+    OSC_SCALAR("/hds/filter/b/slope", filter_b.slope_poles),
+    OSC_SCALAR("/hds/filter/b/type", filter_b.filter_type),
+
+    // --- LFOs (lfo[LFO_COUNT], PackLfoParams) ---
+    OSC_SUBARRAY("/hds/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT),
+    OSC_SUBARRAY("/hds/lfo/%d/rate", lfo, PackLfoParams, rate_hz, LFO_COUNT),
+    OSC_SUBARRAY("/hds/lfo/%d/depth", lfo, PackLfoParams, mod_depth, LFO_COUNT),
+    OSC_SUBARRAY("/hds/lfo/%d/key_sync", lfo, PackLfoParams, key_sync, LFO_COUNT),
+    OSC_SUBARRAY("/hds/lfo/%d/dest", lfo, PackLfoParams, dest_target, LFO_COUNT),
+    OSC_SUBARRAY("/hds/lfo/%d/phase_offset", lfo, PackLfoParams, phase_offset, LFO_COUNT),
+    OSC_SUBARRAY("/hds/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT),
+
+    // --- Assignable EG modulators ---
+    OSC_ARRAY("/hds/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT),
+    OSC_ARRAY("/hds/eg_mod/%d/dest", eg_dest_target, ASSIGNABLE_EG_COUNT),
+
+    // --- Unison Saw ---
+    OSC_SCALAR("/hds/vco1/unison/detune", vco1_unison_saw_detune),
+    OSC_SCALAR("/hds/vco1/unison/width", vco1_unison_saw_width),
+    OSC_SCALAR("/hds/vco2/unison/detune", vco2_unison_saw_detune),
+    OSC_SCALAR("/hds/vco2/unison/width", vco2_unison_saw_width),
+    OSC_SCALAR("/hds/vco3/unison/detune", vco3_unison_saw_detune),
+    OSC_SCALAR("/hds/vco3/unison/width", vco3_unison_saw_width),
+    OSC_SCALAR("/hds/vco4/unison/detune", vco4_unison_saw_detune),
+    OSC_SCALAR("/hds/vco4/unison/width", vco4_unison_saw_width),
+
+    OSC_SCALAR("/hds/mono_glide_random", mono_glide_random),
+    OSC_SCALAR("/hds/vco1/mute", vco1_mute),
+    OSC_SCALAR("/hds/vco2/mute", vco2_mute),
+    OSC_SCALAR("/hds/hard_sync_mode", hard_sync_mode),
+    OSC_SCALAR("/hds/vco1/phase_offset", vco1_phase_offset),
+    OSC_SCALAR("/hds/vco2/phase_offset", vco2_phase_offset),
+    OSC_SCALAR("/hds/vco1/pulse_width", vco1_pulse_width),
+    OSC_SCALAR("/hds/vco2/pulse_width", vco2_pulse_width),
+
+    OSC_SCALAR("/hds/vco3/vol", vco3_vol),
+    OSC_SCALAR("/hds/vco3/pan", vco3_pan),
+    OSC_SCALAR("/hds/vco3/mute", vco3_mute),
+    OSC_SCALAR("/hds/vco3/pulse_width", vco3_pulse_width),
+    OSC_SCALAR("/hds/vco4/vol", vco4_vol),
+    OSC_SCALAR("/hds/vco4/pan", vco4_pan),
+    OSC_SCALAR("/hds/vco4/mute", vco4_mute),
+    OSC_SCALAR("/hds/vco4/pulse_width", vco4_pulse_width),
+
+    OSC_SCALAR("/hds/ext_in/enable", ext_in_enable),
+    OSC_SCALAR("/hds/ext_in/gain", ext_in_gain),
+
+    // --- FX Bus (fx[FX_SLOT_COUNT], FXSlotParams) ---
+    OSC_SUBARRAY("/hds/fx/%d/type", fx, FXSlotParams, fx_type, FX_SLOT_COUNT),
+    OSC_SUBARRAY("/hds/fx/%d/mix", fx, FXSlotParams, mix, FX_SLOT_COUNT),
+    OSC_SUBARRAY("/hds/fx/%d/bypass", fx, FXSlotParams, bypass, FX_SLOT_COUNT),
+    OSC_NESTED("/hds/fx/%d/param/%d", fx, FXSlotParams, param, FX_SLOT_COUNT, FX_SLOT_PARAM_COUNT),
+    OSC_SCALAR("/hds/fx_routing_mode", fx_routing_mode),
+
+    OSC_SCALAR("/hds/pb/range_up", pb_range_up),
+    OSC_SCALAR("/hds/pb/range_down", pb_range_down),
+    OSC_SCALAR("/hds/sustain/polarity", sustain_pedal_polarity),
+    OSC_SCALAR("/hds/audio/latency_ms", audio_latency_ms),
+    OSC_SCALAR("/hds/audio/polyphony", active_voice_limit),
+    OSC_SCALAR("/hds/audio/block_size", block_size_frames),
+
+    OSC_SCALAR("/hds/record/enable", record_enable),
+    OSC_SCALAR("/hds/record/include_synth_output", record_include_synth_output),
+    OSC_SCALAR("/hds/record/downmix_stereo", record_downmix_stereo),
+    OSC_ARRAY("/hds/record/channel/%d/enable", record_input_channel_enable, RECORD_MAX_CHANNELS),
+    OSC_SCALAR("/hds/record/format", record_format),
+
+    OSC_SCALAR("/hds/tempo/bpm", tempo_bpm),
+    OSC_SCALAR("/hds/tempo/marker_count", tempo_marker_count),
+    OSC_ARRAY("/hds/tempo/marker/%d/time", tempo_marker_time, TEMPO_MARKER_MAX),
+    OSC_ARRAY("/hds/tempo/marker/%d/bpm", tempo_marker_bpm, TEMPO_MARKER_MAX),
+
+    OSC_SCALAR("/hds/vco3/shape", vco3_shape),
+    OSC_SCALAR("/hds/vco3/fine_tune", vco3_fine_tune),
+    OSC_SCALAR("/hds/vco3/pitch_offset", vco3_pitch_offset),
+    OSC_SCALAR("/hds/vco3/phase_offset", vco3_phase_offset),
+    OSC_SCALAR("/hds/vco4/shape", vco4_shape),
+    OSC_SCALAR("/hds/vco4/fine_tune", vco4_fine_tune),
+    OSC_SCALAR("/hds/vco4/pitch_offset", vco4_pitch_offset),
+    OSC_SCALAR("/hds/vco4/phase_offset", vco4_phase_offset),
+
+    OSC_SCALAR("/hds/fm/algorithm", fm_algorithm),
+    OSC_SCALAR("/hds/fm/depth/3_1", fm_depth_3_1),
+    OSC_SCALAR("/hds/fm/depth/3_2", fm_depth_3_2),
+    OSC_SCALAR("/hds/fm/depth/4_1", fm_depth_4_1),
+    OSC_SCALAR("/hds/fm/depth/4_3", fm_depth_4_3),
+    OSC_SCALAR("/hds/fm/depth/1_2", fm_depth_1_2),
+    OSC_SCALAR("/hds/fm/depth/3_4", fm_depth_3_4),
+    OSC_SCALAR("/hds/fm/depth/1_3", fm_depth_1_3),
+
+    OSC_STRING("/hds/device/output", output_device, AUDIO_DEVICE_NAME_LEN),
+    OSC_STRING("/hds/device/input", input_device, AUDIO_DEVICE_NAME_LEN),
+    OSC_STRING("/hds/device/midi", midi_device, AUDIO_DEVICE_NAME_LEN),
+    OSC_STRING("/hds/record/path", record_path, RECORD_PATH_LEN),
+};
+#define OSC_PARAMS_COUNT (sizeof(OSC_PARAMS) / sizeof(OSC_PARAMS[0]))
+
+// Rebuild-and-compare match: sscanf's %d is lenient about what follows (it would happily accept
+// "/hds/eg/3abc/attack" as index 3, then keep trying to match the literal "/attack" against
+// "abc/attack" and fail there -- but only after consuming "3"). Re-serializing the parsed index
+// with the SAME template and comparing byte-for-byte against the original path removes any
+// ambiguity: if the address wasn't shaped exactly like the template with a real integer in that
+// slot, this simply won't match, full stop.
+static bool osc_match_one_index(const char *path, const char *tmpl, int *out_idx) {
+    int idx;
+    if (sscanf(path, tmpl, &idx) != 1) return false;
+    char rebuilt[128];
+    snprintf(rebuilt, sizeof(rebuilt), tmpl, idx);
+    if (strcmp(rebuilt, path) != 0) return false;
+    *out_idx = idx;
+    return true;
+}
+static bool osc_match_two_index(const char *path, const char *tmpl, int *out_idx1, int *out_idx2) {
+    int idx1, idx2;
+    if (sscanf(path, tmpl, &idx1, &idx2) != 2) return false;
+    char rebuilt[128];
+    snprintf(rebuilt, sizeof(rebuilt), tmpl, idx1, idx2);
+    if (strcmp(rebuilt, path) != 0) return false;
+    *out_idx1 = idx1; *out_idx2 = idx2;
+    return true;
 }
 
-static void poll_control_socket(int server_fd, int *client_fd, char *packet_buf, size_t *bytes_so_far, SynthSharedControls *knobs) {
-    if (*client_fd < 0) {
-        *client_fd = accept(server_fd, NULL, NULL);
-        if (*client_fd >= 0) { int c_flags = fcntl(*client_fd, F_GETFL, 0); fcntl(*client_fd, F_SETFL, c_flags | O_NONBLOCK); }
-        return;
-    }
-    ssize_t bytes_received = recv(*client_fd, packet_buf + *bytes_so_far, sizeof(SynthSharedControls) - *bytes_so_far, 0);
-    if (bytes_received > 0) {
-        *bytes_so_far += (size_t)bytes_received;
-        if (*bytes_so_far == sizeof(SynthSharedControls)) {
-            memcpy(knobs, packet_buf, sizeof(SynthSharedControls));
-            // Defensive: guarantee null-termination regardless of what the GUI actually sent,
-            // since these fields get handed straight to snd_pcm_open()/string-compared as C
-            // strings.
-            knobs->output_device[AUDIO_DEVICE_NAME_LEN - 1] = '\0';
-            knobs->input_device[AUDIO_DEVICE_NAME_LEN - 1] = '\0';
-            knobs->midi_device[AUDIO_DEVICE_NAME_LEN - 1] = '\0';
-            knobs->record_path[RECORD_PATH_LEN - 1] = '\0';
-            *bytes_so_far = 0;
+// The single generic OSC method (registered with path=NULL, type=NULL -- liblo calls this for
+// every incoming message that no more specific method claims). A linear scan over OSC_PARAMS is
+// completely fine here: control messages arrive at UI-interaction rates (dozens/sec at most),
+// nowhere near the audio thread's hot path.
+static int generic_osc_handler(const char *path, const char *types, lo_arg **argv, int argc,
+                                lo_message msg, void *user_data) {
+    (void)msg;
+    SynthSharedControls *knobs = (SynthSharedControls *)user_data;
+    for (size_t i = 0; i < OSC_PARAMS_COUNT; i++) {
+        const OscParamEntry *e = &OSC_PARAMS[i];
+        size_t offset = e->base_offset;
+        if (e->num_indices == 0) {
+            if (strcmp(path, e->address) != 0) continue;
+        } else if (e->num_indices == 1) {
+            int idx;
+            if (!osc_match_one_index(path, e->address, &idx)) continue;
+            if (idx < 0 || idx >= e->count) { fprintf(stderr, "[osc] index %d out of range for '%s'\n", idx, path); return 0; }
+            offset += (size_t)idx * e->stride;
+        } else { // num_indices == 2
+            int idx1, idx2;
+            if (!osc_match_two_index(path, e->address, &idx1, &idx2)) continue;
+            if (idx1 < 0 || idx1 >= e->count || idx2 < 0 || idx2 >= e->count2) { fprintf(stderr, "[osc] index out of range for '%s'\n", path); return 0; }
+            offset += (size_t)idx1 * e->stride + (size_t)idx2 * e->stride2;
         }
-    } else if (bytes_received == 0 || (bytes_received < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-        close(*client_fd); *client_fd = -1; *bytes_so_far = 0;
+        if (e->kind == OSC_KIND_FLOAT) {
+            if (argc != 1 || types[0] != 'f') { fprintf(stderr, "[osc] '%s' expects one float arg, got types='%s'\n", path, types); return 0; }
+            *(float *)((char *)knobs + offset) = argv[0]->f;
+        } else { // OSC_KIND_STRING
+            if (argc != 1 || types[0] != 's') { fprintf(stderr, "[osc] '%s' expects one string arg, got types='%s'\n", path, types); return 0; }
+            snprintf((char *)knobs + offset, e->str_len, "%s", (const char *)&argv[0]->s);
+        }
+        return 0;
     }
+    fprintf(stderr, "[osc] unrecognized address '%s' (types='%s') ignored\n", path, types);
+    return 0;
+}
+
+static void osc_error_handler(int num, const char *msg, const char *path) {
+    fprintf(stderr, "[osc] liblo error %d (%s): %s\n", num, path ? path : "?", msg);
 }
 
 // FIXED: Restored 'init_default_controls' macro mapping setup routine missing from compilation stack
@@ -2405,7 +2625,7 @@ typedef struct {
                             // zone-matching slot sharing this same group id -- see
                             // find_matching_sample_slot()/g_round_robin_hit_count[].
     int zone_id;  // stable identity assigned by the frontend, used to reconcile ZONE_OP_UPSERT/
-                  // ZONE_OP_REMOVE messages against this array -- see poll_sample_catalog_socket().
+                  // ZONE_OP_REMOVE messages against this array -- see the OSC zone handlers.
     bool active;  // false = a tombstoned (removed) array position, permanently skipped; distinct
                   // from `loaded`, which just means "this slot's file has been successfully
                   // parsed" -- an active-but-not-yet-loaded slot is one whose load is still
@@ -2439,7 +2659,7 @@ typedef struct {
 // never moves for the life of the process, which sample_disk_thread_main() depends on (it
 // dereferences &g_sample_slots[index] directly, with no lock; see SAMPLE_SLOT_CAPACITY's
 // comment). g_sample_slot_count tracks the next append position; entries are append-only and
-// never compacted/reused after a ZONE_OP_REMOVE (see poll_sample_catalog_socket()) -- an
+// never compacted/reused after a ZONE_OP_REMOVE (see the OSC zone handlers) -- an
 // inactive (.active == false) entry is just permanently skipped everywhere.
 static SampleSlot g_sample_slots[SAMPLE_SLOT_CAPACITY];
 static int g_sample_slot_count = 0;
@@ -2453,7 +2673,7 @@ static int g_sample_slot_count = 0;
 // multichannel file are read (render_sample_osc downmixes to mono anyway -- see its comment);
 // any further channels are skipped, not left to desync subsequent frame reads. Loop points are
 // reset to a safe "off, full-range" placeholder here -- the real per-zone loop points get
-// reapplied by the caller immediately after this returns (see poll_sample_catalog_socket()'s
+// reapplied by the caller immediately after this returns (see the OSC zone handlers'
 // throttled load drain), once total_frames (just parsed below) makes that conversion possible.
 static bool load_sample_slot(int index, const char *path, int root_note) {
     if (index < 0 || index >= SAMPLE_SLOT_CAPACITY) return false;
@@ -2524,7 +2744,7 @@ static bool load_sample_slot(int index, const char *path, int root_note) {
     slot->audio_format = audio_format;
     slot->data_start_offset = (unsigned int)ftell(f);
     // Loop points/enable are real per-zone data (the Mapping tab's waveform loop editor), not
-    // computed here -- the caller (poll_sample_catalog_socket()'s throttled load drain) applies
+    // computed here -- the caller (the OSC zone handlers' throttled load drain) applies
     // the real values from the zone record it queued this load with, immediately after this
     // function returns, using total_frames just assigned above. These are just safe placeholders
     // for the moment in between (and for any caller that loads a slot directly, e.g. a test): no
@@ -2842,29 +3062,25 @@ static void *sample_disk_thread_main(void *arg) {
     return NULL;
 }
 
-// --- Sample Bank catalog protocol: a second, dedicated, event-driven socket ---
+// --- Sample Bank catalog protocol: two dedicated OSC addresses ---
 //
-// The Mapping tab's zone catalog is sent over its own Unix socket (set up with the same
-// setup_control_socket() used for the knob-struct socket -- it's already generic, taking a path),
-// entirely separate from SynthSharedControls, and only when the catalog itself actually changes
-// (see the BREAKING CHANGE comment on SynthSharedControls for why). Two message types:
-//   ZONE_OP_UPSERT -- add-or-update one or more zones by zone_id (a drag/edit sends only the
-//     zone(s) actually touched, never the whole catalog; on fresh connect the frontend sends one
-//     UPSERT covering its entire current list, since this side's catalog starts empty).
-//   ZONE_OP_REMOVE -- delete one or more zones by zone_id.
-// Wire shape: a 5-byte header (1-byte opcode, 4-byte record count, host byte order -- both ends
-// run on the same machine) followed by `count` fixed-size records (a ZoneRecordWire per zone for
-// UPSERT, a plain int32 zone_id for REMOVE). poll_sample_catalog_socket() is a genuine two-phase
-// reader: accumulate the header first, THEN size a runtime body buffer from the header's count
-// (bounded by ZONE_MSG_MAX_COUNT, basic input validation against a corrupt/hostile message, not a
-// product-facing sample-count limit -- see SAMPLE_SLOT_CAPACITY's comment for that), accumulate
-// the body, process, reset -- unlike poll_control_socket()'s single fixed-size read, since this
-// message's size isn't known at compile time.
-typedef enum { ZONE_OP_UPSERT = 1, ZONE_OP_REMOVE = 2 } ZoneOp;
+// The Mapping tab's zone catalog travels as its own pair of OSC messages, entirely separate from
+// SynthSharedControls/OSC_PARAMS[] above (see the historical BREAKING CHANGE comment on
+// SynthSharedControls for why it was already kept out of that struct). Each message carries
+// exactly ONE zone -- a drag/edit that touches several zones just sends several messages back to
+// back, rather than one batched wire record the way the old two-phase TCP framing (accumulate a
+// header, size a body buffer from its claimed count, accumulate the body) needed to. That whole
+// framing layer is gone: liblo already delivers each UDP datagram as one complete, self-contained
+// message, so there is no partial-message state to track between polls.
+//   "/hds/zone/upsert" (types "ifffffffffffffffs") -- add-or-update one zone by zone_id (on
+//     fresh connect the frontend sends one upsert per zone in its current list, since this
+//     side's catalog starts empty).
+//   "/hds/zone/remove" (types "i") -- delete one zone by zone_id.
+// See zone_upsert_handler()/zone_remove_handler() below, registered in main().
 
-// One zone's fields, in wire order, parsed field-by-field below rather than memcpy'd onto this
-// struct directly -- that avoids any risk of a compiler-struct-padding mismatch between this side
-// and Python's struct.pack, which a raw memcpy over the two would be quietly vulnerable to.
+// One zone's fields, built directly from OSC message args (zone_upsert_handler) rather than
+// parsed off raw wire bytes -- apply_zone_upsert()'s own logic is unchanged from the old
+// wire-parsed version, it just receives an already-populated struct now.
 typedef struct {
     int32_t zone_id;
     float root_note, min_note, max_note, min_velocity, max_velocity;
@@ -2874,20 +3090,6 @@ typedef struct {
     float tune_cents, gain_db, pan, start_offset_frac, reverse;
     char path[SAMPLE_PATH_LEN];
 } ZoneRecordWire;
-#define ZONE_RECORD_WIRE_SIZE (4 + 15 * 4 + SAMPLE_PATH_LEN) // zone_id + 15 floats + path
-#define ZONE_MSG_MAX_COUNT 200000 // sanity ceiling on one message's claimed record count
-
-typedef struct {
-    int client_fd;
-    unsigned char header_buf[5];
-    size_t header_bytes;
-    unsigned char *body_buf;
-    size_t body_capacity;
-    size_t body_needed;
-    size_t body_bytes;
-    int opcode;
-    uint32_t count;
-} SampleCatalogConn;
 
 // A zone whose file needs (re)loading, queued rather than loaded immediately -- see
 // drain_pending_sample_loads()'s comment. A plain ring buffer, audio-thread-only (both the
@@ -2998,137 +3200,83 @@ static void drain_pending_sample_loads(void) {
     }
 }
 
-// Applies one ZONE_OP_UPSERT/ZONE_OP_REMOVE message's already-fully-accumulated body. `body` is
-// `count` back-to-back fixed-size records (ZoneRecordWire for UPSERT, a plain int32 zone_id for
-// REMOVE) -- see poll_sample_catalog_socket()'s comment for how it gets here.
-static void process_zone_catalog_message(int opcode, uint32_t count, const unsigned char *body) {
-    if (opcode == ZONE_OP_UPSERT) {
-        for (uint32_t i = 0; i < count; i++) {
-            const unsigned char *p = body + (size_t)i * ZONE_RECORD_WIRE_SIZE;
-            ZoneRecordWire rec;
-            size_t off = 0;
-            memcpy(&rec.zone_id, p + off, 4); off += 4;
-            float *floats = &rec.root_note; // root_note..reverse are 15 consecutive floats
-            for (int f = 0; f < 15; f++) { memcpy(&floats[f], p + off, 4); off += 4; }
-            memcpy(rec.path, p + off, SAMPLE_PATH_LEN); off += SAMPLE_PATH_LEN;
-            rec.path[SAMPLE_PATH_LEN - 1] = '\0';
+// Applies one zone upsert -- unchanged logic from the old wire-parsed version, just fed an
+// already-populated ZoneRecordWire (built from OSC args in zone_upsert_handler() below) instead
+// of parsing one out of a raw byte buffer.
+static void apply_zone_upsert(const ZoneRecordWire *rec) {
+    int found_index = -1;
+    for (int s = 0; s < g_sample_slot_count; s++) {
+        if (g_sample_slots[s].active && g_sample_slots[s].zone_id == rec->zone_id) { found_index = s; break; }
+    }
 
-            int found_index = -1;
-            for (int s = 0; s < g_sample_slot_count; s++) {
-                if (g_sample_slots[s].active && g_sample_slots[s].zone_id == rec.zone_id) { found_index = s; break; }
-            }
-
-            if (found_index < 0) {
-                // Brand new zone -- append. g_sample_slots is a plain static array (zero-
-                // initialized BSS), so a never-before-used position already has loaded=false,
-                // pre_roll_l/r=NULL, etc.; only zone_id/active need setting explicitly here.
-                if (g_sample_slot_count >= SAMPLE_SLOT_CAPACITY) {
-                    fprintf(stderr, "[samples] Sample Bank at its %d-zone capacity -- ignoring zone_id %d\n", SAMPLE_SLOT_CAPACITY, rec.zone_id);
-                    continue;
-                }
-                found_index = g_sample_slot_count++;
-                g_sample_slots[found_index].zone_id = rec.zone_id;
-                g_sample_slots[found_index].active = true;
-                enqueue_pending_sample_load(found_index, &rec);
-                continue;
-            }
-
-            SampleSlot *slot = &g_sample_slots[found_index];
-            if (strncmp(slot->file_path, rec.path, SAMPLE_PATH_LEN) != 0 || !slot->loaded) {
-                // Path changed (or a previous load of this same slot never finished/failed) --
-                // (re)queue rather than apply cheap fields in place.
-                enqueue_pending_sample_load(found_index, &rec);
-                continue;
-            }
-
-            // Path unchanged and already loaded: apply the cheap fields immediately, no reload.
-            slot->root_note = (int)rec.root_note;
-            slot->min_note = (int)rec.min_note; slot->max_note = (int)rec.max_note;
-            slot->min_velocity = (int)rec.min_velocity; slot->max_velocity = (int)rec.max_velocity;
-            slot->unpitched = rec.unpitched != 0.0f;
-            slot->round_robin_group = (int)rec.round_robin_group;
-            slot->loop_enabled = rec.loop_enabled != 0.0f;
-            apply_loop_points(slot, rec.loop_start, rec.loop_end);
-            slot->tune_cents = rec.tune_cents; slot->gain_db = rec.gain_db; slot->pan = rec.pan;
-            slot->start_offset_frac = rec.start_offset_frac;
-            slot->reverse = rec.reverse != 0.0f;
+    if (found_index < 0) {
+        // Brand new zone -- append. g_sample_slots is a plain static array (zero-initialized
+        // BSS), so a never-before-used position already has loaded=false, pre_roll_l/r=NULL,
+        // etc.; only zone_id/active need setting explicitly here.
+        if (g_sample_slot_count >= SAMPLE_SLOT_CAPACITY) {
+            fprintf(stderr, "[samples] Sample Bank at its %d-zone capacity -- ignoring zone_id %d\n", SAMPLE_SLOT_CAPACITY, rec->zone_id);
+            return;
         }
-    } else if (opcode == ZONE_OP_REMOVE) {
-        for (uint32_t i = 0; i < count; i++) {
-            int32_t zone_id;
-            memcpy(&zone_id, body + (size_t)i * sizeof(int32_t), sizeof(int32_t));
-            for (int s = 0; s < g_sample_slot_count; s++) {
-                if (g_sample_slots[s].active && g_sample_slots[s].zone_id == zone_id) {
-                    g_sample_slots[s].active = false;
-                    g_sample_slots[s].loaded = false; // matches the pre-existing "empty path" unload behavior
-                    free(g_sample_slots[s].pre_roll_l); g_sample_slots[s].pre_roll_l = NULL;
-                    free(g_sample_slots[s].pre_roll_r); g_sample_slots[s].pre_roll_r = NULL;
-                    break;
-                }
-            }
+        found_index = g_sample_slot_count++;
+        g_sample_slots[found_index].zone_id = rec->zone_id;
+        g_sample_slots[found_index].active = true;
+        enqueue_pending_sample_load(found_index, rec);
+        return;
+    }
+
+    SampleSlot *slot = &g_sample_slots[found_index];
+    if (strncmp(slot->file_path, rec->path, SAMPLE_PATH_LEN) != 0 || !slot->loaded) {
+        // Path changed (or a previous load of this same slot never finished/failed) -- (re)queue
+        // rather than apply cheap fields in place.
+        enqueue_pending_sample_load(found_index, rec);
+        return;
+    }
+
+    // Path unchanged and already loaded: apply the cheap fields immediately, no reload.
+    slot->root_note = (int)rec->root_note;
+    slot->min_note = (int)rec->min_note; slot->max_note = (int)rec->max_note;
+    slot->min_velocity = (int)rec->min_velocity; slot->max_velocity = (int)rec->max_velocity;
+    slot->unpitched = rec->unpitched != 0.0f;
+    slot->round_robin_group = (int)rec->round_robin_group;
+    slot->loop_enabled = rec->loop_enabled != 0.0f;
+    apply_loop_points(slot, rec->loop_start, rec->loop_end);
+    slot->tune_cents = rec->tune_cents; slot->gain_db = rec->gain_db; slot->pan = rec->pan;
+    slot->start_offset_frac = rec->start_offset_frac;
+    slot->reverse = rec->reverse != 0.0f;
+}
+
+static void apply_zone_remove(int32_t zone_id) {
+    for (int s = 0; s < g_sample_slot_count; s++) {
+        if (g_sample_slots[s].active && g_sample_slots[s].zone_id == zone_id) {
+            g_sample_slots[s].active = false;
+            g_sample_slots[s].loaded = false; // matches the pre-existing "empty path" unload behavior
+            free(g_sample_slots[s].pre_roll_l); g_sample_slots[s].pre_roll_l = NULL;
+            free(g_sample_slots[s].pre_roll_r); g_sample_slots[s].pre_roll_r = NULL;
+            break;
         }
     }
 }
 
-static void reset_sample_catalog_conn_message(SampleCatalogConn *conn) {
-    conn->header_bytes = 0;
-    conn->body_needed = 0;
-    conn->body_bytes = 0;
+// "/hds/zone/upsert" ifffffffffffffffs -- zone_id + 15 floats in ZoneRecordWire's own field order
+// (root_note, min_note, max_note, min_velocity, max_velocity, unpitched, loop_start, loop_end,
+// loop_enabled, round_robin_group, tune_cents, gain_db, pan, start_offset_frac, reverse) + path.
+// liblo only dispatches here when the incoming type string matches exactly, so argc/types are
+// already guaranteed correct -- no manual validation needed, unlike generic_osc_handler's table.
+static int zone_upsert_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)argc; (void)msg; (void)user_data;
+    ZoneRecordWire rec;
+    rec.zone_id = argv[0]->i;
+    float *f = &rec.root_note; // root_note..reverse are 15 consecutive floats
+    for (int i = 0; i < 15; i++) f[i] = argv[1 + i]->f;
+    snprintf(rec.path, SAMPLE_PATH_LEN, "%s", (const char *)&argv[16]->s);
+    apply_zone_upsert(&rec);
+    return 0;
 }
-
-static void poll_sample_catalog_socket(int server_fd, SampleCatalogConn *conn) {
-    if (conn->client_fd < 0) {
-        conn->client_fd = accept(server_fd, NULL, NULL);
-        if (conn->client_fd >= 0) {
-            int c_flags = fcntl(conn->client_fd, F_GETFL, 0);
-            fcntl(conn->client_fd, F_SETFL, c_flags | O_NONBLOCK);
-            reset_sample_catalog_conn_message(conn);
-        }
-        return;
-    }
-
-    if (conn->header_bytes < sizeof(conn->header_buf)) {
-        ssize_t n = recv(conn->client_fd, conn->header_buf + conn->header_bytes, sizeof(conn->header_buf) - conn->header_bytes, 0);
-        if (n > 0) {
-            conn->header_bytes += (size_t)n;
-            if (conn->header_bytes == sizeof(conn->header_buf)) {
-                conn->opcode = conn->header_buf[0];
-                uint32_t count; memcpy(&count, conn->header_buf + 1, 4);
-                conn->count = count;
-                if (conn->count > ZONE_MSG_MAX_COUNT) {
-                    fprintf(stderr, "[samples] rejecting catalog message with implausible record count %u\n", conn->count);
-                    close(conn->client_fd); conn->client_fd = -1;
-                    return;
-                }
-                size_t record_size = (conn->opcode == ZONE_OP_REMOVE) ? sizeof(int32_t) : ZONE_RECORD_WIRE_SIZE;
-                conn->body_needed = (size_t)conn->count * record_size;
-                if (conn->body_needed > conn->body_capacity) {
-                    free(conn->body_buf);
-                    conn->body_buf = malloc(conn->body_needed > 0 ? conn->body_needed : 1);
-                    conn->body_capacity = conn->body_needed;
-                }
-                conn->body_bytes = 0;
-                if (conn->body_needed == 0) {
-                    process_zone_catalog_message(conn->opcode, conn->count, conn->body_buf);
-                    reset_sample_catalog_conn_message(conn);
-                }
-            }
-        } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-            close(conn->client_fd); conn->client_fd = -1;
-        }
-        return;
-    }
-
-    ssize_t n = recv(conn->client_fd, conn->body_buf + conn->body_bytes, conn->body_needed - conn->body_bytes, 0);
-    if (n > 0) {
-        conn->body_bytes += (size_t)n;
-        if (conn->body_bytes == conn->body_needed) {
-            process_zone_catalog_message(conn->opcode, conn->count, conn->body_buf);
-            reset_sample_catalog_conn_message(conn);
-        }
-    } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-        close(conn->client_fd); conn->client_fd = -1;
-    }
+// "/hds/zone/remove" i -- a single zone_id.
+static int zone_remove_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)argc; (void)msg; (void)user_data;
+    apply_zone_remove(argv[0]->i);
+    return 0;
 }
 
 // Round-robin hit counters, one per possible group id (index 0 unused -- group 0 means "not
@@ -5060,10 +5208,12 @@ static void *record_writer_thread_main(void *arg) {
     return NULL;
 }
 
-// Status feedback sent back over the same socket the GUI sends control packets on (see
-// vu_decimator below) -- used to be a bare peak float; grew into this small fixed struct so the
-// Recording tab can show live state (is a take actually running, how long, did the last start
-// attempt fail) and the detected input channel count without a second connection.
+// Status feedback (see vu_decimator below) -- used to be a bare peak float; grew into this small
+// fixed struct so the Recording tab can show live state (is a take actually running, how long,
+// did the last start attempt fail) and the detected input channel count. Sent as one OSC bundle
+// (send_osc_status()) to the configured --osc-reply-host/--osc-reply-port rather than raw bytes
+// over a connected socket -- this struct is now just a convenient in-memory container for the
+// values between computing them and handing them to send_osc_status().
 typedef struct {
     float peak;
     float is_recording;
@@ -5073,18 +5223,63 @@ typedef struct {
     float tempo_bpm_live; // compute_current_tempo_bpm()'s result -- equals tempo_bpm whenever no tempo markers are programmed
 } EngineStatus;
 
-int main() {
+// Sends the GUI-status snapshot as one OSC bundle (one UDP datagram, 6 messages) to the reply
+// address configured at startup. Fire-and-forget, same as the rest of this UDP-based protocol:
+// if nothing is listening on the reply port, lo_send_bundle simply has nowhere to deliver to --
+// a no-op, not an error, same as the old stream-socket's behavior whenever client_fd wasn't
+// connected.
+static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
+    lo_bundle b = lo_bundle_new(LO_TT_IMMEDIATE);
+    lo_message m;
+    m = lo_message_new(); lo_message_add_float(m, status->peak); lo_bundle_add_message(b, "/hds/status/peak", m);
+    m = lo_message_new(); lo_message_add_float(m, status->is_recording); lo_bundle_add_message(b, "/hds/status/is_recording", m);
+    m = lo_message_new(); lo_message_add_float(m, status->elapsed_seconds); lo_bundle_add_message(b, "/hds/status/elapsed_seconds", m);
+    m = lo_message_new(); lo_message_add_float(m, status->record_error); lo_bundle_add_message(b, "/hds/status/record_error", m);
+    m = lo_message_new(); lo_message_add_float(m, status->detected_input_channels); lo_bundle_add_message(b, "/hds/status/detected_input_channels", m);
+    m = lo_message_new(); lo_message_add_float(m, status->tempo_bpm_live); lo_bundle_add_message(b, "/hds/status/tempo_bpm_live", m);
+    lo_send_bundle(reply_addr, b);
+    lo_bundle_free_recursive(b); // frees the bundle AND every message added to it
+}
+
+int main(int argc, char **argv) {
     assert_fm_algorithms_acyclic();
-    const char *socket_path = "/tmp/synth.sock"; int client_fd = -1;
     signal(SIGINT, handle_sigint);
-    int server_fd = setup_control_socket(socket_path); if (server_fd < 0) return 1;
+
+    // OSC transport configuration -- see the "OSC Control Protocol" comment above OSC_PARAMS[].
+    // Two independent, explicitly-configured ports (not "reply to whoever last sent a message"),
+    // matching how real OSC tools (TouchOSC, Max, Pd, python-osc) already expect to be wired up.
+    int osc_listen_port = 9000;
+    const char *osc_reply_host = "127.0.0.1";
+    int osc_reply_port = 9001;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--osc-listen-port") == 0 && i + 1 < argc) osc_listen_port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--osc-reply-host") == 0 && i + 1 < argc) osc_reply_host = argv[++i];
+        else if (strcmp(argv[i], "--osc-reply-port") == 0 && i + 1 < argc) osc_reply_port = atoi(argv[++i]);
+    }
 
     SynthSharedControls active_knobs; init_default_controls(&active_knobs);
+
+    // Non-threaded lo_server, polled once per audio block from the main loop below (see the
+    // "while (lo_server_recv_noblock(...))" call site) -- deliberately NOT lo_server_thread, so
+    // only this thread ever touches active_knobs/g_sample_slots, exactly like the poll_*_socket()
+    // functions this replaces. The zone methods are registered with explicit type strings (liblo
+    // tries the most specific registration first), the knob table's generic method last with
+    // path=NULL/type=NULL as the catch-all for everything else.
+    char osc_listen_port_str[16]; snprintf(osc_listen_port_str, sizeof(osc_listen_port_str), "%d", osc_listen_port);
+    lo_server osc_server = lo_server_new_with_proto(osc_listen_port_str, LO_UDP, osc_error_handler);
+    if (!osc_server) { fprintf(stderr, "Cannot continue without an OSC listen socket on port %d.\n", osc_listen_port); return 1; }
+    lo_server_add_method(osc_server, "/hds/zone/upsert", "ifffffffffffffffs", zone_upsert_handler, NULL);
+    lo_server_add_method(osc_server, "/hds/zone/remove", "i", zone_remove_handler, NULL);
+    lo_server_add_method(osc_server, NULL, NULL, generic_osc_handler, &active_knobs);
+
+    char osc_reply_port_str[16]; snprintf(osc_reply_port_str, sizeof(osc_reply_port_str), "%d", osc_reply_port);
+    lo_address osc_reply_addr = lo_address_new(osc_reply_host, osc_reply_port_str);
+    fprintf(stderr, "[osc] listening on UDP port %d, status replies to %s:%d\n", osc_listen_port, osc_reply_host, osc_reply_port);
 
     snd_pcm_t *pcm_handle = NULL;
     if (!open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, 2)) {
         fprintf(stderr, "Cannot continue without an output device.\n");
-        close(server_fd); unlink(socket_path); return 1;
+        lo_address_free(osc_reply_addr); lo_server_free(osc_server); return 1;
     }
     char applied_output_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
@@ -5127,24 +5322,12 @@ int main() {
         fprintf(stderr, "[sample] failed to start disk streaming thread -- WAVE_SAMPLE playback will be unavailable this session\n");
     }
 
-    // Sample Bank catalog socket: a second, independent Unix socket carrying only
-    // ZONE_OP_UPSERT/ZONE_OP_REMOVE messages -- see the "Sample Bank catalog protocol" comment
-    // above setup_sample_catalog_socket()'s call site for why this is separate from the knob
-    // control socket. Reuses the same generic setup_control_socket(), just with a different path.
-    const char *sample_catalog_socket_path = "/tmp/synth_samples.sock";
-    int sample_catalog_server_fd = setup_control_socket(sample_catalog_socket_path);
-    if (sample_catalog_server_fd < 0) {
-        fprintf(stderr, "[samples] failed to open sample catalog socket -- Mapping tab zone updates will be unavailable this session\n");
-    }
-    SampleCatalogConn sample_catalog_conn = {0};
-    sample_catalog_conn.client_fd = -1;
-
     snd_seq_t *seq_handle;
     int seq_err = snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
     if (seq_err < 0) {
         fprintf(stderr, "MIDI sequencer failed to open: %s\n", snd_strerror(seq_err));
         snd_pcm_close(pcm_handle); if (pcm_capture_handle) snd_pcm_close(pcm_capture_handle);
-        close(server_fd); unlink(socket_path); return 1;
+        lo_address_free(osc_reply_addr); lo_server_free(osc_server); return 1;
     }
     snd_seq_set_client_name(seq_handle, "YourSynth Socket Engine");
     int our_midi_port = snd_seq_create_simple_port(seq_handle, "Input", SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE, SND_SEQ_PORT_TYPE_MIDI_GENERIC);
@@ -5162,7 +5345,6 @@ int main() {
     char applied_midi_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
 
-    char socket_packet_buffer[sizeof(SynthSharedControls)]; size_t control_bytes_received = 0;
     float global_lfo_phases[LFO_COUNT] = {0.0f}; int vu_decimator = 0;
 
     SynthVoice voices[MAX_VOICES]; for (int i = 0; i < MAX_VOICES; i++) init_voice(&voices[i]);
@@ -5173,8 +5355,10 @@ int main() {
     uint64_t total_frames_rendered = 0;
 
     while (g_synth_running) {
-        poll_control_socket(server_fd, &client_fd, socket_packet_buffer, &control_bytes_received, &active_knobs);
-        if (sample_catalog_server_fd >= 0) poll_sample_catalog_socket(sample_catalog_server_fd, &sample_catalog_conn);
+        // Drain every pending OSC datagram this block -- generic_osc_handler/zone_upsert_handler/
+        // zone_remove_handler write directly into active_knobs/g_sample_slots as each message is
+        // dispatched, so nothing further is needed here once this returns 0 (no more pending).
+        while (lo_server_recv_noblock(osc_server, 0) > 0) {}
         bool poly_mode_active = (active_knobs.is_polyphonic != 0.0f);
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
@@ -5219,11 +5403,12 @@ int main() {
             snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
         }
 
-        // Sample Bank: reconciliation now happens once per ZONE_OP_UPSERT/ZONE_OP_REMOVE message
-        // (processed inline inside poll_sample_catalog_socket() above, at receipt), not every
-        // audio block -- see process_zone_catalog_message(). The one piece of work that genuinely
-        // can't happen at message-receipt time is finishing a load that got throttled into the
-        // pending-loads queue; that's drained here, at most SAMPLE_LOADS_PER_BLOCK entries per
+        // Sample Bank: reconciliation now happens once per "/hds/zone/upsert"/"/hds/zone/remove"
+        // OSC message (dispatched inline inside the lo_server_recv_noblock() drain above, at
+        // receipt), not every audio block -- see apply_zone_upsert()/apply_zone_remove(). The one
+        // piece of work that genuinely can't happen at message-receipt time is finishing a load
+        // that got throttled into the pending-loads queue; that's drained here, at most
+        // SAMPLE_LOADS_PER_BLOCK entries per
         // block (see its #define for the real-time trade-off this bounds).
         drain_pending_sample_loads();
 
@@ -5366,7 +5551,7 @@ int main() {
         }
 
         vu_decimator++;
-        if (client_fd >= 0 && vu_decimator >= 12) {
+        if (vu_decimator >= 12) {
             bool engine_active = atomic_load_explicit(&record_engine.is_active, memory_order_acquire);
             EngineStatus status = {
                 .peak = block_peak,
@@ -5376,7 +5561,7 @@ int main() {
                 .detected_input_channels = (float)detected_input_channels,
                 .tempo_bpm_live = current_tempo_bpm,
             };
-            send(client_fd, &status, sizeof(status), 0);
+            send_osc_status(osc_reply_addr, &status);
             vu_decimator = 0;
         }
         write_audio_block(pcm_handle, buffer, block_size, active_voices_count, render_ms);
@@ -5396,9 +5581,8 @@ int main() {
     }
     for (int s = 0; s < MAX_SAMPLE_STREAMS; s++) if (g_sample_streams[s].disk_file_handle) fclose(g_sample_streams[s].disk_file_handle);
     for (int s = 0; s < g_sample_slot_count; s++) { free(g_sample_slots[s].pre_roll_l); free(g_sample_slots[s].pre_roll_r); }
-    if (client_fd >= 0) close(client_fd);
-    if (server_fd >= 0) close(server_fd);
-    unlink(socket_path);
+    lo_server_free(osc_server);
+    lo_address_free(osc_reply_addr);
     snd_seq_close(seq_handle);
     snd_pcm_close(pcm_handle);
     if (pcm_capture_handle) snd_pcm_close(pcm_capture_handle);
