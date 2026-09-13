@@ -6,8 +6,13 @@ import math
 import random
 import subprocess
 import re
+import time
 from datetime import datetime
 import numpy as np
+from pythonosc.udp_client import SimpleUDPClient
+from pythonosc.osc_message_builder import OscMessageBuilder
+from pythonosc.osc_bundle_builder import OscBundleBuilder, IMMEDIATELY
+from pythonosc.osc_packet import OscPacket, ParseError as OscParseError
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
                              QSlider, QPushButton, QProgressBar, QSpinBox, QLineEdit, QCheckBox,
@@ -107,6 +112,15 @@ def _decode_wav_peaks(path, num_buckets=600):
 _ROUND_ROBIN_COLORS = ["#c0392b", "#2980b9", "#27ae60", "#8e44ad", "#d35400", "#16a085"]
 def _round_robin_group_color(group):
     return QColor(_ROUND_ROBIN_COLORS[(group - 1) % len(_ROUND_ROBIN_COLORS)])
+
+# OSC control protocol endpoints -- must match backend.c's --osc-listen-port/--osc-reply-port
+# defaults exactly (both localhost-only for now; see connect_to_backend()).
+OSC_HOST = "127.0.0.1"
+OSC_SEND_PORT = 9000  # backend's --osc-listen-port: every knob + Sample Bank catalog goes here
+OSC_RECV_PORT = 9001  # backend's --osc-reply-port: /hds/status/* feedback arrives here
+# How long without a status bundle before the GUI considers the backend gone (a few missed
+# vu_timer ticks' worth) -- see listen_for_status_frames()/_backend_is_live().
+OSC_STATUS_TIMEOUT_S = 1.5
 
 # Device name byte width must match AUDIO_DEVICE_NAME_LEN in backend.c exactly.
 AUDIO_DEVICE_NAME_LEN = 64
@@ -273,11 +287,6 @@ def _list_midi_input_devices():
     except (OSError, subprocess.SubprocessError):
         pass
     return [MIDI_AUTO_LABEL] + names
-
-def _encode_device_name(name):
-    """Pack a device name into the fixed AUDIO_DEVICE_NAME_LEN-byte, null-terminated field the
-    backend's struct expects. Truncates to fit rather than overflowing the fixed-size C buffer."""
-    return name.encode("utf-8", errors="replace")[:AUDIO_DEVICE_NAME_LEN - 1].ljust(AUDIO_DEVICE_NAME_LEN, b"\x00")
 
 class ResetSlider(QSlider):
     """Vertical volume slider that resets to a default value when double-clicked."""
@@ -1723,12 +1732,19 @@ class SynthGui(QWidget):
         self.setWindowTitle("YourSynth Custom Potentiometer Console")
         self.setGeometry(30, 30, 1350, 680)  # Height reduced from 950 to 680 since window footprint is optimized
 
-        self.server_address = '/tmp/synth.sock'
-        self.zone_catalog_server_address = '/tmp/synth_samples.sock'
-        self.sock = None
-        self.zone_catalog_sock = None
-        self.mock_mode = False
-        self._status_recv_buf = b""  # accumulates partial reads of the EngineStatus struct below
+        # OSC control protocol (see backend.c's OSC_PARAMS[]/the "Control protocol: OSC" section
+        # of README.md): one UDP client sends every knob + the Sample Bank catalog to the
+        # backend's --osc-listen-port (default 9000); one plain non-blocking UDP socket receives
+        # /hds/status/* feedback on --osc-reply-port (default 9001). Both ends are on localhost --
+        # see OSC_HOST/OSC_SEND_PORT/OSC_RECV_PORT below the imports for where to change that.
+        self.osc_client = None
+        self.status_sock = None
+        self.mock_mode = True  # connect_to_backend() below owns the real initial value
+        # UDP has no connect-time liveness signal (unlike the old stream socket, whose connect()
+        # failing meant "backend not running") -- so "is the backend actually there" is now
+        # inferred from whether a status bundle has arrived recently. See
+        # listen_for_status_frames()/_backend_is_live().
+        self._last_status_time = 0.0
         self._last_detected_input_channels = -1
         self.connect_to_backend()
 
@@ -3718,61 +3734,92 @@ class SynthGui(QWidget):
         menu.exec(global_pos)
 
     def connect_to_backend(self):
-        try:
-            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.connect(self.server_address); self.sock.setblocking(False)
-            self.mock_mode = False
-            print("Successfully linked up to C engine Unix Domain Socket node!")
-        except socket.error:
-            self.mock_mode = True; self.sock = None
-            print("--- WORKING IN MOCK GUI MODE ---")
+        # UDP: construction never fails just because nothing's listening yet (unlike the old
+        # AF_UNIX SOCK_STREAM connect(), whose success/failure used to BE the mock-mode signal).
+        # Real liveness is inferred from whether /hds/status/* actually arrives -- see
+        # listen_for_status_frames()/_backend_is_live(). Also carries the Sample Bank catalog
+        # (/hds/zone/upsert, /hds/zone/remove) now -- the backend's OSC listener has a single
+        # port for everything, so the old second socket is gone.
+        self.osc_client = SimpleUDPClient(OSC_HOST, OSC_SEND_PORT)
 
-        # Sample Bank catalog socket: a second, independent connection -- best-effort, same mock-
-        # mode convention as the control socket above. Its own outbound-only sender (blocking is
-        # fine: these messages are small and only sent on an explicit Mapping tab edit, never on
-        # the audio-adjacent poll path the control socket's status reads use).
+        self.status_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.status_sock.setblocking(False)
         try:
-            self.zone_catalog_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.zone_catalog_sock.connect(self.zone_catalog_server_address)
-        except socket.error:
-            self.zone_catalog_sock = None
+            self.status_sock.bind((OSC_HOST, OSC_RECV_PORT))
+        except OSError as e:
+            print(f"--- could not bind OSC status port {OSC_RECV_PORT}: {e} ---")
+            self.status_sock = None
+        self.mock_mode = True  # flips to False the first time a real status bundle arrives
+        print(f"OSC client -> {OSC_HOST}:{OSC_SEND_PORT}, status listener on {OSC_RECV_PORT}")
 
-    # EngineStatus wire format: 5 floats (peak, is_recording, elapsed_seconds, record_error,
-    # detected_input_channels) -- must match the EngineStatus struct backend.c sends back over
-    # the same socket the control packet goes out on. Used to be a bare 4-byte peak float; grew
-    # into this once the Recording tab needed live state back from the engine (is a take
-    # actually running, how long, did the last start attempt fail, how many channels does the
-    # current input device actually have).
-    _STATUS_FORMAT = "6f"
-    _STATUS_SIZE = struct.calcsize(_STATUS_FORMAT)
+    # Status feedback: 6 /hds/status/* messages (peak, is_recording, elapsed_seconds,
+    # record_error, detected_input_channels, tempo_bpm_live) sent as one OSC bundle -- see
+    # send_osc_status() in backend.c. Each incoming UDP datagram is already one complete OSC
+    # packet (bundle or single message), so unlike the old stream-socket read there's no partial-
+    # message reassembly to do here at all.
+    _STATUS_ADDRESSES = (
+        "/hds/status/peak", "/hds/status/is_recording", "/hds/status/elapsed_seconds",
+        "/hds/status/record_error", "/hds/status/detected_input_channels", "/hds/status/tempo_bpm_live",
+    )
 
     def listen_for_status_frames(self):
-        if self.sock is None or self.mock_mode:
+        if self.status_sock is None:
             return
-        try:
-            # Drain whatever's available -- a stream socket can deliver less (or, coalesced,
-            # more) than one struct per recv(), so accumulate across calls like the backend's
-            # own poll_control_socket() does for the control packet, rather than assuming a
-            # single recv() lines up with a single struct.
-            chunk = self.sock.recv(4096)
-            if chunk:
-                self._status_recv_buf += chunk
-        except (socket.error, BlockingIOError):
-            pass
-        while len(self._status_recv_buf) >= self._STATUS_SIZE:
-            peak, is_recording, elapsed_seconds, record_error, detected_channels, tempo_bpm_live = struct.unpack(
-                self._STATUS_FORMAT, self._status_recv_buf[:self._STATUS_SIZE]
-            )
-            self._status_recv_buf = self._status_recv_buf[self._STATUS_SIZE:]
-            self.vu_meter.setValue(int(max(0, min(100, peak * 100.0))))
-            self._update_recording_status(bool(is_recording), elapsed_seconds, bool(record_error), int(detected_channels))
-            self.tempo_live_readout.setText(f"engine: {tempo_bpm_live:.1f} BPM")
+        got_any = False
+        while True:
+            try:
+                dgram, _addr = self.status_sock.recvfrom(4096)
+            except (BlockingIOError, OSError):
+                break
+            try:
+                packet = OscPacket(dgram)
+            except OscParseError:
+                continue
+            got_any = True
+            values = {}
+            for timed_msg in packet.messages:
+                msg = timed_msg.message
+                if msg.address in self._STATUS_ADDRESSES and msg.params:
+                    values[msg.address] = msg.params[0]
+            if "/hds/status/peak" in values:
+                self.vu_meter.setValue(int(max(0, min(100, values["/hds/status/peak"] * 100.0))))
+            if all(a in values for a in self._STATUS_ADDRESSES[1:5]):
+                self._update_recording_status(
+                    bool(values["/hds/status/is_recording"]),
+                    values["/hds/status/elapsed_seconds"],
+                    bool(values["/hds/status/record_error"]),
+                    int(values["/hds/status/detected_input_channels"]),
+                )
+            if "/hds/status/tempo_bpm_live" in values:
+                self.tempo_live_readout.setText(f"engine: {values['/hds/status/tempo_bpm_live']:.1f} BPM")
+
+        if got_any:
+            self._last_status_time = time.monotonic()
+        # Liveness: UDP has no connect-time signal, so "is the backend there" is inferred from
+        # whether status has arrived recently (a few missed vu_timer ticks' worth of silence).
+        self.mock_mode = (self._last_status_time == 0.0) or (time.monotonic() - self._last_status_time > OSC_STATUS_TIMEOUT_S)
     def transmit_knob_packet(self):
+        """Sends every knob's current value as one OSC bundle (one UDP datagram) to the backend --
+        the OSC replacement for the old struct.pack'd binary_packet. Every value-computation line
+        below is unchanged from the pre-OSC version; only the destination (an addressed OSC
+        message added to `bundle` via add_f()/add_s(), instead of packet_list.append()) differs.
+        Addresses must match backend.c's OSC_PARAMS[] table exactly -- see
+        scratchpad/check_osc_address_parity.py for the cross-check between the two."""
         glide_ms = self.glide_dial.value()
         self.glide_readout.setText(f"{glide_ms} ms")
         glide_random_pct = self.glide_random_dial.value()
         self.glide_random_readout.setText(f"{glide_random_pct}%")
         self.tempo_readout.setText(f"{self.tempo_dial.value()} BPM")
+
+        bundle = OscBundleBuilder(IMMEDIATELY)
+        def add_f(address, value):
+            msg = OscMessageBuilder(address=address)
+            msg.add_arg(float(value), "f")
+            bundle.add_content(msg.build())
+        def add_s(address, value):
+            msg = OscMessageBuilder(address=address)
+            msg.add_arg(str(value), "s")
+            bundle.add_content(msg.build())
 
         vassign = 1.0 if self.poly_radio.isChecked() else 0.0
         v1_shape = float(self.vco1_combo.currentIndex())
@@ -3791,137 +3838,140 @@ class SynthGui(QWidget):
         v2_pitch = float(self.vco2_pitch_offset.value())
         v2_fine = float(self.vco2_fine_tune.value())
 
-        # Baseline header list: Maps 13 core parameter elements exactly
-        packet_list = [vassign, v1_shape, v2_shape, fm, v1_vol, v2_vol, g_time, m_vol, v1_p, v2_p, v1_fine, v2_pitch, v2_fine]
+        # Baseline: 13 core parameters
+        add_f("/hds/is_polyphonic", vassign)
+        add_f("/hds/vco1/shape", v1_shape)
+        add_f("/hds/vco2/shape", v2_shape)
+        add_f("/hds/fm/intensity", fm)
+        add_f("/hds/vco1/vol", v1_vol)
+        add_f("/hds/vco2/vol", v2_vol)
+        add_f("/hds/portamento_time_ms", g_time)
+        add_f("/hds/master_volume", m_vol)
+        add_f("/hds/vco1/pan", v1_p)
+        add_f("/hds/vco2/pan", v2_p)
+        add_f("/hds/vco1/fine_tune", v1_fine)
+        add_f("/hds/vco2/pitch_offset", v2_pitch)
+        add_f("/hds/vco2/fine_tune", v2_fine)
 
-        # Pack 8 parameters (D, H, A, Dec, S, R, Attack Start, Attack Peak) for all 10 envelope
-        # instances (+80 items). Order matches C struct exactly: Osc 1-4 Amp, then EG 1-6.
+        # 8 parameters (Delay, Hold, Attack, Decay, Sustain, Release, Attack Start, Attack Peak)
+        # for all 10 envelope instances: Osc 1-4 Amp (index 0-3), then EG 1-6 (index 4-9) -- must
+        # match ENV_COUNT/PackEGParams order in backend.c exactly.
         all_panels = [self.vco1_amp_eg, self.vco2_amp_eg, self.vco3_amp_eg, self.vco4_amp_eg] + self.envelopes
-        for panel in all_panels:
-            packet_list.append(float(panel.dials["D"].value()))
-            packet_list.append(float(panel.dials["H"].value()))
-            packet_list.append(float(panel.dials["A"].value()))
-            packet_list.append(float(panel.dials["D_phase"].value()))
-            packet_list.append(float(panel.dials["S"].value()))
-            packet_list.append(float(panel.dials["R"].value()))
-            packet_list.append(float(panel.attack_level_pct))
-            packet_list.append(float(panel.attack_peak_pct))
+        for eg_idx, panel in enumerate(all_panels):
+            add_f(f"/hds/eg/{eg_idx}/delay", panel.dials["D"].value())
+            add_f(f"/hds/eg/{eg_idx}/hold", panel.dials["H"].value())
+            add_f(f"/hds/eg/{eg_idx}/attack", panel.dials["A"].value())
+            add_f(f"/hds/eg/{eg_idx}/decay", panel.dials["D_phase"].value())
+            add_f(f"/hds/eg/{eg_idx}/sustain", panel.dials["S"].value())
+            add_f(f"/hds/eg/{eg_idx}/release", panel.dials["R"].value())
+            add_f(f"/hds/eg/{eg_idx}/attack_start_pct", panel.attack_level_pct)
+            add_f(f"/hds/eg/{eg_idx}/attack_peak_pct", panel.attack_peak_pct)
 
-        # --- Overhauled Filter Section Pack Strategy ---
-        # Add Filter A/B outer routing mode (+1 item) and its Parallel-mode blend (+1 item)
-        packet_list.append(float(self.filter_routing_mode.currentIndex()))
-        packet_list.append(float(self.filter_ab_blend_dial.value()))
+        # --- Filter A/B ---
+        add_f("/hds/filter/ab_routing_mode", self.filter_routing_mode.currentIndex())
+        add_f("/hds/filter/ab_blend", self.filter_ab_blend_dial.value())
+        add_f("/hds/filter/a/mode", self.filter_a_mode_combo.currentIndex())
 
-        # Add Filter A engine mode (+1 item)
-        packet_list.append(float(self.filter_a_mode_combo.currentIndex()))
+        # Filter A Normal Parameters
+        add_f("/hds/filter/a/cutoff", self.cutoff_dials[0].value())
+        add_f("/hds/filter/a/res_q", self.q_dials[0].value())
+        add_f("/hds/filter/a/slope", self.vcf_poles[0].currentIndex())
+        add_f("/hds/filter/a/type", self.vcf_types[0].currentIndex())
+        add_f("/hds/filter/a_multi/routing", self.filter_a_multi_route_combo.currentIndex())
 
-        # Filter A Normal Parameters (+4 items)
-        packet_list.append(float(self.cutoff_dials[0].value()))
-        packet_list.append(float(self.q_dials[0].value()))
-        packet_list.append(float(self.vcf_poles[0].currentIndex()))
-        packet_list.append(float(self.vcf_types[0].currentIndex()))
-        # Filter A Multi internal topology routing (+1 item)
-        packet_list.append(float(self.filter_a_multi_route_combo.currentIndex()))
-
-        # Filter A Multi Engine sub-units 0, 1, and 2 (+12 items)
+        # Filter A Multi Engine sub-units: Python's cutoff_dials[1..3] are backend's
+        # filter_a_multi[0..2] -- index 0 there is Filter A Normal, index 4 is Filter B.
         for m_idx in range(1, 4):
-            packet_list.append(float(self.cutoff_dials[m_idx].value()))
-            packet_list.append(float(self.q_dials[m_idx].value()))
-            packet_list.append(float(self.vcf_poles[m_idx].currentIndex()))
-            packet_list.append(float(self.vcf_types[m_idx].currentIndex()))
+            backend_idx = m_idx - 1
+            add_f(f"/hds/filter/a_multi/{backend_idx}/cutoff", self.cutoff_dials[m_idx].value())
+            add_f(f"/hds/filter/a_multi/{backend_idx}/res_q", self.q_dials[m_idx].value())
+            add_f(f"/hds/filter/a_multi/{backend_idx}/slope", self.vcf_poles[m_idx].currentIndex())
+            add_f(f"/hds/filter/a_multi/{backend_idx}/type", self.vcf_types[m_idx].currentIndex())
 
-        # Filter B Engine Parameters (+4 items)
-        # Mapped onto the end of the lists (index 4)
-        packet_list.append(float(self.cutoff_dials[4].value()))
-        packet_list.append(float(self.q_dials[4].value()))
-        packet_list.append(float(self.vcf_poles[4].currentIndex()))
-        packet_list.append(float(self.vcf_types[4].currentIndex()))
-        # Add active LFO configurations (+112 items, incl. phase offset + mod source CC)
+        # Filter B Engine Parameters (index 4 in these Python arrays)
+        add_f("/hds/filter/b/cutoff", self.cutoff_dials[4].value())
+        add_f("/hds/filter/b/res_q", self.q_dials[4].value())
+        add_f("/hds/filter/b/slope", self.vcf_poles[4].currentIndex())
+        add_f("/hds/filter/b/type", self.vcf_types[4].currentIndex())
+
+        # LFOs (incl. phase offset + mod source CC)
         for idx in range(LFO_COUNT):
             lfo_hz = float(self.lfo_dials[idx].value()) / 10.0
             self.lfo_readouts[idx].setText(f"{lfo_hz:.1f} Hz")
             lfo_dp = float(self.lfo_depth_dials[idx].value()) / 100.0
-            packet_list.append(float(self.lfo_combos[idx].currentIndex()))
-            packet_list.append(lfo_hz)
-            packet_list.append(lfo_dp)
-            packet_list.append(float(self.lfo_sync_combos[idx].currentIndex()))
-            packet_list.append(float(self.lfo_dest_combos[idx].currentIndex()))
-            packet_list.append(float(self.lfo_phase_dials[idx].value()))
-            packet_list.append(float(self.lfo_mod_source_cc[idx]))
-        # Append the 6 custom EG intensity multipliers (+6 items)
+            add_f(f"/hds/lfo/{idx}/wave", self.lfo_combos[idx].currentIndex())
+            add_f(f"/hds/lfo/{idx}/rate", lfo_hz)
+            add_f(f"/hds/lfo/{idx}/depth", lfo_dp)
+            add_f(f"/hds/lfo/{idx}/key_sync", self.lfo_sync_combos[idx].currentIndex())
+            add_f(f"/hds/lfo/{idx}/dest", self.lfo_dest_combos[idx].currentIndex())
+            add_f(f"/hds/lfo/{idx}/phase_offset", self.lfo_phase_dials[idx].value())
+            add_f(f"/hds/lfo/{idx}/mod_source_cc", self.lfo_mod_source_cc[idx])
+
+        # 6 custom EG intensity multipliers
         for idx in range(6):
-            packet_list.append(float(self.eg_intensity_dials[idx].value()) / 100.0)
+            add_f(f"/hds/eg_mod/{idx}/intensity", self.eg_intensity_dials[idx].value() / 100.0)
 
-        # Append each assignable EG's own mod destination (+6 items)
+        # Each assignable EG's own mod destination
         for idx in range(6):
-            packet_list.append(float(self.eg_dest_combos[idx].currentIndex()))
+            add_f(f"/hds/eg_mod/{idx}/dest", self.eg_dest_combos[idx].currentIndex())
 
-        # Append the 10 active envelope mode selection indices (+10 items).
-        # Sequence matches C struct exactly: Osc 1-4 Amp, then EG 1-6.
-        packet_list.append(float(self.vco1_amp_eg.combo_type.currentIndex()))
-        packet_list.append(float(self.vco2_amp_eg.combo_type.currentIndex()))
-        packet_list.append(float(self.vco3_amp_eg.combo_type.currentIndex()))
-        packet_list.append(float(self.vco4_amp_eg.combo_type.currentIndex()))
-        for env in self.envelopes:
-            packet_list.append(float(env.combo_type.currentIndex()))
-        # Append the 4 Unison Saw shape controls (+4 items)
-        packet_list.append(float(self.vco1_unison_detune.value()))
-        packet_list.append(float(self.vco1_unison_width.value()))
-        packet_list.append(float(self.vco2_unison_detune.value()))
-        packet_list.append(float(self.vco2_unison_width.value()))
+        # 10 active envelope mode selection indices: Osc 1-4 Amp (0-3), then EG 1-6 (4-9) -- same
+        # eg_idx convention as the EG-params loop above.
+        add_f("/hds/eg/0/topology_mode", self.vco1_amp_eg.combo_type.currentIndex())
+        add_f("/hds/eg/1/topology_mode", self.vco2_amp_eg.combo_type.currentIndex())
+        add_f("/hds/eg/2/topology_mode", self.vco3_amp_eg.combo_type.currentIndex())
+        add_f("/hds/eg/3/topology_mode", self.vco4_amp_eg.combo_type.currentIndex())
+        for env_idx, env in enumerate(self.envelopes):
+            add_f(f"/hds/eg/{4 + env_idx}/topology_mode", env.combo_type.currentIndex())
 
-        # Mono Legato glide time randomization amount (+1 item)
-        packet_list.append(float(self.glide_random_dial.value()))
+        # Unison Saw shape controls (Osc 1/2 only)
+        add_f("/hds/vco1/unison/detune", self.vco1_unison_detune.value())
+        add_f("/hds/vco1/unison/width", self.vco1_unison_width.value())
+        add_f("/hds/vco2/unison/detune", self.vco2_unison_detune.value())
+        add_f("/hds/vco2/unison/width", self.vco2_unison_width.value())
 
-        # Mute flags, decoupled from FM (+2 items)
-        packet_list.append(1.0 if self.vco1_mute.isChecked() else 0.0)
-        packet_list.append(1.0 if self.vco2_mute.isChecked() else 0.0)
+        # Mono Legato glide time randomization amount
+        add_f("/hds/mono_glide_random", self.glide_random_dial.value())
 
-        # Hard Sync mode: 0=Off, 1=Parallel, 2=Serial (+1 item)
-        packet_list.append(float(self.hard_sync_combo.currentIndex()))
+        # Mute flags, decoupled from FM
+        add_f("/hds/vco1/mute", 1.0 if self.vco1_mute.isChecked() else 0.0)
+        add_f("/hds/vco2/mute", 1.0 if self.vco2_mute.isChecked() else 0.0)
 
-        # Phase pots, degrees 0-360 (+2 items)
-        packet_list.append(float(self.vco1_phase.value()))
-        packet_list.append(float(self.vco2_phase.value()))
+        # Hard Sync mode: 0=Off, 1=Parallel, 2=Serial
+        add_f("/hds/hard_sync_mode", self.hard_sync_combo.currentIndex())
 
-        # --- 4-Oscillator architecture additions (+10 items) ---
-        # Pulse width, Osc 1/2 (+2 items)
-        packet_list.append(float(self.vco1_pulse_width.value()))
-        packet_list.append(float(self.vco2_pulse_width.value()))
+        # Phase pots, degrees 0-360
+        add_f("/hds/vco1/phase_offset", self.vco1_phase.value())
+        add_f("/hds/vco2/phase_offset", self.vco2_phase.value())
 
-        # Osc 3: vol, pan, mute, pulse-width-or-tilt (+4 items)
-        packet_list.append(float(self.vco3_vol.value()) / 100.0)
-        packet_list.append(float(self.vco3_pan.value()) / 100.0)
-        packet_list.append(1.0 if self.vco3_mute.isChecked() else 0.0)
-        packet_list.append(float(self.vco3_pulse_width.value()))
+        # Pulse width, Osc 1/2
+        add_f("/hds/vco1/pulse_width", self.vco1_pulse_width.value())
+        add_f("/hds/vco2/pulse_width", self.vco2_pulse_width.value())
 
-        # Osc 4: vol, pan, mute, pulse-width-or-tilt (+4 items)
-        packet_list.append(float(self.vco4_vol.value()) / 100.0)
-        packet_list.append(float(self.vco4_pan.value()) / 100.0)
-        packet_list.append(1.0 if self.vco4_mute.isChecked() else 0.0)
-        packet_list.append(float(self.vco4_pulse_width.value()))
+        # Osc 3: vol, pan, mute, pulse-width-or-tilt
+        add_f("/hds/vco3/vol", self.vco3_vol.value() / 100.0)
+        add_f("/hds/vco3/pan", self.vco3_pan.value() / 100.0)
+        add_f("/hds/vco3/mute", 1.0 if self.vco3_mute.isChecked() else 0.0)
+        add_f("/hds/vco3/pulse_width", self.vco3_pulse_width.value())
 
-        # --- FX Bus + External Input architecture additions ---
-        # This is the 151f contract's first breaking change since the 4-oscillator overhaul --
-        # everything above this point is untouched, everything below is new. Order here MUST
-        # match SynthSharedControls in backend.c field-for-field: ext_in_enable/gain, then
-        # FX_SLOT_COUNT slots (each fx_type, FX_SLOT_PARAM_COUNT params, mix, bypass), then the
-        # two fixed-width device name strings, packed last since struct.pack keeps fixed-size
-        # string fields at the end of the format string.
+        # Osc 4: vol, pan, mute, pulse-width-or-tilt
+        add_f("/hds/vco4/vol", self.vco4_vol.value() / 100.0)
+        add_f("/hds/vco4/pan", self.vco4_pan.value() / 100.0)
+        add_f("/hds/vco4/mute", 1.0 if self.vco4_mute.isChecked() else 0.0)
+        add_f("/hds/vco4/pulse_width", self.vco4_pulse_width.value())
 
-        # External Audio Input: enable, gain (+2 items)
-        packet_list.append(1.0 if self.ext_in_enable.isChecked() else 0.0)
-        packet_list.append(float(self.ext_in_gain_dial.value()) / 100.0)
+        # External Audio Input: enable, gain
+        add_f("/hds/ext_in/enable", 1.0 if self.ext_in_enable.isChecked() else 0.0)
+        add_f("/hds/ext_in/gain", self.ext_in_gain_dial.value() / 100.0)
 
-        # FX Bus: 12 slots * (1 type + 8 params + 1 mix + 1 bypass) = 132 items. A plain dial
-        # always sends value/100.0 -- a 0-100-range dial (per FX_TYPE_METADATA) reaches the
-        # backend as 0.0-1.0, a -100..100 one as -1.0..1.0. A "choice" param instead sends
-        # (selected index / (option count - 1)) -- see FX_TYPE_METADATA's own comment on that
-        # convention. Mix itself stays 0-100 raw (backend divides it by 100 on its own side,
-        # matching how master_volume-style knobs are packed elsewhere in this function).
+        # FX Bus: 12 slots, each type + 8 params + mix + bypass. A plain dial always sends
+        # value/100.0 -- a 0-100-range dial (per FX_TYPE_METADATA) reaches the backend as
+        # 0.0-1.0, a -100..100 one as -1.0..1.0. A "choice" param instead sends (selected index /
+        # (option count - 1)) -- see FX_TYPE_METADATA's own comment on that convention. Mix
+        # itself stays 0-100 raw (backend divides it by 100 on its own side).
         for slot_idx in range(FX_SLOT_COUNT):
             type_idx = self.fx_type_combos[slot_idx].currentIndex()
-            packet_list.append(float(type_idx))
+            add_f(f"/hds/fx/{slot_idx}/type", type_idx)
             entry = FX_TYPE_METADATA[type_idx] if 0 <= type_idx < len(FX_TYPE_METADATA) else FX_TYPE_METADATA[0]
             params_meta = entry["params"]
             for p_idx in range(FX_SLOT_PARAM_COUNT):
@@ -3932,147 +3982,124 @@ class SynthGui(QWidget):
                     value = float(combo.currentIndex()) / float(option_count - 1) if option_count > 1 else 0.0
                 else:
                     value = float(self.fx_param_dials[slot_idx][p_idx].value()) / 100.0
-                packet_list.append(value)
-            packet_list.append(float(self.fx_mix_dials[slot_idx].value()))
-            packet_list.append(1.0 if self.fx_bypass_buttons[slot_idx].isChecked() else 0.0)
+                add_f(f"/hds/fx/{slot_idx}/param/{p_idx}", value)
+            add_f(f"/hds/fx/{slot_idx}/mix", self.fx_mix_dials[slot_idx].value())
+            add_f(f"/hds/fx/{slot_idx}/bypass", 1.0 if self.fx_bypass_buttons[slot_idx].isChecked() else 0.0)
 
-        # FX Bus routing: 0 = Series, 1 = Parallel (+1 item)
-        packet_list.append(1.0 if self.fx_routing_btn.isChecked() else 0.0)
+        # FX Bus routing: 0 = Series, 1 = Parallel
+        add_f("/hds/fx_routing_mode", 1.0 if self.fx_routing_btn.isChecked() else 0.0)
 
-        # Pitch Bend range, up/down, semitones (+2 items)
-        packet_list.append(float(self.pb_range_up_spin.value()))
-        packet_list.append(float(self.pb_range_down_spin.value()))
+        # Pitch Bend range, up/down, semitones
+        add_f("/hds/pb/range_up", self.pb_range_up_spin.value())
+        add_f("/hds/pb/range_down", self.pb_range_down_spin.value())
 
-        # Sustain pedal polarity: 0 = Normal, 1 = Inverted (+1 item)
-        packet_list.append(1.0 if self.sustain_polarity_inverted.isChecked() else 0.0)
+        # Sustain pedal polarity: 0 = Normal, 1 = Inverted
+        add_f("/hds/sustain/polarity", 1.0 if self.sustain_polarity_inverted.isChecked() else 0.0)
 
-        # Audio latency, ms (+1 item) -- friendly preset dropdown, see audio_latency_ms in backend.c
+        # Audio latency, ms -- friendly preset dropdown, see audio_latency_ms in backend.c
         latency_idx = self.audio_latency_combo.currentIndex()
         latency_ms = self._LATENCY_PRESETS[latency_idx][1] if 0 <= latency_idx < len(self._LATENCY_PRESETS) else 25.0
-        packet_list.append(float(latency_ms))
+        add_f("/hds/audio/latency_ms", latency_ms)
 
-        # Live polyphony ceiling (+1 item) -- see active_voice_limit in backend.c
-        packet_list.append(float(self.polyphony_spin.value()))
+        # Live polyphony ceiling -- see active_voice_limit in backend.c
+        add_f("/hds/audio/polyphony", self.polyphony_spin.value())
 
-        # Live render block size, samples (+1 item) -- see block_size_frames in backend.c
+        # Live render block size, samples -- see block_size_frames in backend.c
         bs_idx = self.block_size_combo.currentIndex()
         block_size = self._BLOCK_SIZE_PRESETS[bs_idx] if 0 <= bs_idx < len(self._BLOCK_SIZE_PRESETS) else 128
-        packet_list.append(float(block_size))
+        add_f("/hds/audio/block_size", block_size)
 
-        # Recording (+19 items: enable, include-synth-output, downmix, 16 per-channel enables)
-        packet_list.append(1.0 if self.record_toggle_btn.isChecked() else 0.0)
-        packet_list.append(1.0 if self.record_synth_output_cb.isChecked() else 0.0)
-        packet_list.append(1.0 if self.record_mode_downmix.isChecked() else 0.0)
+        # Recording: enable, include-synth-output, downmix, 16 per-channel enables
+        add_f("/hds/record/enable", 1.0 if self.record_toggle_btn.isChecked() else 0.0)
+        add_f("/hds/record/include_synth_output", 1.0 if self.record_synth_output_cb.isChecked() else 0.0)
+        add_f("/hds/record/downmix_stereo", 1.0 if self.record_mode_downmix.isChecked() else 0.0)
         for idx in range(RECORD_MAX_CHANNELS):
             checked = idx < len(self.record_input_channel_cbs) and self.record_input_channel_cbs[idx].isChecked()
-            packet_list.append(1.0 if checked else 0.0)
+            add_f(f"/hds/record/channel/{idx}/enable", 1.0 if checked else 0.0)
 
-        # Tempo (+34 items): the Tempo knob (tempo_bpm) plus a programmable tempo-map system in
-        # the backend -- tempo_marker_count + up to TEMPO_MARKER_MAX (time, bpm) marker pairs,
-        # interpolated between (see compute_current_tempo_bpm() in backend.c). No marker editor
-        # UI exists yet, so marker_count is always 0 and the arrays always zero -- reserved in
-        # the wire layout for a future editor rather than requiring another breaking change then.
-        packet_list.append(float(self.tempo_dial.value()))
-        packet_list.append(0.0)  # tempo_marker_count
-        packet_list.extend([0.0] * TEMPO_MARKER_MAX)  # tempo_marker_time[]
-        packet_list.extend([0.0] * TEMPO_MARKER_MAX)  # tempo_marker_bpm[]
+        # Tempo: the Tempo knob (tempo_bpm) plus a programmable tempo-map system in the backend --
+        # tempo_marker_count + up to TEMPO_MARKER_MAX (time, bpm) marker pairs, interpolated
+        # between (see compute_current_tempo_bpm() in backend.c). No marker editor UI exists yet,
+        # so marker_count is always 0 and the arrays always zero -- reserved for a future editor.
+        add_f("/hds/tempo/bpm", self.tempo_dial.value())
+        add_f("/hds/tempo/marker_count", 0.0)
+        for idx in range(TEMPO_MARKER_MAX):
+            add_f(f"/hds/tempo/marker/{idx}/time", 0.0)
+        for idx in range(TEMPO_MARKER_MAX):
+            add_f(f"/hds/tempo/marker/{idx}/bpm", 0.0)
 
-        # Sample Bank: NOT part of this packet -- the Mapping tab's zone catalog travels over its
-        # own dedicated, event-driven socket instead (see transmit_zone_upsert()/
-        # transmit_zone_remove()), sent only when the catalog itself actually changes, not
-        # broadcast in full on every unrelated knob turn like everything above. See
-        # SAMPLE_SLOT_CAPACITY's comment in backend.c for why.
+        # Sample Bank: NOT part of this bundle -- the Mapping tab's zone catalog travels over its
+        # own dedicated OSC addresses instead (see transmit_zone_upsert()/transmit_zone_remove()),
+        # sent only when the catalog itself actually changes, not resent on every unrelated knob
+        # turn like everything above. See SAMPLE_SLOT_CAPACITY's comment in backend.c for why.
 
-        # --- Osc 3 identity/tuning (+6 items): shape, fine tune, pitch offset, phase offset,
-        # unison detune/width. Must come after the Sample Bank comment above and before Osc 4's
-        # identical block, matching backend.c's SynthSharedControls field order exactly. ---
-        packet_list.append(float(self.vco3_combo.currentIndex()))
-        packet_list.append(float(self.vco3_fine_tune.value()))
-        packet_list.append(float(self.vco3_pitch_offset.value()))
-        packet_list.append(float(self.vco3_phase.value()))
-        packet_list.append(float(self.vco3_unison_detune.value()))
-        packet_list.append(float(self.vco3_unison_width.value()))
+        # Osc 3 identity/tuning: shape, fine tune, pitch offset, phase offset, unison detune/width.
+        add_f("/hds/vco3/shape", self.vco3_combo.currentIndex())
+        add_f("/hds/vco3/fine_tune", self.vco3_fine_tune.value())
+        add_f("/hds/vco3/pitch_offset", self.vco3_pitch_offset.value())
+        add_f("/hds/vco3/phase_offset", self.vco3_phase.value())
+        add_f("/hds/vco3/unison/detune", self.vco3_unison_detune.value())
+        add_f("/hds/vco3/unison/width", self.vco3_unison_width.value())
 
-        # --- Osc 4 identity/tuning (+6 items), mirrors Osc 3's block exactly. ---
-        packet_list.append(float(self.vco4_combo.currentIndex()))
-        packet_list.append(float(self.vco4_fine_tune.value()))
-        packet_list.append(float(self.vco4_pitch_offset.value()))
-        packet_list.append(float(self.vco4_phase.value()))
-        packet_list.append(float(self.vco4_unison_detune.value()))
-        packet_list.append(float(self.vco4_unison_width.value()))
+        # Osc 4 identity/tuning, mirrors Osc 3's block exactly.
+        add_f("/hds/vco4/shape", self.vco4_combo.currentIndex())
+        add_f("/hds/vco4/fine_tune", self.vco4_fine_tune.value())
+        add_f("/hds/vco4/pitch_offset", self.vco4_pitch_offset.value())
+        add_f("/hds/vco4/phase_offset", self.vco4_phase.value())
+        add_f("/hds/vco4/unison/detune", self.vco4_unison_detune.value())
+        add_f("/hds/vco4/unison/width", self.vco4_unison_width.value())
 
-        # --- FM Algorithm system (+8 items): algorithm index, then every depth field in the
-        # exact order backend.c declares them. fm_intensity itself was already sent in the
-        # baseline header (position 4, the "2->1" depth, unchanged) -- these are only the NEW
-        # depth fields plus the algorithm selector. ---
-        packet_list.append(float(self.fm_algorithm_combo.currentIndex()))
-        packet_list.append(float(self.fm_depth_dials["fm_depth_3_1"].value()) / 100.0)
-        packet_list.append(float(self.fm_depth_dials["fm_depth_3_2"].value()) / 100.0)
-        packet_list.append(float(self.fm_depth_dials["fm_depth_4_1"].value()) / 100.0)
-        packet_list.append(float(self.fm_depth_dials["fm_depth_4_3"].value()) / 100.0)
-        packet_list.append(float(self.fm_depth_dials["fm_depth_1_2"].value()) / 100.0)
-        packet_list.append(float(self.fm_depth_dials["fm_depth_3_4"].value()) / 100.0)
-        packet_list.append(float(self.fm_depth_dials["fm_depth_1_3"].value()) / 100.0)
+        # FM Algorithm system: algorithm index, then every depth field. fm_intensity itself was
+        # already sent above (the "2->1" depth, used by every algorithm that has that edge).
+        add_f("/hds/fm/algorithm", self.fm_algorithm_combo.currentIndex())
+        add_f("/hds/fm/depth/3_1", self.fm_depth_dials["fm_depth_3_1"].value() / 100.0)
+        add_f("/hds/fm/depth/3_2", self.fm_depth_dials["fm_depth_3_2"].value() / 100.0)
+        add_f("/hds/fm/depth/4_1", self.fm_depth_dials["fm_depth_4_1"].value() / 100.0)
+        add_f("/hds/fm/depth/4_3", self.fm_depth_dials["fm_depth_4_3"].value() / 100.0)
+        add_f("/hds/fm/depth/1_2", self.fm_depth_dials["fm_depth_1_2"].value() / 100.0)
+        add_f("/hds/fm/depth/3_4", self.fm_depth_dials["fm_depth_3_4"].value() / 100.0)
+        add_f("/hds/fm/depth/1_3", self.fm_depth_dials["fm_depth_1_3"].value() / 100.0)
 
-        # Recording format: 0=WAV, 1=WavPack (+1 item)
-        packet_list.append(1.0 if self.record_format_wavpack.isChecked() else 0.0)
+        # Recording format: 0=WAV, 1=WavPack
+        add_f("/hds/record/format", 1.0 if self.record_format_wavpack.isChecked() else 0.0)
 
-        # UNIFIED CONTRACT VERIFICATION -- one term per packet_list.append block above, in order:
-        # 13 (baseline) + 80 (10 EGs * 8 params) + 1 (filter_ab_routing_mode) + 1 (filter_ab_blend)
-        # + 1 (filter_a_mode) + 4 (filter_a) + 1 (filter_a_multi_routing) + 12 (filter_a_multi[3] * 4)
-        # + 4 (filter_b) + 112 (16 LFOs * 7, incl. phase offset + mod_source_cc)
-        # + 6 (eg_intensity) + 6 (eg_dest_target) + 10 (eg_mode)
-        # + 4 (unison saw width/detune, vco1/vco2 only) + 1 (mono glide randomization)
-        # + 2 (vco1/vco2 mute) + 1 (hard sync mode) + 2 (vco1/vco2 phase offset)
-        # + 2 (vco1/vco2 pulse width) + 4 (Osc 3: vol/pan/mute/pulse-or-tilt) + 4 (Osc 4: vol/pan/mute/pulse-or-tilt)
-        # + 2 (ext in enable/gain) + 132 (12 FX slots * 11) + 1 (fx_routing_mode) + 2 (pb range)
-        # + 1 (sustain polarity) + 1 (audio latency) + 1 (polyphony) + 1 (block size)
-        # + 19 (recording: enable/synth-output/downmix + 16 channel enables)
-        # + 34 (tempo: tempo_bpm + tempo_marker_count + 16 marker times + 16 marker bpms)
-        # + 6 (Osc 3 identity) + 6 (Osc 4 identity) + 8 (FM algorithm + 7 new depths)
-        # + 1 (record_format) = 486 floats, followed by 4 fixed strings (not floats):
-        # output_device, input_device, midi_device (64 bytes each), record_path (256 bytes -- a
-        # real filesystem path needs more room than an ALSA device name). The Sample Bank's own
-        # file paths travel over the separate catalog socket instead (see transmit_zone_upsert()).
+        # Device/MIDI selection + record path -- OSC strings, not fixed-size byte buffers (the
+        # backend truncates safely on its own side via snprintf into its fixed char buffers).
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
         # Defensive fallback: an ALSA PCM device name of "" is never valid (unlike MIDI's "auto"
         # convention above) -- if the combo is ever caught between clear() and repopulation (or
         # any other transient empty state), fall back to "default" rather than transmitting an
-        # empty device name, which the backend would try to open every single block until the
-        # next real change arrives, flooding stderr with ALSA errors and killing audio output.
+        # empty device name, which the backend would otherwise ignore as "no change requested"
+        # (see main()'s output_device_valid/input_device_valid guard) -- sending "default"
+        # explicitly is still the more useful behavior for the user here.
         output_device_text = self.output_device_combo.currentText() or "default"
         input_device_text = self.input_device_combo.currentText() or "default"
-        binary_packet = struct.pack(
-            f"486f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s",
-            *packet_list,
-            _encode_device_name(output_device_text),
-            _encode_device_name(input_device_text),
-            _encode_device_name(midi_wire_value),
-            self._current_record_path.encode("utf-8")[:RECORD_PATH_LEN - 1],
-        )
-        if self.sock is not None:
-            try: self.sock.sendall(binary_packet)
-            except socket.error: self.sock = None
+        add_s("/hds/device/output", output_device_text)
+        add_s("/hds/device/input", input_device_text)
+        add_s("/hds/device/midi", midi_wire_value)
+        add_s("/hds/record/path", self._current_record_path)
 
-    # --- Sample Bank catalog socket: a second, dedicated, event-driven Unix socket carrying only
-    # ZONE_OP_UPSERT/ZONE_OP_REMOVE messages (see the matching comment block above
-    # process_zone_catalog_message() in backend.c). Wire shape: a 5-byte header (1-byte opcode,
-    # 4-byte record count, host byte order) followed by `count` fixed-size records -- a
-    # ZoneRecordWire per zone for UPSERT, a plain int32 zone_id for REMOVE.
-    _ZONE_OP_UPSERT = 1
-    _ZONE_OP_REMOVE = 2
-    # zone_id (i) + 10 floats (root_note, min_note, max_note, min_velocity, max_velocity,
-    # unpitched, loop_start, loop_end, loop_enabled, round_robin_group) + path (SAMPLE_PATH_LEN
-    # bytes) -- must match ZoneRecordWire/ZONE_RECORD_WIRE_SIZE in backend.c field-for-field.
-    _ZONE_RECORD_FORMAT = f"=i15f{SAMPLE_PATH_LEN}s"  # "=" (no padding) since backend.c parses this field-by-field, not via a matching C struct memcpy
+        if self.osc_client is not None:
+            try: self.osc_client.send(bundle.build())
+            except OSError: pass
 
-    def _zone_to_wire_record(self, zone):
+    # --- Sample Bank catalog: two dedicated OSC addresses, "/hds/zone/upsert" and
+    # "/hds/zone/remove" (see the matching comment block above zone_upsert_handler() in
+    # backend.c). Each OSC message carries exactly ONE zone -- a Mapping tab edit touching several
+    # zones just sends several messages back to back, unlike the old wire-framed socket's
+    # one-message-covers-many-zones batching.
+    # zone_id (i) + 15 floats (root_note, min_note, max_note, min_velocity, max_velocity,
+    # unpitched, loop_start, loop_end, loop_enabled, round_robin_group, tune_cents, gain_db, pan,
+    # start_offset_frac, reverse) + path (s) -- must match ZoneRecordWire's field order in
+    # backend.c exactly.
+    _ZONE_UPSERT_TYPES = "i" + "f" * 15 + "s"
+
+    def _zone_to_osc_args(self, zone):
         is_drum = (zone.key_center == -1)
         root_note = 60.0 if is_drum else float(zone.key_center)  # DRUM sends 60 as a placeholder --
         # sample_slot_unpitched forces playback rate to 1.0 regardless of this value.
-        return struct.pack(
-            self._ZONE_RECORD_FORMAT,
+        return (
             zone.zone_id,
             root_note, float(zone.root_note), float(zone.max_note),
             float(zone.min_velocity), float(zone.max_velocity),
@@ -4083,36 +4110,35 @@ class SynthGui(QWidget):
             # SFZ-style per-zone params -- must match ZoneRecordWire's field order exactly.
             float(zone.tune_cents), float(zone.gain_db), float(zone.pan) / 100.0,
             float(zone.start_offset), 1.0 if zone.reverse else 0.0,
-            zone.file_path.encode("utf-8")[:SAMPLE_PATH_LEN - 1].ljust(SAMPLE_PATH_LEN, b"\x00"),
+            zone.file_path,
         )
 
     def transmit_zone_upsert(self, zones):
-        """Sends one ZONE_OP_UPSERT message covering exactly the given zones (never the whole
-        catalog) -- called from every Mapping tab edit site: drop, drag/resize, delete's sibling
-        add, loop-marker drag, root-key change, round-robin-group change."""
-        if self.zone_catalog_sock is None or not zones:
+        """Sends one "/hds/zone/upsert" OSC message per given zone (never the whole catalog) --
+        called from every Mapping tab edit site: drop, drag/resize, delete's sibling add,
+        loop-marker drag, root-key change, round-robin-group change."""
+        if self.osc_client is None or not zones:
             return
-        body = b"".join(self._zone_to_wire_record(z) for z in zones)
-        header = struct.pack("=Bi", self._ZONE_OP_UPSERT, len(zones))
-        try:
-            self.zone_catalog_sock.sendall(header + body)
-        except socket.error:
-            self.zone_catalog_sock = None
+        for zone in zones:
+            msg = OscMessageBuilder(address="/hds/zone/upsert")
+            for arg, type_tag in zip(self._zone_to_osc_args(zone), self._ZONE_UPSERT_TYPES):
+                msg.add_arg(arg, type_tag)
+            try: self.osc_client.send(msg.build())
+            except OSError: pass
 
     def transmit_zone_remove(self, zone_ids):
-        """Sends one ZONE_OP_REMOVE message covering exactly the given zone_ids."""
-        if self.zone_catalog_sock is None or not zone_ids:
+        """Sends one "/hds/zone/remove" OSC message per given zone_id."""
+        if self.osc_client is None or not zone_ids:
             return
-        body = b"".join(struct.pack("=i", zid) for zid in zone_ids)
-        header = struct.pack("=Bi", self._ZONE_OP_REMOVE, len(zone_ids))
-        try:
-            self.zone_catalog_sock.sendall(header + body)
-        except socket.error:
-            self.zone_catalog_sock = None
+        for zid in zone_ids:
+            msg = OscMessageBuilder(address="/hds/zone/remove")
+            msg.add_arg(int(zid), "i")
+            try: self.osc_client.send(msg.build())
+            except OSError: pass
 
     def closeEvent(self, event):
-        if self.sock is not None: self.sock.close()
-        if self.zone_catalog_sock is not None: self.zone_catalog_sock.close()
+        if self.osc_client is not None: self.osc_client.close()
+        if self.status_sock is not None: self.status_sock.close()
         event.accept()
 def runtime_connect_and_bind(gui):
     # Core global mode switches

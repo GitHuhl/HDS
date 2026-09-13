@@ -266,15 +266,18 @@ A digital synthesizer split into two processes:
   `ZONE_OP_REMOVE` for it arrives is left alone by the drain once it
   finally runs (checked via `.active`), rather than resurrecting a
   just-removed slot.
-- **`src/frontend.py`** — a PySide6 control surface predating the backend's
-  switch to OSC (see "Control protocol: OSC" under Build & run) and **not
-  updated to speak it** -- it still packs a positional binary struct and
-  sends it over a Unix domain socket the backend no longer listens on, so
-  it can no longer control the backend at all; it always falls back to its
-  standalone mock mode now. Kept in the repo as a reference for the custom
-  potentiometer/ADSR-graph widgets and the Play / Filters / LFOs /
-  Envelopes / FX / Audio / Recording / Mapping tab layout, pending a
-  rewrite (or replacement) as an OSC-native controller.
+- **`src/frontend.py`** — a PySide6 control surface, ported to speak OSC
+  (see "Control protocol: OSC" under Build & run) via `python-osc`: one
+  `SimpleUDPClient` sends every knob change plus the Sample Bank catalog
+  (`/hds/zone/upsert`/`/hds/zone/remove`) to the backend's
+  `--osc-listen-port`, and a plain non-blocking UDP socket receives
+  `/hds/status/*` feedback on the backend's `--osc-reply-port`. Every
+  address it sends must match `backend.c`'s `OSC_PARAMS[]` table exactly --
+  see `scratchpad/check_osc_address_parity.py`'s approach if that ever
+  needs re-verifying. UDP has no connect-time liveness signal, so
+  "connected vs. mock mode" is now inferred from whether a status bundle
+  has arrived recently (a short timeout after the last one) rather than
+  from a socket `connect()` succeeding.
 
   The **Recording** tab: a "Synth Output" checkbox, a grid of "In N"
   checkboxes rebuilt live to match whatever channel count the backend's
@@ -506,7 +509,10 @@ and liblo dev headers (`liblo-dev`, the OSC control protocol -- see below).
 
 ```sh
 make                    # builds ./synth_engine
+pip install -r requirements.txt
+
 ./synth_engine &        # start the audio/MIDI engine
+python3 src/frontend.py # start the GUI -- talks to the engine over OSC (see below)
 ```
 
 ### Control protocol: OSC
@@ -531,8 +537,15 @@ impossible: a wrong field name is a compile error, not a silent miswrite.
 See the `OSC_PARAMS[]` table and its surrounding comment in `backend.c`
 for the full address list. Any OSC-capable tool or library (TouchOSC, Max/
 MSP, Pure Data, `python-osc`, `liblo` itself) can act as a controller --
-**`src/frontend.py` (PySide6 GUI) has NOT been updated to this protocol
-and can no longer control the backend**; it predates this change and is
-kept in the repo only as a reference for the old design and the DSP-facing
-constant names it documents. A new OSC-native frontend is expected to
-replace it.
+`src/frontend.py` is one such controller (via `python-osc`), but nothing
+about the protocol is specific to it.
+
+Since UDP has no connect-time liveness signal, a controller can't tell
+"backend not running" from "backend running but I haven't heard from it
+yet" just from sending -- `frontend.py` infers this from whether a status
+bundle has arrived recently (see `OSC_STATUS_TIMEOUT_S`), falling back to
+its standalone mock mode if not. Multiple simultaneous controllers (e.g.
+`frontend.py` and TouchOSC both talking to the same backend at once) each
+work independently but don't mirror each other's state live -- that would
+need each controller to also listen for every other controller's writes,
+which none of them currently do.
