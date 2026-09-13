@@ -4036,11 +4036,18 @@ class SynthGui(QWidget):
         # file paths travel over the separate catalog socket instead (see transmit_zone_upsert()).
         midi_selection = self.midi_device_combo.currentText()
         midi_wire_value = "auto" if midi_selection == MIDI_AUTO_LABEL else midi_selection
+        # Defensive fallback: an ALSA PCM device name of "" is never valid (unlike MIDI's "auto"
+        # convention above) -- if the combo is ever caught between clear() and repopulation (or
+        # any other transient empty state), fall back to "default" rather than transmitting an
+        # empty device name, which the backend would try to open every single block until the
+        # next real change arrives, flooding stderr with ALSA errors and killing audio output.
+        output_device_text = self.output_device_combo.currentText() or "default"
+        input_device_text = self.input_device_combo.currentText() or "default"
         binary_packet = struct.pack(
             f"486f{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{AUDIO_DEVICE_NAME_LEN}s{RECORD_PATH_LEN}s",
             *packet_list,
-            _encode_device_name(self.output_device_combo.currentText()),
-            _encode_device_name(self.input_device_combo.currentText()),
+            _encode_device_name(output_device_text),
+            _encode_device_name(input_device_text),
             _encode_device_name(midi_wire_value),
             self._current_record_path.encode("utf-8")[:RECORD_PATH_LEN - 1],
         )

@@ -5175,7 +5175,14 @@ int main() {
         // A latency change reopens BOTH streams (it's not tied to one device name), since
         // snd_pcm_set_params' latency target can only be applied at stream-open time.
         bool latency_changed = active_knobs.audio_latency_ms != applied_audio_latency_ms;
-        if (latency_changed || strncmp(active_knobs.output_device, applied_output_device, AUDIO_DEVICE_NAME_LEN) != 0) {
+        // Defensive: an empty device name is never a real selection (unlike midi_device, which
+        // has a genuine "auto" meaning for ""; see midi_client_should_autoconnect) -- it can only
+        // mean a control packet arrived with this field not meaningfully set yet. Treat it as "no
+        // change requested" rather than trying to open a PCM device named "", which fails every
+        // time and, if it kept recurring on every poll, would flood stderr with ALSA errors and
+        // starve the audio thread's attention on nothing but failed reopen attempts.
+        bool output_device_valid = active_knobs.output_device[0] != '\0';
+        if (output_device_valid && (latency_changed || strncmp(active_knobs.output_device, applied_output_device, AUDIO_DEVICE_NAME_LEN) != 0)) {
             if (open_pcm_stream(active_knobs.output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, 2)) {
                 snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
             } else {
@@ -5184,8 +5191,13 @@ int main() {
                 open_pcm_stream(applied_output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, 2);
                 snprintf(active_knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", applied_output_device);
             }
+        } else if (latency_changed) {
+            // Latency-only change with no valid device name yet -- still worth reapplying to
+            // whatever's already open rather than silently doing nothing.
+            open_pcm_stream(applied_output_device, SND_PCM_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, 2);
         }
-        if (latency_changed || strncmp(active_knobs.input_device, applied_input_device, AUDIO_DEVICE_NAME_LEN) != 0) {
+        bool input_device_valid = active_knobs.input_device[0] != '\0';
+        if (input_device_valid && (latency_changed || strncmp(active_knobs.input_device, applied_input_device, AUDIO_DEVICE_NAME_LEN) != 0)) {
             // Re-detect channel count too -- a device switch can mean a completely different
             // interface with a different channel count, not just a renamed same one.
             detected_input_channels = query_device_channel_count(active_knobs.input_device);
