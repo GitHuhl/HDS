@@ -591,6 +591,19 @@ typedef struct {
     float fm_depth_3_4; // Osc3 -> Osc4
     float fm_depth_1_3; // Osc1 -> Osc3
 
+    // --- Manual oscillator Pitch knobs (appended) --- a per-oscillator pitch offset the user can
+    // dial by hand, independent of fine_tune (cents trim) and pitch_offset (the semitone-octave
+    // knob Osc2/3/4 already have). Range +-24 semitones (+-2 octaves), stored directly in cents
+    // to match mod_vcoN_pitch's own units. Summed into the exact same mod_vcoN_pitch accumulator
+    // an LFO/EG already modulating "Osc N Pitch" writes into (see render_audio_block) -- a knob
+    // and a live modulator both targeting pitch just add, no new mod-matrix target needed. Also
+    // the same underlying control an LFO/EG's "Osc N Pitch" destination has always modulated, now
+    // additionally reachable by hand and via its own right-click assignment menu (frontend.py).
+    float vco1_pitch;
+    float vco2_pitch;
+    float vco3_pitch;
+    float vco4_pitch;
+
     // Recording format: 0=WAV (32-bit float, lossless, larger files), 1=WavPack (lossless
     // compression, ~40-60% smaller, converted to 24-bit PCM before encoding since WavPack -- like
     // FLAC -- losslessly compresses integer PCM, not float). Frozen into the writer thread's
@@ -2355,6 +2368,11 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/fm/depth/3_4", fm_depth_3_4),
     OSC_SCALAR("/hds/fm/depth/1_3", fm_depth_1_3),
 
+    OSC_SCALAR("/hds/vco1/pitch", vco1_pitch),
+    OSC_SCALAR("/hds/vco2/pitch", vco2_pitch),
+    OSC_SCALAR("/hds/vco3/pitch", vco3_pitch),
+    OSC_SCALAR("/hds/vco4/pitch", vco4_pitch),
+
     OSC_STRING("/hds/device/output", output_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/input", input_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/midi", midi_device, AUDIO_DEVICE_NAME_LEN),
@@ -2464,6 +2482,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->fm_depth_3_1 = 0.0f; knobs->fm_depth_3_2 = 0.0f;
     knobs->fm_depth_4_1 = 0.0f; knobs->fm_depth_4_3 = 0.0f;
     knobs->fm_depth_1_2 = 0.0f; knobs->fm_depth_3_4 = 0.0f; knobs->fm_depth_1_3 = 0.0f;
+    knobs->vco1_pitch = 0.0f; knobs->vco2_pitch = 0.0f; knobs->vco3_pitch = 0.0f; knobs->vco4_pitch = 0.0f;
     // Osc 3/4 Amp envelopes live at eg[2]/eg[3] (and eg_mode[2]/eg_mode[3]) and were covered by
     // the generic `for(int e=0; e<ENV_COUNT; e++)` default-fill loop above -- nothing extra
     // needed here.
@@ -2651,6 +2670,20 @@ typedef struct {
     unsigned int pre_roll_frames;
     unsigned int loop_start, loop_end;
     bool loop_enabled;
+    // Full SFZ loop_sustain/end= support (appended). loop_release_exit: SFZ's loop_sustain
+    // (true) vs loop_continuous (false) -- when true, the owning voice's SampleStream.
+    // release_requested flag (set once, at the note's STATE_RELEASE transition -- see
+    // trigger_voice_release/request_sample_stream_release) makes sample_disk_thread_main stop
+    // honoring loop_enabled for that stream's session, falling through to the exact same
+    // natural-end-of-file path a plain non-looping zone already takes -- so the disk thread
+    // keeps reading forward past loop_end into the file's own post-loop material (the release
+    // tail) instead of wrapping back to loop_start again. playback_end_frame: SFZ's end=,
+    // converted from a 0-1 fraction (see apply_playback_end(), mirroring apply_loop_points())
+    // to an exclusive frame bound -- defaults to total_frames (no truncation) when end= isn't
+    // given. Used ONLY at the disk thread's natural-end-of-file comparisons (never at the
+    // loop-wrap comparisons, which still need the real total_frames-derived loop points).
+    bool loop_release_exit;
+    unsigned int playback_end_frame;
     float *pre_roll_l;
     float *pre_roll_r;
 } SampleSlot;
@@ -2752,6 +2785,15 @@ static bool load_sample_slot(int index, const char *path, int root_note) {
     slot->loop_enabled = false;
     slot->loop_start = 0;
     slot->loop_end = total_frames;
+    // Same reasoning as loop_start/loop_end above: a safe default for playback_end_frame (SFZ
+    // end=), consulted on EVERY non-looping stream (unlike loop_start/loop_end, which stay
+    // dormant while loop_enabled is false) -- so unlike those, this can't just default to the
+    // BSS zero-init 0, which would make the disk thread think every non-looping zone had already
+    // reached its end before streaming a single frame. The real caller (apply_zone_upsert/
+    // drain_pending_sample_loads) overwrites this via apply_playback_end() immediately after this
+    // function returns, same as loop points above.
+    slot->playback_end_frame = total_frames;
+    slot->loop_release_exit = false;
 
     unsigned int pre_roll_frames = (total_frames < SAMPLE_PRE_ROLL_LIMIT) ? total_frames : SAMPLE_PRE_ROLL_LIMIT;
     slot->pre_roll_frames = pre_roll_frames;
@@ -2860,6 +2902,14 @@ typedef struct {
                                        // below 0), so this flag stands in for "already read frame
                                        // 0 of a non-looping reverse zone, nothing further to give."
                                        // Reset false on SAMPLE_CMD_START.
+    _Atomic bool release_requested;  // audio-thread-owned write (request_sample_stream_release(),
+                                       // called once from trigger_voice_release() at the owning
+                                       // voice's STATE_RELEASE transition), disk-thread-owned read
+                                       // (sample_disk_thread_main's loop-continuation checks) --
+                                       // same simple atomic-flag handoff shape as the rest of this
+                                       // struct. Reset false on SAMPLE_CMD_START (claim_sample_
+                                       // stream) so a reclaimed pool entry never inherits a stale
+                                       // true from whatever note last used it.
 } SampleStream;
 
 static SampleStream g_sample_streams[MAX_SAMPLE_STREAMS];
@@ -2876,6 +2926,9 @@ static int claim_sample_stream(int slot_index, unsigned int start_frame) {
             g_sample_streams[i].in_use = true;
             atomic_store_explicit(&g_sample_streams[i].slot_index, slot_index, memory_order_relaxed);
             atomic_store_explicit(&g_sample_streams[i].start_frame, start_frame, memory_order_relaxed);
+            // Fresh note, fresh session -- a reclaimed pool entry must not inherit a stale `true`
+            // left over from whatever earlier note last released this same slot.
+            atomic_store_explicit(&g_sample_streams[i].release_requested, false, memory_order_relaxed);
             atomic_store_explicit(&g_sample_streams[i].command, SAMPLE_CMD_START, memory_order_release);
             return i;
         }
@@ -2889,6 +2942,16 @@ static void release_sample_stream(int stream_index) {
     if (stream_index < 0 || stream_index >= MAX_SAMPLE_STREAMS) return;
     atomic_store_explicit(&g_sample_streams[stream_index].command, SAMPLE_CMD_STOP, memory_order_release);
     g_sample_streams[stream_index].in_use = false;
+}
+
+// Marks a claimed stream's note as having entered RELEASE (audio-thread only, called once from
+// trigger_voice_release() per oscillator). Read by sample_disk_thread_main() to decide whether a
+// loop_release_exit zone should keep honoring its loop or fall through to its natural end -- see
+// SampleSlot.loop_release_exit's own comment. A no-op on an already-released/invalid stream index,
+// same defensive shape as release_sample_stream() above.
+static void request_sample_stream_release(int stream_index) {
+    if (stream_index < 0 || stream_index >= MAX_SAMPLE_STREAMS) return;
+    atomic_store_explicit(&g_sample_streams[stream_index].release_requested, true, memory_order_release);
 }
 
 static void *sample_disk_thread_main(void *arg) {
@@ -2932,6 +2995,14 @@ static void *sample_disk_thread_main(void *arg) {
             SampleSlot *slot = &g_sample_slots[st->active_slot_index];
             int bytes_per_frame_unit = slot->bits_per_sample / 8;
             int bytes_per_frame = bytes_per_frame_unit * slot->num_channels;
+
+            // SFZ loop_sustain: once this stream's owning voice has entered release AND the zone
+            // is loop_release_exit, stop honoring loop_enabled for the rest of this session --
+            // falls through to the exact same natural-end-of-file path (below) a plain
+            // non-looping zone already takes, so playback continues forward past loop_end into
+            // the file's own release tail instead of wrapping back to loop_start again.
+            bool release_requested = atomic_load_explicit(&st->release_requested, memory_order_acquire);
+            bool loop_active = slot->loop_enabled && !(slot->loop_release_exit && release_requested);
 
             unsigned int r_ptr = atomic_load_explicit(&st->read_ptr, memory_order_acquire);
             unsigned int w_ptr = atomic_load_explicit(&st->write_ptr, memory_order_relaxed);
@@ -2998,7 +3069,7 @@ static void *sample_disk_thread_main(void *arg) {
                     // then the absolute floor (frame 0: either a genuine non-looping end, or a
                     // reverse zone seeded outside its own loop region on the "wrong" side -- see
                     // the Mapping tab's Start Offset documentation), then a normal decrement.
-                    if (slot->loop_enabled && st->disk_read_frame_pos == slot->loop_start) {
+                    if (loop_active && st->disk_read_frame_pos == slot->loop_start) {
                         st->disk_read_frame_pos = slot->loop_end - 1;
                     } else if (st->disk_read_frame_pos == 0) {
                         st->disk_reverse_exhausted = true;
@@ -3008,9 +3079,9 @@ static void *sample_disk_thread_main(void *arg) {
                     }
                 }
             } else {
-                if (slot->loop_enabled && st->disk_read_frame_pos >= slot->loop_end) {
+                if (loop_active && st->disk_read_frame_pos >= slot->loop_end) {
                     st->disk_read_frame_pos = slot->loop_start;
-                } else if (!slot->loop_enabled && st->disk_read_frame_pos >= slot->total_frames) {
+                } else if (!loop_active && st->disk_read_frame_pos >= slot->playback_end_frame) {
                     continue; // nothing left to stream -- render_sample_osc handles end-of-sample itself
                 }
 
@@ -3018,12 +3089,16 @@ static void *sample_disk_thread_main(void *arg) {
                 fseek(st->disk_file_handle, byte_offset, SEEK_SET);
 
                 for (unsigned int c = 0; c < chunk; c++) {
-                    if (slot->loop_enabled && st->disk_read_frame_pos >= slot->loop_end) {
+                    if (loop_active && st->disk_read_frame_pos >= slot->loop_end) {
                         st->disk_read_frame_pos = slot->loop_start;
                         byte_offset = (long)slot->data_start_offset + (long)st->disk_read_frame_pos * bytes_per_frame;
                         fseek(st->disk_file_handle, byte_offset, SEEK_SET);
                     }
-                    if (st->disk_read_frame_pos >= slot->total_frames) break;
+                    // playback_end_frame (SFZ end=, defaults to total_frames when unset): the
+                    // natural end-of-file bound for non-looping playback -- see its own comment
+                    // on SampleSlot. Never substitutes for total_frames at the loop-wrap
+                    // comparisons above, which still need the real file length.
+                    if (st->disk_read_frame_pos >= slot->playback_end_frame) break;
 
                     float fl = 0.0f, fr = 0.0f; short raw16; int raw32; unsigned char b24[3];
                     if (slot->audio_format == 1) {
@@ -3072,7 +3147,7 @@ static void *sample_disk_thread_main(void *arg) {
 // header, size a body buffer from its claimed count, accumulate the body) needed to. That whole
 // framing layer is gone: liblo already delivers each UDP datagram as one complete, self-contained
 // message, so there is no partial-message state to track between polls.
-//   "/hds/zone/upsert" (types "ifffffffffffffffs") -- add-or-update one zone by zone_id (on
+//   "/hds/zone/upsert" (types "ifffffffffffffffffs") -- add-or-update one zone by zone_id (on
 //     fresh connect the frontend sends one upsert per zone in its current list, since this
 //     side's catalog starts empty).
 //   "/hds/zone/remove" (types "i") -- delete one zone by zone_id.
@@ -3088,6 +3163,9 @@ typedef struct {
     // SFZ-style per-zone params (Mapping tab's Zone Inspector) -- see SampleSlot's own fields of
     // the same names for what each does.
     float tune_cents, gain_db, pan, start_offset_frac, reverse;
+    // Full SFZ loop_sustain/end= support (appended, 2 more floats -- 17 total): see
+    // SampleSlot.loop_release_exit/playback_end_frame's own comment.
+    float loop_release_exit, end_frac;
     char path[SAMPLE_PATH_LEN];
 } ZoneRecordWire;
 
@@ -3106,6 +3184,8 @@ typedef struct {
     int round_robin_group;
     float tune_cents, gain_db, pan, start_offset_frac;
     bool reverse;
+    bool loop_release_exit;
+    float end_frac;
 } PendingSampleLoad;
 #define PENDING_SAMPLE_LOAD_CAPACITY 4096
 static PendingSampleLoad g_pending_loads[PENDING_SAMPLE_LOAD_CAPACITY];
@@ -3137,6 +3217,8 @@ static void enqueue_pending_sample_load(int slot_index, const ZoneRecordWire *re
     p->tune_cents = rec->tune_cents; p->gain_db = rec->gain_db; p->pan = rec->pan;
     p->start_offset_frac = rec->start_offset_frac;
     p->reverse = rec->reverse != 0.0f;
+    p->loop_release_exit = rec->loop_release_exit != 0.0f;
+    p->end_frac = rec->end_frac;
     g_pending_load_tail = (g_pending_load_tail + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
     g_pending_load_count++;
 }
@@ -3161,6 +3243,19 @@ static void apply_loop_points(SampleSlot *slot, float start_frac, float end_frac
     }
     slot->loop_start = loop_start;
     slot->loop_end = loop_end;
+}
+
+// Converts SFZ's end= (a 0-1 fraction, same convention as loop_start/loop_end/start_offset_frac)
+// to an exclusive frame bound -- mirrors apply_loop_points()'s shape and call sites exactly.
+// end_frac == 1.0 (the default when a zone specifies no end=) reproduces the pre-existing
+// behavior of using the full file length verbatim (playback_end_frame == total_frames).
+static void apply_playback_end(SampleSlot *slot, float end_frac) {
+    if (!slot->loaded || slot->total_frames == 0) { slot->playback_end_frame = slot->total_frames; return; }
+    end_frac = fmaxf(0.0f, fminf(1.0f, end_frac));
+    unsigned int frame = (unsigned int)(end_frac * (float)slot->total_frames + 0.5f);
+    if (frame < 1) frame = 1;
+    if (frame > slot->total_frames) frame = slot->total_frames;
+    slot->playback_end_frame = frame;
 }
 
 // Drains up to SAMPLE_LOADS_PER_BLOCK pending loads per call (see its #define). Immediately
@@ -3193,6 +3288,8 @@ static void drain_pending_sample_loads(void) {
             slot->tune_cents = p->tune_cents; slot->gain_db = p->gain_db; slot->pan = p->pan;
             slot->start_offset_frac = p->start_offset_frac;
             slot->reverse = p->reverse;
+            slot->loop_release_exit = p->loop_release_exit;
+            apply_playback_end(slot, p->end_frac);
         } else {
             fprintf(stderr, "[samples] failed to load queued sample '%s' (zone_id %d)\n", p->path, p->zone_id);
             g_sample_slots[p->slot_index].active = false;
@@ -3243,6 +3340,8 @@ static void apply_zone_upsert(const ZoneRecordWire *rec) {
     slot->tune_cents = rec->tune_cents; slot->gain_db = rec->gain_db; slot->pan = rec->pan;
     slot->start_offset_frac = rec->start_offset_frac;
     slot->reverse = rec->reverse != 0.0f;
+    slot->loop_release_exit = rec->loop_release_exit != 0.0f;
+    apply_playback_end(slot, rec->end_frac);
 }
 
 static void apply_zone_remove(int32_t zone_id) {
@@ -3257,18 +3356,19 @@ static void apply_zone_remove(int32_t zone_id) {
     }
 }
 
-// "/hds/zone/upsert" ifffffffffffffffs -- zone_id + 15 floats in ZoneRecordWire's own field order
+// "/hds/zone/upsert" i + 17 f's + s -- zone_id + 17 floats in ZoneRecordWire's own field order
 // (root_note, min_note, max_note, min_velocity, max_velocity, unpitched, loop_start, loop_end,
-// loop_enabled, round_robin_group, tune_cents, gain_db, pan, start_offset_frac, reverse) + path.
-// liblo only dispatches here when the incoming type string matches exactly, so argc/types are
-// already guaranteed correct -- no manual validation needed, unlike generic_osc_handler's table.
+// loop_enabled, round_robin_group, tune_cents, gain_db, pan, start_offset_frac, reverse,
+// loop_release_exit, end_frac) + path. liblo only dispatches here when the incoming type string
+// matches exactly, so argc/types are already guaranteed correct -- no manual validation needed,
+// unlike generic_osc_handler's table.
 static int zone_upsert_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argc; (void)msg; (void)user_data;
     ZoneRecordWire rec;
     rec.zone_id = argv[0]->i;
-    float *f = &rec.root_note; // root_note..reverse are 15 consecutive floats
-    for (int i = 0; i < 15; i++) f[i] = argv[1 + i]->f;
-    snprintf(rec.path, SAMPLE_PATH_LEN, "%s", (const char *)&argv[16]->s);
+    float *f = &rec.root_note; // root_note..end_frac are 17 consecutive floats
+    for (int i = 0; i < 17; i++) f[i] = argv[1 + i]->f;
+    snprintf(rec.path, SAMPLE_PATH_LEN, "%s", (const char *)&argv[18]->s);
     apply_zone_upsert(&rec);
     return 0;
 }
@@ -3834,6 +3934,14 @@ static void trigger_voice_release(SynthVoice *voice) {
     voice->vco3_eg.release_level = voice->vco3_eg.current_level; voice->vco3_eg.state = STATE_RELEASE;
     voice->vco4_eg.release_level = voice->vco4_eg.current_level; voice->vco4_eg.state = STATE_RELEASE;
     for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) { voice->assign_eg[e].release_level = voice->assign_eg[e].current_level; voice->assign_eg[e].state = STATE_RELEASE; }
+    // SFZ loop_sustain support: tell each oscillator's claimed sample stream (if any) that this
+    // voice just entered release -- sample_disk_thread_main reads this to decide whether a
+    // loop_release_exit zone should keep looping. A no-op for any oscillator not currently
+    // playing a WAVE_SAMPLE zone (request_sample_stream_release ignores stream_index -1).
+    request_sample_stream_release(voice->vco1_sample_stream);
+    request_sample_stream_release(voice->vco2_sample_stream);
+    request_sample_stream_release(voice->vco3_sample_stream);
+    request_sample_stream_release(voice->vco4_sample_stream);
 }
 
 static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
@@ -4035,6 +4143,29 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
         snd_seq_free_event(ev);
     }
 }
+// LFO Rate/Depth/Phase-as-mod-destination target -> LFO index mapping. Each of the three
+// destination "families" spans two disjoint target-number ranges -- the original LFO 1-4 slots
+// (14-17/18-21/28-31, from before LFO_COUNT grew to 16) and the LFO 5-16 slots appended after
+// target 47 (48-59/60-71/72-83, never renumbering anything live) -- so one small helper per
+// family maps either range back to a single 0-15 LFO index; returns -1 if target isn't in either
+// range for that family. LFO 1-4 Rate/Depth (14-21) were previously unwired dead targets in the
+// dispatch loops below despite being selectable in the frontend's destination dropdown -- this
+// pass wires them up for real, for all 16 LFOs, alongside Phase (which LFOs 1-4 already had).
+static inline int lfo_rate_target_index(int target) {
+    if (target >= 14 && target <= 17) return target - 14;
+    if (target >= 48 && target <= 59) return target - 44;
+    return -1;
+}
+static inline int lfo_depth_target_index(int target) {
+    if (target >= 18 && target <= 21) return target - 18;
+    if (target >= 60 && target <= 71) return target - 56;
+    return -1;
+}
+static inline int lfo_phase_target_index(int target) {
+    if (target >= 28 && target <= 31) return target - 28;
+    if (target >= 72 && target <= 83) return target - 68;
+    return -1;
+}
 static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], const float *ext_in_buffer, const MidiLiveState *midi_live, float *out_buffer) {
     float peak = 0.0f;
     // Each oscillator is panned to stereo AT THE MIXER, before the signal reaches Filter A/B --
@@ -4075,6 +4206,11 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // per-voice one). Function-local static is safe here -- this program runs one synth engine
     // instance on a single audio thread.
     static float lfo_phase_mod_state[LFO_COUNT] = {0.0f};
+    // Same one-sample-delayed pattern, for LFO Rate and Depth as mod destinations (targets
+    // 14-21/48-71 -- see lfo_rate_target_index/lfo_depth_target_index). Applied to rate_hz/
+    // mod_depth in the main per-sample LFO loop below.
+    static float lfo_rate_mod_state[LFO_COUNT] = {0.0f};
+    static float lfo_depth_mod_state[LFO_COUNT] = {0.0f};
 
     // Control-rate decimation state for LFOs 3-16 (index 2-15) -- see LFO_DECIMATION_FACTOR's
     // comment. counter cycles 0..LFO_DECIMATION_FACTOR-1; at 0, last_value/target_value/phase are
@@ -4108,6 +4244,17 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // is the actual CPU concern with 16 always-otherwise-running LFOs).
             if (wave_type == 4) { lfo_out[l] = 0.0f; continue; }
 
+            // Rate/Depth as mod destinations (targets 14-21/48-71): one-sample-delayed
+            // contributions from lfo_rate_mod_state/lfo_depth_mod_state (computed once per
+            // sample, below the voice loop -- see lfo_rate_target_index's comment), applied on
+            // top of this LFO's own knobs. Rate mod is scaled (a unity-depth modulator sweeps
+            // +/-20Hz -- a musically useful range without letting one LFO drag another across
+            // its whole 0.1-200Hz dial range); Depth mod adds directly (mod_depth is already a
+            // plain 0-1 fraction, same convention mod_source_cc's multiplicative scale uses).
+            // Both stay independent of and coexist with mod_source_cc's own CC/aftertouch scale.
+            float effective_rate_hz = fmaxf(0.1f, fminf(200.0f, knobs->lfo[l].rate_hz + lfo_rate_mod_state[l] * 20.0f));
+            float effective_mod_depth = fmaxf(0.0f, fminf(1.0f, knobs->lfo[l].mod_depth + lfo_depth_mod_state[l]));
+
             if (l < 2) {
                 // LFOs 1/2: full audio-rate, unchanged from the original 4-LFO design.
                 // Phase pot (0-360 degrees) plus any modulation, shifting only the read-phase
@@ -4122,8 +4269,8 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 float cc_source_scale = 1.0f;
                 if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
                 else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
-                lfo_out[l] = lookup_lfo_waveform(wave_type, read_phase) * knobs->lfo[l].mod_depth * cc_source_scale;
-                global_lfo_phases[l] += knobs->lfo[l].rate_hz / (float)SAMPLE_RATE;
+                lfo_out[l] = lookup_lfo_waveform(wave_type, read_phase) * effective_mod_depth * cc_source_scale;
+                global_lfo_phases[l] += effective_rate_hz / (float)SAMPLE_RATE;
                 if (global_lfo_phases[l] >= 1.0f) global_lfo_phases[l] -= 1.0f;
             } else {
                 // LFOs 3-16: control-rate decimated (see LFO_DECIMATION_FACTOR's comment). Only
@@ -4138,11 +4285,11 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                     float cc_source_scale = 1.0f;
                     if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
                     else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
-                    lfo_decim_target_value[l] = lookup_lfo_waveform(wave_type, read_phase) * knobs->lfo[l].mod_depth * cc_source_scale;
+                    lfo_decim_target_value[l] = lookup_lfo_waveform(wave_type, read_phase) * effective_mod_depth * cc_source_scale;
                     // Phase advances by DECIMATION_FACTOR steps at once, since we're about to
                     // skip that many samples' worth of recomputation -- this keeps the LFO's
                     // real-world rate correct despite only sampling it every 24th sample.
-                    global_lfo_phases[l] += (knobs->lfo[l].rate_hz / (float)SAMPLE_RATE) * (float)LFO_DECIMATION_FACTOR;
+                    global_lfo_phases[l] += (effective_rate_hz / (float)SAMPLE_RATE) * (float)LFO_DECIMATION_FACTOR;
                     if (global_lfo_phases[l] >= 1.0f) global_lfo_phases[l] = fmodf(global_lfo_phases[l], 1.0f);
                 }
                 float frac = (float)lfo_decim_counter[l] / (float)LFO_DECIMATION_FACTOR;
@@ -4173,24 +4320,28 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             voices[v].vco3_current_freq += (voices[v].vco3_target_freq - voices[v].vco3_current_freq) * portamento_coefficient;
             voices[v].vco4_current_freq += (voices[v].vco4_target_freq - voices[v].vco4_current_freq) * portamento_coefficient;
 
-            float mod_vco1_pitch = knobs->vco1_fine_tune + pb_bend_cents, mod_vco2_pitch = knobs->vco2_fine_tune + (knobs->vco2_pitch_offset * 100.0f) + pb_bend_cents;
-            float mod_vco3_pitch = knobs->vco3_fine_tune + (knobs->vco3_pitch_offset * 100.0f) + pb_bend_cents;
-            float mod_vco4_pitch = knobs->vco4_fine_tune + (knobs->vco4_pitch_offset * 100.0f) + pb_bend_cents;
+            // vco{N}_pitch: the manual Pitch knob (cents, +-2400 = +-24 semitones), added in
+            // alongside fine_tune/pitch_offset/pitch-bend -- an LFO/EG targeting "Osc N Pitch"
+            // sums into this same accumulator further down, so knob + live modulation just add.
+            float mod_vco1_pitch = knobs->vco1_fine_tune + knobs->vco1_pitch + pb_bend_cents;
+            float mod_vco2_pitch = knobs->vco2_fine_tune + (knobs->vco2_pitch_offset * 100.0f) + knobs->vco2_pitch + pb_bend_cents;
+            float mod_vco3_pitch = knobs->vco3_fine_tune + (knobs->vco3_pitch_offset * 100.0f) + knobs->vco3_pitch + pb_bend_cents;
+            float mod_vco4_pitch = knobs->vco4_fine_tune + (knobs->vco4_pitch_offset * 100.0f) + knobs->vco4_pitch + pb_bend_cents;
             float mod_vco1_amp = 0.0f, mod_vco2_amp = 0.0f, fm_mod = 0.0f, mix_bal = 0.0f;
-            // Filter cutoff/resonance mod destinations (targets 8-13), 3 slots each:
+            // Filter cutoff/resonance mod destinations, 4 slots:
             //   slot 0 (targets 8/9)   = Filter A's PRIMARY filter: filter_a when Normal, or
             //                            filter_a_multi[0] (1st internal filter) when Multi
             //   slot 1 (targets 10/11) = Filter B
             //   slot 2 (targets 12/13) = filter_a_multi[2] (3rd internal filter, Multi mode only)
-            // filter_a_multi[1] (the middle internal filter) has no dedicated mod destination
-            // for now -- a reasonable trim given only 3 filter-mod slots exist; still fully
-            // controllable by hand.
+            //   slot 3 (targets 84/85) = filter_a_multi[1] (2nd/middle internal filter, Multi
+            //                            mode only -- appended after target 47, the previously
+            //                            unmoddable "middle sub-filter" gap this pass closes)
             // FIXED: resonance destinations (odd targets 9/11/13) used to fall into the same
             // slot as their neighboring Freq destination via integer division, so picking e.g.
             // "F1 Res" as an LFO destination silently modulated cutoff instead of resonance and
             // resonance itself was never actually modulatable by anything.
-            float filter_cutoff_mods[3] = {0.0f, 0.0f, 0.0f};
-            float filter_res_mods[3] = {0.0f, 0.0f, 0.0f};
+            float filter_cutoff_mods[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float filter_res_mods[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             // Phase Modulation (new): a bipolar mod value shifts where in the cycle each
             // oscillator currently reads from, without touching its actual running phase
             // accumulator (that distinction matters -- it keeps pitch, hard sync, and portamento
@@ -4251,6 +4402,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 if (target == 45) mod_vco3_unison_detune += val * 2000.0f;
                 if (target == 46) mod_vco4_unison_detune += val * 2000.0f;
                 if (target == 47) mod_vco4_tilt += val * 100.0f;
+                // Filter A-M2 (Multi mode's middle sub-filter) -- see filter_cutoff_mods' slot-3
+                // comment above.
+                if (target == 84) filter_cutoff_mods[3] += val * 5000.0f;
+                if (target == 85) filter_res_mods[3] += val * 50.0f;
             }
 
             // FIXED: each assignable EG now routes using its own destination combo (eg_dest_target),
@@ -4292,6 +4447,8 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 if (target == 45) mod_vco3_unison_detune += val * 2000.0f;
                 if (target == 46) mod_vco4_unison_detune += val * 2000.0f;
                 if (target == 47) mod_vco4_tilt += val * 100.0f;
+                if (target == 84) filter_cutoff_mods[3] += val * 5000.0f;
+                if (target == 85) filter_res_mods[3] += val * 50.0f;
             }
 
             // Phase pot (0-360 degrees) plus any modulation, converted to a 0..1 fractional-cycle
@@ -4576,10 +4733,11 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // channel keeps fully independent filter state (fa_low/fa_band/fb_low/fb_band's
             // [channel] dimension) so stereo placement isn't lost going through the filters.
             //
-            // Only unit 0 and unit 2 of Filter A's Multi engine have a dedicated mod destination
-            // (see the comment by filter_cutoff_mods above) -- unit 1's mods are always 0.
-            float multi_cutoff_mods[3] = { filter_cutoff_mods[0], 0.0f, filter_cutoff_mods[2] };
-            float multi_res_mods[3] = { filter_res_mods[0], 0.0f, filter_res_mods[2] };
+            // All 3 units of Filter A's Multi engine now have a dedicated mod destination (see
+            // the comment by filter_cutoff_mods above) -- unit 1 (the middle sub-filter) reads
+            // from slot 3 (targets 84/85), appended after target 47 in this pass.
+            float multi_cutoff_mods[3] = { filter_cutoff_mods[0], filter_cutoff_mods[3], filter_cutoff_mods[2] };
+            float multi_res_mods[3] = { filter_res_mods[0], filter_res_mods[3], filter_res_mods[2] };
 
             float a_out_l, a_out_r, b_out_l, b_out_r;
             int ab_mode = (int)knobs->filter_ab_routing_mode; // 0=Series A->B, 1=Series B->A, 2=Parallel
@@ -4624,23 +4782,36 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 mixed_r += (ab_mode == 1) ? a_out_r : b_out_r;
             }
         }
-        // LFO Phase as a mod destination (targets 28-31): computed once per sample (not per
-        // voice, since LFOs are one resource shared by every voice) from other LFOs' outputs and
-        // voice 0's assignable EGs (the reference source, for the same reason). Applied to affect
-        // the NEXT sample's read-phase above -- a one-sample delay that avoids any ordering
-        // ambiguity between "which LFO's output is current" within a single sample.
+        // LFO Phase/Rate/Depth as mod destinations (targets 14-21/28-31/48-71/72-83): computed
+        // once per sample (not per voice, since LFOs are one resource shared by every voice) from
+        // other LFOs' outputs and voice 0's assignable EGs (the reference source, for the same
+        // reason). Applied to affect the NEXT sample's read-phase/rate/depth above -- a
+        // one-sample delay that avoids any ordering ambiguity between "which LFO's output is
+        // current" within a single sample. See lfo_rate_target_index/lfo_depth_target_index/
+        // lfo_phase_target_index's comment for the target-number -> LFO-index mapping.
         float new_lfo_phase_mod[LFO_COUNT] = {0.0f};
+        float new_lfo_rate_mod[LFO_COUNT] = {0.0f};
+        float new_lfo_depth_mod[LFO_COUNT] = {0.0f};
         for (int l = 0; l < LFO_COUNT; l++) {
             int target = (int)knobs->lfo[l].dest_target;
-            if (target >= 28 && target <= 31) new_lfo_phase_mod[target - 28] += lfo_out[l];
+            int pidx = lfo_phase_target_index(target); if (pidx >= 0) new_lfo_phase_mod[pidx] += lfo_out[l];
+            int ridx = lfo_rate_target_index(target); if (ridx >= 0) new_lfo_rate_mod[ridx] += lfo_out[l];
+            int didx = lfo_depth_target_index(target); if (didx >= 0) new_lfo_depth_mod[didx] += lfo_out[l];
         }
         if (voices[0].vco1_eg.state != STATE_IDLE || voices[0].vco2_eg.state != STATE_IDLE) {
             for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) {
                 int target = (int)knobs->eg_dest_target[e];
-                if (target >= 28 && target <= 31) new_lfo_phase_mod[target - 28] += voices[0].assign_eg[e].current_level * knobs->eg_intensity[e];
+                float val = voices[0].assign_eg[e].current_level * knobs->eg_intensity[e];
+                int pidx = lfo_phase_target_index(target); if (pidx >= 0) new_lfo_phase_mod[pidx] += val;
+                int ridx = lfo_rate_target_index(target); if (ridx >= 0) new_lfo_rate_mod[ridx] += val;
+                int didx = lfo_depth_target_index(target); if (didx >= 0) new_lfo_depth_mod[didx] += val;
             }
         }
-        for (int l = 0; l < LFO_COUNT; l++) lfo_phase_mod_state[l] = new_lfo_phase_mod[l];
+        for (int l = 0; l < LFO_COUNT; l++) {
+            lfo_phase_mod_state[l] = new_lfo_phase_mod[l];
+            lfo_rate_mod_state[l] = new_lfo_rate_mod[l];
+            lfo_depth_mod_state[l] = new_lfo_depth_mod[l];
+        }
 
         // External Audio Input: summed in here, after every voice but before the FX bus, so it
         // passes through the same FX_SLOT_COUNT chain the synth's own signal does. Taken as an
@@ -5268,7 +5439,7 @@ int main(int argc, char **argv) {
     char osc_listen_port_str[16]; snprintf(osc_listen_port_str, sizeof(osc_listen_port_str), "%d", osc_listen_port);
     lo_server osc_server = lo_server_new_with_proto(osc_listen_port_str, LO_UDP, osc_error_handler);
     if (!osc_server) { fprintf(stderr, "Cannot continue without an OSC listen socket on port %d.\n", osc_listen_port); return 1; }
-    lo_server_add_method(osc_server, "/hds/zone/upsert", "ifffffffffffffffs", zone_upsert_handler, NULL);
+    lo_server_add_method(osc_server, "/hds/zone/upsert", "ifffffffffffffffffs", zone_upsert_handler, NULL);
     lo_server_add_method(osc_server, "/hds/zone/remove", "i", zone_remove_handler, NULL);
     lo_server_add_method(osc_server, NULL, NULL, generic_osc_handler, &active_knobs);
 

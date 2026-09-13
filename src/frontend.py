@@ -336,8 +336,6 @@ def _build_zones_from_sfz(path, zone_id_start):
     zones = []
     warnings = []
     missing_samples = 0
-    loop_sustain_count = 0
-    end_ignored_count = 0
     define_usage_count = 0
     round_robin_ids = {}  # SFZ group= value -> compacted small int, only for regions with seq_length
     next_zone_id = zone_id_start
@@ -392,8 +390,10 @@ def _build_zones_from_sfz(path, zone_id_start):
 
         loop_mode = region.get("loop_mode", "").strip().lower()
         if loop_mode == "loop_sustain":
+            # Full support (this engine now has a real release-triggered loop exit) -- see
+            # backend.c's SampleSlot.loop_release_exit.
             zone.loop_enabled = True
-            loop_sustain_count += 1
+            zone.loop_release_exit = True
         elif loop_mode == "loop_continuous":
             zone.loop_enabled = True
         elif loop_mode in ("no_loop", "one_shot"):
@@ -413,7 +413,11 @@ def _build_zones_from_sfz(path, zone_id_start):
             if frac is not None:
                 zone.start_offset = frac
         if "end" in region:
-            end_ignored_count += 1  # no independent one-shot truncation point in HDS -- see plan
+            # Full support: an independent one-shot truncation point -- see backend.c's
+            # SampleSlot.playback_end_frame.
+            frac = _sfz_frame_to_frac(region["end"], total_frames)
+            if frac is not None:
+                zone.end_frac = frac
 
         def _float_opt(key, default):
             try:
@@ -439,10 +443,6 @@ def _build_zones_from_sfz(path, zone_id_start):
 
     if missing_samples:
         warnings.append(f"{missing_samples} region(s) skipped (sample not found, not a .wav, or missing a usable key range)")
-    if loop_sustain_count:
-        warnings.append(f"{loop_sustain_count} region(s) used loop_mode=loop_sustain, imported as loop_continuous (no release-triggered loop exit in this engine)")
-    if end_ignored_count:
-        warnings.append(f"{end_ignored_count} region(s) used end=, which has no equivalent here and was ignored (loop points/natural end of file still apply)")
     if define_usage_count:
         warnings.append(f"{define_usage_count} region(s) appear to use #define/$variable substitution (not supported) -- their sample path may be wrong")
 
@@ -1404,6 +1404,14 @@ class SampleZone:
                                    # knob on the backend side
         self.start_offset = 0.0   # 0.0-1.0, where in the file playback begins
         self.reverse = False      # plays the file/loop region backward
+        # Full SFZ loop_sustain/end= support (appended): loop_release_exit is SFZ's loop_sustain
+        # (True) vs loop_continuous (False) -- the loop is exited for good once the owning voice
+        # enters release, instead of looping forever. end_frac is SFZ's end= (0.0-1.0, same
+        # fraction-of-file convention as loop_start/loop_end/start_offset), where a one-shot's
+        # playback is truncated; 1.0 (default) means no truncation. See backend.c's
+        # SampleSlot.loop_release_exit/playback_end_frame for how these are actually applied.
+        self.loop_release_exit = False
+        self.end_frac = 1.0
 
 class MidiKeyButton(QPushButton):
     """A single piano key on the Mapping tab's reference keyboard -- visual only (no MIDI is
@@ -2393,6 +2401,7 @@ class SynthGui(QWidget):
         self.vco1_pulse_width = PotentiometerKnob("O1 Pulse Width/Tilt", self)
         self.vco1_pulse_width.setRange(-100, 100)
         self.vco1_pulse_width.setValue(50)
+        self.vco1_pulse_width.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(34, pos))
         v1_pw_lay.addWidget(self.vco1_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
         _retain_hidden(self.vco1_pulse_box)
         v1_strip.addWidget(self.vco1_pulse_box)
@@ -2425,8 +2434,24 @@ class SynthGui(QWidget):
         self.vco1_phase = PotentiometerKnob("O1 Phase", self)
         self.vco1_phase.setRange(0, 360)
         self.vco1_phase.setValue(0)
+        self.vco1_phase.setToolTip("Osc 1 Phase (right-click to assign a modulation source)")
+        self.vco1_phase.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(24, pos))
         v1_phase_lay.addWidget(self.vco1_phase, alignment=Qt.AlignmentFlag.AlignCenter)
         v1_tune_block.addLayout(v1_phase_lay)
+
+        # Manual Pitch knob (new): +-24 semitones, independent of Fine (cents trim). The same
+        # underlying control an LFO/EG's "Osc 1 Pitch" destination already modulates -- see
+        # backend.c's vco1_pitch field -- so this knob and live modulation just sum.
+        v1_pitch_lay = QVBoxLayout()
+        v1_pitch_lay.addWidget(QLabel("Pitch"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco1_pitch = PotentiometerKnob("O1 Pitch", self)
+        self.vco1_pitch.setRange(-24, 24)
+        self.vco1_pitch.setValue(0)
+        self.vco1_pitch.value_formatter = lambda v: f"{v:+d} st"
+        self.vco1_pitch.setToolTip("Osc 1 Pitch, +-24 semitones (right-click to assign a modulation source)")
+        self.vco1_pitch.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(1, pos))
+        v1_pitch_lay.addWidget(self.vco1_pitch, alignment=Qt.AlignmentFlag.AlignCenter)
+        v1_tune_block.addLayout(v1_pitch_lay)
         v1_strip.addLayout(v1_tune_block)
 
         self.vco1_unison_box = QWidget()
@@ -2505,6 +2530,7 @@ class SynthGui(QWidget):
         self.vco2_pulse_width = PotentiometerKnob("O2 Pulse Width/Tilt", self)
         self.vco2_pulse_width.setRange(-100, 100)
         self.vco2_pulse_width.setValue(50)
+        self.vco2_pulse_width.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(35, pos))
         v2_pw_lay.addWidget(self.vco2_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
         _retain_hidden(self.vco2_pulse_box)
         v2_strip.addWidget(self.vco2_pulse_box)
@@ -2535,8 +2561,22 @@ class SynthGui(QWidget):
         self.vco2_phase = PotentiometerKnob("O2 Phase", self)
         self.vco2_phase.setRange(0, 360)
         self.vco2_phase.setValue(0)
+        self.vco2_phase.setToolTip("Osc 2 Phase (right-click to assign a modulation source)")
+        self.vco2_phase.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(25, pos))
         v2_phase_lay.addWidget(self.vco2_phase, alignment=Qt.AlignmentFlag.AlignCenter)
         v2_tune_block.addLayout(v2_phase_lay)
+
+        # Manual Pitch knob (new) -- see Osc 1's own comment above.
+        v2_pitch_lay = QVBoxLayout()
+        v2_pitch_lay.addWidget(QLabel("Pitch"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco2_pitch = PotentiometerKnob("O2 Pitch", self)
+        self.vco2_pitch.setRange(-24, 24)
+        self.vco2_pitch.setValue(0)
+        self.vco2_pitch.value_formatter = lambda v: f"{v:+d} st"
+        self.vco2_pitch.setToolTip("Osc 2 Pitch, +-24 semitones (right-click to assign a modulation source)")
+        self.vco2_pitch.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(2, pos))
+        v2_pitch_lay.addWidget(self.vco2_pitch, alignment=Qt.AlignmentFlag.AlignCenter)
+        v2_tune_block.addLayout(v2_pitch_lay)
         v2_strip.addLayout(v2_tune_block)
 
         self.vco2_unison_box = QWidget()
@@ -2619,6 +2659,7 @@ class SynthGui(QWidget):
         self.vco3_pulse_width = PotentiometerKnob("O3 Pulse Width/Tilt", self)
         self.vco3_pulse_width.setRange(-100, 100)
         self.vco3_pulse_width.setValue(0)
+        self.vco3_pulse_width.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(38, pos))
         v3_pw_lay.addWidget(self.vco3_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
         _retain_hidden(self.vco3_pulse_box)
         v3_strip.addWidget(self.vco3_pulse_box)
@@ -2649,8 +2690,22 @@ class SynthGui(QWidget):
         self.vco3_phase = PotentiometerKnob("O3 Phase", self)
         self.vco3_phase.setRange(0, 360)
         self.vco3_phase.setValue(0)
+        self.vco3_phase.setToolTip("Osc 3 Phase (right-click to assign a modulation source)")
+        self.vco3_phase.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(43, pos))
         v3_phase_lay.addWidget(self.vco3_phase, alignment=Qt.AlignmentFlag.AlignCenter)
         v3_tune_block.addLayout(v3_phase_lay)
+
+        # Manual Pitch knob (new) -- see Osc 1's own comment above.
+        v3_pitch_lay = QVBoxLayout()
+        v3_pitch_lay.addWidget(QLabel("Pitch"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco3_pitch = PotentiometerKnob("O3 Pitch", self)
+        self.vco3_pitch.setRange(-24, 24)
+        self.vco3_pitch.setValue(0)
+        self.vco3_pitch.value_formatter = lambda v: f"{v:+d} st"
+        self.vco3_pitch.setToolTip("Osc 3 Pitch, +-24 semitones (right-click to assign a modulation source)")
+        self.vco3_pitch.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(41, pos))
+        v3_pitch_lay.addWidget(self.vco3_pitch, alignment=Qt.AlignmentFlag.AlignCenter)
+        v3_tune_block.addLayout(v3_pitch_lay)
         v3_strip.addLayout(v3_tune_block)
 
         self.vco3_unison_box = QWidget()
@@ -2731,6 +2786,7 @@ class SynthGui(QWidget):
         self.vco4_pulse_width = PotentiometerKnob("O4 Pulse Width/Tilt", self)
         self.vco4_pulse_width.setRange(-100, 100)
         self.vco4_pulse_width.setValue(50)
+        self.vco4_pulse_width.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(47, pos))
         v4_pw_lay.addWidget(self.vco4_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
         _retain_hidden(self.vco4_pulse_box)
         v4_strip.addWidget(self.vco4_pulse_box)
@@ -2761,8 +2817,22 @@ class SynthGui(QWidget):
         self.vco4_phase = PotentiometerKnob("O4 Phase", self)
         self.vco4_phase.setRange(0, 360)
         self.vco4_phase.setValue(0)
+        self.vco4_phase.setToolTip("Osc 4 Phase (right-click to assign a modulation source)")
+        self.vco4_phase.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(44, pos))
         v4_phase_lay.addWidget(self.vco4_phase, alignment=Qt.AlignmentFlag.AlignCenter)
         v4_tune_block.addLayout(v4_phase_lay)
+
+        # Manual Pitch knob (new) -- see Osc 1's own comment above.
+        v4_pitch_lay = QVBoxLayout()
+        v4_pitch_lay.addWidget(QLabel("Pitch"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco4_pitch = PotentiometerKnob("O4 Pitch", self)
+        self.vco4_pitch.setRange(-24, 24)
+        self.vco4_pitch.setValue(0)
+        self.vco4_pitch.value_formatter = lambda v: f"{v:+d} st"
+        self.vco4_pitch.setToolTip("Osc 4 Pitch, +-24 semitones (right-click to assign a modulation source)")
+        self.vco4_pitch.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(42, pos))
+        v4_pitch_lay.addWidget(self.vco4_pitch, alignment=Qt.AlignmentFlag.AlignCenter)
+        v4_tune_block.addLayout(v4_pitch_lay)
         v4_strip.addLayout(v4_tune_block)
 
         self.vco4_unison_box = QWidget()
@@ -2831,19 +2901,42 @@ class SynthGui(QWidget):
         self.vco3_amp_eg = ADSRPanel("Osc 3 Amp EG", (1, 1000), (1, 2000), (1, 2000))
         self.vco4_amp_eg = ADSRPanel("Osc 4 Amp EG", (1, 1000), (1, 2000), (1, 2000))
 
-        self.btn_sync_amp_eg = QPushButton("1\u21922")
+        # "1->All": one-shot static copy of Osc 1's Amp EG onto Osc 2/3/4 (was "1->2", Osc 2 only).
+        self.btn_sync_amp_eg = QPushButton("1\u2192All")
         self.btn_sync_amp_eg.setFixedSize(30, 16)
         self.btn_sync_amp_eg.setStyleSheet("font-size: 8px; font-weight: bold;")
-        self.btn_sync_amp_eg.setToolTip("Copy Osc 1 Amp EG settings to Osc 2 Amp EG")
-        self.vco1_amp_eg.title_layout.addWidget(self.btn_sync_amp_eg)
-        self.btn_sync_amp_eg.clicked.connect(lambda: self.vco2_amp_eg.set_state(self.vco1_amp_eg.get_state()))
+        self.btn_sync_amp_eg.setToolTip("Copy Osc 1 Amp EG settings to Osc 2/3/4 Amp EG (one-time static copy)")
+        self.btn_sync_amp_eg.clicked.connect(self._copy_amp_eg_to_all)
 
-        # Osc 2/3/4 have no sync button of their own -- reserve the exact same footprint in their
-        # title rows anyway so all four panels stay the same height/alignment instead of only
-        # Osc 1's row being taller.
+        # "Sync": a live, continuous version of the same copy -- while checked, Osc 2/3/4's Amp EG
+        # keeps mirroring Osc 1's in real time (handy for realtime sustain-stage auditing, per the
+        # user), instead of only copying once. Osc 2/3/4's panels are disabled while engaged so a
+        # manual edit there can't silently fight the continuous overwrite from Osc 1.
+        self.btn_live_sync_amp_eg = QPushButton("Sync")
+        self.btn_live_sync_amp_eg.setCheckable(True)
+        self.btn_live_sync_amp_eg.setFixedSize(30, 16)
+        self.btn_live_sync_amp_eg.setStyleSheet(
+            "QPushButton { font-size: 8px; font-weight: bold; } "
+            "QPushButton:checked { background-color: #00adb5; color: #1b1b22; }"
+        )
+        self.btn_live_sync_amp_eg.setToolTip(
+            "While engaged, Osc 2/3/4 Amp EG continuously live-mirrors Osc 1's (disables their panels)"
+        )
+        self.btn_live_sync_amp_eg.toggled.connect(self._on_amp_eg_live_sync_toggled)
+
+        sync_btn_box = QWidget()
+        sync_btn_lay = QVBoxLayout(sync_btn_box)
+        sync_btn_lay.setContentsMargins(0, 0, 0, 0); sync_btn_lay.setSpacing(2)
+        sync_btn_lay.addWidget(self.btn_sync_amp_eg)
+        sync_btn_lay.addWidget(self.btn_live_sync_amp_eg)
+        self.vco1_amp_eg.title_layout.addWidget(sync_btn_box)
+
+        # Osc 2/3/4 have no sync buttons of their own -- reserve the exact same footprint (now 2
+        # stacked buttons tall) in their title rows anyway so all four panels stay the same
+        # height/alignment instead of only Osc 1's row being taller.
         for panel in (self.vco2_amp_eg, self.vco3_amp_eg, self.vco4_amp_eg):
             sync_btn_spacer = QWidget()
-            sync_btn_spacer.setFixedSize(30, 16)
+            sync_btn_spacer.setFixedSize(30, 34)
             _retain_hidden(sync_btn_spacer)
             sync_btn_spacer.setVisible(False)
             panel.title_layout.addWidget(sync_btn_spacer)
@@ -2957,10 +3050,12 @@ class SynthGui(QWidget):
 
         c_dial_a0 = PotentiometerKnob("FA Freq", self)
         c_dial_a0.setRange(40, 18000); c_dial_a0.setValue(800)
+        c_dial_a0.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(8, pos))
         self.cutoff_dials.append(c_dial_a0)
 
         q_dial_a0 = PotentiometerKnob("FA Res", self)
         q_dial_a0.setRange(0, 100); q_dial_a0.setValue(20)
+        q_dial_a0.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(9, pos))
         self.q_dials.append(q_dial_a0)
 
         v_pole_a0 = QComboBox(); v_pole_a0.addItems(["2-Pole (12dB/oct)", "4-Pole (24dB/oct)"])
@@ -2993,10 +3088,17 @@ class SynthGui(QWidget):
             sub_row = QHBoxLayout()
             c_dial_am = PotentiometerKnob(f"F1.M{m_idx} Freq", self)
             c_dial_am.setRange(40, 18000); c_dial_am.setValue(400 + (m_idx * 200))
+            # Multi unit 0 shares Filter A's own mod slot (targets 8/9, since Normal and Multi
+            # unit 0 are mutually exclusive -- only one is ever active); unit 1 (middle) is the
+            # new Filter A-M2 slot (84/85); unit 2 keeps its existing slot (12/13).
+            multi_freq_target = {0: 8, 1: 84, 2: 12}[m_idx]
+            multi_res_target = {0: 9, 1: 85, 2: 13}[m_idx]
+            c_dial_am.setContextMenuCallback(lambda pos, t=multi_freq_target: self._show_dest_assign_menu(t, pos))
             self.cutoff_dials.append(c_dial_am)
 
             q_dial_am = PotentiometerKnob(f"F1.M{m_idx} Res", self)
             q_dial_am.setRange(0, 100); q_dial_am.setValue(20)
+            q_dial_am.setContextMenuCallback(lambda pos, t=multi_res_target: self._show_dest_assign_menu(t, pos))
             self.q_dials.append(q_dial_am)
 
             v_pole_am = QComboBox(); v_pole_am.addItems(["2-Pole", "4-Pole"])
@@ -3028,10 +3130,12 @@ class SynthGui(QWidget):
 
         c_dial_b = PotentiometerKnob("FB Freq", self)
         c_dial_b.setRange(40, 18000); c_dial_b.setValue(4000)
+        c_dial_b.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(10, pos))
         self.cutoff_dials.append(c_dial_b)
 
         q_dial_b = PotentiometerKnob("FB Res", self)
         q_dial_b.setRange(0, 100); q_dial_b.setValue(20)
+        q_dial_b.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(11, pos))
         self.q_dials.append(q_dial_b)
 
         v_pole_b = QComboBox(); v_pole_b.addItems(["2-Pole (12dB/oct)", "4-Pole (24dB/oct)"])
@@ -3113,7 +3217,20 @@ class SynthGui(QWidget):
             # backend.c's render_audio_block dispatch loops).
             "Osc 3 Pitch", "Osc 4 Pitch", "Osc 3 Phase", "Osc 4 Phase",
             "Osc 3 Unison Detune", "Osc 4 Unison Detune", "Osc 4 Tilt",
+        ] + [f"LFO {n} Rate" for n in range(5, LFO_COUNT + 1)] \
+          + [f"LFO {n} Dp" for n in range(5, LFO_COUNT + 1)] \
+          + [f"LFO {n} Phase" for n in range(5, LFO_COUNT + 1)] + [
+            # Targets 48-83 (above): LFO 5-16 Rate/Dp/Phase -- closes a real pre-existing gap
+            # (LFO 1-4 Rate/Depth, targets 14-21, used to be selectable here but were completely
+            # unwired in the backend; LFO 1-4 Phase, 28-31, already worked). All 16 LFOs now
+            # support all three as mod destinations -- see lfo_rate_target_index/
+            # lfo_depth_target_index/lfo_phase_target_index in backend.c.
+            "Filter A-M2 Freq (Multi)", "Filter A-M2 Res (Multi)",
         ]
+        # Stored on self -- the generalized right-click "Modulate From" menu (see
+        # _show_dest_assign_menu) needs this list later, well outside __init__, to render each
+        # LFO/EG's currently-assigned destination as a human-readable label.
+        self.matrix_shared_routes = matrix_shared_routes
 
         for x in range(1, LFO_COUNT + 1):
             lfo_row = QHBoxLayout()
@@ -3130,9 +3247,12 @@ class SynthGui(QWidget):
             lfo_row.addWidget(vis)
             self.lfo_combos.append(combo)
 
+            lfo_idx_for_menu = x - 1
+
             dial = PotentiometerKnob(f"LFO {x} Rate", self)
             dial.setRange(1, 2000)
             dial.setValue(45)
+            dial.setContextMenuCallback(lambda pos, i=lfo_idx_for_menu: self._show_lfo_row_menu(i, 'rate', pos))
 
             readout = QLabel("4.5 Hz")
             readout.setFixedWidth(50)
@@ -3149,17 +3269,17 @@ class SynthGui(QWidget):
             lfo_row.addWidget(QLabel("Dp:"))
             lfo_row.addWidget(dp_dial)
             self.lfo_depth_dials.append(dp_dial)
-            lfo_idx_for_menu = x - 1
-            dp_dial.setContextMenuCallback(lambda pos, i=lfo_idx_for_menu: self._show_mod_source_menu(i, pos))
+            dp_dial.setContextMenuCallback(lambda pos, i=lfo_idx_for_menu: self._show_lfo_row_menu(i, 'depth', pos))
             self._update_mod_source_tooltip(lfo_idx_for_menu)
 
             phase_dial = PotentiometerKnob(f"LFO {x} Phase", self)
             phase_dial.setRange(0, 360)
             phase_dial.setValue(0)
-            phase_dial.setToolTip("Shifts this LFO's read-phase; modulatable via LFO/EG")
+            phase_dial.setToolTip("Shifts this LFO's read-phase; modulatable via LFO/EG (right-click to assign)")
             lfo_row.addWidget(QLabel("Ph:"))
             lfo_row.addWidget(phase_dial)
             self.lfo_phase_dials.append(phase_dial)
+            phase_dial.setContextMenuCallback(lambda pos, i=lfo_idx_for_menu: self._show_lfo_row_menu(i, 'phase', pos))
 
             s_combo = QComboBox()
             s_combo.addItems(["Free", "Sync", "Whl"])
@@ -4080,23 +4200,134 @@ class SynthGui(QWidget):
         if ok:
             self._set_mod_source(idx, float(cc_num))
 
-    def _show_mod_source_menu(self, idx, global_pos):
-        menu = QMenu("Modulation Source", self)
-        menu.addSection("Modulation Source")
-        current = self.lfo_mod_source_cc[idx]
-        for label, val in self._MOD_SOURCE_PRESETS:
-            action = QAction(label, self)
+    # --- Generalized "Modulate From" mod-matrix assignment menu ---
+    #
+    # An LFO's/EG's "Destination" IS one field: dest_target (LFO) / eg_dest_target (EG), shown
+    # today via the LFO section's own Destination combo (lfo_dest_combos/eg_dest_combos). The
+    # right-click menu below is just a SECOND way to set that exact same field -- toggling an
+    # entry here calls .setCurrentIndex() on the very same combo box, so the two views can never
+    # disagree; there is no separate state to keep in sync. This absorbed the older
+    # LFO-Depth-only _show_mod_source_menu (still available, folded into _show_lfo_row_menu's
+    # 'depth' case, since Depth ALSO has its own separate multiplicative CC/aftertouch source --
+    # mod_source_cc -- which coexists with, and is unrelated to, this additive routing).
+
+    # Target numbers for LFO Rate/Depth/Phase-as-mod-destination, mirroring backend.c's
+    # lfo_rate_target_index/lfo_depth_target_index/lfo_phase_target_index exactly (inverse
+    # direction: LFO index -> target number). Each family spans two ranges -- LFO 1-4's original
+    # slots and LFO 5-16's slots appended after target 47 -- kept in sync with those C helpers.
+    def _lfo_rate_dest_target(self, idx):
+        return 14 + idx if idx < 4 else 44 + idx
+
+    def _lfo_depth_dest_target(self, idx):
+        return 18 + idx if idx < 4 else 56 + idx
+
+    def _lfo_phase_dest_target(self, idx):
+        return 28 + idx if idx < 4 else 68 + idx
+
+    def _toggle_modulate_from(self, combo, target, checked):
+        # Checking an entry points that LFO's/EG's own Destination combo at `target`; unchecking
+        # it (re-clicking the already-checked entry) sets it back to "None" (index 0). Either way
+        # this fires the combo's existing currentIndexChanged wiring, which already calls
+        # transmit_knob_packet() -- but an explicit call here too costs nothing and keeps this
+        # method correct even if that wiring ever changes.
+        combo.setCurrentIndex(target if checked else 0)
+        self.transmit_knob_packet()
+
+    def _populate_modulate_from_menu(self, menu, target):
+        # Every LFO + every assignable EG, each toggling that source's own Destination combo to
+        # `target`. Self-modulation is allowed (an LFO/EG may target its own Rate/Depth/Phase),
+        # per this feature's own design decision. An entry already pointed elsewhere shows its
+        # current destination in the label, so stealing it from there is never a silent surprise
+        # -- multiple sources CAN already simultaneously target the same destination (their
+        # contributions just sum), this is not a single-owner model.
+        menu.addSection("Modulate From")
+        sources = [(f"LFO {i + 1}", self.lfo_dest_combos[i]) for i in range(LFO_COUNT)]
+        sources += [(f"EG {i + 1}", self.eg_dest_combos[i]) for i in range(len(self.eg_dest_combos))]
+        for label, combo in sources:
+            current = combo.currentIndex()
+            checked = (current == target)
+            display = label
+            if not checked and 0 < current < len(self.matrix_shared_routes):
+                display = f"{label}  (→ {self.matrix_shared_routes[current]})"
+            action = QAction(display, self)
             action.setCheckable(True)
-            action.setChecked(current == val)
-            action.triggered.connect(lambda checked, i=idx, v=val: self._set_mod_source(i, v))
+            action.setChecked(checked)
+            action.triggered.connect(lambda ch, c=combo, t=target: self._toggle_modulate_from(c, t, ch))
             menu.addAction(action)
-        menu.addSeparator()
-        custom_action = QAction("Custom CC…", self)
-        custom_action.setCheckable(True)
-        custom_action.setChecked(current >= 0.0 and current < 128.0 and current not in (1.0, 2.0, 4.0, 11.0))
-        custom_action.triggered.connect(lambda checked, i=idx: self._prompt_custom_cc(i))
-        menu.addAction(custom_action)
+
+    def _show_lfo_row_menu(self, idx, knob_kind, global_pos):
+        # Right-click menu for one LFO row's Rate/Depth/Phase knob. Depth additionally offers the
+        # existing CC/aftertouch "Modulation Source" section (mod_source_cc) -- a separate,
+        # multiplicative scale on this LFO's own output, unrelated to (and coexisting with) the
+        # additive "Modulate From" destination routing every knob here shares.
+        target = {
+            'rate': self._lfo_rate_dest_target(idx),
+            'depth': self._lfo_depth_dest_target(idx),
+            'phase': self._lfo_phase_dest_target(idx),
+        }[knob_kind]
+        menu = QMenu(self)
+        if knob_kind == 'depth':
+            menu.addSection("Modulation Source (CC)")
+            current = self.lfo_mod_source_cc[idx]
+            for label, val in self._MOD_SOURCE_PRESETS:
+                action = QAction(label, self)
+                action.setCheckable(True)
+                action.setChecked(current == val)
+                action.triggered.connect(lambda checked, i=idx, v=val: self._set_mod_source(i, v))
+                menu.addAction(action)
+            menu.addSeparator()
+            custom_action = QAction("Custom CC…", self)
+            custom_action.setCheckable(True)
+            custom_action.setChecked(current >= 0.0 and current < 128.0 and current not in (1.0, 2.0, 4.0, 11.0))
+            custom_action.triggered.connect(lambda checked, i=idx: self._prompt_custom_cc(i))
+            menu.addAction(custom_action)
+        self._populate_modulate_from_menu(menu, target)
         menu.exec(global_pos)
+
+    def _show_dest_assign_menu(self, target, global_pos):
+        # Right-click menu for a generic destination knob (Filter cutoff/res, pulse width,
+        # oscillator phase/pitch): just the "Modulate From" section -- these have no CC-scale
+        # mechanism of their own the way LFO Depth does.
+        menu = QMenu(self)
+        self._populate_modulate_from_menu(menu, target)
+        menu.exec(global_pos)
+
+    # --- Osc 1 Amp EG -> Osc 2/3/4 copy/sync ---
+
+    def _copy_amp_eg_to_all(self):
+        """'1->All' button: one-shot static copy of Osc 1's Amp EG onto Osc 2/3/4."""
+        state = self.vco1_amp_eg.get_state()
+        for panel in (self.vco2_amp_eg, self.vco3_amp_eg, self.vco4_amp_eg):
+            panel.set_state(state)
+        # set_state() already fires valuesChanged (wired to transmit_knob_packet), but an
+        # explicit call here costs nothing and keeps this correct even if that wiring ever changes.
+        self.transmit_knob_packet()
+
+    def _mirror_amp_eg_live(self, *_unused):
+        """Connected to vco1_amp_eg's valuesChanged/typeChanged while the Sync toggle is engaged
+        -- re-copies Osc 1's current Amp EG state onto Osc 2/3/4 on every change."""
+        state = self.vco1_amp_eg.get_state()
+        for panel in (self.vco2_amp_eg, self.vco3_amp_eg, self.vco4_amp_eg):
+            panel.set_state(state)
+        self.transmit_knob_packet()
+
+    def _on_amp_eg_live_sync_toggled(self, checked):
+        """'Sync' toggle button: while checked, Osc 2/3/4's Amp EG continuously live-mirrors
+        Osc 1's (an immediate mirror on check, then on every subsequent Osc 1 Amp EG change) and
+        their panels are disabled to avoid a tug-of-war with manual edits; unchecking stops the
+        mirroring and re-enables them, left wherever they last mirrored to."""
+        targets = (self.vco2_amp_eg, self.vco3_amp_eg, self.vco4_amp_eg)
+        if checked:
+            self._mirror_amp_eg_live()
+            for panel in targets:
+                panel.setEnabled(False)
+            self.vco1_amp_eg.valuesChanged.connect(self._mirror_amp_eg_live)
+            self.vco1_amp_eg.typeChanged.connect(self._mirror_amp_eg_live)
+        else:
+            self.vco1_amp_eg.valuesChanged.disconnect(self._mirror_amp_eg_live)
+            self.vco1_amp_eg.typeChanged.disconnect(self._mirror_amp_eg_live)
+            for panel in targets:
+                panel.setEnabled(True)
 
     def connect_to_backend(self):
         # UDP: construction never fails just because nothing's listening yet (unlike the old
@@ -4309,6 +4540,13 @@ class SynthGui(QWidget):
         add_f("/hds/vco1/phase_offset", self.vco1_phase.value())
         add_f("/hds/vco2/phase_offset", self.vco2_phase.value())
 
+        # Manual Pitch knobs (new): dial range is +-24 semitones, wire field is cents (*100) to
+        # match fine_tune/mod_vcoN_pitch's own units -- see backend.c's vco{1..4}_pitch fields.
+        add_f("/hds/vco1/pitch", self.vco1_pitch.value() * 100.0)
+        add_f("/hds/vco2/pitch", self.vco2_pitch.value() * 100.0)
+        add_f("/hds/vco3/pitch", self.vco3_pitch.value() * 100.0)
+        add_f("/hds/vco4/pitch", self.vco4_pitch.value() * 100.0)
+
         # Pulse width, Osc 1/2
         add_f("/hds/vco1/pulse_width", self.vco1_pulse_width.value())
         add_f("/hds/vco2/pulse_width", self.vco2_pulse_width.value())
@@ -4454,11 +4692,11 @@ class SynthGui(QWidget):
     # backend.c). Each OSC message carries exactly ONE zone -- a Mapping tab edit touching several
     # zones just sends several messages back to back, unlike the old wire-framed socket's
     # one-message-covers-many-zones batching.
-    # zone_id (i) + 15 floats (root_note, min_note, max_note, min_velocity, max_velocity,
+    # zone_id (i) + 17 floats (root_note, min_note, max_note, min_velocity, max_velocity,
     # unpitched, loop_start, loop_end, loop_enabled, round_robin_group, tune_cents, gain_db, pan,
-    # start_offset_frac, reverse) + path (s) -- must match ZoneRecordWire's field order in
-    # backend.c exactly.
-    _ZONE_UPSERT_TYPES = "i" + "f" * 15 + "s"
+    # start_offset_frac, reverse, loop_release_exit, end_frac) + path (s) -- must match
+    # ZoneRecordWire's field order in backend.c exactly.
+    _ZONE_UPSERT_TYPES = "i" + "f" * 17 + "s"
 
     def _zone_to_osc_args(self, zone):
         is_drum = (zone.key_center == -1)
@@ -4475,6 +4713,7 @@ class SynthGui(QWidget):
             # SFZ-style per-zone params -- must match ZoneRecordWire's field order exactly.
             float(zone.tune_cents), float(zone.gain_db), float(zone.pan) / 100.0,
             float(zone.start_offset), 1.0 if zone.reverse else 0.0,
+            1.0 if zone.loop_release_exit else 0.0, float(zone.end_frac),
             zone.file_path,
         )
 

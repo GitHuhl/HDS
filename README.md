@@ -318,13 +318,15 @@ A digital synthesizer split into two processes:
   result through the exact same `transmit_zone_upsert()` path a manual
   edit uses. Always additive, never replaces the existing bank. WAV
   samples only (matching the DFD engine's own format support -- convert
-  anything else first); a region using `loop_mode=loop_sustain` imports as
-  a plain continuous loop (this engine has no release-triggered loop
-  exit), and `end=` (an independent one-shot truncation point) has no
-  equivalent here and is ignored -- both are surfaced in a warning dialog
-  after import, along with any samples that couldn't be found, rather than
-  silently dropped. See `_build_zones_from_sfz()`/`_parse_sfz()` in
-  `frontend.py` for the full opcode mapping.
+  anything else first). `loop_mode=loop_sustain` and `end=` are both fully
+  supported: a loop_sustain zone genuinely exits its loop once the voice
+  releases (playing forward into the file's own post-loop material instead
+  of looping forever), and `end=` truncates one-shot playback at the exact
+  requested point. Samples that couldn't be found (or aren't `.wav`) are
+  surfaced in a warning dialog after import rather than silently dropped.
+  See `_build_zones_from_sfz()`/`_parse_sfz()` in `frontend.py` for the
+  full opcode mapping, and `SampleSlot.loop_release_exit`/
+  `playback_end_frame` in `backend.c` for how these are applied.
 
   Each note's own lane
   (in both the grid above and the
