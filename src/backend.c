@@ -2088,27 +2088,37 @@ static void run_fx_stereodoubler(FXSlotEngine *engine, const FXSlotParams *param
 // regardless of which source owns a slot this block, so a slot's lazily-allocated DSP state
 // (e.g. a delay's buffered tail) survives a live source reassignment exactly like it already
 // survives a live bypass toggle.
+// Type-change bookkeeping (free a slot's old effect state when its Type changed) -- a per-
+// PHYSICAL-SLOT task, completely independent of which source is dispatching. Used to run inside
+// process_fx_chain() itself, once per call; now a separate, explicitly-named step the CALLER runs
+// once per block (see render_audio_block, right before its per-sample loop), since a slot's Type
+// can only ever change in response to an OSC message drained between blocks, never mid-block --
+// with SOURCE_COUNT sources each independently calling process_fx_chain() every single sample,
+// redoing this scan from inside that function meant redoing it SOURCE_COUNT times per sample for
+// no reason (a real, measured underrun regression at any voice count, since it's a flat per-
+// sample tax paid regardless of patch complexity). PRECONDITION for process_fx_chain() below:
+// this must be called at least once after any fx_type change and before that slot is dispatched --
+// render_audio_block satisfies this once per block; a test or other direct caller driving
+// process_fx_chain() outside render_audio_block must call this itself first.
+static void sync_fx_engine_types(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT]) {
+    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+        int type = (int)fx_params[s].fx_type;
+        if (type != fx_engine[s].active_type) {
+            free(fx_engine[s].state);
+            fx_engine[s].state = NULL;
+            fx_engine[s].active_type = type;
+        }
+    }
+}
+
 static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, float *l, float *r) {
     float parallel_in_l = *l, parallel_in_r = *r;
     float parallel_sum_l = 0.0f, parallel_sum_r = 0.0f;
     int parallel_slot_count = 0;
 
     for (int s = 0; s < FX_SLOT_COUNT; s++) {
-        int type = (int)fx_params[s].fx_type;
-        if (type != fx_engine[s].active_type) {
-            // Type changed live -- release whatever the previous effect had allocated. Runs
-            // regardless of which source owns this slot (a per-physical-slot bookkeeping task,
-            // not per-source): whichever source's call happens to run first this block catches
-            // the change; later calls for other sources see type == active_type already and
-            // no-op here, so this is safe to run on every source's pass over all 12 slots. (No
-            // per-type free() branches exist yet since no effect has been ported in; add one
-            // here alongside each new case below if that effect allocates its own state.)
-            free(fx_engine[s].state);
-            fx_engine[s].state = NULL;
-            fx_engine[s].active_type = type;
-        }
-
         if ((int)fx_params[s].fx_source != source_id) continue; // not this source's slot
+        int type = fx_engine[s].active_type;
         if (routing_mode == 1) parallel_slot_count++;
 
         float dry_l = (routing_mode == 0) ? *l : parallel_in_l;
@@ -4309,6 +4319,23 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         limiter_gain_initialized = true;
     }
 
+    // FX slot type-change bookkeeping (free a slot's old effect state when its Type actually
+    // changed) and "which sources own any FX slot at all" both only ever change in response to an
+    // OSC control message -- drained once per BLOCK in main()'s loop, never mid-block -- so both
+    // are computed here exactly once per block, not once per sample (previously this bookkeeping
+    // ran inside process_fx_chain itself, once per SOURCE per SAMPLE: with SOURCE_COUNT=9 sources
+    // now dispatched independently, that had silently become a 9x-per-sample-per-slot cost purely
+    // from scanning for a type change that could not have happened since the last block anyway --
+    // a real, measured underrun regression at any voice count, since it's a flat per-sample tax
+    // paid regardless of patch complexity). See process_fx_chain()'s own comment for how the two
+    // pieces fit together now.
+    sync_fx_engine_types(knobs->fx, fx_engine);
+    bool source_has_fx_slots[SOURCE_COUNT] = {false};
+    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+        int src = (int)knobs->fx[s].fx_source;
+        if (src >= 0 && src < SOURCE_COUNT) source_has_fx_slots[src] = true;
+    }
+
     int voice_limit = effective_voice_limit(knobs);
     int block_size = effective_block_size(knobs);
     for (int i = 0; i < block_size; i++) {
@@ -4918,8 +4945,14 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
 
         // FX Bus: each source runs its own chain independently, on its own bus -- see
         // process_fx_chain's own comment for the routing rationale and the source_routing comment
-        // on SynthSharedControls for the bus/source model this generalizes to.
+        // on SynthSharedControls for the bus/source model this generalizes to. A source that owns
+        // no slots at all (source_has_fx_slots[], precomputed once per block above) is already a
+        // guaranteed no-op dry passthrough per process_fx_chain's own zero-slot-count guard --
+        // skip the call (and its FX_SLOT_COUNT-iteration scan) entirely rather than pay for that
+        // guarantee 128 times a block for nothing, on every ext-in pair nobody has assigned an
+        // effect to.
         for (int src = 0; src < SOURCE_COUNT; src++) {
+            if (!source_has_fx_slots[src]) continue;
             process_fx_chain(knobs->fx, fx_engine, (int)knobs->fx_source_routing_mode[src], src, &bus_l[src], &bus_r[src]);
         }
 
@@ -4963,6 +4996,12 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         const float limiter_ceiling = 0.98f;
         for (int p = 0; p < OUTPUT_PAIR_MAX; p++) {
             float peak_now = fmaxf(fabsf(pair_l[p]), fabsf(pair_r[p]));
+            // Already fully open and under the ceiling -- multiplying by 1.0 is a no-op, so skip
+            // the transcendental release-rate math (expf) entirely rather than pay for it on
+            // every one of the OUTPUT_PAIR_MAX pairs every sample regardless of whether anything
+            // is even routed there. Bit-identical to running the full math below, since the
+            // release update's own delta (needed_gain - limiter_gain) is exactly 0 in this case.
+            if (peak_now <= limiter_ceiling && limiter_gain[p] == 1.0f) continue;
             float needed_gain = (peak_now > limiter_ceiling) ? (limiter_ceiling / peak_now) : 1.0f;
             if (needed_gain < limiter_gain[p]) {
                 limiter_gain[p] = needed_gain; // attack: instant, so THIS sample can never clip
