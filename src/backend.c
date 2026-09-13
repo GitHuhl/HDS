@@ -590,6 +590,20 @@ typedef struct {
     float fm_depth_3_4; // Osc3 -> Osc4
     float fm_depth_1_3; // Osc1 -> Osc3
 
+    // Recording format: 0=WAV (32-bit float, lossless, larger files), 1=WavPack (lossless
+    // compression, ~40-60% smaller, converted to 24-bit PCM before encoding since WavPack -- like
+    // FLAC -- losslessly compresses integer PCM, not float). Frozen into the writer thread's
+    // RecordEngine.cmd_record_format at the same record-start edge as record_path, so a change
+    // mid-take never desyncs an already-open file. See wavpack_recorder_*/WavPackRecorder.
+    // Declared here (float #486, immediately before the 4 fixed-size string fields below) to
+    // match the Python side's "486f64s64s64s256s" packing order -- it was originally declared
+    // after record_path (the struct's actual last field), which put it 4 bytes into the string
+    // region once memcpy'd from the wire, shifting output_device/input_device/midi_device/
+    // record_path each by 4 bytes and truncating record_path's null-terminated content down to
+    // whatever garbage/zero bytes preceded it -- the cause of "[record] failed to open '' for
+    // writing" even when the frontend sent a real path.
+    float record_format;
+
     // --- Sample Bank (DFD/WAVE_SAMPLE) + Mapping tab zones ---
     // The Sample Bank itself (which files are loaded, their key/velocity zones, loop points,
     // round-robin groups) is NOT part of this struct -- it travels over its own dedicated,
@@ -620,13 +634,6 @@ typedef struct {
     // The frontend regenerates this to a fresh timestamped filename in the chosen Recordings
     // folder after every stop, so consecutive takes never collide/overwrite.
     char record_path[RECORD_PATH_LEN];
-
-    // Recording format: 0=WAV (32-bit float, lossless, larger files), 1=WavPack (lossless
-    // compression, ~40-60% smaller, converted to 24-bit PCM before encoding since WavPack -- like
-    // FLAC -- losslessly compresses integer PCM, not float). Frozen into the writer thread's
-    // RecordEngine.cmd_record_format at the same record-start edge as record_path, so a change
-    // mid-take never desyncs an already-open file. See wavpack_recorder_*/WavPackRecorder.
-    float record_format;
 } SynthSharedControls;
 
 // Clamp the live polyphony/block-size controls into their hard array-allocation ceilings.
