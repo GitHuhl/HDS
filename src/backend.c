@@ -100,6 +100,17 @@
 #define SAMPLE_XFADE_SIZE 1024
 #define SAMPLE_PRE_ROLL_LIMIT 7200 // frames cached in RAM per loaded sample for zero-latency note-on (~150ms @ 48kHz)
 
+// Combi/Sequencer scaffolding: one flexible pool of up to 32 lanes, each independently
+// assignable (via SeqLaneState.lane_type) to Program/MIDI or Audio duty, capped at 16 active of
+// each kind -- because each type is meant to eventually draw from its own backend resource pool
+// (PROGRAM_LANE_RESOURCE_COUNT independent Program-synthesis instances; AUDIO_LANE_RESOURCE_COUNT
+// RAM-cached audio buffers). This pass adds only the lane data model + OSC wire + GUI -- neither
+// resource pool is actually allocated/used by the DSP yet; see the struct's own comment below and
+// the plan's "Future Full-Build Notes" for what a real build requires.
+#define SEQ_LANE_COUNT 32
+#define PROGRAM_LANE_RESOURCE_COUNT 16
+#define AUDIO_LANE_RESOURCE_COUNT 16
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
 #endif
@@ -171,6 +182,26 @@ typedef struct {
     float mode2_lp, mode2_bp, mode2_hp, mode2_notch, mode2_dry;
     float crossfade; // 0 = all Mode 1, 100 = all Mode 2
 } FilterParams;
+
+// One lane in the Combi/Sequencer 32-lane pool (see SEQ_LANE_COUNT's own comment above). Purely
+// a mixer-strip + assignment data model this pass -- nothing in render_audio_block reads any of
+// these fields yet. Combi mode shows only lanes 0-15 (implicitly Program/MIDI, never Audio) with
+// midi_channel/seq_mode hidden; Sequencer mode shows all 32 lanes with every field live in the
+// GUI, per the plan's lane-topology decision.
+typedef struct {
+    float lane_type;    // 0 = Program/MIDI, 1 = Audio -- a real per-lane choice, capped at 16
+                         // active of each kind (enforced by the frontend's assignment logic this
+                         // pass, since neither resource pool exists in the backend yet).
+    float volume;        // 0-100
+    float pan;            // -1..1, same convention as vco1_pan
+    float midi_channel;   // 0 = Omni, 1-16 = specific channel. Inert: process_midi_input doesn't
+                           // read this yet (today's engine is fully channel-agnostic) -- the
+                           // field exists now so it's already in place once per-lane MIDI
+                           // filtering is built for real.
+    float seq_mode;        // 0 = Seq (plays back recorded sequence), 1 = Mute, 2 = Rec. Ignored
+                            // entirely in Combi mode; meaningful only once Sequencer's real
+                            // playback/record engine exists.
+} SeqLaneState;
 
 // A single FX bus slot's parameters. FX_SLOT_COUNT of these run in series (slot 0 first) on
 // the master stereo bus -- see the FX section comment on SynthSharedControls and
@@ -685,6 +716,13 @@ typedef struct {
     // changes, not broadcast in full on every unrelated knob turn like the fields in this struct
     // are. See g_sample_slots[]/find_matching_sample_slot() for the backend-side catalog, and the
     // Mapping tab in frontend.py for the editor.
+
+    // --- Combi/Sequencer scaffolding (data model + wire only -- see SEQ_LANE_COUNT's own
+    // comment near the top of this file, and SeqLaneState's comment, for what this does and
+    // does NOT do yet). performance_mode: 0 = Single Program (today's only real mode, unchanged),
+    // 1 = Combi, 2 = Sequencer. (+1 float for the mode, +5*SEQ_LANE_COUNT for the lanes)
+    float performance_mode;
+    SeqLaneState seq_lanes[SEQ_LANE_COUNT];
 
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
@@ -2610,6 +2648,14 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/vco3/pitch", vco3_pitch),
     OSC_SCALAR("/hds/vco4/pitch", vco4_pitch),
 
+    // --- Combi/Sequencer scaffolding (see SEQ_LANE_COUNT's own comment) ---
+    OSC_SCALAR("/hds/performance_mode", performance_mode),
+    OSC_SUBARRAY("/hds/seq/%d/lane_type", seq_lanes, SeqLaneState, lane_type, SEQ_LANE_COUNT),
+    OSC_SUBARRAY("/hds/seq/%d/volume", seq_lanes, SeqLaneState, volume, SEQ_LANE_COUNT),
+    OSC_SUBARRAY("/hds/seq/%d/pan", seq_lanes, SeqLaneState, pan, SEQ_LANE_COUNT),
+    OSC_SUBARRAY("/hds/seq/%d/midi_channel", seq_lanes, SeqLaneState, midi_channel, SEQ_LANE_COUNT),
+    OSC_SUBARRAY("/hds/seq/%d/mode", seq_lanes, SeqLaneState, seq_mode, SEQ_LANE_COUNT),
+
     OSC_STRING("/hds/device/output", output_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/input", input_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/midi", midi_device, AUDIO_DEVICE_NAME_LEN),
@@ -2779,6 +2825,16 @@ static void init_default_controls(SynthSharedControls *knobs) {
     for (int t = 0; t < TEMPO_MARKER_MAX; t++) { knobs->tempo_marker_time[t] = 0.0f; knobs->tempo_marker_bpm[t] = 0.0f; }
     // No sample-bank defaults to fill here -- the Sample Bank isn't part of this struct anymore
     // (see its own dedicated socket/g_sample_slots[]).
+    // Combi/Sequencer scaffolding: Single Program (today's only real mode) by default, every
+    // lane inert -- see SeqLaneState's own comment for why none of this affects the DSP yet.
+    knobs->performance_mode = 0.0f; // Single Program
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        knobs->seq_lanes[l].lane_type = 0.0f;    // Program/MIDI
+        knobs->seq_lanes[l].volume = 80.0f;
+        knobs->seq_lanes[l].pan = 0.0f;
+        knobs->seq_lanes[l].midi_channel = 0.0f; // Omni
+        knobs->seq_lanes[l].seq_mode = 0.0f;     // Seq
+    }
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -5892,6 +5948,12 @@ typedef struct {
     float detected_input_channels;
     float detected_output_channels;
     float tempo_bpm_live; // compute_current_tempo_bpm()'s result -- equals tempo_bpm whenever no tempo markers are programmed
+    // Sequencer tab's transport readout (Combi/Sequencer scaffolding -- see SEQ_LANE_COUNT's own
+    // comment). Reuses the engine-uptime value already computed each block for
+    // compute_current_tempo_bpm() -- deliberately a SEPARATE field from elapsed_seconds above
+    // (that one is the WAV recorder's own recording-duration counter, a different concept that
+    // will diverge from this one once a real transport/playhead exists).
+    float seq_elapsed_seconds;
 } EngineStatus;
 
 // Sends the GUI-status snapshot as one OSC bundle (one UDP datagram, 7 messages) to the reply
@@ -5909,6 +5971,7 @@ static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
     m = lo_message_new(); lo_message_add_float(m, status->detected_input_channels); lo_bundle_add_message(b, "/hds/status/detected_input_channels", m);
     m = lo_message_new(); lo_message_add_float(m, status->detected_output_channels); lo_bundle_add_message(b, "/hds/status/detected_output_channels", m);
     m = lo_message_new(); lo_message_add_float(m, status->tempo_bpm_live); lo_bundle_add_message(b, "/hds/status/tempo_bpm_live", m);
+    m = lo_message_new(); lo_message_add_float(m, status->seq_elapsed_seconds); lo_bundle_add_message(b, "/hds/status/seq_elapsed_seconds", m);
     lo_send_bundle(reply_addr, b);
     lo_bundle_free_recursive(b); // frees the bundle AND every message added to it
 }
@@ -6234,6 +6297,7 @@ int main(int argc, char **argv) {
                 .detected_input_channels = (float)detected_input_channels,
                 .detected_output_channels = (float)detected_output_channels,
                 .tempo_bpm_live = current_tempo_bpm,
+                .seq_elapsed_seconds = (float)engine_elapsed_seconds,
             };
             send_osc_status(osc_reply_addr, &status);
             vu_decimator = 0;

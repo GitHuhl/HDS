@@ -501,6 +501,11 @@ MAX_ROUND_ROBIN_GROUPS = 256
 OSC_SHAPE_NAMES = ["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample", "Off"]
 # LFO count: must match LFO_COUNT in backend.c exactly.
 LFO_COUNT = 16
+# Combi/Sequencer lane scaffolding: must match SEQ_LANE_COUNT/PROGRAM_LANE_RESOURCE_COUNT/
+# AUDIO_LANE_RESOURCE_COUNT in backend.c exactly.
+SEQ_LANE_COUNT = 32
+PROGRAM_LANE_RESOURCE_COUNT = 16
+AUDIO_LANE_RESOURCE_COUNT = 16
 # FM Algorithm system: must match FM_ALGORITHM_COUNT/FM_ALGORITHMS in backend.c exactly. Each
 # entry names which depth dial(s) are relevant for that algorithm (used to show/hide the depth
 # knobs conditionally, mirroring the FX slot param show/hide pattern) -- "fm_intensity" is the
@@ -2124,6 +2129,7 @@ class SynthGui(QWidget):
         self.tab_audio = QWidget()
         self.tab_recording = QWidget()
         self.tab_mapping = QWidget()
+        self.tab_sequencer = QWidget()  # Combi/Sequencer scaffolding -- always reachable regardless of Performance Mode
 
         # ----------------------------------------------------
         # GLOBAL CONTROLS: live in the always-visible left sidebar (not a tab) so Program,
@@ -2360,14 +2366,21 @@ class SynthGui(QWidget):
         # ----------------------------------------------------
         tab_osc_root_lay = QVBoxLayout(self.tab_play)
 
+        # Performance Mode: Single Program (today's only real mode) / Combi / Sequencer -- a real
+        # 3-way now (backed by the new performance_mode field), replacing the old 2-way Prog/Combi
+        # toggle. Picking Sequencer also jumps the main tab deck to the new Sequencer tab, since
+        # its lane list + transport live there now rather than nested in this Play tab (Combi's
+        # lane view stays here, right below, matching where its placeholder already lived).
         osc_mode_row = QHBoxLayout()
         osc_mode_row.setContentsMargins(2, 2, 2, 2)
         osc_mode_row.addWidget(QLabel("<b>Mode:</b>"))
         self.osc_prog_radio = QRadioButton("Prog")
         self.osc_prog_radio.setChecked(True)
         self.osc_combi_radio = QRadioButton("Combi")
+        self.osc_sequencer_radio = QRadioButton("Sequencer")
         osc_mode_row.addWidget(self.osc_prog_radio)
         osc_mode_row.addWidget(self.osc_combi_radio)
+        osc_mode_row.addWidget(self.osc_sequencer_radio)
         osc_mode_row.addStretch()
         tab_osc_root_lay.addLayout(osc_mode_row)
 
@@ -2970,19 +2983,131 @@ class SynthGui(QWidget):
         self.osc_prog_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         tab_osc_root_lay.addWidget(self.osc_prog_scroll)
 
-        # Combi mode content placeholder
+        # --- Combi/Sequencer lane scaffolding (see the plan's own "Combi/Sequencer scaffolding"
+        # section). One shared row-builder used by both Combi's 16-lane view (right below) and
+        # the Sequencer tab's 32-lane view (built further down, once self.tab_sequencer exists) --
+        # they're two independent widget sets (a Qt widget can only have one parent) rather than
+        # one shared widget moved between two tabs, mirroring how Filter A's Normal-vs-Multi views
+        # are already two separate widget sets. Purely inert this pass: nothing in the DSP path
+        # reads any of this yet (verified directly -- see test_seq_scaffolding.c's zero-DSP-change
+        # test), so these are real, live-editable, OSC-wired controls with no audible effect.
+        def _build_seq_lane_row(idx, show_seq_controls):
+            row = QWidget()
+            lay = QHBoxLayout(row); lay.setContentsMargins(2, 2, 2, 2); lay.setSpacing(4)
+            lay.addWidget(QLabel(f"{idx + 1:02d}"))
+            fader = ResetSlider(Qt.Orientation.Vertical, 80)
+            fader.setRange(0, 100); fader.setValue(80); fader.setFixedHeight(70)
+            lay.addWidget(fader)
+            pan_dial = PotentiometerKnob(f"Lane {idx + 1} Pan", self)
+            pan_dial.setRange(-100, 100); pan_dial.setValue(0)
+            lay.addWidget(pan_dial)
+            type_combo, mode_combo = None, None
+            if show_seq_controls:
+                type_combo = QComboBox(); type_combo.addItems(["Program/MIDI", "Audio"])
+                lay.addWidget(type_combo)
+                mode_combo = QComboBox(); mode_combo.addItems(["Seq", "Mute", "Rec"])
+                lay.addWidget(mode_combo)
+            lay.addStretch()
+            return (row, fader, pan_dial, type_combo, mode_combo)
+
+        # Combi view: 16 lanes, no type/seq-mode dropdowns -- every Combi lane is implicitly
+        # Program/MIDI (Combi has no audio-lane concept at all, per the user's own "these two
+        # dropdowns will not be necessary for combi mode").
         self.osc_combi_widget = QWidget()
         combi_lay = QVBoxLayout(self.osc_combi_widget)
-        combi_placeholder = QLabel("Combi mode \u2014 program stacking coming soon")
-        combi_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        combi_placeholder.setStyleSheet("color: #777; font-style: italic; padding: 40px;")
-        combi_lay.addWidget(combi_placeholder)
+        combi_lay.setContentsMargins(2, 2, 2, 2); combi_lay.setSpacing(2)
+        combi_note = QLabel("Combi \u2014 up to 16 stacked Programs (fader + pan scaffolded; real per-lane synthesis is future work)")
+        combi_note.setStyleSheet("color: #777; font-style: italic;")
+        combi_lay.addWidget(combi_note)
+        self.combi_lane_rows = []  # 16 x (row, fader, pan_dial, None, None)
+        for i in range(PROGRAM_LANE_RESOURCE_COUNT):
+            lane = _build_seq_lane_row(i, show_seq_controls=False)
+            combi_lay.addWidget(lane[0])
+            self.combi_lane_rows.append(lane)
         combi_lay.addStretch()
         tab_osc_root_lay.addWidget(self.osc_combi_widget)
         self.osc_combi_widget.setVisible(False)
 
         self.osc_prog_radio.toggled.connect(self.osc_prog_scroll.setVisible)
         self.osc_combi_radio.toggled.connect(self.osc_combi_widget.setVisible)
+        self.osc_prog_radio.toggled.connect(self.transmit_knob_packet)
+        self.osc_combi_radio.toggled.connect(self.transmit_knob_packet)
+        self.osc_sequencer_radio.toggled.connect(self.transmit_knob_packet)
+        self.osc_sequencer_radio.toggled.connect(
+            lambda checked: self.tab_widget.setCurrentWidget(self.tab_sequencer) if checked else None
+        )
+
+        # ----------------------------------------------------
+        # SEQUENCER TAB CONTENT (its own dedicated top-level tab, not nested in Play -- per the
+        # user's explicit correction). 32 lanes (up to 16 Program/MIDI + up to 16 Audio, a single
+        # flexible pool -- see backend.c's SEQ_LANE_COUNT comment), a transport panel with a real
+        # (if inert) elapsed-time/tempo readout, and Play/Pause/Record buttons that exist but
+        # aren't wired to anything yet -- explicitly scaffolding, not a working sequencer.
+        # ----------------------------------------------------
+        seq_outer_lay = QVBoxLayout(self.tab_sequencer)
+        seq_outer_lay.setContentsMargins(6, 6, 6, 6); seq_outer_lay.setSpacing(6)
+
+        transport_box = QGroupBox("Transport")
+        transport_lay = QHBoxLayout(transport_box); transport_lay.setSpacing(8)
+        self.seq_btn_play = QPushButton("\u25b6 Play")
+        self.seq_btn_pause = QPushButton("\u23f8 Pause")
+        self.seq_btn_record = QPushButton("\u23fa Rec")
+        self.seq_btn_record.setStyleSheet("color: #c0392b; font-weight: bold;")
+        for btn in (self.seq_btn_play, self.seq_btn_pause, self.seq_btn_record):
+            btn.setEnabled(False)  # inert this pass -- no transport/playhead engine exists yet
+            btn.setToolTip("Not yet functional -- scaffolding only")
+            transport_lay.addWidget(btn)
+        transport_lay.addSpacing(16)
+        self.seq_elapsed_label = QLabel("00:00.0")
+        self.seq_elapsed_label.setStyleSheet("font-family: monospace; font-size: 14px;")
+        transport_lay.addWidget(QLabel("Elapsed:")); transport_lay.addWidget(self.seq_elapsed_label)
+        self.seq_bars_beats_label = QLabel("1:1")
+        self.seq_bars_beats_label.setStyleSheet("font-family: monospace; font-size: 14px;")
+        transport_lay.addWidget(QLabel("Bars\u200a:\u200aBeats:")); transport_lay.addWidget(self.seq_bars_beats_label)
+        transport_lay.addStretch()
+        seq_outer_lay.addWidget(transport_box)
+
+        self.seq_status_label = QLabel("")
+        self.seq_status_label.setStyleSheet("color: #c0392b; font-style: italic;")
+        seq_outer_lay.addWidget(self.seq_status_label)
+
+        seq_lanes_widget = QWidget()
+        seq_lanes_lay = QVBoxLayout(seq_lanes_widget)
+        seq_lanes_lay.setContentsMargins(2, 2, 2, 2); seq_lanes_lay.setSpacing(2)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>#</b>")); header.addWidget(QLabel("<b>Level</b>"))
+        header.addWidget(QLabel("<b>Pan</b>")); header.addWidget(QLabel("<b>Type</b>"))
+        header.addWidget(QLabel("<b>Seq/Mute/Rec</b>")); header.addStretch()
+        seq_lanes_lay.addLayout(header)
+        self.seq_lane_rows = []  # 32 x (row, fader, pan_dial, type_combo, mode_combo)
+        for i in range(SEQ_LANE_COUNT):
+            lane = _build_seq_lane_row(i, show_seq_controls=True)
+            seq_lanes_lay.addWidget(lane[0])
+            self.seq_lane_rows.append(lane)
+        seq_lanes_lay.addStretch()
+
+        # QScrollArea, matching the FX/LFO tabs' existing pattern for many stacked rows.
+        seq_scroll = QScrollArea()
+        seq_scroll.setWidgetResizable(True)
+        seq_scroll.setWidget(seq_lanes_widget)
+        seq_outer_lay.addWidget(seq_scroll)
+
+        # Audio/MIDI type enforcement: capped at PROGRAM_LANE_RESOURCE_COUNT/AUDIO_LANE_RESOURCE_COUNT
+        # active of each kind, since each type is meant to eventually draw from its own backend
+        # resource pool (neither exists yet -- this is frontend-only validation this pass).
+        def _enforce_seq_lane_type_cap(idx, new_index):
+            type_combo = self.seq_lane_rows[idx][3]
+            counts = [0, 0]
+            for row in self.seq_lane_rows:
+                counts[row[3].currentIndex()] += 1
+            cap = PROGRAM_LANE_RESOURCE_COUNT if new_index == 0 else AUDIO_LANE_RESOURCE_COUNT
+            if counts[new_index] > cap:
+                type_combo.blockSignals(True)
+                type_combo.setCurrentIndex(1 - new_index)
+                type_combo.blockSignals(False)
+                self.seq_status_label.setText(f"Lane {idx + 1}: already {cap} {'Program/MIDI' if new_index == 0 else 'Audio'} lanes active -- reverted")
+        for i, lane in enumerate(self.seq_lane_rows):
+            lane[3].currentIndexChanged.connect(lambda new_index, idx=i: _enforce_seq_lane_type_cap(idx, new_index))
         # ----------------------------------------------------
         # FILTERS TAB CONTENT (2-FILTER OVERHAUL)
         # ----------------------------------------------------
@@ -4118,6 +4243,7 @@ class SynthGui(QWidget):
         self.tab_widget.addTab(self.tab_audio, "Devices")
         self.tab_widget.addTab(self.tab_recording, "Recording")
         self.tab_widget.addTab(self.tab_mapping, "Mapping")
+        self.tab_widget.addTab(self.tab_sequencer, "Sequencer")
 
         outer_layout.addWidget(self.tab_widget, stretch=5)
         self.setLayout(outer_layout)
@@ -4620,6 +4746,7 @@ class SynthGui(QWidget):
         "/hds/status/peak", "/hds/status/is_recording", "/hds/status/elapsed_seconds",
         "/hds/status/record_error", "/hds/status/detected_input_channels",
         "/hds/status/detected_output_channels", "/hds/status/tempo_bpm_live",
+        "/hds/status/seq_elapsed_seconds",
     )
 
     def listen_for_status_frames(self):
@@ -4657,6 +4784,19 @@ class SynthGui(QWidget):
                     self._rebuild_routing_output_columns(min(out_channels // 2, OUTPUT_PAIR_MAX))
             if "/hds/status/tempo_bpm_live" in values:
                 self.tempo_live_readout.setText(f"engine: {values['/hds/status/tempo_bpm_live']:.1f} BPM")
+            # Sequencer tab's transport readout -- real, live data (elapsed engine uptime +
+            # current tempo) even though the Play/Pause/Record buttons themselves are inert this
+            # pass. Bars:Beats is plain presentation-layer math (assumes 4/4), same spirit as the
+            # rest of this file's habit of keeping such conversions out of the DSP hot path.
+            if "/hds/status/seq_elapsed_seconds" in values and "/hds/status/tempo_bpm_live" in values:
+                elapsed = values["/hds/status/seq_elapsed_seconds"]
+                bpm = max(1.0, values["/hds/status/tempo_bpm_live"])
+                minutes, seconds = divmod(elapsed, 60.0)
+                self.seq_elapsed_label.setText(f"{int(minutes):02d}:{seconds:04.1f}")
+                beats_total = elapsed * bpm / 60.0
+                bar = int(beats_total // 4) + 1
+                beat = int(beats_total % 4) + 1
+                self.seq_bars_beats_label.setText(f"{bar}:{beat}")
 
         if got_any:
             self._last_status_time = time.monotonic()
@@ -4778,6 +4918,34 @@ class SynthGui(QWidget):
         add_f("/hds/filter/b/slope", self.vcf_poles[4].currentIndex())
         add_f("/hds/filter/b/type", self.vcf_types[4].currentIndex())
         add_blend("/hds/filter/b", 4)
+
+        # --- Combi/Sequencer scaffolding (see backend.c's SEQ_LANE_COUNT comment) ---
+        if self.osc_combi_radio.isChecked():
+            perf_mode = 1
+        elif self.osc_sequencer_radio.isChecked():
+            perf_mode = 2
+        else:
+            perf_mode = 0
+        add_f("/hds/performance_mode", perf_mode)
+        # Sequencer's 32-lane widget set is always sent, unconditionally, regardless of
+        # Performance Mode -- these are the canonical values for every /hds/seq/... address,
+        # including lanes 16-31 (Audio-lane range) which Combi's view doesn't have at all. In
+        # Combi mode specifically, Combi's own 16-lane widgets are sent AFTER (so they win for
+        # the overlapping lanes 0-15) -- Combi lanes are always Program/MIDI with no real
+        # seq_mode concept, matching "these two dropdowns will not be necessary for combi mode."
+        for i, (_row, fader, pan_dial, type_combo, mode_combo) in enumerate(self.seq_lane_rows):
+            add_f(f"/hds/seq/{i}/lane_type", type_combo.currentIndex())
+            add_f(f"/hds/seq/{i}/volume", fader.value())
+            add_f(f"/hds/seq/{i}/pan", float(pan_dial.value()) / 100.0)
+            add_f(f"/hds/seq/{i}/midi_channel", 0)  # Omni -- no per-lane MIDI UI yet
+            add_f(f"/hds/seq/{i}/mode", mode_combo.currentIndex())
+        if perf_mode == 1:
+            for i, (_row, fader, pan_dial, _type_combo, _mode_combo) in enumerate(self.combi_lane_rows):
+                add_f(f"/hds/seq/{i}/lane_type", 0)  # Combi lanes are always Program/MIDI
+                add_f(f"/hds/seq/{i}/volume", fader.value())
+                add_f(f"/hds/seq/{i}/pan", float(pan_dial.value()) / 100.0)
+                add_f(f"/hds/seq/{i}/midi_channel", 0)
+                add_f(f"/hds/seq/{i}/mode", 0)  # meaningless in Combi mode
 
         # LFOs (incl. phase offset + mod source CC)
         for idx in range(LFO_COUNT):
@@ -5123,6 +5291,16 @@ def runtime_connect_and_bind(gui):
         for k in mode1_knobs + mode2_knobs:
             k.valueChanged.connect(gui.transmit_knob_packet)
         xf_dial.valueChanged.connect(gui.transmit_knob_packet)
+
+    # Combi/Sequencer lane scaffolding: fader/pan (both views) + type/seq-mode combos
+    # (Sequencer view only -- Combi's rows have None in those two tuple slots).
+    for _row, fader, pan_dial, type_combo, mode_combo in gui.combi_lane_rows + gui.seq_lane_rows:
+        fader.valueChanged.connect(gui.transmit_knob_packet)
+        pan_dial.valueChanged.connect(gui.transmit_knob_packet)
+        if type_combo is not None:
+            type_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+        if mode_combo is not None:
+            mode_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
 
     # Unison Unison Saw control loops
     gui.vco1_unison_width.valueChanged.connect(gui.transmit_knob_packet)
