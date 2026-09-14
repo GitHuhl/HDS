@@ -103,12 +103,14 @@
 // Combi/Sequencer scaffolding: one flexible pool of up to 32 lanes, each independently
 // assignable (via SeqLaneState.lane_type) to Program/MIDI or Audio duty, capped at 16 active of
 // each kind -- because each type is meant to eventually draw from its own backend resource pool
-// (PROGRAM_LANE_RESOURCE_COUNT independent Program-synthesis instances; AUDIO_LANE_RESOURCE_COUNT
-// RAM-cached audio buffers). This pass adds only the lane data model + OSC wire + GUI -- neither
-// resource pool is actually allocated/used by the DSP yet; see the struct's own comment below and
-// the plan's "Future Full-Build Notes" for what a real build requires.
+// (COMBI_PROGRAM_COUNT independent Program-synthesis instances -- now real, see ProgramState/
+// SynthSharedControls.programs below; AUDIO_LANE_RESOURCE_COUNT RAM-cached audio buffers, still
+// scaffolding). This pass adds the lane data model + OSC wire + GUI; the audio-lane resource pool
+// is not yet allocated/used by the DSP.
 #define SEQ_LANE_COUNT 32
-#define PROGRAM_LANE_RESOURCE_COUNT 16
+// Renamed from PROGRAM_LANE_RESOURCE_COUNT (was a scaffolding placeholder ceiling; now the real,
+// concrete count of independently-synthesizing Combi Programs -- see ProgramState below).
+#define COMBI_PROGRAM_COUNT 8
 #define AUDIO_LANE_RESOURCE_COUNT 16
 #define SEQ_AUDIO_PATH_LEN 256
 
@@ -429,8 +431,26 @@ typedef struct {
 // fm_depth_3_1/fm_depth_3_2 (+3, that WIP commit never updated this comment) = 114 floats. No
 // new string fields. New total: 486 float items + 448 string bytes. The Python side's
 // struct.pack format changes from "372f64s64s64s256s" to "486f64s64s64s256s".
+// One independently-synthesizing Program (oscillators, filters, EGs, LFOs, FM, tempo -- "the
+// patch"): everything frontend.py's _is_program_scope_address() already treats as Program-scoped
+// for Save/Load, reused verbatim as this struct's exact field boundary rather than re-deriving it
+// -- that boundary is already battle-tested by the save/load feature. Wrapping these fields in a
+// real ProgramState[COMBI_PROGRAM_COUNT] array (instead of them living flat on
+// SynthSharedControls, as they did before Combi mode was real) is what makes independently-
+// configured, simultaneously-playing Programs possible: programs[0] is byte-identical in
+// name/offset/OSC-address terms to what these fields were before this struct existed -- Single
+// Program mode and every existing saved .hdsprog continue to address programs[0] via the exact
+// same, unchanged OSC paths (e.g. /hds/vco1/shape). programs[1..7] are 7 more fully independent
+// copies, addressed under /hds/combi/{1-7}/... (see OSC_PARAMS[]).
+//
+// FX slots (fx[]/fx_source_routing_mode/source_routing below), ext-in, and every other rig/
+// session-level field deliberately stay flat on SynthSharedControls, NOT in this struct -- those
+// are shared, physical-insert-like resources any Program (or the whole Combi stack) can be routed
+// into via fx_source, not part of any one patch. This is a small, deliberate refinement to
+// _is_program_scope_address's own current FX-slot handling (which still treats an FX slot's type/
+// mix/bypass/params as Program-scoped for Save/Load, a holdover from when there was only ever one
+// Program and the FX pool WAS that Program's own FX) -- see the "Real Combi mode" plan.
 typedef struct {
-    // 13 Baseline Control Items
     float is_polyphonic;
     float vco1_shape;
     float vco2_shape;
@@ -438,34 +458,32 @@ typedef struct {
     float vco1_vol;
     float vco2_vol;
     float portamento_time_ms;
-    float master_volume;
     float vco1_pan;
     float vco2_pan;
     float vco1_fine_tune;
     float vco2_pitch_offset;
     float vco2_fine_tune;
 
-    // 72 Envelope Parameter Items (ENV_COUNT=9 Envelopes * 8 Parameters, incl. attack start/peak level)
+    // 80 Envelope Parameter Items (ENV_COUNT=10 Envelopes * 8 Parameters, incl. attack start/peak level)
     PackEGParams eg[ENV_COUNT];
 
-    // --- FILTER SECTION (overhauled): 4 oscillators -> mixer -> Filter A -> Filter B, with
-    // A and B routable in Series (either order) or Parallel with each other (24 floats total).
+    // --- FILTER SECTION: 4 oscillators -> mixer -> Filter A -> Filter B, with A and B routable
+    // in Series (either order) or Parallel with each other.
     //
     // Filter A / Filter B outer routing: 0 = Series A->B (mixer -> A -> B -> output),
     // 1 = Series B->A (mixer -> B -> A -> output -- same two filters, reversed order, e.g. to
     // put Filter A's Multi mode after Filter B instead of before it), 2 = Parallel (mixer -> A,
-    // mixer -> B independently, each with its own level/pan below -> output). (+1 float)
+    // mixer -> B independently, each with its own level/pan below -> output).
     float filter_ab_routing_mode;
 
-    // Parallel-mode independent level (0-100) and pan (-1..1, equal-power) per filter --
-    // replaces the old single filter_ab_blend crossfade (BREAKING CHANGE) so each filter can be
-    // placed at its own level AND stereo position, matching a classic hardware synth's own
-    // "Parallel" filter routing description ("individual control over both level and pan").
-    // Unused in either Series mode, where the chain order alone decides which filter is "heard
-    // last". Defaults (50/50 level, centered pan) reproduce the old blend=50 default output level
-    // exactly -- see run_svf_filter's Parallel-combine comment in render_audio_block for the
-    // sqrt(2)-normalized pan formula that makes pan=0 a true no-op on an already-stereo signal.
-    // (+4 floats)
+    // Parallel-mode independent level (0-100) and pan (-1..1, equal-power) per filter -- each
+    // filter can be placed at its own level AND stereo position, matching a classic hardware
+    // synth's own "Parallel" filter routing description ("individual control over both level and
+    // pan"). Unused in either Series mode, where the chain order alone decides which filter is
+    // "heard last". Defaults (50/50 level, centered pan) reproduce the historical blend=50
+    // default output level exactly -- see run_svf_filter's Parallel-combine comment in
+    // render_audio_block for the sqrt(2)-normalized pan formula that makes pan=0 a true no-op on
+    // an already-stereo signal.
     float filter_a_level;
     float filter_b_level;
     float filter_a_pan;
@@ -474,7 +492,6 @@ typedef struct {
     // Filter A: a single Normal filter by default. Switching filter_a_mode to 1 ("Multi")
     // replaces it with the 3-filter Multi engine below instead of filter_a -- the original
     // 3-filter-stack design, now scoped down to being one of Filter A's two modes.
-    // (+1 float for the mode switch, +4 for filter_a's own params)
     float filter_a_mode; // 0 = Normal (uses filter_a below), 1 = Multi (uses filter_a_multi* below)
     FilterParams filter_a;
 
@@ -482,15 +499,14 @@ typedef struct {
     // the 4 oscillators are already summed into one signal before reaching Filter A, all 3 of
     // these take the SAME post-mixer input -- unlike the old engine, they can no longer see
     // individual oscillators separately, so there's no more "independent per-oscillator" option.
-    // (+1 float for its own internal routing, +12 for its 3 filters' params)
     float filter_a_multi_routing; // 0 = Series (in0->in1->in2), 1 = Parallel (all 3, summed),
                                    // 2 = Split (in0 // in1 summed, -> in2)
     FilterParams filter_a_multi[3];
 
-    // Filter B: always a single, normal filter -- no Multi mode of its own. (+4 floats)
+    // Filter B: always a single, normal filter -- no Multi mode of its own.
     FilterParams filter_b;
 
-    // 28 Active LFO Mapping Items (4 LFOs * 7 Properties, incl. phase offset + mod source CC)
+    // Active LFO Mapping Items (LFO_COUNT=16 LFOs * 7 Properties, incl. phase offset + mod source CC)
     PackLfoParams lfo[LFO_COUNT];
 
     // ASSIGNABLE_EG_COUNT (6) Custom EG Intensity Modulators
@@ -500,7 +516,7 @@ typedef struct {
     // independently of the LFOs)
     float eg_dest_target[ASSIGNABLE_EG_COUNT];
 
-    // ENV_COUNT (9) Active Envelope Topology Selection Mode Indices
+    // ENV_COUNT Active Envelope Topology Selection Mode Indices
     float eg_mode[ENV_COUNT];
 
     // Unison Saw Shape Controls
@@ -531,8 +547,6 @@ typedef struct {
     float vco1_phase_offset;
     float vco2_phase_offset;
 
-    // --- 4-Oscillator Architecture Additions ---
-
     // Pulse width (0-100%, 50=symmetric square) for Osc 1/2, used only when the shape knob is
     // set to WAVE_PULSE. Unrelated to WAVE_SQUARE, which stays a fixed 50% duty cycle for
     // patch compatibility.
@@ -550,46 +564,11 @@ typedef struct {
     float vco3_pulse_width;
 
     // Osc 4: a full peer of Osc 1/2/3 in every respect (own shape/pitch/pan/phase/unison
-    // controls below, own amp envelope eg[3]/eg_mode[3]). Formerly a fixed "Sub Oscillator"
-    // locked one octave below Osc 1 with no controls of its own and sharing Osc 1's envelope;
-    // that automatic-lockstep behavior is gone, replaced by an explicit vco4_pitch_offset knob
-    // (set to -12 semitones to reproduce the old Sub behavior manually).
+    // controls below, own amp envelope eg[3]/eg_mode[3]).
     float vco4_vol;
     float vco4_pan;
     float vco4_mute;
     float vco4_pulse_width; // dual-duty Pulse Width/Tilt, mirrors vco3_pulse_width
-
-    // --- FX Bus + Multi-Source Routing Architecture ---
-
-    // External Audio Input, per stereo pair (appended: generalized from a single hardcoded-to-
-    // capture-channels-0/1 tap into EXT_IN_PAIR_COUNT independently enable/gain/routable stereo
-    // sources -- pair p reads capture channels 2p/2p+1). Each pair is its own routable source (see
-    // fx[].fx_source/source_routing below) -- no pan control here, same as before: capture is
-    // taken as an already-stereo L/R pair and passed through as-is rather than re-panned from mono.
-    float ext_in_enable[EXT_IN_PAIR_COUNT];
-    float ext_in_gain[EXT_IN_PAIR_COUNT];
-
-    // FX Bus: FX_SLOT_COUNT slots, each now assigned to one source (fx[].fx_source, 0=Program,
-    // 1..EXT_IN_PAIR_COUNT=an ext-in pair) rather than implicitly processing one shared mix --
-    // see process_fx_chain()'s source_id parameter. Each ported effect fills in its own case in
-    // that function's dispatch switch; until then every slot is a pass-through (see FX_TYPE_OFF).
-    FXSlotParams fx[FX_SLOT_COUNT];
-
-    // FX Bus routing, per source (appended: generalized from one tab-wide switch into one
-    // Series/Parallel choice per source, applying only to that source's own assigned slots): 0 =
-    // Series (that source's slots run in array order, each fed the previous one's output), 1 =
-    // Parallel (every one of that source's slots fed the SAME pre-FX input independently, their
-    // outputs summed and averaged -- see process_fx_chain()).
-    float fx_source_routing_mode[SOURCE_COUNT];
-
-    // Multi-output hardware routing: which physical output pair(s) each source's final signal (its
-    // dry bus if it owns no FX slots, or the result of its own Series/Parallel chain above) lands
-    // on -- a many-to-many grid, since a source can feed multiple output pairs at once (e.g.
-    // Program to both a main mix and a monitor/cue pair). source_routing[0] is the Program;
-    // source_routing[1..EXT_IN_PAIR_COUNT] are the ext-in pairs, same indexing as ext_in_enable/
-    // fx_source above. See render_audio_block's per-output-pair summing and the always-on limiter,
-    // which moved from once-per-block to once-per-output-pair to match.
-    SourceRouting source_routing[SOURCE_COUNT];
 
     // Pitch Bend range, in semitones, applied equally to both oscillators. Separately
     // specifiable up/down since real-world PB ranges are often asymmetric (e.g. a guitar-style
@@ -602,6 +581,103 @@ typedef struct {
     // sustain pedal), 1 = Inverted (for the rare pedal wired backwards, sending 0 when
     // pressed). See handle_sustain_pedal_change()/the CC64 handling in process_midi_input.
     float sustain_pedal_polarity;
+
+    // --- Tempo (Global panel) ---
+    // A single flat "Tempo" knob for the common case, plus a programmable tempo-MAP system: up
+    // to TEMPO_MARKER_MAX (time, bpm) marker pairs, linearly interpolated between whichever two
+    // markers bracket the engine's current elapsed time -- see compute_current_tempo_bpm().
+    // tempo_marker_count == 0 means "ignore the marker arrays entirely, tempo_bpm alone is the
+    // whole story."
+    float tempo_bpm;
+    float tempo_marker_count;
+    float tempo_marker_time[TEMPO_MARKER_MAX]; // seconds since engine start
+    float tempo_marker_bpm[TEMPO_MARKER_MAX];
+
+    // --- Osc 3 identity/tuning -- vco3_vol/pan/mute/pulse_width already declared above. ---
+    float vco3_shape; // WaveType, full palette -- matches vco1_shape/vco2_shape
+    float vco3_fine_tune; // cents, mirrors vco1_fine_tune
+    float vco3_pitch_offset; // semitones, mirrors vco2_pitch_offset -- Osc3 is a full peer
+    float vco3_phase_offset; // degrees, mirrors vco1/vco2_phase_offset
+    float vco3_unison_saw_detune;
+    float vco3_unison_saw_width;
+
+    // --- Osc 4 identity/tuning, mirrors the Osc 3 block above exactly. vco4_vol/pan/mute/
+    // pulse_width already declared above. ---
+    float vco4_shape; // WaveType, full palette -- matches vco1/2/3_shape
+    float vco4_fine_tune; // cents
+    float vco4_pitch_offset; // semitones (set to -12 to reproduce the historical Sub's fixed octave-down)
+    float vco4_phase_offset; // degrees
+    float vco4_unison_saw_detune;
+    float vco4_unison_saw_width;
+
+    // --- FM Algorithm system: a fixed, cycle-free set of selectable 4-operator routing
+    // topologies (see FM_ALGORITHMS/render_fm_oscillator) -- NOT a general routing matrix, to
+    // keep every topology provably acyclic. fm_intensity (above) keeps its exact existing
+    // meaning (edge Osc2->Osc1) in every algorithm that uses that edge. Algorithm 0 ("Classic",
+    // 2->1 only) reproduces the historical default behavior. ---
+    float fm_algorithm; // 0-11, see FM_ALGORITHMS
+    float fm_depth_3_1; // Osc3 -> Osc1
+    float fm_depth_3_2; // Osc3 -> Osc2
+    float fm_depth_4_1; // Osc4 -> Osc1
+    float fm_depth_4_3; // Osc4 -> Osc3
+    float fm_depth_1_2; // Osc1 -> Osc2
+    float fm_depth_3_4; // Osc3 -> Osc4
+    float fm_depth_1_3; // Osc1 -> Osc3
+
+    // --- Manual oscillator Pitch knobs --- a per-oscillator pitch offset the user can dial by
+    // hand, independent of fine_tune (cents trim) and pitch_offset (the semitone-octave knob
+    // Osc2/3/4 already have). Range +-24 semitones (+-2 octaves), stored directly in cents to
+    // match mod_vcoN_pitch's own units. Summed into the exact same mod_vcoN_pitch accumulator an
+    // LFO/EG already modulating "Osc N Pitch" writes into (see render_audio_block).
+    float vco1_pitch;
+    float vco2_pitch;
+    float vco3_pitch;
+    float vco4_pitch;
+} ProgramState;
+
+typedef struct {
+    // COMBI_PROGRAM_COUNT (8) independently-synthesizing Programs -- see ProgramState's own
+    // comment above. programs[0] is Single Program mode's Program, addressed via the exact same
+    // OSC paths as before this struct existed (e.g. /hds/vco1/shape); programs[1..7] are Combi
+    // mode's remaining 7 Programs, addressed under /hds/combi/{1-7}/...
+    ProgramState programs[COMBI_PROGRAM_COUNT];
+
+    // Session/mix-level output volume -- deliberately NOT part of ProgramState (excluded from
+    // Program scope for Save/Load too): a mixing/session-level level, not part of any one patch,
+    // so loading a Program never yanks the current output level out from under whatever it was
+    // set to.
+    float master_volume;
+
+    // --- FX Bus + Multi-Source Routing Architecture --- deliberately session/rig-level, not
+    // per-Program (see ProgramState's own comment for why): FX slots are shared, physical-insert-
+    // like resources any source (a Program, the whole Combi stack, or an ext-in pair) can be
+    // routed into via fx[].fx_source, not part of any one patch.
+
+    // External Audio Input, per stereo pair: EXT_IN_PAIR_COUNT independently enable/gain/routable
+    // stereo sources -- pair p reads capture channels 2p/2p+1. Each pair is its own routable
+    // source (see fx[].fx_source/source_routing below) -- no pan control here: capture is taken
+    // as an already-stereo L/R pair and passed through as-is rather than re-panned from mono.
+    float ext_in_enable[EXT_IN_PAIR_COUNT];
+    float ext_in_gain[EXT_IN_PAIR_COUNT];
+
+    // FX Bus: FX_SLOT_COUNT slots, each assigned to one source (fx[].fx_source -- see
+    // SOURCE_COUNT's own comment for the full source enumeration: Combi Programs, the Combi Mix
+    // bus, and ext-in pairs) rather than implicitly processing one shared mix -- see
+    // process_fx_chain()'s source_id parameter. Each ported effect fills in its own case in that
+    // function's dispatch switch; until then every slot is a pass-through (see FX_TYPE_OFF).
+    FXSlotParams fx[FX_SLOT_COUNT];
+
+    // FX Bus routing, per source: 0 = Series (that source's slots run in array order, each fed
+    // the previous one's output), 1 = Parallel (every one of that source's slots fed the SAME
+    // pre-FX input independently, their outputs summed and averaged -- see process_fx_chain()).
+    float fx_source_routing_mode[SOURCE_COUNT];
+
+    // Multi-output hardware routing: which physical output pair(s) each source's final signal
+    // (its dry bus if it owns no FX slots, or the result of its own Series/Parallel chain above)
+    // lands on -- a many-to-many grid, since a source can feed multiple output pairs at once
+    // (e.g. a Program to both a main mix and a monitor/cue pair). See render_audio_block's
+    // per-output-pair summing and the always-on limiter (once per output pair).
+    SourceRouting source_routing[SOURCE_COUNT];
 
     // Requested ALSA output/input buffer depth, in milliseconds (passed straight through as
     // snd_pcm_set_params's `latency` argument in open_pcm_stream() -- see the comment there).
@@ -652,68 +728,10 @@ typedef struct {
     // detected_input_channels in the status feedback the backend sends back).
     float record_input_channel_enable[RECORD_MAX_CHANNELS];
 
-    // --- Tempo (Global panel) ---
-    // A single flat "Tempo" knob for the common case, plus a programmable tempo-MAP system: up
-    // to TEMPO_MARKER_MAX (time, bpm) marker pairs, linearly interpolated between whichever two
-    // markers bracket the engine's current elapsed time -- see compute_current_tempo_bpm().
-    // Elapsed time here means seconds since this engine process started (main()'s running
-    // sample count / SAMPLE_RATE); there's no other transport/song-position concept in this
-    // engine. tempo_marker_count == 0 means "ignore the marker arrays entirely, tempo_bpm alone
-    // is the whole story" -- currently the only value the frontend ever sends, since there's no
-    // marker editor UI yet. The marker arrays are still reserved in the wire layout so a future
-    // editor (or anything else driving the protocol directly) can populate them without another
-    // breaking change. Nothing in the DSP consumes the computed tempo yet -- this lays the
-    // groundwork for future tempo-synced features (e.g. delay time, LFO rate).
-    float tempo_bpm;
-    float tempo_marker_count;
-    float tempo_marker_time[TEMPO_MARKER_MAX]; // seconds since engine start
-    float tempo_marker_bpm[TEMPO_MARKER_MAX];
-
-    // --- Osc 3 identity/tuning (appended, not inserted, per this file's own numeric-shape-index
-    // precedent -- see WAVE_PULSE/WAVE_SAMPLE's comment) -- vco3_vol/pan/mute/pulse_width already
-    // exist above (reused in place from the old dedicated Noise oscillator's fields). ---
-    float vco3_shape; // WaveType, full palette -- matches vco1_shape/vco2_shape
-    float vco3_fine_tune; // cents, mirrors vco1_fine_tune
-    float vco3_pitch_offset; // semitones, mirrors vco2_pitch_offset -- Osc3 is a full peer
-    float vco3_phase_offset; // degrees, mirrors vco1/vco2_phase_offset
-    float vco3_unison_saw_detune;
-    float vco3_unison_saw_width;
-
-    // --- Osc 4 identity/tuning (appended), mirrors the Osc 3 block above exactly -- replaces
-    // the old fixed Sub Oscillator entirely. vco4_vol/pan/mute/pulse_width already exist above. ---
-    float vco4_shape; // WaveType, full palette -- matches vco1/2/3_shape
-    float vco4_fine_tune; // cents
-    float vco4_pitch_offset; // semitones (set to -12 to reproduce the old Sub's fixed octave-down)
-    float vco4_phase_offset; // degrees
-    float vco4_unison_saw_detune;
-    float vco4_unison_saw_width;
-
-    // --- FM Algorithm system: a fixed, cycle-free set of selectable 4-operator routing
-    // topologies (see FM_ALGORITHMS/render_fm_oscillator) -- NOT a general routing matrix, to
-    // keep every topology provably acyclic. fm_intensity (existing field, above) keeps its exact
-    // existing meaning (edge Osc2->Osc1) in every algorithm that uses that edge. Algorithm 0
-    // ("Classic", 2->1 only) reproduces today's exact behavior and is the default. ---
-    float fm_algorithm; // 0-11, see FM_ALGORITHMS
-    float fm_depth_3_1; // Osc3 -> Osc1
-    float fm_depth_3_2; // Osc3 -> Osc2
-    float fm_depth_4_1; // Osc4 -> Osc1
-    float fm_depth_4_3; // Osc4 -> Osc3
-    float fm_depth_1_2; // Osc1 -> Osc2
-    float fm_depth_3_4; // Osc3 -> Osc4
-    float fm_depth_1_3; // Osc1 -> Osc3
-
-    // --- Manual oscillator Pitch knobs (appended) --- a per-oscillator pitch offset the user can
-    // dial by hand, independent of fine_tune (cents trim) and pitch_offset (the semitone-octave
-    // knob Osc2/3/4 already have). Range +-24 semitones (+-2 octaves), stored directly in cents
-    // to match mod_vcoN_pitch's own units. Summed into the exact same mod_vcoN_pitch accumulator
-    // an LFO/EG already modulating "Osc N Pitch" writes into (see render_audio_block) -- a knob
-    // and a live modulator both targeting pitch just add, no new mod-matrix target needed. Also
-    // the same underlying control an LFO/EG's "Osc N Pitch" destination has always modulated, now
-    // additionally reachable by hand and via its own right-click assignment menu (frontend.py).
-    float vco1_pitch;
-    float vco2_pitch;
-    float vco3_pitch;
-    float vco4_pitch;
+    // Tempo, FM algorithm, Osc 3/4 identity, and the manual oscillator Pitch knobs all moved into
+    // ProgramState above (each is Program-scoped) -- see that struct's own field-by-field
+    // comments; programs[0] carries the exact same fields under the exact same OSC addresses as
+    // before this struct existed.
 
     // Recording format: 0=WAV (32-bit float, lossless, larger files), 1=WavPack (lossless
     // compression, ~40-60% smaller, converted to 24-bit PCM before encoding since WavPack -- like
@@ -751,6 +769,14 @@ typedef struct {
     float seq_transport_play_trigger;
     float seq_transport_pause_trigger;
     float seq_transport_stop_trigger;
+
+    // Combi mode: which incoming MIDI channel each of the 8 Program lanes listens on (0 = Omni,
+    // 1-16 = a specific channel) -- same convention as SeqLaneState.midi_channel, filtering LIVE
+    // note dispatch (process_midi_input, in Combi mode) to whichever lane(s) match, rather than
+    // Sequencer's own recording filter. Session-level, not part of any one Program -- which
+    // channel a lane listens on is a property of the Combi performance setup, not the patch
+    // itself.
+    float combi_lane_midi_channel[COMBI_PROGRAM_COUNT];
 
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
@@ -802,25 +828,25 @@ static inline int effective_block_size(const SynthSharedControls *knobs) {
 // uses. Markers don't need to be given in time order: this scans for the nearest-before and
 // nearest-after markers directly, so out-of-order input still resolves correctly.
 static float compute_current_tempo_bpm(const SynthSharedControls *knobs, double elapsed_seconds) {
-    int count = (int)knobs->tempo_marker_count;
+    int count = (int)knobs->programs[0].tempo_marker_count;
     if (count < 0) count = 0;
     if (count > TEMPO_MARKER_MAX) count = TEMPO_MARKER_MAX;
-    if (count == 0) return knobs->tempo_bpm;
+    if (count == 0) return knobs->programs[0].tempo_bpm;
 
     int prev = -1; double prev_time = -1e18;
     int next = -1; double next_time = 1e18;
     for (int i = 0; i < count; i++) {
-        double t = (double)knobs->tempo_marker_time[i];
+        double t = (double)knobs->programs[0].tempo_marker_time[i];
         if (t <= elapsed_seconds && t > prev_time) { prev = i; prev_time = t; }
         if (t > elapsed_seconds && t < next_time) { next = i; next_time = t; }
     }
-    if (prev < 0 && next < 0) return knobs->tempo_bpm; // defensive fallback, shouldn't happen when count > 0
-    if (prev < 0) return knobs->tempo_marker_bpm[next]; // before the first marker: hold its bpm flat
-    if (next < 0) return knobs->tempo_marker_bpm[prev]; // after the last marker: hold its bpm flat
+    if (prev < 0 && next < 0) return knobs->programs[0].tempo_bpm; // defensive fallback, shouldn't happen when count > 0
+    if (prev < 0) return knobs->programs[0].tempo_marker_bpm[next]; // before the first marker: hold its bpm flat
+    if (next < 0) return knobs->programs[0].tempo_marker_bpm[prev]; // after the last marker: hold its bpm flat
 
     double span = next_time - prev_time;
     double frac = (span > 1e-9) ? (elapsed_seconds - prev_time) / span : 0.0;
-    double bpm = (double)knobs->tempo_marker_bpm[prev] + frac * ((double)knobs->tempo_marker_bpm[next] - (double)knobs->tempo_marker_bpm[prev]);
+    double bpm = (double)knobs->programs[0].tempo_marker_bpm[prev] + frac * ((double)knobs->programs[0].tempo_marker_bpm[next] - (double)knobs->programs[0].tempo_marker_bpm[prev]);
     return (float)bpm;
 }
 
@@ -2498,130 +2524,149 @@ typedef struct {
 #define OSC_STRING_SUBARRAY(addr, arrfield, subtype, subfield, cnt, len) \
     { addr, offsetof(SynthSharedControls, arrfield) + offsetof(subtype, subfield), sizeof(((SynthSharedControls *)0)->arrfield[0]), cnt, 1, 0, 0, OSC_KIND_STRING, len }
 
+// Program-scoped field variants (Combi mode, see ProgramState's own comment): identical shape to
+// the macros above, but the base offset threads through SynthSharedControls.programs[N] before
+// reaching the field. The _AT forms take an explicit compile-time program index N (used to
+// generate the 7 extra /hds/combi/{1-7}/... address rows); the plain (no _AT) forms default to
+// program 0, reproducing today's exact, unprefixed addresses (e.g. /hds/vco1/shape) byte-for-byte
+// -- Single Program mode and every existing saved .hdsprog are unaffected by this indirection.
+#define OSC_PSCALAR_AT(addr, field, n) \
+    { addr, offsetof(SynthSharedControls, programs[n].field), 0, 1, 0, 0, 0, OSC_KIND_FLOAT, 0 }
+#define OSC_PARRAY_AT(addr, field, cnt, n) \
+    { addr, offsetof(SynthSharedControls, programs[n].field), sizeof(((SynthSharedControls *)0)->programs[n].field[0]), cnt, 1, 0, 0, OSC_KIND_FLOAT, 0 }
+#define OSC_PSUBARRAY_AT(addr, arrfield, subtype, subfield, cnt, n) \
+    { addr, offsetof(SynthSharedControls, programs[n].arrfield) + offsetof(subtype, subfield), sizeof(((SynthSharedControls *)0)->programs[n].arrfield[0]), cnt, 1, 0, 0, OSC_KIND_FLOAT, 0 }
+#define OSC_PNESTED_AT(addr, arrfield, subtype, subfield, cnt1, cnt2, n) \
+    { addr, offsetof(SynthSharedControls, programs[n].arrfield) + offsetof(subtype, subfield), sizeof(((SynthSharedControls *)0)->programs[n].arrfield[0]), cnt1, 2, sizeof(float), cnt2, OSC_KIND_FLOAT, 0 }
+#define OSC_PSCALAR(addr, field) OSC_PSCALAR_AT(addr, field, 0)
+#define OSC_PARRAY(addr, field, cnt) OSC_PARRAY_AT(addr, field, cnt, 0)
+#define OSC_PSUBARRAY(addr, arrfield, subtype, subfield, cnt) OSC_PSUBARRAY_AT(addr, arrfield, subtype, subfield, cnt, 0)
+#define OSC_PNESTED(addr, arrfield, subtype, subfield, cnt1, cnt2) OSC_PNESTED_AT(addr, arrfield, subtype, subfield, cnt1, cnt2, 0)
+
 static const OscParamEntry OSC_PARAMS[] = {
     // --- Baseline ---
-    OSC_SCALAR("/hds/is_polyphonic", is_polyphonic),
-    OSC_SCALAR("/hds/vco1/shape", vco1_shape),
-    OSC_SCALAR("/hds/vco2/shape", vco2_shape),
-    OSC_SCALAR("/hds/fm/intensity", fm_intensity),
-    OSC_SCALAR("/hds/vco1/vol", vco1_vol),
-    OSC_SCALAR("/hds/vco2/vol", vco2_vol),
-    OSC_SCALAR("/hds/portamento_time_ms", portamento_time_ms),
+    OSC_PSCALAR("/hds/is_polyphonic", is_polyphonic),
+    OSC_PSCALAR("/hds/vco1/shape", vco1_shape),
+    OSC_PSCALAR("/hds/vco2/shape", vco2_shape),
+    OSC_PSCALAR("/hds/fm/intensity", fm_intensity),
+    OSC_PSCALAR("/hds/vco1/vol", vco1_vol),
+    OSC_PSCALAR("/hds/vco2/vol", vco2_vol),
+    OSC_PSCALAR("/hds/portamento_time_ms", portamento_time_ms),
     OSC_SCALAR("/hds/master_volume", master_volume),
-    OSC_SCALAR("/hds/vco1/pan", vco1_pan),
-    OSC_SCALAR("/hds/vco2/pan", vco2_pan),
-    OSC_SCALAR("/hds/vco1/fine_tune", vco1_fine_tune),
-    OSC_SCALAR("/hds/vco2/pitch_offset", vco2_pitch_offset),
-    OSC_SCALAR("/hds/vco2/fine_tune", vco2_fine_tune),
+    OSC_PSCALAR("/hds/vco1/pan", vco1_pan),
+    OSC_PSCALAR("/hds/vco2/pan", vco2_pan),
+    OSC_PSCALAR("/hds/vco1/fine_tune", vco1_fine_tune),
+    OSC_PSCALAR("/hds/vco2/pitch_offset", vco2_pitch_offset),
+    OSC_PSCALAR("/hds/vco2/fine_tune", vco2_fine_tune),
 
     // --- Envelopes (eg[ENV_COUNT], PackEGParams: d=delay h=hold a=attack dec=decay s=sustain
     // r=release al=attack_start_pct pk=attack_peak_pct -- see tick_adsr()) ---
-    OSC_SUBARRAY("/hds/eg/%d/delay", eg, PackEGParams, d, ENV_COUNT),
-    OSC_SUBARRAY("/hds/eg/%d/hold", eg, PackEGParams, h, ENV_COUNT),
-    OSC_SUBARRAY("/hds/eg/%d/attack", eg, PackEGParams, a, ENV_COUNT),
-    OSC_SUBARRAY("/hds/eg/%d/decay", eg, PackEGParams, dec, ENV_COUNT),
-    OSC_SUBARRAY("/hds/eg/%d/sustain", eg, PackEGParams, s, ENV_COUNT),
-    OSC_SUBARRAY("/hds/eg/%d/release", eg, PackEGParams, r, ENV_COUNT),
-    OSC_SUBARRAY("/hds/eg/%d/attack_start_pct", eg, PackEGParams, al, ENV_COUNT),
-    OSC_SUBARRAY("/hds/eg/%d/attack_peak_pct", eg, PackEGParams, pk, ENV_COUNT),
-    OSC_ARRAY("/hds/eg/%d/topology_mode", eg_mode, ENV_COUNT),
+    OSC_PSUBARRAY("/hds/eg/%d/delay", eg, PackEGParams, d, ENV_COUNT),
+    OSC_PSUBARRAY("/hds/eg/%d/hold", eg, PackEGParams, h, ENV_COUNT),
+    OSC_PSUBARRAY("/hds/eg/%d/attack", eg, PackEGParams, a, ENV_COUNT),
+    OSC_PSUBARRAY("/hds/eg/%d/decay", eg, PackEGParams, dec, ENV_COUNT),
+    OSC_PSUBARRAY("/hds/eg/%d/sustain", eg, PackEGParams, s, ENV_COUNT),
+    OSC_PSUBARRAY("/hds/eg/%d/release", eg, PackEGParams, r, ENV_COUNT),
+    OSC_PSUBARRAY("/hds/eg/%d/attack_start_pct", eg, PackEGParams, al, ENV_COUNT),
+    OSC_PSUBARRAY("/hds/eg/%d/attack_peak_pct", eg, PackEGParams, pk, ENV_COUNT),
+    OSC_PARRAY("/hds/eg/%d/topology_mode", eg_mode, ENV_COUNT),
 
     // --- Filter A/B ---
-    OSC_SCALAR("/hds/filter/ab_routing_mode", filter_ab_routing_mode),
+    OSC_PSCALAR("/hds/filter/ab_routing_mode", filter_ab_routing_mode),
     // Parallel-mode independent level/pan (replaces the old single filter_ab_blend crossfade).
-    OSC_SCALAR("/hds/filter/a/level", filter_a_level),
-    OSC_SCALAR("/hds/filter/b/level", filter_b_level),
-    OSC_SCALAR("/hds/filter/a/pan", filter_a_pan),
-    OSC_SCALAR("/hds/filter/b/pan", filter_b_pan),
-    OSC_SCALAR("/hds/filter/a/mode", filter_a_mode),
-    OSC_SCALAR("/hds/filter/a/cutoff", filter_a.cutoff),
-    OSC_SCALAR("/hds/filter/a/res_q", filter_a.res_q),
-    OSC_SCALAR("/hds/filter/a/slope", filter_a.slope_poles),
-    OSC_SCALAR("/hds/filter/a/type", filter_a.filter_type),
+    OSC_PSCALAR("/hds/filter/a/level", filter_a_level),
+    OSC_PSCALAR("/hds/filter/b/level", filter_b_level),
+    OSC_PSCALAR("/hds/filter/a/pan", filter_a_pan),
+    OSC_PSCALAR("/hds/filter/b/pan", filter_b_pan),
+    OSC_PSCALAR("/hds/filter/a/mode", filter_a_mode),
+    OSC_PSCALAR("/hds/filter/a/cutoff", filter_a.cutoff),
+    OSC_PSCALAR("/hds/filter/a/res_q", filter_a.res_q),
+    OSC_PSCALAR("/hds/filter/a/slope", filter_a.slope_poles),
+    OSC_PSCALAR("/hds/filter/a/type", filter_a.filter_type),
     // Multi Filter blend (Mode 1/Mode 2/Crossfade) -- one set of 11 addresses per filter unit.
-    OSC_SCALAR("/hds/filter/a/mode1/lp", filter_a.mode1_lp),
-    OSC_SCALAR("/hds/filter/a/mode1/bp", filter_a.mode1_bp),
-    OSC_SCALAR("/hds/filter/a/mode1/hp", filter_a.mode1_hp),
-    OSC_SCALAR("/hds/filter/a/mode1/notch", filter_a.mode1_notch),
-    OSC_SCALAR("/hds/filter/a/mode1/dry", filter_a.mode1_dry),
-    OSC_SCALAR("/hds/filter/a/mode2/lp", filter_a.mode2_lp),
-    OSC_SCALAR("/hds/filter/a/mode2/bp", filter_a.mode2_bp),
-    OSC_SCALAR("/hds/filter/a/mode2/hp", filter_a.mode2_hp),
-    OSC_SCALAR("/hds/filter/a/mode2/notch", filter_a.mode2_notch),
-    OSC_SCALAR("/hds/filter/a/mode2/dry", filter_a.mode2_dry),
-    OSC_SCALAR("/hds/filter/a/crossfade", filter_a.crossfade),
-    OSC_SCALAR("/hds/filter/a_multi/routing", filter_a_multi_routing),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3),
-    OSC_SUBARRAY("/hds/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3),
-    OSC_SCALAR("/hds/filter/b/cutoff", filter_b.cutoff),
-    OSC_SCALAR("/hds/filter/b/res_q", filter_b.res_q),
-    OSC_SCALAR("/hds/filter/b/slope", filter_b.slope_poles),
-    OSC_SCALAR("/hds/filter/b/type", filter_b.filter_type),
-    OSC_SCALAR("/hds/filter/b/mode1/lp", filter_b.mode1_lp),
-    OSC_SCALAR("/hds/filter/b/mode1/bp", filter_b.mode1_bp),
-    OSC_SCALAR("/hds/filter/b/mode1/hp", filter_b.mode1_hp),
-    OSC_SCALAR("/hds/filter/b/mode1/notch", filter_b.mode1_notch),
-    OSC_SCALAR("/hds/filter/b/mode1/dry", filter_b.mode1_dry),
-    OSC_SCALAR("/hds/filter/b/mode2/lp", filter_b.mode2_lp),
-    OSC_SCALAR("/hds/filter/b/mode2/bp", filter_b.mode2_bp),
-    OSC_SCALAR("/hds/filter/b/mode2/hp", filter_b.mode2_hp),
-    OSC_SCALAR("/hds/filter/b/mode2/notch", filter_b.mode2_notch),
-    OSC_SCALAR("/hds/filter/b/mode2/dry", filter_b.mode2_dry),
-    OSC_SCALAR("/hds/filter/b/crossfade", filter_b.crossfade),
+    OSC_PSCALAR("/hds/filter/a/mode1/lp", filter_a.mode1_lp),
+    OSC_PSCALAR("/hds/filter/a/mode1/bp", filter_a.mode1_bp),
+    OSC_PSCALAR("/hds/filter/a/mode1/hp", filter_a.mode1_hp),
+    OSC_PSCALAR("/hds/filter/a/mode1/notch", filter_a.mode1_notch),
+    OSC_PSCALAR("/hds/filter/a/mode1/dry", filter_a.mode1_dry),
+    OSC_PSCALAR("/hds/filter/a/mode2/lp", filter_a.mode2_lp),
+    OSC_PSCALAR("/hds/filter/a/mode2/bp", filter_a.mode2_bp),
+    OSC_PSCALAR("/hds/filter/a/mode2/hp", filter_a.mode2_hp),
+    OSC_PSCALAR("/hds/filter/a/mode2/notch", filter_a.mode2_notch),
+    OSC_PSCALAR("/hds/filter/a/mode2/dry", filter_a.mode2_dry),
+    OSC_PSCALAR("/hds/filter/a/crossfade", filter_a.crossfade),
+    OSC_PSCALAR("/hds/filter/a_multi/routing", filter_a_multi_routing),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3),
+    OSC_PSUBARRAY("/hds/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3),
+    OSC_PSCALAR("/hds/filter/b/cutoff", filter_b.cutoff),
+    OSC_PSCALAR("/hds/filter/b/res_q", filter_b.res_q),
+    OSC_PSCALAR("/hds/filter/b/slope", filter_b.slope_poles),
+    OSC_PSCALAR("/hds/filter/b/type", filter_b.filter_type),
+    OSC_PSCALAR("/hds/filter/b/mode1/lp", filter_b.mode1_lp),
+    OSC_PSCALAR("/hds/filter/b/mode1/bp", filter_b.mode1_bp),
+    OSC_PSCALAR("/hds/filter/b/mode1/hp", filter_b.mode1_hp),
+    OSC_PSCALAR("/hds/filter/b/mode1/notch", filter_b.mode1_notch),
+    OSC_PSCALAR("/hds/filter/b/mode1/dry", filter_b.mode1_dry),
+    OSC_PSCALAR("/hds/filter/b/mode2/lp", filter_b.mode2_lp),
+    OSC_PSCALAR("/hds/filter/b/mode2/bp", filter_b.mode2_bp),
+    OSC_PSCALAR("/hds/filter/b/mode2/hp", filter_b.mode2_hp),
+    OSC_PSCALAR("/hds/filter/b/mode2/notch", filter_b.mode2_notch),
+    OSC_PSCALAR("/hds/filter/b/mode2/dry", filter_b.mode2_dry),
+    OSC_PSCALAR("/hds/filter/b/crossfade", filter_b.crossfade),
 
     // --- LFOs (lfo[LFO_COUNT], PackLfoParams) ---
-    OSC_SUBARRAY("/hds/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT),
-    OSC_SUBARRAY("/hds/lfo/%d/rate", lfo, PackLfoParams, rate_hz, LFO_COUNT),
-    OSC_SUBARRAY("/hds/lfo/%d/depth", lfo, PackLfoParams, mod_depth, LFO_COUNT),
-    OSC_SUBARRAY("/hds/lfo/%d/key_sync", lfo, PackLfoParams, key_sync, LFO_COUNT),
-    OSC_SUBARRAY("/hds/lfo/%d/dest", lfo, PackLfoParams, dest_target, LFO_COUNT),
-    OSC_SUBARRAY("/hds/lfo/%d/phase_offset", lfo, PackLfoParams, phase_offset, LFO_COUNT),
-    OSC_SUBARRAY("/hds/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT),
+    OSC_PSUBARRAY("/hds/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT),
+    OSC_PSUBARRAY("/hds/lfo/%d/rate", lfo, PackLfoParams, rate_hz, LFO_COUNT),
+    OSC_PSUBARRAY("/hds/lfo/%d/depth", lfo, PackLfoParams, mod_depth, LFO_COUNT),
+    OSC_PSUBARRAY("/hds/lfo/%d/key_sync", lfo, PackLfoParams, key_sync, LFO_COUNT),
+    OSC_PSUBARRAY("/hds/lfo/%d/dest", lfo, PackLfoParams, dest_target, LFO_COUNT),
+    OSC_PSUBARRAY("/hds/lfo/%d/phase_offset", lfo, PackLfoParams, phase_offset, LFO_COUNT),
+    OSC_PSUBARRAY("/hds/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT),
 
     // --- Assignable EG modulators ---
-    OSC_ARRAY("/hds/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT),
-    OSC_ARRAY("/hds/eg_mod/%d/dest", eg_dest_target, ASSIGNABLE_EG_COUNT),
+    OSC_PARRAY("/hds/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT),
+    OSC_PARRAY("/hds/eg_mod/%d/dest", eg_dest_target, ASSIGNABLE_EG_COUNT),
 
     // --- Unison Saw ---
-    OSC_SCALAR("/hds/vco1/unison/detune", vco1_unison_saw_detune),
-    OSC_SCALAR("/hds/vco1/unison/width", vco1_unison_saw_width),
-    OSC_SCALAR("/hds/vco2/unison/detune", vco2_unison_saw_detune),
-    OSC_SCALAR("/hds/vco2/unison/width", vco2_unison_saw_width),
-    OSC_SCALAR("/hds/vco3/unison/detune", vco3_unison_saw_detune),
-    OSC_SCALAR("/hds/vco3/unison/width", vco3_unison_saw_width),
-    OSC_SCALAR("/hds/vco4/unison/detune", vco4_unison_saw_detune),
-    OSC_SCALAR("/hds/vco4/unison/width", vco4_unison_saw_width),
+    OSC_PSCALAR("/hds/vco1/unison/detune", vco1_unison_saw_detune),
+    OSC_PSCALAR("/hds/vco1/unison/width", vco1_unison_saw_width),
+    OSC_PSCALAR("/hds/vco2/unison/detune", vco2_unison_saw_detune),
+    OSC_PSCALAR("/hds/vco2/unison/width", vco2_unison_saw_width),
+    OSC_PSCALAR("/hds/vco3/unison/detune", vco3_unison_saw_detune),
+    OSC_PSCALAR("/hds/vco3/unison/width", vco3_unison_saw_width),
+    OSC_PSCALAR("/hds/vco4/unison/detune", vco4_unison_saw_detune),
+    OSC_PSCALAR("/hds/vco4/unison/width", vco4_unison_saw_width),
 
-    OSC_SCALAR("/hds/mono_glide_random", mono_glide_random),
-    OSC_SCALAR("/hds/vco1/mute", vco1_mute),
-    OSC_SCALAR("/hds/vco2/mute", vco2_mute),
-    OSC_SCALAR("/hds/hard_sync_mode", hard_sync_mode),
-    OSC_SCALAR("/hds/vco1/phase_offset", vco1_phase_offset),
-    OSC_SCALAR("/hds/vco2/phase_offset", vco2_phase_offset),
-    OSC_SCALAR("/hds/vco1/pulse_width", vco1_pulse_width),
-    OSC_SCALAR("/hds/vco2/pulse_width", vco2_pulse_width),
+    OSC_PSCALAR("/hds/mono_glide_random", mono_glide_random),
+    OSC_PSCALAR("/hds/vco1/mute", vco1_mute),
+    OSC_PSCALAR("/hds/vco2/mute", vco2_mute),
+    OSC_PSCALAR("/hds/hard_sync_mode", hard_sync_mode),
+    OSC_PSCALAR("/hds/vco1/phase_offset", vco1_phase_offset),
+    OSC_PSCALAR("/hds/vco2/phase_offset", vco2_phase_offset),
+    OSC_PSCALAR("/hds/vco1/pulse_width", vco1_pulse_width),
+    OSC_PSCALAR("/hds/vco2/pulse_width", vco2_pulse_width),
 
-    OSC_SCALAR("/hds/vco3/vol", vco3_vol),
-    OSC_SCALAR("/hds/vco3/pan", vco3_pan),
-    OSC_SCALAR("/hds/vco3/mute", vco3_mute),
-    OSC_SCALAR("/hds/vco3/pulse_width", vco3_pulse_width),
-    OSC_SCALAR("/hds/vco4/vol", vco4_vol),
-    OSC_SCALAR("/hds/vco4/pan", vco4_pan),
-    OSC_SCALAR("/hds/vco4/mute", vco4_mute),
-    OSC_SCALAR("/hds/vco4/pulse_width", vco4_pulse_width),
+    OSC_PSCALAR("/hds/vco3/vol", vco3_vol),
+    OSC_PSCALAR("/hds/vco3/pan", vco3_pan),
+    OSC_PSCALAR("/hds/vco3/mute", vco3_mute),
+    OSC_PSCALAR("/hds/vco3/pulse_width", vco3_pulse_width),
+    OSC_PSCALAR("/hds/vco4/vol", vco4_vol),
+    OSC_PSCALAR("/hds/vco4/pan", vco4_pan),
+    OSC_PSCALAR("/hds/vco4/mute", vco4_mute),
+    OSC_PSCALAR("/hds/vco4/pulse_width", vco4_pulse_width),
 
     OSC_ARRAY("/hds/ext_in/%d/enable", ext_in_enable, EXT_IN_PAIR_COUNT),
     OSC_ARRAY("/hds/ext_in/%d/gain", ext_in_gain, EXT_IN_PAIR_COUNT),
@@ -2637,9 +2682,9 @@ static const OscParamEntry OSC_PARAMS[] = {
     // --- Multi-output hardware routing: which output pair(s) each source lands on ---
     OSC_NESTED("/hds/routing/%d/out/%d", source_routing, SourceRouting, enable, SOURCE_COUNT, OUTPUT_PAIR_MAX),
 
-    OSC_SCALAR("/hds/pb/range_up", pb_range_up),
-    OSC_SCALAR("/hds/pb/range_down", pb_range_down),
-    OSC_SCALAR("/hds/sustain/polarity", sustain_pedal_polarity),
+    OSC_PSCALAR("/hds/pb/range_up", pb_range_up),
+    OSC_PSCALAR("/hds/pb/range_down", pb_range_down),
+    OSC_PSCALAR("/hds/sustain/polarity", sustain_pedal_polarity),
     OSC_SCALAR("/hds/audio/latency_ms", audio_latency_ms),
     OSC_SCALAR("/hds/audio/polyphony", active_voice_limit),
     OSC_SCALAR("/hds/audio/block_size", block_size_frames),
@@ -2650,33 +2695,33 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_ARRAY("/hds/record/channel/%d/enable", record_input_channel_enable, RECORD_MAX_CHANNELS),
     OSC_SCALAR("/hds/record/format", record_format),
 
-    OSC_SCALAR("/hds/tempo/bpm", tempo_bpm),
-    OSC_SCALAR("/hds/tempo/marker_count", tempo_marker_count),
-    OSC_ARRAY("/hds/tempo/marker/%d/time", tempo_marker_time, TEMPO_MARKER_MAX),
-    OSC_ARRAY("/hds/tempo/marker/%d/bpm", tempo_marker_bpm, TEMPO_MARKER_MAX),
+    OSC_PSCALAR("/hds/tempo/bpm", tempo_bpm),
+    OSC_PSCALAR("/hds/tempo/marker_count", tempo_marker_count),
+    OSC_PARRAY("/hds/tempo/marker/%d/time", tempo_marker_time, TEMPO_MARKER_MAX),
+    OSC_PARRAY("/hds/tempo/marker/%d/bpm", tempo_marker_bpm, TEMPO_MARKER_MAX),
 
-    OSC_SCALAR("/hds/vco3/shape", vco3_shape),
-    OSC_SCALAR("/hds/vco3/fine_tune", vco3_fine_tune),
-    OSC_SCALAR("/hds/vco3/pitch_offset", vco3_pitch_offset),
-    OSC_SCALAR("/hds/vco3/phase_offset", vco3_phase_offset),
-    OSC_SCALAR("/hds/vco4/shape", vco4_shape),
-    OSC_SCALAR("/hds/vco4/fine_tune", vco4_fine_tune),
-    OSC_SCALAR("/hds/vco4/pitch_offset", vco4_pitch_offset),
-    OSC_SCALAR("/hds/vco4/phase_offset", vco4_phase_offset),
+    OSC_PSCALAR("/hds/vco3/shape", vco3_shape),
+    OSC_PSCALAR("/hds/vco3/fine_tune", vco3_fine_tune),
+    OSC_PSCALAR("/hds/vco3/pitch_offset", vco3_pitch_offset),
+    OSC_PSCALAR("/hds/vco3/phase_offset", vco3_phase_offset),
+    OSC_PSCALAR("/hds/vco4/shape", vco4_shape),
+    OSC_PSCALAR("/hds/vco4/fine_tune", vco4_fine_tune),
+    OSC_PSCALAR("/hds/vco4/pitch_offset", vco4_pitch_offset),
+    OSC_PSCALAR("/hds/vco4/phase_offset", vco4_phase_offset),
 
-    OSC_SCALAR("/hds/fm/algorithm", fm_algorithm),
-    OSC_SCALAR("/hds/fm/depth/3_1", fm_depth_3_1),
-    OSC_SCALAR("/hds/fm/depth/3_2", fm_depth_3_2),
-    OSC_SCALAR("/hds/fm/depth/4_1", fm_depth_4_1),
-    OSC_SCALAR("/hds/fm/depth/4_3", fm_depth_4_3),
-    OSC_SCALAR("/hds/fm/depth/1_2", fm_depth_1_2),
-    OSC_SCALAR("/hds/fm/depth/3_4", fm_depth_3_4),
-    OSC_SCALAR("/hds/fm/depth/1_3", fm_depth_1_3),
+    OSC_PSCALAR("/hds/fm/algorithm", fm_algorithm),
+    OSC_PSCALAR("/hds/fm/depth/3_1", fm_depth_3_1),
+    OSC_PSCALAR("/hds/fm/depth/3_2", fm_depth_3_2),
+    OSC_PSCALAR("/hds/fm/depth/4_1", fm_depth_4_1),
+    OSC_PSCALAR("/hds/fm/depth/4_3", fm_depth_4_3),
+    OSC_PSCALAR("/hds/fm/depth/1_2", fm_depth_1_2),
+    OSC_PSCALAR("/hds/fm/depth/3_4", fm_depth_3_4),
+    OSC_PSCALAR("/hds/fm/depth/1_3", fm_depth_1_3),
 
-    OSC_SCALAR("/hds/vco1/pitch", vco1_pitch),
-    OSC_SCALAR("/hds/vco2/pitch", vco2_pitch),
-    OSC_SCALAR("/hds/vco3/pitch", vco3_pitch),
-    OSC_SCALAR("/hds/vco4/pitch", vco4_pitch),
+    OSC_PSCALAR("/hds/vco1/pitch", vco1_pitch),
+    OSC_PSCALAR("/hds/vco2/pitch", vco2_pitch),
+    OSC_PSCALAR("/hds/vco3/pitch", vco3_pitch),
+    OSC_PSCALAR("/hds/vco4/pitch", vco4_pitch),
 
     // --- Combi/Sequencer scaffolding (see SEQ_LANE_COUNT's own comment) ---
     OSC_SCALAR("/hds/performance_mode", performance_mode),
@@ -2691,6 +2736,8 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/seq/transport/play", seq_transport_play_trigger),
     OSC_SCALAR("/hds/seq/transport/pause", seq_transport_pause_trigger),
     OSC_SCALAR("/hds/seq/transport/stop", seq_transport_stop_trigger),
+
+    OSC_ARRAY("/hds/combi/%d/midi_channel", combi_lane_midi_channel, COMBI_PROGRAM_COUNT),
 
     OSC_STRING("/hds/device/output", output_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/input", input_device, AUDIO_DEVICE_NAME_LEN),
@@ -2767,62 +2814,69 @@ static void osc_error_handler(int num, const char *msg, const char *path) {
 
 // FIXED: Restored 'init_default_controls' macro mapping setup routine missing from compilation stack
 static void init_default_controls(SynthSharedControls *knobs) {
-    knobs->is_polyphonic = 1.0f; knobs->vco1_shape = 0.0f; knobs->vco2_shape = 3.0f;
-    knobs->fm_intensity = 0.0f; knobs->vco1_vol = 0.8f; knobs->vco2_vol = 0.5f;
-    knobs->portamento_time_ms = 150.0f; knobs->master_volume = 0.50f;
-    knobs->vco1_pan = 0.0f; knobs->vco2_pan = 0.0f;
-    knobs->vco1_fine_tune = 0.0f; knobs->vco2_pitch_offset = 0.0f; knobs->vco2_fine_tune = 0.0f;
-    knobs->filter_ab_routing_mode = 0.0f; // Series A->B: mixer -> A -> B
+    knobs->programs[0].is_polyphonic = 1.0f; knobs->programs[0].vco1_shape = 0.0f; knobs->programs[0].vco2_shape = 3.0f;
+    knobs->programs[0].fm_intensity = 0.0f; knobs->programs[0].vco1_vol = 0.8f; knobs->programs[0].vco2_vol = 0.5f;
+    knobs->programs[0].portamento_time_ms = 150.0f; knobs->master_volume = 0.50f;
+    knobs->programs[0].vco1_pan = 0.0f; knobs->programs[0].vco2_pan = 0.0f;
+    knobs->programs[0].vco1_fine_tune = 0.0f; knobs->programs[0].vco2_pitch_offset = 0.0f; knobs->programs[0].vco2_fine_tune = 0.0f;
+    knobs->programs[0].filter_ab_routing_mode = 0.0f; // Series A->B: mixer -> A -> B
     // Independent Parallel-mode level/pan (replaces the old single filter_ab_blend crossfade --
     // see the Filter Routing plan). 50/50 level, centered pan reproduces the old blend=50 default
     // output level exactly (the pan formula is unity-gain at pan=0 by construction).
-    knobs->filter_a_level = 50.0f; knobs->filter_b_level = 50.0f;
-    knobs->filter_a_pan = 0.0f; knobs->filter_b_pan = 0.0f;
-    knobs->filter_a_mode = 0.0f; // Normal (single filter)
+    knobs->programs[0].filter_a_level = 50.0f; knobs->programs[0].filter_b_level = 50.0f;
+    knobs->programs[0].filter_a_pan = 0.0f; knobs->programs[0].filter_b_pan = 0.0f;
+    knobs->programs[0].filter_a_mode = 0.0f; // Normal (single filter)
     // Multi Filter blend defaults: every filter unit below reproduces its exact old behavior as a
     // one-hot Mode 1 blend (100% of exactly the tap the old exclusive filter_type picked) with
     // crossfade=0, so Mode 2's own values never contribute at the default and are left zeroed.
-    knobs->filter_a.cutoff = 800.0f; knobs->filter_a.res_q = 20.0f; knobs->filter_a.slope_poles = 0.0f; knobs->filter_a.filter_type = 1.0f;
-    knobs->filter_a.mode1_lp = 100.0f; knobs->filter_a.mode1_bp = 0.0f; knobs->filter_a.mode1_hp = 0.0f; knobs->filter_a.mode1_notch = 0.0f; knobs->filter_a.mode1_dry = 0.0f;
-    knobs->filter_a.mode2_lp = 0.0f; knobs->filter_a.mode2_bp = 0.0f; knobs->filter_a.mode2_hp = 0.0f; knobs->filter_a.mode2_notch = 0.0f; knobs->filter_a.mode2_dry = 0.0f;
-    knobs->filter_a.crossfade = 0.0f;
-    knobs->filter_a_multi_routing = 0.0f; // Series, matching the old default 3-filter behavior
+    knobs->programs[0].filter_a.cutoff = 800.0f; knobs->programs[0].filter_a.res_q = 20.0f; knobs->programs[0].filter_a.slope_poles = 0.0f; knobs->programs[0].filter_a.filter_type = 1.0f;
+    knobs->programs[0].filter_a.mode1_lp = 100.0f; knobs->programs[0].filter_a.mode1_bp = 0.0f; knobs->programs[0].filter_a.mode1_hp = 0.0f; knobs->programs[0].filter_a.mode1_notch = 0.0f; knobs->programs[0].filter_a.mode1_dry = 0.0f;
+    knobs->programs[0].filter_a.mode2_lp = 0.0f; knobs->programs[0].filter_a.mode2_bp = 0.0f; knobs->programs[0].filter_a.mode2_hp = 0.0f; knobs->programs[0].filter_a.mode2_notch = 0.0f; knobs->programs[0].filter_a.mode2_dry = 0.0f;
+    knobs->programs[0].filter_a.crossfade = 0.0f;
+    knobs->programs[0].filter_a_multi_routing = 0.0f; // Series, matching the old default 3-filter behavior
     for(int f=0; f<3; f++) {
-        knobs->filter_a_multi[f].cutoff = 400.0f + (f*200); knobs->filter_a_multi[f].res_q = 20.0f; knobs->filter_a_multi[f].slope_poles = 0.0f; knobs->filter_a_multi[f].filter_type = 1.0f;
-        knobs->filter_a_multi[f].mode1_lp = 100.0f; knobs->filter_a_multi[f].mode1_bp = 0.0f; knobs->filter_a_multi[f].mode1_hp = 0.0f; knobs->filter_a_multi[f].mode1_notch = 0.0f; knobs->filter_a_multi[f].mode1_dry = 0.0f;
-        knobs->filter_a_multi[f].mode2_lp = 0.0f; knobs->filter_a_multi[f].mode2_bp = 0.0f; knobs->filter_a_multi[f].mode2_hp = 0.0f; knobs->filter_a_multi[f].mode2_notch = 0.0f; knobs->filter_a_multi[f].mode2_dry = 0.0f;
-        knobs->filter_a_multi[f].crossfade = 0.0f;
+        knobs->programs[0].filter_a_multi[f].cutoff = 400.0f + (f*200); knobs->programs[0].filter_a_multi[f].res_q = 20.0f; knobs->programs[0].filter_a_multi[f].slope_poles = 0.0f; knobs->programs[0].filter_a_multi[f].filter_type = 1.0f;
+        knobs->programs[0].filter_a_multi[f].mode1_lp = 100.0f; knobs->programs[0].filter_a_multi[f].mode1_bp = 0.0f; knobs->programs[0].filter_a_multi[f].mode1_hp = 0.0f; knobs->programs[0].filter_a_multi[f].mode1_notch = 0.0f; knobs->programs[0].filter_a_multi[f].mode1_dry = 0.0f;
+        knobs->programs[0].filter_a_multi[f].mode2_lp = 0.0f; knobs->programs[0].filter_a_multi[f].mode2_bp = 0.0f; knobs->programs[0].filter_a_multi[f].mode2_hp = 0.0f; knobs->programs[0].filter_a_multi[f].mode2_notch = 0.0f; knobs->programs[0].filter_a_multi[f].mode2_dry = 0.0f;
+        knobs->programs[0].filter_a_multi[f].crossfade = 0.0f;
     }
-    knobs->filter_b.cutoff = 4000.0f; knobs->filter_b.res_q = 20.0f; knobs->filter_b.slope_poles = 0.0f; knobs->filter_b.filter_type = 0.0f; // Off by default -- Filter A alone matches old single-filter-ish defaults
-    knobs->filter_b.mode1_lp = 100.0f; knobs->filter_b.mode1_bp = 0.0f; knobs->filter_b.mode1_hp = 0.0f; knobs->filter_b.mode1_notch = 0.0f; knobs->filter_b.mode1_dry = 0.0f;
-    knobs->filter_b.mode2_lp = 0.0f; knobs->filter_b.mode2_bp = 0.0f; knobs->filter_b.mode2_hp = 0.0f; knobs->filter_b.mode2_notch = 0.0f; knobs->filter_b.mode2_dry = 0.0f;
-    knobs->filter_b.crossfade = 0.0f;
-    for(int l=0; l<LFO_COUNT; l++) { knobs->lfo[l].wave_type = 0.0f; knobs->lfo[l].rate_hz = 5.0f; knobs->lfo[l].mod_depth = 0.0f; knobs->lfo[l].key_sync = 1.0f; knobs->lfo[l].dest_target = 0.0f; knobs->lfo[l].phase_offset = 0.0f; knobs->lfo[l].mod_source_cc = -1.0f; }
-    for(int e=0; e<ENV_COUNT; e++) { knobs->eg[e].d = 0.0f; knobs->eg[e].h = 0.0f; knobs->eg[e].a = 10.0f; knobs->eg[e].dec = 150.0f; knobs->eg[e].s = 80.0f; knobs->eg[e].r = 300.0f; knobs->eg[e].al = 0.0f; knobs->eg[e].pk = 100.0f; knobs->eg_mode[e] = 0.0f; }
-    for(int i=0; i<ASSIGNABLE_EG_COUNT; i++) { knobs->eg_intensity[i] = 1.0f; knobs->eg_dest_target[i] = 0.0f; }
+    knobs->programs[0].filter_b.cutoff = 4000.0f; knobs->programs[0].filter_b.res_q = 20.0f; knobs->programs[0].filter_b.slope_poles = 0.0f; knobs->programs[0].filter_b.filter_type = 0.0f; // Off by default -- Filter A alone matches old single-filter-ish defaults
+    knobs->programs[0].filter_b.mode1_lp = 100.0f; knobs->programs[0].filter_b.mode1_bp = 0.0f; knobs->programs[0].filter_b.mode1_hp = 0.0f; knobs->programs[0].filter_b.mode1_notch = 0.0f; knobs->programs[0].filter_b.mode1_dry = 0.0f;
+    knobs->programs[0].filter_b.mode2_lp = 0.0f; knobs->programs[0].filter_b.mode2_bp = 0.0f; knobs->programs[0].filter_b.mode2_hp = 0.0f; knobs->programs[0].filter_b.mode2_notch = 0.0f; knobs->programs[0].filter_b.mode2_dry = 0.0f;
+    knobs->programs[0].filter_b.crossfade = 0.0f;
+    for(int l=0; l<LFO_COUNT; l++) { knobs->programs[0].lfo[l].wave_type = 0.0f; knobs->programs[0].lfo[l].rate_hz = 5.0f; knobs->programs[0].lfo[l].mod_depth = 0.0f; knobs->programs[0].lfo[l].key_sync = 1.0f; knobs->programs[0].lfo[l].dest_target = 0.0f; knobs->programs[0].lfo[l].phase_offset = 0.0f; knobs->programs[0].lfo[l].mod_source_cc = -1.0f; }
+    for(int e=0; e<ENV_COUNT; e++) { knobs->programs[0].eg[e].d = 0.0f; knobs->programs[0].eg[e].h = 0.0f; knobs->programs[0].eg[e].a = 10.0f; knobs->programs[0].eg[e].dec = 150.0f; knobs->programs[0].eg[e].s = 80.0f; knobs->programs[0].eg[e].r = 300.0f; knobs->programs[0].eg[e].al = 0.0f; knobs->programs[0].eg[e].pk = 100.0f; knobs->programs[0].eg_mode[e] = 0.0f; }
+    for(int i=0; i<ASSIGNABLE_EG_COUNT; i++) { knobs->programs[0].eg_intensity[i] = 1.0f; knobs->programs[0].eg_dest_target[i] = 0.0f; }
     // Subtle default detune (matches the old fixed +/-1.5% spread) and no width until the user asks for it
-    knobs->vco1_unison_saw_detune = 25.0f; knobs->vco1_unison_saw_width = 50.0f;
-    knobs->vco2_unison_saw_detune = 25.0f; knobs->vco2_unison_saw_width = 50.0f;
-    knobs->mono_glide_random = 0.0f;
-    knobs->vco1_mute = 0.0f; knobs->vco2_mute = 0.0f;
-    knobs->hard_sync_mode = 0.0f;
-    knobs->vco1_phase_offset = 0.0f; knobs->vco2_phase_offset = 0.0f;
+    knobs->programs[0].vco1_unison_saw_detune = 25.0f; knobs->programs[0].vco1_unison_saw_width = 50.0f;
+    knobs->programs[0].vco2_unison_saw_detune = 25.0f; knobs->programs[0].vco2_unison_saw_width = 50.0f;
+    knobs->programs[0].mono_glide_random = 0.0f;
+    knobs->programs[0].vco1_mute = 0.0f; knobs->programs[0].vco2_mute = 0.0f;
+    knobs->programs[0].hard_sync_mode = 0.0f;
+    knobs->programs[0].vco1_phase_offset = 0.0f; knobs->programs[0].vco2_phase_offset = 0.0f;
 
-    knobs->vco1_pulse_width = 50.0f; knobs->vco2_pulse_width = 50.0f;
-    knobs->vco3_vol = 0.0f; knobs->vco3_pan = 0.0f; knobs->vco3_mute = 0.0f; knobs->vco3_pulse_width = 0.0f;
-    knobs->vco3_shape = (float)WAVE_NOISE; knobs->vco3_fine_tune = 0.0f; knobs->vco3_pitch_offset = 0.0f;
-    knobs->vco3_phase_offset = 0.0f; knobs->vco3_unison_saw_detune = 25.0f; knobs->vco3_unison_saw_width = 50.0f;
-    knobs->vco4_vol = 0.0f; knobs->vco4_pan = 0.0f; knobs->vco4_mute = 0.0f; knobs->vco4_pulse_width = 50.0f;
-    knobs->vco4_shape = (float)WAVE_OFF; knobs->vco4_fine_tune = 0.0f; knobs->vco4_pitch_offset = 0.0f;
-    knobs->vco4_phase_offset = 0.0f; knobs->vco4_unison_saw_detune = 25.0f; knobs->vco4_unison_saw_width = 50.0f;
-    knobs->fm_algorithm = 0.0f;
-    knobs->fm_depth_3_1 = 0.0f; knobs->fm_depth_3_2 = 0.0f;
-    knobs->fm_depth_4_1 = 0.0f; knobs->fm_depth_4_3 = 0.0f;
-    knobs->fm_depth_1_2 = 0.0f; knobs->fm_depth_3_4 = 0.0f; knobs->fm_depth_1_3 = 0.0f;
-    knobs->vco1_pitch = 0.0f; knobs->vco2_pitch = 0.0f; knobs->vco3_pitch = 0.0f; knobs->vco4_pitch = 0.0f;
+    knobs->programs[0].vco1_pulse_width = 50.0f; knobs->programs[0].vco2_pulse_width = 50.0f;
+    knobs->programs[0].vco3_vol = 0.0f; knobs->programs[0].vco3_pan = 0.0f; knobs->programs[0].vco3_mute = 0.0f; knobs->programs[0].vco3_pulse_width = 0.0f;
+    knobs->programs[0].vco3_shape = (float)WAVE_NOISE; knobs->programs[0].vco3_fine_tune = 0.0f; knobs->programs[0].vco3_pitch_offset = 0.0f;
+    knobs->programs[0].vco3_phase_offset = 0.0f; knobs->programs[0].vco3_unison_saw_detune = 25.0f; knobs->programs[0].vco3_unison_saw_width = 50.0f;
+    knobs->programs[0].vco4_vol = 0.0f; knobs->programs[0].vco4_pan = 0.0f; knobs->programs[0].vco4_mute = 0.0f; knobs->programs[0].vco4_pulse_width = 50.0f;
+    knobs->programs[0].vco4_shape = (float)WAVE_OFF; knobs->programs[0].vco4_fine_tune = 0.0f; knobs->programs[0].vco4_pitch_offset = 0.0f;
+    knobs->programs[0].vco4_phase_offset = 0.0f; knobs->programs[0].vco4_unison_saw_detune = 25.0f; knobs->programs[0].vco4_unison_saw_width = 50.0f;
+    knobs->programs[0].fm_algorithm = 0.0f;
+    knobs->programs[0].fm_depth_3_1 = 0.0f; knobs->programs[0].fm_depth_3_2 = 0.0f;
+    knobs->programs[0].fm_depth_4_1 = 0.0f; knobs->programs[0].fm_depth_4_3 = 0.0f;
+    knobs->programs[0].fm_depth_1_2 = 0.0f; knobs->programs[0].fm_depth_3_4 = 0.0f; knobs->programs[0].fm_depth_1_3 = 0.0f;
+    knobs->programs[0].vco1_pitch = 0.0f; knobs->programs[0].vco2_pitch = 0.0f; knobs->programs[0].vco3_pitch = 0.0f; knobs->programs[0].vco4_pitch = 0.0f;
     // Osc 3/4 Amp envelopes live at eg[2]/eg[3] (and eg_mode[2]/eg_mode[3]) and were covered by
     // the generic `for(int e=0; e<ENV_COUNT; e++)` default-fill loop above -- nothing extra
     // needed here.
+
+    // Programs 1-7 (Combi mode's remaining lanes, inert until a real per-lane Program picker
+    // loads something onto them -- see the "Real Combi mode" plan's Phase 5) start from the exact
+    // same sane, musical defaults as programs[0] above, not raw zero-init -- a plain struct copy
+    // is safe here since ProgramState holds no pointers. Whatever gets loaded onto a lane later
+    // simply overwrites this.
+    for (int p = 1; p < COMBI_PROGRAM_COUNT; p++) knobs->programs[p] = knobs->programs[0];
 
     // ext_in_gain defaults to 0.0 (silence/-inf), not unity: an upstream mic pre or interface
     // could already be set hot, and External Input must never be able to burst into the FX bus
@@ -2845,8 +2899,8 @@ static void init_default_controls(SynthSharedControls *knobs) {
         for (int o = 0; o < OUTPUT_PAIR_MAX; o++) knobs->source_routing[s].enable[o] = 0.0f;
     }
     knobs->source_routing[0].enable[0] = 1.0f; // Program -> output pair 0 (today's only output)
-    knobs->pb_range_up = 2.0f; knobs->pb_range_down = 2.0f; // standard +/-2 semitone default
-    knobs->sustain_pedal_polarity = 0.0f; // Normal
+    knobs->programs[0].pb_range_up = 2.0f; knobs->programs[0].pb_range_down = 2.0f; // standard +/-2 semitone default
+    knobs->programs[0].sustain_pedal_polarity = 0.0f; // Normal
     knobs->audio_latency_ms = 25.0f; // matches the old hardcoded 25ms target -- no behavior change by default
     knobs->active_voice_limit = 32.0f; // matches the last-measured-safe default -- live-adjustable from here
     knobs->block_size_frames = 128.0f; // matches the old hardcoded BUFFER_SIZE -- no behavior change by default
@@ -2856,9 +2910,9 @@ static void init_default_controls(SynthSharedControls *knobs) {
     for (int c = 0; c < RECORD_MAX_CHANNELS; c++) knobs->record_input_channel_enable[c] = 0.0f;
     knobs->record_path[0] = '\0';
     knobs->record_format = 0.0f; // WAV
-    knobs->tempo_bpm = 120.0f; // a common, neutral default tempo
-    knobs->tempo_marker_count = 0.0f; // no tempo map programmed -- tempo_bpm alone applies
-    for (int t = 0; t < TEMPO_MARKER_MAX; t++) { knobs->tempo_marker_time[t] = 0.0f; knobs->tempo_marker_bpm[t] = 0.0f; }
+    knobs->programs[0].tempo_bpm = 120.0f; // a common, neutral default tempo
+    knobs->programs[0].tempo_marker_count = 0.0f; // no tempo map programmed -- tempo_bpm alone applies
+    for (int t = 0; t < TEMPO_MARKER_MAX; t++) { knobs->programs[0].tempo_marker_time[t] = 0.0f; knobs->programs[0].tempo_marker_bpm[t] = 0.0f; }
     // No sample-bank defaults to fill here -- the Sample Bank isn't part of this struct anymore
     // (see its own dedicated socket/g_sample_slots[]).
     // Combi/Sequencer scaffolding: Single Program (today's only real mode) by default, every
@@ -2877,6 +2931,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->seq_transport_play_trigger = 0.0f;
     knobs->seq_transport_pause_trigger = 0.0f;
     knobs->seq_transport_stop_trigger = 0.0f;
+    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) knobs->combi_lane_midi_channel[p] = 0.0f; // Omni
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -4430,27 +4485,27 @@ typedef struct {
 #define FM_ALGORITHM_COUNT 12
 static const FmAlgorithm FM_ALGORITHMS[FM_ALGORITHM_COUNT] = {
     // 0: Classic (default) -- 2->1
-    { {1,0,2,3}, 1, { {1,0, offsetof(SynthSharedControls, fm_intensity)} } },
+    { {1,0,2,3}, 1, { {1,0, offsetof(SynthSharedControls, programs[0].fm_intensity)} } },
     // 1: 3-Op Chain, Osc4 independent -- 3->2->1
-    { {2,1,0,3}, 2, { {2,1, offsetof(SynthSharedControls, fm_depth_3_2)}, {1,0, offsetof(SynthSharedControls, fm_intensity)} } },
+    { {2,1,0,3}, 2, { {2,1, offsetof(SynthSharedControls, programs[0].fm_depth_3_2)}, {1,0, offsetof(SynthSharedControls, programs[0].fm_intensity)} } },
     // 2: 4-Op Chain -- 4->3->2->1
-    { {3,2,1,0}, 3, { {3,2, offsetof(SynthSharedControls, fm_depth_4_3)}, {2,1, offsetof(SynthSharedControls, fm_depth_3_2)}, {1,0, offsetof(SynthSharedControls, fm_intensity)} } },
+    { {3,2,1,0}, 3, { {3,2, offsetof(SynthSharedControls, programs[0].fm_depth_4_3)}, {2,1, offsetof(SynthSharedControls, programs[0].fm_depth_3_2)}, {1,0, offsetof(SynthSharedControls, programs[0].fm_intensity)} } },
     // 3: Dual Serial Pairs -- 4->3, 2->1
-    { {3,2,1,0}, 2, { {3,2, offsetof(SynthSharedControls, fm_depth_4_3)}, {1,0, offsetof(SynthSharedControls, fm_intensity)} } },
+    { {3,2,1,0}, 2, { {3,2, offsetof(SynthSharedControls, programs[0].fm_depth_4_3)}, {1,0, offsetof(SynthSharedControls, programs[0].fm_intensity)} } },
     // 4: Many-to-One into 1 -- 3->1, 4->1
-    { {2,3,0,1}, 2, { {2,0, offsetof(SynthSharedControls, fm_depth_3_1)}, {3,0, offsetof(SynthSharedControls, fm_depth_4_1)} } },
+    { {2,3,0,1}, 2, { {2,0, offsetof(SynthSharedControls, programs[0].fm_depth_3_1)}, {3,0, offsetof(SynthSharedControls, programs[0].fm_depth_4_1)} } },
     // 5: One-to-Many from 3 -- 3->1, 3->2
-    { {2,0,1,3}, 2, { {2,0, offsetof(SynthSharedControls, fm_depth_3_1)}, {2,1, offsetof(SynthSharedControls, fm_depth_3_2)} } },
+    { {2,0,1,3}, 2, { {2,0, offsetof(SynthSharedControls, programs[0].fm_depth_3_1)}, {2,1, offsetof(SynthSharedControls, programs[0].fm_depth_3_2)} } },
     // 6: Many-to-One into 2 -- 1->2, 3->2
-    { {0,2,1,3}, 2, { {0,1, offsetof(SynthSharedControls, fm_depth_1_2)}, {2,1, offsetof(SynthSharedControls, fm_depth_3_2)} } },
+    { {0,2,1,3}, 2, { {0,1, offsetof(SynthSharedControls, programs[0].fm_depth_1_2)}, {2,1, offsetof(SynthSharedControls, programs[0].fm_depth_3_2)} } },
     // 7: 4->1 direct, 2/3 independent
-    { {3,0,1,2}, 1, { {3,0, offsetof(SynthSharedControls, fm_depth_4_1)} } },
+    { {3,0,1,2}, 1, { {3,0, offsetof(SynthSharedControls, programs[0].fm_depth_4_1)} } },
     // 8: Dual Independent Pairs -- 1->2, 3->4
-    { {0,1,2,3}, 2, { {0,1, offsetof(SynthSharedControls, fm_depth_1_2)}, {2,3, offsetof(SynthSharedControls, fm_depth_3_4)} } },
+    { {0,1,2,3}, 2, { {0,1, offsetof(SynthSharedControls, programs[0].fm_depth_1_2)}, {2,3, offsetof(SynthSharedControls, programs[0].fm_depth_3_4)} } },
     // 9: 1->3->4, Osc2 independent
-    { {0,2,3,1}, 2, { {0,2, offsetof(SynthSharedControls, fm_depth_1_3)}, {2,3, offsetof(SynthSharedControls, fm_depth_3_4)} } },
+    { {0,2,3,1}, 2, { {0,2, offsetof(SynthSharedControls, programs[0].fm_depth_1_3)}, {2,3, offsetof(SynthSharedControls, programs[0].fm_depth_3_4)} } },
     // 10: Star: 2/3/4 all into 1
-    { {1,2,3,0}, 3, { {1,0, offsetof(SynthSharedControls, fm_intensity)}, {2,0, offsetof(SynthSharedControls, fm_depth_3_1)}, {3,0, offsetof(SynthSharedControls, fm_depth_4_1)} } },
+    { {1,2,3,0}, 3, { {1,0, offsetof(SynthSharedControls, programs[0].fm_intensity)}, {2,0, offsetof(SynthSharedControls, programs[0].fm_depth_3_1)}, {3,0, offsetof(SynthSharedControls, programs[0].fm_depth_4_1)} } },
     // 11: All independent
     { {0,1,2,3}, 0, { {0,0,0}, {0,0,0}, {0,0,0} } },
 };
@@ -4556,49 +4611,49 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         // WAVE_SAMPLE: (re)claim a DFD stream for whichever oscillator is currently set to it,
         // and release any stream a stolen/retriggered voice was still holding from a previous
         // note even if this new note doesn't need one -- see start_sample_osc()'s comment.
-        if ((WaveType)((int)knobs->vco1_shape) == WAVE_SAMPLE) {
+        if ((WaveType)((int)knobs->programs[0].vco1_shape) == WAVE_SAMPLE) {
             start_sample_osc(&voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, note, velocity);
         } else if (voices[slot].vco1_sample_stream >= 0) {
             release_sample_stream(voices[slot].vco1_sample_stream);
             voices[slot].vco1_sample_stream = -1;
         }
-        if ((WaveType)((int)knobs->vco2_shape) == WAVE_SAMPLE) {
+        if ((WaveType)((int)knobs->programs[0].vco2_shape) == WAVE_SAMPLE) {
             start_sample_osc(&voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, note, velocity);
         } else if (voices[slot].vco2_sample_stream >= 0) {
             release_sample_stream(voices[slot].vco2_sample_stream);
             voices[slot].vco2_sample_stream = -1;
         }
-        if ((WaveType)((int)knobs->vco3_shape) == WAVE_SAMPLE) {
+        if ((WaveType)((int)knobs->programs[0].vco3_shape) == WAVE_SAMPLE) {
             start_sample_osc(&voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, note, velocity);
         } else if (voices[slot].vco3_sample_stream >= 0) {
             release_sample_stream(voices[slot].vco3_sample_stream);
             voices[slot].vco3_sample_stream = -1;
         }
-        if ((WaveType)((int)knobs->vco4_shape) == WAVE_SAMPLE) {
+        if ((WaveType)((int)knobs->programs[0].vco4_shape) == WAVE_SAMPLE) {
             start_sample_osc(&voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, note, velocity);
         } else if (voices[slot].vco4_sample_stream >= 0) {
             release_sample_stream(voices[slot].vco4_sample_stream);
             voices[slot].vco4_sample_stream = -1;
         }
         for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voices[slot].fa_low[c][f][0]=0.0f; voices[slot].fa_low[c][f][1]=0.0f; voices[slot].fa_band[c][f][0]=0.0f; voices[slot].fa_band[c][f][1]=0.0f; } voices[slot].fb_low[c][0]=0.0f; voices[slot].fb_low[c][1]=0.0f; voices[slot].fb_band[c][0]=0.0f; voices[slot].fb_band[c][1]=0.0f; }
-        for (int l = 0; l < LFO_COUNT; l++) { if (knobs->lfo[l].key_sync != 0.0f) global_lfo_phases[l] = 0.0f; }
+        for (int l = 0; l < LFO_COUNT; l++) { if (knobs->programs[0].lfo[l].key_sync != 0.0f) global_lfo_phases[l] = 0.0f; }
 
-        int m0 = (int)knobs->eg_mode[0]; voices[slot].vco1_eg.state = (m0 == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco1_eg.current_level = (m0 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[0].al / 100.0f));
-        int m1 = (int)knobs->eg_mode[1]; voices[slot].vco2_eg.state = (m1 == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco2_eg.current_level = (m1 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[1].al / 100.0f));
+        int m0 = (int)knobs->programs[0].eg_mode[0]; voices[slot].vco1_eg.state = (m0 == 5) ? STATE_DELAY : STATE_ATTACK;
+        voices[slot].vco1_eg.current_level = (m0 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].eg[0].al / 100.0f));
+        int m1 = (int)knobs->programs[0].eg_mode[1]; voices[slot].vco2_eg.state = (m1 == 5) ? STATE_DELAY : STATE_ATTACK;
+        voices[slot].vco2_eg.current_level = (m1 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].eg[1].al / 100.0f));
         // Osc 3/4 Amp envelopes: eg[2]/eg_mode[2] and eg[3]/eg_mode[3].
-        int mn = (int)knobs->eg_mode[2]; voices[slot].vco3_eg.state = (mn == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco3_eg.current_level = (mn == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[2].al / 100.0f));
-        int m3 = (int)knobs->eg_mode[3]; voices[slot].vco4_eg.state = (m3 == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco4_eg.current_level = (m3 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[3].al / 100.0f));
+        int mn = (int)knobs->programs[0].eg_mode[2]; voices[slot].vco3_eg.state = (mn == 5) ? STATE_DELAY : STATE_ATTACK;
+        voices[slot].vco3_eg.current_level = (mn == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].eg[2].al / 100.0f));
+        int m3 = (int)knobs->programs[0].eg_mode[3]; voices[slot].vco4_eg.state = (m3 == 5) ? STATE_DELAY : STATE_ATTACK;
+        voices[slot].vco4_eg.current_level = (m3 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].eg[3].al / 100.0f));
         for(int e=0; e<ASSIGNABLE_EG_COUNT; e++) {
-            int me = (int)knobs->eg_mode[4 + e]; voices[slot].assign_eg[e].state = (me == 5) ? STATE_DELAY : STATE_ATTACK;
-            voices[slot].assign_eg[e].current_level = (me == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->eg[4 + e].al / 100.0f));
+            int me = (int)knobs->programs[0].eg_mode[4 + e]; voices[slot].assign_eg[e].state = (me == 5) ? STATE_DELAY : STATE_ATTACK;
+            voices[slot].assign_eg[e].current_level = (me == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].eg[4 + e].al / 100.0f));
         }
     } else {
         // An overlapping legato note: this is an actual audible glide, so reroll its time.
-        voices[slot].glide_time_multiplier = roll_glide_multiplier(knobs->mono_glide_random);
+        voices[slot].glide_time_multiplier = roll_glide_multiplier(knobs->programs[0].mono_glide_random);
     }
     if (!poly_mode_active) mono_stack_push(mono_stack, note, velocity);
 }
@@ -4649,7 +4704,7 @@ static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knob
         voices[0].vco3_target_freq = target_hz;
         voices[0].vco4_target_freq = target_hz;
         // Falling back to a still-held note is also a real audible glide -- reroll its time too.
-        voices[0].glide_time_multiplier = roll_glide_multiplier(knobs->mono_glide_random);
+        voices[0].glide_time_multiplier = roll_glide_multiplier(knobs->programs[0].mono_glide_random);
         // Falling back to a still-held note never retriggers or releases -- the sound never stopped.
     } else if (midi_live->sustain_held) {
         voices[0].sustain_pending = true;
@@ -4968,7 +5023,7 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
                 // Sustain pedal. polarity: 0 = Normal (>=64 means held, essentially every real
                 // pedal), 1 = Inverted (for the rare one wired backwards).
                 bool raw_held = ev->data.control.value >= 64;
-                bool now_held = (knobs->sustain_pedal_polarity != 0.0f) ? !raw_held : raw_held;
+                bool now_held = (knobs->programs[0].sustain_pedal_polarity != 0.0f) ? !raw_held : raw_held;
                 if (midi_live->sustain_held && !now_held) handle_sustain_release(voices, knobs); // pedal just lifted
                 midi_live->sustain_held = now_held;
             }
@@ -5032,10 +5087,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     float vco2_unison_pan_l[UNISON_SAW_VOICES], vco2_unison_pan_r[UNISON_SAW_VOICES];
     float vco3_unison_pan_l[UNISON_SAW_VOICES], vco3_unison_pan_r[UNISON_SAW_VOICES];
     float vco4_unison_pan_l[UNISON_SAW_VOICES], vco4_unison_pan_r[UNISON_SAW_VOICES];
-    compute_unison_saw_pan(knobs->vco1_unison_saw_width, vco1_unison_pan_l, vco1_unison_pan_r);
-    compute_unison_saw_pan(knobs->vco2_unison_saw_width, vco2_unison_pan_l, vco2_unison_pan_r);
-    compute_unison_saw_pan(knobs->vco3_unison_saw_width, vco3_unison_pan_l, vco3_unison_pan_r);
-    compute_unison_saw_pan(knobs->vco4_unison_saw_width, vco4_unison_pan_l, vco4_unison_pan_r);
+    compute_unison_saw_pan(knobs->programs[0].vco1_unison_saw_width, vco1_unison_pan_l, vco1_unison_pan_r);
+    compute_unison_saw_pan(knobs->programs[0].vco2_unison_saw_width, vco2_unison_pan_l, vco2_unison_pan_r);
+    compute_unison_saw_pan(knobs->programs[0].vco3_unison_saw_width, vco3_unison_pan_l, vco3_unison_pan_r);
+    compute_unison_saw_pan(knobs->programs[0].vco4_unison_saw_width, vco4_unison_pan_l, vco4_unison_pan_r);
 
     // Noise Osc's tilt-color filter: a simple one-pole low/high split with a fixed ~800Hz pivot,
     // linearly crossfaded by the Tilt knob. The coefficient depends only on SAMPLE_RATE and the
@@ -5047,8 +5102,8 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // midi_live->pitch_bend is constant across this whole block (only process_midi_input, called
     // once before render_audio_block each block, updates it) so it's computed once here too.
     float pb_bend_cents = (midi_live->pitch_bend >= 0.0f)
-        ? midi_live->pitch_bend * knobs->pb_range_up * 100.0f
-        : midi_live->pitch_bend * knobs->pb_range_down * 100.0f;
+        ? midi_live->pitch_bend * knobs->programs[0].pb_range_up * 100.0f
+        : midi_live->pitch_bend * knobs->programs[0].pb_range_down * 100.0f;
 
     // One-sample-delayed feedback state for LFO Phase modulation: holds each LFO's phase-shift
     // contribution from other LFOs and from voice 0's assignable EGs (the reference source for
@@ -5111,7 +5166,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // both polyphony and envelope count).
     EGDerivedRates eg_rates[ENV_COUNT];
     for (int e = 0; e < ENV_COUNT; e++) {
-        compute_eg_derived_rates(&knobs->eg[e], (int)knobs->eg_mode[e], &eg_rates[e]);
+        compute_eg_derived_rates(&knobs->programs[0].eg[e], (int)knobs->programs[0].eg_mode[e], &eg_rates[e]);
     }
     // Sustain-chase rate: not even knob-dependent (a pure function of SAMPLE_RATE), so computed
     // exactly once for the life of the process rather than once per block.
@@ -5125,7 +5180,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     int voice_limit = effective_voice_limit(knobs);
     int block_size = effective_block_size(knobs);
 
-    // Portamento glide coefficient, per voice: depends only on knobs->portamento_time_ms (a
+    // Portamento glide coefficient, per voice: depends only on knobs->programs[0].portamento_time_ms (a
     // knob, block-invariant) and voices[v].glide_time_multiplier (per-voice, but only rerolled at
     // a glide event in handle_note_on/off -- called once per block from main()'s loop, never
     // mid-block) -- so, same as the EG rates above, this only needs computing once per block, not
@@ -5134,7 +5189,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // held note between glide events that's potentially millions of samples of pure waste.
     float portamento_coeff[MAX_VOICES];
     for (int v = 0; v < voice_limit; v++) {
-        float effective_glide_ms = fmaxf(1.0f, knobs->portamento_time_ms * voices[v].glide_time_multiplier);
+        float effective_glide_ms = fmaxf(1.0f, knobs->programs[0].portamento_time_ms * voices[v].glide_time_multiplier);
         portamento_coeff[v] = 1.0f - expf(-1.0f / ((effective_glide_ms / 1000.0f) * SAMPLE_RATE));
     }
 
@@ -5144,10 +5199,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // a WAVE_SAMPLE oscillator carrying its own zone pan offset. Precomputed once per block so the
     // per-voice per-sample loop can skip the cosf/sinf pair entirely in that case instead of
     // recomputing an unchanged angle up to MAX_VOICES x block_size times for nothing.
-    float static_pan_angle1 = (fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan)) + 1.0f) * ((float)M_PI / 4.0f);
-    float static_pan_angle2 = (fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan)) + 1.0f) * ((float)M_PI / 4.0f);
-    float static_pan_angle3 = (fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan)) + 1.0f) * ((float)M_PI / 4.0f);
-    float static_pan_angle4 = (fmaxf(-1.0f, fminf(1.0f, knobs->vco4_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+    float static_pan_angle1 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco1_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+    float static_pan_angle2 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco2_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+    float static_pan_angle3 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco3_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+    float static_pan_angle4 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco4_pan)) + 1.0f) * ((float)M_PI / 4.0f);
     float static_pan1_l = cosf(static_pan_angle1), static_pan1_r = sinf(static_pan_angle1);
     float static_pan2_l = cosf(static_pan_angle2), static_pan2_r = sinf(static_pan_angle2);
     float static_pan3_l = cosf(static_pan_angle3), static_pan3_r = sinf(static_pan_angle3);
@@ -5157,7 +5212,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         float mixed_l = 0.0f, mixed_r = 0.0f;
         float lfo_out[LFO_COUNT] = {0.0f};
         for (int l = 0; l < LFO_COUNT; l++) {
-            int wave_type = (int)knobs->lfo[l].wave_type;
+            int wave_type = (int)knobs->programs[0].lfo[l].wave_type;
             // Off: complete compute bypass -- no phase_offset/mod_source_cc/waveform lookup, and
             // no phase advance either (nothing else in this engine reads an LFO's raw phase, so
             // freezing it is safe and avoids wasted work on an LFO nobody's listening to -- this
@@ -5172,20 +5227,20 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // its whole 0.1-200Hz dial range); Depth mod adds directly (mod_depth is already a
             // plain 0-1 fraction, same convention mod_source_cc's multiplicative scale uses).
             // Both stay independent of and coexist with mod_source_cc's own CC/aftertouch scale.
-            float effective_rate_hz = fmaxf(0.1f, fminf(200.0f, knobs->lfo[l].rate_hz + lfo_rate_mod_state[l] * 20.0f));
-            float effective_mod_depth = fmaxf(0.0f, fminf(1.0f, knobs->lfo[l].mod_depth + lfo_depth_mod_state[l]));
+            float effective_rate_hz = fmaxf(0.1f, fminf(200.0f, knobs->programs[0].lfo[l].rate_hz + lfo_rate_mod_state[l] * 20.0f));
+            float effective_mod_depth = fmaxf(0.0f, fminf(1.0f, knobs->programs[0].lfo[l].mod_depth + lfo_depth_mod_state[l]));
 
             if (l < 2) {
                 // LFOs 1/2: full audio-rate, unchanged from the original 4-LFO design.
                 // Phase pot (0-360 degrees) plus any modulation, shifting only the read-phase
                 // used for this sample's waveform lookup -- the underlying running phase
                 // (advanced below) is never touched, so Rate/sync stay completely unaffected.
-                float phase_offset = fmodf((knobs->lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
+                float phase_offset = fmodf((knobs->programs[0].lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
                 float read_phase = fmodf(global_lfo_phases[l] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
                 // Modulation Source: scales this LFO's contribution by a live MIDI controller
                 // (e.g. gating vibrato depth with the mod wheel) on top of the plain Depth knob.
                 // Unassigned (-1, the default) is a pure no-op -- cc_source_scale stays 1.0.
-                int mod_src = (int)knobs->lfo[l].mod_source_cc;
+                int mod_src = (int)knobs->programs[0].lfo[l].mod_source_cc;
                 float cc_source_scale = 1.0f;
                 if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
                 else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
@@ -5199,9 +5254,9 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 // one, avoiding a zipper-noise step at each recompute boundary.
                 if (lfo_decim_counter[l] == 0) {
                     lfo_decim_last_value[l] = lfo_decim_target_value[l];
-                    float phase_offset = fmodf((knobs->lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
+                    float phase_offset = fmodf((knobs->programs[0].lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
                     float read_phase = fmodf(global_lfo_phases[l] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
-                    int mod_src = (int)knobs->lfo[l].mod_source_cc;
+                    int mod_src = (int)knobs->programs[0].lfo[l].mod_source_cc;
                     float cc_source_scale = 1.0f;
                     if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
                     else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
@@ -5243,10 +5298,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // vco{N}_pitch: the manual Pitch knob (cents, +-2400 = +-24 semitones), added in
             // alongside fine_tune/pitch_offset/pitch-bend -- an LFO/EG targeting "Osc N Pitch"
             // sums into this same accumulator further down, so knob + live modulation just add.
-            float mod_vco1_pitch = knobs->vco1_fine_tune + knobs->vco1_pitch + pb_bend_cents;
-            float mod_vco2_pitch = knobs->vco2_fine_tune + (knobs->vco2_pitch_offset * 100.0f) + knobs->vco2_pitch + pb_bend_cents;
-            float mod_vco3_pitch = knobs->vco3_fine_tune + (knobs->vco3_pitch_offset * 100.0f) + knobs->vco3_pitch + pb_bend_cents;
-            float mod_vco4_pitch = knobs->vco4_fine_tune + (knobs->vco4_pitch_offset * 100.0f) + knobs->vco4_pitch + pb_bend_cents;
+            float mod_vco1_pitch = knobs->programs[0].vco1_fine_tune + knobs->programs[0].vco1_pitch + pb_bend_cents;
+            float mod_vco2_pitch = knobs->programs[0].vco2_fine_tune + (knobs->programs[0].vco2_pitch_offset * 100.0f) + knobs->programs[0].vco2_pitch + pb_bend_cents;
+            float mod_vco3_pitch = knobs->programs[0].vco3_fine_tune + (knobs->programs[0].vco3_pitch_offset * 100.0f) + knobs->programs[0].vco3_pitch + pb_bend_cents;
+            float mod_vco4_pitch = knobs->programs[0].vco4_fine_tune + (knobs->programs[0].vco4_pitch_offset * 100.0f) + knobs->programs[0].vco4_pitch + pb_bend_cents;
             float mod_vco1_amp = 0.0f, mod_vco2_amp = 0.0f, fm_mod = 0.0f, mix_bal = 0.0f;
             // Filter cutoff/resonance mod destinations, 4 slots:
             //   slot 0 (targets 8/9)   = Filter A's PRIMARY filter: filter_a when Normal, or
@@ -5282,7 +5337,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float mod_vco4_amp = 0.0f, mod_vco4_pan = 0.0f, mod_vco4_tilt = 0.0f;
 
             for (int l = 0; l < LFO_COUNT; l++) {
-                int target = (int)knobs->lfo[l].dest_target;
+                int target = (int)knobs->programs[0].lfo[l].dest_target;
                 // PERF: target 0 ("None") is the common case for any LFO not actually routed
                 // to a destination -- skip straight past the dispatch below instead of evaluating
                 // it for nothing. This loop runs per ACTIVE voice per sample, so on a plain
@@ -5357,11 +5412,11 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // not the corresponding LFO's destination -- the GUI already had a per-EG destination
             // dropdown, but it was never wired to anything back here.
             for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) {
-                int target = (int)knobs->eg_dest_target[e];
+                int target = (int)knobs->programs[0].eg_dest_target[e];
                 // PERF: same early-out as the LFO loop above -- target 0 ("None") is the
                 // common case for an assignable EG not routed anywhere.
                 if (target == 0) continue;
-                float val = voices[v].assign_eg[e].current_level * knobs->eg_intensity[e];
+                float val = voices[v].assign_eg[e].current_level * knobs->programs[0].eg_intensity[e];
                 // PERF: switch, not a flat if-chain -- see the LFO loop's own comment above for why.
                 switch (target) {
                     case 1: mod_vco1_pitch += val * 1200.0f; break;
@@ -5413,26 +5468,26 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
 
             // Phase pot (0-360 degrees) plus any modulation, converted to a 0..1 fractional-cycle
             // offset. Wrapped defensively since modulation can push it negative or past 1.
-            float phase_offset1 = fmodf((knobs->vco1_phase_offset / 360.0f) + mod_vco1_phase, 1.0f); if (phase_offset1 < 0.0f) phase_offset1 += 1.0f;
-            float phase_offset2 = fmodf((knobs->vco2_phase_offset / 360.0f) + mod_vco2_phase, 1.0f); if (phase_offset2 < 0.0f) phase_offset2 += 1.0f;
-            float phase_offset3 = fmodf((knobs->vco3_phase_offset / 360.0f) + mod_vco3_phase, 1.0f); if (phase_offset3 < 0.0f) phase_offset3 += 1.0f;
-            float phase_offset4 = fmodf((knobs->vco4_phase_offset / 360.0f) + mod_vco4_phase, 1.0f); if (phase_offset4 < 0.0f) phase_offset4 += 1.0f;
+            float phase_offset1 = fmodf((knobs->programs[0].vco1_phase_offset / 360.0f) + mod_vco1_phase, 1.0f); if (phase_offset1 < 0.0f) phase_offset1 += 1.0f;
+            float phase_offset2 = fmodf((knobs->programs[0].vco2_phase_offset / 360.0f) + mod_vco2_phase, 1.0f); if (phase_offset2 < 0.0f) phase_offset2 += 1.0f;
+            float phase_offset3 = fmodf((knobs->programs[0].vco3_phase_offset / 360.0f) + mod_vco3_phase, 1.0f); if (phase_offset3 < 0.0f) phase_offset3 += 1.0f;
+            float phase_offset4 = fmodf((knobs->programs[0].vco4_phase_offset / 360.0f) + mod_vco4_phase, 1.0f); if (phase_offset4 < 0.0f) phase_offset4 += 1.0f;
 
             // Unison Saw Detune Width, base knob plus any modulation, clamped back into its valid range.
-            float vco1_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco1_unison_saw_detune + mod_vco1_unison_detune));
-            float vco2_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco2_unison_saw_detune + mod_vco2_unison_detune));
-            float vco3_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco3_unison_saw_detune + mod_vco3_unison_detune));
-            float vco4_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->vco4_unison_saw_detune + mod_vco4_unison_detune));
+            float vco1_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->programs[0].vco1_unison_saw_detune + mod_vco1_unison_detune));
+            float vco2_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->programs[0].vco2_unison_saw_detune + mod_vco2_unison_detune));
+            float vco3_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->programs[0].vco3_unison_saw_detune + mod_vco3_unison_detune));
+            float vco4_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->programs[0].vco4_unison_saw_detune + mod_vco4_unison_detune));
 
             // Oscillator shapes, hoisted here (from their own call sites further below) purely so
             // the Pan block right after can tell whether a WAVE_SAMPLE zone's own Pan setting
             // should fold into the knob-based pan below -- both are plain reads of a knob value
             // with no ordering dependency on anything between here and their old declaration
             // sites, so hoisting is safe.
-            WaveType vco1_shape_now = (WaveType)((int)knobs->vco1_shape);
-            WaveType vco2_shape_now = (WaveType)((int)knobs->vco2_shape);
-            WaveType vco3_shape_now = (WaveType)((int)knobs->vco3_shape);
-            WaveType vco4_shape_now = (WaveType)((int)knobs->vco4_shape);
+            WaveType vco1_shape_now = (WaveType)((int)knobs->programs[0].vco1_shape);
+            WaveType vco2_shape_now = (WaveType)((int)knobs->programs[0].vco2_shape);
+            WaveType vco3_shape_now = (WaveType)((int)knobs->programs[0].vco3_shape);
+            WaveType vco4_shape_now = (WaveType)((int)knobs->programs[0].vco4_shape);
             // WAVE_OFF: skip pan trig + render + mix for this oscillator entirely (phase advance
             // and envelope ticking stay unconditional -- see the WAVE_OFF decision's rationale).
             bool osc1_off = vco1_shape_now == WAVE_OFF, osc2_off = vco2_shape_now == WAVE_OFF;
@@ -5457,29 +5512,29 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             if (!osc1_off) {
                 if (mod_vco1_pan == 0.0f && zone_pan1 == 0.0f) { pan1_l = static_pan1_l; pan1_r = static_pan1_r; }
                 else {
-                    pan1_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
-                    pan1_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
+                    pan1_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
+                    pan1_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
                 }
             }
             if (!osc2_off) {
                 if (mod_vco2_pan == 0.0f && zone_pan2 == 0.0f) { pan2_l = static_pan2_l; pan2_r = static_pan2_r; }
                 else {
-                    pan2_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
-                    pan2_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
+                    pan2_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
+                    pan2_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
                 }
             }
             if (!osc3_off) {
                 if (mod_vco3_pan == 0.0f && zone_pan3 == 0.0f) { pan3_l = static_pan3_l; pan3_r = static_pan3_r; }
                 else {
-                    pan3_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
-                    pan3_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
+                    pan3_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
+                    pan3_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
                 }
             }
             if (!osc4_off) {
                 if (mod_vco4_pan == 0.0f && zone_pan4 == 0.0f) { pan4_l = static_pan4_l; pan4_r = static_pan4_r; }
                 else {
-                    pan4_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
-                    pan4_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
+                    pan4_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
+                    pan4_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
                 }
             }
 
@@ -5488,10 +5543,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // amount) when the shape is Noise -- the same range render_fm_oscillator's Noise
             // branch expects (it divides by 100 itself). Any other shape doesn't consume this
             // value at all, so the exact clamp choice there is moot.
-            float vco1_pulse_width_final = (vco1_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->vco1_pulse_width + mod_vco1_pulse_width)) : fmaxf(2.0f, fminf(98.0f, knobs->vco1_pulse_width + mod_vco1_pulse_width));
-            float vco2_pulse_width_final = (vco2_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->vco2_pulse_width + mod_vco2_pulse_width)) : fmaxf(2.0f, fminf(98.0f, knobs->vco2_pulse_width + mod_vco2_pulse_width));
-            float vco3_pulse_width_final = (vco3_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->vco3_pulse_width + mod_vco3_tilt)) : fmaxf(2.0f, fminf(98.0f, knobs->vco3_pulse_width + mod_vco3_tilt));
-            float vco4_pulse_width_final = (vco4_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->vco4_pulse_width + mod_vco4_tilt)) : fmaxf(2.0f, fminf(98.0f, knobs->vco4_pulse_width + mod_vco4_tilt));
+            float vco1_pulse_width_final = (vco1_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->programs[0].vco1_pulse_width + mod_vco1_pulse_width)) : fmaxf(2.0f, fminf(98.0f, knobs->programs[0].vco1_pulse_width + mod_vco1_pulse_width));
+            float vco2_pulse_width_final = (vco2_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->programs[0].vco2_pulse_width + mod_vco2_pulse_width)) : fmaxf(2.0f, fminf(98.0f, knobs->programs[0].vco2_pulse_width + mod_vco2_pulse_width));
+            float vco3_pulse_width_final = (vco3_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->programs[0].vco3_pulse_width + mod_vco3_tilt)) : fmaxf(2.0f, fminf(98.0f, knobs->programs[0].vco3_pulse_width + mod_vco3_tilt));
+            float vco4_pulse_width_final = (vco4_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->programs[0].vco4_pulse_width + mod_vco4_tilt)) : fmaxf(2.0f, fminf(98.0f, knobs->programs[0].vco4_pulse_width + mod_vco4_tilt));
 
             // Skip the powf() call entirely when there's nothing to bend by (no fine-tune/pitch
             // knob offset, no pitch bend, no live pitch modulation routed here) -- the overwhelmingly
@@ -5512,7 +5567,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // advance any voices[v].vcoN_phase yet -- that stays at the bottom of the loop, since
             // the FM render loop below still needs every oscillator's pre-advance phase. Osc 1 is
             // always the sync master in both topologies -- it is never itself reset.
-            int hard_sync_mode = (int)knobs->hard_sync_mode;
+            int hard_sync_mode = (int)knobs->programs[0].hard_sync_mode;
             float vco1_phase_before = voices[v].vco1_phase;
             float new_vco1_phase = vco1_phase_before + dt1;
             bool do_sync1 = (hard_sync_mode != 0 && new_vco1_phase >= 1.0f);
@@ -5583,14 +5638,14 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // original gain2_for_fm's "muting the sound must not silence the FM modulator"
             // design). Osc1/Osc2 deliberately exclude mix_bal here too (a final-mix-only control).
             float gain_for_fm_arr[4] = {
-                (knobs->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco1_vol + mod_vco1_amp)),
-                (knobs->vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco2_vol + mod_vco2_amp)),
-                (knobs->vco3_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco3_vol + mod_vco3_amp)),
-                (knobs->vco4_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco4_vol + mod_vco4_amp)),
+                (knobs->programs[0].vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco1_vol + mod_vco1_amp)),
+                (knobs->programs[0].vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco2_vol + mod_vco2_amp)),
+                (knobs->programs[0].vco3_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco3_vol + mod_vco3_amp)),
+                (knobs->programs[0].vco4_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco4_vol + mod_vco4_amp)),
             };
             float eg_level_arr[4] = { voices[v].vco1_eg.current_level, voices[v].vco2_eg.current_level, voices[v].vco3_eg.current_level, voices[v].vco4_eg.current_level };
 
-            int fm_algorithm_idx = (int)knobs->fm_algorithm;
+            int fm_algorithm_idx = (int)knobs->programs[0].fm_algorithm;
             if (fm_algorithm_idx < 0) fm_algorithm_idx = 0;
             if (fm_algorithm_idx >= FM_ALGORITHM_COUNT) fm_algorithm_idx = FM_ALGORITHM_COUNT - 1;
             const FmAlgorithm *alg = &FM_ALGORITHMS[fm_algorithm_idx];
@@ -5605,7 +5660,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                     if (alg->edges[e].to_osc != osc) continue;
                     int src = alg->edges[e].from_osc;
                     float depth = *(const float*)((const char*)knobs + alg->edges[e].depth_offset);
-                    if (alg->edges[e].depth_offset == offsetof(SynthSharedControls, fm_intensity)) depth += fm_mod;
+                    if (alg->edges[e].depth_offset == offsetof(SynthSharedControls, programs[0].fm_intensity)) depth += fm_mod;
                     depth = fmaxf(0.0f, depth);
                     modulator_sum += modulator_output[src] * depth;
                 }
@@ -5635,10 +5690,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 shape_arr[3] == WAVE_UNISON_SAW || shape_arr[3] == WAVE_SAMPLE,
             };
             float gain_audible_arr[4] = {
-                (knobs->vco1_mute != 0.0f || knobs->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco1_vol - mix_bal + mod_vco1_amp)),
-                (knobs->vco2_mute != 0.0f || knobs->vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco2_vol + mix_bal + mod_vco2_amp)),
-                (knobs->vco3_mute != 0.0f || knobs->vco3_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco3_vol + mod_vco3_amp)),
-                (knobs->vco4_mute != 0.0f || knobs->vco4_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->vco4_vol + mod_vco4_amp)),
+                (knobs->programs[0].vco1_mute != 0.0f || knobs->programs[0].vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco1_vol - mix_bal + mod_vco1_amp)),
+                (knobs->programs[0].vco2_mute != 0.0f || knobs->programs[0].vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco2_vol + mix_bal + mod_vco2_amp)),
+                (knobs->programs[0].vco3_mute != 0.0f || knobs->programs[0].vco3_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco3_vol + mod_vco3_amp)),
+                (knobs->programs[0].vco4_mute != 0.0f || knobs->programs[0].vco4_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco4_vol + mod_vco4_amp)),
             };
             float pan_l_arr[4] = { pan1_l, pan2_l, pan3_l, pan4_l };
             float pan_r_arr[4] = { pan1_r, pan2_r, pan3_r, pan4_r };
@@ -5720,34 +5775,34 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float multi_crossfade_mods[3] = { filter_crossfade_mods[0], filter_crossfade_mods[3], filter_crossfade_mods[2] };
 
             float a_out_l, a_out_r, b_out_l, b_out_r;
-            int ab_mode = (int)knobs->filter_ab_routing_mode; // 0=Series A->B, 1=Series B->A, 2=Parallel
+            int ab_mode = (int)knobs->programs[0].filter_ab_routing_mode; // 0=Series A->B, 1=Series B->A, 2=Parallel
             if (ab_mode == 1) {
                 // Series B -> A: run B first on the raw mix, then A on B's output -- the same
                 // two filters as mode 0, just reversed, e.g. to put Filter A's Multi engine
                 // after Filter B instead of before it.
-                b_out_l = run_svf_filter_p(stage_in_l, &knobs->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
-                b_out_r = run_svf_filter_p(stage_in_r, &knobs->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
-                if ((int)knobs->filter_a_mode == 0) {
-                    a_out_l = run_svf_filter_p(b_out_l, &knobs->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
-                    a_out_r = run_svf_filter_p(b_out_r, &knobs->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
+                b_out_l = run_svf_filter_p(stage_in_l, &knobs->programs[0].filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
+                b_out_r = run_svf_filter_p(stage_in_r, &knobs->programs[0].filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
+                if ((int)knobs->programs[0].filter_a_mode == 0) {
+                    a_out_l = run_svf_filter_p(b_out_l, &knobs->programs[0].filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
+                    a_out_r = run_svf_filter_p(b_out_r, &knobs->programs[0].filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
                 } else {
-                    a_out_l = run_filter_a_multi(b_out_l, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
-                    a_out_r = run_filter_a_multi(b_out_r, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
+                    a_out_l = run_filter_a_multi(b_out_l, (int)knobs->programs[0].filter_a_multi_routing, knobs->programs[0].filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
+                    a_out_r = run_filter_a_multi(b_out_r, (int)knobs->programs[0].filter_a_multi_routing, knobs->programs[0].filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
                 }
             } else {
                 // Series A -> B (0), or Parallel (2): run A first on the raw mix.
-                if ((int)knobs->filter_a_mode == 0) {
-                    a_out_l = run_svf_filter_p(stage_in_l, &knobs->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
-                    a_out_r = run_svf_filter_p(stage_in_r, &knobs->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
+                if ((int)knobs->programs[0].filter_a_mode == 0) {
+                    a_out_l = run_svf_filter_p(stage_in_l, &knobs->programs[0].filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
+                    a_out_r = run_svf_filter_p(stage_in_r, &knobs->programs[0].filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
                 } else {
-                    a_out_l = run_filter_a_multi(stage_in_l, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
-                    a_out_r = run_filter_a_multi(stage_in_r, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
+                    a_out_l = run_filter_a_multi(stage_in_l, (int)knobs->programs[0].filter_a_multi_routing, knobs->programs[0].filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
+                    a_out_r = run_filter_a_multi(stage_in_r, (int)knobs->programs[0].filter_a_multi_routing, knobs->programs[0].filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
                 }
                 // Series: B fed from A's output. Parallel: B fed straight from the mixer, same as A.
                 float b_in_l = (ab_mode == 0) ? a_out_l : stage_in_l;
                 float b_in_r = (ab_mode == 0) ? a_out_r : stage_in_r;
-                b_out_l = run_svf_filter_p(b_in_l, &knobs->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
-                b_out_r = run_svf_filter_p(b_in_r, &knobs->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
+                b_out_l = run_svf_filter_p(b_in_l, &knobs->programs[0].filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
+                b_out_r = run_svf_filter_p(b_in_r, &knobs->programs[0].filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
             }
 
             // --- Combine A and B: either Series mode means whichever filter ran last is simply
@@ -5760,10 +5815,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // exact no-op on this ALREADY-stereo signal -- level=50/pan=0 (the default for both)
             // reproduces the old blend=50 default output level exactly. ---
             if (ab_mode == 2) {
-                float a_lvl = fmaxf(0.0f, knobs->filter_a_level) / 100.0f;
-                float b_lvl = fmaxf(0.0f, knobs->filter_b_level) / 100.0f;
-                float a_angle = (fmaxf(-1.0f, fminf(1.0f, knobs->filter_a_pan)) + 1.0f) * ((float)M_PI / 4.0f);
-                float b_angle = (fmaxf(-1.0f, fminf(1.0f, knobs->filter_b_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+                float a_lvl = fmaxf(0.0f, knobs->programs[0].filter_a_level) / 100.0f;
+                float b_lvl = fmaxf(0.0f, knobs->programs[0].filter_b_level) / 100.0f;
+                float a_angle = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].filter_a_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+                float b_angle = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].filter_b_pan)) + 1.0f) * ((float)M_PI / 4.0f);
                 float a_gain_l = cosf(a_angle) * 1.41421356f, a_gain_r = sinf(a_angle) * 1.41421356f;
                 float b_gain_l = cosf(b_angle) * 1.41421356f, b_gain_r = sinf(b_angle) * 1.41421356f;
                 mixed_l += a_out_l * a_lvl * a_gain_l + b_out_l * b_lvl * b_gain_l;
@@ -5784,15 +5839,15 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         float new_lfo_rate_mod[LFO_COUNT] = {0.0f};
         float new_lfo_depth_mod[LFO_COUNT] = {0.0f};
         for (int l = 0; l < LFO_COUNT; l++) {
-            int target = (int)knobs->lfo[l].dest_target;
+            int target = (int)knobs->programs[0].lfo[l].dest_target;
             int pidx = lfo_phase_target_index(target); if (pidx >= 0) new_lfo_phase_mod[pidx] += lfo_out[l];
             int ridx = lfo_rate_target_index(target); if (ridx >= 0) new_lfo_rate_mod[ridx] += lfo_out[l];
             int didx = lfo_depth_target_index(target); if (didx >= 0) new_lfo_depth_mod[didx] += lfo_out[l];
         }
         if (voices[0].vco1_eg.state != STATE_IDLE || voices[0].vco2_eg.state != STATE_IDLE) {
             for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) {
-                int target = (int)knobs->eg_dest_target[e];
-                float val = voices[0].assign_eg[e].current_level * knobs->eg_intensity[e];
+                int target = (int)knobs->programs[0].eg_dest_target[e];
+                float val = voices[0].assign_eg[e].current_level * knobs->programs[0].eg_intensity[e];
                 int pidx = lfo_phase_target_index(target); if (pidx >= 0) new_lfo_phase_mod[pidx] += val;
                 int ridx = lfo_rate_target_index(target); if (ridx >= 0) new_lfo_rate_mod[ridx] += val;
                 int didx = lfo_depth_target_index(target); if (didx >= 0) new_lfo_depth_mod[didx] += val;
@@ -6689,7 +6744,7 @@ int main(int argc, char **argv) {
         poll_seq_audio_load_requests(&active_knobs); // spawns a loader thread if a lane's audio_path changed
         poll_seq_audio_preview_triggers(&active_knobs); // starts one-shot playback if a lane's Preview button was clicked
         poll_transport_triggers(&active_knobs); // Play/Pause/Stop -- starts/freezes/resets the real Sequencer playhead
-        bool poly_mode_active = (active_knobs.is_polyphonic != 0.0f);
+        bool poly_mode_active = (active_knobs.programs[0].is_polyphonic != 0.0f);
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
         // packet as every other knob. Only reopen the stream whose name actually changed.
