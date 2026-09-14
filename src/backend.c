@@ -209,8 +209,17 @@ typedef struct {
     // never read by the DSP path -- only g_seq_audio[lane]'s resulting RAM buffer would be, once
     // real playback exists.
     char audio_path[SEQ_AUDIO_PATH_LEN];
-    float audio_offset_sec; // -10..10, GUI-side range. Inert: no playback engine reads this yet,
-                             // exists now so it's already in place once one does.
+    float audio_offset_sec; // -10..10, GUI-side range. Currently only used as a start-frame
+                             // offset by the one-shot Preview trigger below (positive = skip
+                             // that many seconds into the file; negative currently clamps to 0 --
+                             // no pre-roll silence yet). Not yet touched by any real transport.
+    // "Preview" button (Sequencer only): a plain edge-triggered counter, not a level -- the
+    // frontend increments it by 1 on every click and resends the whole packet (same shape as
+    // every other knob), so poll_seq_audio_preview_triggers() in main()'s loop can detect "this
+    // changed since last block" the same way it already detects an audio_path change, and
+    // (re)start that lane's one-shot playback from the beginning (or audio_offset_sec seconds
+    // in). Deliberately NOT a full transport -- see g_seq_audio's own playback-state comment.
+    float audio_preview_trigger;
 } SeqLaneState;
 
 // A single FX bus slot's parameters. FX_SLOT_COUNT of these run in series (slot 0 first) on
@@ -2669,6 +2678,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SUBARRAY("/hds/seq/%d/mode", seq_lanes, SeqLaneState, seq_mode, SEQ_LANE_COUNT),
     OSC_STRING_SUBARRAY("/hds/seq/%d/audio_path", seq_lanes, SeqLaneState, audio_path, SEQ_LANE_COUNT, SEQ_AUDIO_PATH_LEN),
     OSC_SUBARRAY("/hds/seq/%d/audio_offset_sec", seq_lanes, SeqLaneState, audio_offset_sec, SEQ_LANE_COUNT),
+    OSC_SUBARRAY("/hds/seq/%d/audio_preview_trigger", seq_lanes, SeqLaneState, audio_preview_trigger, SEQ_LANE_COUNT),
 
     OSC_STRING("/hds/device/output", output_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/input", input_device, AUDIO_DEVICE_NAME_LEN),
@@ -2850,6 +2860,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->seq_lanes[l].seq_mode = 0.0f;     // Seq
         knobs->seq_lanes[l].audio_path[0] = '\0';
         knobs->seq_lanes[l].audio_offset_sec = 0.0f;
+        knobs->seq_lanes[l].audio_preview_trigger = 0.0f;
     }
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
@@ -3282,6 +3293,15 @@ typedef struct {
     _Atomic int load_state; // SeqAudioLoadState -- the one synchronization point for this lane.
     char last_requested_path[SEQ_AUDIO_PATH_LEN]; // main-thread-only; never touched by a loader
                                                      // thread, so needs no atomics of its own.
+    // "Preview" one-shot playback (see poll_seq_audio_preview_triggers/the mix step in
+    // render_audio_block). Plain fields, no atomics needed -- unlike pcm/load_state above (which
+    // cross from a background loader thread to the audio thread), these are written AND read
+    // exclusively by the single realtime thread (main()'s loop calls both the trigger-poll and
+    // render_audio_block itself -- see the "single non-threaded audio loop" invariant documented
+    // at this file's OSC section).
+    float last_seen_trigger;
+    bool is_playing;
+    long play_frame; // next frame index to read from pcm; advances by 1 per rendered sample
 } SeqAudioLane;
 
 static SeqAudioLane g_seq_audio[SEQ_LANE_COUNT];
@@ -3438,6 +3458,67 @@ static void poll_seq_audio_load_requests(const SynthSharedControls *knobs) {
             free(req);
             atomic_store_explicit(&lane->load_state, SEQ_AUDIO_ERROR, memory_order_release);
         }
+    }
+}
+
+// Renders one sample of preview playback for a single Sequencer audio lane (see the "Preview"
+// button comment on SeqLaneState.audio_preview_trigger), applying the lane's own volume/pan
+// knobs, and advances its play_frame. Mono/stereo pan law mirrors this file's existing
+// convention: a mono source uses the plain (un-normalized) cos/sin law used for oscillator pan
+// (correct there since it's placing a mono source into stereo -- reads ~-3dB at center, which is
+// the point); an already-stereo source uses the sqrt(2)-normalized law used for Filter A/B's
+// Parallel combine (reads unity at center, since attenuating an already-stereo signal at its
+// default pan position would be a real level regression, not a style choice). Sets is_playing
+// false once the buffer's end is reached (checked both before and after, so a lane that was
+// already finished contributes silence this call, and one that finishes mid-call stops cleanly
+// for the next).
+static void render_seq_audio_preview_sample(SeqAudioLane *lane, float volume_0_100, float pan, float *out_l, float *out_r) {
+    *out_l = 0.0f; *out_r = 0.0f;
+    if (!lane->is_playing || lane->play_frame >= lane->frame_count) { lane->is_playing = false; return; }
+
+    float vol = fmaxf(0.0f, volume_0_100) / 100.0f;
+    float clamped_pan = fmaxf(-1.0f, fminf(1.0f, pan));
+    float angle = (clamped_pan + 1.0f) * ((float)M_PI / 4.0f);
+    long frame_base = lane->play_frame * lane->channels;
+
+    if (lane->channels >= 2) {
+        float gain_l = cosf(angle) * 1.41421356f;
+        float gain_r = sinf(angle) * 1.41421356f;
+        *out_l = lane->pcm[frame_base] * gain_l * vol;
+        *out_r = lane->pcm[frame_base + 1] * gain_r * vol;
+    } else {
+        float in_mono = lane->pcm[frame_base];
+        *out_l = in_mono * cosf(angle) * vol;
+        *out_r = in_mono * sinf(angle) * vol;
+    }
+
+    lane->play_frame++;
+    if (lane->play_frame >= lane->frame_count) lane->is_playing = false;
+}
+
+// "Preview" one-shot playback trigger detection (see SeqLaneState.audio_preview_trigger's own
+// comment). Edge-triggered: the frontend increments the trigger value by 1 on every click, so
+// any change (not just "> last") starts (or restarts) that lane's playback from the beginning --
+// or audio_offset_sec seconds in, if positive. Deliberately NOT a full transport: no play/pause/
+// stop state machine, no sync to anything else, just "start this one lane's buffer playing from
+// here, once." Call once per block from main()'s loop, same as poll_seq_audio_load_requests.
+static void poll_seq_audio_preview_triggers(const SynthSharedControls *knobs) {
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        SeqAudioLane *lane = &g_seq_audio[l];
+        float want_trigger = knobs->seq_lanes[l].audio_preview_trigger;
+        if (want_trigger == lane->last_seen_trigger) continue;
+        lane->last_seen_trigger = want_trigger;
+        if (atomic_load_explicit(&lane->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !lane->pcm || lane->frame_count <= 0) {
+            continue; // nothing loaded (yet) for this lane -- silently ignore the trigger
+        }
+        float offset_sec = knobs->seq_lanes[l].audio_offset_sec;
+        long start_frame = 0;
+        if (offset_sec > 0.0f && lane->sample_rate > 0) {
+            start_frame = (long)(offset_sec * (float)lane->sample_rate);
+            if (start_frame >= lane->frame_count) start_frame = lane->frame_count - 1;
+        }
+        lane->play_frame = start_frame;
+        lane->is_playing = true;
     }
 }
 
@@ -5544,6 +5625,21 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             }
         }
 
+        // Sequencer audio-lane "Preview" playback (see render_seq_audio_preview_sample) -- summed
+        // straight into output pair 0, bypassing FX/routing entirely: this is a one-shot preview,
+        // not a routable source (a real per-lane routing model is future work, alongside the rest
+        // of the Sequencer transport). Deliberately allows several lanes to play back
+        // simultaneously -- proving multitrack playback actually works, not just one lane in
+        // isolation -- since each lane's own SeqAudioLane state is fully independent.
+        for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+            SeqAudioLane *lane = &g_seq_audio[l];
+            if (!lane->is_playing) continue;
+            float sample_l, sample_r;
+            render_seq_audio_preview_sample(lane, knobs->seq_lanes[l].volume, knobs->seq_lanes[l].pan, &sample_l, &sample_r);
+            pair_l[0] += sample_l;
+            pair_r[0] += sample_r;
+        }
+
         // Always-on master safety limiter, now evaluated once per output pair (after every source
         // routed to that pair has been summed in -- its whole purpose, the DAC never seeing an
         // out-of-range sample, only makes sense evaluated after a pair's final sum, not per
@@ -6334,6 +6430,7 @@ int main(int argc, char **argv) {
         // dispatched, so nothing further is needed here once this returns 0 (no more pending).
         while (lo_server_recv_noblock(osc_server, 0) > 0) {}
         poll_seq_audio_load_requests(&active_knobs); // spawns a loader thread if a lane's audio_path changed
+        poll_seq_audio_preview_triggers(&active_knobs); // starts one-shot playback if a lane's Preview button was clicked
         bool poly_mode_active = (active_knobs.is_polyphonic != 0.0f);
 
         // Live device switching: the Audio tab writes these as plain fields on the same control

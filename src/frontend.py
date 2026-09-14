@@ -3168,8 +3168,18 @@ class SynthGui(QWidget):
             status_lbl.setFixedWidth(66)
             box_lay.addWidget(status_lbl)
 
+            # Controls that only make sense once the backend actually reports this lane's audio
+            # as loaded (SEQ_AUDIO_READY) -- a real one-shot "Preview" playback trigger (see
+            # poll_seq_audio_preview_triggers/render_seq_audio_preview_sample in backend.c -- this
+            # genuinely plays the loaded RAM buffer, mixed straight into the output, independent
+            # of any other lane's own Preview state so several lanes can play back
+            # simultaneously) plus the Offset knob. Shown/hidden together as one unit.
             offset_widget = QWidget()
-            offset_lay = QVBoxLayout(offset_widget); offset_lay.setContentsMargins(0, 0, 0, 0); offset_lay.setSpacing(0)
+            offset_lay = QVBoxLayout(offset_widget); offset_lay.setContentsMargins(0, 0, 0, 0); offset_lay.setSpacing(2)
+            preview_btn = QPushButton("▶ Preview")
+            preview_btn.setStyleSheet("font-size: 9px;")
+            preview_btn.clicked.connect(lambda: self._preview_seq_audio(idx))
+            offset_lay.addWidget(preview_btn)
             offset_lay.addWidget(QLabel("Offset"), alignment=Qt.AlignmentFlag.AlignCenter)
             offset_dial = PotentiometerKnob(f"Lane {idx + 1} Audio Offset", self)
             offset_dial.setRange(-100, 100); offset_dial.setValue(0)  # tenths of a second: -10.0s..+10.0s
@@ -3185,7 +3195,8 @@ class SynthGui(QWidget):
             _retain_hidden(box)
             box.setVisible(False)
             return {"box": box, "load_btn": load_btn, "status_label": status_lbl,
-                    "offset_dial": offset_dial, "offset_widget": offset_widget, "path": ""}
+                    "offset_dial": offset_dial, "offset_widget": offset_widget,
+                    "preview_btn": preview_btn, "path": "", "preview_trigger": 0}
 
         # Combi view: 16 lanes, no type/seq-mode dropdowns -- every Combi lane is implicitly
         # Program/MIDI (Combi has no audio-lane concept at all, per the user's own "these two
@@ -4717,6 +4728,17 @@ class SynthGui(QWidget):
         widgets["offset_widget"].setVisible(False)
         self.transmit_knob_packet()
 
+    def _preview_seq_audio(self, lane_idx):
+        """'Preview' button: increments this lane's edge-triggered counter and resends the whole
+        packet -- the backend detects the change (poll_seq_audio_preview_triggers in backend.c)
+        and (re)starts that lane's one-shot RAM playback from the beginning (or Offset seconds
+        in), mixed straight into the output. Independent per lane -- multiple lanes' Preview
+        buttons can be clicked and will play back simultaneously, proving multitrack playback
+        rather than one lane at a time."""
+        widgets = self.seq_lane_audio_widgets[lane_idx]
+        widgets["preview_trigger"] = widgets.get("preview_trigger", 0) + 1
+        self.transmit_knob_packet()
+
     def _apply_seq_audio_status(self, updates):
         """updates: {lane_index: {"state": float, "frames"?: float, "channels"?: float,
         "sample_rate"?: float}}, decoded from /hds/status/seq_audio/<lane>/... -- see
@@ -5610,6 +5632,7 @@ class SynthGui(QWidget):
             audio_widgets = self.seq_lane_audio_widgets[i]
             add_s(f"/hds/seq/{i}/audio_path", audio_widgets.get("path", "") or "")
             add_f(f"/hds/seq/{i}/audio_offset_sec", float(audio_widgets["offset_dial"].value()) / 10.0)
+            add_f(f"/hds/seq/{i}/audio_preview_trigger", audio_widgets.get("preview_trigger", 0))
         if perf_mode == 1:
             for i, (_row, fader, pan_dial, _type_combo, _mode_combo) in enumerate(self.combi_lane_rows):
                 add_f(f"/hds/seq/{i}/lane_type", 0)  # Combi lanes are always Program/MIDI
