@@ -4907,6 +4907,22 @@ class SynthGui(QWidget):
             if addr in fields:
                 combo.blockSignals(True); combo.setCurrentIndex(int(round(fields[addr]))); combo.blockSignals(False)
 
+        # Bug fix: every setter above uses blockSignals to avoid a storm of individual
+        # transmit_knob_packet() calls mid-load -- but several of these combos also drive purely
+        # VISUAL state through their own currentIndexChanged connection (the Unison Saw/Pulse-
+        # Width-or-Tilt box show/hide per oscillator Shape, each filter unit's blend-knob-row
+        # show/hide per Type, the Filter Routing preset combo's derived label, the Parallel
+        # level/pan box per Routing mode) -- blocking signals silently skipped all of that, so a
+        # loaded Program's VALUES were always correct but the GUI could visually look like the
+        # oscillator/filter was still in its old configuration until some other control was
+        # touched. Re-emitting each combo's own currentIndexChanged (its current value hasn't
+        # changed since the block above, so this is a pure "run my own side effects" signal, not
+        # a value change) makes the GUI actually recall exactly as if it had been set that way by
+        # hand -- matches every other widget class's real-time behavior.
+        for combo in (self.vco1_combo, self.vco2_combo, self.vco3_combo, self.vco4_combo,
+                      *self.vcf_types, self.filter_routing_mode):
+            combo.currentIndexChanged.emit(combo.currentIndex())
+
         self.transmit_knob_packet()
 
     def _apply_program_fields_filters(self, fields):
@@ -5969,6 +5985,17 @@ def runtime_connect_and_bind(gui):
     gui.vco2_fine_tune.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco1_phase.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco2_phase.valueChanged.connect(gui.transmit_knob_packet)
+    # Bug fix: these 4 Pitch knobs (vco1_pitch..vco4_pitch) were built with a working backend
+    # (knobs->vcoN_pitch sums directly into the same mod_vcoN_pitch accumulator LFO/EG modulation
+    # already writes into -- see backend.c's render_audio_block) and a working OSC address, but
+    # were never connected to transmit_knob_packet -- turning one did nothing audible until some
+    # OTHER control happened to trigger a resend. LFO/EG-driven pitch modulation (via the
+    # Destination dropdown/right-click menu) was never affected by this, since that path already
+    # transmits on its own combo's currentIndexChanged.
+    gui.vco1_pitch.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco2_pitch.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco3_pitch.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco4_pitch.valueChanged.connect(gui.transmit_knob_packet)
     gui.filter_routing_mode.currentIndexChanged.connect(gui.transmit_knob_packet)
     gui.filter_a_level_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.filter_b_level_dial.valueChanged.connect(gui.transmit_knob_packet)
