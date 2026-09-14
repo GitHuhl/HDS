@@ -573,9 +573,6 @@ LFO_COUNT = 16
 SEQ_LANE_COUNT = 32
 PROGRAM_LANE_RESOURCE_COUNT = 16
 AUDIO_LANE_RESOURCE_COUNT = 16
-ENGINE_SAMPLE_RATE = 48000  # must match SAMPLE_RATE in backend.c -- used only to warn when a
-                              # loaded Sequencer audio lane's native rate differs (no resampling
-                              # exists yet; see _apply_seq_audio_status)
 # FM Algorithm system: must match FM_ALGORITHM_COUNT/FM_ALGORITHMS in backend.c exactly. Each
 # entry names which depth dial(s) are relevant for that algorithm (used to show/hide the depth
 # knobs conditionally, mirroring the FX slot param show/hide pattern) -- "fm_intensity" is the
@@ -4794,13 +4791,10 @@ class SynthGui(QWidget):
                 sample_rate = fields.get("sample_rate", 0.0)
                 secs = (frames / sample_rate) if sample_rate > 0 else 0.0
                 text = f"{name} ({secs:.1f}s, {channels}ch)"
-                # No resampling exists yet (see backend.c's seq_audio_load_wav_from_disk --
-                # frame_count/duration are already correct for THIS file's own rate, but nothing
-                # currently reads g_seq_audio[] for playback either, so this is purely an early
-                # warning: once playback exists, a mismatched-rate clip would play back at the
-                # wrong pitch/speed unless resampled first).
-                if sample_rate > 0 and int(sample_rate) != ENGINE_SAMPLE_RATE:
-                    text += f" ⚠ {int(sample_rate)}Hz ≠ engine {ENGINE_SAMPLE_RATE}Hz, will need resampling"
+                # seq_audio_loader_thread_main (backend.c) always resamples a loaded file to the
+                # engine's own SAMPLE_RATE before storing it, so sample_rate reported here will
+                # always equal ENGINE_SAMPLE_RATE post-load -- there's no mismatch state left to
+                # warn about.
                 widgets["status_label"].setText(text)
                 widgets["offset_widget"].setVisible(True)
             elif state == 3:  # SEQ_AUDIO_ERROR

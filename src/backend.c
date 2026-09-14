@@ -3422,6 +3422,36 @@ static float *seq_audio_load_wav_from_disk(const char *path, int *out_frames, in
     return pcm;
 }
 
+// Linear-interpolation sample-rate conversion. Runs once, only on this (non-realtime) loader
+// thread, so a plain single-pass linear resample is more than adequate -- nothing here needs to
+// be low-latency or audio-thread-safe. Returns a newly malloc'd interleaved buffer at to_rate and
+// writes its frame count to *out_frames; returns NULL (leaving *out_frames untouched) if nothing
+// needs doing or on allocation failure, in which case the caller keeps the original buffer as-is.
+static float *seq_audio_resample_linear(const float *pcm, int frames, int channels, int from_rate, int to_rate, int *out_frames) {
+    if (from_rate <= 0 || to_rate <= 0 || from_rate == to_rate || frames <= 0) return NULL;
+    double ratio = (double)to_rate / (double)from_rate;
+    int new_frames = (int)((double)frames * ratio + 0.5);
+    if (new_frames < 1) new_frames = 1;
+    float *out = malloc((size_t)new_frames * (size_t)channels * sizeof(float));
+    if (!out) return NULL;
+    double step = (double)from_rate / (double)to_rate;
+    for (int i = 0; i < new_frames; i++) {
+        double src_pos = (double)i * step;
+        long idx0 = (long)src_pos;
+        if (idx0 >= frames) idx0 = frames - 1;
+        long idx1 = idx0 + 1;
+        if (idx1 >= frames) idx1 = frames - 1;
+        double frac = src_pos - (double)idx0;
+        for (int c = 0; c < channels; c++) {
+            float s0 = pcm[idx0 * channels + c];
+            float s1 = pcm[idx1 * channels + c];
+            out[i * channels + c] = (float)((double)s0 + ((double)s1 - (double)s0) * frac);
+        }
+    }
+    *out_frames = new_frames;
+    return out;
+}
+
 static void *seq_audio_loader_thread_main(void *arg) {
     SeqAudioLoadRequest *req = (SeqAudioLoadRequest *)arg;
     SeqAudioLane *lane = &g_seq_audio[req->lane_index];
@@ -3432,6 +3462,24 @@ static void *seq_audio_loader_thread_main(void *arg) {
     // own start via the acquire/release pair on load_state plus pthread_create's own
     // synchronizes-with guarantee -- see this file's SeqAudioLane comment.
     float *old_pcm = lane->pcm;
+    if (pcm && sample_rate > 0 && sample_rate != SAMPLE_RATE) {
+        // The playback loop (render_seq_audio_preview_sample) reads one PCM frame per rendered
+        // sample with no rate conversion of its own -- a file whose native rate differs from the
+        // engine's would otherwise play back at the wrong pitch/speed. Resample here, once, on
+        // this background thread, so every loaded lane always plays back correctly regardless of
+        // its source file's native rate.
+        int resampled_frames = 0;
+        float *resampled = seq_audio_resample_linear(pcm, frames, channels, sample_rate, SAMPLE_RATE, &resampled_frames);
+        if (resampled) {
+            free(pcm);
+            pcm = resampled;
+            frames = resampled_frames;
+            sample_rate = SAMPLE_RATE;
+        }
+        // resampled == NULL (allocation failure): fall through and keep the original-rate
+        // buffer -- still playable, just at the wrong pitch/speed, same as before this feature
+        // existed, rather than losing the load entirely over a resample-only OOM.
+    }
     if (pcm) {
         lane->frame_count = frames;
         lane->channels = channels;
@@ -4759,12 +4807,20 @@ static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *k
     if (g_transport_state != TRANSPORT_PLAYING) return;
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         if (knobs->seq_lanes[l].lane_type != 0.0f) continue;
-        if ((int)knobs->seq_lanes[l].seq_mode != 0) continue; // not in Seq (playback) mode
+        int mode = (int)knobs->seq_lanes[l].seq_mode;
+        if (mode != 0 && mode != 1) continue; // Rec doesn't play back at all; only Seq/Mute do
         SeqMidiLane *ml = &g_seq_midi[l];
         while (ml->playback_cursor < ml->event_count && ml->events[ml->playback_cursor].time_sec <= (float)g_transport_playhead_sec) {
             SeqMidiEvent *e = &ml->events[ml->playback_cursor];
-            if (e->type == 0) handle_note_on(voices, knobs, global_lfo_phases, e->note, e->velocity, poly_mode_active, mono_stack);
-            else handle_note_off(voices, knobs, midi_live, e->note, poly_mode_active, mono_stack);
+            // Mute (mode == 1) still walks the cursor forward in step with the playhead -- just
+            // without ever calling handle_note_on/off -- so un-muting resumes wherever the
+            // playhead currently is instead of bursting out every note that was skipped while
+            // muted. Same "stay in sync, just silence the output" shape as the audio-lane Mute
+            // fix right above this function's own mix-loop call site.
+            if (mode == 0) {
+                if (e->type == 0) handle_note_on(voices, knobs, global_lfo_phases, e->note, e->velocity, poly_mode_active, mono_stack);
+                else handle_note_off(voices, knobs, midi_live, e->note, poly_mode_active, mono_stack);
+            }
             ml->playback_cursor++;
         }
     }
@@ -5815,6 +5871,14 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             if (lane->driven_by_transport && g_transport_state != TRANSPORT_PLAYING) continue;
             float sample_l, sample_r;
             render_seq_audio_preview_sample(lane, knobs->seq_lanes[l].volume, knobs->seq_lanes[l].pan, &sample_l, &sample_r);
+            // Mute (seq_mode == 1) on a transport-driven lane silences it live, right now, rather
+            // than only preventing it from auto-starting on the next Play -- but the render call
+            // above still ran, so play_frame still advanced in step with the transport. Un-muting
+            // therefore resumes exactly in sync with everything else, instead of picking up from
+            // wherever it happened to be when it was muted. A manually Preview-triggered lane
+            // (driven_by_transport == false) is never affected by Mute, same as it's never
+            // affected by Pause/Stop -- Preview always plays straight through regardless.
+            if (lane->driven_by_transport && (int)knobs->seq_lanes[l].seq_mode == 1) continue;
             pair_l[0] += sample_l;
             pair_r[0] += sample_r;
         }
