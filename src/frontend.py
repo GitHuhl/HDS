@@ -3308,11 +3308,24 @@ class SynthGui(QWidget):
         seq_strips_lay.setContentsMargins(0, 0, 0, 0); seq_strips_lay.setSpacing(3)
         self.seq_lane_rows = []  # 32 x (strip, fader, pan_dial, type_combo, mode_combo)
         self.seq_lane_audio_widgets = []  # 32 x dict, see _build_seq_audio_controls
+        # Per-lane MIDI channel selector (Sequencer only -- Combi lanes stay hardcoded Omni, no
+        # real independent lanes exist there yet). "Omni" (index 0, sent as backend's 0) or a
+        # specific channel 1-16 (combo index N sent as N) -- filters which Rec-armed lane(s) an
+        # incoming note gets RECORDED into (seq_record_midi_event in backend.c); live Program
+        # dispatch stays fully channel-agnostic regardless of this. Built separately and appended
+        # onto the strip afterward, same idiom _build_seq_audio_controls already uses, to keep
+        # _build_seq_lane_row's own return shape unchanged.
+        self.seq_lane_midi_channel_combos = []  # 32 x QComboBox
         for i in range(SEQ_LANE_COUNT):
             lane = _build_seq_lane_row(i, show_seq_controls=True)
             audio_widgets = _build_seq_audio_controls(i)
             lane[0].layout().addWidget(audio_widgets["box"])
             self.seq_lane_audio_widgets.append(audio_widgets)
+            channel_combo = QComboBox()
+            channel_combo.addItems(["Omni"] + [str(c) for c in range(1, 17)])
+            channel_combo.setStyleSheet("font-size: 9px;")
+            lane[0].layout().addWidget(channel_combo)
+            self.seq_lane_midi_channel_combos.append(channel_combo)
             seq_strips_lay.addWidget(lane[0])
             self.seq_lane_rows.append(lane)
         seq_strips_lay.addStretch()
@@ -3354,6 +3367,7 @@ class SynthGui(QWidget):
                     self.seq_status_label.setText(f"Lane {idx + 1}: already {AUDIO_LANE_RESOURCE_COUNT} Audio lanes active -- reverted")
                     new_index = 0
             self.seq_lane_audio_widgets[idx]["box"].setVisible(new_index == 1)
+            self.seq_lane_midi_channel_combos[idx].setVisible(new_index == 0)
         for i, lane in enumerate(self.seq_lane_rows):
             lane[3].currentIndexChanged.connect(lambda new_index, idx=i: _enforce_seq_lane_type_cap(idx, new_index))
         # ----------------------------------------------------
@@ -5687,7 +5701,7 @@ class SynthGui(QWidget):
             add_f(f"/hds/seq/{i}/lane_type", type_combo.currentIndex())
             add_f(f"/hds/seq/{i}/volume", fader.value())
             add_f(f"/hds/seq/{i}/pan", float(pan_dial.value()) / 100.0)
-            add_f(f"/hds/seq/{i}/midi_channel", 0)  # Omni -- no per-lane MIDI UI yet
+            add_f(f"/hds/seq/{i}/midi_channel", self.seq_lane_midi_channel_combos[i].currentIndex())  # 0=Omni, else 1-16
             add_f(f"/hds/seq/{i}/mode", mode_combo.currentIndex())
             audio_widgets = self.seq_lane_audio_widgets[i]
             add_s(f"/hds/seq/{i}/audio_path", audio_widgets.get("path", "") or "")
@@ -6078,6 +6092,8 @@ def runtime_connect_and_bind(gui):
             type_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
         if mode_combo is not None:
             mode_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+    for channel_combo in gui.seq_lane_midi_channel_combos:
+        channel_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
 
     # Unison Unison Saw control loops
     gui.vco1_unison_width.valueChanged.connect(gui.transmit_knob_packet)

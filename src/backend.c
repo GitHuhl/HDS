@@ -195,10 +195,12 @@ typedef struct {
                          // pass, since neither resource pool exists in the backend yet).
     float volume;        // 0-100
     float pan;            // -1..1, same convention as vco1_pan
-    float midi_channel;   // 0 = Omni, 1-16 = specific channel. Inert: process_midi_input doesn't
-                           // read this yet (today's engine is fully channel-agnostic) -- the
-                           // field exists now so it's already in place once per-lane MIDI
-                           // filtering is built for real.
+    float midi_channel;   // 0 = Omni, 1-16 = specific channel. Filters Sequencer RECORDING only
+                           // (see seq_record_midi_event) -- a Rec-armed lane only captures
+                           // incoming notes on its own channel, or every channel if Omni. Live
+                           // Program dispatch (handle_note_on/off, outside the Sequencer) stays
+                           // fully channel-agnostic as before -- this field never touches that
+                           // path, only which lane(s) a note gets RECORDED into.
     float seq_mode;        // 0 = Seq (plays back recorded sequence), 1 = Mute, 2 = Rec. Ignored
                             // entirely in Combi mode; meaningful only once Sequencer's real
                             // playback/record engine exists.
@@ -4786,13 +4788,19 @@ static void advance_transport_playhead(int block_size) {
 
 // Hooked directly into process_midi_input's existing NOTEON/NOTEOFF dispatch (right after the
 // live handle_note_on/handle_note_off call, never instead of it -- recording must never affect
-// what's actually heard live). A no-op unless the transport is genuinely PLAYING and at least one
-// lane is armed to Rec, so an idle Sequencer costs nothing extra on the live MIDI path.
-static void seq_record_midi_event(const SynthSharedControls *knobs, unsigned char type, unsigned char note, unsigned char velocity) {
+// what's actually heard live, and is never itself filtered by channel -- only which Rec-armed
+// lane(s) a note gets recorded INTO is). A no-op unless the transport is genuinely PLAYING and at
+// least one lane is armed to Rec, so an idle Sequencer costs nothing extra on the live MIDI path.
+// midi_channel_1_16 is the incoming event's own MIDI channel, already converted from ALSA's
+// 0-indexed data.note.channel to this file's 1-16 convention (matching SeqLaneState.midi_channel)
+// by the caller.
+static void seq_record_midi_event(const SynthSharedControls *knobs, unsigned char type, unsigned char note, unsigned char velocity, int midi_channel_1_16) {
     if (g_transport_state != TRANSPORT_PLAYING) return;
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         if (knobs->seq_lanes[l].lane_type != 0.0f) continue; // Audio lanes don't record MIDI
         if ((int)knobs->seq_lanes[l].seq_mode != 2) continue; // not armed to Rec
+        float lane_channel = knobs->seq_lanes[l].midi_channel;
+        if (lane_channel != 0.0f && (int)lane_channel != midi_channel_1_16) continue; // 0 = Omni, else must match exactly
         SeqMidiLane *ml = &g_seq_midi[l];
         if (ml->event_count >= SEQ_MIDI_EVENT_CAPACITY) continue; // full -- silently drop further events past this documented cap
         ml->events[ml->event_count++] = (SeqMidiEvent){ (float)g_transport_playhead_sec, type, note, velocity };
@@ -4943,12 +4951,15 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
         snd_seq_event_input(seq_handle, &ev); if (ev == NULL) continue;
         if (ev->type == SND_SEQ_EVENT_NOTEON || ev->type == SND_SEQ_EVENT_NOTEOFF) {
             int note = ev->data.note.note;
+            // ALSA's own sequencer channel is 0-indexed (0-15); SeqLaneState.midi_channel uses
+            // 1-16 (0 reserved for Omni), so +1 here converts once for both call sites below.
+            int midi_channel_1_16 = (int)ev->data.note.channel + 1;
             if (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0) {
                 handle_note_on(voices, knobs, global_lfo_phases, note, ev->data.note.velocity, poly_mode_active, mono_stack);
-                seq_record_midi_event(knobs, 0, (unsigned char)note, (unsigned char)ev->data.note.velocity);
+                seq_record_midi_event(knobs, 0, (unsigned char)note, (unsigned char)ev->data.note.velocity, midi_channel_1_16);
             } else {
                 handle_note_off(voices, knobs, midi_live, note, poly_mode_active, mono_stack);
-                seq_record_midi_event(knobs, 1, (unsigned char)note, 0);
+                seq_record_midi_event(knobs, 1, (unsigned char)note, 0, midi_channel_1_16);
             }
         } else if (ev->type == SND_SEQ_EVENT_CONTROLLER) {
             int cc_num = ev->data.control.param;
