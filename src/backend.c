@@ -155,7 +155,21 @@ typedef struct {
     float cutoff;
     float res_q;
     float slope_poles; // 0 = 2-pole (12dB/oct), 1 = 4-pole (24dB/oct)
-    float filter_type;  // 0 = Off (bypass -- passes the signal through unfiltered), 1 = Low Pass, 2 = High Pass, 3 = Band Pass
+    // Repurposed (not renamed -- same field, same OSC address, matching how hard_sync was
+    // reinterpreted into hard_sync_mode previously): 0 = Off (bypass -- passes the signal through
+    // unfiltered, unchanged), 1 = Active (uses the Multi Filter blend below instead of an
+    // exclusive Low/High/Band Pass pick).
+    float filter_type;
+    // Multi Filter blend: run_svf_filter's SVF core already produces Low/Band/High simultaneously
+    // every sample (Notch = Low+High is a free, standard SVF identity); rather than pick one
+    // exclusively, each of these 5 weights (-100..100, bipolar so a phase-inverted combination is
+    // possible) says how much of that tap the final output carries. "Dry" is this filter's own
+    // pre-stage input. Two independent blends (Mode 1 / Mode 2) let `crossfade` (0-100, modulatable
+    // -- see filter_crossfade_mods in render_audio_block) morph between two hand-built combinations
+    // live, e.g. from an EG/LFO/real-time controller.
+    float mode1_lp, mode1_bp, mode1_hp, mode1_notch, mode1_dry;
+    float mode2_lp, mode2_bp, mode2_hp, mode2_notch, mode2_dry;
+    float crossfade; // 0 = all Mode 1, 100 = all Mode 2
 } FilterParams;
 
 // A single FX bus slot's parameters. FX_SLOT_COUNT of these run in series (slot 0 first) on
@@ -388,14 +402,22 @@ typedef struct {
     // Filter A / Filter B outer routing: 0 = Series A->B (mixer -> A -> B -> output),
     // 1 = Series B->A (mixer -> B -> A -> output -- same two filters, reversed order, e.g. to
     // put Filter A's Multi mode after Filter B instead of before it), 2 = Parallel (mixer -> A,
-    // mixer -> B independently, blended by filter_ab_blend -> output). (+1 float)
+    // mixer -> B independently, each with its own level/pan below -> output). (+1 float)
     float filter_ab_routing_mode;
 
-    // Parallel-mode blend between Filter A and Filter B's independent outputs: 0 = all A,
-    // 100 = all B, 50 (default) = even blend, matching the old fixed-50/50 behavior. Unused in
-    // either Series mode, where the chain order alone decides which filter is "heard last".
-    // (+1 float)
-    float filter_ab_blend;
+    // Parallel-mode independent level (0-100) and pan (-1..1, equal-power) per filter --
+    // replaces the old single filter_ab_blend crossfade (BREAKING CHANGE) so each filter can be
+    // placed at its own level AND stereo position, matching a classic hardware synth's own
+    // "Parallel" filter routing description ("individual control over both level and pan").
+    // Unused in either Series mode, where the chain order alone decides which filter is "heard
+    // last". Defaults (50/50 level, centered pan) reproduce the old blend=50 default output level
+    // exactly -- see run_svf_filter's Parallel-combine comment in render_audio_block for the
+    // sqrt(2)-normalized pan formula that makes pan=0 a true no-op on an already-stereo signal.
+    // (+4 floats)
+    float filter_a_level;
+    float filter_b_level;
+    float filter_a_pan;
+    float filter_b_pan;
 
     // Filter A: a single Normal filter by default. Switching filter_a_mode to 1 ("Multi")
     // replaces it with the 3-filter Multi engine below instead of filter_a -- the original
@@ -976,7 +998,7 @@ static float band_limited_pulse(float phase, float dt, float duty_frac) {
 // core cascaded twice back-to-back for a 4-pole (24dB/oct) slope. low_state/band_state must be
 // 2-element arrays (per-voice, persistent between calls); only element 0 is touched at 2-pole,
 // both at 4-pole -- so switching slopes live doesn't require resetting anything.
-static float run_svf_filter(float input, float cutoff_hz, float res_q, int filter_type, int slope_poles, float low_state[2], float band_state[2]) {
+static float run_svf_filter(float input, float cutoff_hz, float res_q, int active, const float mode1[5], const float mode2[5], float crossfade, int slope_poles, float low_state[2], float band_state[2]) {
     // FIXED (catastrophic bug): "Off" used to return 0.0f -- silencing the signal entirely --
     // carried over unexamined from the old 3-filter engine's convention. In the new 2-filter
     // (A/B) architecture, Filter B defaults to Off, and EVERY voice's signal passes through
@@ -984,7 +1006,7 @@ static float run_svf_filter(float input, float cutoff_hz, float res_q, int filte
     // multiplied the whole synth's output by zero, and there was no way to hear anything with
     // both filters off. "Off" now means bypass: the signal passes through completely
     // unmodified, matching what "Off" obviously should mean.
-    if (filter_type == 0) return input;
+    if (!active) return input;
     cutoff_hz = fmaxf(40.0f, fminf(18000.0f, cutoff_hz));
     // FIXED (catastrophic bug -- "total audio failure when changing filter knobs"): this used to
     // be the classic "naive" Chamberlin SVF (forward-Euler integration of the analog SVF ODEs,
@@ -1023,9 +1045,25 @@ static float run_svf_filter(float input, float cutoff_hz, float res_q, int filte
     float a1 = 1.0f / (1.0f + g * (g + k));
     float a2 = g * a1;
     float a3 = g * a2;
+    // Multi Filter blend: the SVF core below already produces Low/Band/High simultaneously every
+    // sample: rather than pick one exclusively (the old behavior, still reproduced exactly by a
+    // one-hot Mode 1 with crossfade=0 -- see init_default_controls), weight-sum all of them plus
+    // Notch (= Low + High, a free standard SVF identity) and Dry (this stage's own input).
+    // Interpolating the 5 weights Mode1->Mode2 is hoisted here, outside the per-stage loop below,
+    // since it depends only on the two mode vectors + crossfade, never on per-stage state -- so
+    // it's computed once per call and reused for both stages in 4-pole mode, not recomputed per
+    // stage. mode1[]/mode2[] are {lp, bp, hp, notch, dry}, each -100..100 (bipolar -- a negative
+    // weight phase-inverts that tap into the mix, a deliberate extra degree of freedom).
+    float xf = fmaxf(0.0f, fminf(100.0f, crossfade)) / 100.0f;
+    float m_lp    = (mode1[0] + (mode2[0] - mode1[0]) * xf) / 100.0f;
+    float m_bp    = (mode1[1] + (mode2[1] - mode1[1]) * xf) / 100.0f;
+    float m_hp    = (mode1[2] + (mode2[2] - mode1[2]) * xf) / 100.0f;
+    float m_notch = (mode1[3] + (mode2[3] - mode1[3]) * xf) / 100.0f;
+    float m_dry   = (mode1[4] + (mode2[4] - mode1[4]) * xf) / 100.0f;
     int stages = (slope_poles != 0) ? 2 : 1;
     float sig = input;
     for (int s = 0; s < stages; s++) {
+        float dry = sig; // this stage's own pre-filter input -- "Dry" in the blend
         float v3 = sig - low_state[s];
         float v1 = a1 * band_state[s] + a2 * v3; // bandpass output
         float v2 = low_state[s] + a2 * band_state[s] + a3 * v3; // lowpass output
@@ -1041,32 +1079,44 @@ static float run_svf_filter(float input, float cutoff_hz, float res_q, int filte
         band_state[s] = fmaxf(-1.0e6f, fminf(1.0e6f, band_state[s]));
         low_state[s] = fmaxf(-1.0e6f, fminf(1.0e6f, low_state[s]));
         float high = sig - k * v1 - v2; // highpass output
-        sig = (filter_type == 1) ? v2 : ((filter_type == 2) ? high : v1);
+        float notch = v2 + high; // standard SVF identity: Notch = Low + High
+        sig = m_lp*v2 + m_bp*v1 + m_hp*high + m_notch*notch + m_dry*dry;
     }
     return sig;
+}
+
+// Small convenience wrapper: builds run_svf_filter's mode1[]/mode2[] arrays from a FilterParams
+// instance and applies knob+mod combination for cutoff/res/crossfade, matching the existing
+// "*_mods[]" additive-modulation convention used everywhere else in this file. Every call site
+// that drives a FilterParams-backed filter (Filter A Normal, each Filter A Multi unit, Filter B)
+// goes through this instead of repeating the 10-field array-building boilerplate 5 times over.
+static float run_svf_filter_p(float input, const FilterParams *p, float cutoff_mod, float res_mod, float crossfade_mod, float low_state[2], float band_state[2]) {
+    float mode1[5] = { p->mode1_lp, p->mode1_bp, p->mode1_hp, p->mode1_notch, p->mode1_dry };
+    float mode2[5] = { p->mode2_lp, p->mode2_bp, p->mode2_hp, p->mode2_notch, p->mode2_dry };
+    return run_svf_filter(input, p->cutoff + cutoff_mod, p->res_q + res_mod, (int)p->filter_type, mode1, mode2, p->crossfade + crossfade_mod, (int)p->slope_poles, low_state, band_state);
 }
 
 // Filter A's "Multi" mode: the original 3-filter engine, now scoped down to being one of Filter
 // A's two modes (see the FilterParams/filter_a_multi comments in the struct). Processes a
 // single channel (called once for L, once for R -- see render_audio_block); each channel keeps
 // its own independent state so panning survives filtering.
-static float run_filter_a_multi(float in, int routing, const FilterParams multi[3], const float cutoff_mods[3], const float res_mods[3], float low[3][2], float band[3][2]) {
-    float u0 = run_svf_filter(in, multi[0].cutoff + cutoff_mods[0], multi[0].res_q + res_mods[0], (int)multi[0].filter_type, (int)multi[0].slope_poles, low[0], band[0]);
+static float run_filter_a_multi(float in, int routing, const FilterParams multi[3], const float cutoff_mods[3], const float res_mods[3], const float crossfade_mods[3], float low[3][2], float band[3][2]) {
+    float u0 = run_svf_filter_p(in, &multi[0], cutoff_mods[0], res_mods[0], crossfade_mods[0], low[0], band[0]);
 
     if (routing == 0) {
         // Series: unit 0 -> unit 1 -> unit 2
-        float u1 = run_svf_filter(u0, multi[1].cutoff + cutoff_mods[1], multi[1].res_q + res_mods[1], (int)multi[1].filter_type, (int)multi[1].slope_poles, low[1], band[1]);
-        return run_svf_filter(u1, multi[2].cutoff + cutoff_mods[2], multi[2].res_q + res_mods[2], (int)multi[2].filter_type, (int)multi[2].slope_poles, low[2], band[2]);
+        float u1 = run_svf_filter_p(u0, &multi[1], cutoff_mods[1], res_mods[1], crossfade_mods[1], low[1], band[1]);
+        return run_svf_filter_p(u1, &multi[2], cutoff_mods[2], res_mods[2], crossfade_mods[2], low[2], band[2]);
     } else if (routing == 1) {
         // Parallel: all 3 units take the same input directly, summed evenly
-        float u1 = run_svf_filter(in, multi[1].cutoff + cutoff_mods[1], multi[1].res_q + res_mods[1], (int)multi[1].filter_type, (int)multi[1].slope_poles, low[1], band[1]);
-        float u2 = run_svf_filter(in, multi[2].cutoff + cutoff_mods[2], multi[2].res_q + res_mods[2], (int)multi[2].filter_type, (int)multi[2].slope_poles, low[2], band[2]);
+        float u1 = run_svf_filter_p(in, &multi[1], cutoff_mods[1], res_mods[1], crossfade_mods[1], low[1], band[1]);
+        float u2 = run_svf_filter_p(in, &multi[2], cutoff_mods[2], res_mods[2], crossfade_mods[2], low[2], band[2]);
         return (u0 + u1 + u2) / 3.0f;
     } else {
         // Split: unit 0 // unit 1 (both take the same input directly), summed 50/50, -> unit 2
-        float u1 = run_svf_filter(in, multi[1].cutoff + cutoff_mods[1], multi[1].res_q + res_mods[1], (int)multi[1].filter_type, (int)multi[1].slope_poles, low[1], band[1]);
+        float u1 = run_svf_filter_p(in, &multi[1], cutoff_mods[1], res_mods[1], crossfade_mods[1], low[1], band[1]);
         float blended = (u0 + u1) * 0.5f;
-        return run_svf_filter(blended, multi[2].cutoff + cutoff_mods[2], multi[2].res_q + res_mods[2], (int)multi[2].filter_type, (int)multi[2].slope_poles, low[2], band[2]);
+        return run_svf_filter_p(blended, &multi[2], cutoff_mods[2], res_mods[2], crossfade_mods[2], low[2], band[2]);
     }
 }
 
@@ -2410,21 +2460,59 @@ static const OscParamEntry OSC_PARAMS[] = {
 
     // --- Filter A/B ---
     OSC_SCALAR("/hds/filter/ab_routing_mode", filter_ab_routing_mode),
-    OSC_SCALAR("/hds/filter/ab_blend", filter_ab_blend),
+    // Parallel-mode independent level/pan (replaces the old single filter_ab_blend crossfade).
+    OSC_SCALAR("/hds/filter/a/level", filter_a_level),
+    OSC_SCALAR("/hds/filter/b/level", filter_b_level),
+    OSC_SCALAR("/hds/filter/a/pan", filter_a_pan),
+    OSC_SCALAR("/hds/filter/b/pan", filter_b_pan),
     OSC_SCALAR("/hds/filter/a/mode", filter_a_mode),
     OSC_SCALAR("/hds/filter/a/cutoff", filter_a.cutoff),
     OSC_SCALAR("/hds/filter/a/res_q", filter_a.res_q),
     OSC_SCALAR("/hds/filter/a/slope", filter_a.slope_poles),
     OSC_SCALAR("/hds/filter/a/type", filter_a.filter_type),
+    // Multi Filter blend (Mode 1/Mode 2/Crossfade) -- one set of 11 addresses per filter unit.
+    OSC_SCALAR("/hds/filter/a/mode1/lp", filter_a.mode1_lp),
+    OSC_SCALAR("/hds/filter/a/mode1/bp", filter_a.mode1_bp),
+    OSC_SCALAR("/hds/filter/a/mode1/hp", filter_a.mode1_hp),
+    OSC_SCALAR("/hds/filter/a/mode1/notch", filter_a.mode1_notch),
+    OSC_SCALAR("/hds/filter/a/mode1/dry", filter_a.mode1_dry),
+    OSC_SCALAR("/hds/filter/a/mode2/lp", filter_a.mode2_lp),
+    OSC_SCALAR("/hds/filter/a/mode2/bp", filter_a.mode2_bp),
+    OSC_SCALAR("/hds/filter/a/mode2/hp", filter_a.mode2_hp),
+    OSC_SCALAR("/hds/filter/a/mode2/notch", filter_a.mode2_notch),
+    OSC_SCALAR("/hds/filter/a/mode2/dry", filter_a.mode2_dry),
+    OSC_SCALAR("/hds/filter/a/crossfade", filter_a.crossfade),
     OSC_SCALAR("/hds/filter/a_multi/routing", filter_a_multi_routing),
     OSC_SUBARRAY("/hds/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3),
     OSC_SUBARRAY("/hds/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3),
     OSC_SUBARRAY("/hds/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3),
     OSC_SUBARRAY("/hds/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3),
+    OSC_SUBARRAY("/hds/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3),
     OSC_SCALAR("/hds/filter/b/cutoff", filter_b.cutoff),
     OSC_SCALAR("/hds/filter/b/res_q", filter_b.res_q),
     OSC_SCALAR("/hds/filter/b/slope", filter_b.slope_poles),
     OSC_SCALAR("/hds/filter/b/type", filter_b.filter_type),
+    OSC_SCALAR("/hds/filter/b/mode1/lp", filter_b.mode1_lp),
+    OSC_SCALAR("/hds/filter/b/mode1/bp", filter_b.mode1_bp),
+    OSC_SCALAR("/hds/filter/b/mode1/hp", filter_b.mode1_hp),
+    OSC_SCALAR("/hds/filter/b/mode1/notch", filter_b.mode1_notch),
+    OSC_SCALAR("/hds/filter/b/mode1/dry", filter_b.mode1_dry),
+    OSC_SCALAR("/hds/filter/b/mode2/lp", filter_b.mode2_lp),
+    OSC_SCALAR("/hds/filter/b/mode2/bp", filter_b.mode2_bp),
+    OSC_SCALAR("/hds/filter/b/mode2/hp", filter_b.mode2_hp),
+    OSC_SCALAR("/hds/filter/b/mode2/notch", filter_b.mode2_notch),
+    OSC_SCALAR("/hds/filter/b/mode2/dry", filter_b.mode2_dry),
+    OSC_SCALAR("/hds/filter/b/crossfade", filter_b.crossfade),
 
     // --- LFOs (lfo[LFO_COUNT], PackLfoParams) ---
     OSC_SUBARRAY("/hds/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT),
@@ -2603,12 +2691,30 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->vco1_pan = 0.0f; knobs->vco2_pan = 0.0f;
     knobs->vco1_fine_tune = 0.0f; knobs->vco2_pitch_offset = 0.0f; knobs->vco2_fine_tune = 0.0f;
     knobs->filter_ab_routing_mode = 0.0f; // Series A->B: mixer -> A -> B
-    knobs->filter_ab_blend = 50.0f; // even blend, only used in Parallel mode
+    // Independent Parallel-mode level/pan (replaces the old single filter_ab_blend crossfade --
+    // see the Filter Routing plan). 50/50 level, centered pan reproduces the old blend=50 default
+    // output level exactly (the pan formula is unity-gain at pan=0 by construction).
+    knobs->filter_a_level = 50.0f; knobs->filter_b_level = 50.0f;
+    knobs->filter_a_pan = 0.0f; knobs->filter_b_pan = 0.0f;
     knobs->filter_a_mode = 0.0f; // Normal (single filter)
+    // Multi Filter blend defaults: every filter unit below reproduces its exact old behavior as a
+    // one-hot Mode 1 blend (100% of exactly the tap the old exclusive filter_type picked) with
+    // crossfade=0, so Mode 2's own values never contribute at the default and are left zeroed.
     knobs->filter_a.cutoff = 800.0f; knobs->filter_a.res_q = 20.0f; knobs->filter_a.slope_poles = 0.0f; knobs->filter_a.filter_type = 1.0f;
+    knobs->filter_a.mode1_lp = 100.0f; knobs->filter_a.mode1_bp = 0.0f; knobs->filter_a.mode1_hp = 0.0f; knobs->filter_a.mode1_notch = 0.0f; knobs->filter_a.mode1_dry = 0.0f;
+    knobs->filter_a.mode2_lp = 0.0f; knobs->filter_a.mode2_bp = 0.0f; knobs->filter_a.mode2_hp = 0.0f; knobs->filter_a.mode2_notch = 0.0f; knobs->filter_a.mode2_dry = 0.0f;
+    knobs->filter_a.crossfade = 0.0f;
     knobs->filter_a_multi_routing = 0.0f; // Series, matching the old default 3-filter behavior
-    for(int f=0; f<3; f++) { knobs->filter_a_multi[f].cutoff = 400.0f + (f*200); knobs->filter_a_multi[f].res_q = 20.0f; knobs->filter_a_multi[f].slope_poles = 0.0f; knobs->filter_a_multi[f].filter_type = 1.0f; }
+    for(int f=0; f<3; f++) {
+        knobs->filter_a_multi[f].cutoff = 400.0f + (f*200); knobs->filter_a_multi[f].res_q = 20.0f; knobs->filter_a_multi[f].slope_poles = 0.0f; knobs->filter_a_multi[f].filter_type = 1.0f;
+        knobs->filter_a_multi[f].mode1_lp = 100.0f; knobs->filter_a_multi[f].mode1_bp = 0.0f; knobs->filter_a_multi[f].mode1_hp = 0.0f; knobs->filter_a_multi[f].mode1_notch = 0.0f; knobs->filter_a_multi[f].mode1_dry = 0.0f;
+        knobs->filter_a_multi[f].mode2_lp = 0.0f; knobs->filter_a_multi[f].mode2_bp = 0.0f; knobs->filter_a_multi[f].mode2_hp = 0.0f; knobs->filter_a_multi[f].mode2_notch = 0.0f; knobs->filter_a_multi[f].mode2_dry = 0.0f;
+        knobs->filter_a_multi[f].crossfade = 0.0f;
+    }
     knobs->filter_b.cutoff = 4000.0f; knobs->filter_b.res_q = 20.0f; knobs->filter_b.slope_poles = 0.0f; knobs->filter_b.filter_type = 0.0f; // Off by default -- Filter A alone matches old single-filter-ish defaults
+    knobs->filter_b.mode1_lp = 100.0f; knobs->filter_b.mode1_bp = 0.0f; knobs->filter_b.mode1_hp = 0.0f; knobs->filter_b.mode1_notch = 0.0f; knobs->filter_b.mode1_dry = 0.0f;
+    knobs->filter_b.mode2_lp = 0.0f; knobs->filter_b.mode2_bp = 0.0f; knobs->filter_b.mode2_hp = 0.0f; knobs->filter_b.mode2_notch = 0.0f; knobs->filter_b.mode2_dry = 0.0f;
+    knobs->filter_b.crossfade = 0.0f;
     for(int l=0; l<LFO_COUNT; l++) { knobs->lfo[l].wave_type = 0.0f; knobs->lfo[l].rate_hz = 5.0f; knobs->lfo[l].mod_depth = 0.0f; knobs->lfo[l].key_sync = 1.0f; knobs->lfo[l].dest_target = 0.0f; knobs->lfo[l].phase_offset = 0.0f; knobs->lfo[l].mod_source_cc = -1.0f; }
     for(int e=0; e<ENV_COUNT; e++) { knobs->eg[e].d = 0.0f; knobs->eg[e].h = 0.0f; knobs->eg[e].a = 10.0f; knobs->eg[e].dec = 150.0f; knobs->eg[e].s = 80.0f; knobs->eg[e].r = 300.0f; knobs->eg[e].al = 0.0f; knobs->eg[e].pk = 100.0f; knobs->eg_mode[e] = 0.0f; }
     for(int i=0; i<ASSIGNABLE_EG_COUNT; i++) { knobs->eg_intensity[i] = 1.0f; knobs->eg_dest_target[i] = 0.0f; }
@@ -4569,6 +4675,9 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // resonance itself was never actually modulatable by anything.
             float filter_cutoff_mods[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             float filter_res_mods[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            // Multi Filter blend Crossfade as a mod destination (targets 86-89), same 4-slot
+            // grouping as filter_cutoff_mods/filter_res_mods above (0=primary, 1=B, 2=M3, 3=M2).
+            float filter_crossfade_mods[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             // Phase Modulation (new): a bipolar mod value shifts where in the cycle each
             // oscillator currently reads from, without touching its actual running phase
             // accumulator (that distinction matters -- it keeps pitch, hard sync, and portamento
@@ -4647,6 +4756,12 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                     // slot-3 comment above.
                     case 84: filter_cutoff_mods[3] += val * 5000.0f; break;
                     case 85: filter_res_mods[3] += val * 50.0f; break;
+                    // Multi Filter blend Crossfade -- same 4-slot grouping as the cutoff/res mods
+                    // above (0=Filter A primary, 1=Filter B, 2=Filter A-M3, 3=Filter A-M2).
+                    case 86: filter_crossfade_mods[0] += val * 50.0f; break;
+                    case 87: filter_crossfade_mods[1] += val * 50.0f; break;
+                    case 88: filter_crossfade_mods[2] += val * 50.0f; break;
+                    case 89: filter_crossfade_mods[3] += val * 50.0f; break;
                     default: break;
                 }
             }
@@ -4699,6 +4814,12 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                     case 47: mod_vco4_tilt += val * 100.0f; break;
                     case 84: filter_cutoff_mods[3] += val * 5000.0f; break;
                     case 85: filter_res_mods[3] += val * 50.0f; break;
+                    // Multi Filter blend Crossfade -- same 4-slot grouping as the cutoff/res mods
+                    // above (0=Filter A primary, 1=Filter B, 2=Filter A-M3, 3=Filter A-M2).
+                    case 86: filter_crossfade_mods[0] += val * 50.0f; break;
+                    case 87: filter_crossfade_mods[1] += val * 50.0f; break;
+                    case 88: filter_crossfade_mods[2] += val * 50.0f; break;
+                    case 89: filter_crossfade_mods[3] += val * 50.0f; break;
                     default: break;
                 }
             }
@@ -5009,6 +5130,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // from slot 3 (targets 84/85), appended after target 47 in this pass.
             float multi_cutoff_mods[3] = { filter_cutoff_mods[0], filter_cutoff_mods[3], filter_cutoff_mods[2] };
             float multi_res_mods[3] = { filter_res_mods[0], filter_res_mods[3], filter_res_mods[2] };
+            float multi_crossfade_mods[3] = { filter_crossfade_mods[0], filter_crossfade_mods[3], filter_crossfade_mods[2] };
 
             float a_out_l, a_out_r, b_out_l, b_out_r;
             int ab_mode = (int)knobs->filter_ab_routing_mode; // 0=Series A->B, 1=Series B->A, 2=Parallel
@@ -5016,38 +5138,49 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 // Series B -> A: run B first on the raw mix, then A on B's output -- the same
                 // two filters as mode 0, just reversed, e.g. to put Filter A's Multi engine
                 // after Filter B instead of before it.
-                b_out_l = run_svf_filter(stage_in_l, knobs->filter_b.cutoff + filter_cutoff_mods[1], knobs->filter_b.res_q + filter_res_mods[1], (int)knobs->filter_b.filter_type, (int)knobs->filter_b.slope_poles, voices[v].fb_low[0], voices[v].fb_band[0]);
-                b_out_r = run_svf_filter(stage_in_r, knobs->filter_b.cutoff + filter_cutoff_mods[1], knobs->filter_b.res_q + filter_res_mods[1], (int)knobs->filter_b.filter_type, (int)knobs->filter_b.slope_poles, voices[v].fb_low[1], voices[v].fb_band[1]);
+                b_out_l = run_svf_filter_p(stage_in_l, &knobs->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
+                b_out_r = run_svf_filter_p(stage_in_r, &knobs->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
                 if ((int)knobs->filter_a_mode == 0) {
-                    a_out_l = run_svf_filter(b_out_l, knobs->filter_a.cutoff + filter_cutoff_mods[0], knobs->filter_a.res_q + filter_res_mods[0], (int)knobs->filter_a.filter_type, (int)knobs->filter_a.slope_poles, voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
-                    a_out_r = run_svf_filter(b_out_r, knobs->filter_a.cutoff + filter_cutoff_mods[0], knobs->filter_a.res_q + filter_res_mods[0], (int)knobs->filter_a.filter_type, (int)knobs->filter_a.slope_poles, voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
+                    a_out_l = run_svf_filter_p(b_out_l, &knobs->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
+                    a_out_r = run_svf_filter_p(b_out_r, &knobs->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
                 } else {
-                    a_out_l = run_filter_a_multi(b_out_l, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
-                    a_out_r = run_filter_a_multi(b_out_r, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
+                    a_out_l = run_filter_a_multi(b_out_l, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
+                    a_out_r = run_filter_a_multi(b_out_r, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
                 }
             } else {
                 // Series A -> B (0), or Parallel (2): run A first on the raw mix.
                 if ((int)knobs->filter_a_mode == 0) {
-                    a_out_l = run_svf_filter(stage_in_l, knobs->filter_a.cutoff + filter_cutoff_mods[0], knobs->filter_a.res_q + filter_res_mods[0], (int)knobs->filter_a.filter_type, (int)knobs->filter_a.slope_poles, voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
-                    a_out_r = run_svf_filter(stage_in_r, knobs->filter_a.cutoff + filter_cutoff_mods[0], knobs->filter_a.res_q + filter_res_mods[0], (int)knobs->filter_a.filter_type, (int)knobs->filter_a.slope_poles, voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
+                    a_out_l = run_svf_filter_p(stage_in_l, &knobs->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
+                    a_out_r = run_svf_filter_p(stage_in_r, &knobs->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
                 } else {
-                    a_out_l = run_filter_a_multi(stage_in_l, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
-                    a_out_r = run_filter_a_multi(stage_in_r, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
+                    a_out_l = run_filter_a_multi(stage_in_l, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
+                    a_out_r = run_filter_a_multi(stage_in_r, (int)knobs->filter_a_multi_routing, knobs->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
                 }
                 // Series: B fed from A's output. Parallel: B fed straight from the mixer, same as A.
                 float b_in_l = (ab_mode == 0) ? a_out_l : stage_in_l;
                 float b_in_r = (ab_mode == 0) ? a_out_r : stage_in_r;
-                b_out_l = run_svf_filter(b_in_l, knobs->filter_b.cutoff + filter_cutoff_mods[1], knobs->filter_b.res_q + filter_res_mods[1], (int)knobs->filter_b.filter_type, (int)knobs->filter_b.slope_poles, voices[v].fb_low[0], voices[v].fb_band[0]);
-                b_out_r = run_svf_filter(b_in_r, knobs->filter_b.cutoff + filter_cutoff_mods[1], knobs->filter_b.res_q + filter_res_mods[1], (int)knobs->filter_b.filter_type, (int)knobs->filter_b.slope_poles, voices[v].fb_low[1], voices[v].fb_band[1]);
+                b_out_l = run_svf_filter_p(b_in_l, &knobs->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
+                b_out_r = run_svf_filter_p(b_in_r, &knobs->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
             }
 
             // --- Combine A and B: either Series mode means whichever filter ran last is simply
-            // the final stage; Parallel means both are heard side by side, blended by
-            // filter_ab_blend (0=all A, 100=all B, 50=even -- matches the old fixed 50/50). ---
+            // the final stage; Parallel means both are heard side by side, each at its own
+            // independent level (filter_a_level/filter_b_level, 0-100) and stereo position
+            // (filter_a_pan/filter_b_pan, -1..1) -- matches a classic hardware synth's own
+            // Parallel filter routing description ("individual control over both level and
+            // pan"), replacing the old single filter_ab_blend crossfade. The pan gain is
+            // sqrt(2)-normalized (unlike the plain cos/sin oscillator-pan formula) so pan=0 is an
+            // exact no-op on this ALREADY-stereo signal -- level=50/pan=0 (the default for both)
+            // reproduces the old blend=50 default output level exactly. ---
             if (ab_mode == 2) {
-                float blend = fmaxf(0.0f, fminf(1.0f, knobs->filter_ab_blend / 100.0f));
-                mixed_l += a_out_l * (1.0f - blend) + b_out_l * blend;
-                mixed_r += a_out_r * (1.0f - blend) + b_out_r * blend;
+                float a_lvl = fmaxf(0.0f, knobs->filter_a_level) / 100.0f;
+                float b_lvl = fmaxf(0.0f, knobs->filter_b_level) / 100.0f;
+                float a_angle = (fmaxf(-1.0f, fminf(1.0f, knobs->filter_a_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+                float b_angle = (fmaxf(-1.0f, fminf(1.0f, knobs->filter_b_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+                float a_gain_l = cosf(a_angle) * 1.41421356f, a_gain_r = sinf(a_angle) * 1.41421356f;
+                float b_gain_l = cosf(b_angle) * 1.41421356f, b_gain_r = sinf(b_angle) * 1.41421356f;
+                mixed_l += a_out_l * a_lvl * a_gain_l + b_out_l * b_lvl * b_gain_l;
+                mixed_r += a_out_r * a_lvl * a_gain_r + b_out_r * b_lvl * b_gain_r;
             } else {
                 mixed_l += (ab_mode == 1) ? a_out_l : b_out_l;
                 mixed_r += (ab_mode == 1) ? a_out_r : b_out_r;
