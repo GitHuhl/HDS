@@ -110,6 +110,7 @@
 #define SEQ_LANE_COUNT 32
 #define PROGRAM_LANE_RESOURCE_COUNT 16
 #define AUDIO_LANE_RESOURCE_COUNT 16
+#define SEQ_AUDIO_PATH_LEN 256
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
@@ -201,6 +202,15 @@ typedef struct {
     float seq_mode;        // 0 = Seq (plays back recorded sequence), 1 = Mute, 2 = Rec. Ignored
                             // entirely in Combi mode; meaningful only once Sequencer's real
                             // playback/record engine exists.
+    // Audio-lane "Load Audio" (Sequencer only -- see g_seq_audio/seq_audio_loader_thread_main).
+    // Writing a new path here is just a request: main()'s once-per-block change-detection loop
+    // notices the change and spawns a dedicated loader thread to actually read the file, since
+    // a full-file disk read must never happen on the realtime audio thread. audio_path itself is
+    // never read by the DSP path -- only g_seq_audio[lane]'s resulting RAM buffer would be, once
+    // real playback exists.
+    char audio_path[SEQ_AUDIO_PATH_LEN];
+    float audio_offset_sec; // -10..10, GUI-side range. Inert: no playback engine reads this yet,
+                             // exists now so it's already in place once one does.
 } SeqLaneState;
 
 // A single FX bus slot's parameters. FX_SLOT_COUNT of these run in series (slot 0 first) on
@@ -2467,6 +2477,8 @@ typedef struct {
     { addr, offsetof(SynthSharedControls, arrfield) + offsetof(subtype, subfield), sizeof(((SynthSharedControls *)0)->arrfield[0]), cnt1, 2, sizeof(float), cnt2, OSC_KIND_FLOAT, 0 }
 #define OSC_STRING(addr, field, len) \
     { addr, offsetof(SynthSharedControls, field), 0, 1, 0, 0, 0, OSC_KIND_STRING, len }
+#define OSC_STRING_SUBARRAY(addr, arrfield, subtype, subfield, cnt, len) \
+    { addr, offsetof(SynthSharedControls, arrfield) + offsetof(subtype, subfield), sizeof(((SynthSharedControls *)0)->arrfield[0]), cnt, 1, 0, 0, OSC_KIND_STRING, len }
 
 static const OscParamEntry OSC_PARAMS[] = {
     // --- Baseline ---
@@ -2655,6 +2667,8 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SUBARRAY("/hds/seq/%d/pan", seq_lanes, SeqLaneState, pan, SEQ_LANE_COUNT),
     OSC_SUBARRAY("/hds/seq/%d/midi_channel", seq_lanes, SeqLaneState, midi_channel, SEQ_LANE_COUNT),
     OSC_SUBARRAY("/hds/seq/%d/mode", seq_lanes, SeqLaneState, seq_mode, SEQ_LANE_COUNT),
+    OSC_STRING_SUBARRAY("/hds/seq/%d/audio_path", seq_lanes, SeqLaneState, audio_path, SEQ_LANE_COUNT, SEQ_AUDIO_PATH_LEN),
+    OSC_SUBARRAY("/hds/seq/%d/audio_offset_sec", seq_lanes, SeqLaneState, audio_offset_sec, SEQ_LANE_COUNT),
 
     OSC_STRING("/hds/device/output", output_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/input", input_device, AUDIO_DEVICE_NAME_LEN),
@@ -2834,6 +2848,8 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->seq_lanes[l].pan = 0.0f;
         knobs->seq_lanes[l].midi_channel = 0.0f; // Omni
         knobs->seq_lanes[l].seq_mode = 0.0f;     // Seq
+        knobs->seq_lanes[l].audio_path[0] = '\0';
+        knobs->seq_lanes[l].audio_offset_sec = 0.0f;
     }
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
@@ -3234,6 +3250,196 @@ typedef struct {
 static SampleStream g_sample_streams[MAX_SAMPLE_STREAMS];
 static pthread_t g_sample_disk_thread;
 static _Atomic bool g_sample_disk_thread_shutdown = false;
+
+// ============================================================================
+// Sequencer audio-lane RAM loading ("Load Audio", SeqLaneState.audio_path)
+// ============================================================================
+// Audio lanes are meant to be short, RAM-cached clips (per the plan's own "Future Full-Build
+// Notes" -- NOT the DFD disk-streaming pool above, which exists for large multisample
+// libraries). Reading a whole file into RAM is, unlike a sample zone's small header-only parse,
+// an unbounded blocking operation -- it must never run on the realtime audio thread. Rather than
+// invent a new concurrency primitive, this reuses the exact pattern already validated by the
+// sample-streaming engine above: a dedicated background pthread does the blocking I/O, and hands
+// the finished result to the audio thread through a single atomic synchronization point
+// (load_state), with every other field a plain write-then-release/read-after-acquire, per the
+// C11 memory model. One thread is spawned per load request (not a persistent thread, since loads
+// are rare user actions, not a continuous stream) and immediately detached; loads for the same
+// lane are always serialized by the main-loop gate below (never spawns a new one while the
+// previous is still SEQ_AUDIO_LOADING), so exactly one thread ever touches a given lane's `pcm`
+// at a time.
+typedef enum { SEQ_AUDIO_EMPTY = 0, SEQ_AUDIO_LOADING = 1, SEQ_AUDIO_READY = 2, SEQ_AUDIO_ERROR = 3 } SeqAudioLoadState;
+
+typedef struct {
+    float *pcm;           // interleaved float samples, valid once load_state == SEQ_AUDIO_READY.
+                            // Not itself atomic -- see the struct comment above for why that's
+                            // safe (its writer-thread's writes happen-before the load_state
+                            // release store, which happens-before any reader's acquire load).
+    int frame_count;
+    int channels;
+    int sample_rate; // the FILE's own native rate (may differ from the engine's SAMPLE_RATE) --
+                       // needed for a correct duration display now, and for correct playback
+                       // rate once a real playback engine exists.
+    _Atomic int load_state; // SeqAudioLoadState -- the one synchronization point for this lane.
+    char last_requested_path[SEQ_AUDIO_PATH_LEN]; // main-thread-only; never touched by a loader
+                                                     // thread, so needs no atomics of its own.
+} SeqAudioLane;
+
+static SeqAudioLane g_seq_audio[SEQ_LANE_COUNT];
+
+typedef struct {
+    int lane_index;
+    char path[SEQ_AUDIO_PATH_LEN];
+} SeqAudioLoadRequest;
+
+// Reads an entire WAV file into a newly malloc'd interleaved float buffer. Deliberately separate
+// from load_sample_slot() above (which only caches a short pre-roll and hands the rest to
+// on-demand disk streaming) -- an audio lane's whole clip lives in RAM at once, so this is a
+// plain one-shot full-file decode, run only on seq_audio_loader_thread_main's own thread. Keeps
+// every channel present in the file (unlike the sampler's mono/stereo-only pre-roll) since a
+// lane's own future mixdown, not this loader, should decide how to handle >2 channels. Returns
+// NULL on any failure (out_frames/out_channels/out_sample_rate left at 0).
+static float *seq_audio_load_wav_from_disk(const char *path, int *out_frames, int *out_channels, int *out_sample_rate) {
+    *out_frames = 0; *out_channels = 0; *out_sample_rate = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[seq-audio] failed to open '%s': %s\n", path, strerror(errno)); return NULL; }
+
+    char chunk_id[4];
+    fseek(f, 12, SEEK_SET);
+    if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    while (strncmp(chunk_id, "fmt ", 4) != 0) {
+        unsigned int chunk_size;
+        if (fread(&chunk_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+        fseek(f, chunk_size, SEEK_CUR);
+        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    }
+
+    unsigned int subchunk1_size; unsigned short audio_format, num_channels;
+    unsigned int sample_rate, byte_rate; unsigned short block_align, bits_per_sample;
+    if (fread(&subchunk1_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&audio_format, 2, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&num_channels, 2, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&sample_rate, 4, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&byte_rate, 4, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&block_align, 2, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&bits_per_sample, 2, 1, f) != 1) { fclose(f); return NULL; }
+    (void)byte_rate; (void)block_align;
+
+    if (audio_format != 1 && audio_format != 3) {
+        fprintf(stderr, "[seq-audio] '%s': unsupported WAV format tag %u (need 1=PCM or 3=float)\n", path, audio_format);
+        fclose(f); return NULL;
+    }
+    if (audio_format == 1 && bits_per_sample != 16 && bits_per_sample != 24 && bits_per_sample != 32) {
+        fprintf(stderr, "[seq-audio] '%s': unsupported %u-bit PCM\n", path, bits_per_sample);
+        fclose(f); return NULL;
+    }
+    if (audio_format == 3 && bits_per_sample != 32) {
+        fprintf(stderr, "[seq-audio] '%s': float WAV must be 32-bit\n", path);
+        fclose(f); return NULL;
+    }
+    if (num_channels == 0) { fclose(f); return NULL; }
+    if (subchunk1_size > 16) fseek(f, subchunk1_size - 16, SEEK_CUR);
+
+    if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    while (strncmp(chunk_id, "data", 4) != 0) {
+        unsigned int chunk_size;
+        if (fread(&chunk_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+        fseek(f, chunk_size, SEEK_CUR);
+        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    }
+    unsigned int data_size;
+    if (fread(&data_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+
+    int bytes_per_sample = bits_per_sample / 8;
+    unsigned int total_frames = data_size / (unsigned int)(num_channels * bytes_per_sample);
+    if (total_frames == 0) { fclose(f); return NULL; }
+
+    float *pcm = malloc((size_t)total_frames * num_channels * sizeof(float));
+    if (!pcm) { fprintf(stderr, "[seq-audio] '%s': out of memory (%u frames x %u ch)\n", path, total_frames, num_channels); fclose(f); return NULL; }
+
+    for (unsigned int i = 0; i < total_frames * num_channels; i++) {
+        float sample = 0.0f;
+        bool ok = true;
+        if (audio_format == 1) {
+            if (bits_per_sample == 16) {
+                short raw16;
+                if (fread(&raw16, 2, 1, f) != 1) ok = false; else sample = (float)raw16 / 32768.0f;
+            } else if (bits_per_sample == 24) {
+                unsigned char b24[3];
+                if (fread(b24, 1, 3, f) != 3) ok = false;
+                else { int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); sample = (float)v / 2147483648.0f; }
+            } else {
+                int raw32;
+                if (fread(&raw32, 4, 1, f) != 1) ok = false; else sample = (float)raw32 / 2147483648.0f;
+            }
+        } else {
+            if (fread(&sample, 4, 1, f) != 1) ok = false;
+        }
+        if (!ok) { fprintf(stderr, "[seq-audio] '%s': truncated read at sample %u\n", path, i); free(pcm); fclose(f); return NULL; }
+        pcm[i] = sample;
+    }
+    fclose(f);
+    *out_frames = (int)total_frames;
+    *out_channels = (int)num_channels;
+    *out_sample_rate = (int)sample_rate;
+    return pcm;
+}
+
+static void *seq_audio_loader_thread_main(void *arg) {
+    SeqAudioLoadRequest *req = (SeqAudioLoadRequest *)arg;
+    SeqAudioLane *lane = &g_seq_audio[req->lane_index];
+    int frames = 0, channels = 0, sample_rate = 0;
+    float *pcm = seq_audio_load_wav_from_disk(req->path, &frames, &channels, &sample_rate);
+    // Safe to read/free the previous buffer here without its own atomic: loads for this lane are
+    // serialized by the main-loop gate (see below), and its write happens-before this thread's
+    // own start via the acquire/release pair on load_state plus pthread_create's own
+    // synchronizes-with guarantee -- see this file's SeqAudioLane comment.
+    float *old_pcm = lane->pcm;
+    if (pcm) {
+        lane->frame_count = frames;
+        lane->channels = channels;
+        lane->sample_rate = sample_rate;
+        lane->pcm = pcm;
+        atomic_store_explicit(&lane->load_state, SEQ_AUDIO_READY, memory_order_release);
+    } else {
+        lane->pcm = NULL;
+        lane->frame_count = 0;
+        lane->channels = 0;
+        lane->sample_rate = 0;
+        atomic_store_explicit(&lane->load_state, SEQ_AUDIO_ERROR, memory_order_release);
+    }
+    free(old_pcm);
+    free(req);
+    return NULL;
+}
+
+// Once-per-block change detection (mirrors the existing output_device/input_device strncmp
+// pattern in main()'s loop): notices when a lane's requested audio_path differs from what's
+// already loading/loaded, and spawns a loader thread for it -- never more than one in flight per
+// lane at a time. Call this from main()'s loop, same cadence as every other live-knob check.
+static void poll_seq_audio_load_requests(const SynthSharedControls *knobs) {
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        SeqAudioLane *lane = &g_seq_audio[l];
+        const char *want_path = knobs->seq_lanes[l].audio_path;
+        if (want_path[0] == '\0') continue;
+        if (strncmp(want_path, lane->last_requested_path, SEQ_AUDIO_PATH_LEN) == 0) continue;
+        int state = atomic_load_explicit(&lane->load_state, memory_order_acquire);
+        if (state == SEQ_AUDIO_LOADING) continue; // catches up once the in-flight load finishes
+        snprintf(lane->last_requested_path, SEQ_AUDIO_PATH_LEN, "%s", want_path);
+        SeqAudioLoadRequest *req = malloc(sizeof(SeqAudioLoadRequest));
+        if (!req) continue;
+        req->lane_index = l;
+        snprintf(req->path, SEQ_AUDIO_PATH_LEN, "%s", want_path);
+        atomic_store_explicit(&lane->load_state, SEQ_AUDIO_LOADING, memory_order_release);
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, seq_audio_loader_thread_main, req) == 0) {
+            pthread_detach(tid);
+        } else {
+            fprintf(stderr, "[seq-audio] failed to spawn loader thread for lane %d\n", l);
+            free(req);
+            atomic_store_explicit(&lane->load_state, SEQ_AUDIO_ERROR, memory_order_release);
+        }
+    }
+}
 
 // Claims a free pool slot for a NEW stream session (audio-thread only, called from
 // handle_note_on). Returns -1 if the pool is exhausted -- a real possibility if someone tries to
@@ -5976,6 +6182,34 @@ static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
     lo_bundle_free_recursive(b); // frees the bundle AND every message added to it
 }
 
+// Per-lane "Load Audio" feedback (see g_seq_audio/poll_seq_audio_load_requests). Separate from
+// send_osc_status()'s fixed-shape bundle above since this is a variable-length, mostly-empty
+// set -- only lanes with a non-idle load_state (at most SEQ_LANE_COUNT, in practice usually 0)
+// get a message, so an unused Sequencer session costs nothing extra on this reply port. Sent at
+// the same vu_decimator cadence as send_osc_status(), from the same call site.
+static void send_seq_audio_status(lo_address reply_addr) {
+    lo_bundle b = lo_bundle_new(LO_TT_IMMEDIATE);
+    bool any = false;
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        int state = atomic_load_explicit(&g_seq_audio[l].load_state, memory_order_acquire);
+        if (state == SEQ_AUDIO_EMPTY) continue;
+        any = true;
+        char addr[64];
+        snprintf(addr, sizeof(addr), "/hds/status/seq_audio/%d/state", l);
+        lo_message m = lo_message_new(); lo_message_add_float(m, (float)state); lo_bundle_add_message(b, addr, m);
+        if (state == SEQ_AUDIO_READY) {
+            snprintf(addr, sizeof(addr), "/hds/status/seq_audio/%d/frames", l);
+            m = lo_message_new(); lo_message_add_float(m, (float)g_seq_audio[l].frame_count); lo_bundle_add_message(b, addr, m);
+            snprintf(addr, sizeof(addr), "/hds/status/seq_audio/%d/channels", l);
+            m = lo_message_new(); lo_message_add_float(m, (float)g_seq_audio[l].channels); lo_bundle_add_message(b, addr, m);
+            snprintf(addr, sizeof(addr), "/hds/status/seq_audio/%d/sample_rate", l);
+            m = lo_message_new(); lo_message_add_float(m, (float)g_seq_audio[l].sample_rate); lo_bundle_add_message(b, addr, m);
+        }
+    }
+    if (any) lo_send_bundle(reply_addr, b);
+    lo_bundle_free_recursive(b);
+}
+
 int main(int argc, char **argv) {
     assert_fm_algorithms_acyclic();
     signal(SIGINT, handle_sigint);
@@ -6099,6 +6333,7 @@ int main(int argc, char **argv) {
         // zone_remove_handler write directly into active_knobs/g_sample_slots as each message is
         // dispatched, so nothing further is needed here once this returns 0 (no more pending).
         while (lo_server_recv_noblock(osc_server, 0) > 0) {}
+        poll_seq_audio_load_requests(&active_knobs); // spawns a loader thread if a lane's audio_path changed
         bool poly_mode_active = (active_knobs.is_polyphonic != 0.0f);
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
@@ -6300,6 +6535,7 @@ int main(int argc, char **argv) {
                 .seq_elapsed_seconds = (float)engine_elapsed_seconds,
             };
             send_osc_status(osc_reply_addr, &status);
+            send_seq_audio_status(osc_reply_addr);
             vu_decimator = 0;
         }
         write_audio_block(pcm_handle, buffer, detected_output_channels, block_size, active_voices_count, render_ms);
@@ -6319,6 +6555,10 @@ int main(int argc, char **argv) {
     }
     for (int s = 0; s < MAX_SAMPLE_STREAMS; s++) if (g_sample_streams[s].disk_file_handle) fclose(g_sample_streams[s].disk_file_handle);
     for (int s = 0; s < g_sample_slot_count; s++) { free(g_sample_slots[s].pre_roll_l); free(g_sample_slots[s].pre_roll_r); }
+    // Best-effort: seq-audio loader threads are one-shot/detached (see poll_seq_audio_load_
+    // requests), not joined here -- the process is exiting either way, so this is tidiness for a
+    // leak checker, not a safety requirement.
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) free(g_seq_audio[l].pcm);
     lo_server_free(osc_server);
     lo_address_free(osc_reply_addr);
     snd_seq_close(seq_handle);
