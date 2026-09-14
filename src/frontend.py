@@ -3258,9 +3258,11 @@ class SynthGui(QWidget):
         # SEQUENCER TAB CONTENT (its own dedicated top-level tab, not nested in Play -- per the
         # user's explicit correction, and never merged with Combi's view). 32 lanes (up to 16
         # Program/MIDI + up to 16 Audio, a single flexible pool -- see backend.c's SEQ_LANE_COUNT
-        # comment), a transport panel with a real (if inert) elapsed-time/tempo readout, and
-        # Play/Pause/Record buttons that exist but aren't wired to anything yet -- explicitly
-        # scaffolding, not a working sequencer transport. "Load Audio" (below) is real.
+        # comment), a real transport panel (Play/Pause/Stop, a live state readout, and an
+        # elapsed-time/bars:beats readout) -- see poll_transport_triggers in backend.c. Pressing
+        # Play auto-starts every Seq-mode Audio lane and begins recording every Rec-armed
+        # Program/MIDI lane (armed via that lane's own Seq/Mute/Rec dropdown below); there's no
+        # separate global Record button/trigger.
         # ----------------------------------------------------
         seq_outer_lay = QVBoxLayout(self.tab_sequencer)
         seq_outer_lay.setContentsMargins(6, 6, 6, 6); seq_outer_lay.setSpacing(6)
@@ -3269,17 +3271,32 @@ class SynthGui(QWidget):
         transport_lay = QHBoxLayout(transport_box); transport_lay.setSpacing(8)
         self.seq_btn_play = QPushButton("\u25b6 Play")
         self.seq_btn_pause = QPushButton("\u23f8 Pause")
-        self.seq_btn_record = QPushButton("\u23fa Rec")
-        self.seq_btn_record.setStyleSheet("color: #c0392b; font-weight: bold;")
-        for btn in (self.seq_btn_play, self.seq_btn_pause, self.seq_btn_record):
-            btn.setEnabled(False)  # inert this pass -- no transport/playhead engine exists yet
-            btn.setToolTip("Not yet functional -- scaffolding only")
+        self.seq_btn_stop = QPushButton("\u23f9 Stop")
+        for btn in (self.seq_btn_play, self.seq_btn_pause, self.seq_btn_stop):
             transport_lay.addWidget(btn)
+        # Real, edge-triggered counters -- same idiom as each Sequencer audio lane's own Preview
+        # button (_preview_seq_audio/preview_trigger): the backend's poll_transport_triggers
+        # detects a change in the value since last block, so each click just increments and
+        # resends the whole packet. There's no separate global "Record" button/trigger -- Rec is
+        # armed per lane via that lane's own Seq/Mute/Rec dropdown (already in each lane strip);
+        # pressing Play here starts every Rec-armed lane recording automatically, matching a
+        # classic hardware step-sequencer's transport (recording is a per-track arm state, not a
+        # separate global action).
+        self.seq_transport_play_trigger = 0
+        self.seq_transport_pause_trigger = 0
+        self.seq_transport_stop_trigger = 0
+        self.seq_btn_play.clicked.connect(self._seq_transport_play)
+        self.seq_btn_pause.clicked.connect(self._seq_transport_pause)
+        self.seq_btn_stop.clicked.connect(self._seq_transport_stop)
+        transport_lay.addSpacing(16)
+        self.seq_transport_state_label = QLabel("STOPPED")
+        self.seq_transport_state_label.setStyleSheet("font-weight: bold;")
+        transport_lay.addWidget(self.seq_transport_state_label)
         transport_lay.addSpacing(16)
         self.seq_elapsed_label = QLabel("00:00.0")
         self.seq_elapsed_label.setStyleSheet("font-family: monospace; font-size: 14px;")
         transport_lay.addWidget(QLabel("Elapsed:")); transport_lay.addWidget(self.seq_elapsed_label)
-        self.seq_bars_beats_label = QLabel("1:1")
+        self.seq_bars_beats_label = QLabel("0:1")
         self.seq_bars_beats_label.setStyleSheet("font-family: monospace; font-size: 14px;")
         transport_lay.addWidget(QLabel("Bars\u200a:\u200aBeats:")); transport_lay.addWidget(self.seq_bars_beats_label)
         transport_lay.addStretch()
@@ -4739,6 +4756,28 @@ class SynthGui(QWidget):
         widgets["preview_trigger"] = widgets.get("preview_trigger", 0) + 1
         self.transmit_knob_packet()
 
+    def _seq_transport_play(self):
+        """Play button: edge-triggered counter, same idiom as _preview_seq_audio -- the backend's
+        poll_transport_triggers (backend.c) detects the change and transitions STOPPED/PAUSED ->
+        PLAYING, auto-starting every Seq-mode Audio lane and clearing every Rec-armed MIDI lane's
+        previous take on a fresh (from-STOPPED) Play."""
+        self.seq_transport_play_trigger += 1
+        self.transmit_knob_packet()
+
+    def _seq_transport_pause(self):
+        """Pause button: edge-triggered counter -- freezes the playhead and gates every
+        transport-driven Audio lane off, without resetting anything (Play resumes exactly where
+        it left off)."""
+        self.seq_transport_pause_trigger += 1
+        self.transmit_knob_packet()
+
+    def _seq_transport_stop(self):
+        """Stop button: edge-triggered counter -- resets the playhead to 0, stops every
+        transport-driven Audio lane (a manually Preview-triggered lane is unaffected -- see
+        driven_by_transport in backend.c), and rewinds every MIDI lane's playback cursor."""
+        self.seq_transport_stop_trigger += 1
+        self.transmit_knob_packet()
+
     def _apply_seq_audio_status(self, updates):
         """updates: {lane_index: {"state": float, "frames"?: float, "channels"?: float,
         "sample_rate"?: float}}, decoded from /hds/status/seq_audio/<lane>/... -- see
@@ -5436,7 +5475,7 @@ class SynthGui(QWidget):
         "/hds/status/peak", "/hds/status/is_recording", "/hds/status/elapsed_seconds",
         "/hds/status/record_error", "/hds/status/detected_input_channels",
         "/hds/status/detected_output_channels", "/hds/status/tempo_bpm_live",
-        "/hds/status/seq_elapsed_seconds",
+        "/hds/status/seq_elapsed_seconds", "/hds/status/seq_transport_state",
     )
 
     def listen_for_status_frames(self):
@@ -5488,19 +5527,30 @@ class SynthGui(QWidget):
                     self._rebuild_routing_output_columns(min(out_channels // 2, OUTPUT_PAIR_MAX))
             if "/hds/status/tempo_bpm_live" in values:
                 self.tempo_live_readout.setText(f"engine: {values['/hds/status/tempo_bpm_live']:.1f} BPM")
-            # Sequencer tab's transport readout -- real, live data (elapsed engine uptime +
-            # current tempo) even though the Play/Pause/Record buttons themselves are inert this
-            # pass. Bars:Beats is plain presentation-layer math (assumes 4/4), same spirit as the
-            # rest of this file's habit of keeping such conversions out of the DSP hot path.
+            # Sequencer tab's transport readout -- real, live data (the transport's own real
+            # playhead, seq_transport_state, plus current tempo). Bars:Beats is plain
+            # presentation-layer math (assumes 4/4), same spirit as the rest of this file's habit
+            # of keeping such conversions out of the DSP hot path.
+            #
+            # Bar numbering is 0-indexed: the playhead itself starts at plain, non-negative 0.0 the
+            # instant Play is pressed (backend.c never runs it negative -- nothing needs a "before
+            # zero" to avoid clipping, since recording is already active from that first instant).
+            # What "measure 0" means is purely this display choice -- the first measure a performer
+            # hears/plays in is labeled "0", so the nominal downbeat they're counting in towards is
+            # "1" -- exactly like a hardware sequencer's one-bar count-in, without the playhead or
+            # any recorded timestamp ever going negative.
             if "/hds/status/seq_elapsed_seconds" in values and "/hds/status/tempo_bpm_live" in values:
                 elapsed = values["/hds/status/seq_elapsed_seconds"]
                 bpm = max(1.0, values["/hds/status/tempo_bpm_live"])
                 minutes, seconds = divmod(elapsed, 60.0)
                 self.seq_elapsed_label.setText(f"{int(minutes):02d}:{seconds:04.1f}")
                 beats_total = elapsed * bpm / 60.0
-                bar = int(beats_total // 4) + 1
+                bar = int(beats_total // 4)
                 beat = int(beats_total % 4) + 1
                 self.seq_bars_beats_label.setText(f"{bar}:{beat}")
+            if "/hds/status/seq_transport_state" in values:
+                state = int(values["/hds/status/seq_transport_state"])
+                self.seq_transport_state_label.setText(("STOPPED", "PLAYING", "PAUSED")[state] if 0 <= state <= 2 else "?")
 
         if got_any:
             self._last_status_time = time.monotonic()
@@ -5656,6 +5706,12 @@ class SynthGui(QWidget):
                 add_f(f"/hds/seq/{i}/pan", float(pan_dial.value()) / 100.0)
                 add_f(f"/hds/seq/{i}/midi_channel", 0)
                 add_f(f"/hds/seq/{i}/mode", 0)  # meaningless in Combi mode
+
+        # Sequencer transport -- edge-triggered counters, same idiom as each audio lane's own
+        # Preview trigger (see poll_transport_triggers in backend.c).
+        add_f("/hds/seq/transport/play", self.seq_transport_play_trigger)
+        add_f("/hds/seq/transport/pause", self.seq_transport_pause_trigger)
+        add_f("/hds/seq/transport/stop", self.seq_transport_stop_trigger)
 
         # LFOs (incl. phase offset + mod source CC)
         for idx in range(LFO_COUNT):

@@ -743,6 +743,13 @@ typedef struct {
     float performance_mode;
     SeqLaneState seq_lanes[SEQ_LANE_COUNT];
 
+    // Sequencer transport (Play/Pause/Stop) -- see poll_transport_triggers's own comment. Each
+    // is a plain edge-triggered counter, same idiom as SeqLaneState.audio_preview_trigger: the
+    // frontend increments it by 1 on every button click and resends the whole packet.
+    float seq_transport_play_trigger;
+    float seq_transport_pause_trigger;
+    float seq_transport_stop_trigger;
+
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
     // it last opened each stream with, and closes/reopens that stream on a live change via
@@ -2679,6 +2686,9 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_STRING_SUBARRAY("/hds/seq/%d/audio_path", seq_lanes, SeqLaneState, audio_path, SEQ_LANE_COUNT, SEQ_AUDIO_PATH_LEN),
     OSC_SUBARRAY("/hds/seq/%d/audio_offset_sec", seq_lanes, SeqLaneState, audio_offset_sec, SEQ_LANE_COUNT),
     OSC_SUBARRAY("/hds/seq/%d/audio_preview_trigger", seq_lanes, SeqLaneState, audio_preview_trigger, SEQ_LANE_COUNT),
+    OSC_SCALAR("/hds/seq/transport/play", seq_transport_play_trigger),
+    OSC_SCALAR("/hds/seq/transport/pause", seq_transport_pause_trigger),
+    OSC_SCALAR("/hds/seq/transport/stop", seq_transport_stop_trigger),
 
     OSC_STRING("/hds/device/output", output_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/input", input_device, AUDIO_DEVICE_NAME_LEN),
@@ -2862,6 +2872,9 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->seq_lanes[l].audio_offset_sec = 0.0f;
         knobs->seq_lanes[l].audio_preview_trigger = 0.0f;
     }
+    knobs->seq_transport_play_trigger = 0.0f;
+    knobs->seq_transport_pause_trigger = 0.0f;
+    knobs->seq_transport_stop_trigger = 0.0f;
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -3302,6 +3315,11 @@ typedef struct {
     float last_seen_trigger;
     bool is_playing;
     long play_frame; // next frame index to read from pcm; advances by 1 per rendered sample
+    // true if the TRANSPORT started this lane playing (transport_start_fresh, on STOPPED ->
+    // PLAYING); false if the manual Preview button started it. Gates the per-sample mix loop:
+    // a transport-driven lane pauses/stops with the transport, a Preview-driven lane always
+    // plays through regardless of transport state, exactly like before the transport existed.
+    bool driven_by_transport;
 } SeqAudioLane;
 
 static SeqAudioLane g_seq_audio[SEQ_LANE_COUNT];
@@ -3499,9 +3517,12 @@ static void render_seq_audio_preview_sample(SeqAudioLane *lane, float volume_0_1
 // "Preview" one-shot playback trigger detection (see SeqLaneState.audio_preview_trigger's own
 // comment). Edge-triggered: the frontend increments the trigger value by 1 on every click, so
 // any change (not just "> last") starts (or restarts) that lane's playback from the beginning --
-// or audio_offset_sec seconds in, if positive. Deliberately NOT a full transport: no play/pause/
-// stop state machine, no sync to anything else, just "start this one lane's buffer playing from
-// here, once." Call once per block from main()'s loop, same as poll_seq_audio_load_requests.
+// or audio_offset_sec seconds in, if positive. Deliberately independent of the Sequencer
+// transport (see poll_transport_triggers/transport_start_fresh, added alongside this): a
+// Preview-triggered lane always plays through to completion regardless of Play/Pause/Stop state,
+// unlike a transport-driven lane -- auditioning a sound must never depend on whether the
+// Sequencer happens to be running. Call once per block from main()'s loop, same as
+// poll_seq_audio_load_requests.
 static void poll_seq_audio_preview_triggers(const SynthSharedControls *knobs) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         SeqAudioLane *lane = &g_seq_audio[l];
@@ -3519,6 +3540,7 @@ static void poll_seq_audio_preview_triggers(const SynthSharedControls *knobs) {
         }
         lane->play_frame = start_frame;
         lane->is_playing = true;
+        lane->driven_by_transport = false;
     }
 }
 
@@ -4598,6 +4620,156 @@ static void handle_sustain_release(SynthVoice voices[], const SynthSharedControl
     }
 }
 
+// ============================================================================
+// Sequencer transport (Play/Pause/Stop) + per-lane MIDI record/playback
+// ============================================================================
+// A real playhead, decoupled from engine uptime (unlike compute_current_tempo_bpm's own
+// engine_elapsed_seconds axis) -- advances only while PLAYING, freezes exactly in place on
+// PAUSE, resets to 0 on STOP. Single realtime thread owns all of this (main()'s loop), same as
+// every other piece of Sequencer state -- no atomics needed here at all, unlike g_seq_audio's
+// pcm/load_state (which cross from a background loader thread).
+//
+// Scope, stated plainly: this plays recorded MIDI back through the SAME single Program engine
+// live MIDI already drives (handle_note_on/handle_note_off, reused verbatim) -- NOT N separate
+// per-lane synthesis instances, which don't exist (see the Combi/Sequencer scaffolding plan's own
+// "Future Full-Build Notes"). Several lanes in Seq mode play back simultaneously (their recorded
+// notes interleaved by time into one instrument, like a classic hardware step-sequencer's single
+// sound module), and a lane in Rec mode can record a new take while others play back -- real,
+// useful layered-recording behavior, just not independent per-lane instruments.
+typedef enum { TRANSPORT_STOPPED = 0, TRANSPORT_PLAYING = 1, TRANSPORT_PAUSED = 2 } TransportState;
+static TransportState g_transport_state = TRANSPORT_STOPPED;
+static double g_transport_playhead_sec = 0.0;
+static float g_transport_last_play_trigger = 0.0f, g_transport_last_pause_trigger = 0.0f, g_transport_last_stop_trigger = 0.0f;
+
+// RAM-only, mirrors the audio lanes' own RAM-caching decision -- a short recorded phrase's worth
+// of note events is tiny even at this capacity, no disk streaming needed. Events are stored in
+// arrival order, so time_sec is monotonically non-decreasing within one lane by construction
+// (real-time recording can't record out of order) -- playback just walks forward, no sort needed.
+#define SEQ_MIDI_EVENT_CAPACITY 8192
+typedef struct {
+    float time_sec;     // playhead-relative timestamp when this event was recorded
+    unsigned char type;  // 0 = note_on, 1 = note_off
+    unsigned char note;
+    unsigned char velocity; // unused for note_off, kept for a uniform record shape
+} SeqMidiEvent;
+typedef struct {
+    SeqMidiEvent events[SEQ_MIDI_EVENT_CAPACITY];
+    int event_count;
+    int playback_cursor; // next event index to fire during Seq-mode playback
+} SeqMidiLane;
+static SeqMidiLane g_seq_midi[SEQ_LANE_COUNT];
+
+// Called once, only on a STOPPED -> PLAYING transition (never on PAUSED -> PLAYING/resume, which
+// must leave every lane's position exactly where it was): starts every Seq-mode loaded Audio
+// lane's one-shot playback fresh from its own audio_offset_sec (mirrors
+// poll_seq_audio_preview_triggers' own start-frame logic, marked driven_by_transport so the
+// per-sample mix loop gates it on transport state -- unlike a manually Preview-triggered lane,
+// which always plays through regardless), rewinds every Program/MIDI lane's playback cursor to
+// the top, and clears any lane currently armed to Rec so it starts a genuinely fresh take rather
+// than appending onto whatever it recorded last time.
+static void transport_start_fresh(const SynthSharedControls *knobs) {
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        bool is_audio_lane = (knobs->seq_lanes[l].lane_type != 0.0f);
+        int mode = (int)knobs->seq_lanes[l].seq_mode;
+        if (is_audio_lane) {
+            if (mode != 0) continue; // only Seq-mode Audio lanes auto-start; Mute/Rec don't
+            SeqAudioLane *al = &g_seq_audio[l];
+            if (atomic_load_explicit(&al->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !al->pcm || al->frame_count <= 0) continue;
+            float offset_sec = knobs->seq_lanes[l].audio_offset_sec;
+            long start_frame = 0;
+            if (offset_sec > 0.0f && al->sample_rate > 0) {
+                start_frame = (long)(offset_sec * (float)al->sample_rate);
+                if (start_frame >= al->frame_count) start_frame = al->frame_count - 1;
+            }
+            al->play_frame = start_frame;
+            al->is_playing = true;
+            al->driven_by_transport = true;
+        } else {
+            SeqMidiLane *ml = &g_seq_midi[l];
+            ml->playback_cursor = 0;
+            if (mode == 2) ml->event_count = 0; // fresh Rec take
+        }
+    }
+}
+
+// Edge-triggered, same idiom as poll_seq_audio_preview_triggers: each button increments its own
+// counter on every click and resends the whole packet, so a genuine change (not just "button
+// held") is what starts/pauses/stops the transport -- immune to a stale resend re-triggering
+// anything. Call once per block from main()'s loop.
+static void poll_transport_triggers(const SynthSharedControls *knobs) {
+    if (knobs->seq_transport_play_trigger != g_transport_last_play_trigger) {
+        g_transport_last_play_trigger = knobs->seq_transport_play_trigger;
+        if (g_transport_state != TRANSPORT_PLAYING) {
+            bool was_stopped = (g_transport_state == TRANSPORT_STOPPED);
+            g_transport_state = TRANSPORT_PLAYING;
+            if (was_stopped) transport_start_fresh(knobs);
+            // PAUSED -> PLAYING: deliberately does nothing else -- every lane's play_frame/
+            // playback_cursor already holds exactly where it was paused.
+        }
+    }
+    if (knobs->seq_transport_pause_trigger != g_transport_last_pause_trigger) {
+        g_transport_last_pause_trigger = knobs->seq_transport_pause_trigger;
+        if (g_transport_state == TRANSPORT_PLAYING) g_transport_state = TRANSPORT_PAUSED;
+    }
+    if (knobs->seq_transport_stop_trigger != g_transport_last_stop_trigger) {
+        g_transport_last_stop_trigger = knobs->seq_transport_stop_trigger;
+        g_transport_state = TRANSPORT_STOPPED;
+        g_transport_playhead_sec = 0.0;
+        for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+            // Only stop lanes the TRANSPORT itself started -- a manually Preview-triggered lane
+            // keeps playing through Stop exactly as it already does today (Preview is fully
+            // independent of transport state, per its own existing contract).
+            if (g_seq_audio[l].driven_by_transport) {
+                g_seq_audio[l].is_playing = false;
+                g_seq_audio[l].driven_by_transport = false;
+            }
+            g_seq_midi[l].playback_cursor = 0;
+        }
+    }
+}
+
+// Advances the real playhead by exactly one block's worth of time, only while PLAYING. Call once
+// per block from main()'s loop, after block_size is known for this iteration.
+static void advance_transport_playhead(int block_size) {
+    if (g_transport_state == TRANSPORT_PLAYING) {
+        g_transport_playhead_sec += (double)block_size / (double)SAMPLE_RATE;
+    }
+}
+
+// Hooked directly into process_midi_input's existing NOTEON/NOTEOFF dispatch (right after the
+// live handle_note_on/handle_note_off call, never instead of it -- recording must never affect
+// what's actually heard live). A no-op unless the transport is genuinely PLAYING and at least one
+// lane is armed to Rec, so an idle Sequencer costs nothing extra on the live MIDI path.
+static void seq_record_midi_event(const SynthSharedControls *knobs, unsigned char type, unsigned char note, unsigned char velocity) {
+    if (g_transport_state != TRANSPORT_PLAYING) return;
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        if (knobs->seq_lanes[l].lane_type != 0.0f) continue; // Audio lanes don't record MIDI
+        if ((int)knobs->seq_lanes[l].seq_mode != 2) continue; // not armed to Rec
+        SeqMidiLane *ml = &g_seq_midi[l];
+        if (ml->event_count >= SEQ_MIDI_EVENT_CAPACITY) continue; // full -- silently drop further events past this documented cap
+        ml->events[ml->event_count++] = (SeqMidiEvent){ (float)g_transport_playhead_sec, type, note, velocity };
+    }
+}
+
+// Called once per block, right after process_midi_input -- walks every Seq-mode Program/MIDI
+// lane's recorded events and fires any whose timestamp has now been reached, via the exact same
+// handle_note_on/handle_note_off functions live MIDI already calls (see this section's own scope
+// comment for why that's a deliberate choice, not a shortcut).
+static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], bool poly_mode_active, MonoNoteStack *mono_stack, const MidiLiveState *midi_live) {
+    if (g_transport_state != TRANSPORT_PLAYING) return;
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        if (knobs->seq_lanes[l].lane_type != 0.0f) continue;
+        if ((int)knobs->seq_lanes[l].seq_mode != 0) continue; // not in Seq (playback) mode
+        SeqMidiLane *ml = &g_seq_midi[l];
+        while (ml->playback_cursor < ml->event_count && ml->events[ml->playback_cursor].time_sec <= (float)g_transport_playhead_sec) {
+            SeqMidiEvent *e = &ml->events[ml->playback_cursor];
+            if (e->type == 0) handle_note_on(voices, knobs, global_lfo_phases, e->note, e->velocity, poly_mode_active, mono_stack);
+            else handle_note_off(voices, knobs, midi_live, e->note, poly_mode_active, mono_stack);
+            ml->playback_cursor++;
+        }
+    }
+}
+
 // --- MIDI auto-connect: no more manually running aconnect ---
 //
 // Keeps track of which ALSA sequencer client:port pairs are currently subscribed to feed our
@@ -4715,8 +4887,13 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
         snd_seq_event_input(seq_handle, &ev); if (ev == NULL) continue;
         if (ev->type == SND_SEQ_EVENT_NOTEON || ev->type == SND_SEQ_EVENT_NOTEOFF) {
             int note = ev->data.note.note;
-            if (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0) { handle_note_on(voices, knobs, global_lfo_phases, note, ev->data.note.velocity, poly_mode_active, mono_stack); }
-            else { handle_note_off(voices, knobs, midi_live, note, poly_mode_active, mono_stack); }
+            if (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0) {
+                handle_note_on(voices, knobs, global_lfo_phases, note, ev->data.note.velocity, poly_mode_active, mono_stack);
+                seq_record_midi_event(knobs, 0, (unsigned char)note, (unsigned char)ev->data.note.velocity);
+            } else {
+                handle_note_off(voices, knobs, midi_live, note, poly_mode_active, mono_stack);
+                seq_record_midi_event(knobs, 1, (unsigned char)note, 0);
+            }
         } else if (ev->type == SND_SEQ_EVENT_CONTROLLER) {
             int cc_num = ev->data.control.param;
             if (cc_num >= 0 && cc_num < 128) midi_live->cc[cc_num] = fmaxf(0.0f, fminf(1.0f, ev->data.control.value / 127.0f));
@@ -5625,15 +5802,17 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             }
         }
 
-        // Sequencer audio-lane "Preview" playback (see render_seq_audio_preview_sample) -- summed
-        // straight into output pair 0, bypassing FX/routing entirely: this is a one-shot preview,
-        // not a routable source (a real per-lane routing model is future work, alongside the rest
-        // of the Sequencer transport). Deliberately allows several lanes to play back
-        // simultaneously -- proving multitrack playback actually works, not just one lane in
-        // isolation -- since each lane's own SeqAudioLane state is fully independent.
+        // Sequencer audio-lane playback (Preview button OR the real transport, see
+        // render_seq_audio_preview_sample) -- summed straight into output pair 0, bypassing FX/
+        // routing entirely (a real per-lane routing model is future work). Several lanes play
+        // back simultaneously since each lane's own SeqAudioLane state is fully independent --
+        // proving multitrack playback actually works, not just one lane in isolation. A
+        // transport-driven lane (driven_by_transport) pauses/stops with the transport; a
+        // manually Preview-triggered lane always plays through regardless of transport state.
         for (int l = 0; l < SEQ_LANE_COUNT; l++) {
             SeqAudioLane *lane = &g_seq_audio[l];
             if (!lane->is_playing) continue;
+            if (lane->driven_by_transport && g_transport_state != TRANSPORT_PLAYING) continue;
             float sample_l, sample_r;
             render_seq_audio_preview_sample(lane, knobs->seq_lanes[l].volume, knobs->seq_lanes[l].pan, &sample_l, &sample_r);
             pair_l[0] += sample_l;
@@ -6250,15 +6429,17 @@ typedef struct {
     float detected_input_channels;
     float detected_output_channels;
     float tempo_bpm_live; // compute_current_tempo_bpm()'s result -- equals tempo_bpm whenever no tempo markers are programmed
-    // Sequencer tab's transport readout (Combi/Sequencer scaffolding -- see SEQ_LANE_COUNT's own
-    // comment). Reuses the engine-uptime value already computed each block for
-    // compute_current_tempo_bpm() -- deliberately a SEPARATE field from elapsed_seconds above
-    // (that one is the WAV recorder's own recording-duration counter, a different concept that
-    // will diverge from this one once a real transport/playhead exists).
+    // Sequencer tab's transport readout. Reports the REAL transport playhead now (see
+    // g_transport_playhead_sec/poll_transport_triggers) -- this field used to reuse engine
+    // uptime as a placeholder before a real transport existed; now that one does, this is the
+    // genuine, pausable/resettable position, a real behavior change from that placeholder.
+    // Deliberately still a SEPARATE field from elapsed_seconds above, which remains the WAV
+    // recorder's own unrelated recording-duration counter.
     float seq_elapsed_seconds;
+    float seq_transport_state; // 0 = stopped, 1 = playing, 2 = paused -- see TransportState
 } EngineStatus;
 
-// Sends the GUI-status snapshot as one OSC bundle (one UDP datagram, 7 messages) to the reply
+// Sends the GUI-status snapshot as one OSC bundle (one UDP datagram, 8 messages) to the reply
 // address configured at startup. Fire-and-forget, same as the rest of this UDP-based protocol:
 // if nothing is listening on the reply port, lo_send_bundle simply has nowhere to deliver to --
 // a no-op, not an error, same as the old stream-socket's behavior whenever client_fd wasn't
@@ -6274,6 +6455,7 @@ static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
     m = lo_message_new(); lo_message_add_float(m, status->detected_output_channels); lo_bundle_add_message(b, "/hds/status/detected_output_channels", m);
     m = lo_message_new(); lo_message_add_float(m, status->tempo_bpm_live); lo_bundle_add_message(b, "/hds/status/tempo_bpm_live", m);
     m = lo_message_new(); lo_message_add_float(m, status->seq_elapsed_seconds); lo_bundle_add_message(b, "/hds/status/seq_elapsed_seconds", m);
+    m = lo_message_new(); lo_message_add_float(m, status->seq_transport_state); lo_bundle_add_message(b, "/hds/status/seq_transport_state", m);
     lo_send_bundle(reply_addr, b);
     lo_bundle_free_recursive(b); // frees the bundle AND every message added to it
 }
@@ -6431,6 +6613,7 @@ int main(int argc, char **argv) {
         while (lo_server_recv_noblock(osc_server, 0) > 0) {}
         poll_seq_audio_load_requests(&active_knobs); // spawns a loader thread if a lane's audio_path changed
         poll_seq_audio_preview_triggers(&active_knobs); // starts one-shot playback if a lane's Preview button was clicked
+        poll_transport_triggers(&active_knobs); // Play/Pause/Stop -- starts/freezes/resets the real Sequencer playhead
         bool poly_mode_active = (active_knobs.is_polyphonic != 0.0f);
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
@@ -6489,6 +6672,7 @@ int main(int argc, char **argv) {
         drain_pending_sample_loads();
 
         process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack, our_midi_port, &midi_sources, &midi_live);
+        seq_playback_midi_events(voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack, &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead
 
         // block_size/voice_limit are computed fresh every iteration since both are live,
         // user-adjustable controls (Audio tab: Block Size, Polyphony) -- see
@@ -6496,6 +6680,7 @@ int main(int argc, char **argv) {
         // at the hard BUFFER_SIZE ceiling; only the first block_size frames of each are
         // actually read/written/rendered this iteration.
         int block_size = effective_block_size(&active_knobs);
+        advance_transport_playhead(block_size); // advances the real Sequencer playhead by exactly this block's worth of time, only while PLAYING
 
         // Programmable tempo: resolved once per block from the Tempo knob/tempo-map (see
         // compute_current_tempo_bpm()) against this engine's own running uptime. Nothing in the
@@ -6629,7 +6814,8 @@ int main(int argc, char **argv) {
                 .detected_input_channels = (float)detected_input_channels,
                 .detected_output_channels = (float)detected_output_channels,
                 .tempo_bpm_live = current_tempo_bpm,
-                .seq_elapsed_seconds = (float)engine_elapsed_seconds,
+                .seq_elapsed_seconds = (float)g_transport_playhead_sec,
+                .seq_transport_state = (float)g_transport_state,
             };
             send_osc_status(osc_reply_addr, &status);
             send_seq_audio_status(osc_reply_addr);
