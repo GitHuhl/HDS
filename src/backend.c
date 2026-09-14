@@ -986,15 +986,62 @@ static float run_svf_filter(float input, float cutoff_hz, float res_q, int filte
     // unmodified, matching what "Off" obviously should mean.
     if (filter_type == 0) return input;
     cutoff_hz = fmaxf(40.0f, fminf(18000.0f, cutoff_hz));
-    float damp = 2.0f * (1.0f - (fmaxf(0.0f, fminf(100.0f, res_q)) / 100.0f));
-    float coeff = 2.0f * sinf((float)M_PI * cutoff_hz / (float)SAMPLE_RATE);
+    // FIXED (catastrophic bug -- "total audio failure when changing filter knobs"): this used to
+    // be the classic "naive" Chamberlin SVF (forward-Euler integration of the analog SVF ODEs,
+    // coefficient 2*sin(pi*fc/fs)), which is only numerically stable for cutoff frequencies up to
+    // roughly SAMPLE_RATE/6 (~8kHz at 48kHz) -- ABOVE that, its own internal state (low_state/
+    // band_state) diverges to NaN/Inf within a handful of samples, at ANY resonance including
+    // zero (confirmed directly: cutoff=8000 blew up by sample 22, cutoff=18000 by sample 6).
+    // Since the Cutoff knob's own range is [40,18000], almost the entire "bright" half of the
+    // knob's travel was landing in the unstable zone -- once triggered, NaN propagates through
+    // every downstream mix/sum forever (nothing recovers it) until the voice is retriggered,
+    // which is exactly the reported symptom.
+    //
+    // Replaced with Vadim Zavalishin's Topology-Preserving Transform (TPT / zero-delay-feedback)
+    // SVF ("The Art of VA Filter Design") -- a trapezoidal (bilinear-consistent) discretization
+    // of the same analog SVF prototype instead of forward-Euler. It is unconditionally stable for
+    // any cutoff strictly below Nyquist (g = tan(pi*fc/fs) stays finite and well-bounded for this
+    // knob's whole range -- max is tan(0.375*pi) ~= 2.414, nowhere near tan's pi/2 asymptote) and
+    // for any resonance from 0 up to and including self-oscillation (k=0). This is a standard,
+    // widely-used replacement (the reference design behind most modern software synth filters),
+    // not an exotic one -- low_state/band_state keep their existing per-channel-per-stage array
+    // layout and calling convention exactly (now holding the TPT integrators' ic2eq/ic1eq state
+    // instead of the old Euler integrators' state, but still one lowpass-flavored and one
+    // bandpass-flavored value per stage, so no caller or struct layout needed to change).
+    // Damping: floored well above 0 rather than allowing Res=100 to reach EXACTLY k=0. Exact
+    // zero damping is only marginally (not strictly) stable -- a single stage stays bounded, but
+    // cascading two of them back-to-back at 4-pole slope has no energy dissipation anywhere in
+    // the loop to correct for ordinary floating-point rounding, so it slowly drifts into runaway
+    // growth (confirmed directly, and NOT just a theoretical concern: 4-pole/Res=100 diverged
+    // anywhere from ~5k to ~90k samples in depending on cutoff, and a first attempt at a tiny
+    // k=0.001 floor -- Q~1000 -- only delayed that, it didn't fix it, since 0.001 is still close
+    // enough to marginal for the same drift to eventually win). k=0.05 (Q=20, an audibly extreme,
+    // "nearly screaming" resonance already) gives enough real margin that the system is robustly
+    // exponentially stable rather than borderline. Combined with the hard state clamp below.
+    float k = fmaxf(0.05f, 2.0f * (1.0f - (fmaxf(0.0f, fminf(100.0f, res_q)) / 100.0f)));
+    float g = tanf((float)M_PI * cutoff_hz / (float)SAMPLE_RATE); // prewarped coefficient
+    float a1 = 1.0f / (1.0f + g * (g + k));
+    float a2 = g * a1;
+    float a3 = g * a2;
     int stages = (slope_poles != 0) ? 2 : 1;
     float sig = input;
     for (int s = 0; s < stages; s++) {
-        float high = sig - low_state[s] - (damp * band_state[s]);
-        band_state[s] += coeff * high;
-        low_state[s] += coeff * band_state[s];
-        sig = (filter_type == 1) ? low_state[s] : ((filter_type == 2) ? high : band_state[s]);
+        float v3 = sig - low_state[s];
+        float v1 = a1 * band_state[s] + a2 * v3; // bandpass output
+        float v2 = low_state[s] + a2 * band_state[s] + a3 * v3; // lowpass output
+        band_state[s] = 2.0f * v1 - band_state[s];
+        low_state[s] = 2.0f * v2 - low_state[s];
+        // Defense in depth: even with damping floored above, a real-time recursive filter running
+        // continuously for minutes at a time (a held pad note) is hard to prove stable for every
+        // possible knob/modulation combination purely from theory -- clamp the state to a range
+        // enormously wider than anything musically meaningful (real signals here live in roughly
+        // [-5,5]) but far short of actually reaching Inf/NaN, so a still-undiscovered edge case
+        // degrades to a loud-but-recoverable clip instead of the permanent NaN lockup this whole
+        // fix exists to eliminate.
+        band_state[s] = fmaxf(-1.0e6f, fminf(1.0e6f, band_state[s]));
+        low_state[s] = fmaxf(-1.0e6f, fminf(1.0e6f, low_state[s]));
+        float high = sig - k * v1 - v2; // highpass output
+        sig = (filter_type == 1) ? v2 : ((filter_type == 2) ? high : v1);
     }
     return sig;
 }
