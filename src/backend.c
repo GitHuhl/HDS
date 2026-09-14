@@ -4541,51 +4541,67 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             for (int l = 0; l < LFO_COUNT; l++) {
                 int target = (int)knobs->lfo[l].dest_target;
                 // PERF: target 0 ("None") is the common case for any LFO not actually routed
-                // to a destination -- skip straight past the ~19-branch dispatch chain below
-                // instead of evaluating every one of them for nothing. This loop runs per
-                // ACTIVE voice per sample, so on a plain unmodulated patch this was burning a
-                // measurable chunk of every block's CPU budget on comparisons that could never
-                // match (found via real-world underrun diagnostics: a 33-voice plain sawtooth
+                // to a destination -- skip straight past the dispatch below instead of evaluating
+                // it for nothing. This loop runs per ACTIVE voice per sample, so on a plain
+                // unmodulated patch this was burning a measurable chunk of every block's CPU
+                // budget (found via real-world underrun diagnostics: a 33-voice plain sawtooth
                 // patch, no modulation configured at all, was already blowing the block budget).
                 if (target == 0) continue;
                 float val = lfo_out[l];
-                if (target == 1) mod_vco1_pitch += val * 1200.0f;
-                if (target == 2) mod_vco2_pitch += val * 1200.0f;
-                if (target == 3) { mod_vco1_pitch += val * 1200.0f; mod_vco2_pitch += val * 1200.0f; }
-                if (target == 4) mod_vco1_pitch += val * 100.0f;
-                if (target == 5) mod_vco2_pitch += val * 100.0f;
-                if (target == 6) mod_vco1_amp += val;
-                if (target == 7) mod_vco2_amp += val;
-                if (target >= 8 && target <= 13) { int slot = (target - 8) / 2; if (((target - 8) % 2) == 1) filter_res_mods[slot] += val * 50.0f; else filter_cutoff_mods[slot] += val * 5000.0f; }
-                // FIXED: this was checking target 20/21 (which are actually "LFO 3/4 Depth" in the
-                // GUI's destination list), so FM Depth and Mix Balance (the real 22/23) could never
-                // be reached as destinations, while picking "LFO 3/4 Depth" silently hijacked them.
-                if (target == 22) fm_mod += val;
-                if (target == 23) mix_bal += val;
-                if (target == 24) mod_vco1_phase += val;
-                if (target == 25) mod_vco2_phase += val;
-                if (target == 26) mod_vco1_unison_detune += val * 2000.0f;
-                if (target == 27) mod_vco2_unison_detune += val * 2000.0f;
-                if (target == 32) mod_vco1_pan += val;
-                if (target == 33) mod_vco2_pan += val;
-                if (target == 34) mod_vco1_pulse_width += val * 50.0f;
-                if (target == 35) mod_vco2_pulse_width += val * 50.0f;
-                if (target == 36) mod_vco3_amp += val;
-                if (target == 37) mod_vco3_pan += val;
-                if (target == 38) mod_vco3_tilt += val * 100.0f;
-                if (target == 39) mod_vco4_amp += val;
-                if (target == 40) mod_vco4_pan += val;
-                if (target == 41) mod_vco3_pitch += val * 1200.0f;
-                if (target == 42) mod_vco4_pitch += val * 1200.0f;
-                if (target == 43) mod_vco3_phase += val;
-                if (target == 44) mod_vco4_phase += val;
-                if (target == 45) mod_vco3_unison_detune += val * 2000.0f;
-                if (target == 46) mod_vco4_unison_detune += val * 2000.0f;
-                if (target == 47) mod_vco4_tilt += val * 100.0f;
-                // Filter A-M2 (Multi mode's middle sub-filter) -- see filter_cutoff_mods' slot-3
-                // comment above.
-                if (target == 84) filter_cutoff_mods[3] += val * 5000.0f;
-                if (target == 85) filter_res_mods[3] += val * 50.0f;
+                // PERF: a real switch (not a flat if-chain) so the compiler can build a jump
+                // table -- O(1) dispatch per routed target instead of a linear scan through every
+                // earlier case. Targets are mutually exclusive by construction (target can only
+                // equal one value), so this is a behavior-preserving transform of the original
+                // if-chain, not a semantic change. This matters specifically for a heavily-
+                // modulated patch: every one of LFO_COUNT + ASSIGNABLE_EG_COUNT routed sources
+                // pays this dispatch once per voice per sample, so a long if-chain here was real,
+                // scaling cost on top of whatever the modulation itself costs.
+                switch (target) {
+                    case 1: mod_vco1_pitch += val * 1200.0f; break;
+                    case 2: mod_vco2_pitch += val * 1200.0f; break;
+                    case 3: mod_vco1_pitch += val * 1200.0f; mod_vco2_pitch += val * 1200.0f; break;
+                    case 4: mod_vco1_pitch += val * 100.0f; break;
+                    case 5: mod_vco2_pitch += val * 100.0f; break;
+                    case 6: mod_vco1_amp += val; break;
+                    case 7: mod_vco2_amp += val; break;
+                    case 8: case 9: case 10: case 11: case 12: case 13: {
+                        int slot = (target - 8) / 2;
+                        if (((target - 8) % 2) == 1) filter_res_mods[slot] += val * 50.0f;
+                        else filter_cutoff_mods[slot] += val * 5000.0f;
+                        break;
+                    }
+                    // FIXED: this used to check target 20/21 (which are actually "LFO 3/4 Depth"
+                    // in the GUI's destination list), so FM Depth and Mix Balance (the real 22/23)
+                    // could never be reached as destinations, while picking "LFO 3/4 Depth"
+                    // silently hijacked them.
+                    case 22: fm_mod += val; break;
+                    case 23: mix_bal += val; break;
+                    case 24: mod_vco1_phase += val; break;
+                    case 25: mod_vco2_phase += val; break;
+                    case 26: mod_vco1_unison_detune += val * 2000.0f; break;
+                    case 27: mod_vco2_unison_detune += val * 2000.0f; break;
+                    case 32: mod_vco1_pan += val; break;
+                    case 33: mod_vco2_pan += val; break;
+                    case 34: mod_vco1_pulse_width += val * 50.0f; break;
+                    case 35: mod_vco2_pulse_width += val * 50.0f; break;
+                    case 36: mod_vco3_amp += val; break;
+                    case 37: mod_vco3_pan += val; break;
+                    case 38: mod_vco3_tilt += val * 100.0f; break;
+                    case 39: mod_vco4_amp += val; break;
+                    case 40: mod_vco4_pan += val; break;
+                    case 41: mod_vco3_pitch += val * 1200.0f; break;
+                    case 42: mod_vco4_pitch += val * 1200.0f; break;
+                    case 43: mod_vco3_phase += val; break;
+                    case 44: mod_vco4_phase += val; break;
+                    case 45: mod_vco3_unison_detune += val * 2000.0f; break;
+                    case 46: mod_vco4_unison_detune += val * 2000.0f; break;
+                    case 47: mod_vco4_tilt += val * 100.0f; break;
+                    // Filter A-M2 (Multi mode's middle sub-filter) -- see filter_cutoff_mods'
+                    // slot-3 comment above.
+                    case 84: filter_cutoff_mods[3] += val * 5000.0f; break;
+                    case 85: filter_res_mods[3] += val * 50.0f; break;
+                    default: break;
+                }
             }
 
             // FIXED: each assignable EG now routes using its own destination combo (eg_dest_target),
@@ -4597,38 +4613,47 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 // common case for an assignable EG not routed anywhere.
                 if (target == 0) continue;
                 float val = voices[v].assign_eg[e].current_level * knobs->eg_intensity[e];
-                if (target == 1) mod_vco1_pitch += val * 1200.0f;
-                if (target == 2) mod_vco2_pitch += val * 1200.0f;
-                if (target == 3) { mod_vco1_pitch += val * 1200.0f; mod_vco2_pitch += val * 1200.0f; }
-                if (target == 4) mod_vco1_pitch += val * 100.0f;
-                if (target == 5) mod_vco2_pitch += val * 100.0f;
-                if (target == 6) mod_vco1_amp += val;
-                if (target == 7) mod_vco2_amp += val;
-                if (target >= 8 && target <= 13) { int slot = (target - 8) / 2; if (((target - 8) % 2) == 1) filter_res_mods[slot] += val * 50.0f; else filter_cutoff_mods[slot] += val * 5000.0f; }
-                if (target == 22) fm_mod += val;
-                if (target == 23) mix_bal += val;
-                if (target == 24) mod_vco1_phase += val;
-                if (target == 25) mod_vco2_phase += val;
-                if (target == 26) mod_vco1_unison_detune += val * 2000.0f;
-                if (target == 27) mod_vco2_unison_detune += val * 2000.0f;
-                if (target == 32) mod_vco1_pan += val;
-                if (target == 33) mod_vco2_pan += val;
-                if (target == 34) mod_vco1_pulse_width += val * 50.0f;
-                if (target == 35) mod_vco2_pulse_width += val * 50.0f;
-                if (target == 36) mod_vco3_amp += val;
-                if (target == 37) mod_vco3_pan += val;
-                if (target == 38) mod_vco3_tilt += val * 100.0f;
-                if (target == 39) mod_vco4_amp += val;
-                if (target == 40) mod_vco4_pan += val;
-                if (target == 41) mod_vco3_pitch += val * 1200.0f;
-                if (target == 42) mod_vco4_pitch += val * 1200.0f;
-                if (target == 43) mod_vco3_phase += val;
-                if (target == 44) mod_vco4_phase += val;
-                if (target == 45) mod_vco3_unison_detune += val * 2000.0f;
-                if (target == 46) mod_vco4_unison_detune += val * 2000.0f;
-                if (target == 47) mod_vco4_tilt += val * 100.0f;
-                if (target == 84) filter_cutoff_mods[3] += val * 5000.0f;
-                if (target == 85) filter_res_mods[3] += val * 50.0f;
+                // PERF: switch, not a flat if-chain -- see the LFO loop's own comment above for why.
+                switch (target) {
+                    case 1: mod_vco1_pitch += val * 1200.0f; break;
+                    case 2: mod_vco2_pitch += val * 1200.0f; break;
+                    case 3: mod_vco1_pitch += val * 1200.0f; mod_vco2_pitch += val * 1200.0f; break;
+                    case 4: mod_vco1_pitch += val * 100.0f; break;
+                    case 5: mod_vco2_pitch += val * 100.0f; break;
+                    case 6: mod_vco1_amp += val; break;
+                    case 7: mod_vco2_amp += val; break;
+                    case 8: case 9: case 10: case 11: case 12: case 13: {
+                        int slot = (target - 8) / 2;
+                        if (((target - 8) % 2) == 1) filter_res_mods[slot] += val * 50.0f;
+                        else filter_cutoff_mods[slot] += val * 5000.0f;
+                        break;
+                    }
+                    case 22: fm_mod += val; break;
+                    case 23: mix_bal += val; break;
+                    case 24: mod_vco1_phase += val; break;
+                    case 25: mod_vco2_phase += val; break;
+                    case 26: mod_vco1_unison_detune += val * 2000.0f; break;
+                    case 27: mod_vco2_unison_detune += val * 2000.0f; break;
+                    case 32: mod_vco1_pan += val; break;
+                    case 33: mod_vco2_pan += val; break;
+                    case 34: mod_vco1_pulse_width += val * 50.0f; break;
+                    case 35: mod_vco2_pulse_width += val * 50.0f; break;
+                    case 36: mod_vco3_amp += val; break;
+                    case 37: mod_vco3_pan += val; break;
+                    case 38: mod_vco3_tilt += val * 100.0f; break;
+                    case 39: mod_vco4_amp += val; break;
+                    case 40: mod_vco4_pan += val; break;
+                    case 41: mod_vco3_pitch += val * 1200.0f; break;
+                    case 42: mod_vco4_pitch += val * 1200.0f; break;
+                    case 43: mod_vco3_phase += val; break;
+                    case 44: mod_vco4_phase += val; break;
+                    case 45: mod_vco3_unison_detune += val * 2000.0f; break;
+                    case 46: mod_vco4_unison_detune += val * 2000.0f; break;
+                    case 47: mod_vco4_tilt += val * 100.0f; break;
+                    case 84: filter_cutoff_mods[3] += val * 5000.0f; break;
+                    case 85: filter_res_mods[3] += val * 50.0f; break;
+                    default: break;
+                }
             }
 
             // Phase pot (0-360 degrees) plus any modulation, converted to a 0..1 fractional-cycle
