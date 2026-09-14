@@ -7,6 +7,7 @@ import random
 import subprocess
 import re
 import time
+import json
 from datetime import datetime
 import numpy as np
 from pythonosc.udp_client import SimpleUDPClient
@@ -447,6 +448,72 @@ def _build_zones_from_sfz(path, zone_id_start):
         warnings.append(f"{define_usage_count} region(s) appear to use #define/$variable substitution (not supported) -- their sample path may be wrong")
 
     return zones, warnings
+
+def _sfz_frac_to_frame(frac, total_frames):
+    """The exact inverse of _sfz_frame_to_frac() above -- SampleZone's 0.0-1.0 fraction back to
+    an absolute sample frame for writing loop_start=/loop_end=/offset=/end=."""
+    if total_frames <= 1:
+        return 0
+    return round(max(0.0, min(1.0, frac)) * (total_frames - 1))
+
+def _build_sfz_from_zones(zones):
+    """Direct inverse of _build_zones_from_sfz()'s own opcode table -- one <region> per zone,
+    plain vanilla SFZ with no HDS-specific extensions, so the file stays genuinely spec-compliant
+    on its own (Program Save references it by filename rather than embedding it, specifically to
+    keep HDS's own save format and the SFZ spec cleanly separate). Samples themselves are NOT
+    copied -- sample= points at each zone's existing file_path, same posture the importer already
+    takes on sample ownership. Round-robin groups are re-numbered into sequential seq_position
+    values per group (SFZ has no direct "group index" concept to preserve verbatim)."""
+    lines = ["// Exported by HDS -- see the Program that references this file for its own", "// non-SFZ parameters (this file itself carries none).", ""]
+    group_members = {}  # round_robin_group -> ordered list of zone indices, for seq_length/seq_position
+    for i, zone in enumerate(zones):
+        if zone.round_robin_group > 0:
+            group_members.setdefault(zone.round_robin_group, []).append(i)
+    group_position = {}  # zone index -> (seq_length, seq_position)
+    for members in group_members.values():
+        for pos, idx in enumerate(members):
+            group_position[idx] = (len(members), pos + 1)
+
+    for i, zone in enumerate(zones):
+        total_frames = _wav_total_frames(zone.file_path)
+        lines.append("<region>")
+        lines.append(f"sample={zone.file_path}")
+        lines.append(f"lokey={int(zone.root_note)}")
+        lines.append(f"hikey={int(zone.max_note)}")
+        if zone.key_center == -1:
+            lines.append("pitch_keytrack=0")
+            lines.append(f"pitch_keycenter={int(zone.root_note)}")
+        else:
+            lines.append(f"pitch_keycenter={int(zone.key_center)}")
+        lines.append(f"lovel={int(zone.min_velocity)}")
+        lines.append(f"hivel={int(zone.max_velocity)}")
+        if zone.loop_enabled:
+            lines.append(f"loop_mode={'loop_sustain' if zone.loop_release_exit else 'loop_continuous'}")
+        else:
+            lines.append("loop_mode=no_loop")
+        if total_frames and total_frames > 1:
+            if zone.loop_enabled:
+                lines.append(f"loop_start={_sfz_frac_to_frame(zone.loop_start, total_frames)}")
+                lines.append(f"loop_end={_sfz_frac_to_frame(zone.loop_end, total_frames)}")
+            if zone.start_offset > 0.0:
+                lines.append(f"offset={_sfz_frac_to_frame(zone.start_offset, total_frames)}")
+            if zone.end_frac < 1.0:
+                lines.append(f"end={_sfz_frac_to_frame(zone.end_frac, total_frames)}")
+        if zone.tune_cents:
+            lines.append(f"tune={zone.tune_cents}")
+        if zone.gain_db:
+            lines.append(f"volume={zone.gain_db}")
+        if zone.pan:
+            lines.append(f"pan={zone.pan}")
+        if zone.reverse:
+            lines.append("direction=reverse")
+        if i in group_position:
+            seq_length, seq_position = group_position[i]
+            lines.append(f"group={zone.round_robin_group}")
+            lines.append(f"seq_length={seq_length}")
+            lines.append(f"seq_position={seq_position}")
+        lines.append("")
+    return "\n".join(lines)
 
 # Distinct badge colors for round-robin groups 1, 2, 3, ... (cycles if there are more groups
 # than colors -- purely cosmetic, doesn't affect which group a zone actually belongs to).
@@ -2087,6 +2154,25 @@ class ZoneInspectorPanel(QWidget):
             self.start_offset_spin.blockSignals(False)
         if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
 
+# Program save/load: which OSC addresses count as "the Program" (saved/restored by
+# Save/Load) vs. "the rig" (device selection, recording, routing/ext-in, hardware performance
+# tuning, and Combi/Sequencer's own session-level stacking state -- none of which belong inside
+# a single self-contained patch file). See the plan's own field-scope section for the reasoning
+# behind each exclusion. One exception that isn't a plain prefix rule: /hds/fx_routing/%d/mode is
+# per-SOURCE (0=Program, 1-8=ext-in pairs) -- index 0 is genuinely patch content (the Program's
+# own FX Series/Parallel choice), the rest are rig-level.
+_PROGRAM_SCOPE_EXCLUDED_PREFIXES = ("/hds/device/", "/hds/record/", "/hds/routing/", "/hds/ext_in/", "/hds/audio/")
+def _is_program_scope_address(addr):
+    if addr == "/hds/performance_mode" or addr.startswith("/hds/seq/"):
+        return False
+    if addr.startswith(_PROGRAM_SCOPE_EXCLUDED_PREFIXES):
+        return False
+    if addr.startswith("/hds/fx/") and addr.endswith("/source"):
+        return False
+    if addr.startswith("/hds/fx_routing/"):
+        return addr == "/hds/fx_routing/0/mode"
+    return True
+
 class SynthGui(QWidget):
     def __init__(self):
         super().__init__()
@@ -2107,6 +2193,15 @@ class SynthGui(QWidget):
         # listen_for_status_frames()/_backend_is_live().
         self._last_status_time = 0.0
         self._last_detected_input_channels = -1
+        # Program save/load: transmit_knob_packet()'s own add_f()/add_s() closures keep this
+        # dict current on every send (see their own comment there) -- a complete, always-fresh
+        # address->value snapshot of everything this GUI last transmitted, with zero duplicated
+        # widget-reading logic. Program Save filters this through an allowlist rather than
+        # re-deriving values from widgets a second time.
+        self._last_wire_state = {}
+        # Program save/load: one subfolder per Program (~/HDS_Programs/<name>/<name>.hdsprog
+        # [+ <name>.sfz]) -- mirrors the existing ~/HDS_Recordings convention (self.record_folder).
+        self.programs_folder = os.path.expanduser("~/HDS_Programs")
         self.connect_to_backend()
 
         # The master outer structural layout
@@ -3019,11 +3114,25 @@ class SynthGui(QWidget):
         combi_note = QLabel("Combi \u2014 up to 16 stacked Programs (fader + pan scaffolded; real per-lane synthesis is future work)")
         combi_note.setStyleSheet("color: #777; font-style: italic;")
         combi_lay.addWidget(combi_note)
+        # Per-lane "pick a saved Program" dropdown -- the loading mechanism the user described,
+        # added now as pure GUI-local bookkeeping (no backend field/OSC address -- see the
+        # Program save/load plan's own reasoning: this is a load-TIME instruction, not a
+        # continuously-read mixer parameter the way volume/pan/lane_type/seq_mode are). Doesn't
+        # load anything into anything yet -- there's no per-lane engine to load into until real
+        # N-instance synthesis exists.
+        self.combi_lane_program_choice = [None] * PROGRAM_LANE_RESOURCE_COUNT
+        self.combi_program_combos = []
         self.combi_lane_rows = []  # 16 x (row, fader, pan_dial, None, None)
         for i in range(PROGRAM_LANE_RESOURCE_COUNT):
             lane = _build_seq_lane_row(i, show_seq_controls=False)
+            prog_combo = QComboBox()
+            prog_combo.setToolTip("Not yet functional -- picks a saved Program for this lane once per-lane synthesis exists")
+            lane[0].layout().addWidget(prog_combo)
+            prog_combo.currentTextChanged.connect(lambda text, idx=i: self.combi_lane_program_choice.__setitem__(idx, text or None))
+            self.combi_program_combos.append(prog_combo)
             combi_lay.addWidget(lane[0])
             self.combi_lane_rows.append(lane)
+        self._refresh_combi_program_combos()
         combi_lay.addStretch()
         tab_osc_root_lay.addWidget(self.osc_combi_widget)
         self.osc_combi_widget.setVisible(False)
@@ -4452,6 +4561,361 @@ class SynthGui(QWidget):
         if warnings:
             QMessageBox.warning(self, "SFZ Import", f"Imported {len(zones)} zone(s) from {filename}, with some issues:\n\n" + "\n".join(f"- {w}" for w in warnings))
 
+    def _scan_programs_folder(self):
+        """Lists saved Program names -- one per ~/HDS_Programs/<name>/<name>.hdsprog subfolder."""
+        if not os.path.isdir(self.programs_folder):
+            return []
+        names = []
+        for entry in sorted(os.listdir(self.programs_folder)):
+            subdir = os.path.join(self.programs_folder, entry)
+            if os.path.isdir(subdir) and os.path.isfile(os.path.join(subdir, f"{entry}.hdsprog")):
+                names.append(entry)
+        return names
+
+    def _refresh_combi_program_combos(self):
+        """Repopulates every Combi lane's Program-picker dropdown from the Programs folder,
+        preserving each lane's current selection where it still exists."""
+        names = self._scan_programs_folder()
+        for i, combo in enumerate(self.combi_program_combos):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("")  # none selected
+            combo.addItems(names)
+            current = self.combi_lane_program_choice[i]
+            if current in names:
+                combo.setCurrentText(current)
+            else:
+                self.combi_lane_program_choice[i] = None
+            combo.blockSignals(False)
+
+    def _pick_and_save_program(self):
+        """Save/Load's Save handler -- writes the current Program (every field
+        _is_program_scope_address() allows) to ~/HDS_Programs/<name>/<name>.hdsprog, plus a
+        colocated <name>.sfz (via _build_sfz_from_zones()) when the Sample Bank has any zones.
+        Deliberately does NOT touch performance_mode/seq_lanes or any rig/routing/device field --
+        see _is_program_scope_address()'s own comment for why a Program is a self-contained unit
+        with no reference to the session it happens to be running in."""
+        default_name = self.program_name_field.text().strip() or "Unsaved Program"
+        name, ok = QInputDialog.getText(self, "Save Program", "Program name:", QLineEdit.EchoMode.Normal, default_name)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        self.transmit_knob_packet()  # freshen self._last_wire_state before capturing it
+        fields = {addr: value for addr, value in self._last_wire_state.items() if _is_program_scope_address(addr)}
+        prog_dir = os.path.join(self.programs_folder, name)
+        try:
+            os.makedirs(prog_dir, exist_ok=True)
+            data = {"format_version": 1, "name": name, "fields": fields}
+            if self.mapping_grid.sample_zones:
+                sfz_filename = f"{name}.sfz"
+                with open(os.path.join(prog_dir, sfz_filename), "w") as f:
+                    f.write(_build_sfz_from_zones(self.mapping_grid.sample_zones))
+                data["sfz_file"] = sfz_filename
+            with open(os.path.join(prog_dir, f"{name}.hdsprog"), "w") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            QMessageBox.warning(self, "Save Program", f"Could not save '{name}':\n{e}")
+            return
+        self.program_name_field.setText(name)
+        self._refresh_combi_program_combos()
+
+    def _apply_program_fields(self, fields):
+        """Save/Load's Load handler's field-application step -- the mirror image of
+        transmit_knob_packet()'s own value-computation, in reverse: for each address in `fields`,
+        finds the matching widget and sets it (signals blocked throughout to avoid a storm of
+        individual transmit_knob_packet() calls), then transmits the fully-restored state once at
+        the end. Missing keys (an older/partial file, or an address this build doesn't know about
+        yet) simply leave that widget at whatever it already was -- never an error."""
+        widgets_touched = []
+        def set_dial(addr, dial):
+            if addr in fields:
+                dial.blockSignals(True); dial.setValue(int(round(fields[addr]))); dial.blockSignals(False)
+                widgets_touched.append(dial)
+        def set_combo_index(addr, combo):
+            if addr in fields:
+                combo.blockSignals(True); combo.setCurrentIndex(int(round(fields[addr]))); combo.blockSignals(False)
+                widgets_touched.append(combo)
+        def set_radio_from_bool(addr, radio_if_true, radio_if_false):
+            if addr in fields:
+                checked_true = fields[addr] != 0.0
+                for r in (radio_if_true, radio_if_false):
+                    r.blockSignals(True)
+                (radio_if_true if checked_true else radio_if_false).setChecked(True)
+                for r in (radio_if_true, radio_if_false):
+                    r.blockSignals(False)
+                widgets_touched.extend([radio_if_true, radio_if_false])
+
+        set_radio_from_bool("/hds/is_polyphonic", self.poly_radio, self.mono_radio)
+        if "/hds/master_volume" in fields:
+            self.master_vol.blockSignals(True); self.master_vol.setValue(int(round(fields["/hds/master_volume"] * 100.0))); self.master_vol.blockSignals(False)
+        set_dial("/hds/portamento_time_ms", self.glide_dial)
+        set_dial("/hds/mono_glide_random", self.glide_random_dial)
+        set_combo_index("/hds/hard_sync_mode", self.hard_sync_combo)
+        if "/hds/pb/range_up" in fields: self.pb_range_up_spin.setValue(int(round(fields["/hds/pb/range_up"])))
+        if "/hds/pb/range_down" in fields: self.pb_range_down_spin.setValue(int(round(fields["/hds/pb/range_down"])))
+        set_radio_from_bool("/hds/sustain/polarity", self.sustain_polarity_inverted, self.sustain_polarity_normal)
+        if "/hds/tempo/bpm" in fields: self.tempo_dial.setValue(int(round(fields["/hds/tempo/bpm"])))
+
+        # Filters (incl. Multi Filter blend), EGs, LFOs, FX, FM depths: same loop-shaped groups
+        # transmit_knob_packet() itself uses, applied in reverse. (Oscillator scalars are handled
+        # directly below, alongside the rest of this function's plain single-field restores.)
+        self._apply_program_fields_filters(fields)
+        self._apply_program_fields_egs(fields)
+        self._apply_program_fields_lfos(fields)
+        self._apply_program_fields_fx(fields)
+        for key, dial in self.fm_depth_dials.items():
+            addr = {
+                "fm_intensity": "/hds/fm/intensity", "fm_depth_3_1": "/hds/fm/depth/3_1",
+                "fm_depth_3_2": "/hds/fm/depth/3_2", "fm_depth_4_1": "/hds/fm/depth/4_1",
+                "fm_depth_4_3": "/hds/fm/depth/4_3", "fm_depth_1_2": "/hds/fm/depth/1_2",
+                "fm_depth_3_4": "/hds/fm/depth/3_4", "fm_depth_1_3": "/hds/fm/depth/1_3",
+            }[key]
+            if addr in fields:
+                dial.blockSignals(True); dial.setValue(int(round(fields[addr] * 100.0))); dial.blockSignals(False)
+        if "/hds/fm/algorithm" in fields:
+            self.fm_algorithm_combo.blockSignals(True)
+            self.fm_algorithm_combo.setCurrentIndex(int(round(fields["/hds/fm/algorithm"])))
+            self.fm_algorithm_combo.blockSignals(False)
+
+        # Remaining scalar oscillator/global fields transmit_knob_packet() sends raw (no scale)
+        # or as a simple checkbox/bool -- mirrors each of those lines directly.
+        set_dial("/hds/vco1/unison/detune", self.vco1_unison_detune)
+        set_dial("/hds/vco1/unison/width", self.vco1_unison_width)
+        set_dial("/hds/vco2/unison/detune", self.vco2_unison_detune)
+        set_dial("/hds/vco2/unison/width", self.vco2_unison_width)
+        set_dial("/hds/vco3/unison/detune", self.vco3_unison_detune)
+        set_dial("/hds/vco3/unison/width", self.vco3_unison_width)
+        set_dial("/hds/vco4/unison/detune", self.vco4_unison_detune)
+        set_dial("/hds/vco4/unison/width", self.vco4_unison_width)
+        set_dial("/hds/vco1/phase_offset", self.vco1_phase)
+        set_dial("/hds/vco2/phase_offset", self.vco2_phase)
+        set_dial("/hds/vco3/phase_offset", self.vco3_phase)
+        set_dial("/hds/vco4/phase_offset", self.vco4_phase)
+        set_dial("/hds/vco1/pulse_width", self.vco1_pulse_width)
+        set_dial("/hds/vco2/pulse_width", self.vco2_pulse_width)
+        set_dial("/hds/vco3/pulse_width", self.vco3_pulse_width)
+        set_dial("/hds/vco4/pulse_width", self.vco4_pulse_width)
+        set_dial("/hds/vco1/fine_tune", self.vco1_fine_tune)
+        set_dial("/hds/vco2/fine_tune", self.vco2_fine_tune)
+        set_dial("/hds/vco2/pitch_offset", self.vco2_pitch_offset)
+        set_dial("/hds/vco3/fine_tune", self.vco3_fine_tune)
+        set_dial("/hds/vco3/pitch_offset", self.vco3_pitch_offset)
+        set_dial("/hds/vco4/fine_tune", self.vco4_fine_tune)
+        set_dial("/hds/vco4/pitch_offset", self.vco4_pitch_offset)
+        for addr, dial in (("/hds/vco1/pitch", self.vco1_pitch), ("/hds/vco2/pitch", self.vco2_pitch),
+                           ("/hds/vco3/pitch", self.vco3_pitch), ("/hds/vco4/pitch", self.vco4_pitch)):
+            if addr in fields:
+                dial.blockSignals(True); dial.setValue(int(round(fields[addr] / 100.0))); dial.blockSignals(False)
+        for addr, cb in (("/hds/vco1/mute", self.vco1_mute), ("/hds/vco2/mute", self.vco2_mute),
+                         ("/hds/vco3/mute", self.vco3_mute), ("/hds/vco4/mute", self.vco4_mute)):
+            if addr in fields:
+                cb.blockSignals(True); cb.setChecked(fields[addr] != 0.0); cb.blockSignals(False)
+        for addr, dial in (("/hds/vco1/vol", self.vco1_vol), ("/hds/vco2/vol", self.vco2_vol),
+                           ("/hds/vco3/vol", self.vco3_vol), ("/hds/vco4/vol", self.vco4_vol)):
+            if addr in fields:
+                dial.blockSignals(True); dial.setValue(int(round(fields[addr] * 100.0))); dial.blockSignals(False)
+        for addr, dial in (("/hds/vco1/pan", self.vco1_pan), ("/hds/vco2/pan", self.vco2_pan),
+                           ("/hds/vco3/pan", self.vco3_pan), ("/hds/vco4/pan", self.vco4_pan)):
+            if addr in fields:
+                dial.blockSignals(True); dial.setValue(int(round(fields[addr] * 100.0))); dial.blockSignals(False)
+        for addr, combo in (("/hds/vco1/shape", self.vco1_combo), ("/hds/vco2/shape", self.vco2_combo),
+                            ("/hds/vco3/shape", self.vco3_combo), ("/hds/vco4/shape", self.vco4_combo)):
+            if addr in fields:
+                combo.blockSignals(True); combo.setCurrentIndex(int(round(fields[addr]))); combo.blockSignals(False)
+
+        self.transmit_knob_packet()
+
+    def _apply_program_fields_filters(self, fields):
+        """Mirrors transmit_knob_packet()'s own Filter A/B section (incl. the Multi Filter blend
+        loop) in reverse -- same cutoff_dials/q_dials/vcf_poles/vcf_types/filter_blend_units
+        index convention (0=Filter A Normal, 1-3=Filter A Multi units 0-2, 4=Filter B)."""
+        def sd(addr, dial, scale=1.0):
+            if addr in fields:
+                dial.blockSignals(True); dial.setValue(int(round(fields[addr] * scale))); dial.blockSignals(False)
+        def sc(addr, combo):
+            if addr in fields:
+                combo.blockSignals(True); combo.setCurrentIndex(int(round(fields[addr]))); combo.blockSignals(False)
+
+        sc("/hds/filter/ab_routing_mode", self.filter_routing_mode)
+        sd("/hds/filter/a/level", self.filter_a_level_dial)
+        sd("/hds/filter/b/level", self.filter_b_level_dial)
+        sd("/hds/filter/a/pan", self.filter_a_pan_dial, 100.0)
+        sd("/hds/filter/b/pan", self.filter_b_pan_dial, 100.0)
+        sc("/hds/filter/a/mode", self.filter_a_mode_combo)
+
+        blend_taps = ["lp", "bp", "hp", "notch", "dry"]
+        def apply_blend(addr_prefix, unit_idx):
+            mode1_knobs, mode2_knobs, xf_dial, _box = self.filter_blend_units[unit_idx]
+            for tap, k in zip(blend_taps, mode1_knobs):
+                sd(f"{addr_prefix}/mode1/{tap}", k)
+            for tap, k in zip(blend_taps, mode2_knobs):
+                sd(f"{addr_prefix}/mode2/{tap}", k)
+            sd(f"{addr_prefix}/crossfade", xf_dial)
+
+        sd("/hds/filter/a/cutoff", self.cutoff_dials[0])
+        sd("/hds/filter/a/res_q", self.q_dials[0])
+        sc("/hds/filter/a/slope", self.vcf_poles[0])
+        sc("/hds/filter/a/type", self.vcf_types[0])
+        apply_blend("/hds/filter/a", 0)
+        sc("/hds/filter/a_multi/routing", self.filter_a_multi_route_combo)
+
+        for m_idx in range(1, 4):
+            backend_idx = m_idx - 1
+            sd(f"/hds/filter/a_multi/{backend_idx}/cutoff", self.cutoff_dials[m_idx])
+            sd(f"/hds/filter/a_multi/{backend_idx}/res_q", self.q_dials[m_idx])
+            sc(f"/hds/filter/a_multi/{backend_idx}/slope", self.vcf_poles[m_idx])
+            sc(f"/hds/filter/a_multi/{backend_idx}/type", self.vcf_types[m_idx])
+            apply_blend(f"/hds/filter/a_multi/{backend_idx}", m_idx)
+
+        sd("/hds/filter/b/cutoff", self.cutoff_dials[4])
+        sd("/hds/filter/b/res_q", self.q_dials[4])
+        sc("/hds/filter/b/slope", self.vcf_poles[4])
+        sc("/hds/filter/b/type", self.vcf_types[4])
+        apply_blend("/hds/filter/b", 4)
+
+    def _apply_program_fields_egs(self, fields):
+        """Mirrors transmit_knob_packet()'s EG-params loop, reusing each EG panel's own existing
+        get_state()/set_state() pair (already built for the "1->All"/Sync copy buttons) rather
+        than re-deriving the dial-by-dial logic a second time."""
+        all_panels = [self.vco1_amp_eg, self.vco2_amp_eg, self.vco3_amp_eg, self.vco4_amp_eg] + self.envelopes
+        for eg_idx, panel in enumerate(all_panels):
+            if f"/hds/eg/{eg_idx}/delay" not in fields:
+                continue  # this EG wasn't in the saved file -- leave it untouched
+            state = {
+                "type": int(round(fields.get(f"/hds/eg/{eg_idx}/topology_mode", panel.combo_type.currentIndex()))),
+                "d": fields[f"/hds/eg/{eg_idx}/delay"],
+                "h": fields[f"/hds/eg/{eg_idx}/hold"],
+                "a": fields[f"/hds/eg/{eg_idx}/attack"],
+                "dec": fields[f"/hds/eg/{eg_idx}/decay"],
+                "s": fields[f"/hds/eg/{eg_idx}/sustain"],
+                "r": fields[f"/hds/eg/{eg_idx}/release"],
+                "al": fields.get(f"/hds/eg/{eg_idx}/attack_start_pct", panel.attack_level_pct),
+                "pk": fields.get(f"/hds/eg/{eg_idx}/attack_peak_pct", panel.attack_peak_pct),
+            }
+            panel.set_state(state)
+
+    def _apply_program_fields_lfos(self, fields):
+        """Mirrors transmit_knob_packet()'s LFO loop in reverse."""
+        for idx in range(LFO_COUNT):
+            if f"/hds/lfo/{idx}/wave" in fields:
+                self.lfo_combos[idx].blockSignals(True)
+                self.lfo_combos[idx].setCurrentIndex(int(round(fields[f"/hds/lfo/{idx}/wave"])))
+                self.lfo_combos[idx].blockSignals(False)
+            if f"/hds/lfo/{idx}/rate" in fields:
+                self.lfo_dials[idx].blockSignals(True)
+                self.lfo_dials[idx].setValue(int(round(fields[f"/hds/lfo/{idx}/rate"] * 10.0)))
+                self.lfo_dials[idx].blockSignals(False)
+                self.lfo_readouts[idx].setText(f"{fields[f'/hds/lfo/{idx}/rate']:.1f} Hz")
+            if f"/hds/lfo/{idx}/depth" in fields:
+                self.lfo_depth_dials[idx].blockSignals(True)
+                self.lfo_depth_dials[idx].setValue(int(round(fields[f"/hds/lfo/{idx}/depth"] * 100.0)))
+                self.lfo_depth_dials[idx].blockSignals(False)
+            if f"/hds/lfo/{idx}/key_sync" in fields:
+                self.lfo_sync_combos[idx].blockSignals(True)
+                self.lfo_sync_combos[idx].setCurrentIndex(int(round(fields[f"/hds/lfo/{idx}/key_sync"])))
+                self.lfo_sync_combos[idx].blockSignals(False)
+            if f"/hds/lfo/{idx}/dest" in fields:
+                self.lfo_dest_combos[idx].blockSignals(True)
+                self.lfo_dest_combos[idx].setCurrentIndex(int(round(fields[f"/hds/lfo/{idx}/dest"])))
+                self.lfo_dest_combos[idx].blockSignals(False)
+            if f"/hds/lfo/{idx}/phase_offset" in fields:
+                self.lfo_phase_dials[idx].blockSignals(True)
+                self.lfo_phase_dials[idx].setValue(int(round(fields[f"/hds/lfo/{idx}/phase_offset"])))
+                self.lfo_phase_dials[idx].blockSignals(False)
+            if f"/hds/lfo/{idx}/mod_source_cc" in fields:
+                self.lfo_mod_source_cc[idx] = fields[f"/hds/lfo/{idx}/mod_source_cc"]
+
+        # 6 assignable EG intensity multipliers + their own mod destinations.
+        for idx in range(6):
+            if f"/hds/eg_mod/{idx}/intensity" in fields:
+                self.eg_intensity_dials[idx].blockSignals(True)
+                self.eg_intensity_dials[idx].setValue(int(round(fields[f"/hds/eg_mod/{idx}/intensity"] * 100.0)))
+                self.eg_intensity_dials[idx].blockSignals(False)
+            if f"/hds/eg_mod/{idx}/dest" in fields:
+                self.eg_dest_combos[idx].blockSignals(True)
+                self.eg_dest_combos[idx].setCurrentIndex(int(round(fields[f"/hds/eg_mod/{idx}/dest"])))
+                self.eg_dest_combos[idx].blockSignals(False)
+
+    def _apply_program_fields_fx(self, fields):
+        """Mirrors transmit_knob_packet()'s FX Bus loop in reverse, reusing the existing
+        _fx_slot_restore() (built for the drag-reorder buttons) so per-type param widget
+        reconfiguration (dial vs. choice, range, visibility) happens exactly the same way a
+        manual Type change already triggers it -- rather than re-deriving that logic a second
+        time. fx_source (which bus a slot serves) is deliberately left untouched -- routing, not
+        patch content, per _is_program_scope_address()."""
+        for slot_idx in range(FX_SLOT_COUNT):
+            type_addr = f"/hds/fx/{slot_idx}/type"
+            if type_addr not in fields:
+                continue
+            type_idx = int(round(fields[type_addr]))
+            entry = FX_TYPE_METADATA[type_idx] if 0 <= type_idx < len(FX_TYPE_METADATA) else FX_TYPE_METADATA[0]
+            params_meta = entry["params"]
+            # Re-configure this slot's param widgets (ranges, choice-combo items, visibility) for
+            # the TARGET type before reading anything off them below -- otherwise a choice param's
+            # combo.count() would still reflect whatever type this slot was previously showing,
+            # not the one being loaded. _fx_slot_restore() does this same reconfiguration too, but
+            # only after this loop has already (mis-)read the stale widget state.
+            self._apply_fx_slot_type(slot_idx, type_idx)
+            params = []
+            for p_idx in range(FX_SLOT_PARAM_COUNT):
+                addr = f"/hds/fx/{slot_idx}/param/{p_idx}"
+                spec = params_meta[p_idx] if p_idx < len(params_meta) else None
+                raw = fields.get(addr, 0.0)
+                if spec is not None and spec.get("type") == "choice":
+                    combo = self.fx_param_combos[slot_idx][p_idx]
+                    option_count = combo.count()
+                    idx = int(round(raw * (option_count - 1))) if option_count > 1 else 0
+                    params.append(("combo", idx))
+                else:
+                    params.append(("dial", int(round(raw * 100.0))))
+            snapshot = {
+                "type_idx": type_idx,
+                "source_idx": self.fx_source_combos[slot_idx].currentIndex(),  # untouched -- routing, not patch
+                "params": params,
+                "mix": int(round(fields.get(f"/hds/fx/{slot_idx}/mix", self.fx_mix_dials[slot_idx].value()))),
+                "bypass": fields.get(f"/hds/fx/{slot_idx}/bypass", 0.0) != 0.0,
+            }
+            self._fx_slot_restore(slot_idx, snapshot)
+
+    def _pick_and_load_program(self):
+        """Save/Load's Load handler -- browse ~/HDS_Programs/*/*.hdsprog, apply every included
+        field via _apply_program_fields(), and if the file references a colocated .sfz, REPLACE
+        (not merge with) the current Sample Bank: a real, deliberate behavior difference from the
+        SFZ importer's own additive-only posture, because loading a *Program* means "this
+        Program's own samples," not "add these on top of whatever was already loaded.\""""
+        os.makedirs(self.programs_folder, exist_ok=True)
+        path, _ = QFileDialog.getOpenFileName(self, "Load Program", self.programs_folder, "HDS Programs (*.hdsprog)")
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            QMessageBox.warning(self, "Load Program", f"Could not read '{path}':\n{e}")
+            return
+        self._apply_program_fields(data.get("fields", {}))
+
+        sfz_file = data.get("sfz_file")
+        if sfz_file:
+            sfz_path = os.path.join(os.path.dirname(path), sfz_file)
+            if self.mapping_grid.sample_zones:
+                old_ids = [z.zone_id for z in self.mapping_grid.sample_zones]
+                self.transmit_zone_remove(old_ids)
+                self.mapping_grid.sample_zones.clear()
+                self.mapping_grid.update()
+            if os.path.isfile(sfz_path):
+                zones, warnings = _build_zones_from_sfz(sfz_path, self.mapping_grid._next_zone_id)
+                if zones:
+                    self.mapping_grid._next_zone_id += len(zones)
+                    self.mapping_grid.sample_zones.extend(zones)
+                    self.mapping_grid.update()
+                    self.transmit_zone_upsert(zones)
+                if warnings:
+                    QMessageBox.warning(self, "Load Program", f"Loaded '{data.get('name', '')}' with some sample issues:\n\n" + "\n".join(f"- {w}" for w in warnings))
+            self.set_mapping_status(None)
+
+        self.program_name_field.setText(data.get("name", os.path.splitext(os.path.basename(path))[0]))
+
     def set_mapping_status(self, message, error=False):
         """Status line under the Mapping tab's top bar -- shows the live zone count by default
         (no ceiling to report against -- the catalog has no product-facing cap)."""
@@ -4821,10 +5285,12 @@ class SynthGui(QWidget):
             msg = OscMessageBuilder(address=address)
             msg.add_arg(float(value), "f")
             bundle.add_content(msg.build())
+            self._last_wire_state[address] = float(value)  # see __init__'s own comment on this dict
         def add_s(address, value):
             msg = OscMessageBuilder(address=address)
             msg.add_arg(str(value), "s")
             bundle.add_content(msg.build())
+            self._last_wire_state[address] = str(value)
 
         vassign = 1.0 if self.poly_radio.isChecked() else 0.0
         v1_shape = float(self.vco1_combo.currentIndex())
@@ -5211,6 +5677,10 @@ class SynthGui(QWidget):
         if self.status_sock is not None: self.status_sock.close()
         event.accept()
 def runtime_connect_and_bind(gui):
+    # Program save/load
+    gui.btn_save.clicked.connect(gui._pick_and_save_program)
+    gui.btn_load.clicked.connect(gui._pick_and_load_program)
+
     # Core global mode switches
     gui.poly_radio.toggled.connect(gui.transmit_knob_packet)
     gui.mono_radio.toggled.connect(gui.transmit_knob_packet)
