@@ -573,6 +573,9 @@ LFO_COUNT = 16
 SEQ_LANE_COUNT = 32
 PROGRAM_LANE_RESOURCE_COUNT = 16
 AUDIO_LANE_RESOURCE_COUNT = 16
+ENGINE_SAMPLE_RATE = 48000  # must match SAMPLE_RATE in backend.c -- used only to warn when a
+                              # loaded Sequencer audio lane's native rate differs (no resampling
+                              # exists yet; see _apply_seq_audio_status)
 # FM Algorithm system: must match FM_ALGORITHM_COUNT/FM_ALGORITHMS in backend.c exactly. Each
 # entry names which depth dial(s) are relevant for that algorithm (used to show/hide the depth
 # knobs conditionally, mirroring the FX slot param show/hide pattern) -- "fm_intensity" is the
@@ -4729,7 +4732,15 @@ class SynthGui(QWidget):
                 channels = int(fields.get("channels", 0))
                 sample_rate = fields.get("sample_rate", 0.0)
                 secs = (frames / sample_rate) if sample_rate > 0 else 0.0
-                widgets["status_label"].setText(f"{name} ({secs:.1f}s, {channels}ch)")
+                text = f"{name} ({secs:.1f}s, {channels}ch)"
+                # No resampling exists yet (see backend.c's seq_audio_load_wav_from_disk --
+                # frame_count/duration are already correct for THIS file's own rate, but nothing
+                # currently reads g_seq_audio[] for playback either, so this is purely an early
+                # warning: once playback exists, a mismatched-rate clip would play back at the
+                # wrong pitch/speed unless resampled first).
+                if sample_rate > 0 and int(sample_rate) != ENGINE_SAMPLE_RATE:
+                    text += f" ⚠ {int(sample_rate)}Hz ≠ engine {ENGINE_SAMPLE_RATE}Hz, will need resampling"
+                widgets["status_label"].setText(text)
                 widgets["offset_widget"].setVisible(True)
             elif state == 3:  # SEQ_AUDIO_ERROR
                 widgets["status_label"].setText(f"{name}: load failed")
@@ -5029,15 +5040,22 @@ class SynthGui(QWidget):
             self._fx_slot_restore(slot_idx, snapshot)
 
     def _pick_and_load_program(self):
-        """Save/Load's Load handler -- browse ~/HDS_Programs/*/*.hdsprog, apply every included
-        field via _apply_program_fields(), and if the file references a colocated .sfz, REPLACE
-        (not merge with) the current Sample Bank: a real, deliberate behavior difference from the
-        SFZ importer's own additive-only posture, because loading a *Program* means "this
-        Program's own samples," not "add these on top of whatever was already loaded.\""""
+        """Save/Load's Load handler -- browse ~/HDS_Programs/*/*.hdsprog and load it via
+        _load_program_from_path(). See that method's docstring for the Sample-Bank-replace
+        behavior."""
         os.makedirs(self.programs_folder, exist_ok=True)
         path, _ = QFileDialog.getOpenFileName(self, "Load Program", self.programs_folder, "HDS Programs (*.hdsprog)")
         if not path:
             return
+        self._load_program_from_path(path)
+
+    def _load_program_from_path(self, path):
+        """Shared load logic behind both the file-dialog-driven Load button and the </>
+        prev/next cycling buttons: apply every included field via _apply_program_fields(), and
+        if the file references a colocated .sfz, REPLACE (not merge with) the current Sample
+        Bank -- a real, deliberate behavior difference from the SFZ importer's own additive-only
+        posture, because loading a *Program* means "this Program's own samples," not "add these
+        on top of whatever was already loaded.\""""
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -5066,6 +5084,25 @@ class SynthGui(QWidget):
             self.set_mapping_status(None)
 
         self.program_name_field.setText(data.get("name", os.path.splitext(os.path.basename(path))[0]))
+
+    def _cycle_program(self, delta):
+        """'◀'/'▶' buttons: load the previous/next saved Program alphabetically from
+        ~/HDS_Programs/, wrapping around. If the current program_name_field text matches a saved
+        Program, cycling starts relative to it; otherwise (an unsaved/renamed patch) '▶'
+        starts at the first saved Program and '◀' at the last. No-op if no Programs are
+        saved yet."""
+        names = self._scan_programs_folder()
+        if not names:
+            return
+        current = self.program_name_field.text().strip()
+        if current in names:
+            next_idx = (names.index(current) + delta) % len(names)
+        else:
+            next_idx = 0 if delta > 0 else len(names) - 1
+        next_name = names[next_idx]
+        path = os.path.join(self.programs_folder, next_name, f"{next_name}.hdsprog")
+        if os.path.isfile(path):
+            self._load_program_from_path(path)
 
     def set_mapping_status(self, message, error=False):
         """Status line under the Mapping tab's top bar -- shows the live zone count by default
@@ -5848,6 +5885,8 @@ def runtime_connect_and_bind(gui):
     # Program save/load
     gui.btn_save.clicked.connect(gui._pick_and_save_program)
     gui.btn_load.clicked.connect(gui._pick_and_load_program)
+    gui.btn_prev_prog.clicked.connect(lambda: gui._cycle_program(-1))
+    gui.btn_next_prog.clicked.connect(lambda: gui._cycle_program(1))
 
     # Core global mode switches
     gui.poly_radio.toggled.connect(gui.transmit_knob_packet)
