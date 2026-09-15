@@ -3328,6 +3328,15 @@ class SynthGui(QWidget):
         self.seq_btn_seek_fwd = QPushButton("1 Measure \u23e9")
         self.seq_btn_seek_fwd.setToolTip("Forward one measure")
         transport_lay.addWidget(self.seq_btn_seek_fwd)
+        # Metronome: a plain on/off toggle (not an edge-triggered counter like the buttons above
+        # -- this is sustained state), engaging a cheap, hardcoded 400Hz/8ms square-wave click on
+        # each beat while the transport is PLAYING -- see poll_metronome() in backend.c. Not a
+        # Program voice, so it deliberately never touches the oscillator/filter/envelope
+        # machinery, and stays off by default (metronome_enable defaults to 0).
+        self.seq_btn_metronome = QPushButton("\U0001f3b5 Metronome")
+        self.seq_btn_metronome.setCheckable(True)
+        self.seq_btn_metronome.setToolTip("Click on each beat while playing (400Hz, 8ms square wave)")
+        transport_lay.addWidget(self.seq_btn_metronome)
         # Real, edge-triggered counters -- same idiom as each Sequencer audio lane's own Preview
         # button (_preview_seq_audio/preview_trigger): the backend's poll_transport_triggers
         # detects a change in the value since last block, so each click just increments and
@@ -3348,6 +3357,7 @@ class SynthGui(QWidget):
         self.seq_btn_seek_start.clicked.connect(self._seq_transport_seek_start)
         self.seq_btn_seek_back.clicked.connect(self._seq_transport_seek_back)
         self.seq_btn_seek_fwd.clicked.connect(self._seq_transport_seek_fwd)
+        self.seq_btn_metronome.toggled.connect(self.transmit_knob_packet)
         transport_lay.addSpacing(16)
         self.seq_transport_state_label = QLabel("STOPPED")
         self.seq_transport_state_label.setStyleSheet("font-weight: bold;")
@@ -5911,6 +5921,7 @@ class SynthGui(QWidget):
         add_f("/hds/seq/transport/seek_start", self.seq_transport_seek_start_trigger)
         add_f("/hds/seq/transport/seek_back", self.seq_transport_seek_back_trigger)
         add_f("/hds/seq/transport/seek_fwd", self.seq_transport_seek_fwd_trigger)
+        add_f("/hds/seq/transport/metronome", 1.0 if self.seq_btn_metronome.isChecked() else 0.0)
 
         # LFOs (incl. phase offset + mod source CC)
         for idx in range(LFO_COUNT):

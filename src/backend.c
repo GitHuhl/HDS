@@ -810,6 +810,13 @@ typedef struct {
     float seq_transport_seek_back_trigger;
     float seq_transport_seek_fwd_trigger;
 
+    // Metronome: a plain on/off toggle (not a trigger -- this is a sustained state, unlike the
+    // edge-triggered transport buttons above), engaging a cheap, hardcoded 400Hz/8ms square-wave
+    // click on each beat while the transport is PLAYING. See poll_metronome()/the click-render
+    // block in render_audio_block. Deliberately session-level, not Program-scoped (a monitoring
+    // aid, not patch content) -- excluded from Program save/load same as performance_mode.
+    float metronome_enable;
+
     // Combi mode: which incoming MIDI channel each of the 8 Program lanes listens on (0 = Omni,
     // 1-16 = a specific channel) -- same convention as SeqLaneState.midi_channel, filtering LIVE
     // note dispatch (process_midi_input, in Combi mode) to whichever lane(s) match, rather than
@@ -3748,6 +3755,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/seq/transport/seek_start", seq_transport_seek_start_trigger),
     OSC_SCALAR("/hds/seq/transport/seek_back", seq_transport_seek_back_trigger),
     OSC_SCALAR("/hds/seq/transport/seek_fwd", seq_transport_seek_fwd_trigger),
+    OSC_SCALAR("/hds/seq/transport/metronome", metronome_enable),
 
     OSC_ARRAY("/hds/combi/%d/midi_channel", combi_lane_midi_channel, COMBI_PROGRAM_COUNT),
 
@@ -3956,6 +3964,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->seq_transport_seek_start_trigger = 0.0f;
     knobs->seq_transport_seek_back_trigger = 0.0f;
     knobs->seq_transport_seek_fwd_trigger = 0.0f;
+    knobs->metronome_enable = 0.0f;
     for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) knobs->combi_lane_midi_channel[p] = 0.0f; // Omni
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
@@ -5957,6 +5966,39 @@ static void poll_transport_triggers(const SynthSharedControls *knobs, float curr
     if (seeked) transport_reposition_lanes(knobs);
 }
 
+// --- Metronome: a cheap, deliberately hardcoded 400Hz/8ms square-wave click on each beat while
+// PLAYING -- not a Program voice, so it never touches the oscillator/filter/envelope machinery
+// (per the ask: "low quality, efficient"). Scheduled at block granularity (matching how the
+// transport playhead itself only updates once per block -- see advance_transport_playhead), which
+// is more than adequate for a monitoring click. ---
+#define METRONOME_CLICK_HZ 400.0f
+#define METRONOME_CLICK_DURATION_SEC 0.008f
+#define METRONOME_CLICK_GAIN 0.25f
+static double g_metronome_next_click_sec = 0.0; // playhead-seconds of the next scheduled click
+static int g_metronome_click_samples_left = 0;  // countdown of remaining click samples to render
+static int g_metronome_click_phase = 0;         // running square-wave sample counter, reset per click
+
+// Called once per block, right after poll_transport_triggers (so it sees this block's already-
+// resolved tempo/playhead). Schedules (but does not itself render) upcoming clicks: crossing one
+// or more beat boundaries this block arms/re-arms the click-sample countdown that
+// render_audio_block's per-sample loop actually renders from.
+static void poll_metronome(const SynthSharedControls *knobs, float current_tempo_bpm) {
+    if (knobs->metronome_enable == 0.0f || g_transport_state != TRANSPORT_PLAYING) {
+        // Not engaged, or transport isn't running -- keep the next-click schedule pinned to
+        // "right after wherever the playhead currently is" so re-enabling or resuming Play
+        // starts cleanly on the very next beat instead of firing a backlog of missed clicks.
+        g_metronome_next_click_sec = g_transport_playhead_sec;
+        g_metronome_click_samples_left = 0;
+        return;
+    }
+    float beat_sec = 60.0f / fmaxf(1.0f, current_tempo_bpm);
+    while (g_transport_playhead_sec >= g_metronome_next_click_sec) {
+        g_metronome_next_click_sec += (double)beat_sec;
+        g_metronome_click_samples_left = (int)(METRONOME_CLICK_DURATION_SEC * (float)SAMPLE_RATE);
+        g_metronome_click_phase = 0;
+    }
+}
+
 // Called every block from main()'s loop (see seq_audio_start_transport_playback's own comment
 // on why this exists): starts any lane transport_start_fresh had to skip because its load hadn't
 // finished yet, the moment SEQ_AUDIO_READY actually lands, as long as the transport is still
@@ -7243,6 +7285,21 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             pair_r[0] += sample_r;
         }
 
+        // Metronome click (see poll_metronome, which schedules g_metronome_click_samples_left):
+        // a raw, hardcoded 400Hz square wave, summed straight into output pair 0 same as the
+        // Sequencer audio-lane playback right above -- deliberately not a Program voice, so it
+        // never touches the oscillator/filter/envelope machinery and costs nothing when idle
+        // (the overwhelmingly common case, checked with one cheap comparison).
+        if (g_metronome_click_samples_left > 0) {
+            int half_period_samples = (int)((float)SAMPLE_RATE / (METRONOME_CLICK_HZ * 2.0f));
+            if (half_period_samples < 1) half_period_samples = 1;
+            float click_val = ((g_metronome_click_phase / half_period_samples) % 2 == 0) ? METRONOME_CLICK_GAIN : -METRONOME_CLICK_GAIN;
+            pair_l[0] += click_val;
+            pair_r[0] += click_val;
+            g_metronome_click_phase++;
+            g_metronome_click_samples_left--;
+        }
+
         // Always-on master safety limiter, now evaluated once per output pair (after every source
         // routed to that pair has been summed in -- its whole purpose, the DAC never seeing an
         // out-of-range sample, only makes sense evaluated after a pair's final sum, not per
@@ -8050,6 +8107,7 @@ int main(int argc, char **argv) {
         float current_tempo_bpm = compute_current_tempo_bpm(&active_knobs, engine_elapsed_seconds);
 
         poll_transport_triggers(&active_knobs, current_tempo_bpm); // Play/Pause/Stop/Seek -- starts/freezes/resets/repositions the real Sequencer playhead
+        poll_metronome(&active_knobs, current_tempo_bpm); // schedules the next click, if engaged and PLAYING
         poll_seq_audio_transport_catchup(&active_knobs); // starts any lane whose load finished after Play was already pressed
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
