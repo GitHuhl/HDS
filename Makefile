@@ -18,12 +18,26 @@ WIN_CFLAGS := -O2 -Wall -Wextra -std=gnu11 -I$(WIN_DEPS)/liblo/include -I$(WIN_D
 WIN_LDFLAGS := -L$(WIN_DEPS)/liblo/lib -L$(WIN_DEPS)/wavpack/lib
 WIN_LDLIBS := -llo -lwavpack -lws2_32 -liphlpapi -lwinmm -lole32 -lm -lpthread
 
-.PHONY: all run-backend run-frontend clean windows clean-windows
+# --- Linux CLAP plugin ---
+# Produces hds.clap (a plain ELF shared object under the required .clap extension -- real hosts
+# scan for it at ~/.clap/, /usr/lib/clap/, or $CLAP_PATH). #include's the whole of backend.c (see
+# src/clap_plugin.c's own header comment), so every ALSA-touching symbol still needs linking even
+# though the plugin's own vtable never calls open_pcm_stream/write_audio_block -- they're simply
+# unreferenced-but-compiled-in dead code sharing the translation unit. Linux-only for now; see the
+# plan doc's own stated Windows-out-of-scope boundary.
+CLAP_INC := third_party/clap/include
+CLAP_BIN := hds.clap
+CLAP_SRC := src/clap_plugin.c
+
+.PHONY: all run-backend run-frontend clean windows clean-windows clap
 
 all: $(BIN)
 
 $(BIN): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+clap: $(CLAP_SRC)
+	$(CC) $(CFLAGS) -fPIC -shared -I$(CLAP_INC) -o $(CLAP_BIN) $(CLAP_SRC) $(LDLIBS)
 
 windows: $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a
 	$(WIN_CC) $(WIN_CFLAGS) -o $(WIN_BIN) $(SRC) $(WIN_LDFLAGS) $(WIN_LDLIBS)
@@ -39,7 +53,7 @@ run-frontend:
 	python3 src/frontend.py
 
 clean:
-	rm -f $(BIN)
+	rm -f $(BIN) $(CLAP_BIN)
 
 clean-windows:
 	rm -f $(WIN_BIN)

@@ -1,5 +1,6 @@
 synth_engine
 synth_engine.exe
+hds.clap
 *.o
 __pycache__/
 *.pyc
