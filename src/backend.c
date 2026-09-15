@@ -8010,6 +8010,10 @@ struct HdsPcmStream {
                                       // there -- see the comment below); read/reported from
                                       // main()'s own loop, same cross-thread-counter pattern
                                       // record_engine.ring.dropped_samples already uses.
+    ma_uint32 target_occupancy_frames; // see write_audio_block()'s own comment -- the steady-state
+                                        // depth writes are throttled to hover around, NOT the
+                                        // ring's full capacity (which exists purely as a transient-
+                                        // stall cushion, same role ALSA's own hardware ring plays).
 };
 
 static void hds_win_playback_callback(ma_device *device, void *output, const void *input, ma_uint32 frame_count) {
@@ -8122,6 +8126,28 @@ static void write_audio_block(HdsPcmStream *pcm_handle, const float *buffer, int
     uint32_t written = 0;
     int spin_guard = 0;
     while (written < frame_count && g_synth_running) {
+        // BUG FIX (Windows latency + post-stall "drain delay"): writing eagerly whenever the ring
+        // had ANY room (the old behavior here) let occupancy creep up toward the ring's full
+        // capacity in steady state, since nothing throttled it below that -- the ring's whole
+        // depth (sized generously as a transient-stall cushion, see open_pcm_stream()'s own
+        // comment) became the ADDED latency sitting in front of WASAPI's own hardware buffer,
+        // continuously, not just during a stall. It also meant that after any real stall, the
+        // render loop (running far faster than real time) would refill the ring all the way back
+        // to full as fast as it could -- an audible "glitch, then extra delay that has to drain
+        // back down" on top of the original glitch. Waiting here once occupancy has already
+        // reached target_occupancy_frames (one real period, not the whole cushion) keeps the ring
+        // hovering near that single-period depth in steady state -- matching ALSA's own blocking-
+        // write behavior -- and caps how far a stall can push it ahead, since a write is never
+        // released faster than the ring can actually drain toward that target.
+        if (ma_pcm_rb_available_read(&pcm_handle->rb) >= pcm_handle->target_occupancy_frames) {
+            if (++spin_guard > 200) {
+                fprintf(stderr, "[audio] WASAPI ring stayed backed up past target occupancy -- dropping the rest of this block -- %d active voices, last render_audio_block took %.3fms\n",
+                        active_voices_count, render_ms);
+                break;
+            }
+            struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+            continue;
+        }
         ma_uint32 avail = frame_count - written;
         void *write_ptr;
         if (ma_pcm_rb_acquire_write(&pcm_handle->rb, &avail, &write_ptr) == MA_SUCCESS && avail > 0) {
@@ -8130,12 +8156,12 @@ static void write_audio_block(HdsPcmStream *pcm_handle, const float *buffer, int
             written += avail;
             spin_guard = 0;
         } else {
-            // Ring momentarily full (playback callback hasn't drained it yet) -- brief wait and
-            // retry, mirroring ALSA's own blocking-until-room semantics. Bail after ~200ms so a
-            // truly stalled device (unplugged mid-block) can't hang the audio thread forever. This
-            // is the PRODUCER side running dry of room (main() too slow to keep the ring drained,
-            // or the callback thread stalled) -- distinct from hds_win_playback_callback()'s own
-            // underrun_count, which is the CONSUMER side running dry of data (the actual click).
+            // Ring genuinely full (playback callback hasn't drained it at all, or a real stall) --
+            // brief wait and retry, mirroring ALSA's own blocking-until-room semantics. Bail after
+            // ~200ms so a truly stalled device (unplugged mid-block) can't hang the audio thread
+            // forever. This is the PRODUCER side running dry of room -- distinct from
+            // hds_win_playback_callback()'s own underrun_count, which is the CONSUMER side running
+            // dry of data (the actual click).
             if (++spin_guard > 200) {
                 fprintf(stderr, "[audio] WASAPI ring stayed full -- dropping the rest of this block -- %d active voices, last render_audio_block took %.3fms\n",
                         active_voices_count, render_ms);
@@ -8350,6 +8376,7 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
     ma_uint32 actual_period_frames = s->is_capture ? s->device.capture.internalPeriodSizeInFrames : s->device.playback.internalPeriodSizeInFrames;
     if (actual_period_frames == 0) actual_period_frames = (ma_uint32)BUFFER_SIZE; // defensive: some backends/paths may not populate this -- BUFFER_SIZE is still a sane worst-case single-write size
     ma_uint32 rb_frames = actual_period_frames * 4;
+    s->target_occupancy_frames = actual_period_frames; // the ring's *resting* depth -- see write_audio_block()'s own comment
     if (ma_pcm_rb_init(ma_format_f32, (ma_uint32)channels, rb_frames, NULL, NULL, &s->rb) != MA_SUCCESS) {
         fprintf(stderr, "%s device '%s': failed to allocate its internal ring buffer\n", s->is_capture ? "Input" : "Output", device_name);
         ma_device_uninit(&s->device); free(s);
