@@ -4336,6 +4336,15 @@ typedef struct {
     // a transport-driven lane pauses/stops with the transport, a Preview-driven lane always
     // plays through regardless of transport state, exactly like before the transport existed.
     bool driven_by_transport;
+    // Set by transport_start_fresh() for every Seq-mode audio lane, even one whose load hasn't
+    // finished yet (SEQ_AUDIO_READY not reached) -- without this, hitting Play on a lane that's
+    // still loading (a real, easy-to-hit race: click Load Audio, then immediately click Play)
+    // permanently skips that lane for the rest of this Play session, since nothing else ever
+    // revisits it. poll_seq_audio_transport_catchup(), called every block, starts any armed lane
+    // the moment it becomes ready while the transport is still playing, and clears the flag once
+    // started (or on Stop). A no-op for a lane that was already ready when Play was pressed --
+    // transport_start_fresh starts it immediately and this never needs to trigger.
+    bool armed_for_transport;
 } SeqAudioLane;
 
 static SeqAudioLane g_seq_audio[SEQ_LANE_COUNT];
@@ -5737,6 +5746,22 @@ typedef struct {
 } SeqMidiLane;
 static SeqMidiLane g_seq_midi[SEQ_LANE_COUNT];
 
+// Actually starts one Seq-mode audio lane's transport-driven playback from its own
+// audio_offset_sec -- shared by transport_start_fresh (a lane already READY when Play is
+// pressed) and poll_seq_audio_transport_catchup (a lane that becomes READY while the transport
+// is already playing). Caller must have already confirmed load_state == SEQ_AUDIO_READY.
+static void seq_audio_start_transport_playback(SeqAudioLane *al, float audio_offset_sec) {
+    long start_frame = 0;
+    if (audio_offset_sec > 0.0f && al->sample_rate > 0) {
+        start_frame = (long)(audio_offset_sec * (float)al->sample_rate);
+        if (start_frame >= al->frame_count) start_frame = al->frame_count - 1;
+    }
+    al->play_frame = start_frame;
+    al->is_playing = true;
+    al->driven_by_transport = true;
+    al->armed_for_transport = false;
+}
+
 // Called once, only on a STOPPED -> PLAYING transition (never on PAUSED -> PLAYING/resume, which
 // must leave every lane's position exactly where it was): starts every Seq-mode loaded Audio
 // lane's one-shot playback fresh from its own audio_offset_sec (mirrors
@@ -5752,16 +5777,14 @@ static void transport_start_fresh(const SynthSharedControls *knobs) {
         if (is_audio_lane) {
             if (mode != 0) continue; // only Seq-mode Audio lanes auto-start; Mute/Rec don't
             SeqAudioLane *al = &g_seq_audio[l];
-            if (atomic_load_explicit(&al->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !al->pcm || al->frame_count <= 0) continue;
-            float offset_sec = knobs->seq_lanes[l].audio_offset_sec;
-            long start_frame = 0;
-            if (offset_sec > 0.0f && al->sample_rate > 0) {
-                start_frame = (long)(offset_sec * (float)al->sample_rate);
-                if (start_frame >= al->frame_count) start_frame = al->frame_count - 1;
+            if (atomic_load_explicit(&al->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !al->pcm || al->frame_count <= 0) {
+                // Not ready yet (still loading, or loading was only just kicked off) -- arm it so
+                // poll_seq_audio_transport_catchup starts it the moment it becomes ready, instead
+                // of silently skipping this lane for the rest of the Play session.
+                al->armed_for_transport = true;
+                continue;
             }
-            al->play_frame = start_frame;
-            al->is_playing = true;
-            al->driven_by_transport = true;
+            seq_audio_start_transport_playback(al, knobs->seq_lanes[l].audio_offset_sec);
         } else {
             SeqMidiLane *ml = &g_seq_midi[l];
             ml->playback_cursor = 0;
@@ -5801,8 +5824,25 @@ static void poll_transport_triggers(const SynthSharedControls *knobs) {
                 g_seq_audio[l].is_playing = false;
                 g_seq_audio[l].driven_by_transport = false;
             }
+            g_seq_audio[l].armed_for_transport = false;
             g_seq_midi[l].playback_cursor = 0;
         }
+    }
+}
+
+// Called every block from main()'s loop (see seq_audio_start_transport_playback's own comment
+// on why this exists): starts any lane transport_start_fresh had to skip because its load hadn't
+// finished yet, the moment SEQ_AUDIO_READY actually lands, as long as the transport is still
+// PLAYING when that happens. A cheap, unconditional scan -- armed_for_transport is false for
+// every lane in the overwhelmingly common case (load already finished before Play was pressed),
+// so this is a no-op most of the time.
+static void poll_seq_audio_transport_catchup(const SynthSharedControls *knobs) {
+    if (g_transport_state != TRANSPORT_PLAYING) return;
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        SeqAudioLane *al = &g_seq_audio[l];
+        if (!al->armed_for_transport) continue;
+        if (atomic_load_explicit(&al->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !al->pcm || al->frame_count <= 0) continue;
+        seq_audio_start_transport_playback(al, knobs->seq_lanes[l].audio_offset_sec);
     }
 }
 
@@ -7837,6 +7877,7 @@ int main(int argc, char **argv) {
         poll_seq_audio_load_requests(&active_knobs); // spawns a loader thread if a lane's audio_path changed
         poll_seq_audio_preview_triggers(&active_knobs); // starts one-shot playback if a lane's Preview button was clicked
         poll_transport_triggers(&active_knobs); // Play/Pause/Stop -- starts/freezes/resets the real Sequencer playhead
+        poll_seq_audio_transport_catchup(&active_knobs); // starts any lane whose load finished after Play was already pressed
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
         // packet as every other knob. Only reopen the stream whose name actually changed.
