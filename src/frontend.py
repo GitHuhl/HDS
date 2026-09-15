@@ -3214,8 +3214,8 @@ class SynthGui(QWidget):
         combi_lay.setContentsMargins(2, 2, 2, 2); combi_lay.setSpacing(2)
         combi_note = QLabel(
             f"Combi \u2014 up to {COMBI_PROGRAM_COUNT} independently-synthesizing Programs, one shared voice pool. "
-            "Pick a saved Program per lane below; Level/Pan here are not yet wired to anything audible -- "
-            "shape each Program's level/placement via its own oscillator Pan/Vol knobs and FX routing."
+            "Pick a saved Program per lane below; each lane's own Level/Pan shape that Program's "
+            "output here on top of its own oscillator Pan/Vol knobs and FX routing."
         )
         combi_note.setWordWrap(True)
         combi_note.setStyleSheet("color: #777; font-style: italic;")

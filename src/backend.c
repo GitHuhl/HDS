@@ -6239,6 +6239,25 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         static_pan4_l[p] = cosf(angle4); static_pan4_r[p] = sinf(angle4);
     }
 
+    // Combi lane Level/Pan (seq_lanes[p].volume/pan -- the same fader/pan widgets Combi's own
+    // mixer strip UI already shows) applied per-Program-bus, Combi mode only. Gated on
+    // performance_mode so Single Program/Sequencer mode's output stays byte-identical to before
+    // this existed (programs[0]'s own bus there is never scaled by seq_lanes[0]'s fader, which
+    // defaults to 80 -- applying it unconditionally would silently quiet every existing patch by
+    // default). An already-stereo source (a Program's own oscillators are already panned) uses
+    // the sqrt(2)-normalized pan law -- same convention as Filter A/B's Parallel combine and the
+    // Sequencer audio-lane preview mixer's own "already-stereo source" case -- so pan=0 is a true
+    // no-op. Precomputed once per block (knob values, block-invariant) rather than per sample.
+    float combi_lane_gain_l[COMBI_PROGRAM_COUNT], combi_lane_gain_r[COMBI_PROGRAM_COUNT];
+    bool combi_mode_active = ((int)knobs->performance_mode == 1);
+    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+        if (!combi_mode_active) { combi_lane_gain_l[p] = 1.0f; combi_lane_gain_r[p] = 1.0f; continue; }
+        float lvl = fmaxf(0.0f, knobs->seq_lanes[p].volume) / 100.0f;
+        float lane_angle = (fmaxf(-1.0f, fminf(1.0f, knobs->seq_lanes[p].pan)) + 1.0f) * ((float)M_PI / 4.0f);
+        combi_lane_gain_l[p] = lvl * cosf(lane_angle) * 1.41421356f;
+        combi_lane_gain_r[p] = lvl * sinf(lane_angle) * 1.41421356f;
+    }
+
     for (int i = 0; i < block_size; i++) {
         float mixed_l[COMBI_PROGRAM_COUNT] = {0.0f}, mixed_r[COMBI_PROGRAM_COUNT] = {0.0f};
         float lfo_out[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
@@ -6936,8 +6955,8 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         float bus_l[SOURCE_COUNT], bus_r[SOURCE_COUNT];
         float combi_mix_l = 0.0f, combi_mix_r = 0.0f;
         for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
-            bus_l[p] = mixed_l[p] * knobs->master_volume;
-            bus_r[p] = mixed_r[p] * knobs->master_volume;
+            bus_l[p] = mixed_l[p] * knobs->master_volume * combi_lane_gain_l[p];
+            bus_r[p] = mixed_r[p] * knobs->master_volume * combi_lane_gain_r[p];
             combi_mix_l += bus_l[p];
             combi_mix_r += bus_r[p];
         }
