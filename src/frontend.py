@@ -535,13 +535,19 @@ AUDIO_DEVICE_NAME_LEN = 64
 # FX bus geometry must match FX_SLOT_COUNT / FX_SLOT_PARAM_COUNT in backend.c exactly.
 FX_SLOT_COUNT = 12
 FX_SLOT_PARAM_COUNT = 8
+# Combi mode: up to COMBI_PROGRAM_COUNT independently-synthesizing Programs sharing one voice
+# pool -- must match COMBI_PROGRAM_COUNT in backend.c exactly. Defined here, ahead of
+# SOURCE_NAMES/SOURCE_COUNT below, since the bus/source model is built directly on top of it.
+COMBI_PROGRAM_COUNT = 8
 # Multi-source/multi-output audio routing: must match EXT_IN_PAIR_COUNT/SOURCE_COUNT/
-# OUTPUT_PAIR_MAX in backend.c exactly. Source id 0 = Program, 1..EXT_IN_PAIR_COUNT = ext-in
-# pairs -- see the bus/source model comment on SynthSharedControls in backend.c.
+# OUTPUT_PAIR_MAX in backend.c exactly. BREAKING CHANGE (real Combi mode): source ids 0-7 are
+# now the COMBI_PROGRAM_COUNT Combi Programs (0 = today's single Program, unchanged), id 8 is
+# the new "Combi Mix" bus (the whole stack's raw dry pre-FX sum), and ext-in pairs moved from
+# ids 1-8 to COMBI_PROGRAM_COUNT+1..+8 (9-16) -- see SOURCE_COUNT's own comment in backend.c.
 EXT_IN_PAIR_COUNT = 8
-SOURCE_COUNT = 1 + EXT_IN_PAIR_COUNT
 OUTPUT_PAIR_MAX = 8
-SOURCE_NAMES = ["Program"] + [f"Ext In {p + 1}" for p in range(EXT_IN_PAIR_COUNT)]
+SOURCE_NAMES = [f"Program {p + 1}" for p in range(COMBI_PROGRAM_COUNT)] + ["Combi Mix"] + [f"Ext In {p + 1}" for p in range(EXT_IN_PAIR_COUNT)]
+SOURCE_COUNT = len(SOURCE_NAMES)
 # Hard array-allocation ceilings -- must match MAX_VOICES / BUFFER_SIZE in backend.c exactly.
 # The ACTUAL live polyphony/block size are user-adjustable (Audio tab) up to these ceilings;
 # see active_voice_limit/block_size_frames and effective_voice_limit()/effective_block_size()
@@ -568,10 +574,10 @@ MAX_ROUND_ROBIN_GROUPS = 256
 OSC_SHAPE_NAMES = ["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample", "Off"]
 # LFO count: must match LFO_COUNT in backend.c exactly.
 LFO_COUNT = 16
-# Combi/Sequencer lane scaffolding: must match SEQ_LANE_COUNT/PROGRAM_LANE_RESOURCE_COUNT/
-# AUDIO_LANE_RESOURCE_COUNT in backend.c exactly.
+# Combi/Sequencer lane scaffolding: must match SEQ_LANE_COUNT/AUDIO_LANE_RESOURCE_COUNT in
+# backend.c exactly. COMBI_PROGRAM_COUNT itself is defined earlier now (ahead of SOURCE_NAMES/
+# SOURCE_COUNT, which are built directly on top of it) -- see that definition's own comment.
 SEQ_LANE_COUNT = 32
-PROGRAM_LANE_RESOURCE_COUNT = 16
 AUDIO_LANE_RESOURCE_COUNT = 16
 # FM Algorithm system: must match FM_ALGORITHM_COUNT/FM_ALGORITHMS in backend.c exactly. Each
 # entry names which depth dial(s) are relevant for that algorithm (used to show/hide the depth
@@ -3195,35 +3201,55 @@ class SynthGui(QWidget):
                     "offset_dial": offset_dial, "offset_widget": offset_widget,
                     "preview_btn": preview_btn, "path": "", "preview_trigger": 0}
 
-        # Combi view: 16 lanes, no type/seq-mode dropdowns -- every Combi lane is implicitly
-        # Program/MIDI (Combi has no audio-lane concept at all, per the user's own "these two
-        # dropdowns will not be necessary for combi mode"). Stays in the Play tab -- never moved
-        # or merged with Sequencer.
+        # Combi view: COMBI_PROGRAM_COUNT (8) lanes, no type/seq-mode dropdowns -- every Combi
+        # lane is implicitly Program/MIDI (Combi has no audio-lane concept at all, per the user's
+        # own "these two dropdowns will not be necessary for combi mode"). Stays in the Play tab
+        # -- never moved or merged with Sequencer. Real synthesis now: each lane is one of
+        # programs[0..7] in backend.c, sharing one voice pool (capped by the same Polyphony knob
+        # every other mode uses -- no separate per-lane budget), independently MIDI-triggerable
+        # (channel selector below) and independently routable to any FX slot or the whole-stack
+        # "Combi Mix" bus (see the FX tab's source combo, Combi-mode-aware).
         self.osc_combi_widget = QWidget()
         combi_lay = QVBoxLayout(self.osc_combi_widget)
         combi_lay.setContentsMargins(2, 2, 2, 2); combi_lay.setSpacing(2)
-        combi_note = QLabel("Combi \u2014 up to 16 stacked Programs (fader + pan scaffolded; real per-lane synthesis is future work)")
+        combi_note = QLabel(
+            f"Combi \u2014 up to {COMBI_PROGRAM_COUNT} independently-synthesizing Programs, one shared voice pool. "
+            "Pick a saved Program per lane below; Level/Pan here are not yet wired to anything audible -- "
+            "shape each Program's level/placement via its own oscillator Pan/Vol knobs and FX routing."
+        )
+        combi_note.setWordWrap(True)
         combi_note.setStyleSheet("color: #777; font-style: italic;")
         combi_lay.addWidget(combi_note)
-        # Per-lane "pick a saved Program" dropdown -- the loading mechanism the user described,
-        # added now as pure GUI-local bookkeeping (no backend field/OSC address -- see the
-        # Program save/load plan's own reasoning: this is a load-TIME instruction, not a
-        # continuously-read mixer parameter the way volume/pan/lane_type/seq_mode are). Doesn't
-        # load anything into anything yet -- there's no per-lane engine to load into until real
-        # N-instance synthesis exists.
-        self.combi_lane_program_choice = [None] * PROGRAM_LANE_RESOURCE_COUNT
+        # Per-lane "pick a saved Program" dropdown -- loads that .hdsprog's fields onto this
+        # lane's own /hds/combi/{lane}/... address set (programs[lane] in backend.c). Lane 0 is
+        # the same Program the Oscillators/Filters/LFO/EG tabs already edit, so picking a Program
+        # there also updates those tabs' widgets, same as the main Load button; lanes 1-7 send
+        # directly over OSC with no widget of their own -- see
+        # _apply_program_fields_to_combi_lane()'s own comment for why.
+        self.combi_lane_program_choice = [None] * COMBI_PROGRAM_COUNT
         self.combi_program_combos = []
-        self.combi_lane_rows = []  # 16 x (strip, fader, pan_dial, None, None)
+        self.combi_lane_rows = []  # COMBI_PROGRAM_COUNT x (strip, fader, pan_dial, None, None)
+        # Per-lane MIDI channel selector -- mirrors the Sequencer lanes' own
+        # seq_lane_midi_channel_combos pattern exactly: "Omni" (index 0) or a specific channel
+        # 1-16, filtering which Combi lane(s) a live incoming note dispatches to
+        # (process_midi_input's Combi-mode branch in backend.c).
+        self.combi_lane_midi_channel_combos = []  # COMBI_PROGRAM_COUNT x QComboBox
         combi_strips_widget = QWidget()
         combi_strips_lay = QHBoxLayout(combi_strips_widget)
         combi_strips_lay.setContentsMargins(0, 0, 0, 0); combi_strips_lay.setSpacing(3)
-        for i in range(PROGRAM_LANE_RESOURCE_COUNT):
+        for i in range(COMBI_PROGRAM_COUNT):
             lane = _build_seq_lane_row(i, show_seq_controls=False)
             prog_combo = QComboBox()
-            prog_combo.setToolTip("Not yet functional -- picks a saved Program for this lane once per-lane synthesis exists")
+            prog_combo.setToolTip(f"Loads a saved Program onto this lane (programs[{i}] in the backend)")
             lane[0].layout().addWidget(prog_combo)
-            prog_combo.currentTextChanged.connect(lambda text, idx=i: self.combi_lane_program_choice.__setitem__(idx, text or None))
+            prog_combo.currentTextChanged.connect(lambda text, idx=i: self._on_combi_lane_program_picked(idx, text))
             self.combi_program_combos.append(prog_combo)
+            channel_combo = QComboBox()
+            channel_combo.addItems(["Omni"] + [str(c) for c in range(1, 17)])
+            channel_combo.setStyleSheet("font-size: 9px;")
+            channel_combo.setToolTip("Which incoming MIDI channel plays this lane (Omni = every channel)")
+            lane[0].layout().addWidget(channel_combo)
+            self.combi_lane_midi_channel_combos.append(channel_combo)
             combi_strips_lay.addWidget(lane[0])
             self.combi_lane_rows.append(lane)
         combi_strips_lay.addStretch()
@@ -3236,7 +3262,7 @@ class SynthGui(QWidget):
         combi_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         combi_mixer_row = QHBoxLayout(); combi_mixer_row.setSpacing(4)
-        combi_mixer_row.addWidget(_build_lane_legend(["#", "Level", "Pan", "Program"]))
+        combi_mixer_row.addWidget(_build_lane_legend(["#", "Level", "Pan", "Program", "MIDI Ch"]))
         combi_mixer_row.addWidget(combi_scroll, stretch=1)
         combi_lay.addLayout(combi_mixer_row, 1)
         tab_osc_root_lay.addWidget(self.osc_combi_widget)
@@ -3343,7 +3369,7 @@ class SynthGui(QWidget):
         seq_mixer_row.addWidget(seq_scroll, stretch=1)
         seq_outer_lay.addLayout(seq_mixer_row, 1)
 
-        # Audio/MIDI type enforcement: capped at PROGRAM_LANE_RESOURCE_COUNT/AUDIO_LANE_RESOURCE_COUNT
+        # Audio/MIDI type enforcement: capped at COMBI_PROGRAM_COUNT/AUDIO_LANE_RESOURCE_COUNT
         # active of each kind, since each type is meant to eventually draw from its own backend
         # resource pool (neither exists yet -- this is frontend-only validation this pass). Also
         # shows/hides that lane's "Load Audio" box -- meaningless for a Program/MIDI lane.
@@ -3353,7 +3379,7 @@ class SynthGui(QWidget):
             # lane is meaningful. Program/MIDI has no equivalent scarcity here -- every lane that
             # ISN'T Audio is trivially "the rest" (up to all 32, never more, since SEQ_LANE_COUNT
             # itself already bounds that) -- so there is nothing to enforce going the other way.
-            # (PROGRAM_LANE_RESOURCE_COUNT is Combi's own, unrelated ceiling on simultaneous
+            # (COMBI_PROGRAM_COUNT is Combi's own, unrelated ceiling on simultaneous
             # Program-synthesis instances -- conflating the two previously meant every lane
             # defaulting to Program/MIDI already "exceeded" a same-named cap, making it impossible
             # to ever revert a lane back to Program/MIDI. Fixed here.)
@@ -3933,7 +3959,8 @@ class SynthGui(QWidget):
         # Series/Parallel is now a per-source choice (each source's OWN assigned slots run in
         # Series or Parallel independently of every other source) rather than one tab-wide
         # switch -- see fx_source_routing_mode[SOURCE_COUNT] in backend.c. One small toggle per
-        # source, laid out in a compact grid since there are 9 of them (Program + 8 ext-in pairs).
+        # source, laid out in a compact grid since there are SOURCE_COUNT (17) of them (8 Combi
+        # Programs + Combi Mix + 8 ext-in pairs).
         routing_box = QGroupBox("FX Routing Mode (per source)")
         routing_box.setStyleSheet("QGroupBox { font-size: 9px; font-weight: bold; }")
         routing_grid = QGridLayout(routing_box)
@@ -3996,7 +4023,12 @@ class SynthGui(QWidget):
             source_combo.addItems(SOURCE_NAMES)
             source_combo.setFixedWidth(70)
             source_combo.setStyleSheet("font-size: 9px;")
-            source_combo.setToolTip("Which source (Program or an external-input pair) feeds this slot")
+            source_combo.setToolTip(
+                "Which source feeds this slot -- an individual Combi Program, the whole-stack\n"
+                "\"Combi Mix\" bus (only meaningful in Combi mode -- see the Performance Mode\n"
+                "selector), or an external-input pair. A Program can be both individually routed\n"
+                "AND included in Combi Mix at the same time -- that's intentional."
+            )
             slot_lay.addWidget(source_combo)
             self.fx_source_combos.append(source_combo)
 
@@ -4120,9 +4152,11 @@ class SynthGui(QWidget):
         for src in range(SOURCE_COUNT):
             row = src + 1
             self.routing_grid.addWidget(QLabel(SOURCE_NAMES[src]), row, 0)
-            if src == 0:
-                # Program has no enable/gain of its own here -- it's always live (master_volume
-                # lives on the main page); only its output routing is configured on this tab.
+            if src < COMBI_PROGRAM_COUNT + 1:
+                # A Program (0..COMBI_PROGRAM_COUNT-1) or the Combi Mix bus (COMBI_PROGRAM_COUNT)
+                # has no enable/gain of its own here -- Programs are always live (master_volume
+                # lives on the main page, and each oscillator has its own Vol knob); only their
+                # output routing is configured on this tab.
                 self.routing_ext_in_enable_cbs.append(None)
                 self.routing_ext_in_gain_dials.append(None)
             else:
@@ -4741,6 +4775,19 @@ class SynthGui(QWidget):
                 self.combi_lane_program_choice[i] = None
             combo.blockSignals(False)
 
+    def _on_combi_lane_program_picked(self, lane_idx, name):
+        """Combi lane Program-picker change handler: records the choice (same GUI-local
+        bookkeeping the scaffolding already did) and, when a real name was picked (not the blank
+        "none selected" entry), actually loads that saved Program onto this lane via
+        _load_program_from_path(..., lane_idx=lane_idx) -- see that method's own docstring for
+        what "loading onto a lane" means for lane 0 vs. lanes 1-7."""
+        self.combi_lane_program_choice[lane_idx] = name or None
+        if not name:
+            return
+        path = os.path.join(self.programs_folder, name, f"{name}.hdsprog")
+        if os.path.isfile(path):
+            self._load_program_from_path(path, lane_idx=lane_idx)
+
     def _pick_seq_audio_file(self, lane_idx):
         """'Load Audio' button handler for one Sequencer lane. Sends the chosen path over OSC
         (/hds/seq/<lane>/audio_path); the backend actually reads the WAV into RAM on a background
@@ -5134,20 +5181,57 @@ class SynthGui(QWidget):
             return
         self._load_program_from_path(path)
 
-    def _load_program_from_path(self, path):
-        """Shared load logic behind both the file-dialog-driven Load button and the </>
-        prev/next cycling buttons: apply every included field via _apply_program_fields(), and
-        if the file references a colocated .sfz, REPLACE (not merge with) the current Sample
-        Bank -- a real, deliberate behavior difference from the SFZ importer's own additive-only
-        posture, because loading a *Program* means "this Program's own samples," not "add these
-        on top of whatever was already loaded.\""""
+    def _apply_program_fields_to_combi_lane(self, lane_idx, fields):
+        """Loads a saved Program's fields onto Combi lane `lane_idx` (0-7, matching
+        programs[0..7] in backend.c). Lane 0 IS the same Program the Oscillators/Filters/LFO/EG
+        tabs already edit, so it goes through the normal widget-syncing
+        _apply_program_fields() -- selecting a Program for Combi lane 1 updates exactly what
+        you'd see if you'd loaded it via the main Load button. Lanes 1-7 have no widgets of
+        their own (this pass deliberately doesn't add a live per-lane knob-editing UI for 8
+        simultaneous Programs -- see the Combi mode plan's own scope note), so those addresses
+        are sent directly over OSC with each address's leading /hds remapped to
+        /hds/combi/{lane_idx}, bypassing the widget layer entirely -- the backend's own
+        generic_osc_handler applies them to programs[lane_idx] exactly as if a widget had sent
+        them. self._last_wire_state is intentionally left untouched for lanes 1-7 (it mirrors
+        the currently-EDITED Program, i.e. lane 0/programs[0], not every lane at once)."""
+        if lane_idx == 0:
+            self._apply_program_fields(fields)
+            return
+        if not fields:
+            return
+        bundle = OscBundleBuilder(IMMEDIATELY)
+        for addr, value in fields.items():
+            if not addr.startswith("/hds"):
+                continue
+            new_addr = f"/hds/combi/{lane_idx}" + addr[len("/hds"):]
+            msg = OscMessageBuilder(address=new_addr)
+            msg.add_arg(float(value), "f")
+            bundle.add_content(msg.build())
+        try:
+            self.osc_client.send(bundle.build())
+        except OSError:
+            pass
+
+    def _load_program_from_path(self, path, lane_idx=0):
+        """Shared load logic behind the file-dialog-driven Load button, the </> prev/next
+        cycling buttons, and each Combi lane's own Program picker (lane_idx 1-7): apply every
+        included field via _apply_program_fields_to_combi_lane(), and -- lane 0 only -- if the
+        file references a colocated .sfz, REPLACE (not merge with) the current Sample Bank -- a
+        real, deliberate behavior difference from the SFZ importer's own additive-only posture,
+        because loading a *Program* means "this Program's own samples," not "add these on top of
+        whatever was already loaded." The Sample Bank is a single session-wide catalog with no
+        per-Program partitioning (see the Mapping tab's own zone-catalog design), so this pass
+        deliberately does not attempt to load a Combi lane's own colocated .sfz for lanes 1-7 --
+        a documented scope boundary, not an oversight."""
         try:
             with open(path) as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
             QMessageBox.warning(self, "Load Program", f"Could not read '{path}':\n{e}")
             return
-        self._apply_program_fields(data.get("fields", {}))
+        self._apply_program_fields_to_combi_lane(lane_idx, data.get("fields", {}))
+        if lane_idx != 0:
+            return
 
         sfz_file = data.get("sfz_file")
         if sfz_file:
@@ -5715,6 +5799,13 @@ class SynthGui(QWidget):
                 add_f(f"/hds/seq/{i}/midi_channel", 0)
                 add_f(f"/hds/seq/{i}/mode", 0)  # meaningless in Combi mode
 
+        # Combi lanes' own real MIDI channel routing (0=Omni, else 1-16) -- separate from the
+        # /hds/seq/{i}/midi_channel line above, which is Sequencer's own inert per-lane field.
+        # Sent unconditionally (same convention as every other knob here), consumed only by
+        # process_midi_input's Combi-mode dispatch branch in backend.c.
+        for i, combo in enumerate(self.combi_lane_midi_channel_combos):
+            add_f(f"/hds/combi/{i}/midi_channel", combo.currentIndex())
+
         # Sequencer transport -- edge-triggered counters, same idiom as each audio lane's own
         # Preview trigger (see poll_transport_triggers in backend.c).
         add_f("/hds/seq/transport/play", self.seq_transport_play_trigger)
@@ -5794,9 +5885,10 @@ class SynthGui(QWidget):
         add_f("/hds/vco4/mute", 1.0 if self.vco4_mute.isChecked() else 0.0)
         add_f("/hds/vco4/pulse_width", self.vco4_pulse_width.value())
 
-        # External Audio Input: enable + gain per ext-in pair (Routing tab).
+        # External Audio Input: enable + gain per ext-in pair (Routing tab). Ext-in pairs sit at
+        # source ids COMBI_PROGRAM_COUNT+1..+8 (9-16), after the 8 Combi Programs + Combi Mix.
         for p in range(EXT_IN_PAIR_COUNT):
-            src = p + 1
+            src = COMBI_PROGRAM_COUNT + 1 + p
             add_f(f"/hds/ext_in/{p}/enable", 1.0 if self.routing_ext_in_enable_cbs[src].isChecked() else 0.0)
             add_f(f"/hds/ext_in/{p}/gain", self.routing_ext_in_gain_dials[src].value() / 100.0)
 
@@ -6144,8 +6236,10 @@ def runtime_connect_and_bind(gui):
     for btn in gui.fx_source_routing_btns:
         btn.toggled.connect(gui.transmit_knob_packet)
 
-    # Routing tab: per-pair ext-in enable/gain + the source x output-pair grid
-    for src in range(1, SOURCE_COUNT):
+    # Routing tab: per-pair ext-in enable/gain + the source x output-pair grid. Only ext-in
+    # sources (ids COMBI_PROGRAM_COUNT+1..SOURCE_COUNT-1) have enable/gain widgets -- Programs
+    # and Combi Mix don't (see their construction's own comment).
+    for src in range(COMBI_PROGRAM_COUNT + 1, SOURCE_COUNT):
         gui.routing_ext_in_enable_cbs[src].toggled.connect(gui.transmit_knob_packet)
         gui.routing_ext_in_gain_dials[src].valueChanged.connect(gui.transmit_knob_packet)
     for src in range(SOURCE_COUNT):
