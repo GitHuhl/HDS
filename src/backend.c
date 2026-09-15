@@ -795,6 +795,20 @@ typedef struct {
     // added latency. See the Audio tab's Latency control.
     float audio_latency_ms;
 
+    // WASAPI-only (Windows): 0 = Shared (default -- goes through the Windows audio engine's own
+    // mixer, which historically imposes a higher effective minimum period than what
+    // audio_latency_ms alone requests, regardless of that setting), 1 = Exclusive (this stream
+    // gets the hardware directly, bypassing the mixer -- the real way to get audio_latency_ms's
+    // requested period actually honored close to its floor on Windows, at the cost of no other
+    // application being able to use the device at the same time). Meaningless/ignored on Linux
+    // (ALSA has no equivalent shared/exclusive split at this layer) -- see open_pcm_stream()'s
+    // Windows branch, the only place this is ever read. If the device or driver doesn't actually
+    // support Exclusive mode, ma_device_init() fails outright (miniaudio's own documented
+    // behavior, it does not silently fall back) -- open_pcm_stream() retries once in Shared mode
+    // before giving up, so a bad Exclusive request degrades gracefully instead of leaving the
+    // user with no audio at all.
+    float wasapi_exclusive_mode;
+
     // Live polyphony ceiling: how many voices are allowed to be simultaneously ACTIVE, clamped
     // into [1, MAX_VOICES] by effective_voice_limit(). MAX_VOICES itself is just the hard array
     // allocation size now -- this is the real, tunable ceiling, because the right number is a
@@ -3733,6 +3747,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/audio/latency_ms", audio_latency_ms),
     OSC_SCALAR("/hds/audio/polyphony", active_voice_limit),
     OSC_SCALAR("/hds/audio/block_size", block_size_frames),
+    OSC_SCALAR("/hds/audio/wasapi_exclusive_mode", wasapi_exclusive_mode),
 
     OSC_SCALAR("/hds/record/enable", record_enable),
     OSC_SCALAR("/hds/record/include_synth_output", record_include_synth_output),
@@ -4256,6 +4271,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].pb_range_up = 2.0f; knobs->programs[0].pb_range_down = 2.0f; // standard +/-2 semitone default
     knobs->programs[0].sustain_pedal_polarity = 0.0f; // Normal
     knobs->audio_latency_ms = 25.0f; // matches the old hardcoded 25ms target -- no behavior change by default
+    knobs->wasapi_exclusive_mode = 0.0f; // Shared -- matches every prior build's only behavior (this field didn't exist before), and is the only choice that can't fail to open (see open_pcm_stream()'s own comment on Exclusive mode's fallback)
     knobs->active_voice_limit = 32.0f; // matches the last-measured-safe default -- live-adjustable from here
     knobs->block_size_frames = 128.0f; // matches the old hardcoded BUFFER_SIZE -- no behavior change by default
     knobs->record_enable = 0.0f;
@@ -8244,7 +8260,7 @@ static int query_output_device_channel_count(const char *device_name) {
 // return values at all -- an unavailable "default" device (no sound card, no PulseAudio/ALSA
 // routing) left pcm_handle uninitialized/unusable and the very first snd_pcm_writei() call
 // would segfault or hang instead of failing with a clear message.
-static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, HdsPcmStream **handle, float latency_ms, int channels) {
+static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, HdsPcmStream **handle, float latency_ms, int channels, bool wasapi_exclusive) {
 #ifdef _WIN32
     if (*handle) { close_pcm_stream(*handle); *handle = NULL; }
     HdsPcmStream *s = (HdsPcmStream *)calloc(1, sizeof(HdsPcmStream));
@@ -8272,21 +8288,34 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
     if (s->is_capture) {
         config.capture.format = ma_format_f32; config.capture.channels = (ma_uint32)channels;
         config.capture.pDeviceID = have_id ? &chosen_id : NULL;
+        config.capture.shareMode = wasapi_exclusive ? ma_share_mode_exclusive : ma_share_mode_shared;
         config.dataCallback = hds_win_capture_callback;
     } else {
         config.playback.format = ma_format_f32; config.playback.channels = (ma_uint32)channels;
         config.playback.pDeviceID = have_id ? &chosen_id : NULL;
+        config.playback.shareMode = wasapi_exclusive ? ma_share_mode_exclusive : ma_share_mode_shared;
         config.dataCallback = hds_win_playback_callback;
     }
     config.sampleRate = SAMPLE_RATE;
     config.periodSizeInMilliseconds = (ma_uint32)fmaxf(1.0f, latency_ms);
     config.pUserData = s;
 
+    // Exclusive mode fails outright at ma_device_init() if the device/driver doesn't actually
+    // support it (miniaudio's own documented behavior -- it never silently falls back on its
+    // own). Retry once in Shared mode rather than leaving the caller with no audio at all; a
+    // second failure past that point is a real "can't open this device" error, not an
+    // Exclusive-mode-specific one.
     if (ma_device_init(NULL, &config, &s->device) != MA_SUCCESS) {
-        fprintf(stderr, "%s device '%s' failed to open\n", s->is_capture ? "Input" : "Output", device_name);
-        ma_pcm_rb_uninit(&s->rb); free(s);
-        *handle = NULL;
-        return false;
+        if (wasapi_exclusive) {
+            fprintf(stderr, "%s device '%s' failed to open in Exclusive mode -- falling back to Shared\n", s->is_capture ? "Input" : "Output", device_name);
+            if (s->is_capture) config.capture.shareMode = ma_share_mode_shared; else config.playback.shareMode = ma_share_mode_shared;
+        }
+        if (!wasapi_exclusive || ma_device_init(NULL, &config, &s->device) != MA_SUCCESS) {
+            fprintf(stderr, "%s device '%s' failed to open\n", s->is_capture ? "Input" : "Output", device_name);
+            ma_pcm_rb_uninit(&s->rb); free(s);
+            *handle = NULL;
+            return false;
+        }
     }
     if (ma_device_start(&s->device) != MA_SUCCESS) {
         fprintf(stderr, "%s device '%s' failed to start\n", s->is_capture ? "Input" : "Output", device_name);
@@ -8298,6 +8327,7 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
     *handle = s;
     return true;
 #else
+    (void)wasapi_exclusive; // WASAPI-only concept, see the field's own comment on SynthSharedControls
     if (*handle) { snd_pcm_close(*handle); *handle = NULL; }
     snd_pcm_stream_t alsa_stream = (stream == HDS_STREAM_PLAYBACK) ? SND_PCM_STREAM_PLAYBACK : SND_PCM_STREAM_CAPTURE;
     int err = snd_pcm_open(handle, device_name, alsa_stream, 0);
@@ -8882,7 +8912,7 @@ int main(int argc, char **argv) {
     // actually reachable, not just its first pair. Symmetric with the input side just below.
     int detected_output_channels = query_output_device_channel_count(active_knobs.output_device);
     HdsPcmStream *pcm_handle = NULL;
-    if (!open_pcm_stream(active_knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels)) {
+    if (!open_pcm_stream(active_knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels, active_knobs.wasapi_exclusive_mode != 0.0f)) {
         fprintf(stderr, "Cannot continue without an output device.\n");
         lo_address_free(osc_reply_addr); lo_server_free(osc_server); return 1;
     }
@@ -8897,10 +8927,11 @@ int main(int argc, char **argv) {
     // actually reachable, not just its first two.
     HdsPcmStream *pcm_capture_handle = NULL;
     int detected_input_channels = query_device_channel_count(active_knobs.input_device);
-    open_pcm_stream(active_knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels);
+    open_pcm_stream(active_knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels, active_knobs.wasapi_exclusive_mode != 0.0f);
     char applied_input_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
     float applied_audio_latency_ms = active_knobs.audio_latency_ms;
+    bool applied_wasapi_exclusive_mode = active_knobs.wasapi_exclusive_mode != 0.0f;
 
     // Recording engine: `record_ring`/writer thread state must be static -- RecordEngine embeds
     // a RECORD_RING_CAPACITY(1<<22)-float ring buffer (16MB), far too large for main()'s stack.
@@ -8993,8 +9024,12 @@ int main(int argc, char **argv) {
         // Live device switching: the Audio tab writes these as plain fields on the same control
         // packet as every other knob. Only reopen the stream whose name actually changed.
         // A latency change reopens BOTH streams (it's not tied to one device name), since
-        // snd_pcm_set_params' latency target can only be applied at stream-open time.
-        bool latency_changed = active_knobs.audio_latency_ms != applied_audio_latency_ms;
+        // snd_pcm_set_params' latency target can only be applied at stream-open time. A live
+        // Shared<->Exclusive WASAPI toggle needs exactly the same reopen (Windows-only in
+        // effect, but reads harmlessly as always-false on Linux -- see wasapi_exclusive_mode's
+        // own comment).
+        bool latency_changed = active_knobs.audio_latency_ms != applied_audio_latency_ms
+            || (active_knobs.wasapi_exclusive_mode != 0.0f) != applied_wasapi_exclusive_mode;
         // Defensive: an empty device name is never a real selection (unlike midi_device, which
         // has a genuine "auto" meaning for ""; see midi_client_should_autoconnect) -- it can only
         // mean a control packet arrived with this field not meaningfully set yet. Treat it as "no
@@ -9006,29 +9041,29 @@ int main(int argc, char **argv) {
             // Re-detect channel count too -- a device switch can mean a completely different
             // interface with a different channel count, not just a renamed same one.
             int candidate_output_channels = query_output_device_channel_count(active_knobs.output_device);
-            if (open_pcm_stream(active_knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, candidate_output_channels)) {
+            if (open_pcm_stream(active_knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, candidate_output_channels, active_knobs.wasapi_exclusive_mode != 0.0f)) {
                 detected_output_channels = candidate_output_channels;
                 snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
             } else {
                 // Failed -- fall back to the last device that was actually working rather than
                 // leaving pcm_handle NULL, and stop retrying this same bad name every block.
-                open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels);
+                open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels, active_knobs.wasapi_exclusive_mode != 0.0f);
                 snprintf(active_knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", applied_output_device);
             }
         } else if (latency_changed) {
             // Latency-only change with no valid device name yet -- still worth reapplying to
             // whatever's already open rather than silently doing nothing.
-            open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels);
+            open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels, active_knobs.wasapi_exclusive_mode != 0.0f);
         }
         bool input_device_valid = active_knobs.input_device[0] != '\0';
         if (input_device_valid && (latency_changed || strncmp(active_knobs.input_device, applied_input_device, AUDIO_DEVICE_NAME_LEN) != 0)) {
             // Re-detect channel count too -- a device switch can mean a completely different
             // interface with a different channel count, not just a renamed same one.
             detected_input_channels = query_device_channel_count(active_knobs.input_device);
-            open_pcm_stream(active_knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels); // best-effort
+            open_pcm_stream(active_knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels, active_knobs.wasapi_exclusive_mode != 0.0f); // best-effort
             snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
         }
-        if (latency_changed) applied_audio_latency_ms = active_knobs.audio_latency_ms;
+        if (latency_changed) { applied_audio_latency_ms = active_knobs.audio_latency_ms; applied_wasapi_exclusive_mode = active_knobs.wasapi_exclusive_mode != 0.0f; }
         if (strncmp(active_knobs.midi_device, applied_midi_device, AUDIO_DEVICE_NAME_LEN) != 0) {
             // Selection changed live from the Audio tab -- drop whatever was auto-connected
             // under the old selection and rescan under the new one.
