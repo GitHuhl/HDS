@@ -61,6 +61,13 @@
 // synthetic "Combi Mix" bus (the whole stack's pre-FX dry sum), and every ext-in pair comes
 // after that -- see SOURCE_COUNT's own updated comment.
 #define COMBI_PROGRAM_COUNT 8
+// Single Program mode's own live-edit buffer is a DEDICATED 9th ProgramState slot, never one of
+// the 8 real Combi lanes -- see SynthSharedControls.programs' own comment for why (mutual
+// exclusivity: editing in the Oscillators/Filters/LFO/EG tabs must never silently rewrite
+// whatever's loaded onto Combi lane 1, and vice versa). COMBI_PROGRAM_COUNT itself still means
+// exactly "8 real Combi lanes" everywhere else in this file (SOURCE_COUNT, the Combi rendering
+// loops, the OSC address family below) -- untouched by this.
+#define SINGLE_PROGRAM_SLOT COMBI_PROGRAM_COUNT
 #define EXT_IN_PAIR_COUNT 8
 // BREAKING CHANGE (real Combi mode): SOURCE_COUNT grows from 9 (1 Program + 8 ext-in) to 17, and
 // existing source ids are RENUMBERED -- ext-in pairs move from ids 1-8 to 9-16, since ids 0-7 are
@@ -470,13 +477,19 @@ typedef struct {
 // patch"): everything frontend.py's _is_program_scope_address() already treats as Program-scoped
 // for Save/Load, reused verbatim as this struct's exact field boundary rather than re-deriving it
 // -- that boundary is already battle-tested by the save/load feature. Wrapping these fields in a
-// real ProgramState[COMBI_PROGRAM_COUNT] array (instead of them living flat on
+// real ProgramState[COMBI_PROGRAM_COUNT + 1] array (instead of them living flat on
 // SynthSharedControls, as they did before Combi mode was real) is what makes independently-
-// configured, simultaneously-playing Programs possible: programs[0] is byte-identical in
-// name/offset/OSC-address terms to what these fields were before this struct existed -- Single
-// Program mode and every existing saved .hdsprog continue to address programs[0] via the exact
-// same, unchanged OSC paths (e.g. /hds/vco1/shape). programs[1..7] are 7 more fully independent
-// copies, addressed under /hds/combi/{1-7}/... (see OSC_PARAMS[]).
+// configured, simultaneously-playing Programs possible: programs[0..7] are the 8 real Combi
+// lanes, addressed under /hds/combi/{0-7}/... (see OSC_PARAMS[]) -- Combi lane 1 is programs[0],
+// lane 2 is programs[1], and so on. programs[SINGLE_PROGRAM_SLOT] (index 8, the one extra slot)
+// is a DEDICATED 9th ProgramState belonging ONLY to Single Program mode -- the exact same,
+// unchanged OSC paths (e.g. /hds/vco1/shape) that used to address programs[0] now address this
+// slot instead (see OSC_PSCALAR's own comment). This is a deliberate mutual-exclusivity fix:
+// programs[0]/Combi lane 1 and Single Program mode used to be the SAME storage (editing one
+// silently rewrote the other); they are now two fully independent ProgramStates that happen to
+// share nothing but the field layout. render_audio_block resolves which slot a render pass
+// actually reads via combi_mode_active (identity 0..7 in Combi mode, always SINGLE_PROGRAM_SLOT
+// outside it) -- see that function's own comments at each resolution point.
 //
 // FX slots (fx[]/fx_source_routing_mode/source_routing below), ext-in, and every other rig/
 // session-level field deliberately stay flat on SynthSharedControls, NOT in this struct -- those
@@ -686,11 +699,13 @@ typedef struct {
 } ProgramState;
 
 typedef struct {
-    // COMBI_PROGRAM_COUNT (8) independently-synthesizing Programs -- see ProgramState's own
-    // comment above. programs[0] is Single Program mode's Program, addressed via the exact same
-    // OSC paths as before this struct existed (e.g. /hds/vco1/shape); programs[1..7] are Combi
-    // mode's remaining 7 Programs, addressed under /hds/combi/{1-7}/...
-    ProgramState programs[COMBI_PROGRAM_COUNT];
+    // COMBI_PROGRAM_COUNT (8) independently-synthesizing Programs, plus one dedicated 9th slot
+    // for Single Program mode -- see ProgramState's own comment above for the full mutual-
+    // exclusivity design. programs[0..7] are Combi mode's 8 real lanes, addressed under
+    // /hds/combi/{0-7}/...; programs[SINGLE_PROGRAM_SLOT] is Single Program mode's own Program,
+    // addressed via the exact same OSC paths as before this struct existed (e.g.
+    // /hds/vco1/shape) -- NOT the same storage as any Combi lane.
+    ProgramState programs[COMBI_PROGRAM_COUNT + 1]; // index 8 = SINGLE_PROGRAM_SLOT, see above
 
     // Session/mix-level output volume -- deliberately NOT part of ProgramState (excluded from
     // Program scope for Save/Load too): a mixing/session-level level, not part of any one patch,
@@ -780,8 +795,8 @@ typedef struct {
 
     // Tempo, FM algorithm, Osc 3/4 identity, and the manual oscillator Pitch knobs all moved into
     // ProgramState above (each is Program-scoped) -- see that struct's own field-by-field
-    // comments; programs[0] carries the exact same fields under the exact same OSC addresses as
-    // before this struct existed.
+    // comments; programs[SINGLE_PROGRAM_SLOT] carries the exact same fields under the exact same
+    // OSC addresses as before this struct existed.
 
     // Recording format: 0=WAV (32-bit float, lossless, larger files), 1=WavPack (lossless
     // compression, ~40-60% smaller, converted to 24-bit PCM before encoding since WavPack -- like
@@ -895,25 +910,31 @@ static inline int effective_block_size(const SynthSharedControls *knobs) {
 // uses. Markers don't need to be given in time order: this scans for the nearest-before and
 // nearest-after markers directly, so out-of-order input still resolves correctly.
 static float compute_current_tempo_bpm(const SynthSharedControls *knobs, double elapsed_seconds) {
-    int count = (int)knobs->programs[0].tempo_marker_count;
+    // Tempo is Program-scoped (see the Program Save/Load allowlist), so "the current tempo" has
+    // to resolve to a specific slot -- Combi lane 1 (programs[0]) in Combi mode, matching every
+    // other per-Program precompute's own resolution; Single Program mode's own dedicated slot
+    // otherwise. Byte-identical to before this fix outside Combi mode (both were programs[0]
+    // before Single Program mode and Combi lane 1 were split apart).
+    const ProgramState *prog = &knobs->programs[((int)knobs->performance_mode == 1) ? 0 : SINGLE_PROGRAM_SLOT];
+    int count = (int)prog->tempo_marker_count;
     if (count < 0) count = 0;
     if (count > TEMPO_MARKER_MAX) count = TEMPO_MARKER_MAX;
-    if (count == 0) return knobs->programs[0].tempo_bpm;
+    if (count == 0) return prog->tempo_bpm;
 
     int prev = -1; double prev_time = -1e18;
     int next = -1; double next_time = 1e18;
     for (int i = 0; i < count; i++) {
-        double t = (double)knobs->programs[0].tempo_marker_time[i];
+        double t = (double)prog->tempo_marker_time[i];
         if (t <= elapsed_seconds && t > prev_time) { prev = i; prev_time = t; }
         if (t > elapsed_seconds && t < next_time) { next = i; next_time = t; }
     }
-    if (prev < 0 && next < 0) return knobs->programs[0].tempo_bpm; // defensive fallback, shouldn't happen when count > 0
-    if (prev < 0) return knobs->programs[0].tempo_marker_bpm[next]; // before the first marker: hold its bpm flat
-    if (next < 0) return knobs->programs[0].tempo_marker_bpm[prev]; // after the last marker: hold its bpm flat
+    if (prev < 0 && next < 0) return prog->tempo_bpm; // defensive fallback, shouldn't happen when count > 0
+    if (prev < 0) return prog->tempo_marker_bpm[next]; // before the first marker: hold its bpm flat
+    if (next < 0) return prog->tempo_marker_bpm[prev]; // after the last marker: hold its bpm flat
 
     double span = next_time - prev_time;
     double frac = (span > 1e-9) ? (elapsed_seconds - prev_time) / span : 0.0;
-    double bpm = (double)knobs->programs[0].tempo_marker_bpm[prev] + frac * ((double)knobs->programs[0].tempo_marker_bpm[next] - (double)knobs->programs[0].tempo_marker_bpm[prev]);
+    double bpm = (double)prog->tempo_marker_bpm[prev] + frac * ((double)prog->tempo_marker_bpm[next] - (double)prog->tempo_marker_bpm[prev]);
     return (float)bpm;
 }
 
@@ -2608,9 +2629,12 @@ typedef struct {
 // Program-scoped field variants (Combi mode, see ProgramState's own comment): identical shape to
 // the macros above, but the base offset threads through SynthSharedControls.programs[N] before
 // reaching the field. The _AT forms take an explicit compile-time program index N (used to
-// generate the 7 extra /hds/combi/{1-7}/... address rows); the plain (no _AT) forms default to
-// program 0, reproducing today's exact, unprefixed addresses (e.g. /hds/vco1/shape) byte-for-byte
-// -- Single Program mode and every existing saved .hdsprog are unaffected by this indirection.
+// generate the 8 real Combi lane address rows, /hds/combi/{0-7}/...); the plain (no _AT) forms
+// default to SINGLE_PROGRAM_SLOT (index 8), so the existing, unprefixed addresses (e.g.
+// /hds/vco1/shape) now address Single Program mode's own dedicated ProgramState -- NOT any Combi
+// lane's storage, per the mutual-exclusivity fix (see ProgramState's own comment). Single Program
+// mode and every existing saved .hdsprog are unaffected by this indirection -- same addresses,
+// same wire format, just a different (and now correctly independent) target underneath.
 #define OSC_PSCALAR_AT(addr, field, n) \
     { addr, offsetof(SynthSharedControls, programs[n].field), 0, 1, 0, 0, 0, OSC_KIND_FLOAT, 0 }
 #define OSC_PARRAY_AT(addr, field, cnt, n) \
@@ -2619,14 +2643,15 @@ typedef struct {
     { addr, offsetof(SynthSharedControls, programs[n].arrfield) + offsetof(subtype, subfield), sizeof(((SynthSharedControls *)0)->programs[n].arrfield[0]), cnt, 1, 0, 0, OSC_KIND_FLOAT, 0 }
 #define OSC_PNESTED_AT(addr, arrfield, subtype, subfield, cnt1, cnt2, n) \
     { addr, offsetof(SynthSharedControls, programs[n].arrfield) + offsetof(subtype, subfield), sizeof(((SynthSharedControls *)0)->programs[n].arrfield[0]), cnt1, 2, sizeof(float), cnt2, OSC_KIND_FLOAT, 0 }
-#define OSC_PSCALAR(addr, field) OSC_PSCALAR_AT(addr, field, 0)
-#define OSC_PARRAY(addr, field, cnt) OSC_PARRAY_AT(addr, field, cnt, 0)
-#define OSC_PSUBARRAY(addr, arrfield, subtype, subfield, cnt) OSC_PSUBARRAY_AT(addr, arrfield, subtype, subfield, cnt, 0)
-#define OSC_PNESTED(addr, arrfield, subtype, subfield, cnt1, cnt2) OSC_PNESTED_AT(addr, arrfield, subtype, subfield, cnt1, cnt2, 0)
+#define OSC_PSCALAR(addr, field) OSC_PSCALAR_AT(addr, field, SINGLE_PROGRAM_SLOT)
+#define OSC_PARRAY(addr, field, cnt) OSC_PARRAY_AT(addr, field, cnt, SINGLE_PROGRAM_SLOT)
+#define OSC_PSUBARRAY(addr, arrfield, subtype, subfield, cnt) OSC_PSUBARRAY_AT(addr, arrfield, subtype, subfield, cnt, SINGLE_PROGRAM_SLOT)
+#define OSC_PNESTED(addr, arrfield, subtype, subfield, cnt1, cnt2) OSC_PNESTED_AT(addr, arrfield, subtype, subfield, cnt1, cnt2, SINGLE_PROGRAM_SLOT)
 
 static const OscParamEntry OSC_PARAMS[] = {
     // --- Baseline ---
     OSC_PSCALAR("/hds/is_polyphonic", is_polyphonic),
+    OSC_PSCALAR_AT("/hds/combi/0/is_polyphonic", is_polyphonic, 0),
     OSC_PSCALAR_AT("/hds/combi/1/is_polyphonic", is_polyphonic, 1),
     OSC_PSCALAR_AT("/hds/combi/2/is_polyphonic", is_polyphonic, 2),
     OSC_PSCALAR_AT("/hds/combi/3/is_polyphonic", is_polyphonic, 3),
@@ -2635,6 +2660,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/is_polyphonic", is_polyphonic, 6),
     OSC_PSCALAR_AT("/hds/combi/7/is_polyphonic", is_polyphonic, 7),
     OSC_PSCALAR("/hds/vco1/shape", vco1_shape),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/shape", vco1_shape, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/shape", vco1_shape, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco1/shape", vco1_shape, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco1/shape", vco1_shape, 3),
@@ -2643,6 +2669,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco1/shape", vco1_shape, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco1/shape", vco1_shape, 7),
     OSC_PSCALAR("/hds/vco2/shape", vco2_shape),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/shape", vco2_shape, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/shape", vco2_shape, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/shape", vco2_shape, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/shape", vco2_shape, 3),
@@ -2651,6 +2678,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco2/shape", vco2_shape, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco2/shape", vco2_shape, 7),
     OSC_PSCALAR("/hds/fm/intensity", fm_intensity),
+    OSC_PSCALAR_AT("/hds/combi/0/fm/intensity", fm_intensity, 0),
     OSC_PSCALAR_AT("/hds/combi/1/fm/intensity", fm_intensity, 1),
     OSC_PSCALAR_AT("/hds/combi/2/fm/intensity", fm_intensity, 2),
     OSC_PSCALAR_AT("/hds/combi/3/fm/intensity", fm_intensity, 3),
@@ -2659,6 +2687,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/fm/intensity", fm_intensity, 6),
     OSC_PSCALAR_AT("/hds/combi/7/fm/intensity", fm_intensity, 7),
     OSC_PSCALAR("/hds/vco1/vol", vco1_vol),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/vol", vco1_vol, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/vol", vco1_vol, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco1/vol", vco1_vol, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco1/vol", vco1_vol, 3),
@@ -2667,6 +2696,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco1/vol", vco1_vol, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco1/vol", vco1_vol, 7),
     OSC_PSCALAR("/hds/vco2/vol", vco2_vol),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/vol", vco2_vol, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/vol", vco2_vol, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/vol", vco2_vol, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/vol", vco2_vol, 3),
@@ -2675,6 +2705,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco2/vol", vco2_vol, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco2/vol", vco2_vol, 7),
     OSC_PSCALAR("/hds/portamento_time_ms", portamento_time_ms),
+    OSC_PSCALAR_AT("/hds/combi/0/portamento_time_ms", portamento_time_ms, 0),
     OSC_PSCALAR_AT("/hds/combi/1/portamento_time_ms", portamento_time_ms, 1),
     OSC_PSCALAR_AT("/hds/combi/2/portamento_time_ms", portamento_time_ms, 2),
     OSC_PSCALAR_AT("/hds/combi/3/portamento_time_ms", portamento_time_ms, 3),
@@ -2684,6 +2715,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/7/portamento_time_ms", portamento_time_ms, 7),
     OSC_SCALAR("/hds/master_volume", master_volume),
     OSC_PSCALAR("/hds/vco1/pan", vco1_pan),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/pan", vco1_pan, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/pan", vco1_pan, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco1/pan", vco1_pan, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco1/pan", vco1_pan, 3),
@@ -2692,6 +2724,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco1/pan", vco1_pan, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco1/pan", vco1_pan, 7),
     OSC_PSCALAR("/hds/vco2/pan", vco2_pan),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/pan", vco2_pan, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/pan", vco2_pan, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/pan", vco2_pan, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/pan", vco2_pan, 3),
@@ -2700,6 +2733,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco2/pan", vco2_pan, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco2/pan", vco2_pan, 7),
     OSC_PSCALAR("/hds/vco1/fine_tune", vco1_fine_tune),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/fine_tune", vco1_fine_tune, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/fine_tune", vco1_fine_tune, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco1/fine_tune", vco1_fine_tune, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco1/fine_tune", vco1_fine_tune, 3),
@@ -2708,6 +2742,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco1/fine_tune", vco1_fine_tune, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco1/fine_tune", vco1_fine_tune, 7),
     OSC_PSCALAR("/hds/vco2/pitch_offset", vco2_pitch_offset),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/pitch_offset", vco2_pitch_offset, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/pitch_offset", vco2_pitch_offset, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/pitch_offset", vco2_pitch_offset, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/pitch_offset", vco2_pitch_offset, 3),
@@ -2716,6 +2751,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco2/pitch_offset", vco2_pitch_offset, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco2/pitch_offset", vco2_pitch_offset, 7),
     OSC_PSCALAR("/hds/vco2/fine_tune", vco2_fine_tune),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/fine_tune", vco2_fine_tune, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/fine_tune", vco2_fine_tune, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/fine_tune", vco2_fine_tune, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/fine_tune", vco2_fine_tune, 3),
@@ -2727,6 +2763,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     // --- Envelopes (eg[ENV_COUNT], PackEGParams: d=delay h=hold a=attack dec=decay s=sustain
     // r=release al=attack_start_pct pk=attack_peak_pct -- see tick_adsr()) ---
     OSC_PSUBARRAY("/hds/eg/%d/delay", eg, PackEGParams, d, ENV_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/eg/%d/delay", eg, PackEGParams, d, ENV_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/eg/%d/delay", eg, PackEGParams, d, ENV_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/eg/%d/delay", eg, PackEGParams, d, ENV_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/eg/%d/delay", eg, PackEGParams, d, ENV_COUNT, 3),
@@ -2735,6 +2772,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/eg/%d/delay", eg, PackEGParams, d, ENV_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/eg/%d/delay", eg, PackEGParams, d, ENV_COUNT, 7),
     OSC_PSUBARRAY("/hds/eg/%d/hold", eg, PackEGParams, h, ENV_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/eg/%d/hold", eg, PackEGParams, h, ENV_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/eg/%d/hold", eg, PackEGParams, h, ENV_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/eg/%d/hold", eg, PackEGParams, h, ENV_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/eg/%d/hold", eg, PackEGParams, h, ENV_COUNT, 3),
@@ -2743,6 +2781,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/eg/%d/hold", eg, PackEGParams, h, ENV_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/eg/%d/hold", eg, PackEGParams, h, ENV_COUNT, 7),
     OSC_PSUBARRAY("/hds/eg/%d/attack", eg, PackEGParams, a, ENV_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/eg/%d/attack", eg, PackEGParams, a, ENV_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/eg/%d/attack", eg, PackEGParams, a, ENV_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/eg/%d/attack", eg, PackEGParams, a, ENV_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/eg/%d/attack", eg, PackEGParams, a, ENV_COUNT, 3),
@@ -2751,6 +2790,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/eg/%d/attack", eg, PackEGParams, a, ENV_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/eg/%d/attack", eg, PackEGParams, a, ENV_COUNT, 7),
     OSC_PSUBARRAY("/hds/eg/%d/decay", eg, PackEGParams, dec, ENV_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/eg/%d/decay", eg, PackEGParams, dec, ENV_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/eg/%d/decay", eg, PackEGParams, dec, ENV_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/eg/%d/decay", eg, PackEGParams, dec, ENV_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/eg/%d/decay", eg, PackEGParams, dec, ENV_COUNT, 3),
@@ -2759,6 +2799,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/eg/%d/decay", eg, PackEGParams, dec, ENV_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/eg/%d/decay", eg, PackEGParams, dec, ENV_COUNT, 7),
     OSC_PSUBARRAY("/hds/eg/%d/sustain", eg, PackEGParams, s, ENV_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/eg/%d/sustain", eg, PackEGParams, s, ENV_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/eg/%d/sustain", eg, PackEGParams, s, ENV_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/eg/%d/sustain", eg, PackEGParams, s, ENV_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/eg/%d/sustain", eg, PackEGParams, s, ENV_COUNT, 3),
@@ -2767,6 +2808,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/eg/%d/sustain", eg, PackEGParams, s, ENV_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/eg/%d/sustain", eg, PackEGParams, s, ENV_COUNT, 7),
     OSC_PSUBARRAY("/hds/eg/%d/release", eg, PackEGParams, r, ENV_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/eg/%d/release", eg, PackEGParams, r, ENV_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/eg/%d/release", eg, PackEGParams, r, ENV_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/eg/%d/release", eg, PackEGParams, r, ENV_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/eg/%d/release", eg, PackEGParams, r, ENV_COUNT, 3),
@@ -2775,6 +2817,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/eg/%d/release", eg, PackEGParams, r, ENV_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/eg/%d/release", eg, PackEGParams, r, ENV_COUNT, 7),
     OSC_PSUBARRAY("/hds/eg/%d/attack_start_pct", eg, PackEGParams, al, ENV_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/eg/%d/attack_start_pct", eg, PackEGParams, al, ENV_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/eg/%d/attack_start_pct", eg, PackEGParams, al, ENV_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/eg/%d/attack_start_pct", eg, PackEGParams, al, ENV_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/eg/%d/attack_start_pct", eg, PackEGParams, al, ENV_COUNT, 3),
@@ -2783,6 +2826,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/eg/%d/attack_start_pct", eg, PackEGParams, al, ENV_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/eg/%d/attack_start_pct", eg, PackEGParams, al, ENV_COUNT, 7),
     OSC_PSUBARRAY("/hds/eg/%d/attack_peak_pct", eg, PackEGParams, pk, ENV_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/eg/%d/attack_peak_pct", eg, PackEGParams, pk, ENV_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/eg/%d/attack_peak_pct", eg, PackEGParams, pk, ENV_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/eg/%d/attack_peak_pct", eg, PackEGParams, pk, ENV_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/eg/%d/attack_peak_pct", eg, PackEGParams, pk, ENV_COUNT, 3),
@@ -2791,6 +2835,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/eg/%d/attack_peak_pct", eg, PackEGParams, pk, ENV_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/eg/%d/attack_peak_pct", eg, PackEGParams, pk, ENV_COUNT, 7),
     OSC_PARRAY("/hds/eg/%d/topology_mode", eg_mode, ENV_COUNT),
+    OSC_PARRAY_AT("/hds/combi/0/eg/%d/topology_mode", eg_mode, ENV_COUNT, 0),
     OSC_PARRAY_AT("/hds/combi/1/eg/%d/topology_mode", eg_mode, ENV_COUNT, 1),
     OSC_PARRAY_AT("/hds/combi/2/eg/%d/topology_mode", eg_mode, ENV_COUNT, 2),
     OSC_PARRAY_AT("/hds/combi/3/eg/%d/topology_mode", eg_mode, ENV_COUNT, 3),
@@ -2801,6 +2846,7 @@ static const OscParamEntry OSC_PARAMS[] = {
 
     // --- Filter A/B ---
     OSC_PSCALAR("/hds/filter/ab_routing_mode", filter_ab_routing_mode),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/ab_routing_mode", filter_ab_routing_mode, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/ab_routing_mode", filter_ab_routing_mode, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/ab_routing_mode", filter_ab_routing_mode, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/ab_routing_mode", filter_ab_routing_mode, 3),
@@ -2810,6 +2856,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/7/filter/ab_routing_mode", filter_ab_routing_mode, 7),
     // Parallel-mode independent level/pan (replaces the old single filter_ab_blend crossfade).
     OSC_PSCALAR("/hds/filter/a/level", filter_a_level),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/level", filter_a_level, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/level", filter_a_level, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/level", filter_a_level, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/level", filter_a_level, 3),
@@ -2818,6 +2865,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/level", filter_a_level, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/level", filter_a_level, 7),
     OSC_PSCALAR("/hds/filter/b/level", filter_b_level),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/level", filter_b_level, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/level", filter_b_level, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/level", filter_b_level, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/level", filter_b_level, 3),
@@ -2826,6 +2874,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/level", filter_b_level, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/level", filter_b_level, 7),
     OSC_PSCALAR("/hds/filter/a/pan", filter_a_pan),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/pan", filter_a_pan, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/pan", filter_a_pan, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/pan", filter_a_pan, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/pan", filter_a_pan, 3),
@@ -2834,6 +2883,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/pan", filter_a_pan, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/pan", filter_a_pan, 7),
     OSC_PSCALAR("/hds/filter/b/pan", filter_b_pan),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/pan", filter_b_pan, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/pan", filter_b_pan, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/pan", filter_b_pan, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/pan", filter_b_pan, 3),
@@ -2842,6 +2892,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/pan", filter_b_pan, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/pan", filter_b_pan, 7),
     OSC_PSCALAR("/hds/filter/a/mode", filter_a_mode),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode", filter_a_mode, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode", filter_a_mode, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode", filter_a_mode, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode", filter_a_mode, 3),
@@ -2850,6 +2901,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode", filter_a_mode, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode", filter_a_mode, 7),
     OSC_PSCALAR("/hds/filter/a/cutoff", filter_a.cutoff),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/cutoff", filter_a.cutoff, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/cutoff", filter_a.cutoff, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/cutoff", filter_a.cutoff, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/cutoff", filter_a.cutoff, 3),
@@ -2858,6 +2910,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/cutoff", filter_a.cutoff, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/cutoff", filter_a.cutoff, 7),
     OSC_PSCALAR("/hds/filter/a/res_q", filter_a.res_q),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/res_q", filter_a.res_q, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/res_q", filter_a.res_q, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/res_q", filter_a.res_q, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/res_q", filter_a.res_q, 3),
@@ -2866,6 +2919,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/res_q", filter_a.res_q, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/res_q", filter_a.res_q, 7),
     OSC_PSCALAR("/hds/filter/a/slope", filter_a.slope_poles),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/slope", filter_a.slope_poles, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/slope", filter_a.slope_poles, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/slope", filter_a.slope_poles, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/slope", filter_a.slope_poles, 3),
@@ -2874,6 +2928,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/slope", filter_a.slope_poles, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/slope", filter_a.slope_poles, 7),
     OSC_PSCALAR("/hds/filter/a/type", filter_a.filter_type),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/type", filter_a.filter_type, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/type", filter_a.filter_type, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/type", filter_a.filter_type, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/type", filter_a.filter_type, 3),
@@ -2883,6 +2938,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/type", filter_a.filter_type, 7),
     // Multi Filter blend (Mode 1/Mode 2/Crossfade) -- one set of 11 addresses per filter unit.
     OSC_PSCALAR("/hds/filter/a/mode1/lp", filter_a.mode1_lp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode1/lp", filter_a.mode1_lp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode1/lp", filter_a.mode1_lp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode1/lp", filter_a.mode1_lp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode1/lp", filter_a.mode1_lp, 3),
@@ -2891,6 +2947,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode1/lp", filter_a.mode1_lp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode1/lp", filter_a.mode1_lp, 7),
     OSC_PSCALAR("/hds/filter/a/mode1/bp", filter_a.mode1_bp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode1/bp", filter_a.mode1_bp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode1/bp", filter_a.mode1_bp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode1/bp", filter_a.mode1_bp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode1/bp", filter_a.mode1_bp, 3),
@@ -2899,6 +2956,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode1/bp", filter_a.mode1_bp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode1/bp", filter_a.mode1_bp, 7),
     OSC_PSCALAR("/hds/filter/a/mode1/hp", filter_a.mode1_hp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode1/hp", filter_a.mode1_hp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode1/hp", filter_a.mode1_hp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode1/hp", filter_a.mode1_hp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode1/hp", filter_a.mode1_hp, 3),
@@ -2907,6 +2965,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode1/hp", filter_a.mode1_hp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode1/hp", filter_a.mode1_hp, 7),
     OSC_PSCALAR("/hds/filter/a/mode1/notch", filter_a.mode1_notch),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode1/notch", filter_a.mode1_notch, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode1/notch", filter_a.mode1_notch, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode1/notch", filter_a.mode1_notch, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode1/notch", filter_a.mode1_notch, 3),
@@ -2915,6 +2974,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode1/notch", filter_a.mode1_notch, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode1/notch", filter_a.mode1_notch, 7),
     OSC_PSCALAR("/hds/filter/a/mode1/dry", filter_a.mode1_dry),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode1/dry", filter_a.mode1_dry, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode1/dry", filter_a.mode1_dry, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode1/dry", filter_a.mode1_dry, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode1/dry", filter_a.mode1_dry, 3),
@@ -2923,6 +2983,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode1/dry", filter_a.mode1_dry, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode1/dry", filter_a.mode1_dry, 7),
     OSC_PSCALAR("/hds/filter/a/mode2/lp", filter_a.mode2_lp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode2/lp", filter_a.mode2_lp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode2/lp", filter_a.mode2_lp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode2/lp", filter_a.mode2_lp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode2/lp", filter_a.mode2_lp, 3),
@@ -2931,6 +2992,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode2/lp", filter_a.mode2_lp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode2/lp", filter_a.mode2_lp, 7),
     OSC_PSCALAR("/hds/filter/a/mode2/bp", filter_a.mode2_bp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode2/bp", filter_a.mode2_bp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode2/bp", filter_a.mode2_bp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode2/bp", filter_a.mode2_bp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode2/bp", filter_a.mode2_bp, 3),
@@ -2939,6 +3001,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode2/bp", filter_a.mode2_bp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode2/bp", filter_a.mode2_bp, 7),
     OSC_PSCALAR("/hds/filter/a/mode2/hp", filter_a.mode2_hp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode2/hp", filter_a.mode2_hp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode2/hp", filter_a.mode2_hp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode2/hp", filter_a.mode2_hp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode2/hp", filter_a.mode2_hp, 3),
@@ -2947,6 +3010,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode2/hp", filter_a.mode2_hp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode2/hp", filter_a.mode2_hp, 7),
     OSC_PSCALAR("/hds/filter/a/mode2/notch", filter_a.mode2_notch),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode2/notch", filter_a.mode2_notch, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode2/notch", filter_a.mode2_notch, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode2/notch", filter_a.mode2_notch, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode2/notch", filter_a.mode2_notch, 3),
@@ -2955,6 +3019,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode2/notch", filter_a.mode2_notch, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode2/notch", filter_a.mode2_notch, 7),
     OSC_PSCALAR("/hds/filter/a/mode2/dry", filter_a.mode2_dry),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode2/dry", filter_a.mode2_dry, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode2/dry", filter_a.mode2_dry, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode2/dry", filter_a.mode2_dry, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode2/dry", filter_a.mode2_dry, 3),
@@ -2963,6 +3028,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode2/dry", filter_a.mode2_dry, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode2/dry", filter_a.mode2_dry, 7),
     OSC_PSCALAR("/hds/filter/a/crossfade", filter_a.crossfade),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a/crossfade", filter_a.crossfade, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a/crossfade", filter_a.crossfade, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a/crossfade", filter_a.crossfade, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a/crossfade", filter_a.crossfade, 3),
@@ -2971,6 +3037,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a/crossfade", filter_a.crossfade, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a/crossfade", filter_a.crossfade, 7),
     OSC_PSCALAR("/hds/filter/a_multi/routing", filter_a_multi_routing),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/a_multi/routing", filter_a_multi_routing, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/a_multi/routing", filter_a_multi_routing, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/a_multi/routing", filter_a_multi_routing, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/a_multi/routing", filter_a_multi_routing, 3),
@@ -2979,6 +3046,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/a_multi/routing", filter_a_multi_routing, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/a_multi/routing", filter_a_multi_routing, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 3),
@@ -2987,6 +3055,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 3),
@@ -2995,6 +3064,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 3),
@@ -3003,6 +3073,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 3),
@@ -3011,6 +3082,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 3),
@@ -3019,6 +3091,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 3),
@@ -3027,6 +3100,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 3),
@@ -3035,6 +3109,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 3),
@@ -3043,6 +3118,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 3),
@@ -3051,6 +3127,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 3),
@@ -3059,6 +3136,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 3),
@@ -3067,6 +3145,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 3),
@@ -3075,6 +3154,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 3),
@@ -3083,6 +3163,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 3),
@@ -3091,6 +3172,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 7),
     OSC_PSUBARRAY("/hds/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 3),
@@ -3099,6 +3181,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 7),
     OSC_PSCALAR("/hds/filter/b/cutoff", filter_b.cutoff),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/cutoff", filter_b.cutoff, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/cutoff", filter_b.cutoff, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/cutoff", filter_b.cutoff, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/cutoff", filter_b.cutoff, 3),
@@ -3107,6 +3190,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/cutoff", filter_b.cutoff, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/cutoff", filter_b.cutoff, 7),
     OSC_PSCALAR("/hds/filter/b/res_q", filter_b.res_q),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/res_q", filter_b.res_q, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/res_q", filter_b.res_q, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/res_q", filter_b.res_q, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/res_q", filter_b.res_q, 3),
@@ -3115,6 +3199,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/res_q", filter_b.res_q, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/res_q", filter_b.res_q, 7),
     OSC_PSCALAR("/hds/filter/b/slope", filter_b.slope_poles),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/slope", filter_b.slope_poles, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/slope", filter_b.slope_poles, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/slope", filter_b.slope_poles, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/slope", filter_b.slope_poles, 3),
@@ -3123,6 +3208,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/slope", filter_b.slope_poles, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/slope", filter_b.slope_poles, 7),
     OSC_PSCALAR("/hds/filter/b/type", filter_b.filter_type),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/type", filter_b.filter_type, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/type", filter_b.filter_type, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/type", filter_b.filter_type, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/type", filter_b.filter_type, 3),
@@ -3131,6 +3217,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/type", filter_b.filter_type, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/type", filter_b.filter_type, 7),
     OSC_PSCALAR("/hds/filter/b/mode1/lp", filter_b.mode1_lp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode1/lp", filter_b.mode1_lp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode1/lp", filter_b.mode1_lp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode1/lp", filter_b.mode1_lp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode1/lp", filter_b.mode1_lp, 3),
@@ -3139,6 +3226,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode1/lp", filter_b.mode1_lp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode1/lp", filter_b.mode1_lp, 7),
     OSC_PSCALAR("/hds/filter/b/mode1/bp", filter_b.mode1_bp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode1/bp", filter_b.mode1_bp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode1/bp", filter_b.mode1_bp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode1/bp", filter_b.mode1_bp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode1/bp", filter_b.mode1_bp, 3),
@@ -3147,6 +3235,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode1/bp", filter_b.mode1_bp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode1/bp", filter_b.mode1_bp, 7),
     OSC_PSCALAR("/hds/filter/b/mode1/hp", filter_b.mode1_hp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode1/hp", filter_b.mode1_hp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode1/hp", filter_b.mode1_hp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode1/hp", filter_b.mode1_hp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode1/hp", filter_b.mode1_hp, 3),
@@ -3155,6 +3244,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode1/hp", filter_b.mode1_hp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode1/hp", filter_b.mode1_hp, 7),
     OSC_PSCALAR("/hds/filter/b/mode1/notch", filter_b.mode1_notch),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode1/notch", filter_b.mode1_notch, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode1/notch", filter_b.mode1_notch, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode1/notch", filter_b.mode1_notch, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode1/notch", filter_b.mode1_notch, 3),
@@ -3163,6 +3253,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode1/notch", filter_b.mode1_notch, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode1/notch", filter_b.mode1_notch, 7),
     OSC_PSCALAR("/hds/filter/b/mode1/dry", filter_b.mode1_dry),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode1/dry", filter_b.mode1_dry, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode1/dry", filter_b.mode1_dry, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode1/dry", filter_b.mode1_dry, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode1/dry", filter_b.mode1_dry, 3),
@@ -3171,6 +3262,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode1/dry", filter_b.mode1_dry, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode1/dry", filter_b.mode1_dry, 7),
     OSC_PSCALAR("/hds/filter/b/mode2/lp", filter_b.mode2_lp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode2/lp", filter_b.mode2_lp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode2/lp", filter_b.mode2_lp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode2/lp", filter_b.mode2_lp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode2/lp", filter_b.mode2_lp, 3),
@@ -3179,6 +3271,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode2/lp", filter_b.mode2_lp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode2/lp", filter_b.mode2_lp, 7),
     OSC_PSCALAR("/hds/filter/b/mode2/bp", filter_b.mode2_bp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode2/bp", filter_b.mode2_bp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode2/bp", filter_b.mode2_bp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode2/bp", filter_b.mode2_bp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode2/bp", filter_b.mode2_bp, 3),
@@ -3187,6 +3280,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode2/bp", filter_b.mode2_bp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode2/bp", filter_b.mode2_bp, 7),
     OSC_PSCALAR("/hds/filter/b/mode2/hp", filter_b.mode2_hp),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode2/hp", filter_b.mode2_hp, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode2/hp", filter_b.mode2_hp, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode2/hp", filter_b.mode2_hp, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode2/hp", filter_b.mode2_hp, 3),
@@ -3195,6 +3289,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode2/hp", filter_b.mode2_hp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode2/hp", filter_b.mode2_hp, 7),
     OSC_PSCALAR("/hds/filter/b/mode2/notch", filter_b.mode2_notch),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode2/notch", filter_b.mode2_notch, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode2/notch", filter_b.mode2_notch, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode2/notch", filter_b.mode2_notch, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode2/notch", filter_b.mode2_notch, 3),
@@ -3203,6 +3298,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode2/notch", filter_b.mode2_notch, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode2/notch", filter_b.mode2_notch, 7),
     OSC_PSCALAR("/hds/filter/b/mode2/dry", filter_b.mode2_dry),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode2/dry", filter_b.mode2_dry, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode2/dry", filter_b.mode2_dry, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode2/dry", filter_b.mode2_dry, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode2/dry", filter_b.mode2_dry, 3),
@@ -3211,6 +3307,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode2/dry", filter_b.mode2_dry, 6),
     OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode2/dry", filter_b.mode2_dry, 7),
     OSC_PSCALAR("/hds/filter/b/crossfade", filter_b.crossfade),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/b/crossfade", filter_b.crossfade, 0),
     OSC_PSCALAR_AT("/hds/combi/1/filter/b/crossfade", filter_b.crossfade, 1),
     OSC_PSCALAR_AT("/hds/combi/2/filter/b/crossfade", filter_b.crossfade, 2),
     OSC_PSCALAR_AT("/hds/combi/3/filter/b/crossfade", filter_b.crossfade, 3),
@@ -3221,6 +3318,7 @@ static const OscParamEntry OSC_PARAMS[] = {
 
     // --- LFOs (lfo[LFO_COUNT], PackLfoParams) ---
     OSC_PSUBARRAY("/hds/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT, 3),
@@ -3229,6 +3327,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT, 7),
     OSC_PSUBARRAY("/hds/lfo/%d/rate", lfo, PackLfoParams, rate_hz, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/rate", lfo, PackLfoParams, rate_hz, LFO_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/rate", lfo, PackLfoParams, rate_hz, LFO_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/rate", lfo, PackLfoParams, rate_hz, LFO_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/rate", lfo, PackLfoParams, rate_hz, LFO_COUNT, 3),
@@ -3237,6 +3336,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/rate", lfo, PackLfoParams, rate_hz, LFO_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/rate", lfo, PackLfoParams, rate_hz, LFO_COUNT, 7),
     OSC_PSUBARRAY("/hds/lfo/%d/depth", lfo, PackLfoParams, mod_depth, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/depth", lfo, PackLfoParams, mod_depth, LFO_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/depth", lfo, PackLfoParams, mod_depth, LFO_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/depth", lfo, PackLfoParams, mod_depth, LFO_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/depth", lfo, PackLfoParams, mod_depth, LFO_COUNT, 3),
@@ -3245,6 +3345,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/depth", lfo, PackLfoParams, mod_depth, LFO_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/depth", lfo, PackLfoParams, mod_depth, LFO_COUNT, 7),
     OSC_PSUBARRAY("/hds/lfo/%d/key_sync", lfo, PackLfoParams, key_sync, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/key_sync", lfo, PackLfoParams, key_sync, LFO_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/key_sync", lfo, PackLfoParams, key_sync, LFO_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/key_sync", lfo, PackLfoParams, key_sync, LFO_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/key_sync", lfo, PackLfoParams, key_sync, LFO_COUNT, 3),
@@ -3253,6 +3354,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/key_sync", lfo, PackLfoParams, key_sync, LFO_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/key_sync", lfo, PackLfoParams, key_sync, LFO_COUNT, 7),
     OSC_PSUBARRAY("/hds/lfo/%d/dest", lfo, PackLfoParams, dest_target, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/dest", lfo, PackLfoParams, dest_target, LFO_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/dest", lfo, PackLfoParams, dest_target, LFO_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/dest", lfo, PackLfoParams, dest_target, LFO_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/dest", lfo, PackLfoParams, dest_target, LFO_COUNT, 3),
@@ -3261,6 +3363,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/dest", lfo, PackLfoParams, dest_target, LFO_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/dest", lfo, PackLfoParams, dest_target, LFO_COUNT, 7),
     OSC_PSUBARRAY("/hds/lfo/%d/phase_offset", lfo, PackLfoParams, phase_offset, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/phase_offset", lfo, PackLfoParams, phase_offset, LFO_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/phase_offset", lfo, PackLfoParams, phase_offset, LFO_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/phase_offset", lfo, PackLfoParams, phase_offset, LFO_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/phase_offset", lfo, PackLfoParams, phase_offset, LFO_COUNT, 3),
@@ -3269,6 +3372,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/phase_offset", lfo, PackLfoParams, phase_offset, LFO_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/phase_offset", lfo, PackLfoParams, phase_offset, LFO_COUNT, 7),
     OSC_PSUBARRAY("/hds/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT, 3),
@@ -3277,6 +3381,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT, 7),
     OSC_PSUBARRAY("/hds/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 3),
@@ -3285,6 +3390,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 7),
     OSC_PSUBARRAY("/hds/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 3),
@@ -3293,6 +3399,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 7),
     OSC_PSUBARRAY("/hds/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 0),
     OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 1),
     OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 2),
     OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 3),
@@ -3303,6 +3410,7 @@ static const OscParamEntry OSC_PARAMS[] = {
 
     // --- Assignable EG modulators ---
     OSC_PARRAY("/hds/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT),
+    OSC_PARRAY_AT("/hds/combi/0/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT, 0),
     OSC_PARRAY_AT("/hds/combi/1/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT, 1),
     OSC_PARRAY_AT("/hds/combi/2/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT, 2),
     OSC_PARRAY_AT("/hds/combi/3/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT, 3),
@@ -3311,6 +3419,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PARRAY_AT("/hds/combi/6/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT, 6),
     OSC_PARRAY_AT("/hds/combi/7/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT, 7),
     OSC_PARRAY("/hds/eg_mod/%d/dest", eg_dest_target, ASSIGNABLE_EG_COUNT),
+    OSC_PARRAY_AT("/hds/combi/0/eg_mod/%d/dest", eg_dest_target, ASSIGNABLE_EG_COUNT, 0),
     OSC_PARRAY_AT("/hds/combi/1/eg_mod/%d/dest", eg_dest_target, ASSIGNABLE_EG_COUNT, 1),
     OSC_PARRAY_AT("/hds/combi/2/eg_mod/%d/dest", eg_dest_target, ASSIGNABLE_EG_COUNT, 2),
     OSC_PARRAY_AT("/hds/combi/3/eg_mod/%d/dest", eg_dest_target, ASSIGNABLE_EG_COUNT, 3),
@@ -3321,6 +3430,7 @@ static const OscParamEntry OSC_PARAMS[] = {
 
     // --- Unison Saw ---
     OSC_PSCALAR("/hds/vco1/unison/detune", vco1_unison_saw_detune),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/unison/detune", vco1_unison_saw_detune, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/unison/detune", vco1_unison_saw_detune, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco1/unison/detune", vco1_unison_saw_detune, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco1/unison/detune", vco1_unison_saw_detune, 3),
@@ -3329,6 +3439,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco1/unison/detune", vco1_unison_saw_detune, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco1/unison/detune", vco1_unison_saw_detune, 7),
     OSC_PSCALAR("/hds/vco1/unison/width", vco1_unison_saw_width),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/unison/width", vco1_unison_saw_width, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/unison/width", vco1_unison_saw_width, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco1/unison/width", vco1_unison_saw_width, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco1/unison/width", vco1_unison_saw_width, 3),
@@ -3337,6 +3448,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco1/unison/width", vco1_unison_saw_width, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco1/unison/width", vco1_unison_saw_width, 7),
     OSC_PSCALAR("/hds/vco2/unison/detune", vco2_unison_saw_detune),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/unison/detune", vco2_unison_saw_detune, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/unison/detune", vco2_unison_saw_detune, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/unison/detune", vco2_unison_saw_detune, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/unison/detune", vco2_unison_saw_detune, 3),
@@ -3345,6 +3457,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco2/unison/detune", vco2_unison_saw_detune, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco2/unison/detune", vco2_unison_saw_detune, 7),
     OSC_PSCALAR("/hds/vco2/unison/width", vco2_unison_saw_width),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/unison/width", vco2_unison_saw_width, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/unison/width", vco2_unison_saw_width, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/unison/width", vco2_unison_saw_width, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/unison/width", vco2_unison_saw_width, 3),
@@ -3353,6 +3466,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco2/unison/width", vco2_unison_saw_width, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco2/unison/width", vco2_unison_saw_width, 7),
     OSC_PSCALAR("/hds/vco3/unison/detune", vco3_unison_saw_detune),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/unison/detune", vco3_unison_saw_detune, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/unison/detune", vco3_unison_saw_detune, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/unison/detune", vco3_unison_saw_detune, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/unison/detune", vco3_unison_saw_detune, 3),
@@ -3361,6 +3475,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/unison/detune", vco3_unison_saw_detune, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/unison/detune", vco3_unison_saw_detune, 7),
     OSC_PSCALAR("/hds/vco3/unison/width", vco3_unison_saw_width),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/unison/width", vco3_unison_saw_width, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/unison/width", vco3_unison_saw_width, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/unison/width", vco3_unison_saw_width, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/unison/width", vco3_unison_saw_width, 3),
@@ -3369,6 +3484,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/unison/width", vco3_unison_saw_width, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/unison/width", vco3_unison_saw_width, 7),
     OSC_PSCALAR("/hds/vco4/unison/detune", vco4_unison_saw_detune),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/unison/detune", vco4_unison_saw_detune, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/unison/detune", vco4_unison_saw_detune, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/unison/detune", vco4_unison_saw_detune, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/unison/detune", vco4_unison_saw_detune, 3),
@@ -3377,6 +3493,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco4/unison/detune", vco4_unison_saw_detune, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco4/unison/detune", vco4_unison_saw_detune, 7),
     OSC_PSCALAR("/hds/vco4/unison/width", vco4_unison_saw_width),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/unison/width", vco4_unison_saw_width, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/unison/width", vco4_unison_saw_width, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/unison/width", vco4_unison_saw_width, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/unison/width", vco4_unison_saw_width, 3),
@@ -3386,6 +3503,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/7/vco4/unison/width", vco4_unison_saw_width, 7),
 
     OSC_PSCALAR("/hds/mono_glide_random", mono_glide_random),
+    OSC_PSCALAR_AT("/hds/combi/0/mono_glide_random", mono_glide_random, 0),
     OSC_PSCALAR_AT("/hds/combi/1/mono_glide_random", mono_glide_random, 1),
     OSC_PSCALAR_AT("/hds/combi/2/mono_glide_random", mono_glide_random, 2),
     OSC_PSCALAR_AT("/hds/combi/3/mono_glide_random", mono_glide_random, 3),
@@ -3394,6 +3512,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/mono_glide_random", mono_glide_random, 6),
     OSC_PSCALAR_AT("/hds/combi/7/mono_glide_random", mono_glide_random, 7),
     OSC_PSCALAR("/hds/vco1/mute", vco1_mute),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/mute", vco1_mute, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/mute", vco1_mute, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco1/mute", vco1_mute, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco1/mute", vco1_mute, 3),
@@ -3402,6 +3521,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco1/mute", vco1_mute, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco1/mute", vco1_mute, 7),
     OSC_PSCALAR("/hds/vco2/mute", vco2_mute),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/mute", vco2_mute, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/mute", vco2_mute, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/mute", vco2_mute, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/mute", vco2_mute, 3),
@@ -3410,6 +3530,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco2/mute", vco2_mute, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco2/mute", vco2_mute, 7),
     OSC_PSCALAR("/hds/hard_sync_mode", hard_sync_mode),
+    OSC_PSCALAR_AT("/hds/combi/0/hard_sync_mode", hard_sync_mode, 0),
     OSC_PSCALAR_AT("/hds/combi/1/hard_sync_mode", hard_sync_mode, 1),
     OSC_PSCALAR_AT("/hds/combi/2/hard_sync_mode", hard_sync_mode, 2),
     OSC_PSCALAR_AT("/hds/combi/3/hard_sync_mode", hard_sync_mode, 3),
@@ -3418,6 +3539,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/hard_sync_mode", hard_sync_mode, 6),
     OSC_PSCALAR_AT("/hds/combi/7/hard_sync_mode", hard_sync_mode, 7),
     OSC_PSCALAR("/hds/vco1/phase_offset", vco1_phase_offset),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/phase_offset", vco1_phase_offset, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/phase_offset", vco1_phase_offset, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco1/phase_offset", vco1_phase_offset, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco1/phase_offset", vco1_phase_offset, 3),
@@ -3426,6 +3548,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco1/phase_offset", vco1_phase_offset, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco1/phase_offset", vco1_phase_offset, 7),
     OSC_PSCALAR("/hds/vco2/phase_offset", vco2_phase_offset),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/phase_offset", vco2_phase_offset, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/phase_offset", vco2_phase_offset, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/phase_offset", vco2_phase_offset, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/phase_offset", vco2_phase_offset, 3),
@@ -3434,6 +3557,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco2/phase_offset", vco2_phase_offset, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco2/phase_offset", vco2_phase_offset, 7),
     OSC_PSCALAR("/hds/vco1/pulse_width", vco1_pulse_width),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/pulse_width", vco1_pulse_width, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/pulse_width", vco1_pulse_width, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco1/pulse_width", vco1_pulse_width, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco1/pulse_width", vco1_pulse_width, 3),
@@ -3442,6 +3566,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco1/pulse_width", vco1_pulse_width, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco1/pulse_width", vco1_pulse_width, 7),
     OSC_PSCALAR("/hds/vco2/pulse_width", vco2_pulse_width),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/pulse_width", vco2_pulse_width, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/pulse_width", vco2_pulse_width, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/pulse_width", vco2_pulse_width, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/pulse_width", vco2_pulse_width, 3),
@@ -3451,6 +3576,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/7/vco2/pulse_width", vco2_pulse_width, 7),
 
     OSC_PSCALAR("/hds/vco3/vol", vco3_vol),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/vol", vco3_vol, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/vol", vco3_vol, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/vol", vco3_vol, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/vol", vco3_vol, 3),
@@ -3459,6 +3585,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/vol", vco3_vol, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/vol", vco3_vol, 7),
     OSC_PSCALAR("/hds/vco3/pan", vco3_pan),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/pan", vco3_pan, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/pan", vco3_pan, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/pan", vco3_pan, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/pan", vco3_pan, 3),
@@ -3467,6 +3594,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/pan", vco3_pan, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/pan", vco3_pan, 7),
     OSC_PSCALAR("/hds/vco3/mute", vco3_mute),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/mute", vco3_mute, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/mute", vco3_mute, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/mute", vco3_mute, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/mute", vco3_mute, 3),
@@ -3475,6 +3603,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/mute", vco3_mute, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/mute", vco3_mute, 7),
     OSC_PSCALAR("/hds/vco3/pulse_width", vco3_pulse_width),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/pulse_width", vco3_pulse_width, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/pulse_width", vco3_pulse_width, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/pulse_width", vco3_pulse_width, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/pulse_width", vco3_pulse_width, 3),
@@ -3483,6 +3612,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/pulse_width", vco3_pulse_width, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/pulse_width", vco3_pulse_width, 7),
     OSC_PSCALAR("/hds/vco4/vol", vco4_vol),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/vol", vco4_vol, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/vol", vco4_vol, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/vol", vco4_vol, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/vol", vco4_vol, 3),
@@ -3491,6 +3621,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco4/vol", vco4_vol, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco4/vol", vco4_vol, 7),
     OSC_PSCALAR("/hds/vco4/pan", vco4_pan),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/pan", vco4_pan, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/pan", vco4_pan, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/pan", vco4_pan, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/pan", vco4_pan, 3),
@@ -3499,6 +3630,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco4/pan", vco4_pan, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco4/pan", vco4_pan, 7),
     OSC_PSCALAR("/hds/vco4/mute", vco4_mute),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/mute", vco4_mute, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/mute", vco4_mute, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/mute", vco4_mute, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/mute", vco4_mute, 3),
@@ -3507,6 +3639,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco4/mute", vco4_mute, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco4/mute", vco4_mute, 7),
     OSC_PSCALAR("/hds/vco4/pulse_width", vco4_pulse_width),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/pulse_width", vco4_pulse_width, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/pulse_width", vco4_pulse_width, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/pulse_width", vco4_pulse_width, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/pulse_width", vco4_pulse_width, 3),
@@ -3530,6 +3663,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_NESTED("/hds/routing/%d/out/%d", source_routing, SourceRouting, enable, SOURCE_COUNT, OUTPUT_PAIR_MAX),
 
     OSC_PSCALAR("/hds/pb/range_up", pb_range_up),
+    OSC_PSCALAR_AT("/hds/combi/0/pb/range_up", pb_range_up, 0),
     OSC_PSCALAR_AT("/hds/combi/1/pb/range_up", pb_range_up, 1),
     OSC_PSCALAR_AT("/hds/combi/2/pb/range_up", pb_range_up, 2),
     OSC_PSCALAR_AT("/hds/combi/3/pb/range_up", pb_range_up, 3),
@@ -3538,6 +3672,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/pb/range_up", pb_range_up, 6),
     OSC_PSCALAR_AT("/hds/combi/7/pb/range_up", pb_range_up, 7),
     OSC_PSCALAR("/hds/pb/range_down", pb_range_down),
+    OSC_PSCALAR_AT("/hds/combi/0/pb/range_down", pb_range_down, 0),
     OSC_PSCALAR_AT("/hds/combi/1/pb/range_down", pb_range_down, 1),
     OSC_PSCALAR_AT("/hds/combi/2/pb/range_down", pb_range_down, 2),
     OSC_PSCALAR_AT("/hds/combi/3/pb/range_down", pb_range_down, 3),
@@ -3546,6 +3681,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/pb/range_down", pb_range_down, 6),
     OSC_PSCALAR_AT("/hds/combi/7/pb/range_down", pb_range_down, 7),
     OSC_PSCALAR("/hds/sustain/polarity", sustain_pedal_polarity),
+    OSC_PSCALAR_AT("/hds/combi/0/sustain/polarity", sustain_pedal_polarity, 0),
     OSC_PSCALAR_AT("/hds/combi/1/sustain/polarity", sustain_pedal_polarity, 1),
     OSC_PSCALAR_AT("/hds/combi/2/sustain/polarity", sustain_pedal_polarity, 2),
     OSC_PSCALAR_AT("/hds/combi/3/sustain/polarity", sustain_pedal_polarity, 3),
@@ -3564,6 +3700,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/record/format", record_format),
 
     OSC_PSCALAR("/hds/tempo/bpm", tempo_bpm),
+    OSC_PSCALAR_AT("/hds/combi/0/tempo/bpm", tempo_bpm, 0),
     OSC_PSCALAR_AT("/hds/combi/1/tempo/bpm", tempo_bpm, 1),
     OSC_PSCALAR_AT("/hds/combi/2/tempo/bpm", tempo_bpm, 2),
     OSC_PSCALAR_AT("/hds/combi/3/tempo/bpm", tempo_bpm, 3),
@@ -3572,6 +3709,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/tempo/bpm", tempo_bpm, 6),
     OSC_PSCALAR_AT("/hds/combi/7/tempo/bpm", tempo_bpm, 7),
     OSC_PSCALAR("/hds/tempo/marker_count", tempo_marker_count),
+    OSC_PSCALAR_AT("/hds/combi/0/tempo/marker_count", tempo_marker_count, 0),
     OSC_PSCALAR_AT("/hds/combi/1/tempo/marker_count", tempo_marker_count, 1),
     OSC_PSCALAR_AT("/hds/combi/2/tempo/marker_count", tempo_marker_count, 2),
     OSC_PSCALAR_AT("/hds/combi/3/tempo/marker_count", tempo_marker_count, 3),
@@ -3580,6 +3718,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/tempo/marker_count", tempo_marker_count, 6),
     OSC_PSCALAR_AT("/hds/combi/7/tempo/marker_count", tempo_marker_count, 7),
     OSC_PARRAY("/hds/tempo/marker/%d/time", tempo_marker_time, TEMPO_MARKER_MAX),
+    OSC_PARRAY_AT("/hds/combi/0/tempo/marker/%d/time", tempo_marker_time, TEMPO_MARKER_MAX, 0),
     OSC_PARRAY_AT("/hds/combi/1/tempo/marker/%d/time", tempo_marker_time, TEMPO_MARKER_MAX, 1),
     OSC_PARRAY_AT("/hds/combi/2/tempo/marker/%d/time", tempo_marker_time, TEMPO_MARKER_MAX, 2),
     OSC_PARRAY_AT("/hds/combi/3/tempo/marker/%d/time", tempo_marker_time, TEMPO_MARKER_MAX, 3),
@@ -3588,6 +3727,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PARRAY_AT("/hds/combi/6/tempo/marker/%d/time", tempo_marker_time, TEMPO_MARKER_MAX, 6),
     OSC_PARRAY_AT("/hds/combi/7/tempo/marker/%d/time", tempo_marker_time, TEMPO_MARKER_MAX, 7),
     OSC_PARRAY("/hds/tempo/marker/%d/bpm", tempo_marker_bpm, TEMPO_MARKER_MAX),
+    OSC_PARRAY_AT("/hds/combi/0/tempo/marker/%d/bpm", tempo_marker_bpm, TEMPO_MARKER_MAX, 0),
     OSC_PARRAY_AT("/hds/combi/1/tempo/marker/%d/bpm", tempo_marker_bpm, TEMPO_MARKER_MAX, 1),
     OSC_PARRAY_AT("/hds/combi/2/tempo/marker/%d/bpm", tempo_marker_bpm, TEMPO_MARKER_MAX, 2),
     OSC_PARRAY_AT("/hds/combi/3/tempo/marker/%d/bpm", tempo_marker_bpm, TEMPO_MARKER_MAX, 3),
@@ -3597,6 +3737,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PARRAY_AT("/hds/combi/7/tempo/marker/%d/bpm", tempo_marker_bpm, TEMPO_MARKER_MAX, 7),
 
     OSC_PSCALAR("/hds/vco3/shape", vco3_shape),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/shape", vco3_shape, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/shape", vco3_shape, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/shape", vco3_shape, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/shape", vco3_shape, 3),
@@ -3605,6 +3746,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/shape", vco3_shape, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/shape", vco3_shape, 7),
     OSC_PSCALAR("/hds/vco3/fine_tune", vco3_fine_tune),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/fine_tune", vco3_fine_tune, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/fine_tune", vco3_fine_tune, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/fine_tune", vco3_fine_tune, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/fine_tune", vco3_fine_tune, 3),
@@ -3613,6 +3755,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/fine_tune", vco3_fine_tune, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/fine_tune", vco3_fine_tune, 7),
     OSC_PSCALAR("/hds/vco3/pitch_offset", vco3_pitch_offset),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/pitch_offset", vco3_pitch_offset, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/pitch_offset", vco3_pitch_offset, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/pitch_offset", vco3_pitch_offset, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/pitch_offset", vco3_pitch_offset, 3),
@@ -3621,6 +3764,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/pitch_offset", vco3_pitch_offset, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/pitch_offset", vco3_pitch_offset, 7),
     OSC_PSCALAR("/hds/vco3/phase_offset", vco3_phase_offset),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/phase_offset", vco3_phase_offset, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/phase_offset", vco3_phase_offset, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/phase_offset", vco3_phase_offset, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/phase_offset", vco3_phase_offset, 3),
@@ -3629,6 +3773,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/phase_offset", vco3_phase_offset, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/phase_offset", vco3_phase_offset, 7),
     OSC_PSCALAR("/hds/vco4/shape", vco4_shape),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/shape", vco4_shape, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/shape", vco4_shape, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/shape", vco4_shape, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/shape", vco4_shape, 3),
@@ -3637,6 +3782,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco4/shape", vco4_shape, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco4/shape", vco4_shape, 7),
     OSC_PSCALAR("/hds/vco4/fine_tune", vco4_fine_tune),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/fine_tune", vco4_fine_tune, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/fine_tune", vco4_fine_tune, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/fine_tune", vco4_fine_tune, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/fine_tune", vco4_fine_tune, 3),
@@ -3645,6 +3791,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco4/fine_tune", vco4_fine_tune, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco4/fine_tune", vco4_fine_tune, 7),
     OSC_PSCALAR("/hds/vco4/pitch_offset", vco4_pitch_offset),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/pitch_offset", vco4_pitch_offset, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/pitch_offset", vco4_pitch_offset, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/pitch_offset", vco4_pitch_offset, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/pitch_offset", vco4_pitch_offset, 3),
@@ -3653,6 +3800,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco4/pitch_offset", vco4_pitch_offset, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco4/pitch_offset", vco4_pitch_offset, 7),
     OSC_PSCALAR("/hds/vco4/phase_offset", vco4_phase_offset),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/phase_offset", vco4_phase_offset, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/phase_offset", vco4_phase_offset, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/phase_offset", vco4_phase_offset, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/phase_offset", vco4_phase_offset, 3),
@@ -3662,6 +3810,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/7/vco4/phase_offset", vco4_phase_offset, 7),
 
     OSC_PSCALAR("/hds/fm/algorithm", fm_algorithm),
+    OSC_PSCALAR_AT("/hds/combi/0/fm/algorithm", fm_algorithm, 0),
     OSC_PSCALAR_AT("/hds/combi/1/fm/algorithm", fm_algorithm, 1),
     OSC_PSCALAR_AT("/hds/combi/2/fm/algorithm", fm_algorithm, 2),
     OSC_PSCALAR_AT("/hds/combi/3/fm/algorithm", fm_algorithm, 3),
@@ -3670,6 +3819,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/fm/algorithm", fm_algorithm, 6),
     OSC_PSCALAR_AT("/hds/combi/7/fm/algorithm", fm_algorithm, 7),
     OSC_PSCALAR("/hds/fm/depth/3_1", fm_depth_3_1),
+    OSC_PSCALAR_AT("/hds/combi/0/fm/depth/3_1", fm_depth_3_1, 0),
     OSC_PSCALAR_AT("/hds/combi/1/fm/depth/3_1", fm_depth_3_1, 1),
     OSC_PSCALAR_AT("/hds/combi/2/fm/depth/3_1", fm_depth_3_1, 2),
     OSC_PSCALAR_AT("/hds/combi/3/fm/depth/3_1", fm_depth_3_1, 3),
@@ -3678,6 +3828,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/fm/depth/3_1", fm_depth_3_1, 6),
     OSC_PSCALAR_AT("/hds/combi/7/fm/depth/3_1", fm_depth_3_1, 7),
     OSC_PSCALAR("/hds/fm/depth/3_2", fm_depth_3_2),
+    OSC_PSCALAR_AT("/hds/combi/0/fm/depth/3_2", fm_depth_3_2, 0),
     OSC_PSCALAR_AT("/hds/combi/1/fm/depth/3_2", fm_depth_3_2, 1),
     OSC_PSCALAR_AT("/hds/combi/2/fm/depth/3_2", fm_depth_3_2, 2),
     OSC_PSCALAR_AT("/hds/combi/3/fm/depth/3_2", fm_depth_3_2, 3),
@@ -3686,6 +3837,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/fm/depth/3_2", fm_depth_3_2, 6),
     OSC_PSCALAR_AT("/hds/combi/7/fm/depth/3_2", fm_depth_3_2, 7),
     OSC_PSCALAR("/hds/fm/depth/4_1", fm_depth_4_1),
+    OSC_PSCALAR_AT("/hds/combi/0/fm/depth/4_1", fm_depth_4_1, 0),
     OSC_PSCALAR_AT("/hds/combi/1/fm/depth/4_1", fm_depth_4_1, 1),
     OSC_PSCALAR_AT("/hds/combi/2/fm/depth/4_1", fm_depth_4_1, 2),
     OSC_PSCALAR_AT("/hds/combi/3/fm/depth/4_1", fm_depth_4_1, 3),
@@ -3694,6 +3846,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/fm/depth/4_1", fm_depth_4_1, 6),
     OSC_PSCALAR_AT("/hds/combi/7/fm/depth/4_1", fm_depth_4_1, 7),
     OSC_PSCALAR("/hds/fm/depth/4_3", fm_depth_4_3),
+    OSC_PSCALAR_AT("/hds/combi/0/fm/depth/4_3", fm_depth_4_3, 0),
     OSC_PSCALAR_AT("/hds/combi/1/fm/depth/4_3", fm_depth_4_3, 1),
     OSC_PSCALAR_AT("/hds/combi/2/fm/depth/4_3", fm_depth_4_3, 2),
     OSC_PSCALAR_AT("/hds/combi/3/fm/depth/4_3", fm_depth_4_3, 3),
@@ -3702,6 +3855,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/fm/depth/4_3", fm_depth_4_3, 6),
     OSC_PSCALAR_AT("/hds/combi/7/fm/depth/4_3", fm_depth_4_3, 7),
     OSC_PSCALAR("/hds/fm/depth/1_2", fm_depth_1_2),
+    OSC_PSCALAR_AT("/hds/combi/0/fm/depth/1_2", fm_depth_1_2, 0),
     OSC_PSCALAR_AT("/hds/combi/1/fm/depth/1_2", fm_depth_1_2, 1),
     OSC_PSCALAR_AT("/hds/combi/2/fm/depth/1_2", fm_depth_1_2, 2),
     OSC_PSCALAR_AT("/hds/combi/3/fm/depth/1_2", fm_depth_1_2, 3),
@@ -3710,6 +3864,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/fm/depth/1_2", fm_depth_1_2, 6),
     OSC_PSCALAR_AT("/hds/combi/7/fm/depth/1_2", fm_depth_1_2, 7),
     OSC_PSCALAR("/hds/fm/depth/3_4", fm_depth_3_4),
+    OSC_PSCALAR_AT("/hds/combi/0/fm/depth/3_4", fm_depth_3_4, 0),
     OSC_PSCALAR_AT("/hds/combi/1/fm/depth/3_4", fm_depth_3_4, 1),
     OSC_PSCALAR_AT("/hds/combi/2/fm/depth/3_4", fm_depth_3_4, 2),
     OSC_PSCALAR_AT("/hds/combi/3/fm/depth/3_4", fm_depth_3_4, 3),
@@ -3718,6 +3873,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/fm/depth/3_4", fm_depth_3_4, 6),
     OSC_PSCALAR_AT("/hds/combi/7/fm/depth/3_4", fm_depth_3_4, 7),
     OSC_PSCALAR("/hds/fm/depth/1_3", fm_depth_1_3),
+    OSC_PSCALAR_AT("/hds/combi/0/fm/depth/1_3", fm_depth_1_3, 0),
     OSC_PSCALAR_AT("/hds/combi/1/fm/depth/1_3", fm_depth_1_3, 1),
     OSC_PSCALAR_AT("/hds/combi/2/fm/depth/1_3", fm_depth_1_3, 2),
     OSC_PSCALAR_AT("/hds/combi/3/fm/depth/1_3", fm_depth_1_3, 3),
@@ -3727,6 +3883,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/7/fm/depth/1_3", fm_depth_1_3, 7),
 
     OSC_PSCALAR("/hds/vco1/pitch", vco1_pitch),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/pitch", vco1_pitch, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/pitch", vco1_pitch, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco1/pitch", vco1_pitch, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco1/pitch", vco1_pitch, 3),
@@ -3735,6 +3892,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco1/pitch", vco1_pitch, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco1/pitch", vco1_pitch, 7),
     OSC_PSCALAR("/hds/vco2/pitch", vco2_pitch),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/pitch", vco2_pitch, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/pitch", vco2_pitch, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/pitch", vco2_pitch, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/pitch", vco2_pitch, 3),
@@ -3743,6 +3901,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco2/pitch", vco2_pitch, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco2/pitch", vco2_pitch, 7),
     OSC_PSCALAR("/hds/vco3/pitch", vco3_pitch),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/pitch", vco3_pitch, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/pitch", vco3_pitch, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/pitch", vco3_pitch, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/pitch", vco3_pitch, 3),
@@ -3751,6 +3910,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/pitch", vco3_pitch, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/pitch", vco3_pitch, 7),
     OSC_PSCALAR("/hds/vco4/pitch", vco4_pitch),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/pitch", vco4_pitch, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/pitch", vco4_pitch, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/pitch", vco4_pitch, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/pitch", vco4_pitch, 3),
@@ -3761,6 +3921,7 @@ static const OscParamEntry OSC_PARAMS[] = {
 
     // Monophonic Noise (Noise shape only -- see ProgramState.vco1_mono_noise's own comment).
     OSC_PSCALAR("/hds/vco1/mono_noise", vco1_mono_noise),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/mono_noise", vco1_mono_noise, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/mono_noise", vco1_mono_noise, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco1/mono_noise", vco1_mono_noise, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco1/mono_noise", vco1_mono_noise, 3),
@@ -3769,6 +3930,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco1/mono_noise", vco1_mono_noise, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco1/mono_noise", vco1_mono_noise, 7),
     OSC_PSCALAR("/hds/vco2/mono_noise", vco2_mono_noise),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/mono_noise", vco2_mono_noise, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco2/mono_noise", vco2_mono_noise, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco2/mono_noise", vco2_mono_noise, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco2/mono_noise", vco2_mono_noise, 3),
@@ -3777,6 +3939,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco2/mono_noise", vco2_mono_noise, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco2/mono_noise", vco2_mono_noise, 7),
     OSC_PSCALAR("/hds/vco3/mono_noise", vco3_mono_noise),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/mono_noise", vco3_mono_noise, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco3/mono_noise", vco3_mono_noise, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco3/mono_noise", vco3_mono_noise, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco3/mono_noise", vco3_mono_noise, 3),
@@ -3785,6 +3948,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco3/mono_noise", vco3_mono_noise, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco3/mono_noise", vco3_mono_noise, 7),
     OSC_PSCALAR("/hds/vco4/mono_noise", vco4_mono_noise),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/mono_noise", vco4_mono_noise, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco4/mono_noise", vco4_mono_noise, 1),
     OSC_PSCALAR_AT("/hds/combi/2/vco4/mono_noise", vco4_mono_noise, 2),
     OSC_PSCALAR_AT("/hds/combi/3/vco4/mono_noise", vco4_mono_noise, 3),
@@ -4008,11 +4172,13 @@ static void init_default_controls(SynthSharedControls *knobs) {
     // needed here.
 
     // Programs 1-7 (Combi mode's remaining lanes, inert until a real per-lane Program picker
-    // loads something onto them -- see the "Real Combi mode" plan's Phase 5) start from the exact
-    // same sane, musical defaults as programs[0] above, not raw zero-init -- a plain struct copy
-    // is safe here since ProgramState holds no pointers. Whatever gets loaded onto a lane later
-    // simply overwrites this.
-    for (int p = 1; p < COMBI_PROGRAM_COUNT; p++) knobs->programs[p] = knobs->programs[0];
+    // loads something onto them -- see the "Real Combi mode" plan's Phase 5) and
+    // programs[SINGLE_PROGRAM_SLOT] (Single Program mode's own dedicated ProgramState -- see that
+    // slot's own comment on the mutual-exclusivity fix) all start from the exact same sane,
+    // musical defaults as programs[0] above, not raw zero-init -- a plain struct copy is safe
+    // here since ProgramState holds no pointers. Whatever gets loaded/edited onto a slot later
+    // simply overwrites this, independently of every other slot.
+    for (int p = 1; p <= COMBI_PROGRAM_COUNT; p++) knobs->programs[p] = knobs->programs[0];
 
     // ext_in_gain defaults to 0.0 (silence/-inf), not unity: an upstream mic pre or interface
     // could already be set hot, and External Input must never be able to burst into the FX bus
@@ -5727,7 +5893,7 @@ static float sample_osc_zone_pan_offset(int stream_idx) {
 // simultaneously-mono-mode Combi Programs never collide on voice 0 -- a direct generalization of
 // today's hardcoded "mono always uses voice 0", byte-identical when target_program is always 0
 // (Single Program/Sequencer modes).
-static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT][LFO_COUNT], int target_program, int note, int velocity, bool poly_mode_active, MonoNoteStack *mono_stack) {
+static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], int target_program, int note, int velocity, bool poly_mode_active, MonoNoteStack *mono_stack) {
     const ProgramState *prog = &knobs->programs[target_program];
     int slot = -1;
     if (poly_mode_active) {
@@ -6181,11 +6347,13 @@ static void seq_record_midi_event(const SynthSharedControls *knobs, unsigned cha
 // lane's recorded events and fires any whose timestamp has now been reached, via the exact same
 // handle_note_on/handle_note_off functions live MIDI already calls (see this section's own scope
 // comment for why that's a deliberate choice, not a shortcut).
-static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT][LFO_COUNT], MonoNoteStack *mono_stack, const MidiLiveState *midi_live) {
+static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack *mono_stack, const MidiLiveState *midi_live) {
     if (g_transport_state != TRANSPORT_PLAYING) return;
-    // Sequencer's recorded MIDI always targets Program 0 (see this section's scope comment) --
-    // so its own poly/mono mode is always Program 0's is_polyphonic, computed once here.
-    bool poly_mode_active = (knobs->programs[0].is_polyphonic != 0.0f);
+    // Sequencer's recorded MIDI always targets Single Program mode's own dedicated ProgramState
+    // (SINGLE_PROGRAM_SLOT, not any Combi lane -- see this section's scope comment and
+    // ProgramState's own comment on the mutual-exclusivity fix) -- so its own poly/mono mode is
+    // always that slot's is_polyphonic, computed once here.
+    bool poly_mode_active = (knobs->programs[SINGLE_PROGRAM_SLOT].is_polyphonic != 0.0f);
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         if (knobs->seq_lanes[l].lane_type != 0.0f) continue;
         int mode = (int)knobs->seq_lanes[l].seq_mode;
@@ -6199,10 +6367,11 @@ static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *k
             // muted. Same "stay in sync, just silence the output" shape as the audio-lane Mute
             // fix right above this function's own mix-loop call site.
             if (mode == 0) {
-                // Sequencer's own recorded MIDI always targets Program 0 -- see this section's
-                // scope comment (a separate, parallel concern from Combi's own live dispatch).
-                if (e->type == 0) handle_note_on(voices, knobs, global_lfo_phases, 0, e->note, e->velocity, poly_mode_active, mono_stack);
-                else handle_note_off(voices, knobs, midi_live, 0, e->note, poly_mode_active, mono_stack);
+                // Sequencer's own recorded MIDI always targets SINGLE_PROGRAM_SLOT -- see this
+                // section's scope comment (a separate, parallel concern from Combi's own live
+                // dispatch) and ProgramState's own comment on why this is no longer Program 0.
+                if (e->type == 0) handle_note_on(voices, knobs, global_lfo_phases, SINGLE_PROGRAM_SLOT, e->note, e->velocity, poly_mode_active, mono_stack);
+                else handle_note_off(voices, knobs, midi_live, SINGLE_PROGRAM_SLOT, e->note, poly_mode_active, mono_stack);
             }
             ml->playback_cursor++;
         }
@@ -6320,7 +6489,7 @@ static void midi_autoconnect_scan(snd_seq_t *seq, int our_port, const char *midi
 // our_midi_port/midi_sources are only needed for hotplug auto-connect (SND_SEQ_EVENT_PORT_START/
 // PORT_EXIT) -- these arrive on the same event stream as NOTEON/NOTEOFF because main() subscribes
 // our port to the ALSA announce port at startup (see main()'s comment on that subscription).
-static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT], int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live) {
+static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live) {
     snd_seq_event_t *ev = NULL;
     while (snd_seq_event_input_pending(seq_handle, 1) > 0) {
         snd_seq_event_input(seq_handle, &ev); if (ev == NULL) continue;
@@ -6335,7 +6504,8 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
                 // Combi mode: live dispatch fans out to every Combi lane whose own MIDI channel
                 // matches (0 = Omni) -- a separate, parallel mechanism from Sequencer's own
                 // recorded-MIDI playback (seq_playback_midi_events), which always targets
-                // Program 0 regardless of this mode (see that function's own scope comment).
+                // SINGLE_PROGRAM_SLOT regardless of this mode (see that function's own scope
+                // comment).
                 for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
                     float lane_channel = knobs->combi_lane_midi_channel[p];
                     if (lane_channel != 0.0f && (int)lane_channel != midi_channel_1_16) continue;
@@ -6344,11 +6514,13 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
                     else handle_note_off(voices, knobs, midi_live, p, note, prog_poly_active, &mono_stacks[p]);
                 }
             } else {
-                // Single Program / Sequencer modes: always Program 0, fully channel-agnostic,
-                // exactly as today.
-                bool prog_poly_active = (knobs->programs[0].is_polyphonic != 0.0f);
-                if (is_note_on) handle_note_on(voices, knobs, global_lfo_phases, 0, note, ev->data.note.velocity, prog_poly_active, &mono_stacks[0]);
-                else handle_note_off(voices, knobs, midi_live, 0, note, prog_poly_active, &mono_stacks[0]);
+                // Single Program / Sequencer modes: always SINGLE_PROGRAM_SLOT (Single Program
+                // mode's own dedicated ProgramState, never a Combi lane's -- see ProgramState's
+                // own comment on the mutual-exclusivity fix), fully channel-agnostic, exactly as
+                // today.
+                bool prog_poly_active = (knobs->programs[SINGLE_PROGRAM_SLOT].is_polyphonic != 0.0f);
+                if (is_note_on) handle_note_on(voices, knobs, global_lfo_phases, SINGLE_PROGRAM_SLOT, note, ev->data.note.velocity, prog_poly_active, &mono_stacks[SINGLE_PROGRAM_SLOT]);
+                else handle_note_off(voices, knobs, midi_live, SINGLE_PROGRAM_SLOT, note, prog_poly_active, &mono_stacks[SINGLE_PROGRAM_SLOT]);
             }
             if (is_note_on) seq_record_midi_event(knobs, 0, (unsigned char)note, (unsigned char)ev->data.note.velocity, midi_channel_1_16);
             else seq_record_midi_event(knobs, 1, (unsigned char)note, 0, midi_channel_1_16);
@@ -6357,12 +6529,13 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
             if (cc_num >= 0 && cc_num < 128) midi_live->cc[cc_num] = fmaxf(0.0f, fminf(1.0f, ev->data.control.value / 127.0f));
             if (cc_num == 64) {
                 // Sustain pedal. polarity: 0 = Normal (>=64 means held, essentially every real
-                // pedal), 1 = Inverted (for the rare one wired backwards). Uses Program 0's own
-                // polarity setting even in Combi mode -- the sustain pedal is one physical
-                // controller and this engine has no per-Program polarity concept to fan out to;
-                // a documented scope boundary, not an oversight.
+                // pedal), 1 = Inverted (for the rare one wired backwards). Uses Single Program
+                // mode's own polarity setting (the one physical Global-panel knob) even in Combi
+                // mode -- the sustain pedal is one physical controller and this engine has no
+                // per-Program polarity concept to fan out to; a documented scope boundary, not an
+                // oversight.
                 bool raw_held = ev->data.control.value >= 64;
-                bool now_held = (knobs->programs[0].sustain_pedal_polarity != 0.0f) ? !raw_held : raw_held;
+                bool now_held = (knobs->programs[SINGLE_PROGRAM_SLOT].sustain_pedal_polarity != 0.0f) ? !raw_held : raw_held;
                 if (midi_live->sustain_held && !now_held) handle_sustain_release(voices, knobs); // pedal just lifted
                 midi_live->sustain_held = now_held;
             }
@@ -6454,7 +6627,7 @@ static float compute_per_key_lfo_output(SynthVoice *voice, const PackLfoParams *
     return out;
 }
 
-static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer) {
+static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer) {
     float peak = 0.0f;
     // Combi mode: how many of the 8 Program slots are actually "live" this block -- 1 (just
     // program 0) outside Combi mode, all 8 inside it. Every per-program precompute below loops
@@ -6480,11 +6653,15 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // Program slot unconditionally (not just "active" ones): 8 Programs x 4 oscillators x one
     // cheap cosf/sinf fill is negligible once per block, and avoids needing active_program_count
     // gating here at all.
-    float vco1_unison_pan_l[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES], vco1_unison_pan_r[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES];
-    float vco2_unison_pan_l[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES], vco2_unison_pan_r[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES];
-    float vco3_unison_pan_l[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES], vco3_unison_pan_r[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES];
-    float vco4_unison_pan_l[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES], vco4_unison_pan_r[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES];
-    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+    float vco1_unison_pan_l[COMBI_PROGRAM_COUNT + 1][UNISON_SAW_VOICES], vco1_unison_pan_r[COMBI_PROGRAM_COUNT + 1][UNISON_SAW_VOICES];
+    float vco2_unison_pan_l[COMBI_PROGRAM_COUNT + 1][UNISON_SAW_VOICES], vco2_unison_pan_r[COMBI_PROGRAM_COUNT + 1][UNISON_SAW_VOICES];
+    float vco3_unison_pan_l[COMBI_PROGRAM_COUNT + 1][UNISON_SAW_VOICES], vco3_unison_pan_r[COMBI_PROGRAM_COUNT + 1][UNISON_SAW_VOICES];
+    float vco4_unison_pan_l[COMBI_PROGRAM_COUNT + 1][UNISON_SAW_VOICES], vco4_unison_pan_r[COMBI_PROGRAM_COUNT + 1][UNISON_SAW_VOICES];
+    // <= COMBI_PROGRAM_COUNT (not <): covers slot SINGLE_PROGRAM_SLOT too, so Single Program
+    // mode's own precompute is valid wherever this table is read by program index later --
+    // otherwise slot 8 would sit at all-zero and Single Program mode's Unison Saw pan would
+    // silently read Combi lane 1's width knob (before this fix) or nothing at all.
+    for (int p = 0; p <= COMBI_PROGRAM_COUNT; p++) {
         compute_unison_saw_pan(knobs->programs[p].vco1_unison_saw_width, vco1_unison_pan_l[p], vco1_unison_pan_r[p]);
         compute_unison_saw_pan(knobs->programs[p].vco2_unison_saw_width, vco2_unison_pan_l[p], vco2_unison_pan_r[p]);
         compute_unison_saw_pan(knobs->programs[p].vco3_unison_saw_width, vco3_unison_pan_l[p], vco3_unison_pan_r[p]);
@@ -6501,8 +6678,8 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // midi_live->pitch_bend is one shared physical wheel (constant across this whole block), but
     // pb_range_up/down are Program-scoped -- so each Program's own bend-in-cents is precomputed
     // once per block here.
-    float pb_bend_cents[COMBI_PROGRAM_COUNT];
-    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+    float pb_bend_cents[COMBI_PROGRAM_COUNT + 1];
+    for (int p = 0; p <= COMBI_PROGRAM_COUNT; p++) { // <= : covers SINGLE_PROGRAM_SLOT too, see the unison-pan loop's comment above
         pb_bend_cents[p] = (midi_live->pitch_bend >= 0.0f)
             ? midi_live->pitch_bend * knobs->programs[p].pb_range_up * 100.0f
             : midi_live->pitch_bend * knobs->programs[p].pb_range_down * 100.0f;
@@ -6514,27 +6691,27 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // Now per-Program (LFOs are a resource shared across every voice OF THE SAME PROGRAM, not
     // across Programs). Function-local static is safe here -- this program runs one synth engine
     // instance on a single audio thread.
-    static float lfo_phase_mod_state[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
+    static float lfo_phase_mod_state[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
     // Same one-sample-delayed pattern, for LFO Rate and Depth as mod destinations (targets
     // 14-21/48-71 -- see lfo_rate_target_index/lfo_depth_target_index). Applied to rate_hz/
     // mod_depth in the main per-sample LFO loop below.
-    static float lfo_rate_mod_state[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
-    static float lfo_depth_mod_state[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
+    static float lfo_rate_mod_state[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
+    static float lfo_depth_mod_state[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
 
     // Control-rate decimation state for LFOs 3-16 (index 2-15) -- see LFO_DECIMATION_FACTOR's
     // comment. counter cycles 0..LFO_DECIMATION_FACTOR-1; at 0, last_value/target_value/phase are
     // all advanced by one full decimated step, then every sample in between linearly interpolates
     // from last_value to target_value. Function-local static for the same single-instance reason
     // as lfo_phase_mod_state above. Per-Program now, same reason as lfo_phase_mod_state.
-    static int lfo_decim_counter[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0}};
-    static float lfo_decim_last_value[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
-    static float lfo_decim_target_value[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
+    static int lfo_decim_counter[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0}};
+    static float lfo_decim_last_value[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
+    static float lfo_decim_target_value[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
 
     // Monophonic Noise tilt-filter state (see ProgramState.vco1_mono_noise's own comment) --
     // one shared generator per Program+oscillator, computed once per sample below (before the
     // voice loop) rather than once per voice. Function-local static for the same single-instance
     // reason as lfo_phase_mod_state above.
-    static float mono_noise_tilt_lp[COMBI_PROGRAM_COUNT][4] = {{0.0f}};
+    static float mono_noise_tilt_lp[COMBI_PROGRAM_COUNT + 1][4] = {{0.0f}};
 
     // FX bus engine state: persists across calls (and across FX_TYPE changes -- see
     // process_fx_chain) for the same "single synth engine instance" reason as above.
@@ -6575,8 +6752,8 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // tick_adsr() itself (once per voice per sample -- a redundancy that scaled directly, and
     // expensively, with both polyphony and envelope count). Computed for every Program slot
     // unconditionally, same reasoning as the unison-pan tables above (cheap, once per block).
-    EGDerivedRates eg_rates[COMBI_PROGRAM_COUNT][ENV_COUNT];
-    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+    EGDerivedRates eg_rates[COMBI_PROGRAM_COUNT + 1][ENV_COUNT];
+    for (int p = 0; p <= COMBI_PROGRAM_COUNT; p++) { // <= : covers SINGLE_PROGRAM_SLOT too, see the unison-pan loop's comment above
         for (int e = 0; e < ENV_COUNT; e++) {
             compute_eg_derived_rates(&knobs->programs[p].eg[e], (int)knobs->programs[p].eg_mode[e], &eg_rates[p][e]);
         }
@@ -6616,11 +6793,11 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // unison-pan tables above) so the per-voice per-sample loop can skip the cosf/sinf pair
     // entirely in that case instead of recomputing an unchanged angle up to MAX_VOICES x
     // block_size times for nothing.
-    float static_pan1_l[COMBI_PROGRAM_COUNT], static_pan1_r[COMBI_PROGRAM_COUNT];
-    float static_pan2_l[COMBI_PROGRAM_COUNT], static_pan2_r[COMBI_PROGRAM_COUNT];
-    float static_pan3_l[COMBI_PROGRAM_COUNT], static_pan3_r[COMBI_PROGRAM_COUNT];
-    float static_pan4_l[COMBI_PROGRAM_COUNT], static_pan4_r[COMBI_PROGRAM_COUNT];
-    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+    float static_pan1_l[COMBI_PROGRAM_COUNT + 1], static_pan1_r[COMBI_PROGRAM_COUNT + 1];
+    float static_pan2_l[COMBI_PROGRAM_COUNT + 1], static_pan2_r[COMBI_PROGRAM_COUNT + 1];
+    float static_pan3_l[COMBI_PROGRAM_COUNT + 1], static_pan3_r[COMBI_PROGRAM_COUNT + 1];
+    float static_pan4_l[COMBI_PROGRAM_COUNT + 1], static_pan4_r[COMBI_PROGRAM_COUNT + 1];
+    for (int p = 0; p <= COMBI_PROGRAM_COUNT; p++) { // <= : covers SINGLE_PROGRAM_SLOT too, see the unison-pan loop's comment above
         float angle1 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[p].vco1_pan)) + 1.0f) * ((float)M_PI / 4.0f);
         float angle2 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[p].vco2_pan)) + 1.0f) * ((float)M_PI / 4.0f);
         float angle3 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[p].vco3_pan)) + 1.0f) * ((float)M_PI / 4.0f);
@@ -6651,13 +6828,19 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     }
 
     for (int i = 0; i < block_size; i++) {
-        float mixed_l[COMBI_PROGRAM_COUNT] = {0.0f}, mixed_r[COMBI_PROGRAM_COUNT] = {0.0f};
-        float lfo_out[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
+        float mixed_l[COMBI_PROGRAM_COUNT + 1] = {0.0f}, mixed_r[COMBI_PROGRAM_COUNT + 1] = {0.0f};
+        float lfo_out[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
         // LFOs are computed per active Program slot (see active_program_count's own comment --
         // always advancing continuously per Program, never gated on voice activity, to preserve
         // today's exact phase-continuity behavior). Outside Combi mode this is just p=0, the
         // exact same single pass as before this restructuring.
-        for (int p = 0; p < active_program_count; p++) {
+        for (int p_loop = 0; p_loop < active_program_count; p_loop++) {
+        // Resolve which REAL programs[]/mixed_l[]/lfo_out[]/state-array slot this iteration
+        // actually touches: identity in Combi mode (p_loop IS the Combi lane's own array index,
+        // 0-7); always SINGLE_PROGRAM_SLOT outside it, where this loop only ever runs once
+        // (active_program_count == 1) -- see ProgramState's own comment on the mutual-exclusivity
+        // fix this resolves. Every `[p]` reference in the rest of this loop body is unchanged.
+        int p = combi_mode_active ? p_loop : SINGLE_PROGRAM_SLOT;
         for (int l = 0; l < LFO_COUNT; l++) {
             int wave_type = (int)knobs->programs[p].lfo[l].wave_type;
             // Off: complete compute bypass -- no phase_offset/mod_source_cc/waveform lookup, and
@@ -6731,8 +6914,9 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         // shared generator has no single per-voice modulated value to defer to. Meaningless/
         // unused for any oscillator not currently WAVE_NOISE with mono_noise engaged -- cheap to
         // just always compute for the (at most 8) active Programs regardless.
-        float mono_noise_out[COMBI_PROGRAM_COUNT][4] = {{0.0f}};
-        for (int p = 0; p < active_program_count; p++) {
+        float mono_noise_out[COMBI_PROGRAM_COUNT + 1][4] = {{0.0f}};
+        for (int p_loop = 0; p_loop < active_program_count; p_loop++) {
+        int p = combi_mode_active ? p_loop : SINGLE_PROGRAM_SLOT; // see the LFO loop's own comment on this resolution
             const ProgramState *mprog = &knobs->programs[p];
             float mono_flag[4] = { mprog->vco1_mono_noise, mprog->vco2_mono_noise, mprog->vco3_mono_noise, mprog->vco4_mono_noise };
             WaveType mono_shape[4] = { (WaveType)(int)mprog->vco1_shape, (WaveType)(int)mprog->vco2_shape, (WaveType)(int)mprog->vco3_shape, (WaveType)(int)mprog->vco4_shape };
@@ -7332,15 +7516,18 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         // LFO Phase/Rate/Depth as mod destinations (targets 14-21/28-31/48-71/72-83): computed
         // once per sample per active Program (not per voice, since LFOs are one resource shared
         // by every voice OF THE SAME PROGRAM) from that Program's own LFOs' outputs and its own
-        // reference voice's assignable EGs. The reference voice for Program p is voices[p] --
-        // a direct generalization of today's single-Program "voice 0 is the reference" convention
-        // (p is always 0 outside Combi mode, so this is byte-identical there), and matches the
-        // same dedicated-slot convention handle_note_on's own mono-mode branch already uses.
+        // reference voice's assignable EGs. The reference voice for Program slot p is voices[p]
+        // -- a direct generalization of today's single-Program "voice 0 is the reference"
+        // convention, and matches the same dedicated-slot convention handle_note_on's own
+        // mono-mode branch already uses. Outside Combi mode this resolves to SINGLE_PROGRAM_SLOT
+        // (voices[8]), not voices[0] -- see the LFO computation loop's own comment on this same
+        // resolution and why (mutual exclusivity between Single Program mode and Combi lane 1).
         // Applied to affect the NEXT sample's read-phase/rate/depth above -- a one-sample delay
         // that avoids any ordering ambiguity between "which LFO's output is current" within a
         // single sample. See lfo_rate_target_index/lfo_depth_target_index/lfo_phase_target_index's
         // comment for the target-number -> LFO-index mapping.
-        for (int p = 0; p < active_program_count; p++) {
+        for (int p_loop = 0; p_loop < active_program_count; p_loop++) {
+            int p = combi_mode_active ? p_loop : SINGLE_PROGRAM_SLOT;
             const ProgramState *rprog = &knobs->programs[p];
             SynthVoice *ref_voice = &voices[p];
             float new_lfo_phase_mod[LFO_COUNT] = {0.0f};
@@ -7396,6 +7583,17 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             bus_r[p] = mixed_r[p] * knobs->master_volume * combi_lane_gain_r[p];
             combi_mix_l += bus_l[p];
             combi_mix_r += bus_r[p];
+        }
+        // Outside Combi mode, mixed_l[0..7] are all silent (the actual per-sample synthesis above
+        // only ever wrote into mixed_l[SINGLE_PROGRAM_SLOT] -- see combi_mode_active's own
+        // resolution comment), so the loop above left bus_l[0]/combi_mix silent too. Source 0
+        // ("Program" in the FX/Routing UI) and Combi Mix must still carry Single Program mode's
+        // own audio here, exactly as they always have -- pull it from its real home instead.
+        if (!combi_mode_active) {
+            bus_l[0] = mixed_l[SINGLE_PROGRAM_SLOT] * knobs->master_volume;
+            bus_r[0] = mixed_r[SINGLE_PROGRAM_SLOT] * knobs->master_volume;
+            combi_mix_l = bus_l[0];
+            combi_mix_r = bus_r[0];
         }
         bus_l[COMBI_PROGRAM_COUNT] = combi_mix_l;
         bus_r[COMBI_PROGRAM_COUNT] = combi_mix_r;
@@ -8273,10 +8471,10 @@ int main(int argc, char **argv) {
     char applied_midi_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
 
-    float global_lfo_phases[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}}; int vu_decimator = 0;
+    float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}}; int vu_decimator = 0;
 
     SynthVoice voices[MAX_VOICES]; for (int i = 0; i < MAX_VOICES; i++) init_voice(&voices[i]);
-    MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT]; for (int mp = 0; mp < COMBI_PROGRAM_COUNT; mp++) mono_stacks[mp] = (MonoNoteStack){0};
+    MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1]; for (int mp = 0; mp <= COMBI_PROGRAM_COUNT; mp++) mono_stacks[mp] = (MonoNoteStack){0}; // index COMBI_PROGRAM_COUNT = SINGLE_PROGRAM_SLOT
 
     // Engine "uptime" in samples, purely for the Tempo system's elapsed-time axis (see
     // compute_current_tempo_bpm()) -- there's no other transport/song-position concept here.
@@ -8361,7 +8559,7 @@ int main(int argc, char **argv) {
         drain_pending_sample_loads();
 
         process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live);
-        seq_playback_midi_events(voices, &active_knobs, global_lfo_phases, &mono_stacks[0], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets Program 0)
+        seq_playback_midi_events(voices, &active_knobs, global_lfo_phases, &mono_stacks[SINGLE_PROGRAM_SLOT], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets SINGLE_PROGRAM_SLOT)
 
         // block_size/voice_limit are computed fresh every iteration since both are live,
         // user-adjustable controls (Audio tab: Block Size, Polyphony) -- see

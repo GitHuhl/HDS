@@ -3239,13 +3239,17 @@ class SynthGui(QWidget):
         combi_note.setStyleSheet("color: #777; font-style: italic;")
         combi_lay.addWidget(combi_note)
         # Per-lane "pick a saved Program" dropdown -- loads that .hdsprog's fields onto this
-        # lane's own /hds/combi/{lane}/... address set (programs[lane] in backend.c). Lane 0 is
-        # the same Program the Oscillators/Filters/LFO/EG tabs already edit, so picking a Program
-        # there also updates those tabs' widgets, same as the main Load button; lanes 1-7 send
-        # directly over OSC with no widget of their own -- see
-        # _apply_program_fields_to_combi_lane()'s own comment for why.
+        # lane's own /hds/combi/{lane}/... address set (programs[lane] in backend.c). Every lane
+        # (0-7) is its own fully independent ProgramState, completely separate from Single
+        # Program mode's own dedicated slot (see ProgramState's own comment in backend.c on the
+        # mutual-exclusivity fix) -- none of them have a widget of their own, so the picker sends
+        # directly over OSC. See _apply_program_fields_to_combi_lane()'s own comment for why.
+        # The "Edit" button below each picker jumps into Single Program mode with that same
+        # Program loaded into its own editing buffer -- see
+        # _edit_combi_lane_in_program_mode()'s own docstring.
         self.combi_lane_program_choice = [None] * COMBI_PROGRAM_COUNT
         self.combi_program_combos = []
+        self.combi_lane_edit_buttons = []
         self.combi_lane_rows = []  # COMBI_PROGRAM_COUNT x (strip, fader, pan_dial, None, None)
         # Per-lane MIDI channel selector -- mirrors the Sequencer lanes' own
         # seq_lane_midi_channel_combos pattern exactly: "Omni" (index 0) or a specific channel
@@ -3262,6 +3266,16 @@ class SynthGui(QWidget):
             lane[0].layout().addWidget(prog_combo)
             prog_combo.currentTextChanged.connect(lambda text, idx=i: self._on_combi_lane_program_picked(idx, text))
             self.combi_program_combos.append(prog_combo)
+            edit_btn = QPushButton("Edit")
+            edit_btn.setToolTip(
+                "Load this lane's Program into Single Program mode to edit and save it -- "
+                "editing here never changes what this lane plays until you explicitly reload it "
+                "onto the lane afterward (the two are independent, see the picker's own tooltip)."
+            )
+            edit_btn.setStyleSheet("font-size: 9px; padding: 1px 4px;")
+            edit_btn.clicked.connect(lambda checked=False, idx=i: self._edit_combi_lane_in_program_mode(idx))
+            lane[0].layout().addWidget(edit_btn)
+            self.combi_lane_edit_buttons.append(edit_btn)
             channel_combo = QComboBox()
             channel_combo.addItems(["Omni"] + [str(c) for c in range(1, 17)])
             channel_combo.setStyleSheet("font-size: 9px;")
@@ -4896,13 +4910,37 @@ class SynthGui(QWidget):
         bookkeeping the scaffolding already did) and, when a real name was picked (not the blank
         "none selected" entry), actually loads that saved Program onto this lane via
         _load_program_from_path(..., lane_idx=lane_idx) -- see that method's own docstring for
-        what "loading onto a lane" means for lane 0 vs. lanes 1-7."""
+        what "loading onto a lane" means (every lane 0-7 is its own independent Program now, see
+        the mutual-exclusivity fix)."""
         self.combi_lane_program_choice[lane_idx] = name or None
         if not name:
             return
         path = os.path.join(self.programs_folder, name, f"{name}.hdsprog")
         if os.path.isfile(path):
             self._load_program_from_path(path, lane_idx=lane_idx)
+
+    def _edit_combi_lane_in_program_mode(self, lane_idx):
+        """'Edit' button handler below each Combi lane's Program picker: loads that same saved
+        .hdsprog into Single Program mode's own dedicated editing buffer (lane_idx=None --
+        _apply_program_fields(), the exact same path the main Load button uses) and switches
+        Performance Mode to Single Program so it's immediately audible/editable, then switches
+        the main tab deck to Oscillators (where Program editing actually happens) as a
+        convenience. This is a one-way copy, not a live link: the Combi lane keeps playing
+        whatever it already had (its own independent programs[lane_idx], per the
+        mutual-exclusivity fix) until you explicitly pick this Program for that lane again from
+        its own picker -- editing here and clicking Save writes a new/updated .hdsprog file, it
+        does not reach back and change the lane."""
+        name = self.combi_lane_program_choice[lane_idx]
+        if not name:
+            self.set_mapping_status(f"Lane {lane_idx + 1} has no Program loaded to edit", error=True)
+            return
+        path = os.path.join(self.programs_folder, name, f"{name}.hdsprog")
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "Edit Program", f"'{name}.hdsprog' no longer exists at:\n{path}")
+            return
+        self._load_program_from_path(path)  # lane_idx=None: Single Program mode's own slot
+        self.osc_prog_radio.setChecked(True)  # jump into Single Program mode so it's audible/editable
+        self.tab_widget.setCurrentWidget(self.tab_play)
 
     def _pick_seq_audio_file(self, lane_idx):
         """'Load Audio' button handler for one Sequencer lane. Sends the chosen path over OSC
@@ -5336,18 +5374,23 @@ class SynthGui(QWidget):
 
     def _apply_program_fields_to_combi_lane(self, lane_idx, fields):
         """Loads a saved Program's fields onto Combi lane `lane_idx` (0-7, matching
-        programs[0..7] in backend.c). Lane 0 IS the same Program the Oscillators/Filters/LFO/EG
-        tabs already edit, so it goes through the normal widget-syncing
-        _apply_program_fields() -- selecting a Program for Combi lane 1 updates exactly what
-        you'd see if you'd loaded it via the main Load button. Lanes 1-7 have no widgets of
-        their own (this pass deliberately doesn't add a live per-lane knob-editing UI for 8
+        programs[0..7] in backend.c -- ALL 8 real Combi lanes, no special case). `lane_idx=None`
+        instead means "Single Program mode's own dedicated ProgramState" (backend.c's
+        SINGLE_PROGRAM_SLOT) -- the Oscillators/Filters/LFO/EG tabs' own widgets -- so it goes
+        through the normal widget-syncing _apply_program_fields().
+        Combi lane 1 (programs[0]) and Single Program mode used to be the SAME backend storage
+        (editing one silently rewrote the other -- a real bug); they are now fully independent,
+        each addressed under its own OSC prefix, so this function no longer special-cases
+        lane_idx==0 as "the Program-mode Program." Every real Combi lane (0-7) has no widgets of
+        its own (this pass deliberately doesn't add a live per-lane knob-editing UI for 8
         simultaneous Programs -- see the Combi mode plan's own scope note), so those addresses
         are sent directly over OSC with each address's leading /hds remapped to
         /hds/combi/{lane_idx}, bypassing the widget layer entirely -- the backend's own
         generic_osc_handler applies them to programs[lane_idx] exactly as if a widget had sent
-        them. self._last_wire_state is intentionally left untouched for lanes 1-7 (it mirrors
-        the currently-EDITED Program, i.e. lane 0/programs[0], not every lane at once)."""
-        if lane_idx == 0:
+        them. self._last_wire_state is intentionally left untouched for Combi lanes (it mirrors
+        the currently-EDITED Program, i.e. Single Program mode's own slot, not every lane at
+        once)."""
+        if lane_idx is None:
             self._apply_program_fields(fields)
             return
         if not fields:
@@ -5365,17 +5408,20 @@ class SynthGui(QWidget):
         except OSError:
             pass
 
-    def _load_program_from_path(self, path, lane_idx=0):
+    def _load_program_from_path(self, path, lane_idx=None):
         """Shared load logic behind the file-dialog-driven Load button, the </> prev/next
-        cycling buttons, and each Combi lane's own Program picker (lane_idx 1-7): apply every
-        included field via _apply_program_fields_to_combi_lane(), and -- lane 0 only -- if the
-        file references a colocated .sfz, REPLACE (not merge with) the current Sample Bank -- a
-        real, deliberate behavior difference from the SFZ importer's own additive-only posture,
-        because loading a *Program* means "this Program's own samples," not "add these on top of
-        whatever was already loaded." The Sample Bank is a single session-wide catalog with no
+        cycling buttons (lane_idx=None: Single Program mode's own dedicated ProgramState), the
+        Edit button below each loaded Combi lane (also lane_idx=None -- see
+        _edit_combi_lane_in_program_mode), and each Combi lane's own Program picker (lane_idx
+        0-7): apply every included field via _apply_program_fields_to_combi_lane(), and -- only
+        when loading into Single Program mode's own slot (lane_idx is None) -- if the file
+        references a colocated .sfz, REPLACE (not merge with) the current Sample Bank -- a real,
+        deliberate behavior difference from the SFZ importer's own additive-only posture, because
+        loading a *Program* means "this Program's own samples," not "add these on top of whatever
+        was already loaded." The Sample Bank is a single session-wide catalog with no
         per-Program partitioning (see the Mapping tab's own zone-catalog design), so this pass
-        deliberately does not attempt to load a Combi lane's own colocated .sfz for lanes 1-7 --
-        a documented scope boundary, not an oversight."""
+        deliberately does not attempt to load a Combi lane's own colocated .sfz -- a documented
+        scope boundary, not an oversight."""
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -5383,7 +5429,7 @@ class SynthGui(QWidget):
             QMessageBox.warning(self, "Load Program", f"Could not read '{path}':\n{e}")
             return
         self._apply_program_fields_to_combi_lane(lane_idx, data.get("fields", {}))
-        if lane_idx != 0:
+        if lane_idx is not None:
             return
 
         sfz_file = data.get("sfz_file")
