@@ -17,9 +17,11 @@
 // the standalone app, just pointed at a different port. There is no CLAP `params` extension in
 // this first version; the ~1150 knobs stay 100% OSC-driven.
 //
-// Windows CLAP support and a CLAP `params`/`state` round-trip are explicitly out of scope for
-// this version -- see the plan doc's own stated scope boundaries.
+// Windows CLAP support and a CLAP `params` extension (host-automatable knobs) are explicitly out
+// of scope for this version -- see the plan doc's own stated scope boundaries. `state` (DAW
+// project save/load) IS implemented -- see its own section below.
 
+#include <stdarg.h>
 #include "../third_party/clap/include/clap/clap.h"
 
 #define main backend_main_unused
@@ -136,30 +138,193 @@ static const clap_plugin_note_ports_t k_note_ports_ext = {
 };
 
 // ---------------------------------------------------------------------------------------------
-// state extension: version-header-only stub. Does NOT round-trip `knobs` yet -- reopening a
-// saved DAW project loads HDS at its default patch; the user reconnects frontend.py (OSC) and
-// re-establishes sound design manually. SynthSharedControls is flat POD with no pointers, so a
-// real fwrite/fread round-trip is mechanically easy to add later, but needs a real version/
-// migration scheme to not be build-fragile against this synth's still-growing struct -- a stated
-// follow-up, not attempted here.
+// state extension: real save/load. Round-trips every knob in `p->knobs` PLUS the Sample Bank
+// (g_sample_slots[]) so a DAW project reopens with the patch -- oscillators, filters, EGs, LFOs,
+// FX, Combi/Sequencer state, WAVE_SAMPLE zone mappings -- intact, not the default patch.
+//
+// Format is text, one line per record, addressed by NAME (the same OSC address strings
+// OSC_PARAMS[]/osc_dispatch_table already use) rather than a raw positional struct dump. This is
+// a deliberate reuse of this project's own hard-won lesson: the backend used to speak a raw
+// positional wire protocol (a straight memcpy onto SynthSharedControls) and that was replaced
+// with OSC specifically because a struct-layout change silently corrupted the wire contract with
+// no compiler error -- see this repo's own "Replace the control-socket protocols with OSC" pass.
+// A name-addressed save is immune to the same failure mode: a field the CURRENT binary doesn't
+// recognize (e.g. state saved by a newer/older build) is just skipped, and a field the saved
+// file doesn't mention simply keeps its already-applied default -- forward AND backward
+// compatible by construction, no migration scheme needed.
+//
+//   HDS1                                 -- version line, first
+//   K <address> <float>                  -- one per concrete OSC_KIND_FLOAT address
+//   T <address> <string>                 -- one per concrete OSC_KIND_STRING address
+//   Z <zone_id> <17 ints/floats> <path>  -- one per loaded Sample Bank zone, ZoneRecordWire's
+//                                           own field order (see apply_zone_upsert)
 // ---------------------------------------------------------------------------------------------
 
 #define HDS_CLAP_STATE_VERSION 1
 
+// Small growable buffer for building the save payload in memory before writing it out (the CLAP
+// stream API only guarantees partial writes per call, not "write this whole blob atomically") --
+// and for reading the whole load payload in before parsing it line-by-line (simpler and more
+// robust than trying to reassemble lines split across arbitrary stream->read() chunk boundaries).
+// Total size is bounded and small in practice (~4100 knob lines + a few hundred zone lines at
+// most, well under 1MB) -- not a concern to hold in memory whole.
+typedef struct { char *buf; size_t len; size_t cap; } HdsStateBuf;
+
+static void state_buf_reserve(HdsStateBuf *b, size_t extra) {
+    if (b->len + extra + 1 <= b->cap) return;
+    size_t new_cap = b->cap ? b->cap * 2 : 4096;
+    while (new_cap < b->len + extra + 1) new_cap *= 2;
+    b->buf = (char *)realloc(b->buf, new_cap);
+    b->cap = new_cap;
+}
+
+static void state_buf_appendf(HdsStateBuf *b, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    va_list ap2; va_copy(ap2, ap);
+    int needed = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (needed < 0) { va_end(ap2); return; }
+    state_buf_reserve(b, (size_t)needed);
+    vsnprintf(b->buf + b->len, (size_t)needed + 1, fmt, ap2);
+    va_end(ap2);
+    b->len += (size_t)needed;
+}
+
 static bool clap_state_save(const clap_plugin_t *plugin, const clap_ostream_t *stream) {
-    (void)plugin;
-    uint32_t version = HDS_CLAP_STATE_VERSION;
-    return stream->write(stream, &version, sizeof(version)) == (int64_t)sizeof(version);
+    HdsClapPlugin *p = (HdsClapPlugin *)plugin->plugin_data;
+    HdsStateBuf b = {0};
+    state_buf_appendf(&b, "HDS%d\n", HDS_CLAP_STATE_VERSION);
+
+    // Every concrete knob address, straight from the already-built dispatch table (built once at
+    // plugin.init(), guaranteed populated -- see g_osc_dispatch_table_ready) -- avoids
+    // re-deriving the same OSC_PARAMS[] index-expansion logic build_osc_dispatch_table() already
+    // owns, and guarantees this walks the EXACT same address space generic_osc_handler() does.
+    for (int i = 0; i < OSC_DISPATCH_TABLE_SIZE; i++) {
+        const OscDispatchSlot *slot = &osc_dispatch_table[i];
+        if (!slot->occupied) continue;
+        if (slot->kind == OSC_KIND_FLOAT) {
+            float v = *(const float *)((const char *)&p->knobs + slot->offset);
+            state_buf_appendf(&b, "K %s %.9g\n", slot->address, (double)v);
+        } else {
+            const char *s = (const char *)&p->knobs + slot->offset;
+            state_buf_appendf(&b, "T %s %s\n", slot->address, s);
+        }
+    }
+
+    // Sample Bank: every active, loaded zone, mirroring ZoneRecordWire's own field order/units
+    // exactly. loop_start/loop_end/playback_end_frame are stored on SampleSlot as frame indices
+    // (only meaningful once total_frames is known) -- converted back to the 0-1 fractions the
+    // wire format uses, the direct inverse of apply_loop_points()/apply_playback_end().
+    for (int s = 0; s < g_sample_slot_count; s++) {
+        SampleSlot *slot = &g_sample_slots[s];
+        if (!slot->active || !slot->loaded) continue;
+        float loop_start_frac = (slot->total_frames > 1) ? (float)slot->loop_start / (float)(slot->total_frames - 1) : 0.0f;
+        float loop_end_frac   = (slot->total_frames > 1) ? (float)slot->loop_end   / (float)(slot->total_frames - 1) : 0.0f;
+        float end_frac = (slot->total_frames > 0) ? (float)slot->playback_end_frame / (float)slot->total_frames : 1.0f;
+        state_buf_appendf(&b, "Z %d %d %d %d %d %d %d %.9g %.9g %d %d %.9g %.9g %.9g %.9g %d %d %.9g %s\n",
+            slot->zone_id, slot->root_note, slot->min_note, slot->max_note, slot->min_velocity, slot->max_velocity,
+            slot->unpitched ? 1 : 0, (double)loop_start_frac, (double)loop_end_frac, slot->loop_enabled ? 1 : 0,
+            slot->round_robin_group, (double)slot->tune_cents, (double)slot->gain_db, (double)slot->pan,
+            (double)slot->start_offset_frac, slot->reverse ? 1 : 0, slot->loop_release_exit ? 1 : 0, (double)end_frac,
+            slot->file_path);
+    }
+
+    bool ok = true;
+    size_t written = 0;
+    while (written < b.len) {
+        int64_t n = stream->write(stream, b.buf + written, b.len - written);
+        if (n <= 0) { ok = false; break; }
+        written += (size_t)n;
+    }
+    free(b.buf);
+    return ok;
 }
 
 static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *stream) {
-    (void)plugin;
-    uint32_t version = 0;
-    int64_t got = stream->read(stream, &version, sizeof(version));
-    // Reject anything that isn't exactly this stub's own 4-byte version header -- an empty
-    // stream, a short read, or unrecognized bytes (e.g. state saved by a future version of this
-    // stub, or random/foreign data) are all real failures, not silently accepted successes.
-    if (got != (int64_t)sizeof(version) || version != HDS_CLAP_STATE_VERSION) return false;
+    HdsClapPlugin *p = (HdsClapPlugin *)plugin->plugin_data;
+
+    HdsStateBuf b = {0};
+    char chunk[4096];
+    for (;;) {
+        int64_t n = stream->read(stream, chunk, sizeof(chunk));
+        if (n < 0) { free(b.buf); return false; }
+        if (n == 0) break;
+        state_buf_reserve(&b, (size_t)n);
+        memcpy(b.buf + b.len, chunk, (size_t)n);
+        b.len += (size_t)n;
+    }
+    if (b.len == 0) { free(b.buf); return false; } // an empty state is invalid, not "nothing to do"
+    state_buf_reserve(&b, 1); b.buf[b.len] = '\0';
+
+    char *cursor = b.buf;
+    char *first_newline = strchr(cursor, '\n');
+    if (!first_newline) { free(b.buf); return false; }
+    *first_newline = '\0';
+    int version = 0;
+    if (sscanf(cursor, "HDS%d", &version) != 1 || version < 1 || version > HDS_CLAP_STATE_VERSION) { free(b.buf); return false; }
+    cursor = first_newline + 1;
+
+    // Clear whatever's currently loaded before applying the saved zones -- loading a project
+    // means "this project's own samples," not "add these on top of whatever was already there"
+    // (same posture frontend.py's own Program-load-with-SFZ path already established).
+    for (int s = 0; s < g_sample_slot_count; s++) {
+        if (g_sample_slots[s].active) apply_zone_remove(g_sample_slots[s].zone_id);
+    }
+
+    int applied_knobs = 0, skipped_knobs = 0, applied_zones = 0;
+    while (*cursor) {
+        char *line_end = strchr(cursor, '\n');
+        if (line_end) *line_end = '\0';
+
+        if (cursor[0] == 'K' && cursor[1] == ' ') {
+            char addr[128]; double value;
+            if (sscanf(cursor + 2, "%127s %lf", addr, &value) == 2) {
+                const OscDispatchSlot *slot = osc_dispatch_lookup(addr);
+                if (slot && slot->kind == OSC_KIND_FLOAT) { *(float *)((char *)&p->knobs + slot->offset) = (float)value; applied_knobs++; }
+                else skipped_knobs++;
+            }
+        } else if (cursor[0] == 'T' && cursor[1] == ' ') {
+            char addr[128]; int addr_chars = 0;
+            if (sscanf(cursor + 2, "%127s%n", addr, &addr_chars) == 1) {
+                const char *value = cursor + 2 + addr_chars;
+                while (*value == ' ') value++;
+                const OscDispatchSlot *slot = osc_dispatch_lookup(addr);
+                if (slot && slot->kind == OSC_KIND_STRING) { snprintf((char *)&p->knobs + slot->offset, slot->str_len, "%s", value); applied_knobs++; }
+                else skipped_knobs++;
+            }
+        } else if (cursor[0] == 'Z' && cursor[1] == ' ') {
+            ZoneRecordWire rec;
+            int unpitched_i, loop_enabled_i, reverse_i, loop_release_exit_i;
+            int root_note, min_note, max_note, min_velocity, max_velocity, round_robin_group;
+            double loop_start, loop_end, tune_cents, gain_db, pan, start_offset_frac, end_frac;
+            char path[SAMPLE_PATH_LEN];
+            int n = sscanf(cursor + 2, "%d %d %d %d %d %d %d %lf %lf %d %d %lf %lf %lf %lf %d %d %lf %[^\n]",
+                &rec.zone_id, &root_note, &min_note, &max_note, &min_velocity, &max_velocity,
+                &unpitched_i, &loop_start, &loop_end, &loop_enabled_i, &round_robin_group,
+                &tune_cents, &gain_db, &pan, &start_offset_frac, &reverse_i, &loop_release_exit_i, &end_frac, path);
+            if (n == 19) {
+                rec.root_note = (float)root_note; rec.min_note = (float)min_note; rec.max_note = (float)max_note;
+                rec.min_velocity = (float)min_velocity; rec.max_velocity = (float)max_velocity;
+                rec.unpitched = unpitched_i ? 1.0f : 0.0f;
+                rec.loop_start = (float)loop_start; rec.loop_end = (float)loop_end;
+                rec.loop_enabled = loop_enabled_i ? 1.0f : 0.0f;
+                rec.round_robin_group = (float)round_robin_group;
+                rec.tune_cents = (float)tune_cents; rec.gain_db = (float)gain_db; rec.pan = (float)pan;
+                rec.start_offset_frac = (float)start_offset_frac;
+                rec.reverse = reverse_i ? 1.0f : 0.0f;
+                rec.loop_release_exit = loop_release_exit_i ? 1.0f : 0.0f;
+                rec.end_frac = (float)end_frac;
+                snprintf(rec.path, sizeof(rec.path), "%s", path);
+                apply_zone_upsert(&rec); // brand-new zone -> queued via enqueue_pending_sample_load, picked up by this instance's own drain_pending_sample_loads() poll in process()
+                applied_zones++;
+            }
+        }
+        cursor = line_end ? line_end + 1 : cursor + strlen(cursor);
+    }
+
+    fprintf(stderr, "[hds-clap] state load: %d knob(s) applied, %d skipped (unrecognized address), %d zone(s) queued\n",
+            applied_knobs, skipped_knobs, applied_zones);
+    free(b.buf);
     return true;
 }
 
