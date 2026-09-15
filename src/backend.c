@@ -3843,12 +3843,20 @@ static void init_default_controls(SynthSharedControls *knobs) {
     }
     // Routing defaults: only the Program is routed anywhere (to output pair 0, i.e. today's only
     // output pair), every ext-in pair unrouted, every source's own FX chain in Series -- this
-    // combination reproduces today's exact single-output-pair, Program-only behavior bit-for-bit.
+    // combination reproduces today's exact single-output-pair, Program-only behavior bit-for-bit
+    // in Single Program mode (Programs 1-7 never claim a voice outside Combi mode, so routing
+    // them anywhere is a harmless no-op there).
     for (int s = 0; s < SOURCE_COUNT; s++) {
         knobs->fx_source_routing_mode[s] = 0.0f; // Series
         for (int o = 0; o < OUTPUT_PAIR_MAX; o++) knobs->source_routing[s].enable[o] = 0.0f;
     }
-    knobs->source_routing[0].enable[0] = 1.0f; // Program -> output pair 0 (today's only output)
+    // Every Combi Program (source ids 0..COMBI_PROGRAM_COUNT-1) defaults to output pair 0, not
+    // just Program 1 -- otherwise switching to Combi mode and loading a Program onto lane 2+
+    // produces total silence for that lane until the user separately visits the Routing tab,
+    // which nothing prompts them to do. Combi Mix (source id COMBI_PROGRAM_COUNT) stays
+    // unrouted by default -- routing it too would double-count every individually-routed
+    // Program's output. Ext-in pairs stay unrouted by default, unchanged.
+    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) knobs->source_routing[p].enable[0] = 1.0f;
     knobs->programs[0].pb_range_up = 2.0f; knobs->programs[0].pb_range_down = 2.0f; // standard +/-2 semitone default
     knobs->programs[0].sustain_pedal_polarity = 0.0f; // Normal
     knobs->audio_latency_ms = 25.0f; // matches the old hardcoded 25ms target -- no behavior change by default
