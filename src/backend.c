@@ -266,9 +266,29 @@ typedef struct {
                            // Program dispatch (handle_note_on/off, outside the Sequencer) stays
                            // fully channel-agnostic as before -- this field never touches that
                            // path, only which lane(s) a note gets RECORDED into.
-    float seq_mode;        // 0 = Seq (plays back recorded sequence), 1 = Mute, 2 = Rec. Ignored
-                            // entirely in Combi mode; meaningful only once Sequencer's real
-                            // playback/record engine exists.
+    // seq_mode/mute/rec_armed/rec_overdub are all independent toggles (not one exclusive mode),
+    // per the user's own explicit ask -- but "Off" still wins over everything else, since it's a
+    // real compute bypass: an Off lane never plays back, never records, never mixes, and is never
+    // repositioned/auto-started by the transport, matching this codebase's existing "skip work
+    // entirely, don't just silence" philosophy (same idea as WAVE_OFF). Precedence, applied
+    // consistently everywhere these fields are read:
+    //   1. seq_mode == 1 (Off) -> lane does nothing at all, full stop.
+    //   2. else rec_armed != 0 (Program/MIDI lanes only) -> plays no recorded events; instead
+    //      records incoming MIDI (filtered by midi_channel) while the transport is PLAYING.
+    //   3. else -> normal Seq playback (or Audio-lane transport-driven playback), silenced by
+    //      `mute` but still advancing in sync with the transport (so un-muting resumes exactly in
+    //      step rather than picking up wherever it happened to be).
+    // All ignored entirely in Combi mode (see Combi's own hardcoded-Seq override in frontend.py).
+    float seq_mode;      // 0 = Seq, 1 = Off (a real bypass -- see precedence above)
+    float mute;           // 0/1, independent of seq_mode/rec_armed (both Program/MIDI + Audio lanes)
+    float rec_armed;      // 0/1, independent of seq_mode/mute (Program/MIDI lanes only -- Audio
+                           // lanes never record)
+    float rec_overdub;    // 0 = Overwrite (a fresh Rec take clears this lane's previously
+                           // recorded events -- the original behavior), 1 = Overdub (a fresh take
+                           // keeps them; newly recorded notes are inserted into the existing
+                           // sequence in time order rather than replacing it -- see
+                           // seq_record_midi_event's own comment). Only meaningful on a Rec-armed
+                           // Program/MIDI lane; a harmless no-op otherwise.
     // Audio-lane "Load Audio" (Sequencer only -- see g_seq_audio/seq_audio_loader_thread_main).
     // Writing a new path here is just a request: main()'s once-per-block change-detection loop
     // notices the change and spawns a dedicated loader thread to actually read the file, since
@@ -3985,6 +4005,9 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SUBARRAY("/hds/seq/%d/pan", seq_lanes, SeqLaneState, pan, SEQ_LANE_COUNT),
     OSC_SUBARRAY("/hds/seq/%d/midi_channel", seq_lanes, SeqLaneState, midi_channel, SEQ_LANE_COUNT),
     OSC_SUBARRAY("/hds/seq/%d/mode", seq_lanes, SeqLaneState, seq_mode, SEQ_LANE_COUNT),
+    OSC_SUBARRAY("/hds/seq/%d/mute", seq_lanes, SeqLaneState, mute, SEQ_LANE_COUNT),
+    OSC_SUBARRAY("/hds/seq/%d/rec_armed", seq_lanes, SeqLaneState, rec_armed, SEQ_LANE_COUNT),
+    OSC_SUBARRAY("/hds/seq/%d/rec_overdub", seq_lanes, SeqLaneState, rec_overdub, SEQ_LANE_COUNT),
     OSC_STRING_SUBARRAY("/hds/seq/%d/audio_path", seq_lanes, SeqLaneState, audio_path, SEQ_LANE_COUNT, SEQ_AUDIO_PATH_LEN),
     OSC_SUBARRAY("/hds/seq/%d/audio_offset_sec", seq_lanes, SeqLaneState, audio_offset_sec, SEQ_LANE_COUNT),
     OSC_SUBARRAY("/hds/seq/%d/audio_preview_trigger", seq_lanes, SeqLaneState, audio_preview_trigger, SEQ_LANE_COUNT),
@@ -4255,6 +4278,9 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->seq_lanes[l].pan = 0.0f;
         knobs->seq_lanes[l].midi_channel = 0.0f; // Omni
         knobs->seq_lanes[l].seq_mode = 0.0f;     // Seq
+        knobs->seq_lanes[l].mute = 0.0f;
+        knobs->seq_lanes[l].rec_armed = 0.0f;
+        knobs->seq_lanes[l].rec_overdub = 0.0f;  // Overwrite
         knobs->seq_lanes[l].audio_path[0] = '\0';
         knobs->seq_lanes[l].audio_offset_sec = 0.0f;
         knobs->seq_lanes[l].audio_preview_trigger = 0.0f;
@@ -6170,19 +6196,20 @@ static void seq_audio_start_transport_playback(SeqAudioLane *al, float audio_off
     al->armed_for_transport = false;
 }
 
-// Repositions every Seq/Mute-mode lane's own playback state (Audio lanes' play_frame, MIDI
+// Repositions every playback-eligible lane's own playback state (Audio lanes' play_frame, MIDI
 // lanes' playback_cursor) to match wherever g_transport_playhead_sec CURRENTLY is -- shared by
 // transport_start_fresh (a fresh Play from Stop, playhead already reset to the target by the
 // caller) and the Seek triggers below (Reset/Back/Forward, playhead already moved by the caller
-// before this runs). Rec-armed lanes are deliberately left untouched -- they have no "position"
-// to seek to; repositioning would either discard an in-progress take or make no sense for one
-// that hasn't started, so a seek simply doesn't affect what a Rec-armed lane is doing.
+// before this runs). Off lanes and Rec-armed lanes are both deliberately left untouched -- an Off
+// lane does nothing at all (see SeqLaneState's own precedence comment), and a Rec-armed lane has
+// no "position" to seek to (repositioning would either discard an in-progress take or make no
+// sense for one that hasn't started), so a seek simply doesn't affect either.
 static void transport_reposition_lanes(const SynthSharedControls *knobs) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        if ((int)knobs->seq_lanes[l].seq_mode == 1) continue; // Off -- a real bypass, the transport never touches this lane
         bool is_audio_lane = (knobs->seq_lanes[l].lane_type != 0.0f);
-        int mode = (int)knobs->seq_lanes[l].seq_mode;
         if (is_audio_lane) {
-            if (mode != 0) continue; // only Seq-mode Audio lanes are transport-driven; Mute/Rec aren't repositioned
+            // Audio lanes never record -- rec_armed is meaningless for them.
             SeqAudioLane *al = &g_seq_audio[l];
             if (atomic_load_explicit(&al->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !al->pcm || al->frame_count <= 0) {
                 // Not ready yet -- arm it so poll_seq_audio_transport_catchup starts it at the
@@ -6192,7 +6219,7 @@ static void transport_reposition_lanes(const SynthSharedControls *knobs) {
             }
             seq_audio_start_transport_playback(al, knobs->seq_lanes[l].audio_offset_sec);
         } else {
-            if (mode != 0 && mode != 1) continue; // Rec-armed lanes have no playback position to reposition
+            if (knobs->seq_lanes[l].rec_armed != 0.0f) continue; // Rec-armed lanes have no playback position to reposition
             SeqMidiLane *ml = &g_seq_midi[l];
             // Events are stored in non-decreasing time order (real-time recording can't record
             // out of order -- see SeqMidiLane's own comment), so the new cursor is just "how many
@@ -6207,19 +6234,37 @@ static void transport_reposition_lanes(const SynthSharedControls *knobs) {
 }
 
 // Called once, only on a STOPPED -> PLAYING transition (never on PAUSED -> PLAYING/resume, which
-// must leave every lane's position exactly where it was): repositions every Seq/Mute-mode lane
-// to match the transport's current playhead (transport_reposition_lanes -- ordinarily 0, unless
-// the transport was seeked while Stopped, in which case Play correctly starts from there instead
-// of silently snapping back to the top), and clears any lane currently armed to Rec so it starts
-// a genuinely fresh take rather than appending onto whatever it recorded last time.
+// must leave every lane's position exactly where it was): repositions every playback-eligible
+// lane to match the transport's current playhead (transport_reposition_lanes -- ordinarily 0,
+// unless the transport was seeked while Stopped, in which case Play correctly starts from there
+// instead of silently snapping back to the top). A lane armed to Rec starts a genuinely fresh
+// take (clears its previously recorded events) UNLESS rec_overdub is set, in which case its
+// existing events are deliberately left in place -- newly recorded notes get merged into them in
+// time order instead (see seq_record_midi_event).
 static void transport_start_fresh(const SynthSharedControls *knobs) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
-        if (knobs->seq_lanes[l].lane_type == 0.0f && (int)knobs->seq_lanes[l].seq_mode == 2) {
-            g_seq_midi[l].event_count = 0; // fresh Rec take
-        }
+        if (knobs->seq_lanes[l].lane_type != 0.0f) continue; // Audio lanes never record
+        if ((int)knobs->seq_lanes[l].seq_mode == 1) continue; // Off -- untouched
+        if (knobs->seq_lanes[l].rec_armed == 0.0f) continue; // not armed to Rec
+        if (knobs->seq_lanes[l].rec_overdub != 0.0f) continue; // Overdub -- keep existing events
+        g_seq_midi[l].event_count = 0; // Overwrite (default) -- fresh take
     }
     transport_reposition_lanes(knobs);
 }
+
+// --- Metronome state (declared here, ahead of poll_transport_triggers below, so a Seek can
+// resync it -- see the `seeked` block's own comment further down). A cheap, deliberately
+// hardcoded 400Hz/8ms square-wave click on each beat while PLAYING -- not a Program voice, so it
+// never touches the oscillator/filter/envelope machinery (per the ask: "low quality, efficient").
+// Scheduled at block granularity (matching how the transport playhead itself only updates once
+// per block -- see advance_transport_playhead), which is more than adequate for a monitoring
+// click. ---
+#define METRONOME_CLICK_HZ 400.0f
+#define METRONOME_CLICK_DURATION_SEC 0.008f
+#define METRONOME_CLICK_GAIN 0.25f
+static double g_metronome_next_click_sec = 0.0; // playhead-seconds of the next scheduled click
+static int g_metronome_click_samples_left = 0;  // countdown of remaining click samples to render
+static int g_metronome_click_phase = 0;         // running square-wave sample counter, reset per click
 
 // Edge-triggered, same idiom as poll_seq_audio_preview_triggers: each button increments its own
 // counter on every click and resends the whole packet, so a genuine change (not just "button
@@ -6283,20 +6328,20 @@ static void poll_transport_triggers(const SynthSharedControls *knobs, float curr
         g_transport_playhead_sec += (double)measure_sec;
         seeked = true;
     }
-    if (seeked) transport_reposition_lanes(knobs);
+    if (seeked) {
+        transport_reposition_lanes(knobs);
+        // Resync the metronome's own schedule to the NEW playhead position -- without this, a
+        // seek backward (e.g. "to beginning") left it pinned to wherever it was scheduled BEFORE
+        // the jump, now far ahead of the playhead, so it would stay silent until the playhead
+        // caught back up to that stale point (looking "broken"); a seek forward past one or more
+        // beat boundaries would instead have poll_metronome's own while-loop fire a whole backlog
+        // of missed clicks at once on the very next block. Same "pin to right where the playhead
+        // currently is" fix poll_metronome already applies when disabled/not-PLAYING (see its own
+        // comment) -- a seek is exactly the same kind of playhead discontinuity.
+        g_metronome_next_click_sec = g_transport_playhead_sec;
+        g_metronome_click_samples_left = 0;
+    }
 }
-
-// --- Metronome: a cheap, deliberately hardcoded 400Hz/8ms square-wave click on each beat while
-// PLAYING -- not a Program voice, so it never touches the oscillator/filter/envelope machinery
-// (per the ask: "low quality, efficient"). Scheduled at block granularity (matching how the
-// transport playhead itself only updates once per block -- see advance_transport_playhead), which
-// is more than adequate for a monitoring click. ---
-#define METRONOME_CLICK_HZ 400.0f
-#define METRONOME_CLICK_DURATION_SEC 0.008f
-#define METRONOME_CLICK_GAIN 0.25f
-static double g_metronome_next_click_sec = 0.0; // playhead-seconds of the next scheduled click
-static int g_metronome_click_samples_left = 0;  // countdown of remaining click samples to render
-static int g_metronome_click_phase = 0;         // running square-wave sample counter, reset per click
 
 // Called once per block, right after poll_transport_triggers (so it sees this block's already-
 // resolved tempo/playhead). Schedules (but does not itself render) upcoming clicks: crossing one
@@ -6355,12 +6400,24 @@ static void seq_record_midi_event(const SynthSharedControls *knobs, unsigned cha
     if (g_transport_state != TRANSPORT_PLAYING) return;
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         if (knobs->seq_lanes[l].lane_type != 0.0f) continue; // Audio lanes don't record MIDI
-        if ((int)knobs->seq_lanes[l].seq_mode != 2) continue; // not armed to Rec
+        if ((int)knobs->seq_lanes[l].seq_mode == 1) continue; // Off -- a real bypass, see SeqLaneState's own precedence comment
+        if (knobs->seq_lanes[l].rec_armed == 0.0f) continue; // not armed to Rec
         float lane_channel = knobs->seq_lanes[l].midi_channel;
         if (lane_channel != 0.0f && (int)lane_channel != midi_channel_1_16) continue; // 0 = Omni, else must match exactly
         SeqMidiLane *ml = &g_seq_midi[l];
         if (ml->event_count >= SEQ_MIDI_EVENT_CAPACITY) continue; // full -- silently drop further events past this documented cap
-        ml->events[ml->event_count++] = (SeqMidiEvent){ (float)g_transport_playhead_sec, type, note, velocity };
+        // Insert in time order rather than a blind append: Overdub mode deliberately leaves this
+        // lane's previously-recorded events in place (see transport_start_fresh), so a new note's
+        // own timestamp can land anywhere relative to them, not just at the end. (This also
+        // quietly closes a latent Overwrite-mode edge case: seeking the transport backward
+        // mid-take already made g_transport_playhead_sec non-monotonic relative to a blind
+        // append, which would have stored that event out of order.)
+        float t = (float)g_transport_playhead_sec;
+        int idx = ml->event_count;
+        while (idx > 0 && ml->events[idx - 1].time_sec > t) idx--;
+        for (int j = ml->event_count; j > idx; j--) ml->events[j] = ml->events[j - 1];
+        ml->events[idx] = (SeqMidiEvent){ t, type, note, velocity };
+        ml->event_count++;
     }
 }
 
@@ -6377,17 +6434,18 @@ static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *k
     bool poly_mode_active = (knobs->programs[SINGLE_PROGRAM_SLOT].is_polyphonic != 0.0f);
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         if (knobs->seq_lanes[l].lane_type != 0.0f) continue;
-        int mode = (int)knobs->seq_lanes[l].seq_mode;
-        if (mode != 0 && mode != 1) continue; // Rec doesn't play back at all; only Seq/Mute do
+        if ((int)knobs->seq_lanes[l].seq_mode == 1) continue; // Off -- a real bypass, see SeqLaneState's own precedence comment
+        if (knobs->seq_lanes[l].rec_armed != 0.0f) continue; // Rec-armed lanes don't play back at all
+        bool muted = (knobs->seq_lanes[l].mute != 0.0f);
         SeqMidiLane *ml = &g_seq_midi[l];
         while (ml->playback_cursor < ml->event_count && ml->events[ml->playback_cursor].time_sec <= (float)g_transport_playhead_sec) {
             SeqMidiEvent *e = &ml->events[ml->playback_cursor];
-            // Mute (mode == 1) still walks the cursor forward in step with the playhead -- just
-            // without ever calling handle_note_on/off -- so un-muting resumes wherever the
-            // playhead currently is instead of bursting out every note that was skipped while
-            // muted. Same "stay in sync, just silence the output" shape as the audio-lane Mute
-            // fix right above this function's own mix-loop call site.
-            if (mode == 0) {
+            // Mute still walks the cursor forward in step with the playhead -- just without ever
+            // calling handle_note_on/off -- so un-muting resumes wherever the playhead currently
+            // is instead of bursting out every note that was skipped while muted. Same "stay in
+            // sync, just silence the output" shape as the audio-lane Mute fix right above this
+            // function's own mix-loop call site.
+            if (!muted) {
                 // Sequencer's own recorded MIDI always targets SINGLE_PROGRAM_SLOT -- see this
                 // section's scope comment (a separate, parallel concern from Combi's own live
                 // dispatch) and ProgramState's own comment on why this is no longer Program 0.
@@ -7810,16 +7868,21 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             SeqAudioLane *lane = &g_seq_audio[l];
             if (!lane->is_playing) continue;
             if (lane->driven_by_transport && g_transport_state != TRANSPORT_PLAYING) continue;
+            // Off (seq_mode == 1) on a transport-driven lane is a real compute bypass -- skip the
+            // render call entirely (position frozen, not just silenced) -- per SeqLaneState's own
+            // precedence comment. A manually Preview-triggered lane is never affected, same as
+            // it's never affected by Pause/Stop -- Preview always plays straight through.
+            if (lane->driven_by_transport && (int)knobs->seq_lanes[l].seq_mode == 1) continue;
             float sample_l, sample_r;
             render_seq_audio_preview_sample(lane, knobs->seq_lanes[l].volume, knobs->seq_lanes[l].pan, &sample_l, &sample_r);
-            // Mute (seq_mode == 1) on a transport-driven lane silences it live, right now, rather
-            // than only preventing it from auto-starting on the next Play -- but the render call
-            // above still ran, so play_frame still advanced in step with the transport. Un-muting
+            // Mute on a transport-driven lane silences it live, right now, rather than only
+            // preventing it from auto-starting on the next Play -- but the render call above
+            // still ran, so play_frame still advanced in step with the transport. Un-muting
             // therefore resumes exactly in sync with everything else, instead of picking up from
             // wherever it happened to be when it was muted. A manually Preview-triggered lane
             // (driven_by_transport == false) is never affected by Mute, same as it's never
             // affected by Pause/Stop -- Preview always plays straight through regardless.
-            if (lane->driven_by_transport && (int)knobs->seq_lanes[l].seq_mode == 1) continue;
+            if (lane->driven_by_transport && knobs->seq_lanes[l].mute != 0.0f) continue;
             pair_l[0] += sample_l;
             pair_r[0] += sample_r;
         }

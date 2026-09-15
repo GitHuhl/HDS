@@ -3164,10 +3164,42 @@ class SynthGui(QWidget):
             if show_seq_controls:
                 type_combo = QComboBox(); type_combo.addItems(["Program/MIDI", "Audio"])
                 lay.addWidget(type_combo)
-                mode_combo = QComboBox(); mode_combo.addItems(["Seq", "Mute", "Rec"])
+                # Mute and Rec used to be two of this combo's own entries (a single exclusive
+                # Seq/Mute/Rec choice) -- per direct feedback, they're now independent toggle
+                # buttons instead (see _build_seq_lane_rec_mute_controls below), so this dropdown
+                # only carries what's left: Seq (the lane runs) vs Off (a real compute bypass --
+                # see SeqLaneState's own precedence comment in backend.c for exactly how Off
+                # overrides Mute/Rec when combined).
+                mode_combo = QComboBox(); mode_combo.addItems(["Seq", "Off"])
                 lay.addWidget(mode_combo)
             lay.addStretch()
             return (strip, fader, pan_dial, type_combo, mode_combo)
+
+        # Mute/Rec toggle buttons + the Overwrite/Overdub dropdown for one Sequencer lane
+        # (Sequencer tab only -- Combi has no per-lane recording concept at all, matching how
+        # _build_seq_audio_controls is likewise only ever called for the Sequencer view). Built
+        # separately and appended onto the strip's own layout afterward, same idiom
+        # _build_seq_audio_controls/the Combi picker's "Edit" button already use, to keep
+        # _build_seq_lane_row's own return shape unchanged (other code destructures it as a fixed
+        # 5-tuple). Both buttons mirror the oscillator Mute buttons' own checkable/red-when-
+        # engaged styling exactly (see vco1_mute) for a consistent "this is armed/engaged" look.
+        def _build_seq_lane_rec_mute_controls(idx):
+            mute_btn = QPushButton("Mute")
+            mute_btn.setCheckable(True)
+            mute_btn.setStyleSheet("QPushButton:checked { background-color: red; color: white; }")
+            mute_btn.setToolTip("Silence this lane's output live -- position stays in sync, resumes exactly where it left off when un-muted")
+            rec_btn = QPushButton("● Rec")
+            rec_btn.setCheckable(True)
+            rec_btn.setStyleSheet("QPushButton:checked { background-color: red; color: white; }")
+            rec_btn.setToolTip("Arm this lane to record incoming MIDI the next time Play is pressed (filtered by its own MIDI Channel below)")
+            overdub_combo = QComboBox()
+            overdub_combo.addItems(["Overwrite", "Overdub"])
+            overdub_combo.setStyleSheet("font-size: 9px;")
+            overdub_combo.setToolTip(
+                "Overwrite: a fresh Rec take clears this lane's previously recorded notes.\n"
+                "Overdub: a fresh take keeps them -- newly recorded notes are merged in by time, nothing is lost."
+            )
+            return mute_btn, rec_btn, overdub_combo
 
         # "Load Audio" controls for one Sequencer lane (Sequencer only -- Combi has no audio-lane
         # concept at all). Built separately from _build_seq_lane_row and appended onto the strip's
@@ -3396,6 +3428,14 @@ class SynthGui(QWidget):
         seq_strips_lay.setContentsMargins(0, 0, 0, 0); seq_strips_lay.setSpacing(3)
         self.seq_lane_rows = []  # 32 x (strip, fader, pan_dial, type_combo, mode_combo)
         self.seq_lane_audio_widgets = []  # 32 x dict, see _build_seq_audio_controls
+        # Mute/Rec toggle buttons + Overwrite-vs-Overdub dropdown (Program/MIDI lanes only in
+        # spirit -- Audio lanes still get a Mute button since they can be transport-driven too,
+        # but Rec/Overdub are meaningless for them and simply have no effect on the backend side;
+        # not worth hiding conditionally here since Type can be flipped live). See
+        # _build_seq_lane_rec_mute_controls's own comment.
+        self.seq_lane_mute_buttons = []  # 32 x QPushButton (checkable)
+        self.seq_lane_rec_buttons = []   # 32 x QPushButton (checkable)
+        self.seq_lane_overdub_combos = []  # 32 x QComboBox
         # Per-lane MIDI channel selector (Sequencer only -- Combi lanes stay hardcoded Omni, no
         # real independent lanes exist there yet). "Omni" (index 0, sent as backend's 0) or a
         # specific channel 1-16 (combo index N sent as N) -- filters which Rec-armed lane(s) an
@@ -3406,6 +3446,13 @@ class SynthGui(QWidget):
         self.seq_lane_midi_channel_combos = []  # 32 x QComboBox
         for i in range(SEQ_LANE_COUNT):
             lane = _build_seq_lane_row(i, show_seq_controls=True)
+            mute_btn, rec_btn, overdub_combo = _build_seq_lane_rec_mute_controls(i)
+            lane[0].layout().addWidget(mute_btn)
+            lane[0].layout().addWidget(rec_btn)
+            lane[0].layout().addWidget(overdub_combo)
+            self.seq_lane_mute_buttons.append(mute_btn)
+            self.seq_lane_rec_buttons.append(rec_btn)
+            self.seq_lane_overdub_combos.append(overdub_combo)
             audio_widgets = _build_seq_audio_controls(i)
             lane[0].layout().addWidget(audio_widgets["box"])
             self.seq_lane_audio_widgets.append(audio_widgets)
@@ -3427,7 +3474,7 @@ class SynthGui(QWidget):
         seq_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         seq_mixer_row = QHBoxLayout(); seq_mixer_row.setSpacing(4)
-        seq_mixer_row.addWidget(_build_lane_legend(["#", "Level", "Pan", "Type", "Mode", "Audio"]))
+        seq_mixer_row.addWidget(_build_lane_legend(["#", "Level", "Pan", "Type", "Mode", "Mute/Rec", "Audio"]))
         seq_mixer_row.addWidget(seq_scroll, stretch=1)
         seq_outer_lay.addLayout(seq_mixer_row, 1)
 
@@ -6011,6 +6058,9 @@ class SynthGui(QWidget):
             add_f(f"/hds/seq/{i}/pan", float(pan_dial.value()) / 100.0)
             add_f(f"/hds/seq/{i}/midi_channel", self.seq_lane_midi_channel_combos[i].currentIndex())  # 0=Omni, else 1-16
             add_f(f"/hds/seq/{i}/mode", mode_combo.currentIndex())
+            add_f(f"/hds/seq/{i}/mute", 1 if self.seq_lane_mute_buttons[i].isChecked() else 0)
+            add_f(f"/hds/seq/{i}/rec_armed", 1 if self.seq_lane_rec_buttons[i].isChecked() else 0)
+            add_f(f"/hds/seq/{i}/rec_overdub", self.seq_lane_overdub_combos[i].currentIndex())
             audio_widgets = self.seq_lane_audio_widgets[i]
             add_s(f"/hds/seq/{i}/audio_path", audio_widgets.get("path", "") or "")
             add_f(f"/hds/seq/{i}/audio_offset_sec", float(audio_widgets["offset_dial"].value()) / 10.0)
@@ -6022,6 +6072,9 @@ class SynthGui(QWidget):
                 add_f(f"/hds/seq/{i}/pan", float(pan_dial.value()) / 100.0)
                 add_f(f"/hds/seq/{i}/midi_channel", 0)
                 add_f(f"/hds/seq/{i}/mode", 0)  # meaningless in Combi mode
+                add_f(f"/hds/seq/{i}/mute", 0)
+                add_f(f"/hds/seq/{i}/rec_armed", 0)
+                add_f(f"/hds/seq/{i}/rec_overdub", 0)
 
         # Combi lanes' own real MIDI channel routing (0=Omni, else 1-16) -- separate from the
         # /hds/seq/{i}/midi_channel line above, which is Sequencer's own inert per-lane field.
@@ -6428,6 +6481,10 @@ def runtime_connect_and_bind(gui):
             mode_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
     for channel_combo in gui.seq_lane_midi_channel_combos:
         channel_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+    for mute_btn, rec_btn, overdub_combo in zip(gui.seq_lane_mute_buttons, gui.seq_lane_rec_buttons, gui.seq_lane_overdub_combos):
+        mute_btn.toggled.connect(gui.transmit_knob_packet)
+        rec_btn.toggled.connect(gui.transmit_knob_packet)
+        overdub_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
 
     # Unison Unison Saw control loops
     gui.vco1_unison_width.valueChanged.connect(gui.transmit_knob_packet)
