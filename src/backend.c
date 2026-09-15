@@ -7996,8 +7996,10 @@ typedef enum { HDS_STREAM_PLAYBACK, HDS_STREAM_CAPTURE } HdsStreamDirection;
 // ring buffer (miniaudio's own ma_pcm_rb) sits between the two: the callback drains/fills it at
 // the device's own pace, and write_audio_block/read_capture_block below push/pull from it with a
 // short blocking wait, reproducing the same "block until the device has room/data" contract ALSA
-// already provided. Sized off BUFFER_SIZE, not latency_ms -- see open_pcm_stream()'s own comment
-// for why (it bridges polling-vs-callback jitter, it's not a second latency-sized buffer).
+// already provided. Sized off the device's own ACTUAL negotiated period (known only once
+// ma_device_init() succeeds), not a pre-negotiation guess or latency_ms -- see open_pcm_stream()'s
+// own comment for why (it bridges polling-vs-callback jitter; the period WASAPI actually grants,
+// especially in Exclusive mode, can differ a lot from what was requested).
 struct HdsPcmStream {
     ma_device device;
     ma_pcm_rb rb;
@@ -8285,25 +8287,6 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
     HdsPcmStream *s = (HdsPcmStream *)calloc(1, sizeof(HdsPcmStream));
     if (!s) return false;
     s->channels = channels; s->is_capture = (stream == HDS_STREAM_CAPTURE);
-    // BUG FIX (Windows latency, round 2): the first fix (sizing this ring off latency_ms*4) was
-    // itself the wrong model. Compare against the ALSA branch just below: snd_pcm_set_params()
-    // passes latency_us STRAIGHT THROUGH with no multiplier at all -- ALSA's own hardware ring IS
-    // the single, whole latency budget the Devices tab's Latency knob promises, nothing stacked
-    // in front of it. On Windows, `config.periodSizeInMilliseconds` below (set from latency_ms)
-    // is the direct analogue of that same ALSA call -- it's WASAPI's own real, hardware-facing
-    // buffer. This software ring sits IN FRONT of that, bridging the gap between main()'s own
-    // polling cadence and WASAPI's callback cadence -- it was never supposed to be a second
-    // latency-sized buffer. Sizing it off latency_ms*4 (even with a 50ms floor) stacked an extra
-    // ~1-4x latency_ms of pure queueing delay on top of WASAPI's own already-latency_ms-sized
-    // buffer -- a real, structural gap versus ALSA's single-buffer contract, and exactly the kind
-    // of thing that would survive the first fix and still read as "still bad" next to Linux.
-    // Sized off BUFFER_SIZE (1024 frames, the hard block-size ceiling -- see
-    // effective_block_size()) instead: the largest single write this ring will ever need to
-    // absorb in one shot is one full block, so a small fixed multiple of that is enough margin
-    // for scheduling jitter between main()'s loop and the WASAPI callback, independent of
-    // whatever latency_ms happens to be set to.
-    ma_uint32 rb_frames = (ma_uint32)BUFFER_SIZE * 2;
-    if (ma_pcm_rb_init(ma_format_f32, (ma_uint32)channels, rb_frames, NULL, NULL, &s->rb) != MA_SUCCESS) { free(s); return false; }
 
     ma_device_id chosen_id; bool have_id = hds_win_find_device_id(device_name, s->is_capture, &chosen_id);
     ma_device_config config = ma_device_config_init(s->is_capture ? ma_device_type_capture : ma_device_type_playback);
@@ -8346,11 +8329,34 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
         }
         if (!wasapi_exclusive || ma_device_init(NULL, &config, &s->device) != MA_SUCCESS) {
             fprintf(stderr, "%s device '%s' failed to open\n", s->is_capture ? "Input" : "Output", device_name);
-            ma_pcm_rb_uninit(&s->rb); free(s);
+            free(s);
             *handle = NULL;
             return false;
         }
     }
+
+    // BUG FIX (Windows underruns even at idle, 0 voices): the ring used to be sized BEFORE
+    // ma_device_init() off a guessed constant (first BUFFER_SIZE*2, before that latency_ms*4) --
+    // but the period WASAPI actually grants (device.playback/capture.internalPeriodSizeInFrames,
+    // only known once ma_device_init() succeeds) can differ substantially from what was
+    // requested, especially in Exclusive mode where the DEVICE dictates which periods are even
+    // available at all, not the request. If the real negotiated period is close to or bigger than
+    // whatever fixed guess the ring used, the callback thread structurally can never be kept fed
+    // -- underruns climb continuously even rendering pure silence, since it's not a speed problem
+    // at all, it's the ring being the wrong size for what WASAPI is actually asking for. Now
+    // sized off the real, post-negotiation period every time (including on a live Shared<->
+    // Exclusive switch, since that's a full reopen through this same function) instead of a
+    // pre-negotiation guess.
+    ma_uint32 actual_period_frames = s->is_capture ? s->device.capture.internalPeriodSizeInFrames : s->device.playback.internalPeriodSizeInFrames;
+    if (actual_period_frames == 0) actual_period_frames = (ma_uint32)BUFFER_SIZE; // defensive: some backends/paths may not populate this -- BUFFER_SIZE is still a sane worst-case single-write size
+    ma_uint32 rb_frames = actual_period_frames * 4;
+    if (ma_pcm_rb_init(ma_format_f32, (ma_uint32)channels, rb_frames, NULL, NULL, &s->rb) != MA_SUCCESS) {
+        fprintf(stderr, "%s device '%s': failed to allocate its internal ring buffer\n", s->is_capture ? "Input" : "Output", device_name);
+        ma_device_uninit(&s->device); free(s);
+        *handle = NULL;
+        return false;
+    }
+
     if (ma_device_start(&s->device) != MA_SUCCESS) {
         fprintf(stderr, "%s device '%s' failed to start\n", s->is_capture ? "Input" : "Output", device_name);
         ma_device_uninit(&s->device); ma_pcm_rb_uninit(&s->rb); free(s);
