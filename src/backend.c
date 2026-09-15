@@ -8266,21 +8266,24 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
     HdsPcmStream *s = (HdsPcmStream *)calloc(1, sizeof(HdsPcmStream));
     if (!s) return false;
     s->channels = channels; s->is_capture = (stream == HDS_STREAM_CAPTURE);
-    // BUG FIX (Windows latency): this used to be a flat half-second (24000 frames) regardless of
-    // latency_ms. Since write_audio_block() only blocks when the ring is genuinely full, a fixed
-    // oversized ring let main()'s loop -- which renders far faster than real time -- race ahead
-    // and queue up to that full half-second of unplayed audio before backpressure ever kicked in,
-    // so every note landed roughly 500ms late no matter what the Devices tab's Latency knob was
-    // set to (the knob only changed the *requested* WASAPI period, never this ring's actual
-    // capacity). Sizing the ring off latency_ms instead -- a handful of periods of headroom, the
-    // same period-count-of-headroom relationship ALSA's own snd_pcm_set_params buffer/period
-    // split already uses -- makes the ring drain back down close to one requested period's worth
-    // of backlog in steady state, and makes the Latency knob actually govern real-world latency
-    // again. Floor/ceiling keep it sane at the knob's extremes.
-    ma_uint32 period_frames = (ma_uint32)(SAMPLE_RATE * fmaxf(1.0f, latency_ms) / 1000.0f);
-    ma_uint32 rb_frames = period_frames * 4;
-    if (rb_frames < (ma_uint32)(SAMPLE_RATE / 20)) rb_frames = (ma_uint32)(SAMPLE_RATE / 20); // floor: 50ms
-    if (rb_frames > (ma_uint32)(SAMPLE_RATE * 2)) rb_frames = (ma_uint32)(SAMPLE_RATE * 2); // ceiling: 2s
+    // BUG FIX (Windows latency, round 2): the first fix (sizing this ring off latency_ms*4) was
+    // itself the wrong model. Compare against the ALSA branch just below: snd_pcm_set_params()
+    // passes latency_us STRAIGHT THROUGH with no multiplier at all -- ALSA's own hardware ring IS
+    // the single, whole latency budget the Devices tab's Latency knob promises, nothing stacked
+    // in front of it. On Windows, `config.periodSizeInMilliseconds` below (set from latency_ms)
+    // is the direct analogue of that same ALSA call -- it's WASAPI's own real, hardware-facing
+    // buffer. This software ring sits IN FRONT of that, bridging the gap between main()'s own
+    // polling cadence and WASAPI's callback cadence -- it was never supposed to be a second
+    // latency-sized buffer. Sizing it off latency_ms*4 (even with a 50ms floor) stacked an extra
+    // ~1-4x latency_ms of pure queueing delay on top of WASAPI's own already-latency_ms-sized
+    // buffer -- a real, structural gap versus ALSA's single-buffer contract, and exactly the kind
+    // of thing that would survive the first fix and still read as "still bad" next to Linux.
+    // Sized off BUFFER_SIZE (1024 frames, the hard block-size ceiling -- see
+    // effective_block_size()) instead: the largest single write this ring will ever need to
+    // absorb in one shot is one full block, so a small fixed multiple of that is enough margin
+    // for scheduling jitter between main()'s loop and the WASAPI callback, independent of
+    // whatever latency_ms happens to be set to.
+    ma_uint32 rb_frames = (ma_uint32)BUFFER_SIZE * 2;
     if (ma_pcm_rb_init(ma_format_f32, (ma_uint32)channels, rb_frames, NULL, NULL, &s->rb) != MA_SUCCESS) { free(s); return false; }
 
     ma_device_id chosen_id; bool have_id = hds_win_find_device_id(device_name, s->is_capture, &chosen_id);
