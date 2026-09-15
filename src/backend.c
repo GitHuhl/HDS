@@ -648,6 +648,21 @@ typedef struct {
     float vco2_pitch;
     float vco3_pitch;
     float vco4_pitch;
+
+    // Monophonic Noise (Noise shape only -- meaningless/unread for any other shape, matching the
+    // dual-duty pulse_width-or-tilt convention's own shape-conditional posture). When set, every
+    // currently-sounding voice on this oscillator shares ONE noise generator for the whole
+    // Program instead of each voice computing its own independent white noise -- the classic
+    // "one physical noise source feeding the whole keyboard" behavior real analog synths have
+    // (as opposed to N uncorrelated per-voice generators, which average toward smoother/thicker
+    // noise under a chord purely as a side effect of polyphony). Computed once per
+    // Program+oscillator+sample, before the voice loop -- see mono_noise_out[]/
+    // mono_noise_tilt_lp[] in render_audio_block. Default off (0.0f) reproduces today's exact
+    // per-voice-independent-noise behavior.
+    float vco1_mono_noise;
+    float vco2_mono_noise;
+    float vco3_mono_noise;
+    float vco4_mono_noise;
 } ProgramState;
 
 typedef struct {
@@ -3673,6 +3688,40 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco4/pitch", vco4_pitch, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco4/pitch", vco4_pitch, 7),
 
+    // Monophonic Noise (Noise shape only -- see ProgramState.vco1_mono_noise's own comment).
+    OSC_PSCALAR("/hds/vco1/mono_noise", vco1_mono_noise),
+    OSC_PSCALAR_AT("/hds/combi/1/vco1/mono_noise", vco1_mono_noise, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco1/mono_noise", vco1_mono_noise, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco1/mono_noise", vco1_mono_noise, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco1/mono_noise", vco1_mono_noise, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco1/mono_noise", vco1_mono_noise, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco1/mono_noise", vco1_mono_noise, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco1/mono_noise", vco1_mono_noise, 7),
+    OSC_PSCALAR("/hds/vco2/mono_noise", vco2_mono_noise),
+    OSC_PSCALAR_AT("/hds/combi/1/vco2/mono_noise", vco2_mono_noise, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco2/mono_noise", vco2_mono_noise, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco2/mono_noise", vco2_mono_noise, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco2/mono_noise", vco2_mono_noise, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco2/mono_noise", vco2_mono_noise, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco2/mono_noise", vco2_mono_noise, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco2/mono_noise", vco2_mono_noise, 7),
+    OSC_PSCALAR("/hds/vco3/mono_noise", vco3_mono_noise),
+    OSC_PSCALAR_AT("/hds/combi/1/vco3/mono_noise", vco3_mono_noise, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco3/mono_noise", vco3_mono_noise, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco3/mono_noise", vco3_mono_noise, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco3/mono_noise", vco3_mono_noise, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco3/mono_noise", vco3_mono_noise, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco3/mono_noise", vco3_mono_noise, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco3/mono_noise", vco3_mono_noise, 7),
+    OSC_PSCALAR("/hds/vco4/mono_noise", vco4_mono_noise),
+    OSC_PSCALAR_AT("/hds/combi/1/vco4/mono_noise", vco4_mono_noise, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco4/mono_noise", vco4_mono_noise, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco4/mono_noise", vco4_mono_noise, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco4/mono_noise", vco4_mono_noise, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco4/mono_noise", vco4_mono_noise, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco4/mono_noise", vco4_mono_noise, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco4/mono_noise", vco4_mono_noise, 7),
+
     // --- Combi/Sequencer scaffolding (see SEQ_LANE_COUNT's own comment) ---
     OSC_SCALAR("/hds/performance_mode", performance_mode),
     OSC_SUBARRAY("/hds/seq/%d/lane_type", seq_lanes, SeqLaneState, lane_type, SEQ_LANE_COUNT),
@@ -3817,6 +3866,8 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].fm_depth_4_1 = 0.0f; knobs->programs[0].fm_depth_4_3 = 0.0f;
     knobs->programs[0].fm_depth_1_2 = 0.0f; knobs->programs[0].fm_depth_3_4 = 0.0f; knobs->programs[0].fm_depth_1_3 = 0.0f;
     knobs->programs[0].vco1_pitch = 0.0f; knobs->programs[0].vco2_pitch = 0.0f; knobs->programs[0].vco3_pitch = 0.0f; knobs->programs[0].vco4_pitch = 0.0f;
+    knobs->programs[0].vco1_mono_noise = 0.0f; knobs->programs[0].vco2_mono_noise = 0.0f;
+    knobs->programs[0].vco3_mono_noise = 0.0f; knobs->programs[0].vco4_mono_noise = 0.0f;
     // Osc 3/4 Amp envelopes live at eg[2]/eg[3] (and eg_mode[2]/eg_mode[3]) and were covered by
     // the generic `for(int e=0; e<ENV_COUNT; e++)` default-fill loop above -- nothing extra
     // needed here.
@@ -5369,6 +5420,7 @@ static float render_fm_oscillator(
     const float unison_pan_l[UNISON_SAW_VOICES], const float unison_pan_r[UNISON_SAW_VOICES],
     int *sample_stream, double *sample_ptr, bool *sample_preroll, float hz,
     bool do_sync, float t_wrap, float *pending_sync_correction,
+    bool mono_noise_active, float mono_noise_value,
     float *out_side_l, float *out_side_r)
 {
     if (shape == WAVE_UNISON_SAW) {
@@ -5391,6 +5443,13 @@ static float render_fm_oscillator(
     float adaptive_dt = fmaxf(fminf(fabsf(phase_delta), 0.499f), dt);
 
     if (shape == WAVE_NOISE) {
+        *out_side_l = *out_side_r = 0.0f;
+        // Monophonic Noise: every voice reads the exact same precomputed sample this sample
+        // (computed once per Program+oscillator, before the voice loop -- see mono_noise_out[]
+        // in render_audio_block) instead of each voice running its own independent generator/
+        // filter below. This voice's own tilt_lp state is simply left untouched while mono is
+        // active, so it picks up wherever it left off if the checkbox is ever turned back off.
+        if (mono_noise_active) return mono_noise_value;
         // Tilt-shaped noise (unified across all 4 oscillators -- see the Tilt-noise decision):
         // white noise through a one-pole low-pass; tilt_frac in [-1,1] crossfades low-passed
         // (dark, -1) against its high-passed complement (bright/hissy, +1), 0 = flat white
@@ -5399,7 +5458,6 @@ static float render_fm_oscillator(
         *tilt_lp += noise_tilt_coeff * (white - *tilt_lp);
         float tilt_high = white - *tilt_lp;
         float tilt_frac = fmaxf(-1.0f, fminf(1.0f, pulse_or_tilt_input / 100.0f));
-        *out_side_l = *out_side_r = 0.0f;
         return *tilt_lp * (1.0f - tilt_frac) + tilt_high * (1.0f + tilt_frac);
     }
 
@@ -6184,6 +6242,12 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     static float lfo_decim_last_value[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
     static float lfo_decim_target_value[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
 
+    // Monophonic Noise tilt-filter state (see ProgramState.vco1_mono_noise's own comment) --
+    // one shared generator per Program+oscillator, computed once per sample below (before the
+    // voice loop) rather than once per voice. Function-local static for the same single-instance
+    // reason as lfo_phase_mod_state above.
+    static float mono_noise_tilt_lp[COMBI_PROGRAM_COUNT][4] = {{0.0f}};
+
     // FX bus engine state: persists across calls (and across FX_TYPE changes -- see
     // process_fx_chain) for the same "single synth engine instance" reason as above.
     static FXSlotEngine fx_engine[FX_SLOT_COUNT];
@@ -6367,6 +6431,32 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 lfo_decim_counter[p][l] = (lfo_decim_counter[p][l] + 1) % LFO_DECIMATION_FACTOR;
             }
         }
+        }
+
+        // Monophonic Noise: one shared white-noise/tilt-filter generator per Program+oscillator,
+        // computed once per sample HERE (before the voice loop, not inside it) so every voice
+        // sharing this Program's oscillator reads the exact same sample this sample -- the
+        // classic "one physical noise source feeding the whole keyboard" behavior, as opposed to
+        // each voice running its own independent, uncorrelated generator (today's default,
+        // still what happens whenever the checkbox is off). Tilt uses the Program's own knob
+        // value only (no per-voice EG modulation) -- a deliberate simplification, since a single
+        // shared generator has no single per-voice modulated value to defer to. Meaningless/
+        // unused for any oscillator not currently WAVE_NOISE with mono_noise engaged -- cheap to
+        // just always compute for the (at most 8) active Programs regardless.
+        float mono_noise_out[COMBI_PROGRAM_COUNT][4] = {{0.0f}};
+        for (int p = 0; p < active_program_count; p++) {
+            const ProgramState *mprog = &knobs->programs[p];
+            float mono_flag[4] = { mprog->vco1_mono_noise, mprog->vco2_mono_noise, mprog->vco3_mono_noise, mprog->vco4_mono_noise };
+            WaveType mono_shape[4] = { (WaveType)(int)mprog->vco1_shape, (WaveType)(int)mprog->vco2_shape, (WaveType)(int)mprog->vco3_shape, (WaveType)(int)mprog->vco4_shape };
+            float mono_pulse_or_tilt[4] = { mprog->vco1_pulse_width, mprog->vco2_pulse_width, mprog->vco3_pulse_width, mprog->vco4_pulse_width };
+            for (int osc = 0; osc < 4; osc++) {
+                if (mono_flag[osc] == 0.0f || mono_shape[osc] != WAVE_NOISE) continue;
+                float white = (((float)rand() / (float)RAND_MAX) * 2.0f) - 1.0f;
+                mono_noise_tilt_lp[p][osc] += noise_tilt_coeff * (white - mono_noise_tilt_lp[p][osc]);
+                float tilt_high = white - mono_noise_tilt_lp[p][osc];
+                float tilt_frac = fmaxf(-1.0f, fminf(1.0f, mono_pulse_or_tilt[osc] / 100.0f));
+                mono_noise_out[p][osc] = mono_noise_tilt_lp[p][osc] * (1.0f - tilt_frac) + tilt_high * (1.0f + tilt_frac);
+            }
         }
 
         for (int v = 0; v < voice_limit; v++) {
@@ -6756,6 +6846,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
 
             float osc_out[4] = {0.0f, 0.0f, 0.0f, 0.0f}, osc_side_l[4] = {0.0f, 0.0f, 0.0f, 0.0f}, osc_side_r[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             float modulator_output[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            bool mono_noise_flag_arr[4] = { prog->vco1_mono_noise != 0.0f, prog->vco2_mono_noise != 0.0f, prog->vco3_mono_noise != 0.0f, prog->vco4_mono_noise != 0.0f };
             for (int slot = 0; slot < 4; slot++) {
                 int osc = alg->render_order[slot];
                 if (shape_arr[osc] == WAVE_OFF) { *pending_sync_correction_ptr[osc] = 0.0f; continue; } // WAVE_OFF: skip render entirely (phase advances unconditionally below)
@@ -6775,6 +6866,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                     unison_pan_l_ptr[osc], unison_pan_r_ptr[osc],
                     sample_stream_ptr[osc], sample_ptr_ptr[osc], sample_preroll_ptr[osc], hz_arr[osc],
                     do_sync_arr[osc], t_wrap_arr[osc], pending_sync_correction_ptr[osc],
+                    mono_noise_flag_arr[osc], mono_noise_out[pidx][osc],
                     &osc_side_l[osc], &osc_side_r[osc]);
                 modulator_output[osc] = osc_out[osc] * gain_for_fm_arr[osc] * eg_level_arr[osc];
             }

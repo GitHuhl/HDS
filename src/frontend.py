@@ -2541,6 +2541,12 @@ class SynthGui(QWidget):
         self.vco1_pulse_width.setValue(50)
         self.vco1_pulse_width.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(34, pos))
         v1_pw_lay.addWidget(self.vco1_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
+        # Monophonic Noise -- only visible (and only meaningful to the backend) when this
+        # oscillator's Shape is Noise. See ProgramState.vco1_mono_noise's own comment.
+        self.vco1_mono_noise = QCheckBox("Mono")
+        self.vco1_mono_noise.setToolTip("Every voice shares one noise generator instead of each voice having its own independent noise.")
+        _retain_hidden(self.vco1_mono_noise)
+        v1_pw_lay.addWidget(self.vco1_mono_noise, alignment=Qt.AlignmentFlag.AlignCenter)
         _retain_hidden(self.vco1_pulse_box)
         v1_strip.addWidget(self.vco1_pulse_box)
 
@@ -2670,6 +2676,10 @@ class SynthGui(QWidget):
         self.vco2_pulse_width.setValue(50)
         self.vco2_pulse_width.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(35, pos))
         v2_pw_lay.addWidget(self.vco2_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco2_mono_noise = QCheckBox("Mono")
+        self.vco2_mono_noise.setToolTip("Every voice shares one noise generator instead of each voice having its own independent noise.")
+        _retain_hidden(self.vco2_mono_noise)
+        v2_pw_lay.addWidget(self.vco2_mono_noise, alignment=Qt.AlignmentFlag.AlignCenter)
         _retain_hidden(self.vco2_pulse_box)
         v2_strip.addWidget(self.vco2_pulse_box)
 
@@ -2799,6 +2809,10 @@ class SynthGui(QWidget):
         self.vco3_pulse_width.setValue(0)
         self.vco3_pulse_width.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(38, pos))
         v3_pw_lay.addWidget(self.vco3_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco3_mono_noise = QCheckBox("Mono")
+        self.vco3_mono_noise.setToolTip("Every voice shares one noise generator instead of each voice having its own independent noise.")
+        _retain_hidden(self.vco3_mono_noise)
+        v3_pw_lay.addWidget(self.vco3_mono_noise, alignment=Qt.AlignmentFlag.AlignCenter)
         _retain_hidden(self.vco3_pulse_box)
         v3_strip.addWidget(self.vco3_pulse_box)
 
@@ -2926,6 +2940,10 @@ class SynthGui(QWidget):
         self.vco4_pulse_width.setValue(50)
         self.vco4_pulse_width.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(47, pos))
         v4_pw_lay.addWidget(self.vco4_pulse_width, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.vco4_mono_noise = QCheckBox("Mono")
+        self.vco4_mono_noise.setToolTip("Every voice shares one noise generator instead of each voice having its own independent noise.")
+        _retain_hidden(self.vco4_mono_noise)
+        v4_pw_lay.addWidget(self.vco4_mono_noise, alignment=Qt.AlignmentFlag.AlignCenter)
         _retain_hidden(self.vco4_pulse_box)
         v4_strip.addWidget(self.vco4_pulse_box)
 
@@ -4556,11 +4574,18 @@ class SynthGui(QWidget):
         NOISE_INDEX = OSC_SHAPE_NAMES.index("Noise")
         PULSE_INDEX = OSC_SHAPE_NAMES.index("Pulse")
 
-        def _wire_osc_strip(combo, vis, unison_box, pulse_box, pulse_label, pulse_knob):
+        def _wire_osc_strip(combo, vis, unison_box, pulse_box, pulse_label, pulse_knob, mono_check):
             def on_shape_changed(idx):
                 vis.set_waveform(idx, is_lfo=False)
                 unison_box.setVisible(idx == UNISON_SAW_INDEX)
                 pulse_box.setVisible(idx in (PULSE_INDEX, NOISE_INDEX))
+                # Monophonic Noise checkbox: visible only for Noise, and unchecked (backend no-op,
+                # since mono_noise is meaningless for any other shape) the moment the shape leaves
+                # Noise -- so a checked box can never sit silently behind a shape it doesn't apply
+                # to, and switching back to Noise always starts from the safe default (unchecked).
+                mono_check.setVisible(idx == NOISE_INDEX)
+                if idx != NOISE_INDEX and mono_check.isChecked():
+                    mono_check.setChecked(False)
                 if idx == NOISE_INDEX:
                     pulse_label.setText("Tilt")
                 else:
@@ -4568,10 +4593,10 @@ class SynthGui(QWidget):
             combo.currentIndexChanged.connect(on_shape_changed)
             on_shape_changed(combo.currentIndex())
 
-        _wire_osc_strip(self.vco1_combo, self.vco1_vis, self.vco1_unison_box, self.vco1_pulse_box, self.vco1_pulse_label, self.vco1_pulse_width)
-        _wire_osc_strip(self.vco2_combo, self.vco2_vis, self.vco2_unison_box, self.vco2_pulse_box, self.vco2_pulse_label, self.vco2_pulse_width)
-        _wire_osc_strip(self.vco3_combo, self.vco3_vis, self.vco3_unison_box, self.vco3_pulse_box, self.vco3_pulse_label, self.vco3_pulse_width)
-        _wire_osc_strip(self.vco4_combo, self.vco4_vis, self.vco4_unison_box, self.vco4_pulse_box, self.vco4_pulse_label, self.vco4_pulse_width)
+        _wire_osc_strip(self.vco1_combo, self.vco1_vis, self.vco1_unison_box, self.vco1_pulse_box, self.vco1_pulse_label, self.vco1_pulse_width, self.vco1_mono_noise)
+        _wire_osc_strip(self.vco2_combo, self.vco2_vis, self.vco2_unison_box, self.vco2_pulse_box, self.vco2_pulse_label, self.vco2_pulse_width, self.vco2_mono_noise)
+        _wire_osc_strip(self.vco3_combo, self.vco3_vis, self.vco3_unison_box, self.vco3_pulse_box, self.vco3_pulse_label, self.vco3_pulse_width, self.vco3_mono_noise)
+        _wire_osc_strip(self.vco4_combo, self.vco4_vis, self.vco4_unison_box, self.vco4_pulse_box, self.vco4_pulse_label, self.vco4_pulse_width, self.vco4_mono_noise)
 
         # FM Algorithm: show only the depth dial(s) the selected algorithm actually uses.
         def _on_fm_algorithm_changed(idx):
@@ -5016,6 +5041,10 @@ class SynthGui(QWidget):
                 dial.blockSignals(True); dial.setValue(int(round(fields[addr] / 100.0))); dial.blockSignals(False)
         for addr, cb in (("/hds/vco1/mute", self.vco1_mute), ("/hds/vco2/mute", self.vco2_mute),
                          ("/hds/vco3/mute", self.vco3_mute), ("/hds/vco4/mute", self.vco4_mute)):
+            if addr in fields:
+                cb.blockSignals(True); cb.setChecked(fields[addr] != 0.0); cb.blockSignals(False)
+        for addr, cb in (("/hds/vco1/mono_noise", self.vco1_mono_noise), ("/hds/vco2/mono_noise", self.vco2_mono_noise),
+                         ("/hds/vco3/mono_noise", self.vco3_mono_noise), ("/hds/vco4/mono_noise", self.vco4_mono_noise)):
             if addr in fields:
                 cb.blockSignals(True); cb.setChecked(fields[addr] != 0.0); cb.blockSignals(False)
         for addr, dial in (("/hds/vco1/vol", self.vco1_vol), ("/hds/vco2/vol", self.vco2_vol),
@@ -5902,18 +5931,23 @@ class SynthGui(QWidget):
         # Pulse width, Osc 1/2
         add_f("/hds/vco1/pulse_width", self.vco1_pulse_width.value())
         add_f("/hds/vco2/pulse_width", self.vco2_pulse_width.value())
+        # Monophonic Noise (Noise shape only -- see the checkbox's own tooltip/comment)
+        add_f("/hds/vco1/mono_noise", 1.0 if self.vco1_mono_noise.isChecked() else 0.0)
+        add_f("/hds/vco2/mono_noise", 1.0 if self.vco2_mono_noise.isChecked() else 0.0)
 
         # Osc 3: vol, pan, mute, pulse-width-or-tilt
         add_f("/hds/vco3/vol", self.vco3_vol.value() / 100.0)
         add_f("/hds/vco3/pan", self.vco3_pan.value() / 100.0)
         add_f("/hds/vco3/mute", 1.0 if self.vco3_mute.isChecked() else 0.0)
         add_f("/hds/vco3/pulse_width", self.vco3_pulse_width.value())
+        add_f("/hds/vco3/mono_noise", 1.0 if self.vco3_mono_noise.isChecked() else 0.0)
 
         # Osc 4: vol, pan, mute, pulse-width-or-tilt
         add_f("/hds/vco4/vol", self.vco4_vol.value() / 100.0)
         add_f("/hds/vco4/pan", self.vco4_pan.value() / 100.0)
         add_f("/hds/vco4/mute", 1.0 if self.vco4_mute.isChecked() else 0.0)
         add_f("/hds/vco4/pulse_width", self.vco4_pulse_width.value())
+        add_f("/hds/vco4/mono_noise", 1.0 if self.vco4_mono_noise.isChecked() else 0.0)
 
         # External Audio Input: enable + gain per ext-in pair (Routing tab). Ext-in pairs sit at
         # source ids COMBI_PROGRAM_COUNT+1..+8 (9-16), after the 8 Combi Programs + Combi Mix.
@@ -6140,6 +6174,8 @@ def runtime_connect_and_bind(gui):
     gui.tempo_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco1_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco2_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco1_mono_noise.toggled.connect(gui.transmit_knob_packet)
+    gui.vco2_mono_noise.toggled.connect(gui.transmit_knob_packet)
 
     # Oscillator 3 (full peer of Osc 1/2 now, was the dedicated Noise oscillator)
     gui.vco3_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
@@ -6147,6 +6183,7 @@ def runtime_connect_and_bind(gui):
     gui.vco3_pan.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_mute.toggled.connect(gui.transmit_knob_packet)
     gui.vco3_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco3_mono_noise.toggled.connect(gui.transmit_knob_packet)
     gui.vco3_fine_tune.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_pitch_offset.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_phase.valueChanged.connect(gui.transmit_knob_packet)
@@ -6159,6 +6196,7 @@ def runtime_connect_and_bind(gui):
     gui.vco4_pan.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_mute.toggled.connect(gui.transmit_knob_packet)
     gui.vco4_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco4_mono_noise.toggled.connect(gui.transmit_knob_packet)
     gui.vco4_fine_tune.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_pitch_offset.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_phase.valueChanged.connect(gui.transmit_knob_packet)
