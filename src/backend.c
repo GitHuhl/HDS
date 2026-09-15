@@ -8377,6 +8377,20 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
     if (actual_period_frames == 0) actual_period_frames = (ma_uint32)BUFFER_SIZE; // defensive: some backends/paths may not populate this -- BUFFER_SIZE is still a sane worst-case single-write size
     ma_uint32 rb_frames = actual_period_frames * 4;
     s->target_occupancy_frames = actual_period_frames; // the ring's *resting* depth -- see write_audio_block()'s own comment
+
+    // DIAGNOSTIC: every previous fix only ever touched the software ring sitting IN FRONT OF
+    // WASAPI's own hardware buffer -- none of them ever measured what WASAPI itself actually
+    // granted for that buffer. If the real negotiated period/buffer here is far bigger than
+    // latency_ms (a real possibility -- some drivers/devices enforce their own floor regardless
+    // of what's requested; Bluetooth output is the extreme case, with 100ms+ baked into the
+    // transport itself, no software fix reaches that) then every ring-side change is downstream
+    // of a bottleneck that was never actually measured. Logged once per open so a report of "no
+    // change" can be checked against real numbers instead of guessed at again.
+    ma_uint32 actual_buffer_frames = s->is_capture ? s->device.wasapi.actualBufferSizeInFramesCapture : s->device.wasapi.actualBufferSizeInFramesPlayback;
+    fprintf(stderr, "[audio] %s opened (%s): requested %.1fms, WASAPI granted period=%u frames (%.1fms), full buffer=%u frames (%.1fms)\n",
+            s->is_capture ? "Input" : "Output", wasapi_exclusive ? "Exclusive" : "Shared", (double)latency_ms,
+            actual_period_frames, (double)actual_period_frames * 1000.0 / SAMPLE_RATE,
+            actual_buffer_frames, (double)actual_buffer_frames * 1000.0 / SAMPLE_RATE);
     if (ma_pcm_rb_init(ma_format_f32, (ma_uint32)channels, rb_frames, NULL, NULL, &s->rb) != MA_SUCCESS) {
         fprintf(stderr, "%s device '%s': failed to allocate its internal ring buffer\n", s->is_capture ? "Input" : "Output", device_name);
         ma_device_uninit(&s->device); free(s);
