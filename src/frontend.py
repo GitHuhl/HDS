@@ -669,10 +669,75 @@ FX_TYPE_METADATA = [
     ]},
 ]
 
+# Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --
+# must match the backend's own "auto"/empty-string convention in midi_client_should_autoconnect.
+MIDI_AUTO_LABEL = "Auto (recommended)"
+
+def _find_windows_backend_exe():
+    """Locates synth_engine.exe so _list_windows_devices() below can spawn it for
+    `--list-devices`. Mirrors _maybe_launch_bundled_backend()'s own bundle_dir lookup for a frozen
+    PyInstaller build; for a plain `python src\\frontend.py` dev run (no bundle), falls back to
+    looking next to this script's own repo checkout -- the `make windows` output location -- and
+    then the current working directory. Returns None if none of those panned out; callers treat
+    that the same as the executable failing to run at all."""
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    candidates = []
+    if bundle_dir:
+        candidates.append(os.path.join(bundle_dir, "synth_engine.exe"))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "synth_engine.exe"))
+    candidates.append(os.path.join(os.getcwd(), "synth_engine.exe"))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+_windows_devices_cache = {"time": 0.0, "data": None}
+
+def _list_windows_devices():
+    """Runs `synth_engine.exe --list-devices` (backend.c's hds_win_print_device_list(), gated
+    behind that CLI flag in main()) and parses its [output]/[input]/[midi] sections -- the Windows
+    equivalent of _list_alsa_devices()/_list_midi_input_devices()'s aplay/arecord/aconnect calls,
+    none of which exist on Windows (they fail silently and those functions were falling back to
+    their single "default"/"Auto" entry always, making the Devices tab's dropdowns look inert).
+    Cached for a second so a burst of calls (startup builds all 3 combos back to back; so does a
+    single Refresh click) spawns the exe once, not three times. Falls back to the same safe
+    single-entry lists on any failure (exe not found, timeout, nonzero exit)."""
+    now = time.monotonic()
+    if _windows_devices_cache["data"] is not None and now - _windows_devices_cache["time"] < 1.0:
+        return _windows_devices_cache["data"]
+    fallback = {"output": ["default"], "input": ["default"], "midi": [MIDI_AUTO_LABEL]}
+    exe = _find_windows_backend_exe()
+    devices = fallback
+    if exe:
+        try:
+            result = subprocess.run([exe, "--list-devices"], capture_output=True, text=True, timeout=5)
+            devices = {"output": [], "input": [], "midi": []}
+            section = None
+            for line in result.stdout.splitlines():
+                line = line.rstrip("\r\n")
+                if line in ("[output]", "[input]", "[midi]"):
+                    section = line[1:-1]
+                elif section and line:
+                    devices[section].append(line)
+            if "default" not in devices["output"]:
+                devices["output"].insert(0, "default")
+            if "default" not in devices["input"]:
+                devices["input"].insert(0, "default")
+            if not devices["midi"]:
+                devices["midi"] = [MIDI_AUTO_LABEL]
+        except (OSError, subprocess.SubprocessError):
+            devices = fallback
+    _windows_devices_cache["time"] = now
+    _windows_devices_cache["data"] = devices
+    return devices
+
 def _list_alsa_devices(list_cmd):
-    """Best-effort enumeration of ALSA PCM device names via `aplay -L` / `arecord -L`. Falls
-    back to just ["default"] if the tool isn't installed, times out, or returns nothing --
-    "default" is always a safe starting point."""
+    """Best-effort enumeration of PCM device names. On Windows, delegates to
+    _list_windows_devices() (aplay/arecord don't exist there); on Linux, via `aplay -L` /
+    `arecord -L`. Falls back to just ["default"] if the tool isn't installed, times out, or
+    returns nothing -- "default" is always a safe starting point."""
+    if sys.platform == "win32":
+        return _list_windows_devices()["output" if list_cmd[0] == "aplay" else "input"]
     names = []
     try:
         result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=2)
@@ -685,19 +750,18 @@ def _list_alsa_devices(list_cmd):
         names.remove("default")
     return ["default"] + names
 
-# Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --
-# must match the backend's own "auto"/empty-string convention in midi_client_should_autoconnect.
-MIDI_AUTO_LABEL = "Auto (recommended)"
-
 _ACONNECT_CLIENT_RE = re.compile(r"^client\s+(\d+):\s*'(.*)'\s*\[type=(\w+)")
 
 def _list_midi_input_devices():
-    """Best-effort enumeration of real MIDI source device names via `aconnect -i` (lists
+    """Best-effort enumeration of real MIDI source device names. On Windows, delegates to
+    _list_windows_devices() (`aconnect` doesn't exist there). On Linux, via `aconnect -i` (lists
     input-capable clients, i.e. things that GENERATE MIDI -- keyboards/controllers -- as opposed
     to `aconnect -o`'s output-capable/receiving clients). Falls back to just [MIDI_AUTO_LABEL] if
     the tool isn't installed, times out, or nothing qualifies -- backend.c applies the exact same
     System-client/kernel-type/"Midi Through" filtering independently when it does its own live
     scan, so this list is a preview of what auto-connect would pick up, not the source of truth."""
+    if sys.platform == "win32":
+        return _list_windows_devices()["midi"]
     names = []
     try:
         result = subprocess.run(["aconnect", "-i"], capture_output=True, text=True, timeout=2)

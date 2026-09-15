@@ -8047,6 +8047,33 @@ static bool hds_win_find_device_id(const char *device_name, bool capture, ma_dev
     }
     return false;
 }
+
+// `synth_engine.exe --list-devices` (see main()'s CLI handling below): prints every real
+// output/input/MIDI-input device name this machine currently has, one per line, grouped under a
+// bracketed section header. frontend.py's Devices tab populates its combo boxes this way on
+// Windows instead of shelling out to the ALSA-only `aplay -L`/`arecord -L`/`aconnect -i` tools it
+// already uses on Linux (which don't exist here and would otherwise silently leave every combo
+// showing nothing but its single "default"/"Auto" fallback entry, making device selection look
+// like it does nothing). Reuses the exact same enumeration calls hds_win_find_device_id() and the
+// WinMM MIDI shim's own win32_midi_open_matching() already use -- this is a read-only listing of
+// the same data, not a new enumeration mechanism.
+static void hds_win_print_device_list(void) {
+    hds_win_ensure_context();
+    printf("[output]\n");
+    ma_device_info *playback_infos = NULL, *capture_infos = NULL; ma_uint32 playback_count = 0, capture_count = 0;
+    bool got_devices = g_hds_ma_context_ok &&
+        ma_context_get_devices(&g_hds_ma_context, &playback_infos, &playback_count, &capture_infos, &capture_count) == MA_SUCCESS;
+    if (got_devices) for (ma_uint32 i = 0; i < playback_count; i++) printf("%s\n", playback_infos[i].name);
+    printf("[input]\n");
+    if (got_devices) for (ma_uint32 i = 0; i < capture_count; i++) printf("%s\n", capture_infos[i].name);
+    printf("[midi]\n");
+    UINT midi_count = midiInGetNumDevs();
+    for (UINT i = 0; i < midi_count; i++) {
+        MIDIINCAPSA caps;
+        if (midiInGetDevCapsA(i, &caps, sizeof(caps)) == MMSYSERR_NOERROR) printf("%s\n", caps.szPname);
+    }
+    fflush(stdout);
+}
 #endif // _WIN32
 
 // DIAGNOSTIC: active_voices_count and render_ms are purely informational (see their computation
@@ -8223,7 +8250,21 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
     HdsPcmStream *s = (HdsPcmStream *)calloc(1, sizeof(HdsPcmStream));
     if (!s) return false;
     s->channels = channels; s->is_capture = (stream == HDS_STREAM_CAPTURE);
-    ma_uint32 rb_frames = (ma_uint32)(SAMPLE_RATE / 2); // half a second -- see the shim's own comment on why this is sized generously
+    // BUG FIX (Windows latency): this used to be a flat half-second (24000 frames) regardless of
+    // latency_ms. Since write_audio_block() only blocks when the ring is genuinely full, a fixed
+    // oversized ring let main()'s loop -- which renders far faster than real time -- race ahead
+    // and queue up to that full half-second of unplayed audio before backpressure ever kicked in,
+    // so every note landed roughly 500ms late no matter what the Devices tab's Latency knob was
+    // set to (the knob only changed the *requested* WASAPI period, never this ring's actual
+    // capacity). Sizing the ring off latency_ms instead -- a handful of periods of headroom, the
+    // same period-count-of-headroom relationship ALSA's own snd_pcm_set_params buffer/period
+    // split already uses -- makes the ring drain back down close to one requested period's worth
+    // of backlog in steady state, and makes the Latency knob actually govern real-world latency
+    // again. Floor/ceiling keep it sane at the knob's extremes.
+    ma_uint32 period_frames = (ma_uint32)(SAMPLE_RATE * fmaxf(1.0f, latency_ms) / 1000.0f);
+    ma_uint32 rb_frames = period_frames * 4;
+    if (rb_frames < (ma_uint32)(SAMPLE_RATE / 20)) rb_frames = (ma_uint32)(SAMPLE_RATE / 20); // floor: 50ms
+    if (rb_frames > (ma_uint32)(SAMPLE_RATE * 2)) rb_frames = (ma_uint32)(SAMPLE_RATE * 2); // ceiling: 2s
     if (ma_pcm_rb_init(ma_format_f32, (ma_uint32)channels, rb_frames, NULL, NULL, &s->rb) != MA_SUCCESS) { free(s); return false; }
 
     ma_device_id chosen_id; bool have_id = hds_win_find_device_id(device_name, s->is_capture, &chosen_id);
@@ -8794,6 +8835,14 @@ static void send_seq_audio_status(lo_address reply_addr) {
 int main(int argc, char **argv) {
     assert_fm_algorithms_acyclic();
     signal(SIGINT, handle_sigint);
+
+#ifdef _WIN32
+    // Handled before anything else starts (OSC server, audio devices, etc.) -- this is a pure
+    // one-shot query mode frontend.py spawns and reads stdout from, never a real synth session.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--list-devices") == 0) { hds_win_print_device_list(); return 0; }
+    }
+#endif
 
     // OSC transport configuration -- see the "OSC Control Protocol" comment above OSC_PARAMS[].
     // Two independent, explicitly-configured ports (not "reply to whoever last sent a message"),
