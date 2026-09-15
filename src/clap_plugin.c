@@ -217,7 +217,11 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
     // active_knobs/g_sample_slots, no locking needed). Bind failure is logged but not fatal to
     // activation: the synth can still make sound (default patch, MIDI-driven) with no external
     // control surface, which is strictly better than refusing to activate at all.
-    build_osc_dispatch_table(); // no-op if already built (guarded internally by g_osc_dispatch_table_ready via plugin.init(), called first per the CLAP spec) -- called again here defensively in case a host ever calls activate() without a preceding init() on this exact instance is impossible per spec, so this is just belt-and-suspenders
+    // build_osc_dispatch_table() is NOT called here: it's a call-once-ever-per-process function
+    // (a second call hits its own internal "duplicate address" fatal check and calls exit(1) --
+    // fatal inside a plugin loaded into a host, unlike the standalone app where it's genuinely
+    // fatal-and-correct at startup). plugin.init() already guarantees it ran once before any
+    // activate() call can happen, per the CLAP spec's own init-before-activate ordering.
     char listen_port_str[16]; snprintf(listen_port_str, sizeof(listen_port_str), "%d", CLAP_OSC_LISTEN_PORT);
     p->osc_server = lo_server_new_with_proto(listen_port_str, LO_UDP, osc_error_handler);
     if (p->osc_server) {
