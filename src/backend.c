@@ -54,8 +54,24 @@
 // changing this model) plus every ext-in pair. OUTPUT_MAX_CHANNELS/OUTPUT_PAIR_MAX mirror the same
 // ceiling on the OUTPUT side, symmetric with the input side's existing RECORD_MAX_CHANNELS -- see
 // query_output_device_channel_count()/open_pcm_stream() in main().
+// Combi mode: up to COMBI_PROGRAM_COUNT independently-synthesizing Programs sharing one voice
+// pool (see ProgramState/SynthSharedControls.programs below). Defined here, ahead of
+// EXT_IN_PAIR_COUNT/SOURCE_COUNT, since the bus/source model below is built directly on top of
+// it: source ids 0..COMBI_PROGRAM_COUNT-1 are the Programs themselves, one more id is the
+// synthetic "Combi Mix" bus (the whole stack's pre-FX dry sum), and every ext-in pair comes
+// after that -- see SOURCE_COUNT's own updated comment.
+#define COMBI_PROGRAM_COUNT 8
 #define EXT_IN_PAIR_COUNT 8
-#define SOURCE_COUNT (1 + EXT_IN_PAIR_COUNT)
+// BREAKING CHANGE (real Combi mode): SOURCE_COUNT grows from 9 (1 Program + 8 ext-in) to 17, and
+// existing source ids are RENUMBERED -- ext-in pairs move from ids 1-8 to 9-16, since ids 0-7 are
+// now the 8 Combi Programs (0 = today's single Program, byte-identical) and id 8 is the new
+// "Combi Mix" bus (sum of all 8 Programs' raw dry pre-FX output -- lets one FX slot serially
+// process the whole stack while other slots still individually target a single Program,
+// deliberately allowed to overlap, per "let them route"). Any existing fx_source/routing
+// configuration referencing ext-in pairs by their old 1-8 ids now points at the wrong source and
+// must be re-set -- the same category of break this file's own running BREAKING CHANGE log has
+// documented for every prior wire-format-shape change.
+#define SOURCE_COUNT (COMBI_PROGRAM_COUNT + 1 + EXT_IN_PAIR_COUNT)
 #define OUTPUT_MAX_CHANNELS 16
 #define OUTPUT_PAIR_MAX (OUTPUT_MAX_CHANNELS / 2)
 #define AUDIO_DEVICE_NAME_LEN 64
@@ -108,9 +124,8 @@
 // scaffolding). This pass adds the lane data model + OSC wire + GUI; the audio-lane resource pool
 // is not yet allocated/used by the DSP.
 #define SEQ_LANE_COUNT 32
-// Renamed from PROGRAM_LANE_RESOURCE_COUNT (was a scaffolding placeholder ceiling; now the real,
-// concrete count of independently-synthesizing Combi Programs -- see ProgramState below).
-#define COMBI_PROGRAM_COUNT 8
+// COMBI_PROGRAM_COUNT itself is defined earlier now (ahead of SOURCE_COUNT, which is built
+// directly on top of it) -- see that definition's own comment.
 #define AUDIO_LANE_RESOURCE_COUNT 16
 #define SEQ_AUDIO_PATH_LEN 256
 
@@ -866,6 +881,10 @@ typedef struct {
                         // applied to amp/filter response for the periodic oscillators (no
                         // engine-wide velocity sensitivity exists yet, see handle_note_on's
                         // comment on this).
+    int program_index; // which of knobs->programs[COMBI_PROGRAM_COUNT] this voice's note belongs
+                        // to (0 in Single Program / Sequencer modes; 0-7 in Combi mode). Stamped
+                        // once at claim time in handle_note_on -- the voice-search/steal logic
+                        // itself stays completely program-agnostic, exactly as it is today.
 
     float vco1_phase;
     float vco1_target_freq;
@@ -2940,6 +2959,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
 static void init_voice(SynthVoice *voice) {
     voice->midi_note = -1;
     voice->midi_velocity = 100;
+    voice->program_index = 0;
     voice->vco1_phase = 0.0f; voice->vco1_target_freq = 0.0f; voice->vco1_current_freq = 0.0f; voice->vco1_tri_state = 0.0f; voice->vco1_prev_fm_phase = 0.0f;
     voice->vco2_phase = 0.0f; voice->vco2_target_freq = 0.0f; voice->vco2_current_freq = 0.0f; voice->vco2_tri_state = 0.0f; voice->vco2_prev_fm_phase = 0.0f; voice->vco2_pending_sync_correction = 0.0f;
     voice->vco3_phase = 0.0f; voice->vco3_target_freq = 0.0f; voice->vco3_current_freq = 0.0f; voice->vco3_tri_state = 0.0f; voice->vco3_prev_fm_phase = 0.0f; voice->vco3_pending_sync_correction = 0.0f;
@@ -4547,7 +4567,17 @@ static float sample_osc_zone_pan_offset(int stream_idx) {
     return slot->loaded ? slot->pan : 0.0f;
 }
 
-static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], int note, int velocity, bool poly_mode_active, MonoNoteStack *mono_stack) {
+// target_program: which of knobs->programs[COMBI_PROGRAM_COUNT] this note belongs to (0 in
+// Single Program/Sequencer modes; 0-7 in Combi mode). Poly-mode voice claiming stays fully
+// program-agnostic (searches/steals across the whole shared pool, per the user's explicit "one
+// shared budget" requirement) -- only the claimed voice's program_index stamp and which
+// ProgramState's fields/EGs/LFO-key-sync get read are program-specific. Mono mode reserves voice
+// slot `target_program` itself (0-7) as that Program's own dedicated single voice, so multiple
+// simultaneously-mono-mode Combi Programs never collide on voice 0 -- a direct generalization of
+// today's hardcoded "mono always uses voice 0", byte-identical when target_program is always 0
+// (Single Program/Sequencer modes).
+static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT][LFO_COUNT], int target_program, int note, int velocity, bool poly_mode_active, MonoNoteStack *mono_stack) {
+    const ProgramState *prog = &knobs->programs[target_program];
     int slot = -1;
     if (poly_mode_active) {
         // BUG FIX: this used to only check vco1_eg/vco2_eg, so a voice whose vco3_eg was
@@ -4580,9 +4610,10 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
             // an underrun/glitch you're chasing.
             fprintf(stderr, "[voices] polyphony ceiling hit (%d active) -- stole slot %d (score %.4f)\n", voice_limit, slot, best_score);
         }
-    } else { slot = 0; }
+    } else { slot = target_program; }
 
     float target_hz = 440.0f * powf(2.0f, (note - 69) / 12.0f);
+    voices[slot].program_index = target_program;
     voices[slot].midi_note = note;
     voices[slot].midi_velocity = velocity;
     voices[slot].vco1_target_freq = target_hz;
@@ -4611,49 +4642,49 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         // WAVE_SAMPLE: (re)claim a DFD stream for whichever oscillator is currently set to it,
         // and release any stream a stolen/retriggered voice was still holding from a previous
         // note even if this new note doesn't need one -- see start_sample_osc()'s comment.
-        if ((WaveType)((int)knobs->programs[0].vco1_shape) == WAVE_SAMPLE) {
+        if ((WaveType)((int)prog->vco1_shape) == WAVE_SAMPLE) {
             start_sample_osc(&voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, note, velocity);
         } else if (voices[slot].vco1_sample_stream >= 0) {
             release_sample_stream(voices[slot].vco1_sample_stream);
             voices[slot].vco1_sample_stream = -1;
         }
-        if ((WaveType)((int)knobs->programs[0].vco2_shape) == WAVE_SAMPLE) {
+        if ((WaveType)((int)prog->vco2_shape) == WAVE_SAMPLE) {
             start_sample_osc(&voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, note, velocity);
         } else if (voices[slot].vco2_sample_stream >= 0) {
             release_sample_stream(voices[slot].vco2_sample_stream);
             voices[slot].vco2_sample_stream = -1;
         }
-        if ((WaveType)((int)knobs->programs[0].vco3_shape) == WAVE_SAMPLE) {
+        if ((WaveType)((int)prog->vco3_shape) == WAVE_SAMPLE) {
             start_sample_osc(&voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, note, velocity);
         } else if (voices[slot].vco3_sample_stream >= 0) {
             release_sample_stream(voices[slot].vco3_sample_stream);
             voices[slot].vco3_sample_stream = -1;
         }
-        if ((WaveType)((int)knobs->programs[0].vco4_shape) == WAVE_SAMPLE) {
+        if ((WaveType)((int)prog->vco4_shape) == WAVE_SAMPLE) {
             start_sample_osc(&voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, note, velocity);
         } else if (voices[slot].vco4_sample_stream >= 0) {
             release_sample_stream(voices[slot].vco4_sample_stream);
             voices[slot].vco4_sample_stream = -1;
         }
         for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voices[slot].fa_low[c][f][0]=0.0f; voices[slot].fa_low[c][f][1]=0.0f; voices[slot].fa_band[c][f][0]=0.0f; voices[slot].fa_band[c][f][1]=0.0f; } voices[slot].fb_low[c][0]=0.0f; voices[slot].fb_low[c][1]=0.0f; voices[slot].fb_band[c][0]=0.0f; voices[slot].fb_band[c][1]=0.0f; }
-        for (int l = 0; l < LFO_COUNT; l++) { if (knobs->programs[0].lfo[l].key_sync != 0.0f) global_lfo_phases[l] = 0.0f; }
+        for (int l = 0; l < LFO_COUNT; l++) { if (prog->lfo[l].key_sync != 0.0f) global_lfo_phases[target_program][l] = 0.0f; }
 
-        int m0 = (int)knobs->programs[0].eg_mode[0]; voices[slot].vco1_eg.state = (m0 == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco1_eg.current_level = (m0 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].eg[0].al / 100.0f));
-        int m1 = (int)knobs->programs[0].eg_mode[1]; voices[slot].vco2_eg.state = (m1 == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco2_eg.current_level = (m1 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].eg[1].al / 100.0f));
+        int m0 = (int)prog->eg_mode[0]; voices[slot].vco1_eg.state = (m0 == 5) ? STATE_DELAY : STATE_ATTACK;
+        voices[slot].vco1_eg.current_level = (m0 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->eg[0].al / 100.0f));
+        int m1 = (int)prog->eg_mode[1]; voices[slot].vco2_eg.state = (m1 == 5) ? STATE_DELAY : STATE_ATTACK;
+        voices[slot].vco2_eg.current_level = (m1 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->eg[1].al / 100.0f));
         // Osc 3/4 Amp envelopes: eg[2]/eg_mode[2] and eg[3]/eg_mode[3].
-        int mn = (int)knobs->programs[0].eg_mode[2]; voices[slot].vco3_eg.state = (mn == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco3_eg.current_level = (mn == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].eg[2].al / 100.0f));
-        int m3 = (int)knobs->programs[0].eg_mode[3]; voices[slot].vco4_eg.state = (m3 == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco4_eg.current_level = (m3 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].eg[3].al / 100.0f));
+        int mn = (int)prog->eg_mode[2]; voices[slot].vco3_eg.state = (mn == 5) ? STATE_DELAY : STATE_ATTACK;
+        voices[slot].vco3_eg.current_level = (mn == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->eg[2].al / 100.0f));
+        int m3 = (int)prog->eg_mode[3]; voices[slot].vco4_eg.state = (m3 == 5) ? STATE_DELAY : STATE_ATTACK;
+        voices[slot].vco4_eg.current_level = (m3 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->eg[3].al / 100.0f));
         for(int e=0; e<ASSIGNABLE_EG_COUNT; e++) {
-            int me = (int)knobs->programs[0].eg_mode[4 + e]; voices[slot].assign_eg[e].state = (me == 5) ? STATE_DELAY : STATE_ATTACK;
-            voices[slot].assign_eg[e].current_level = (me == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].eg[4 + e].al / 100.0f));
+            int me = (int)prog->eg_mode[4 + e]; voices[slot].assign_eg[e].state = (me == 5) ? STATE_DELAY : STATE_ATTACK;
+            voices[slot].assign_eg[e].current_level = (me == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->eg[4 + e].al / 100.0f));
         }
     } else {
         // An overlapping legato note: this is an actual audible glide, so reroll its time.
-        voices[slot].glide_time_multiplier = roll_glide_multiplier(knobs->programs[0].mono_glide_random);
+        voices[slot].glide_time_multiplier = roll_glide_multiplier(prog->mono_glide_random);
     }
     if (!poly_mode_active) mono_stack_push(mono_stack, note, velocity);
 }
@@ -4677,10 +4708,10 @@ static void trigger_voice_release(SynthVoice *voice) {
     request_sample_stream_release(voice->vco4_sample_stream);
 }
 
-static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
+static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int target_program, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
     if (poly_mode_active) {
         int voice_limit = effective_voice_limit(knobs);
-        for (int v = 0; v < voice_limit; v++) { if (voices[v].midi_note == note) {
+        for (int v = 0; v < voice_limit; v++) { if (voices[v].midi_note == note && voices[v].program_index == target_program) {
             // Sustain pedal held: defer the actual release until it lifts (see
             // handle_sustain_release) instead of releasing right now.
             if (midi_live->sustain_held) voices[v].sustain_pending = true;
@@ -4689,6 +4720,9 @@ static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knob
         return;
     }
 
+    // Mono mode: this Program's dedicated voice is always voices[target_program] -- see
+    // handle_note_on's own comment on why (matches its slot = target_program assignment).
+    SynthVoice *mono_voice = &voices[target_program];
     mono_stack_remove(mono_stack, note);
     if (mono_stack->count > 0) {
         // FIXED: another key is still physically held -- fall back to it (the note most
@@ -4697,19 +4731,19 @@ static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knob
         // even when an earlier key was still held.
         int fallback_note = mono_stack->notes[mono_stack->count - 1];
         float target_hz = 440.0f * powf(2.0f, (fallback_note - 69) / 12.0f);
-        voices[0].midi_note = fallback_note;
-        voices[0].midi_velocity = mono_stack->velocities[mono_stack->count - 1];
-        voices[0].vco1_target_freq = target_hz;
-        voices[0].vco2_target_freq = target_hz;
-        voices[0].vco3_target_freq = target_hz;
-        voices[0].vco4_target_freq = target_hz;
+        mono_voice->midi_note = fallback_note;
+        mono_voice->midi_velocity = mono_stack->velocities[mono_stack->count - 1];
+        mono_voice->vco1_target_freq = target_hz;
+        mono_voice->vco2_target_freq = target_hz;
+        mono_voice->vco3_target_freq = target_hz;
+        mono_voice->vco4_target_freq = target_hz;
         // Falling back to a still-held note is also a real audible glide -- reroll its time too.
-        voices[0].glide_time_multiplier = roll_glide_multiplier(knobs->programs[0].mono_glide_random);
+        mono_voice->glide_time_multiplier = roll_glide_multiplier(knobs->programs[target_program].mono_glide_random);
         // Falling back to a still-held note never retriggers or releases -- the sound never stopped.
     } else if (midi_live->sustain_held) {
-        voices[0].sustain_pending = true;
+        mono_voice->sustain_pending = true;
     } else {
-        trigger_voice_release(&voices[0]);
+        trigger_voice_release(mono_voice);
     }
 }
 
@@ -4866,8 +4900,11 @@ static void seq_record_midi_event(const SynthSharedControls *knobs, unsigned cha
 // lane's recorded events and fires any whose timestamp has now been reached, via the exact same
 // handle_note_on/handle_note_off functions live MIDI already calls (see this section's own scope
 // comment for why that's a deliberate choice, not a shortcut).
-static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], bool poly_mode_active, MonoNoteStack *mono_stack, const MidiLiveState *midi_live) {
+static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT][LFO_COUNT], MonoNoteStack *mono_stack, const MidiLiveState *midi_live) {
     if (g_transport_state != TRANSPORT_PLAYING) return;
+    // Sequencer's recorded MIDI always targets Program 0 (see this section's scope comment) --
+    // so its own poly/mono mode is always Program 0's is_polyphonic, computed once here.
+    bool poly_mode_active = (knobs->programs[0].is_polyphonic != 0.0f);
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         if (knobs->seq_lanes[l].lane_type != 0.0f) continue;
         int mode = (int)knobs->seq_lanes[l].seq_mode;
@@ -4881,8 +4918,10 @@ static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *k
             // muted. Same "stay in sync, just silence the output" shape as the audio-lane Mute
             // fix right above this function's own mix-loop call site.
             if (mode == 0) {
-                if (e->type == 0) handle_note_on(voices, knobs, global_lfo_phases, e->note, e->velocity, poly_mode_active, mono_stack);
-                else handle_note_off(voices, knobs, midi_live, e->note, poly_mode_active, mono_stack);
+                // Sequencer's own recorded MIDI always targets Program 0 -- see this section's
+                // scope comment (a separate, parallel concern from Combi's own live dispatch).
+                if (e->type == 0) handle_note_on(voices, knobs, global_lfo_phases, 0, e->note, e->velocity, poly_mode_active, mono_stack);
+                else handle_note_off(voices, knobs, midi_live, 0, e->note, poly_mode_active, mono_stack);
             }
             ml->playback_cursor++;
         }
@@ -5000,28 +5039,47 @@ static void midi_autoconnect_scan(snd_seq_t *seq, int our_port, const char *midi
 // our_midi_port/midi_sources are only needed for hotplug auto-connect (SND_SEQ_EVENT_PORT_START/
 // PORT_EXIT) -- these arrive on the same event stream as NOTEON/NOTEOFF because main() subscribes
 // our port to the ALSA announce port at startup (see main()'s comment on that subscription).
-static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], bool poly_mode_active, MonoNoteStack *mono_stack, int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live) {
+static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT], int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live) {
     snd_seq_event_t *ev = NULL;
     while (snd_seq_event_input_pending(seq_handle, 1) > 0) {
         snd_seq_event_input(seq_handle, &ev); if (ev == NULL) continue;
         if (ev->type == SND_SEQ_EVENT_NOTEON || ev->type == SND_SEQ_EVENT_NOTEOFF) {
             int note = ev->data.note.note;
-            // ALSA's own sequencer channel is 0-indexed (0-15); SeqLaneState.midi_channel uses
-            // 1-16 (0 reserved for Omni), so +1 here converts once for both call sites below.
+            // ALSA's own sequencer channel is 0-indexed (0-15); SeqLaneState.midi_channel/
+            // combi_lane_midi_channel use 1-16 (0 reserved for Omni), so +1 here converts once
+            // for every call site below.
             int midi_channel_1_16 = (int)ev->data.note.channel + 1;
-            if (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0) {
-                handle_note_on(voices, knobs, global_lfo_phases, note, ev->data.note.velocity, poly_mode_active, mono_stack);
-                seq_record_midi_event(knobs, 0, (unsigned char)note, (unsigned char)ev->data.note.velocity, midi_channel_1_16);
+            bool is_note_on = (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0);
+            if ((int)knobs->performance_mode == 1) {
+                // Combi mode: live dispatch fans out to every Combi lane whose own MIDI channel
+                // matches (0 = Omni) -- a separate, parallel mechanism from Sequencer's own
+                // recorded-MIDI playback (seq_playback_midi_events), which always targets
+                // Program 0 regardless of this mode (see that function's own scope comment).
+                for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+                    float lane_channel = knobs->combi_lane_midi_channel[p];
+                    if (lane_channel != 0.0f && (int)lane_channel != midi_channel_1_16) continue;
+                    bool prog_poly_active = (knobs->programs[p].is_polyphonic != 0.0f);
+                    if (is_note_on) handle_note_on(voices, knobs, global_lfo_phases, p, note, ev->data.note.velocity, prog_poly_active, &mono_stacks[p]);
+                    else handle_note_off(voices, knobs, midi_live, p, note, prog_poly_active, &mono_stacks[p]);
+                }
             } else {
-                handle_note_off(voices, knobs, midi_live, note, poly_mode_active, mono_stack);
-                seq_record_midi_event(knobs, 1, (unsigned char)note, 0, midi_channel_1_16);
+                // Single Program / Sequencer modes: always Program 0, fully channel-agnostic,
+                // exactly as today.
+                bool prog_poly_active = (knobs->programs[0].is_polyphonic != 0.0f);
+                if (is_note_on) handle_note_on(voices, knobs, global_lfo_phases, 0, note, ev->data.note.velocity, prog_poly_active, &mono_stacks[0]);
+                else handle_note_off(voices, knobs, midi_live, 0, note, prog_poly_active, &mono_stacks[0]);
             }
+            if (is_note_on) seq_record_midi_event(knobs, 0, (unsigned char)note, (unsigned char)ev->data.note.velocity, midi_channel_1_16);
+            else seq_record_midi_event(knobs, 1, (unsigned char)note, 0, midi_channel_1_16);
         } else if (ev->type == SND_SEQ_EVENT_CONTROLLER) {
             int cc_num = ev->data.control.param;
             if (cc_num >= 0 && cc_num < 128) midi_live->cc[cc_num] = fmaxf(0.0f, fminf(1.0f, ev->data.control.value / 127.0f));
             if (cc_num == 64) {
                 // Sustain pedal. polarity: 0 = Normal (>=64 means held, essentially every real
-                // pedal), 1 = Inverted (for the rare one wired backwards).
+                // pedal), 1 = Inverted (for the rare one wired backwards). Uses Program 0's own
+                // polarity setting even in Combi mode -- the sustain pedal is one physical
+                // controller and this engine has no per-Program polarity concept to fan out to;
+                // a documented scope boundary, not an oversight.
                 bool raw_held = ev->data.control.value >= 64;
                 bool now_held = (knobs->programs[0].sustain_pedal_polarity != 0.0f) ? !raw_held : raw_held;
                 if (midi_live->sustain_held && !now_held) handle_sustain_release(voices, knobs); // pedal just lifted
@@ -5071,8 +5129,18 @@ static inline int lfo_phase_target_index(int target) {
     if (target >= 72 && target <= 83) return target - 68;
     return -1;
 }
-static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer) {
+static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer) {
     float peak = 0.0f;
+    // Combi mode: how many of the 8 Program slots are actually "live" this block -- 1 (just
+    // program 0) outside Combi mode, all 8 inside it. Every per-program precompute below loops
+    // over this many slots, NOT over which voices happen to be currently sounding -- LFOs must
+    // keep advancing continuously per Program regardless of note activity (so phase doesn't
+    // reset/freeze while idle, exactly like today's single-Program behavior), and the cost of
+    // computing for an idle Program slot is negligible next to gating logic that could regress
+    // that phase-continuity guarantee. Outside Combi mode this is always 1 -- byte-identical cost
+    // and behavior to before this pass.
+    int active_program_count = ((int)knobs->performance_mode == 1) ? COMBI_PROGRAM_COUNT : 1;
+
     // Each oscillator is panned to stereo AT THE MIXER, before the signal reaches Filter A/B --
     // Filter A/B then run as two fully independent mono filters (one per channel, see fa_low/
     // fb_low's [channel] dimension) so that placement survives filtering instead of collapsing
@@ -5083,14 +5151,20 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // PERF: Unison Saw's per-unison pan (cosf/sinf) only depends on the Width knob, which is
     // constant across the whole buffer -- computed once here instead of every sample, for
     // every voice, for both oscillators. See compute_unison_saw_pan's comment for the numbers.
-    float vco1_unison_pan_l[UNISON_SAW_VOICES], vco1_unison_pan_r[UNISON_SAW_VOICES];
-    float vco2_unison_pan_l[UNISON_SAW_VOICES], vco2_unison_pan_r[UNISON_SAW_VOICES];
-    float vco3_unison_pan_l[UNISON_SAW_VOICES], vco3_unison_pan_r[UNISON_SAW_VOICES];
-    float vco4_unison_pan_l[UNISON_SAW_VOICES], vco4_unison_pan_r[UNISON_SAW_VOICES];
-    compute_unison_saw_pan(knobs->programs[0].vco1_unison_saw_width, vco1_unison_pan_l, vco1_unison_pan_r);
-    compute_unison_saw_pan(knobs->programs[0].vco2_unison_saw_width, vco2_unison_pan_l, vco2_unison_pan_r);
-    compute_unison_saw_pan(knobs->programs[0].vco3_unison_saw_width, vco3_unison_pan_l, vco3_unison_pan_r);
-    compute_unison_saw_pan(knobs->programs[0].vco4_unison_saw_width, vco4_unison_pan_l, vco4_unison_pan_r);
+    // Per-Program now (one Program's Width knob doesn't affect another's) -- computed for every
+    // Program slot unconditionally (not just "active" ones): 8 Programs x 4 oscillators x one
+    // cheap cosf/sinf fill is negligible once per block, and avoids needing active_program_count
+    // gating here at all.
+    float vco1_unison_pan_l[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES], vco1_unison_pan_r[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES];
+    float vco2_unison_pan_l[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES], vco2_unison_pan_r[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES];
+    float vco3_unison_pan_l[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES], vco3_unison_pan_r[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES];
+    float vco4_unison_pan_l[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES], vco4_unison_pan_r[COMBI_PROGRAM_COUNT][UNISON_SAW_VOICES];
+    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+        compute_unison_saw_pan(knobs->programs[p].vco1_unison_saw_width, vco1_unison_pan_l[p], vco1_unison_pan_r[p]);
+        compute_unison_saw_pan(knobs->programs[p].vco2_unison_saw_width, vco2_unison_pan_l[p], vco2_unison_pan_r[p]);
+        compute_unison_saw_pan(knobs->programs[p].vco3_unison_saw_width, vco3_unison_pan_l[p], vco3_unison_pan_r[p]);
+        compute_unison_saw_pan(knobs->programs[p].vco4_unison_saw_width, vco4_unison_pan_l[p], vco4_unison_pan_r[p]);
+    }
 
     // Noise Osc's tilt-color filter: a simple one-pole low/high split with a fixed ~800Hz pivot,
     // linearly crossfaded by the Tilt knob. The coefficient depends only on SAMPLE_RATE and the
@@ -5099,32 +5173,37 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
 
     // Pitch Bend: applies equally to both oscillators (like a real keyboard's wheel bends the
     // whole voice, not one oscillator), with separately specifiable up/down range in semitones.
-    // midi_live->pitch_bend is constant across this whole block (only process_midi_input, called
-    // once before render_audio_block each block, updates it) so it's computed once here too.
-    float pb_bend_cents = (midi_live->pitch_bend >= 0.0f)
-        ? midi_live->pitch_bend * knobs->programs[0].pb_range_up * 100.0f
-        : midi_live->pitch_bend * knobs->programs[0].pb_range_down * 100.0f;
+    // midi_live->pitch_bend is one shared physical wheel (constant across this whole block), but
+    // pb_range_up/down are Program-scoped -- so each Program's own bend-in-cents is precomputed
+    // once per block here.
+    float pb_bend_cents[COMBI_PROGRAM_COUNT];
+    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+        pb_bend_cents[p] = (midi_live->pitch_bend >= 0.0f)
+            ? midi_live->pitch_bend * knobs->programs[p].pb_range_up * 100.0f
+            : midi_live->pitch_bend * knobs->programs[p].pb_range_down * 100.0f;
+    }
 
     // One-sample-delayed feedback state for LFO Phase modulation: holds each LFO's phase-shift
-    // contribution from other LFOs and from voice 0's assignable EGs (the reference source for
-    // LFO modulation, since LFOs are a single resource shared across every voice rather than a
-    // per-voice one). Function-local static is safe here -- this program runs one synth engine
+    // contribution from other LFOs and from its own Program's reference voice's assignable EGs
+    // (voices[p] -- see the LFO-as-destination block below for why that's the reference voice).
+    // Now per-Program (LFOs are a resource shared across every voice OF THE SAME PROGRAM, not
+    // across Programs). Function-local static is safe here -- this program runs one synth engine
     // instance on a single audio thread.
-    static float lfo_phase_mod_state[LFO_COUNT] = {0.0f};
+    static float lfo_phase_mod_state[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
     // Same one-sample-delayed pattern, for LFO Rate and Depth as mod destinations (targets
     // 14-21/48-71 -- see lfo_rate_target_index/lfo_depth_target_index). Applied to rate_hz/
     // mod_depth in the main per-sample LFO loop below.
-    static float lfo_rate_mod_state[LFO_COUNT] = {0.0f};
-    static float lfo_depth_mod_state[LFO_COUNT] = {0.0f};
+    static float lfo_rate_mod_state[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
+    static float lfo_depth_mod_state[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
 
     // Control-rate decimation state for LFOs 3-16 (index 2-15) -- see LFO_DECIMATION_FACTOR's
     // comment. counter cycles 0..LFO_DECIMATION_FACTOR-1; at 0, last_value/target_value/phase are
     // all advanced by one full decimated step, then every sample in between linearly interpolates
     // from last_value to target_value. Function-local static for the same single-instance reason
-    // as lfo_phase_mod_state above.
-    static int lfo_decim_counter[LFO_COUNT] = {0};
-    static float lfo_decim_last_value[LFO_COUNT] = {0.0f};
-    static float lfo_decim_target_value[LFO_COUNT] = {0.0f};
+    // as lfo_phase_mod_state above. Per-Program now, same reason as lfo_phase_mod_state.
+    static int lfo_decim_counter[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0}};
+    static float lfo_decim_last_value[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
+    static float lfo_decim_target_value[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
 
     // FX bus engine state: persists across calls (and across FX_TYPE changes -- see
     // process_fx_chain) for the same "single synth engine instance" reason as above.
@@ -5146,9 +5225,9 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // changed) and "which sources own any FX slot at all" both only ever change in response to an
     // OSC control message -- drained once per BLOCK in main()'s loop, never mid-block -- so both
     // are computed here exactly once per block, not once per sample (previously this bookkeeping
-    // ran inside process_fx_chain itself, once per SOURCE per SAMPLE: with SOURCE_COUNT=9 sources
-    // now dispatched independently, that had silently become a 9x-per-sample-per-slot cost purely
-    // from scanning for a type change that could not have happened since the last block anyway --
+    // ran inside process_fx_chain itself, once per SOURCE per SAMPLE: with many sources now
+    // dispatched independently, that had silently become a per-sample-per-slot cost purely from
+    // scanning for a type change that could not have happened since the last block anyway --
     // a real, measured underrun regression at any voice count, since it's a flat per-sample tax
     // paid regardless of patch complexity). See process_fx_chain()'s own comment for how the two
     // pieces fit together now.
@@ -5159,14 +5238,17 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         if (src >= 0 && src < SOURCE_COUNT) source_has_fx_slots[src] = true;
     }
 
-    // Envelope rates: one EGDerivedRates per EG *config* (ENV_COUNT of them), shared by every
-    // voice's own instance of that EG -- see compute_eg_derived_rates()'s own comment for why
-    // this moved here (once per block) instead of being recomputed inside tick_adsr() itself
-    // (once per voice per sample -- a redundancy that scaled directly, and expensively, with
-    // both polyphony and envelope count).
-    EGDerivedRates eg_rates[ENV_COUNT];
-    for (int e = 0; e < ENV_COUNT; e++) {
-        compute_eg_derived_rates(&knobs->programs[0].eg[e], (int)knobs->programs[0].eg_mode[e], &eg_rates[e]);
+    // Envelope rates: one EGDerivedRates per EG *config* per Program (ENV_COUNT of them each),
+    // shared by every voice's own instance of that EG -- see compute_eg_derived_rates()'s own
+    // comment for why this moved here (once per block) instead of being recomputed inside
+    // tick_adsr() itself (once per voice per sample -- a redundancy that scaled directly, and
+    // expensively, with both polyphony and envelope count). Computed for every Program slot
+    // unconditionally, same reasoning as the unison-pan tables above (cheap, once per block).
+    EGDerivedRates eg_rates[COMBI_PROGRAM_COUNT][ENV_COUNT];
+    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+        for (int e = 0; e < ENV_COUNT; e++) {
+            compute_eg_derived_rates(&knobs->programs[p].eg[e], (int)knobs->programs[p].eg_mode[e], &eg_rates[p][e]);
+        }
     }
     // Sustain-chase rate: not even knob-dependent (a pure function of SAMPLE_RATE), so computed
     // exactly once for the life of the process rather than once per block.
@@ -5180,44 +5262,59 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     int voice_limit = effective_voice_limit(knobs);
     int block_size = effective_block_size(knobs);
 
-    // Portamento glide coefficient, per voice: depends only on knobs->programs[0].portamento_time_ms (a
-    // knob, block-invariant) and voices[v].glide_time_multiplier (per-voice, but only rerolled at
-    // a glide event in handle_note_on/off -- called once per block from main()'s loop, never
-    // mid-block) -- so, same as the EG rates above, this only needs computing once per block, not
-    // once per voice per SAMPLE. It was previously recomputed (with an expf() call) on every
-    // sample for every active voice regardless of whether a glide was even in progress -- for a
-    // held note between glide events that's potentially millions of samples of pure waste.
+    // Portamento glide coefficient, per voice: depends on that voice's OWN Program's
+    // portamento_time_ms (a knob, block-invariant) and voices[v].glide_time_multiplier (per-voice,
+    // but only rerolled at a glide event in handle_note_on/off -- called once per block from
+    // main()'s loop, never mid-block) -- so, same as the EG rates above, this only needs computing
+    // once per block, not once per voice per SAMPLE. It was previously recomputed (with an expf()
+    // call) on every sample for every active voice regardless of whether a glide was even in
+    // progress -- for a held note between glide events that's potentially millions of samples of
+    // pure waste.
     float portamento_coeff[MAX_VOICES];
     for (int v = 0; v < voice_limit; v++) {
-        float effective_glide_ms = fmaxf(1.0f, knobs->programs[0].portamento_time_ms * voices[v].glide_time_multiplier);
+        const ProgramState *voice_prog = &knobs->programs[voices[v].program_index];
+        float effective_glide_ms = fmaxf(1.0f, voice_prog->portamento_time_ms * voices[v].glide_time_multiplier);
         portamento_coeff[v] = 1.0f - expf(-1.0f / ((effective_glide_ms / 1000.0f) * SAMPLE_RATE));
     }
 
     // Static-pan fallback: pan1_l/r..pan4_l/r (below, per voice per sample) reduce to just
-    // knobs->vcoN_pan -- the same value for every voice, every sample -- whenever nothing is
-    // actively modulating that oscillator's pan (mod_vcoN_pan == 0, the common case) and it isn't
-    // a WAVE_SAMPLE oscillator carrying its own zone pan offset. Precomputed once per block so the
-    // per-voice per-sample loop can skip the cosf/sinf pair entirely in that case instead of
-    // recomputing an unchanged angle up to MAX_VOICES x block_size times for nothing.
-    float static_pan_angle1 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco1_pan)) + 1.0f) * ((float)M_PI / 4.0f);
-    float static_pan_angle2 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco2_pan)) + 1.0f) * ((float)M_PI / 4.0f);
-    float static_pan_angle3 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco3_pan)) + 1.0f) * ((float)M_PI / 4.0f);
-    float static_pan_angle4 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco4_pan)) + 1.0f) * ((float)M_PI / 4.0f);
-    float static_pan1_l = cosf(static_pan_angle1), static_pan1_r = sinf(static_pan_angle1);
-    float static_pan2_l = cosf(static_pan_angle2), static_pan2_r = sinf(static_pan_angle2);
-    float static_pan3_l = cosf(static_pan_angle3), static_pan3_r = sinf(static_pan_angle3);
-    float static_pan4_l = cosf(static_pan_angle4), static_pan4_r = sinf(static_pan_angle4);
+    // that voice's own Program's vcoN_pan -- the same value for every voice OF THAT PROGRAM, every
+    // sample -- whenever nothing is actively modulating that oscillator's pan (mod_vcoN_pan == 0,
+    // the common case) and it isn't a WAVE_SAMPLE oscillator carrying its own zone pan offset.
+    // Precomputed once per block, per Program slot (unconditionally, same reasoning as the
+    // unison-pan tables above) so the per-voice per-sample loop can skip the cosf/sinf pair
+    // entirely in that case instead of recomputing an unchanged angle up to MAX_VOICES x
+    // block_size times for nothing.
+    float static_pan1_l[COMBI_PROGRAM_COUNT], static_pan1_r[COMBI_PROGRAM_COUNT];
+    float static_pan2_l[COMBI_PROGRAM_COUNT], static_pan2_r[COMBI_PROGRAM_COUNT];
+    float static_pan3_l[COMBI_PROGRAM_COUNT], static_pan3_r[COMBI_PROGRAM_COUNT];
+    float static_pan4_l[COMBI_PROGRAM_COUNT], static_pan4_r[COMBI_PROGRAM_COUNT];
+    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+        float angle1 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[p].vco1_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+        float angle2 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[p].vco2_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+        float angle3 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[p].vco3_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+        float angle4 = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[p].vco4_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+        static_pan1_l[p] = cosf(angle1); static_pan1_r[p] = sinf(angle1);
+        static_pan2_l[p] = cosf(angle2); static_pan2_r[p] = sinf(angle2);
+        static_pan3_l[p] = cosf(angle3); static_pan3_r[p] = sinf(angle3);
+        static_pan4_l[p] = cosf(angle4); static_pan4_r[p] = sinf(angle4);
+    }
 
     for (int i = 0; i < block_size; i++) {
-        float mixed_l = 0.0f, mixed_r = 0.0f;
-        float lfo_out[LFO_COUNT] = {0.0f};
+        float mixed_l[COMBI_PROGRAM_COUNT] = {0.0f}, mixed_r[COMBI_PROGRAM_COUNT] = {0.0f};
+        float lfo_out[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}};
+        // LFOs are computed per active Program slot (see active_program_count's own comment --
+        // always advancing continuously per Program, never gated on voice activity, to preserve
+        // today's exact phase-continuity behavior). Outside Combi mode this is just p=0, the
+        // exact same single pass as before this restructuring.
+        for (int p = 0; p < active_program_count; p++) {
         for (int l = 0; l < LFO_COUNT; l++) {
-            int wave_type = (int)knobs->programs[0].lfo[l].wave_type;
+            int wave_type = (int)knobs->programs[p].lfo[l].wave_type;
             // Off: complete compute bypass -- no phase_offset/mod_source_cc/waveform lookup, and
             // no phase advance either (nothing else in this engine reads an LFO's raw phase, so
             // freezing it is safe and avoids wasted work on an LFO nobody's listening to -- this
             // is the actual CPU concern with 16 always-otherwise-running LFOs).
-            if (wave_type == 4) { lfo_out[l] = 0.0f; continue; }
+            if (wave_type == 4) { lfo_out[p][l] = 0.0f; continue; }
 
             // Rate/Depth as mod destinations (targets 14-21/48-71): one-sample-delayed
             // contributions from lfo_rate_mod_state/lfo_depth_mod_state (computed once per
@@ -5227,61 +5324,70 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // its whole 0.1-200Hz dial range); Depth mod adds directly (mod_depth is already a
             // plain 0-1 fraction, same convention mod_source_cc's multiplicative scale uses).
             // Both stay independent of and coexist with mod_source_cc's own CC/aftertouch scale.
-            float effective_rate_hz = fmaxf(0.1f, fminf(200.0f, knobs->programs[0].lfo[l].rate_hz + lfo_rate_mod_state[l] * 20.0f));
-            float effective_mod_depth = fmaxf(0.0f, fminf(1.0f, knobs->programs[0].lfo[l].mod_depth + lfo_depth_mod_state[l]));
+            float effective_rate_hz = fmaxf(0.1f, fminf(200.0f, knobs->programs[p].lfo[l].rate_hz + lfo_rate_mod_state[p][l] * 20.0f));
+            float effective_mod_depth = fmaxf(0.0f, fminf(1.0f, knobs->programs[p].lfo[l].mod_depth + lfo_depth_mod_state[p][l]));
 
             if (l < 2) {
                 // LFOs 1/2: full audio-rate, unchanged from the original 4-LFO design.
                 // Phase pot (0-360 degrees) plus any modulation, shifting only the read-phase
                 // used for this sample's waveform lookup -- the underlying running phase
                 // (advanced below) is never touched, so Rate/sync stay completely unaffected.
-                float phase_offset = fmodf((knobs->programs[0].lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
-                float read_phase = fmodf(global_lfo_phases[l] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
+                float phase_offset = fmodf((knobs->programs[p].lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[p][l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
+                float read_phase = fmodf(global_lfo_phases[p][l] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
                 // Modulation Source: scales this LFO's contribution by a live MIDI controller
                 // (e.g. gating vibrato depth with the mod wheel) on top of the plain Depth knob.
                 // Unassigned (-1, the default) is a pure no-op -- cc_source_scale stays 1.0.
-                int mod_src = (int)knobs->programs[0].lfo[l].mod_source_cc;
+                int mod_src = (int)knobs->programs[p].lfo[l].mod_source_cc;
                 float cc_source_scale = 1.0f;
                 if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
                 else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
-                lfo_out[l] = lookup_lfo_waveform(wave_type, read_phase) * effective_mod_depth * cc_source_scale;
-                global_lfo_phases[l] += effective_rate_hz / (float)SAMPLE_RATE;
-                if (global_lfo_phases[l] >= 1.0f) global_lfo_phases[l] -= 1.0f;
+                lfo_out[p][l] = lookup_lfo_waveform(wave_type, read_phase) * effective_mod_depth * cc_source_scale;
+                global_lfo_phases[p][l] += effective_rate_hz / (float)SAMPLE_RATE;
+                if (global_lfo_phases[p][l] >= 1.0f) global_lfo_phases[p][l] -= 1.0f;
             } else {
                 // LFOs 3-16: control-rate decimated (see LFO_DECIMATION_FACTOR's comment). Only
                 // recompute the waveform/phase every LFO_DECIMATION_FACTOR samples; every sample
                 // in between linearly interpolates from the last recomputed value toward the new
                 // one, avoiding a zipper-noise step at each recompute boundary.
-                if (lfo_decim_counter[l] == 0) {
-                    lfo_decim_last_value[l] = lfo_decim_target_value[l];
-                    float phase_offset = fmodf((knobs->programs[0].lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
-                    float read_phase = fmodf(global_lfo_phases[l] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
-                    int mod_src = (int)knobs->programs[0].lfo[l].mod_source_cc;
+                if (lfo_decim_counter[p][l] == 0) {
+                    lfo_decim_last_value[p][l] = lfo_decim_target_value[p][l];
+                    float phase_offset = fmodf((knobs->programs[p].lfo[l].phase_offset / 360.0f) + lfo_phase_mod_state[p][l], 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
+                    float read_phase = fmodf(global_lfo_phases[p][l] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
+                    int mod_src = (int)knobs->programs[p].lfo[l].mod_source_cc;
                     float cc_source_scale = 1.0f;
                     if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
                     else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
-                    lfo_decim_target_value[l] = lookup_lfo_waveform(wave_type, read_phase) * effective_mod_depth * cc_source_scale;
+                    lfo_decim_target_value[p][l] = lookup_lfo_waveform(wave_type, read_phase) * effective_mod_depth * cc_source_scale;
                     // Phase advances by DECIMATION_FACTOR steps at once, since we're about to
                     // skip that many samples' worth of recomputation -- this keeps the LFO's
                     // real-world rate correct despite only sampling it every 24th sample.
-                    global_lfo_phases[l] += (effective_rate_hz / (float)SAMPLE_RATE) * (float)LFO_DECIMATION_FACTOR;
-                    if (global_lfo_phases[l] >= 1.0f) global_lfo_phases[l] = fmodf(global_lfo_phases[l], 1.0f);
+                    global_lfo_phases[p][l] += (effective_rate_hz / (float)SAMPLE_RATE) * (float)LFO_DECIMATION_FACTOR;
+                    if (global_lfo_phases[p][l] >= 1.0f) global_lfo_phases[p][l] = fmodf(global_lfo_phases[p][l], 1.0f);
                 }
-                float frac = (float)lfo_decim_counter[l] / (float)LFO_DECIMATION_FACTOR;
-                lfo_out[l] = lfo_decim_last_value[l] + (lfo_decim_target_value[l] - lfo_decim_last_value[l]) * frac;
-                lfo_decim_counter[l] = (lfo_decim_counter[l] + 1) % LFO_DECIMATION_FACTOR;
+                float frac = (float)lfo_decim_counter[p][l] / (float)LFO_DECIMATION_FACTOR;
+                lfo_out[p][l] = lfo_decim_last_value[p][l] + (lfo_decim_target_value[p][l] - lfo_decim_last_value[p][l]) * frac;
+                lfo_decim_counter[p][l] = (lfo_decim_counter[p][l] + 1) % LFO_DECIMATION_FACTOR;
             }
+        }
         }
 
         for (int v = 0; v < voice_limit; v++) {
             if (voices[v].vco1_eg.state == STATE_IDLE && voices[v].vco2_eg.state == STATE_IDLE && voices[v].vco3_eg.state == STATE_IDLE && voices[v].vco4_eg.state == STATE_IDLE) continue;
 
+            // This voice's own Program -- resolved once here and reused for every Program-scoped
+            // knob read for the rest of this voice's own per-sample rendering below (Combi mode's
+            // whole "shared voice pool, N independent Programs" design comes down to this one
+            // resolution: the voice-claim/steal logic in handle_note_on stays completely
+            // program-agnostic, only this read needs to know which Program a voice belongs to).
+            int pidx = voices[v].program_index;
+            const ProgramState *prog = &knobs->programs[pidx];
+
             for(int e=0; e<ENV_COUNT; e++) {
-                if(e==0) tick_adsr(&voices[v].vco1_eg, &eg_rates[e], eg_sustain_chase_rate);
-                else if(e==1) tick_adsr(&voices[v].vco2_eg, &eg_rates[e], eg_sustain_chase_rate);
-                else if(e==2) tick_adsr(&voices[v].vco3_eg, &eg_rates[e], eg_sustain_chase_rate);
-                else if(e==3) tick_adsr(&voices[v].vco4_eg, &eg_rates[e], eg_sustain_chase_rate);
-                else tick_adsr(&voices[v].assign_eg[e-4], &eg_rates[e], eg_sustain_chase_rate);
+                if(e==0) tick_adsr(&voices[v].vco1_eg, &eg_rates[pidx][e], eg_sustain_chase_rate);
+                else if(e==1) tick_adsr(&voices[v].vco2_eg, &eg_rates[pidx][e], eg_sustain_chase_rate);
+                else if(e==2) tick_adsr(&voices[v].vco3_eg, &eg_rates[pidx][e], eg_sustain_chase_rate);
+                else if(e==3) tick_adsr(&voices[v].vco4_eg, &eg_rates[pidx][e], eg_sustain_chase_rate);
+                else tick_adsr(&voices[v].assign_eg[e-4], &eg_rates[pidx][e], eg_sustain_chase_rate);
             }
             release_idle_sample_streams(&voices[v]); // WAVE_SAMPLE: free any DFD stream this voice's oscillator(s) no longer need
 
@@ -5298,10 +5404,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // vco{N}_pitch: the manual Pitch knob (cents, +-2400 = +-24 semitones), added in
             // alongside fine_tune/pitch_offset/pitch-bend -- an LFO/EG targeting "Osc N Pitch"
             // sums into this same accumulator further down, so knob + live modulation just add.
-            float mod_vco1_pitch = knobs->programs[0].vco1_fine_tune + knobs->programs[0].vco1_pitch + pb_bend_cents;
-            float mod_vco2_pitch = knobs->programs[0].vco2_fine_tune + (knobs->programs[0].vco2_pitch_offset * 100.0f) + knobs->programs[0].vco2_pitch + pb_bend_cents;
-            float mod_vco3_pitch = knobs->programs[0].vco3_fine_tune + (knobs->programs[0].vco3_pitch_offset * 100.0f) + knobs->programs[0].vco3_pitch + pb_bend_cents;
-            float mod_vco4_pitch = knobs->programs[0].vco4_fine_tune + (knobs->programs[0].vco4_pitch_offset * 100.0f) + knobs->programs[0].vco4_pitch + pb_bend_cents;
+            float mod_vco1_pitch = prog->vco1_fine_tune + prog->vco1_pitch + pb_bend_cents[pidx];
+            float mod_vco2_pitch = prog->vco2_fine_tune + (prog->vco2_pitch_offset * 100.0f) + prog->vco2_pitch + pb_bend_cents[pidx];
+            float mod_vco3_pitch = prog->vco3_fine_tune + (prog->vco3_pitch_offset * 100.0f) + prog->vco3_pitch + pb_bend_cents[pidx];
+            float mod_vco4_pitch = prog->vco4_fine_tune + (prog->vco4_pitch_offset * 100.0f) + prog->vco4_pitch + pb_bend_cents[pidx];
             float mod_vco1_amp = 0.0f, mod_vco2_amp = 0.0f, fm_mod = 0.0f, mix_bal = 0.0f;
             // Filter cutoff/resonance mod destinations, 4 slots:
             //   slot 0 (targets 8/9)   = Filter A's PRIMARY filter: filter_a when Normal, or
@@ -5337,7 +5443,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float mod_vco4_amp = 0.0f, mod_vco4_pan = 0.0f, mod_vco4_tilt = 0.0f;
 
             for (int l = 0; l < LFO_COUNT; l++) {
-                int target = (int)knobs->programs[0].lfo[l].dest_target;
+                int target = (int)prog->lfo[l].dest_target;
                 // PERF: target 0 ("None") is the common case for any LFO not actually routed
                 // to a destination -- skip straight past the dispatch below instead of evaluating
                 // it for nothing. This loop runs per ACTIVE voice per sample, so on a plain
@@ -5345,7 +5451,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 // budget (found via real-world underrun diagnostics: a 33-voice plain sawtooth
                 // patch, no modulation configured at all, was already blowing the block budget).
                 if (target == 0) continue;
-                float val = lfo_out[l];
+                float val = lfo_out[pidx][l];
                 // PERF: a real switch (not a flat if-chain) so the compiler can build a jump
                 // table -- O(1) dispatch per routed target instead of a linear scan through every
                 // earlier case. Targets are mutually exclusive by construction (target can only
@@ -5412,11 +5518,11 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // not the corresponding LFO's destination -- the GUI already had a per-EG destination
             // dropdown, but it was never wired to anything back here.
             for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) {
-                int target = (int)knobs->programs[0].eg_dest_target[e];
+                int target = (int)prog->eg_dest_target[e];
                 // PERF: same early-out as the LFO loop above -- target 0 ("None") is the
                 // common case for an assignable EG not routed anywhere.
                 if (target == 0) continue;
-                float val = voices[v].assign_eg[e].current_level * knobs->programs[0].eg_intensity[e];
+                float val = voices[v].assign_eg[e].current_level * prog->eg_intensity[e];
                 // PERF: switch, not a flat if-chain -- see the LFO loop's own comment above for why.
                 switch (target) {
                     case 1: mod_vco1_pitch += val * 1200.0f; break;
@@ -5468,26 +5574,26 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
 
             // Phase pot (0-360 degrees) plus any modulation, converted to a 0..1 fractional-cycle
             // offset. Wrapped defensively since modulation can push it negative or past 1.
-            float phase_offset1 = fmodf((knobs->programs[0].vco1_phase_offset / 360.0f) + mod_vco1_phase, 1.0f); if (phase_offset1 < 0.0f) phase_offset1 += 1.0f;
-            float phase_offset2 = fmodf((knobs->programs[0].vco2_phase_offset / 360.0f) + mod_vco2_phase, 1.0f); if (phase_offset2 < 0.0f) phase_offset2 += 1.0f;
-            float phase_offset3 = fmodf((knobs->programs[0].vco3_phase_offset / 360.0f) + mod_vco3_phase, 1.0f); if (phase_offset3 < 0.0f) phase_offset3 += 1.0f;
-            float phase_offset4 = fmodf((knobs->programs[0].vco4_phase_offset / 360.0f) + mod_vco4_phase, 1.0f); if (phase_offset4 < 0.0f) phase_offset4 += 1.0f;
+            float phase_offset1 = fmodf((prog->vco1_phase_offset / 360.0f) + mod_vco1_phase, 1.0f); if (phase_offset1 < 0.0f) phase_offset1 += 1.0f;
+            float phase_offset2 = fmodf((prog->vco2_phase_offset / 360.0f) + mod_vco2_phase, 1.0f); if (phase_offset2 < 0.0f) phase_offset2 += 1.0f;
+            float phase_offset3 = fmodf((prog->vco3_phase_offset / 360.0f) + mod_vco3_phase, 1.0f); if (phase_offset3 < 0.0f) phase_offset3 += 1.0f;
+            float phase_offset4 = fmodf((prog->vco4_phase_offset / 360.0f) + mod_vco4_phase, 1.0f); if (phase_offset4 < 0.0f) phase_offset4 += 1.0f;
 
             // Unison Saw Detune Width, base knob plus any modulation, clamped back into its valid range.
-            float vco1_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->programs[0].vco1_unison_saw_detune + mod_vco1_unison_detune));
-            float vco2_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->programs[0].vco2_unison_saw_detune + mod_vco2_unison_detune));
-            float vco3_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->programs[0].vco3_unison_saw_detune + mod_vco3_unison_detune));
-            float vco4_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, knobs->programs[0].vco4_unison_saw_detune + mod_vco4_unison_detune));
+            float vco1_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, prog->vco1_unison_saw_detune + mod_vco1_unison_detune));
+            float vco2_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, prog->vco2_unison_saw_detune + mod_vco2_unison_detune));
+            float vco3_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, prog->vco3_unison_saw_detune + mod_vco3_unison_detune));
+            float vco4_unison_detune_final = fmaxf(0.0f, fminf(4200.0f, prog->vco4_unison_saw_detune + mod_vco4_unison_detune));
 
             // Oscillator shapes, hoisted here (from their own call sites further below) purely so
             // the Pan block right after can tell whether a WAVE_SAMPLE zone's own Pan setting
             // should fold into the knob-based pan below -- both are plain reads of a knob value
             // with no ordering dependency on anything between here and their old declaration
             // sites, so hoisting is safe.
-            WaveType vco1_shape_now = (WaveType)((int)knobs->programs[0].vco1_shape);
-            WaveType vco2_shape_now = (WaveType)((int)knobs->programs[0].vco2_shape);
-            WaveType vco3_shape_now = (WaveType)((int)knobs->programs[0].vco3_shape);
-            WaveType vco4_shape_now = (WaveType)((int)knobs->programs[0].vco4_shape);
+            WaveType vco1_shape_now = (WaveType)((int)prog->vco1_shape);
+            WaveType vco2_shape_now = (WaveType)((int)prog->vco2_shape);
+            WaveType vco3_shape_now = (WaveType)((int)prog->vco3_shape);
+            WaveType vco4_shape_now = (WaveType)((int)prog->vco4_shape);
             // WAVE_OFF: skip pan trig + render + mix for this oscillator entirely (phase advance
             // and envelope ticking stay unconditional -- see the WAVE_OFF decision's rationale).
             bool osc1_off = vco1_shape_now == WAVE_OFF, osc2_off = vco2_shape_now == WAVE_OFF;
@@ -5510,31 +5616,31 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // nothing is actually contributing on top of the plain Pan knob this sample -- skips
             // the cosf/sinf pair entirely in the common (unmodulated) case.
             if (!osc1_off) {
-                if (mod_vco1_pan == 0.0f && zone_pan1 == 0.0f) { pan1_l = static_pan1_l; pan1_r = static_pan1_r; }
+                if (mod_vco1_pan == 0.0f && zone_pan1 == 0.0f) { pan1_l = static_pan1_l[pidx]; pan1_r = static_pan1_r[pidx]; }
                 else {
-                    pan1_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
-                    pan1_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
+                    pan1_l = cosf((fmaxf(-1.0f, fminf(1.0f, prog->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
+                    pan1_r = sinf((fmaxf(-1.0f, fminf(1.0f, prog->vco1_pan + mod_vco1_pan + zone_pan1)) + 1.0f) * (M_PI / 4.0f));
                 }
             }
             if (!osc2_off) {
-                if (mod_vco2_pan == 0.0f && zone_pan2 == 0.0f) { pan2_l = static_pan2_l; pan2_r = static_pan2_r; }
+                if (mod_vco2_pan == 0.0f && zone_pan2 == 0.0f) { pan2_l = static_pan2_l[pidx]; pan2_r = static_pan2_r[pidx]; }
                 else {
-                    pan2_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
-                    pan2_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
+                    pan2_l = cosf((fmaxf(-1.0f, fminf(1.0f, prog->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
+                    pan2_r = sinf((fmaxf(-1.0f, fminf(1.0f, prog->vco2_pan + mod_vco2_pan + zone_pan2)) + 1.0f) * (M_PI / 4.0f));
                 }
             }
             if (!osc3_off) {
-                if (mod_vco3_pan == 0.0f && zone_pan3 == 0.0f) { pan3_l = static_pan3_l; pan3_r = static_pan3_r; }
+                if (mod_vco3_pan == 0.0f && zone_pan3 == 0.0f) { pan3_l = static_pan3_l[pidx]; pan3_r = static_pan3_r[pidx]; }
                 else {
-                    pan3_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
-                    pan3_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
+                    pan3_l = cosf((fmaxf(-1.0f, fminf(1.0f, prog->vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
+                    pan3_r = sinf((fmaxf(-1.0f, fminf(1.0f, prog->vco3_pan + mod_vco3_pan + zone_pan3)) + 1.0f) * (M_PI / 4.0f));
                 }
             }
             if (!osc4_off) {
-                if (mod_vco4_pan == 0.0f && zone_pan4 == 0.0f) { pan4_l = static_pan4_l; pan4_r = static_pan4_r; }
+                if (mod_vco4_pan == 0.0f && zone_pan4 == 0.0f) { pan4_l = static_pan4_l[pidx]; pan4_r = static_pan4_r[pidx]; }
                 else {
-                    pan4_l = cosf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
-                    pan4_r = sinf((fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
+                    pan4_l = cosf((fmaxf(-1.0f, fminf(1.0f, prog->vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
+                    pan4_r = sinf((fmaxf(-1.0f, fminf(1.0f, prog->vco4_pan + mod_vco4_pan + zone_pan4)) + 1.0f) * (M_PI / 4.0f));
                 }
             }
 
@@ -5543,10 +5649,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // amount) when the shape is Noise -- the same range render_fm_oscillator's Noise
             // branch expects (it divides by 100 itself). Any other shape doesn't consume this
             // value at all, so the exact clamp choice there is moot.
-            float vco1_pulse_width_final = (vco1_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->programs[0].vco1_pulse_width + mod_vco1_pulse_width)) : fmaxf(2.0f, fminf(98.0f, knobs->programs[0].vco1_pulse_width + mod_vco1_pulse_width));
-            float vco2_pulse_width_final = (vco2_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->programs[0].vco2_pulse_width + mod_vco2_pulse_width)) : fmaxf(2.0f, fminf(98.0f, knobs->programs[0].vco2_pulse_width + mod_vco2_pulse_width));
-            float vco3_pulse_width_final = (vco3_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->programs[0].vco3_pulse_width + mod_vco3_tilt)) : fmaxf(2.0f, fminf(98.0f, knobs->programs[0].vco3_pulse_width + mod_vco3_tilt));
-            float vco4_pulse_width_final = (vco4_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, knobs->programs[0].vco4_pulse_width + mod_vco4_tilt)) : fmaxf(2.0f, fminf(98.0f, knobs->programs[0].vco4_pulse_width + mod_vco4_tilt));
+            float vco1_pulse_width_final = (vco1_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, prog->vco1_pulse_width + mod_vco1_pulse_width)) : fmaxf(2.0f, fminf(98.0f, prog->vco1_pulse_width + mod_vco1_pulse_width));
+            float vco2_pulse_width_final = (vco2_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, prog->vco2_pulse_width + mod_vco2_pulse_width)) : fmaxf(2.0f, fminf(98.0f, prog->vco2_pulse_width + mod_vco2_pulse_width));
+            float vco3_pulse_width_final = (vco3_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, prog->vco3_pulse_width + mod_vco3_tilt)) : fmaxf(2.0f, fminf(98.0f, prog->vco3_pulse_width + mod_vco3_tilt));
+            float vco4_pulse_width_final = (vco4_shape_now == WAVE_NOISE) ? fmaxf(-100.0f, fminf(100.0f, prog->vco4_pulse_width + mod_vco4_tilt)) : fmaxf(2.0f, fminf(98.0f, prog->vco4_pulse_width + mod_vco4_tilt));
 
             // Skip the powf() call entirely when there's nothing to bend by (no fine-tune/pitch
             // knob offset, no pitch bend, no live pitch modulation routed here) -- the overwhelmingly
@@ -5567,7 +5673,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // advance any voices[v].vcoN_phase yet -- that stays at the bottom of the loop, since
             // the FM render loop below still needs every oscillator's pre-advance phase. Osc 1 is
             // always the sync master in both topologies -- it is never itself reset.
-            int hard_sync_mode = (int)knobs->programs[0].hard_sync_mode;
+            int hard_sync_mode = (int)prog->hard_sync_mode;
             float vco1_phase_before = voices[v].vco1_phase;
             float new_vco1_phase = vco1_phase_before + dt1;
             bool do_sync1 = (hard_sync_mode != 0 && new_vco1_phase >= 1.0f);
@@ -5627,8 +5733,8 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float *tri_state_ptr[4] = { &voices[v].vco1_tri_state, &voices[v].vco2_tri_state, &voices[v].vco3_tri_state, &voices[v].vco4_tri_state };
             float *tilt_lp_ptr[4] = { &voices[v].vco1_tilt_lp, &voices[v].vco2_tilt_lp, &voices[v].vco3_tilt_lp, &voices[v].vco4_tilt_lp };
             float *unison_phases_ptr[4] = { voices[v].vco1_unison_saw_phases, voices[v].vco2_unison_saw_phases, voices[v].vco3_unison_saw_phases, voices[v].vco4_unison_saw_phases };
-            const float *unison_pan_l_ptr[4] = { vco1_unison_pan_l, vco2_unison_pan_l, vco3_unison_pan_l, vco4_unison_pan_l };
-            const float *unison_pan_r_ptr[4] = { vco1_unison_pan_r, vco2_unison_pan_r, vco3_unison_pan_r, vco4_unison_pan_r };
+            const float *unison_pan_l_ptr[4] = { vco1_unison_pan_l[pidx], vco2_unison_pan_l[pidx], vco3_unison_pan_l[pidx], vco4_unison_pan_l[pidx] };
+            const float *unison_pan_r_ptr[4] = { vco1_unison_pan_r[pidx], vco2_unison_pan_r[pidx], vco3_unison_pan_r[pidx], vco4_unison_pan_r[pidx] };
             int *sample_stream_ptr[4] = { &voices[v].vco1_sample_stream, &voices[v].vco2_sample_stream, &voices[v].vco3_sample_stream, &voices[v].vco4_sample_stream };
             double *sample_ptr_ptr[4] = { &voices[v].vco1_sample_ptr, &voices[v].vco2_sample_ptr, &voices[v].vco3_sample_ptr, &voices[v].vco4_sample_ptr };
             bool *sample_preroll_ptr[4] = { &voices[v].vco1_sample_preroll, &voices[v].vco2_sample_preroll, &voices[v].vco3_sample_preroll, &voices[v].vco4_sample_preroll };
@@ -5638,14 +5744,14 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // original gain2_for_fm's "muting the sound must not silence the FM modulator"
             // design). Osc1/Osc2 deliberately exclude mix_bal here too (a final-mix-only control).
             float gain_for_fm_arr[4] = {
-                (knobs->programs[0].vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco1_vol + mod_vco1_amp)),
-                (knobs->programs[0].vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco2_vol + mod_vco2_amp)),
-                (knobs->programs[0].vco3_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco3_vol + mod_vco3_amp)),
-                (knobs->programs[0].vco4_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco4_vol + mod_vco4_amp)),
+                (prog->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->vco1_vol + mod_vco1_amp)),
+                (prog->vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->vco2_vol + mod_vco2_amp)),
+                (prog->vco3_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->vco3_vol + mod_vco3_amp)),
+                (prog->vco4_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->vco4_vol + mod_vco4_amp)),
             };
             float eg_level_arr[4] = { voices[v].vco1_eg.current_level, voices[v].vco2_eg.current_level, voices[v].vco3_eg.current_level, voices[v].vco4_eg.current_level };
 
-            int fm_algorithm_idx = (int)knobs->programs[0].fm_algorithm;
+            int fm_algorithm_idx = (int)prog->fm_algorithm;
             if (fm_algorithm_idx < 0) fm_algorithm_idx = 0;
             if (fm_algorithm_idx >= FM_ALGORITHM_COUNT) fm_algorithm_idx = FM_ALGORITHM_COUNT - 1;
             const FmAlgorithm *alg = &FM_ALGORITHMS[fm_algorithm_idx];
@@ -5659,7 +5765,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 for (int e = 0; e < alg->edge_count; e++) {
                     if (alg->edges[e].to_osc != osc) continue;
                     int src = alg->edges[e].from_osc;
-                    float depth = *(const float*)((const char*)knobs + alg->edges[e].depth_offset);
+                    float depth = *(const float*)((const char*)knobs + alg->edges[e].depth_offset + (size_t)pidx * sizeof(ProgramState));
                     if (alg->edges[e].depth_offset == offsetof(SynthSharedControls, programs[0].fm_intensity)) depth += fm_mod;
                     depth = fmaxf(0.0f, depth);
                     modulator_sum += modulator_output[src] * depth;
@@ -5690,10 +5796,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 shape_arr[3] == WAVE_UNISON_SAW || shape_arr[3] == WAVE_SAMPLE,
             };
             float gain_audible_arr[4] = {
-                (knobs->programs[0].vco1_mute != 0.0f || knobs->programs[0].vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco1_vol - mix_bal + mod_vco1_amp)),
-                (knobs->programs[0].vco2_mute != 0.0f || knobs->programs[0].vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco2_vol + mix_bal + mod_vco2_amp)),
-                (knobs->programs[0].vco3_mute != 0.0f || knobs->programs[0].vco3_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco3_vol + mod_vco3_amp)),
-                (knobs->programs[0].vco4_mute != 0.0f || knobs->programs[0].vco4_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, knobs->programs[0].vco4_vol + mod_vco4_amp)),
+                (prog->vco1_mute != 0.0f || prog->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->vco1_vol - mix_bal + mod_vco1_amp)),
+                (prog->vco2_mute != 0.0f || prog->vco2_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->vco2_vol + mix_bal + mod_vco2_amp)),
+                (prog->vco3_mute != 0.0f || prog->vco3_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->vco3_vol + mod_vco3_amp)),
+                (prog->vco4_mute != 0.0f || prog->vco4_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->vco4_vol + mod_vco4_amp)),
             };
             float pan_l_arr[4] = { pan1_l, pan2_l, pan3_l, pan4_l };
             float pan_r_arr[4] = { pan1_r, pan2_r, pan3_r, pan4_r };
@@ -5775,34 +5881,34 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float multi_crossfade_mods[3] = { filter_crossfade_mods[0], filter_crossfade_mods[3], filter_crossfade_mods[2] };
 
             float a_out_l, a_out_r, b_out_l, b_out_r;
-            int ab_mode = (int)knobs->programs[0].filter_ab_routing_mode; // 0=Series A->B, 1=Series B->A, 2=Parallel
+            int ab_mode = (int)prog->filter_ab_routing_mode; // 0=Series A->B, 1=Series B->A, 2=Parallel
             if (ab_mode == 1) {
                 // Series B -> A: run B first on the raw mix, then A on B's output -- the same
                 // two filters as mode 0, just reversed, e.g. to put Filter A's Multi engine
                 // after Filter B instead of before it.
-                b_out_l = run_svf_filter_p(stage_in_l, &knobs->programs[0].filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
-                b_out_r = run_svf_filter_p(stage_in_r, &knobs->programs[0].filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
-                if ((int)knobs->programs[0].filter_a_mode == 0) {
-                    a_out_l = run_svf_filter_p(b_out_l, &knobs->programs[0].filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
-                    a_out_r = run_svf_filter_p(b_out_r, &knobs->programs[0].filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
+                b_out_l = run_svf_filter_p(stage_in_l, &prog->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
+                b_out_r = run_svf_filter_p(stage_in_r, &prog->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
+                if ((int)prog->filter_a_mode == 0) {
+                    a_out_l = run_svf_filter_p(b_out_l, &prog->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
+                    a_out_r = run_svf_filter_p(b_out_r, &prog->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
                 } else {
-                    a_out_l = run_filter_a_multi(b_out_l, (int)knobs->programs[0].filter_a_multi_routing, knobs->programs[0].filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
-                    a_out_r = run_filter_a_multi(b_out_r, (int)knobs->programs[0].filter_a_multi_routing, knobs->programs[0].filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
+                    a_out_l = run_filter_a_multi(b_out_l, (int)prog->filter_a_multi_routing, prog->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
+                    a_out_r = run_filter_a_multi(b_out_r, (int)prog->filter_a_multi_routing, prog->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
                 }
             } else {
                 // Series A -> B (0), or Parallel (2): run A first on the raw mix.
-                if ((int)knobs->programs[0].filter_a_mode == 0) {
-                    a_out_l = run_svf_filter_p(stage_in_l, &knobs->programs[0].filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
-                    a_out_r = run_svf_filter_p(stage_in_r, &knobs->programs[0].filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
+                if ((int)prog->filter_a_mode == 0) {
+                    a_out_l = run_svf_filter_p(stage_in_l, &prog->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
+                    a_out_r = run_svf_filter_p(stage_in_r, &prog->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
                 } else {
-                    a_out_l = run_filter_a_multi(stage_in_l, (int)knobs->programs[0].filter_a_multi_routing, knobs->programs[0].filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
-                    a_out_r = run_filter_a_multi(stage_in_r, (int)knobs->programs[0].filter_a_multi_routing, knobs->programs[0].filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
+                    a_out_l = run_filter_a_multi(stage_in_l, (int)prog->filter_a_multi_routing, prog->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
+                    a_out_r = run_filter_a_multi(stage_in_r, (int)prog->filter_a_multi_routing, prog->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
                 }
                 // Series: B fed from A's output. Parallel: B fed straight from the mixer, same as A.
                 float b_in_l = (ab_mode == 0) ? a_out_l : stage_in_l;
                 float b_in_r = (ab_mode == 0) ? a_out_r : stage_in_r;
-                b_out_l = run_svf_filter_p(b_in_l, &knobs->programs[0].filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
-                b_out_r = run_svf_filter_p(b_in_r, &knobs->programs[0].filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
+                b_out_l = run_svf_filter_p(b_in_l, &prog->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
+                b_out_r = run_svf_filter_p(b_in_r, &prog->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
             }
 
             // --- Combine A and B: either Series mode means whichever filter ran last is simply
@@ -5815,61 +5921,93 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // exact no-op on this ALREADY-stereo signal -- level=50/pan=0 (the default for both)
             // reproduces the old blend=50 default output level exactly. ---
             if (ab_mode == 2) {
-                float a_lvl = fmaxf(0.0f, knobs->programs[0].filter_a_level) / 100.0f;
-                float b_lvl = fmaxf(0.0f, knobs->programs[0].filter_b_level) / 100.0f;
-                float a_angle = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].filter_a_pan)) + 1.0f) * ((float)M_PI / 4.0f);
-                float b_angle = (fmaxf(-1.0f, fminf(1.0f, knobs->programs[0].filter_b_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+                float a_lvl = fmaxf(0.0f, prog->filter_a_level) / 100.0f;
+                float b_lvl = fmaxf(0.0f, prog->filter_b_level) / 100.0f;
+                float a_angle = (fmaxf(-1.0f, fminf(1.0f, prog->filter_a_pan)) + 1.0f) * ((float)M_PI / 4.0f);
+                float b_angle = (fmaxf(-1.0f, fminf(1.0f, prog->filter_b_pan)) + 1.0f) * ((float)M_PI / 4.0f);
                 float a_gain_l = cosf(a_angle) * 1.41421356f, a_gain_r = sinf(a_angle) * 1.41421356f;
                 float b_gain_l = cosf(b_angle) * 1.41421356f, b_gain_r = sinf(b_angle) * 1.41421356f;
-                mixed_l += a_out_l * a_lvl * a_gain_l + b_out_l * b_lvl * b_gain_l;
-                mixed_r += a_out_r * a_lvl * a_gain_r + b_out_r * b_lvl * b_gain_r;
+                mixed_l[pidx] += a_out_l * a_lvl * a_gain_l + b_out_l * b_lvl * b_gain_l;
+                mixed_r[pidx] += a_out_r * a_lvl * a_gain_r + b_out_r * b_lvl * b_gain_r;
             } else {
-                mixed_l += (ab_mode == 1) ? a_out_l : b_out_l;
-                mixed_r += (ab_mode == 1) ? a_out_r : b_out_r;
+                mixed_l[pidx] += (ab_mode == 1) ? a_out_l : b_out_l;
+                mixed_r[pidx] += (ab_mode == 1) ? a_out_r : b_out_r;
             }
         }
         // LFO Phase/Rate/Depth as mod destinations (targets 14-21/28-31/48-71/72-83): computed
-        // once per sample (not per voice, since LFOs are one resource shared by every voice) from
-        // other LFOs' outputs and voice 0's assignable EGs (the reference source, for the same
-        // reason). Applied to affect the NEXT sample's read-phase/rate/depth above -- a
-        // one-sample delay that avoids any ordering ambiguity between "which LFO's output is
-        // current" within a single sample. See lfo_rate_target_index/lfo_depth_target_index/
-        // lfo_phase_target_index's comment for the target-number -> LFO-index mapping.
-        float new_lfo_phase_mod[LFO_COUNT] = {0.0f};
-        float new_lfo_rate_mod[LFO_COUNT] = {0.0f};
-        float new_lfo_depth_mod[LFO_COUNT] = {0.0f};
-        for (int l = 0; l < LFO_COUNT; l++) {
-            int target = (int)knobs->programs[0].lfo[l].dest_target;
-            int pidx = lfo_phase_target_index(target); if (pidx >= 0) new_lfo_phase_mod[pidx] += lfo_out[l];
-            int ridx = lfo_rate_target_index(target); if (ridx >= 0) new_lfo_rate_mod[ridx] += lfo_out[l];
-            int didx = lfo_depth_target_index(target); if (didx >= 0) new_lfo_depth_mod[didx] += lfo_out[l];
-        }
-        if (voices[0].vco1_eg.state != STATE_IDLE || voices[0].vco2_eg.state != STATE_IDLE) {
-            for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) {
-                int target = (int)knobs->programs[0].eg_dest_target[e];
-                float val = voices[0].assign_eg[e].current_level * knobs->programs[0].eg_intensity[e];
-                int pidx = lfo_phase_target_index(target); if (pidx >= 0) new_lfo_phase_mod[pidx] += val;
-                int ridx = lfo_rate_target_index(target); if (ridx >= 0) new_lfo_rate_mod[ridx] += val;
-                int didx = lfo_depth_target_index(target); if (didx >= 0) new_lfo_depth_mod[didx] += val;
+        // once per sample per active Program (not per voice, since LFOs are one resource shared
+        // by every voice OF THE SAME PROGRAM) from that Program's own LFOs' outputs and its own
+        // reference voice's assignable EGs. The reference voice for Program p is voices[p] --
+        // a direct generalization of today's single-Program "voice 0 is the reference" convention
+        // (p is always 0 outside Combi mode, so this is byte-identical there), and matches the
+        // same dedicated-slot convention handle_note_on's own mono-mode branch already uses.
+        // Applied to affect the NEXT sample's read-phase/rate/depth above -- a one-sample delay
+        // that avoids any ordering ambiguity between "which LFO's output is current" within a
+        // single sample. See lfo_rate_target_index/lfo_depth_target_index/lfo_phase_target_index's
+        // comment for the target-number -> LFO-index mapping.
+        for (int p = 0; p < active_program_count; p++) {
+            const ProgramState *rprog = &knobs->programs[p];
+            SynthVoice *ref_voice = &voices[p];
+            float new_lfo_phase_mod[LFO_COUNT] = {0.0f};
+            float new_lfo_rate_mod[LFO_COUNT] = {0.0f};
+            float new_lfo_depth_mod[LFO_COUNT] = {0.0f};
+            for (int l = 0; l < LFO_COUNT; l++) {
+                int target = (int)rprog->lfo[l].dest_target;
+                int ppidx = lfo_phase_target_index(target); if (ppidx >= 0) new_lfo_phase_mod[ppidx] += lfo_out[p][l];
+                int pridx = lfo_rate_target_index(target); if (pridx >= 0) new_lfo_rate_mod[pridx] += lfo_out[p][l];
+                int pdidx = lfo_depth_target_index(target); if (pdidx >= 0) new_lfo_depth_mod[pdidx] += lfo_out[p][l];
             }
-        }
-        for (int l = 0; l < LFO_COUNT; l++) {
-            lfo_phase_mod_state[l] = new_lfo_phase_mod[l];
-            lfo_rate_mod_state[l] = new_lfo_rate_mod[l];
-            lfo_depth_mod_state[l] = new_lfo_depth_mod[l];
+            if (ref_voice->vco1_eg.state != STATE_IDLE || ref_voice->vco2_eg.state != STATE_IDLE) {
+                for (int e = 0; e < ASSIGNABLE_EG_COUNT; e++) {
+                    int target = (int)rprog->eg_dest_target[e];
+                    float val = ref_voice->assign_eg[e].current_level * rprog->eg_intensity[e];
+                    int ppidx = lfo_phase_target_index(target); if (ppidx >= 0) new_lfo_phase_mod[ppidx] += val;
+                    int pridx = lfo_rate_target_index(target); if (pridx >= 0) new_lfo_rate_mod[pridx] += val;
+                    int pdidx = lfo_depth_target_index(target); if (pdidx >= 0) new_lfo_depth_mod[pdidx] += val;
+                }
+            }
+            for (int l = 0; l < LFO_COUNT; l++) {
+                lfo_phase_mod_state[p][l] = new_lfo_phase_mod[l];
+                lfo_rate_mod_state[p][l] = new_lfo_rate_mod[l];
+                lfo_depth_mod_state[p][l] = new_lfo_depth_mod[l];
+            }
         }
 
         // --- Multi-source bus dispatch ---
-        // Source 0 (Program) is exactly mixed_l/r as computed above -- oscillators summed and run
-        // through Filter A/B together, untouched by any of this. Each external-input pair (source
-        // 1..EXT_IN_PAIR_COUNT) gets its own independent dry bus, tapped directly from its own
-        // pair of capture channels (2p/2p+1) -- generalizes what used to be a single hardcoded tap
-        // at capture channels 0/1, and is never summed into Program's own bus.
+        // Sources 0..COMBI_PROGRAM_COUNT-1 are the 8 Combi Programs, each exactly its own
+        // mixed_l/r as computed above (oscillators summed and run through Filter A/B together,
+        // untouched by any of this) -- source 0 is byte-identical to today's single Program bus.
+        // Source COMBI_PROGRAM_COUNT ("Combi Mix") is a new synthetic bus: the whole stack's raw
+        // dry pre-FX sum, unconditionally including every Program regardless of whatever other
+        // individual FX routing those same Programs also have -- lets one FX slot serially treat
+        // the whole stack while other slots still individually target a single Program, a
+        // deliberate, intentional overlap ("let them route"). Each external-input pair (the
+        // remaining EXT_IN_PAIR_COUNT source ids) gets its own independent dry bus, tapped
+        // directly from its own pair of capture channels (2p/2p+1) -- generalizes what used to be
+        // a single hardcoded tap at capture channels 0/1, and is never summed into any Program's
+        // own bus.
+        // master_volume is session-level (scales the WHOLE session's output uniformly), applied
+        // here to each Program's own bus individually -- mathematically equivalent to applying it
+        // once globally, while also correctly scaling any Program routed individually (not via
+        // Combi Mix) and keeping Combi Mix's own sum consistent with what each Program bus
+        // actually outputs (applied BEFORE the Combi Mix sum below, not after, so a Program's
+        // contribution to Combi Mix always matches its own individually-routed bus). Generalizes
+        // today's Program-only `bus_l[0] *= knobs->master_volume;` cleanly. Ext-in pairs rely
+        // solely on their own per-pair gain (below) as their equivalent "volume" knob, unchanged.
         float bus_l[SOURCE_COUNT], bus_r[SOURCE_COUNT];
-        bus_l[0] = mixed_l;
-        bus_r[0] = mixed_r;
+        float combi_mix_l = 0.0f, combi_mix_r = 0.0f;
+        for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+            bus_l[p] = mixed_l[p] * knobs->master_volume;
+            bus_r[p] = mixed_r[p] * knobs->master_volume;
+            combi_mix_l += bus_l[p];
+            combi_mix_r += bus_r[p];
+        }
+        bus_l[COMBI_PROGRAM_COUNT] = combi_mix_l;
+        bus_r[COMBI_PROGRAM_COUNT] = combi_mix_r;
         for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) {
-            int src = 1 + p;
+            // Ext-in pairs now sit after the 8 Programs + Combi Mix (source ids 9-16, was 1-8 --
+            // see SOURCE_COUNT's own BREAKING CHANGE comment).
+            int src = COMBI_PROGRAM_COUNT + 1 + p;
             bus_l[src] = 0.0f;
             bus_r[src] = 0.0f;
             if (knobs->ext_in_enable[p] != 0.0f && 2 * p < ext_in_channels) {
@@ -5905,12 +6043,9 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
         // release gain reduction, explicitly designed for "several voices lining up" and
         // "12 FX slots summed in Parallel routing" -- see its own comment right below), making
         // the old pad pure redundant attenuation: quietly cutting every patch by ~16.5dB more
-        // than master_volume alone would, for no remaining safety benefit.
-        // master_volume stays Program-only, applied here before Program's bus is summed into any
-        // output-pair accumulator -- ext-in pairs rely solely on their own per-pair gain above as
-        // their equivalent "volume" knob (unchanged from today's behavior).
-        bus_l[0] *= knobs->master_volume;
-        bus_r[0] *= knobs->master_volume;
+        // than master_volume alone would, for no remaining safety benefit. master_volume itself
+        // was already applied above, to each Program bus (and so, transitively, to Combi Mix) --
+        // see that comment for why it happens there now instead of here.
 
         // Sum every source into whichever output pair(s) it's routed to -- many-to-many: a source
         // can feed multiple pairs at once, several sources can share one pair.
@@ -6727,10 +6862,10 @@ int main(int argc, char **argv) {
     char applied_midi_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
 
-    float global_lfo_phases[LFO_COUNT] = {0.0f}; int vu_decimator = 0;
+    float global_lfo_phases[COMBI_PROGRAM_COUNT][LFO_COUNT] = {{0.0f}}; int vu_decimator = 0;
 
     SynthVoice voices[MAX_VOICES]; for (int i = 0; i < MAX_VOICES; i++) init_voice(&voices[i]);
-    MonoNoteStack mono_stack = {0};
+    MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT]; for (int mp = 0; mp < COMBI_PROGRAM_COUNT; mp++) mono_stacks[mp] = (MonoNoteStack){0};
 
     // Engine "uptime" in samples, purely for the Tempo system's elapsed-time axis (see
     // compute_current_tempo_bpm()) -- there's no other transport/song-position concept here.
@@ -6744,7 +6879,6 @@ int main(int argc, char **argv) {
         poll_seq_audio_load_requests(&active_knobs); // spawns a loader thread if a lane's audio_path changed
         poll_seq_audio_preview_triggers(&active_knobs); // starts one-shot playback if a lane's Preview button was clicked
         poll_transport_triggers(&active_knobs); // Play/Pause/Stop -- starts/freezes/resets the real Sequencer playhead
-        bool poly_mode_active = (active_knobs.programs[0].is_polyphonic != 0.0f);
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
         // packet as every other knob. Only reopen the stream whose name actually changed.
@@ -6801,8 +6935,8 @@ int main(int argc, char **argv) {
         // block (see its #define for the real-time trade-off this bounds).
         drain_pending_sample_loads();
 
-        process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack, our_midi_port, &midi_sources, &midi_live);
-        seq_playback_midi_events(voices, &active_knobs, global_lfo_phases, poly_mode_active, &mono_stack, &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead
+        process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live);
+        seq_playback_midi_events(voices, &active_knobs, global_lfo_phases, &mono_stacks[0], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets Program 0)
 
         // block_size/voice_limit are computed fresh every iteration since both are live,
         // user-adjustable controls (Audio tab: Block Size, Polyphony) -- see
