@@ -552,6 +552,44 @@ pip install -r requirements.txt
 python3 src/frontend.py # start the GUI -- talks to the engine over OSC (see below)
 ```
 
+### Building for Windows
+
+Linux (with ALSA) is the primary, actively-developed platform. A Windows build of the backend
+also exists, using WASAPI (via the vendored [miniaudio](https://miniaudio.h) single-header
+library, `third_party/miniaudio.h`) for audio and WinMM for MIDI instead of ALSA -- see the
+"Windows audio/MIDI platform shim" comments near the top of `src/backend.c` for how that's kept
+completely isolated from the DSP/synth code, which is identical on both platforms. This is
+cross-compiled and link-verified in CI-like conditions, but has **not** been run on real Windows
+hardware yet -- treat it as a first real smoke test to confirm on an actual machine, same
+limitation as this project's other platform-specific work (real multichannel audio hardware,
+etc.).
+
+Cross-compiling from Linux (or WSL) needs the mingw-w64 toolchain:
+
+```sh
+sudo apt-get install mingw-w64       # Debian/Ubuntu
+tools/build_windows_deps.sh          # one-time: cross-builds liblo + wavpack for Windows
+make windows                         # produces synth_engine.exe
+```
+
+`tools/build_windows_deps.sh` fetches liblo and WavPack's own source (the same portable C
+libraries used on Linux -- there's no Windows-specific fork of either) and cross-builds them as
+static libraries under `third_party/win64-deps/` (not committed -- see the script's own header
+comment). Audio and MIDI need nothing beyond mingw-w64 itself.
+
+To ship the GUI alongside it as a single double-clickable `.exe`, build `synth_engine.exe` first
+(above), then **on an actual Windows machine** (PyInstaller does not cross-compile):
+
+```sh
+pip install -r requirements.txt pyinstaller
+pyinstaller frontend.spec
+```
+
+This produces `dist/HDS.exe`, with `synth_engine.exe` bundled inside it; `frontend.py`'s own
+`_maybe_launch_bundled_backend()` detects it's running from a frozen bundle and launches the
+bundled engine automatically on startup (a no-op in every other run mode, including the normal
+`python3 src/frontend.py` this project is developed against).
+
 ### Control protocol: OSC
 
 The backend is controlled entirely over OSC (Open Sound Control), via a

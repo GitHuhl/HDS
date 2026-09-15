@@ -1,6 +1,10 @@
 synth_engine
+synth_engine.exe
 *.o
 __pycache__/
 *.pyc
 .venv/
 venv/
+# Cross-built Windows dependencies (liblo/wavpack) -- built from source by
+# tools/build_windows_deps.sh, not committed (see that script's own header comment for why).
+/third_party/win64-deps/

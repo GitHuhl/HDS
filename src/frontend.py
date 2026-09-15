@@ -2213,6 +2213,7 @@ class SynthGui(QWidget):
         # Program save/load: one subfolder per Program (~/HDS_Programs/<name>/<name>.hdsprog
         # [+ <name>.sfz]) -- mirrors the existing ~/HDS_Recordings convention (self.record_folder).
         self.programs_folder = os.path.expanduser("~/HDS_Programs")
+        self._maybe_launch_bundled_backend()
         self.connect_to_backend()
 
         # The master outer structural layout
@@ -5738,6 +5739,30 @@ class SynthGui(QWidget):
             for panel in targets:
                 panel.setEnabled(True)
 
+    # Windows packaging: a PyInstaller --onefile build of this file can bundle synth_engine.exe
+    # alongside it as a data file (see tools/build_windows_deps.sh + the README's Windows build
+    # section) so the whole app ships as one double-clickable .exe. On every other run mode --
+    # the normal `python3 src/frontend.py` on Linux this project is developed against, or a
+    # frozen build with no bundled backend present -- this is a complete no-op: the user (or a
+    # dev) starts synth_engine themselves, exactly as today, and frontend.py just connects to it
+    # over OSC same as always. sys.frozen/sys._MEIPASS are PyInstaller's own documented markers
+    # for "am I running from a frozen bundle, and where did it unpack to."
+    def _maybe_launch_bundled_backend(self):
+        self._bundled_backend_proc = None
+        if not (getattr(sys, "frozen", False) and sys.platform == "win32"):
+            return
+        bundle_dir = getattr(sys, "_MEIPASS", None)
+        if not bundle_dir:
+            return
+        backend_path = os.path.join(bundle_dir, "synth_engine.exe")
+        if not os.path.isfile(backend_path):
+            return
+        try:
+            self._bundled_backend_proc = subprocess.Popen([backend_path])
+            print(f"launched bundled backend: {backend_path}")
+        except OSError as e:
+            print(f"--- failed to launch bundled backend {backend_path}: {e} ---")
+
     def connect_to_backend(self):
         # UDP: construction never fails just because nothing's listening yet (unlike the old
         # AF_UNIX SOCK_STREAM connect(), whose success/failure used to BE the mock-mode signal).
@@ -6286,6 +6311,8 @@ class SynthGui(QWidget):
     def closeEvent(self, event):
         if self.osc_client is not None: self.osc_client.close()
         if self.status_sock is not None: self.status_sock.close()
+        if getattr(self, "_bundled_backend_proc", None) is not None:
+            self._bundled_backend_proc.terminate()  # only ever set when this GUI itself launched it -- see _maybe_launch_bundled_backend()
         event.accept()
 def runtime_connect_and_bind(gui):
     # Program save/load
