@@ -7007,8 +7007,19 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             float osc_l[4], osc_r[4];
             for (int osc = 0; osc < 4; osc++) {
                 float amp = gain_audible_arr[osc] * eg_level_arr[osc];
-                osc_l[osc] = (osc_uses_side[osc] ? osc_side_l[osc] : osc_out[osc]) * amp * pan_l_arr[osc];
-                osc_r[osc] = (osc_uses_side[osc] ? osc_side_r[osc] : osc_out[osc]) * amp * pan_r_arr[osc];
+                // Unison Saw/Sample's side_l/r are ALREADY a full stereo image (unlike every
+                // other shape's osc_out, which is mono until this Pan multiply gives it width) --
+                // reusing the plain mono-source pan law here would silently cut an untouched
+                // (centered) Unison Saw/Sample oscillator by -3dB, the same "already-stereo
+                // source" bug this codebase has already fixed for Filter A/B's Parallel combine
+                // and the Sequencer/Combi lane mixer's own Level/Pan (see those for the identical
+                // sqrt(2)-normalization fix) -- reused here for the same reason: pan_l_arr/
+                // pan_r_arr read exactly 0.70711 at center (correct for a mono source split two
+                // ways), so an already-stereo source needs the sqrt(2)-normalized law instead,
+                // which reads exactly 1.0 at center and only narrows/widens away from it.
+                float pan_gain_mult = osc_uses_side[osc] ? 1.41421356f : 1.0f;
+                osc_l[osc] = (osc_uses_side[osc] ? osc_side_l[osc] : osc_out[osc]) * amp * pan_l_arr[osc] * pan_gain_mult;
+                osc_r[osc] = (osc_uses_side[osc] ? osc_side_r[osc] : osc_out[osc]) * amp * pan_r_arr[osc] * pan_gain_mult;
             }
 
             // Phase advance (unconditional, even for WAVE_OFF -- phase bookkeeping stays live so
