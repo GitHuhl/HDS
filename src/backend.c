@@ -3820,65 +3820,125 @@ static const OscParamEntry OSC_PARAMS[] = {
 };
 #define OSC_PARAMS_COUNT (sizeof(OSC_PARAMS) / sizeof(OSC_PARAMS[0]))
 
-// Rebuild-and-compare match: sscanf's %d is lenient about what follows (it would happily accept
-// "/hds/eg/3abc/attack" as index 3, then keep trying to match the literal "/attack" against
-// "abc/attack" and fail there -- but only after consuming "3"). Re-serializing the parsed index
-// with the SAME template and comparing byte-for-byte against the original path removes any
-// ambiguity: if the address wasn't shaped exactly like the template with a real integer in that
-// slot, this simply won't match, full stop.
-static bool osc_match_one_index(const char *path, const char *tmpl, int *out_idx) {
-    int idx;
-    if (sscanf(path, tmpl, &idx) != 1) return false;
-    char rebuilt[128];
-    snprintf(rebuilt, sizeof(rebuilt), tmpl, idx);
-    if (strcmp(rebuilt, path) != 0) return false;
-    *out_idx = idx;
-    return true;
+
+// Dispatch table: a flat, open-addressed hash map from every CONCRETE OSC address (i.e. OSC_PARAMS
+// fully expanded across every array index -- ~4100 entries, not the ~1050 template rows in
+// OSC_PARAMS itself) straight to its resolved (offset, kind, str_len). Built once at startup by
+// build_osc_dispatch_table() (see its own call site in main(), before the OSC server starts
+// accepting messages) and read-only from then on, so it's safe to probe from generic_osc_handler
+// with no locking.
+//
+// This replaces an earlier linear-scan-over-OSC_PARAMS design that measured fine in isolation
+// (control messages "at UI-interaction rates, dozens/sec at most") but broke down against how
+// transmit_knob_packet() actually behaves: it resends the ENTIRE knob state -- all ~4100 concrete
+// addresses -- as one OSC bundle on EVERY single knob change, and that whole bundle is drained
+// synchronously on the audio thread (see main()'s "while (lo_server_recv_noblock(...))" loop)
+// before that block's audio is rendered. A probe harness driving the old linear-scan handler
+// through one such burst measured ~46ms wall time against a ~10.7ms real-time budget for a
+// 512-frame block -- a guaranteed audible click/pop synced to the very next UI change, and worse
+// the more OSC_PARAMS grows (which it has, repeatedly, as this synth's feature surface grew).
+// The hash lookup below is O(1) average per message, so the same 4100-message burst finishes in
+// well under a millisecond -- see test_osc_dispatch_no_click.c for the regression test asserting
+// this stays true.
+#define OSC_DISPATCH_TABLE_SIZE 16384 // power of two; ~4100 concrete addresses -> ~25% load factor
+typedef struct {
+    char address[128];
+    size_t offset;
+    OscParamKind kind;
+    size_t str_len;
+    bool occupied;
+} OscDispatchSlot;
+static OscDispatchSlot osc_dispatch_table[OSC_DISPATCH_TABLE_SIZE];
+
+// FNV-1a: fast, simple, and more than good enough for a fixed, known-at-startup key set with no
+// adversarial-input concern (OSC addresses are our own compile-time-generated strings).
+static uint32_t osc_hash_address(const char *s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
+    return h;
 }
-static bool osc_match_two_index(const char *path, const char *tmpl, int *out_idx1, int *out_idx2) {
-    int idx1, idx2;
-    if (sscanf(path, tmpl, &idx1, &idx2) != 2) return false;
-    char rebuilt[128];
-    snprintf(rebuilt, sizeof(rebuilt), tmpl, idx1, idx2);
-    if (strcmp(rebuilt, path) != 0) return false;
-    *out_idx1 = idx1; *out_idx2 = idx2;
-    return true;
+
+static void osc_dispatch_insert(const char *address, size_t offset, OscParamKind kind, size_t str_len) {
+    uint32_t h = osc_hash_address(address) & (OSC_DISPATCH_TABLE_SIZE - 1);
+    for (int probes = 0; probes < OSC_DISPATCH_TABLE_SIZE; probes++) {
+        OscDispatchSlot *slot = &osc_dispatch_table[h];
+        if (!slot->occupied) {
+            snprintf(slot->address, sizeof(slot->address), "%s", address);
+            slot->offset = offset; slot->kind = kind; slot->str_len = str_len; slot->occupied = true;
+            return;
+        }
+        // Every concrete address OSC_PARAMS expands to must be unique (the whole point of the
+        // table) -- a collision on the STRING itself (not just the hash) means two OSC_PARAMS
+        // rows generate the same wire address, an authoring bug in the table that must be caught
+        // at startup, never silently overwritten.
+        if (strcmp(slot->address, address) == 0) {
+            fprintf(stderr, "[osc] FATAL: duplicate OSC_PARAMS address '%s' -- two table rows generate the same concrete address\n", address);
+            exit(1);
+        }
+        h = (h + 1) & (OSC_DISPATCH_TABLE_SIZE - 1);
+    }
+    fprintf(stderr, "[osc] FATAL: dispatch table full inserting '%s' -- raise OSC_DISPATCH_TABLE_SIZE\n", address);
+    exit(1);
+}
+
+// Mirrors dump_osc_params_addresses.c's own expansion loop exactly (same nested-index shape),
+// since that's the same enumeration this table's correctness depends on matching.
+static void build_osc_dispatch_table(void) {
+    for (size_t i = 0; i < OSC_PARAMS_COUNT; i++) {
+        const OscParamEntry *e = &OSC_PARAMS[i];
+        int n1 = (e->num_indices >= 1) ? e->count : 1;
+        int n2 = (e->num_indices == 2) ? e->count2 : 1;
+        for (int idx1 = 0; idx1 < n1; idx1++) {
+            for (int idx2 = 0; idx2 < n2; idx2++) {
+                char addr[128];
+                size_t offset = e->base_offset;
+                if (e->num_indices == 0) {
+                    snprintf(addr, sizeof(addr), "%s", e->address);
+                } else if (e->num_indices == 1) {
+                    snprintf(addr, sizeof(addr), e->address, idx1);
+                    offset += (size_t)idx1 * e->stride;
+                } else {
+                    snprintf(addr, sizeof(addr), e->address, idx1, idx2);
+                    offset += (size_t)idx1 * e->stride + (size_t)idx2 * e->stride2;
+                }
+                osc_dispatch_insert(addr, offset, e->kind, e->str_len);
+            }
+        }
+    }
+}
+
+static const OscDispatchSlot *osc_dispatch_lookup(const char *address) {
+    uint32_t h = osc_hash_address(address) & (OSC_DISPATCH_TABLE_SIZE - 1);
+    for (int probes = 0; probes < OSC_DISPATCH_TABLE_SIZE; probes++) {
+        const OscDispatchSlot *slot = &osc_dispatch_table[h];
+        if (!slot->occupied) return NULL;
+        if (strcmp(slot->address, address) == 0) return slot;
+        h = (h + 1) & (OSC_DISPATCH_TABLE_SIZE - 1);
+    }
+    return NULL;
 }
 
 // The single generic OSC method (registered with path=NULL, type=NULL -- liblo calls this for
-// every incoming message that no more specific method claims). A linear scan over OSC_PARAMS is
-// completely fine here: control messages arrive at UI-interaction rates (dozens/sec at most),
-// nowhere near the audio thread's hot path.
+// every incoming message that no more specific method claims). O(1) average-case hash lookup via
+// osc_dispatch_table (see above) -- an out-of-range index (e.g. "/hds/lfo/99/rate") simply was
+// never inserted into the table, so it correctly falls through to "unrecognized address" below
+// rather than needing its own explicit bounds check.
 static int generic_osc_handler(const char *path, const char *types, lo_arg **argv, int argc,
                                 lo_message msg, void *user_data) {
     (void)msg;
     SynthSharedControls *knobs = (SynthSharedControls *)user_data;
-    for (size_t i = 0; i < OSC_PARAMS_COUNT; i++) {
-        const OscParamEntry *e = &OSC_PARAMS[i];
-        size_t offset = e->base_offset;
-        if (e->num_indices == 0) {
-            if (strcmp(path, e->address) != 0) continue;
-        } else if (e->num_indices == 1) {
-            int idx;
-            if (!osc_match_one_index(path, e->address, &idx)) continue;
-            if (idx < 0 || idx >= e->count) { fprintf(stderr, "[osc] index %d out of range for '%s'\n", idx, path); return 0; }
-            offset += (size_t)idx * e->stride;
-        } else { // num_indices == 2
-            int idx1, idx2;
-            if (!osc_match_two_index(path, e->address, &idx1, &idx2)) continue;
-            if (idx1 < 0 || idx1 >= e->count || idx2 < 0 || idx2 >= e->count2) { fprintf(stderr, "[osc] index out of range for '%s'\n", path); return 0; }
-            offset += (size_t)idx1 * e->stride + (size_t)idx2 * e->stride2;
-        }
-        if (e->kind == OSC_KIND_FLOAT) {
-            if (argc != 1 || types[0] != 'f') { fprintf(stderr, "[osc] '%s' expects one float arg, got types='%s'\n", path, types); return 0; }
-            *(float *)((char *)knobs + offset) = argv[0]->f;
-        } else { // OSC_KIND_STRING
-            if (argc != 1 || types[0] != 's') { fprintf(stderr, "[osc] '%s' expects one string arg, got types='%s'\n", path, types); return 0; }
-            snprintf((char *)knobs + offset, e->str_len, "%s", (const char *)&argv[0]->s);
-        }
+    const OscDispatchSlot *slot = osc_dispatch_lookup(path);
+    if (!slot) {
+        fprintf(stderr, "[osc] unrecognized address '%s' (types='%s') ignored\n", path, types);
         return 0;
     }
-    fprintf(stderr, "[osc] unrecognized address '%s' (types='%s') ignored\n", path, types);
+    if (slot->kind == OSC_KIND_FLOAT) {
+        if (argc != 1 || types[0] != 'f') { fprintf(stderr, "[osc] '%s' expects one float arg, got types='%s'\n", path, types); return 0; }
+        *(float *)((char *)knobs + slot->offset) = argv[0]->f;
+    } else { // OSC_KIND_STRING
+        if (argc != 1 || types[0] != 's') { fprintf(stderr, "[osc] '%s' expects one string arg, got types='%s'\n", path, types); return 0; }
+        snprintf((char *)knobs + slot->offset, slot->str_len, "%s", (const char *)&argv[0]->s);
+    }
     return 0;
 }
 
@@ -8127,6 +8187,7 @@ int main(int argc, char **argv) {
     // functions this replaces. The zone methods are registered with explicit type strings (liblo
     // tries the most specific registration first), the knob table's generic method last with
     // path=NULL/type=NULL as the catch-all for everything else.
+    build_osc_dispatch_table(); // once, before any message can arrive -- see its own comment for why
     char osc_listen_port_str[16]; snprintf(osc_listen_port_str, sizeof(osc_listen_port_str), "%d", osc_listen_port);
     lo_server osc_server = lo_server_new_with_proto(osc_listen_port_str, LO_UDP, osc_error_handler);
     if (!osc_server) { fprintf(stderr, "Cannot continue without an OSC listen socket on port %d.\n", osc_listen_port); return 1; }
