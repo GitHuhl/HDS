@@ -8875,6 +8875,23 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--list-devices") == 0) { hds_win_print_device_list(); return 0; }
     }
+
+    // BUG FIX (Windows "crunchy" audio / underruns): write_audio_block()'s WASAPI branch waits
+    // for ring room via nanosleep(1ms) retries when the (now deliberately small, see
+    // open_pcm_stream()'s own comment) ring is momentarily full. MinGW's nanosleep() on Windows
+    // bottoms out on Sleep(), which is bound by the OS's system timer resolution -- by default
+    // ~15.6ms, not 1ms, on most Windows installs, unless a process explicitly asks for better.
+    // Without this call, every "1ms" retry could actually take up to ~15ms, meaning the render
+    // thread can stall over 10x longer than intended whenever the ring fills -- long enough for
+    // WASAPI's own callback to drain it dry and zero-fill (an audible click/crackle) before the
+    // render thread wakes back up. This is very likely why shrinking the ring (the previous fix,
+    // needed to stop double-buffering latency) traded "laggy" for "crunchy": the ring's now
+    // small enough that it empties fast, and this timer-resolution gap was the thing stopping the
+    // render thread from refilling it in time. timeBeginPeriod(1) requests 1ms system timer
+    // resolution for this whole process (matched by timeEndPeriod(1) at clean shutdown, near
+    // main()'s own return 0 below) -- the standard, documented fix for exactly this class of
+    // Windows audio-glitch bug.
+    timeBeginPeriod(1);
 #endif
 
     // OSC transport configuration -- see the "OSC Control Protocol" comment above OSC_PARAMS[].
@@ -9264,5 +9281,8 @@ int main(int argc, char **argv) {
 #endif
     close_pcm_stream(pcm_handle);
     if (pcm_capture_handle) close_pcm_stream(pcm_capture_handle);
+#ifdef _WIN32
+    timeEndPeriod(1); // matches timeBeginPeriod(1) near the top of main()
+#endif
     return 0;
 }
