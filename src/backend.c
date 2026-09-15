@@ -799,6 +799,16 @@ typedef struct {
     float seq_transport_play_trigger;
     float seq_transport_pause_trigger;
     float seq_transport_stop_trigger;
+    // Seek: same edge-triggered-counter idiom as Play/Pause/Stop above. seek_start jumps the
+    // playhead to 0:00 ("very beginning" reset); seek_back/seek_fwd move it by one whole measure
+    // (4 beats at the engine's current tempo -- see poll_transport_triggers' own comment on why
+    // "current" rather than "at the target position": this engine's tempo-map system interpolates
+    // against uptime, not a seekable playhead, an existing limitation this reuses rather than
+    // solves). All three work in every transport state (Stopped/Paused/Playing), repositioning
+    // every lane's own playback position to match, not just the display.
+    float seq_transport_seek_start_trigger;
+    float seq_transport_seek_back_trigger;
+    float seq_transport_seek_fwd_trigger;
 
     // Combi mode: which incoming MIDI channel each of the 8 Program lanes listens on (0 = Omni,
     // 1-16 = a specific channel) -- same convention as SeqLaneState.midi_channel, filtering LIVE
@@ -3735,6 +3745,9 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/seq/transport/play", seq_transport_play_trigger),
     OSC_SCALAR("/hds/seq/transport/pause", seq_transport_pause_trigger),
     OSC_SCALAR("/hds/seq/transport/stop", seq_transport_stop_trigger),
+    OSC_SCALAR("/hds/seq/transport/seek_start", seq_transport_seek_start_trigger),
+    OSC_SCALAR("/hds/seq/transport/seek_back", seq_transport_seek_back_trigger),
+    OSC_SCALAR("/hds/seq/transport/seek_fwd", seq_transport_seek_fwd_trigger),
 
     OSC_ARRAY("/hds/combi/%d/midi_channel", combi_lane_midi_channel, COMBI_PROGRAM_COUNT),
 
@@ -3940,6 +3953,9 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->seq_transport_play_trigger = 0.0f;
     knobs->seq_transport_pause_trigger = 0.0f;
     knobs->seq_transport_stop_trigger = 0.0f;
+    knobs->seq_transport_seek_start_trigger = 0.0f;
+    knobs->seq_transport_seek_back_trigger = 0.0f;
+    knobs->seq_transport_seek_fwd_trigger = 0.0f;
     for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) knobs->combi_lane_midi_channel[p] = 0.0f; // Omni
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
@@ -5785,6 +5801,7 @@ typedef enum { TRANSPORT_STOPPED = 0, TRANSPORT_PLAYING = 1, TRANSPORT_PAUSED = 
 static TransportState g_transport_state = TRANSPORT_STOPPED;
 static double g_transport_playhead_sec = 0.0;
 static float g_transport_last_play_trigger = 0.0f, g_transport_last_pause_trigger = 0.0f, g_transport_last_stop_trigger = 0.0f;
+static float g_transport_last_seek_start_trigger = 0.0f, g_transport_last_seek_back_trigger = 0.0f, g_transport_last_seek_fwd_trigger = 0.0f;
 
 // RAM-only, mirrors the audio lanes' own RAM-caching decision -- a short recorded phrase's worth
 // of note events is tiny even at this capacity, no disk streaming needed. Events are stored in
@@ -5804,14 +5821,18 @@ typedef struct {
 } SeqMidiLane;
 static SeqMidiLane g_seq_midi[SEQ_LANE_COUNT];
 
-// Actually starts one Seq-mode audio lane's transport-driven playback from its own
-// audio_offset_sec -- shared by transport_start_fresh (a lane already READY when Play is
-// pressed) and poll_seq_audio_transport_catchup (a lane that becomes READY while the transport
-// is already playing). Caller must have already confirmed load_state == SEQ_AUDIO_READY.
+// Actually starts (or repositions) one Seq-mode audio lane's transport-driven playback: its file
+// position is audio_offset_sec (the lane's own knob, "start reading the file from here") PLUS
+// the transport's own current playhead (g_transport_playhead_sec) -- so a lane repositions
+// correctly whether this is a fresh Play from Stop (playhead is 0 there), a late-loading lane
+// catching up mid-song (poll_seq_audio_transport_catchup), or a Seek (transport_reposition_lanes,
+// playhead already updated by the caller before this runs). Shared by all three callers. Caller
+// must have already confirmed load_state == SEQ_AUDIO_READY.
 static void seq_audio_start_transport_playback(SeqAudioLane *al, float audio_offset_sec) {
     long start_frame = 0;
-    if (audio_offset_sec > 0.0f && al->sample_rate > 0) {
-        start_frame = (long)(audio_offset_sec * (float)al->sample_rate);
+    float target_sec = audio_offset_sec + (float)g_transport_playhead_sec;
+    if (target_sec > 0.0f && al->sample_rate > 0) {
+        start_frame = (long)(target_sec * (float)al->sample_rate);
         if (start_frame >= al->frame_count) start_frame = al->frame_count - 1;
     }
     al->play_frame = start_frame;
@@ -5820,42 +5841,64 @@ static void seq_audio_start_transport_playback(SeqAudioLane *al, float audio_off
     al->armed_for_transport = false;
 }
 
-// Called once, only on a STOPPED -> PLAYING transition (never on PAUSED -> PLAYING/resume, which
-// must leave every lane's position exactly where it was): starts every Seq-mode loaded Audio
-// lane's one-shot playback fresh from its own audio_offset_sec (mirrors
-// poll_seq_audio_preview_triggers' own start-frame logic, marked driven_by_transport so the
-// per-sample mix loop gates it on transport state -- unlike a manually Preview-triggered lane,
-// which always plays through regardless), rewinds every Program/MIDI lane's playback cursor to
-// the top, and clears any lane currently armed to Rec so it starts a genuinely fresh take rather
-// than appending onto whatever it recorded last time.
-static void transport_start_fresh(const SynthSharedControls *knobs) {
+// Repositions every Seq/Mute-mode lane's own playback state (Audio lanes' play_frame, MIDI
+// lanes' playback_cursor) to match wherever g_transport_playhead_sec CURRENTLY is -- shared by
+// transport_start_fresh (a fresh Play from Stop, playhead already reset to the target by the
+// caller) and the Seek triggers below (Reset/Back/Forward, playhead already moved by the caller
+// before this runs). Rec-armed lanes are deliberately left untouched -- they have no "position"
+// to seek to; repositioning would either discard an in-progress take or make no sense for one
+// that hasn't started, so a seek simply doesn't affect what a Rec-armed lane is doing.
+static void transport_reposition_lanes(const SynthSharedControls *knobs) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         bool is_audio_lane = (knobs->seq_lanes[l].lane_type != 0.0f);
         int mode = (int)knobs->seq_lanes[l].seq_mode;
         if (is_audio_lane) {
-            if (mode != 0) continue; // only Seq-mode Audio lanes auto-start; Mute/Rec don't
+            if (mode != 0) continue; // only Seq-mode Audio lanes are transport-driven; Mute/Rec aren't repositioned
             SeqAudioLane *al = &g_seq_audio[l];
             if (atomic_load_explicit(&al->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !al->pcm || al->frame_count <= 0) {
-                // Not ready yet (still loading, or loading was only just kicked off) -- arm it so
-                // poll_seq_audio_transport_catchup starts it the moment it becomes ready, instead
-                // of silently skipping this lane for the rest of the Play session.
+                // Not ready yet -- arm it so poll_seq_audio_transport_catchup starts it at the
+                // right (already-updated) position the moment it becomes ready.
                 al->armed_for_transport = true;
                 continue;
             }
             seq_audio_start_transport_playback(al, knobs->seq_lanes[l].audio_offset_sec);
         } else {
+            if (mode != 0 && mode != 1) continue; // Rec-armed lanes have no playback position to reposition
             SeqMidiLane *ml = &g_seq_midi[l];
-            ml->playback_cursor = 0;
-            if (mode == 2) ml->event_count = 0; // fresh Rec take
+            // Events are stored in non-decreasing time order (real-time recording can't record
+            // out of order -- see SeqMidiLane's own comment), so the new cursor is just "how many
+            // events have a timestamp at or before the new playhead," found by a plain forward
+            // scan from 0. Cheap even for a full 8192-event lane; only runs on an actual seek
+            // (button click), never per-block.
+            int cursor = 0;
+            while (cursor < ml->event_count && ml->events[cursor].time_sec <= (float)g_transport_playhead_sec) cursor++;
+            ml->playback_cursor = cursor;
         }
     }
 }
 
+// Called once, only on a STOPPED -> PLAYING transition (never on PAUSED -> PLAYING/resume, which
+// must leave every lane's position exactly where it was): repositions every Seq/Mute-mode lane
+// to match the transport's current playhead (transport_reposition_lanes -- ordinarily 0, unless
+// the transport was seeked while Stopped, in which case Play correctly starts from there instead
+// of silently snapping back to the top), and clears any lane currently armed to Rec so it starts
+// a genuinely fresh take rather than appending onto whatever it recorded last time.
+static void transport_start_fresh(const SynthSharedControls *knobs) {
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        if (knobs->seq_lanes[l].lane_type == 0.0f && (int)knobs->seq_lanes[l].seq_mode == 2) {
+            g_seq_midi[l].event_count = 0; // fresh Rec take
+        }
+    }
+    transport_reposition_lanes(knobs);
+}
+
 // Edge-triggered, same idiom as poll_seq_audio_preview_triggers: each button increments its own
 // counter on every click and resends the whole packet, so a genuine change (not just "button
-// held") is what starts/pauses/stops the transport -- immune to a stale resend re-triggering
-// anything. Call once per block from main()'s loop.
-static void poll_transport_triggers(const SynthSharedControls *knobs) {
+// held") is what starts/pauses/stops/seeks the transport -- immune to a stale resend
+// re-triggering anything. Call once per block from main()'s loop. current_tempo_bpm is this
+// block's already-resolved tempo (see the Seek Back/Forward triggers' own comment on why "right
+// now" rather than "at the seek target").
+static void poll_transport_triggers(const SynthSharedControls *knobs, float current_tempo_bpm) {
     if (knobs->seq_transport_play_trigger != g_transport_last_play_trigger) {
         g_transport_last_play_trigger = knobs->seq_transport_play_trigger;
         if (g_transport_state != TRANSPORT_PLAYING) {
@@ -5886,6 +5929,32 @@ static void poll_transport_triggers(const SynthSharedControls *knobs) {
             g_seq_midi[l].playback_cursor = 0;
         }
     }
+
+    // Seek: "very beginning" reset, and back/forward by one whole measure. Works in every
+    // transport state (Stopped/Paused/Playing) -- none of these three requires PLAYING first,
+    // unlike Play/Pause/Stop's own state-transition guards above. A measure is 4 beats (this
+    // engine has no time-signature concept yet, so 4/4 is assumed -- matching the Sequencer tab's
+    // own bars:beats readout, which already makes the same assumption) at current_tempo_bpm;
+    // clamped to a sane floor so a pathologically low/zero tempo can't produce an infinite or
+    // negative-duration measure.
+    float measure_sec = 4.0f * 60.0f / fmaxf(1.0f, current_tempo_bpm);
+    bool seeked = false;
+    if (knobs->seq_transport_seek_start_trigger != g_transport_last_seek_start_trigger) {
+        g_transport_last_seek_start_trigger = knobs->seq_transport_seek_start_trigger;
+        g_transport_playhead_sec = 0.0;
+        seeked = true;
+    }
+    if (knobs->seq_transport_seek_back_trigger != g_transport_last_seek_back_trigger) {
+        g_transport_last_seek_back_trigger = knobs->seq_transport_seek_back_trigger;
+        g_transport_playhead_sec = fmax(0.0, g_transport_playhead_sec - (double)measure_sec);
+        seeked = true;
+    }
+    if (knobs->seq_transport_seek_fwd_trigger != g_transport_last_seek_fwd_trigger) {
+        g_transport_last_seek_fwd_trigger = knobs->seq_transport_seek_fwd_trigger;
+        g_transport_playhead_sec += (double)measure_sec;
+        seeked = true;
+    }
+    if (seeked) transport_reposition_lanes(knobs);
 }
 
 // Called every block from main()'s loop (see seq_audio_start_transport_playback's own comment
@@ -7968,7 +8037,19 @@ int main(int argc, char **argv) {
         while (lo_server_recv_noblock(osc_server, 0) > 0) {}
         poll_seq_audio_load_requests(&active_knobs); // spawns a loader thread if a lane's audio_path changed
         poll_seq_audio_preview_triggers(&active_knobs); // starts one-shot playback if a lane's Preview button was clicked
-        poll_transport_triggers(&active_knobs); // Play/Pause/Stop -- starts/freezes/resets the real Sequencer playhead
+
+        // Programmable tempo: resolved once per block from the Tempo knob/tempo-map (see
+        // compute_current_tempo_bpm()) against this engine's own running uptime. Computed here,
+        // before poll_transport_triggers, so the new Seek Back/Forward-one-measure triggers can
+        // use it too (a measure = 4 beats at whatever tempo is "current" right now -- this
+        // engine's tempo-map system interpolates against uptime, not a seekable playhead, an
+        // existing limitation this reuses rather than solves). Otherwise reported back to the GUI
+        // (EngineStatus.tempo_bpm_live) purely so the Tempo knob visibly does something
+        // end-to-end even before a tempo-synced feature exists to actually use it.
+        double engine_elapsed_seconds = (double)total_frames_rendered / (double)SAMPLE_RATE;
+        float current_tempo_bpm = compute_current_tempo_bpm(&active_knobs, engine_elapsed_seconds);
+
+        poll_transport_triggers(&active_knobs, current_tempo_bpm); // Play/Pause/Stop/Seek -- starts/freezes/resets/repositions the real Sequencer playhead
         poll_seq_audio_transport_catchup(&active_knobs); // starts any lane whose load finished after Play was already pressed
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
@@ -8036,14 +8117,6 @@ int main(int argc, char **argv) {
         // actually read/written/rendered this iteration.
         int block_size = effective_block_size(&active_knobs);
         advance_transport_playhead(block_size); // advances the real Sequencer playhead by exactly this block's worth of time, only while PLAYING
-
-        // Programmable tempo: resolved once per block from the Tempo knob/tempo-map (see
-        // compute_current_tempo_bpm()) against this engine's own running uptime. Nothing in the
-        // DSP consumes this yet -- it's reported back to the GUI (EngineStatus.tempo_bpm_live)
-        // purely so the Tempo knob visibly does something end-to-end even before a tempo-synced
-        // feature exists to actually use it.
-        double engine_elapsed_seconds = (double)total_frames_rendered / (double)SAMPLE_RATE;
-        float current_tempo_bpm = compute_current_tempo_bpm(&active_knobs, engine_elapsed_seconds);
 
         // Read one block of external input, ALL detected_input_channels of it -- interleaved,
         // stride detected_input_channels per frame (not always 2 anymore; see

@@ -3310,11 +3310,24 @@ class SynthGui(QWidget):
 
         transport_box = QGroupBox("Transport")
         transport_lay = QHBoxLayout(transport_box); transport_lay.setSpacing(8)
+        # Seek controls (Reset/Back/Forward) precede Play/Pause/Stop, standard transport layout
+        # order. All three work in every transport state (Stopped/Paused/Playing) and reposition
+        # every lane's own playback position, not just the display -- see
+        # poll_transport_triggers/transport_reposition_lanes in backend.c.
+        self.seq_btn_seek_start = QPushButton("\u23ee")
+        self.seq_btn_seek_start.setToolTip("Reset to the very beginning (0:00)")
+        self.seq_btn_seek_back = QPushButton("\u23ea 1 Measure")
+        self.seq_btn_seek_back.setToolTip("Back one measure")
+        for btn in (self.seq_btn_seek_start, self.seq_btn_seek_back):
+            transport_lay.addWidget(btn)
         self.seq_btn_play = QPushButton("\u25b6 Play")
         self.seq_btn_pause = QPushButton("\u23f8 Pause")
         self.seq_btn_stop = QPushButton("\u23f9 Stop")
         for btn in (self.seq_btn_play, self.seq_btn_pause, self.seq_btn_stop):
             transport_lay.addWidget(btn)
+        self.seq_btn_seek_fwd = QPushButton("1 Measure \u23e9")
+        self.seq_btn_seek_fwd.setToolTip("Forward one measure")
+        transport_lay.addWidget(self.seq_btn_seek_fwd)
         # Real, edge-triggered counters -- same idiom as each Sequencer audio lane's own Preview
         # button (_preview_seq_audio/preview_trigger): the backend's poll_transport_triggers
         # detects a change in the value since last block, so each click just increments and
@@ -3326,9 +3339,15 @@ class SynthGui(QWidget):
         self.seq_transport_play_trigger = 0
         self.seq_transport_pause_trigger = 0
         self.seq_transport_stop_trigger = 0
+        self.seq_transport_seek_start_trigger = 0
+        self.seq_transport_seek_back_trigger = 0
+        self.seq_transport_seek_fwd_trigger = 0
         self.seq_btn_play.clicked.connect(self._seq_transport_play)
         self.seq_btn_pause.clicked.connect(self._seq_transport_pause)
         self.seq_btn_stop.clicked.connect(self._seq_transport_stop)
+        self.seq_btn_seek_start.clicked.connect(self._seq_transport_seek_start)
+        self.seq_btn_seek_back.clicked.connect(self._seq_transport_seek_back)
+        self.seq_btn_seek_fwd.clicked.connect(self._seq_transport_seek_fwd)
         transport_lay.addSpacing(16)
         self.seq_transport_state_label = QLabel("STOPPED")
         self.seq_transport_state_label.setStyleSheet("font-weight: bold;")
@@ -4891,6 +4910,25 @@ class SynthGui(QWidget):
         self.seq_transport_stop_trigger += 1
         self.transmit_knob_packet()
 
+    def _seq_transport_seek_start(self):
+        """"Very beginning" reset: edge-triggered counter, same idiom as Play/Pause/Stop --
+        jumps the playhead to 0:00 and repositions every lane to match (backend.c's
+        transport_reposition_lanes), without changing the transport's Play/Pause/Stop state."""
+        self.seq_transport_seek_start_trigger += 1
+        self.transmit_knob_packet()
+
+    def _seq_transport_seek_back(self):
+        """Back one measure (4 beats at the current tempo) -- clamped at 0:00, never negative.
+        Works in every transport state, repositioning every lane to match the new playhead."""
+        self.seq_transport_seek_back_trigger += 1
+        self.transmit_knob_packet()
+
+    def _seq_transport_seek_fwd(self):
+        """Forward one measure (4 beats at the current tempo). Works in every transport state,
+        repositioning every lane to match the new playhead."""
+        self.seq_transport_seek_fwd_trigger += 1
+        self.transmit_knob_packet()
+
     def _apply_seq_audio_status(self, updates):
         """updates: {lane_index: {"state": float, "frames"?: float, "channels"?: float,
         "sample_rate"?: float}}, decoded from /hds/status/seq_audio/<lane>/... -- see
@@ -5870,6 +5908,9 @@ class SynthGui(QWidget):
         add_f("/hds/seq/transport/play", self.seq_transport_play_trigger)
         add_f("/hds/seq/transport/pause", self.seq_transport_pause_trigger)
         add_f("/hds/seq/transport/stop", self.seq_transport_stop_trigger)
+        add_f("/hds/seq/transport/seek_start", self.seq_transport_seek_start_trigger)
+        add_f("/hds/seq/transport/seek_back", self.seq_transport_seek_back_trigger)
+        add_f("/hds/seq/transport/seek_fwd", self.seq_transport_seek_fwd_trigger)
 
         # LFOs (incl. phase offset + mod source CC)
         for idx in range(LFO_COUNT):
