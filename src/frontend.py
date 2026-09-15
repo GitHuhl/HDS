@@ -4511,6 +4511,11 @@ class SynthGui(QWidget):
         btn_import_sfz.clicked.connect(self._pick_and_import_sfz)
         mapping_top_bar.addWidget(btn_import_sfz)
 
+        btn_save_sfz = QPushButton("Save SFZ…")
+        btn_save_sfz.setToolTip("Exports the current Sample Bank as a plain, standard .sfz file -- spec-compliant zone/region data only, nothing HDS- or OSC-specific. Lets this tab double as a standalone SFZ editor/creator.")
+        btn_save_sfz.clicked.connect(self._pick_and_save_sfz)
+        mapping_top_bar.addWidget(btn_save_sfz)
+
         mapping_top_bar.addStretch()
         self.mapping_status_label = QLabel("")
         self.mapping_status_label.setStyleSheet("font-size: 10px; color: #888;")
@@ -4747,6 +4752,31 @@ class SynthGui(QWidget):
         self.set_mapping_status(f"Imported {len(zones)} zone(s) from {filename}" if zones else f"Imported 0 zones from {filename}", error=not zones)
         if warnings:
             QMessageBox.warning(self, "SFZ Import", f"Imported {len(zones)} zone(s) from {filename}, with some issues:\n\n" + "\n".join(f"- {w}" for w in warnings))
+
+    def _pick_and_save_sfz(self):
+        """Exports the current Sample Bank as a standalone, plain .sfz file -- the direct
+        inverse of _pick_and_import_sfz(), and independent of Program save (which only ever
+        writes a colocated .sfz bundled inside a Program's own folder). Reuses
+        _build_sfz_from_zones() unchanged, so the output is exactly what Program save already
+        writes: standard SFZ-spec region opcodes only, zero HDS/OSC-specific content -- letting
+        this tab double as a general-purpose, portable SFZ editor/creator even for someone who
+        never touches the rest of HDS."""
+        if not self.mapping_grid.sample_zones:
+            QMessageBox.information(self, "Save SFZ", "The Sample Bank is empty -- nothing to export.")
+            return
+        default_path = os.path.join(os.path.expanduser("~"), "Untitled.sfz")
+        path, _ = QFileDialog.getSaveFileName(self, "Save SFZ", default_path, "SFZ files (*.sfz)")
+        if not path:
+            return
+        if not path.lower().endswith(".sfz"):
+            path += ".sfz"
+        try:
+            with open(path, "w") as f:
+                f.write(_build_sfz_from_zones(self.mapping_grid.sample_zones))
+        except OSError as e:
+            QMessageBox.warning(self, "Save SFZ", f"Could not save '{path}':\n{e}")
+            return
+        self.set_mapping_status(f"Saved {len(self.mapping_grid.sample_zones)} zone(s) to {os.path.basename(path)}")
 
     def _scan_programs_folder(self):
         """Lists saved Program names -- one per ~/HDS_Programs/<name>/<name>.hdsprog subfolder."""
