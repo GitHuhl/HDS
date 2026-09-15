@@ -8302,6 +8302,18 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
     config.sampleRate = SAMPLE_RATE;
     config.periodSizeInMilliseconds = (ma_uint32)fmaxf(1.0f, latency_ms);
     config.pUserData = s;
+    // BUG FIX (Windows Exclusive-mode crackle): without this, miniaudio never registers its
+    // WASAPI callback thread with MMCSS at all (ma_to_usage_string__wasapi() returns NULL for
+    // the default ma_wasapi_usage_default, so its own internal AvSetMmThreadCharacteristicsA
+    // call is skipped entirely) -- the callback thread runs at a plain Windows priority CLASS
+    // with no real-time scheduling guarantee. Shared mode tolerates that because the Windows
+    // audio engine's own mixer sits between us and the hardware, absorbing a late callback;
+    // Exclusive mode hands the hardware directly to this thread with none of that safety net, so
+    // even a brief preemption by ordinary background activity is enough to underrun -- exactly
+    // the "crackle got worse specifically in Exclusive mode" symptom. "Pro Audio" is the standard
+    // MMCSS task class for this (same one Windows' own low-latency audio apps register under),
+    // giving the callback thread guaranteed scheduling quantum instead of just a priority hint.
+    config.wasapi.usage = ma_wasapi_usage_pro_audio;
 
     // Exclusive mode fails outright at ma_device_init() if the device/driver doesn't actually
     // support it (miniaudio's own documented behavior -- it never silently falls back on its
