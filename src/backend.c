@@ -175,6 +175,26 @@ typedef struct {
     // scaling -- the LFO always runs at its knob depth). 0-127 = that MIDI CC number. 128 =
     // channel (monophonic) aftertouch. See render_audio_block's LFO loop.
     float mod_source_cc;
+    // Per-Key mode: 0 = Global (today's only behavior -- one shared phase for the whole
+    // Program, the same LFO cycle heard identically by every voice). 1 = Per-Key -- this LFO
+    // becomes a per-VOICE resource with its own independent phase (and, when key_sync is also
+    // on, a phase that resets at THIS voice's own note-on instead of whichever note last reset
+    // the shared phase) -- the standard "per-key LFO" feature real digital synths have, letting
+    // overlapping notes each run their own unsynced cycle, and letting Rate track key/velocity
+    // per note. ALWAYS uses the decimated/interpolated computation (see LFO_DECIMATION_FACTOR),
+    // even for LFO slots 1/2 which are otherwise full audio-rate -- per-voice computation multiplies
+    // cost by polyphony, so the cheap path is used unconditionally in this mode, never the exact
+    // one. See render_audio_block's per-voice LFO dispatch.
+    float per_key_mode;
+    // Keyboard tracking (Per-Key mode only): rate scales by 2^((note-60)/12 * key_track/100) --
+    // an octave-per-octave-of-keyboard multiplier at key_track=+-100 (matching the standard
+    // filter-cutoff-keytrack convention), 0 = no tracking (every note the same rate). Negative
+    // values invert direction (higher notes = slower).
+    float key_track;
+    // Velocity tracking (Per-Key mode only): rate scales linearly by
+    // 1 + (key_velocity-64)/63 * vel_track/100 -- 0 = no tracking, +-100 = full range from half
+    // to double rate (approx) across the velocity range, centered on a "normal" velocity of 64.
+    float vel_track;
 } PackLfoParams;
 
 // A single filter's parameters: State-Variable Filter (SVF) core, cutoff/resonance/type, plus
@@ -1015,6 +1035,16 @@ typedef struct {
     int vco4_sample_stream;
     double vco4_sample_ptr;
     bool vco4_sample_preroll;
+
+    // Per-Key LFO state (see PackLfoParams.per_key_mode) -- one independent phase/decimation
+    // state per LFO slot, PER VOICE, used only for LFOs actually in Per-Key mode (meaningless/
+    // unread otherwise, exactly like vco*_sample_stream above when that oscillator isn't
+    // WAVE_SAMPLE). Mirrors the Program-level lfo_decim_* function-local statics in
+    // render_audio_block exactly, just duplicated per voice instead of shared per Program.
+    float lfo_phase[LFO_COUNT];
+    int lfo_decim_counter[LFO_COUNT];
+    float lfo_decim_last_value[LFO_COUNT];
+    float lfo_decim_target_value[LFO_COUNT];
 } SynthVoice;
 // FIXED: Restored 'p->s' to reference sustain data properties correctly
 // Everything tick_adsr() needs BESIDES the envelope instance's own dynamic state (current_level/
@@ -3246,6 +3276,30 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/5/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT, 5),
     OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/mod_source_cc", lfo, PackLfoParams, mod_source_cc, LFO_COUNT, 7),
+    OSC_PSUBARRAY("/hds/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/per_key", lfo, PackLfoParams, per_key_mode, LFO_COUNT, 7),
+    OSC_PSUBARRAY("/hds/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/key_track", lfo, PackLfoParams, key_track, LFO_COUNT, 7),
+    OSC_PSUBARRAY("/hds/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 7),
 
     // --- Assignable EG modulators ---
     OSC_PARRAY("/hds/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT),
@@ -3864,7 +3918,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].filter_b.mode1_lp = 100.0f; knobs->programs[0].filter_b.mode1_bp = 0.0f; knobs->programs[0].filter_b.mode1_hp = 0.0f; knobs->programs[0].filter_b.mode1_notch = 0.0f; knobs->programs[0].filter_b.mode1_dry = 0.0f;
     knobs->programs[0].filter_b.mode2_lp = 0.0f; knobs->programs[0].filter_b.mode2_bp = 0.0f; knobs->programs[0].filter_b.mode2_hp = 0.0f; knobs->programs[0].filter_b.mode2_notch = 0.0f; knobs->programs[0].filter_b.mode2_dry = 0.0f;
     knobs->programs[0].filter_b.crossfade = 0.0f;
-    for(int l=0; l<LFO_COUNT; l++) { knobs->programs[0].lfo[l].wave_type = 0.0f; knobs->programs[0].lfo[l].rate_hz = 5.0f; knobs->programs[0].lfo[l].mod_depth = 0.0f; knobs->programs[0].lfo[l].key_sync = 1.0f; knobs->programs[0].lfo[l].dest_target = 0.0f; knobs->programs[0].lfo[l].phase_offset = 0.0f; knobs->programs[0].lfo[l].mod_source_cc = -1.0f; }
+    for(int l=0; l<LFO_COUNT; l++) { knobs->programs[0].lfo[l].wave_type = 0.0f; knobs->programs[0].lfo[l].rate_hz = 5.0f; knobs->programs[0].lfo[l].mod_depth = 0.0f; knobs->programs[0].lfo[l].key_sync = 1.0f; knobs->programs[0].lfo[l].dest_target = 0.0f; knobs->programs[0].lfo[l].phase_offset = 0.0f; knobs->programs[0].lfo[l].mod_source_cc = -1.0f; knobs->programs[0].lfo[l].per_key_mode = 0.0f; knobs->programs[0].lfo[l].key_track = 0.0f; knobs->programs[0].lfo[l].vel_track = 0.0f; }
     for(int e=0; e<ENV_COUNT; e++) { knobs->programs[0].eg[e].d = 0.0f; knobs->programs[0].eg[e].h = 0.0f; knobs->programs[0].eg[e].a = 10.0f; knobs->programs[0].eg[e].dec = 150.0f; knobs->programs[0].eg[e].s = 80.0f; knobs->programs[0].eg[e].r = 300.0f; knobs->programs[0].eg[e].al = 0.0f; knobs->programs[0].eg[e].pk = 100.0f; knobs->programs[0].eg_mode[e] = 0.0f; }
     for(int i=0; i<ASSIGNABLE_EG_COUNT; i++) { knobs->programs[0].eg_intensity[i] = 1.0f; knobs->programs[0].eg_dest_target[i] = 0.0f; }
     // Subtle default detune (matches the old fixed +/-1.5% spread) and no width until the user asks for it
@@ -3993,6 +4047,12 @@ static void init_voice(SynthVoice *voice) {
     voice->vco2_sample_stream = -1; voice->vco2_sample_ptr = 0.0; voice->vco2_sample_preroll = false;
     voice->vco3_sample_stream = -1; voice->vco3_sample_ptr = 0.0; voice->vco3_sample_preroll = false;
     voice->vco4_sample_stream = -1; voice->vco4_sample_ptr = 0.0; voice->vco4_sample_preroll = false;
+    for (int l = 0; l < LFO_COUNT; l++) {
+        voice->lfo_phase[l] = 0.0f;
+        voice->lfo_decim_counter[l] = 0;
+        voice->lfo_decim_last_value[l] = 0.0f;
+        voice->lfo_decim_target_value[l] = 0.0f;
+    }
 }
 // Rolls a randomized glide-time multiplier for Mono Legato: 1.0 = no variation. glide_random_pct
 // (0-100) controls how far the multiplier can wander from 1.0 in either direction; floored well
@@ -5698,7 +5758,20 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
             voices[slot].vco4_sample_stream = -1;
         }
         for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voices[slot].fa_low[c][f][0]=0.0f; voices[slot].fa_low[c][f][1]=0.0f; voices[slot].fa_band[c][f][0]=0.0f; voices[slot].fa_band[c][f][1]=0.0f; } voices[slot].fb_low[c][0]=0.0f; voices[slot].fb_low[c][1]=0.0f; voices[slot].fb_band[c][0]=0.0f; voices[slot].fb_band[c][1]=0.0f; }
-        for (int l = 0; l < LFO_COUNT; l++) { if (prog->lfo[l].key_sync != 0.0f) global_lfo_phases[target_program][l] = 0.0f; }
+        for (int l = 0; l < LFO_COUNT; l++) {
+            if (prog->lfo[l].key_sync == 0.0f) continue;
+            // Per-Key mode: reset only THIS voice's own phase (every other voice's own per-key
+            // cycle is untouched) -- the whole point of Per-Key mode. Global mode: reset the one
+            // shared phase every voice of this Program reads, exactly as today.
+            if (prog->lfo[l].per_key_mode != 0.0f) {
+                voices[slot].lfo_phase[l] = 0.0f;
+                voices[slot].lfo_decim_counter[l] = 0;
+                voices[slot].lfo_decim_last_value[l] = 0.0f;
+                voices[slot].lfo_decim_target_value[l] = 0.0f;
+            } else {
+                global_lfo_phases[target_program][l] = 0.0f;
+            }
+        }
 
         int m0 = (int)prog->eg_mode[0]; voices[slot].vco1_eg.state = (m0 == 5) ? STATE_DELAY : STATE_ATTACK;
         voices[slot].vco1_eg.current_level = (m0 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->eg[0].al / 100.0f));
@@ -6277,6 +6350,50 @@ static inline int lfo_phase_target_index(int target) {
     if (target >= 72 && target <= 83) return target - 68;
     return -1;
 }
+
+// Per-Key LFO (see PackLfoParams.per_key_mode): computes one sample of ONE LFO for ONE voice,
+// using that voice's own phase/decimation state (voice->lfo_phase/lfo_decim_*) instead of the
+// Program-shared global_lfo_phases/lfo_out this same math normally reads/writes -- see
+// render_audio_block's per-voice LFO dispatch, the only caller. ALWAYS decimated (mirrors the
+// Program-level computation's LFO-3-16 branch exactly, see LFO_DECIMATION_FACTOR), even for LFO
+// slots 1/2 which are full audio-rate in Global mode -- per-voice computation multiplies cost by
+// polyphony, so Per-Key mode always pays the cheap path, never the exact one, regardless of slot.
+// rate_mod/depth_mod/phase_mod are the exact same one-sample-delayed Program-level cross-
+// modulation state (lfo_rate_mod_state/lfo_depth_mod_state/lfo_phase_mod_state) every LFO --
+// Global or Per-Key -- already reads; a source LFO/EG modulating "this LFO's Rate/Depth/Phase"
+// contributes the same broadcast value to every voice's own independent Per-Key cycle rather
+// than needing its own per-voice derivation (a deliberate simplification: the source itself may
+// well be a Global-mode LFO with no per-voice identity of its own to begin with).
+static float compute_per_key_lfo_output(SynthVoice *voice, const PackLfoParams *lp, int lfo_idx,
+                                          float rate_mod, float depth_mod, float phase_mod,
+                                          const MidiLiveState *midi_live) {
+    int wave_type = (int)lp->wave_type;
+    if (wave_type == 4) return 0.0f; // Off
+    float effective_mod_depth = fmaxf(0.0f, fminf(1.0f, lp->mod_depth + depth_mod));
+    // Keyboard tracking: +-100 = a full octave-per-octave-of-keyboard multiplier, centered on
+    // note 60 (middle C). Velocity tracking: linear, centered on velocity 64 ("normal").
+    float key_mult = powf(2.0f, ((float)(voice->midi_note - 60) / 12.0f) * (lp->key_track / 100.0f));
+    float vel_mult = 1.0f + (lp->vel_track / 100.0f) * ((float)(voice->midi_velocity - 64) / 63.0f);
+    float effective_rate_hz = fmaxf(0.1f, fminf(200.0f, (lp->rate_hz + rate_mod * 20.0f) * key_mult * vel_mult));
+
+    if (voice->lfo_decim_counter[lfo_idx] == 0) {
+        voice->lfo_decim_last_value[lfo_idx] = voice->lfo_decim_target_value[lfo_idx];
+        float phase_offset = fmodf((lp->phase_offset / 360.0f) + phase_mod, 1.0f); if (phase_offset < 0.0f) phase_offset += 1.0f;
+        float read_phase = fmodf(voice->lfo_phase[lfo_idx] + phase_offset, 1.0f); if (read_phase < 0.0f) read_phase += 1.0f;
+        int mod_src = (int)lp->mod_source_cc;
+        float cc_source_scale = 1.0f;
+        if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
+        else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
+        voice->lfo_decim_target_value[lfo_idx] = lookup_lfo_waveform(wave_type, read_phase) * effective_mod_depth * cc_source_scale;
+        voice->lfo_phase[lfo_idx] += (effective_rate_hz / (float)SAMPLE_RATE) * (float)LFO_DECIMATION_FACTOR;
+        if (voice->lfo_phase[lfo_idx] >= 1.0f) voice->lfo_phase[lfo_idx] = fmodf(voice->lfo_phase[lfo_idx], 1.0f);
+    }
+    float frac = (float)voice->lfo_decim_counter[lfo_idx] / (float)LFO_DECIMATION_FACTOR;
+    float out = voice->lfo_decim_last_value[lfo_idx] + (voice->lfo_decim_target_value[lfo_idx] - voice->lfo_decim_last_value[lfo_idx]) * frac;
+    voice->lfo_decim_counter[lfo_idx] = (voice->lfo_decim_counter[lfo_idx] + 1) % LFO_DECIMATION_FACTOR;
+    return out;
+}
+
 static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer) {
     float peak = 0.0f;
     // Combi mode: how many of the 8 Program slots are actually "live" this block -- 1 (just
@@ -6650,7 +6767,13 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 // budget (found via real-world underrun diagnostics: a 33-voice plain sawtooth
                 // patch, no modulation configured at all, was already blowing the block budget).
                 if (target == 0) continue;
-                float val = lfo_out[pidx][l];
+                // Per-Key mode (see PackLfoParams.per_key_mode): this voice's own independent
+                // phase/rate instead of the Program-shared lfo_out every OTHER voice of this
+                // Program reads -- the whole point of Per-Key mode (overlapping notes each run
+                // their own unsynced cycle, and Rate can track this voice's own key/velocity).
+                float val = (prog->lfo[l].per_key_mode != 0.0f)
+                    ? compute_per_key_lfo_output(&voices[v], &prog->lfo[l], l, lfo_rate_mod_state[pidx][l], lfo_depth_mod_state[pidx][l], lfo_phase_mod_state[pidx][l], midi_live)
+                    : lfo_out[pidx][l];
                 // PERF: a real switch (not a flat if-chain) so the compiler can build a jump
                 // table -- O(1) dispatch per routed target instead of a linear scan through every
                 // earlier case. Targets are mutually exclusive by construction (target can only

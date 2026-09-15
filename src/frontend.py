@@ -3790,6 +3790,7 @@ class SynthGui(QWidget):
 
         self.lfo_combos, self.lfo_dials, self.lfo_readouts = [], [], []
         self.lfo_sync_combos, self.lfo_dest_combos, self.lfo_depth_dials, self.lfo_visualizers = [], [], [], []
+        self.lfo_per_key_checks, self.lfo_key_track_dials, self.lfo_vel_track_dials, self.lfo_key_track_boxes = [], [], [], []
         self.lfo_phase_dials = []
         # Modulation Source (right-click on an LFO's Depth pot): -1.0 = None, 0.0-127.0 = that
         # MIDI CC number, 128.0 = channel aftertouch. Mirrors PackLfoParams.mod_source_cc.
@@ -3902,6 +3903,37 @@ class SynthGui(QWidget):
             s_combo.setStyleSheet("font-size: 10px;")
             lfo_row.addWidget(s_combo)
             self.lfo_sync_combos.append(s_combo)
+
+            # Per-Key mode: this LFO becomes a per-VOICE resource (its own independent phase per
+            # note, instead of one phase shared by every voice of the Program) -- the standard
+            # "per-key LFO" feature (per-note vibrato/tremolo starting points, Rate tracking key
+            # position/velocity). ALWAYS uses the efficient decimated/interpolated computation on
+            # the backend, even for LFO 1/2 which are otherwise full audio-rate in the shared
+            # mode -- per-voice computation multiplies cost by polyphony, so this mode never pays
+            # the exact per-sample path. Key/Vel Track only matter (and are only shown) in this
+            # mode -- see PackLfoParams.per_key_mode/key_track/vel_track in backend.c.
+            pk_check = QCheckBox("PK")
+            pk_check.setToolTip("Per-Key mode: independent LFO phase per voice/note (instead of one shared phase for the whole Program). Always uses the efficient decimated computation.")
+            lfo_row.addWidget(pk_check)
+            self.lfo_per_key_checks.append(pk_check)
+
+            kt_dial = PotentiometerKnob(f"LFO {x} Key Track", self)
+            kt_dial.setRange(-100, 100)
+            kt_dial.setValue(0)
+            kt_dial.setToolTip("Per-Key only: Rate scales by keyboard position (+-100 = a full octave-per-octave multiplier, centered on middle C)")
+            vt_dial = PotentiometerKnob(f"LFO {x} Vel Track", self)
+            vt_dial.setRange(-100, 100)
+            vt_dial.setValue(0)
+            vt_dial.setToolTip("Per-Key only: Rate scales by note-on velocity (+-100 = full range, centered on velocity 64)")
+            kt_box = QWidget(); kt_lay = QHBoxLayout(kt_box); kt_lay.setContentsMargins(0, 0, 0, 0); kt_lay.setSpacing(2)
+            kt_lay.addWidget(QLabel("Key:")); kt_lay.addWidget(kt_dial); kt_lay.addWidget(QLabel("Vel:")); kt_lay.addWidget(vt_dial)
+            _retain_hidden(kt_box)
+            kt_box.setVisible(False)
+            lfo_row.addWidget(kt_box)
+            self.lfo_key_track_dials.append(kt_dial)
+            self.lfo_vel_track_dials.append(vt_dial)
+            self.lfo_key_track_boxes.append(kt_box)
+            pk_check.toggled.connect(lambda checked, box=kt_box: box.setVisible(checked))
 
             d_combo = QComboBox()
             d_combo.addItems(matrix_shared_routes)
@@ -5225,6 +5257,20 @@ class SynthGui(QWidget):
                 self.lfo_phase_dials[idx].blockSignals(False)
             if f"/hds/lfo/{idx}/mod_source_cc" in fields:
                 self.lfo_mod_source_cc[idx] = fields[f"/hds/lfo/{idx}/mod_source_cc"]
+            if f"/hds/lfo/{idx}/per_key" in fields:
+                self.lfo_per_key_checks[idx].blockSignals(True)
+                checked = fields[f"/hds/lfo/{idx}/per_key"] != 0.0
+                self.lfo_per_key_checks[idx].setChecked(checked)
+                self.lfo_per_key_checks[idx].blockSignals(False)
+                self.lfo_key_track_boxes[idx].setVisible(checked)
+            if f"/hds/lfo/{idx}/key_track" in fields:
+                self.lfo_key_track_dials[idx].blockSignals(True)
+                self.lfo_key_track_dials[idx].setValue(int(round(fields[f"/hds/lfo/{idx}/key_track"])))
+                self.lfo_key_track_dials[idx].blockSignals(False)
+            if f"/hds/lfo/{idx}/vel_track" in fields:
+                self.lfo_vel_track_dials[idx].blockSignals(True)
+                self.lfo_vel_track_dials[idx].setValue(int(round(fields[f"/hds/lfo/{idx}/vel_track"])))
+                self.lfo_vel_track_dials[idx].blockSignals(False)
 
         # 6 assignable EG intensity multipliers + their own mod destinations.
         for idx in range(6):
@@ -5935,6 +5981,9 @@ class SynthGui(QWidget):
             add_f(f"/hds/lfo/{idx}/dest", self.lfo_dest_combos[idx].currentIndex())
             add_f(f"/hds/lfo/{idx}/phase_offset", self.lfo_phase_dials[idx].value())
             add_f(f"/hds/lfo/{idx}/mod_source_cc", self.lfo_mod_source_cc[idx])
+            add_f(f"/hds/lfo/{idx}/per_key", 1.0 if self.lfo_per_key_checks[idx].isChecked() else 0.0)
+            add_f(f"/hds/lfo/{idx}/key_track", self.lfo_key_track_dials[idx].value())
+            add_f(f"/hds/lfo/{idx}/vel_track", self.lfo_vel_track_dials[idx].value())
 
         # 6 custom EG intensity multipliers
         for idx in range(6):
@@ -6335,6 +6384,9 @@ def runtime_connect_and_bind(gui):
         gui.lfo_depth_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.lfo_phase_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.lfo_sync_combos[idx].currentIndexChanged.connect(gui.transmit_knob_packet)
+        gui.lfo_per_key_checks[idx].toggled.connect(gui.transmit_knob_packet)
+        gui.lfo_key_track_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
+        gui.lfo_vel_track_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.lfo_dest_combos[idx].currentIndexChanged.connect(gui.transmit_knob_packet)
 
     # FX Bus: 12 slots, each wired the same way
