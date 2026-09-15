@@ -4488,14 +4488,29 @@ typedef struct {
     float *pre_roll_r;
 } SampleSlot;
 
-// A plain static array (not malloc'd/realloc'd) sized SAMPLE_SLOT_CAPACITY -- its base address
-// never moves for the life of the process, which sample_disk_thread_main() depends on (it
-// dereferences &g_sample_slots[index] directly, with no lock; see SAMPLE_SLOT_CAPACITY's
-// comment). g_sample_slot_count tracks the next append position; entries are append-only and
-// never compacted/reused after a ZONE_OP_REMOVE (see the OSC zone handlers) -- an
-// inactive (.active == false) entry is just permanently skipped everywhere.
-static SampleSlot g_sample_slots[SAMPLE_SLOT_CAPACITY];
-static int g_sample_slot_count = 0;
+// Part of the multi-instance refactor's HdsEngineState consolidation (see its main definition,
+// much further down, for the full explanation) -- split into several separately-named,
+// separately-positioned struct "tiers" purely because C requires each field's type to be
+// complete at the point of use: SeqMidiLane (needed by the "main" HdsEngineState) isn't declared
+// until much later in this file, well after several of these globals are already read/written by
+// functions declared right here. Each tier is declared at the earliest point its own member
+// type(s) are available, and each is a real, separate per-instance struct/global -- in Phase 6
+// (clap_plugin.c) HdsClapPlugin holds one instance of each tier as a named field, which is
+// functionally identical "per-instance state," just spread across a few struct types instead of
+// one, for this ordering reason alone.
+//
+// This tier: the Sample Bank catalog. Its base address never moves for the life of ITS OWNING
+// INSTANCE (same guarantee sample_disk_thread_main() depends on, now scoped per-instance instead
+// of per-process). sample_slot_count tracks the next append position; entries are append-only and
+// never compacted/reused after a ZONE_OP_REMOVE (see the OSC zone handlers) -- an inactive
+// (.active == false) entry is just permanently skipped everywhere.
+typedef struct {
+    SampleSlot sample_slots[SAMPLE_SLOT_CAPACITY];
+    int        sample_slot_count;
+} HdsSampleSlotState;
+static HdsSampleSlotState g_sample_slot_state;
+#define g_sample_slots g_sample_slot_state.sample_slots
+#define g_sample_slot_count g_sample_slot_state.sample_slot_count
 
 #define SAMPLE_CHECK_READ(ptr, size, count, stream) \
     do { if (fread(ptr, size, count, stream) != (size_t)(count)) { fclose(stream); return false; } } while (0)
@@ -4712,9 +4727,9 @@ typedef struct {
                                        // true from whatever note last used it.
 } SampleStream;
 
-static SampleStream g_sample_streams[MAX_SAMPLE_STREAMS];
-static pthread_t g_sample_disk_thread;
-static _Atomic bool g_sample_disk_thread_shutdown = false;
+// g_sample_streams[]/g_sample_disk_thread/g_sample_disk_thread_shutdown are declared as part of
+// HdsStreamsState, just below SeqAudioLane (see that struct's own comment for why the combined
+// declaration point had to move this far down).
 
 // ============================================================================
 // Sequencer audio-lane RAM loading ("Load Audio", SeqLaneState.audio_path)
@@ -4772,7 +4787,32 @@ typedef struct {
     bool armed_for_transport;
 } SeqAudioLane;
 
-static SeqAudioLane g_seq_audio[SEQ_LANE_COUNT];
+// This tier (see HdsSampleSlotState's own comment for why this is split into several structs):
+// the sample-streaming disk-read pool (SampleStream, ready just above SeqAudioLane) plus the
+// Sequencer audio lanes (SeqAudioLane, just declared) -- grouped together because both need to
+// be visible before the functions right after this point start using them, and SampleStream was
+// already ready by the time SeqAudioLane became available, so one combined declaration here
+// covers both with no further splitting needed.
+typedef struct {
+    SampleStream sample_streams[MAX_SAMPLE_STREAMS];
+    pthread_t    sample_disk_thread;
+    _Atomic bool sample_disk_thread_shutdown;
+    bool         sample_disk_thread_running; // lets deactivate()/destroy() know whether THIS
+                                              // instance actually has a thread to join
+    SeqAudioLane seq_audio[SEQ_LANE_COUNT];
+    // Tracks in-flight per-lane audio loader threads so deactivate() can join them before this
+    // struct can be freed -- see poll_seq_audio_load_requests's own comment on the use-after-
+    // free hazard this fixes (a detached thread was safe only while seq_audio[] was process-
+    // lifetime BSS that never got freed; once it's a field of a free()-able struct, a still-in-
+    // flight detached load completing after destroy() would write into freed memory).
+    pthread_t    seq_audio_loader_thread[SEQ_LANE_COUNT];
+    bool         seq_audio_loader_thread_active[SEQ_LANE_COUNT];
+} HdsStreamsState;
+static HdsStreamsState g_streams_state;
+#define g_sample_streams g_streams_state.sample_streams
+#define g_sample_disk_thread g_streams_state.sample_disk_thread
+#define g_sample_disk_thread_shutdown g_streams_state.sample_disk_thread_shutdown
+#define g_seq_audio g_streams_state.seq_audio
 
 typedef struct {
     int lane_index;
@@ -5314,8 +5354,6 @@ typedef struct {
     float end_frac;
 } PendingSampleLoad;
 #define PENDING_SAMPLE_LOAD_CAPACITY 4096
-static PendingSampleLoad g_pending_loads[PENDING_SAMPLE_LOAD_CAPACITY];
-static int g_pending_load_head = 0, g_pending_load_tail = 0, g_pending_load_count = 0;
 // How many queued sample loads (each a bounded, one-file blocking file-open+pre-roll-decode) the
 // audio thread will perform per block -- the throttle that keeps a large bulk-add from stalling
 // real-time audio in one long burst; see SAMPLE_SLOT_CAPACITY's comment for the accepted
@@ -5323,6 +5361,21 @@ static int g_pending_load_head = 0, g_pending_load_tail = 0, g_pending_load_coun
 // thread for its own load duration -- this bounds how many such stalls can pile up per block, not
 // how long any single one can take).
 #define SAMPLE_LOADS_PER_BLOCK 1
+
+// This tier (see HdsSampleSlotState's own comment for why this is split into several structs):
+// the throttled sample-load queue plus round-robin cycling state, grouped together since both
+// need PendingSampleLoad (just declared) and nothing later.
+typedef struct {
+    PendingSampleLoad pending_loads[PENDING_SAMPLE_LOAD_CAPACITY];
+    int          pending_load_head, pending_load_tail, pending_load_count;
+    unsigned int round_robin_hit_count[MAX_ROUND_ROBIN_GROUPS + 1];
+} HdsPendingLoadState;
+static HdsPendingLoadState g_pending_load_state;
+#define g_pending_loads g_pending_load_state.pending_loads
+#define g_pending_load_head g_pending_load_state.pending_load_head
+#define g_pending_load_tail g_pending_load_state.pending_load_tail
+#define g_pending_load_count g_pending_load_state.pending_load_count
+#define g_round_robin_hit_count g_pending_load_state.round_robin_hit_count
 
 static void enqueue_pending_sample_load(int slot_index, const ZoneRecordWire *rec) {
     if (g_pending_load_count >= PENDING_SAMPLE_LOAD_CAPACITY) {
@@ -5509,7 +5562,6 @@ static int zone_remove_handler(const char *path, const char *types, lo_arg **arg
 // grouped", see SampleSlot.round_robin_group). Persists across calls the same way limiter_gain/
 // lfo_phase_mod_state do elsewhere in this file (one synth instance, one audio thread -- no
 // atomics needed, this is audio-thread-only state).
-static unsigned int g_round_robin_hit_count[MAX_ROUND_ROBIN_GROUPS + 1] = {0};
 
 // Finds the loaded sample slot whose zone (key range AND velocity range, both inclusive) covers
 // this (note, velocity) -- the real per-note/velocity mapping (SFZ-style): a note outside every
@@ -6169,10 +6221,6 @@ static void handle_sustain_release(SynthVoice voices[], const SynthSharedControl
 // sound module), and a lane in Rec mode can record a new take while others play back -- real,
 // useful layered-recording behavior, just not independent per-lane instruments.
 typedef enum { TRANSPORT_STOPPED = 0, TRANSPORT_PLAYING = 1, TRANSPORT_PAUSED = 2 } TransportState;
-static TransportState g_transport_state = TRANSPORT_STOPPED;
-static double g_transport_playhead_sec = 0.0;
-static float g_transport_last_play_trigger = 0.0f, g_transport_last_pause_trigger = 0.0f, g_transport_last_stop_trigger = 0.0f;
-static float g_transport_last_seek_start_trigger = 0.0f, g_transport_last_seek_back_trigger = 0.0f, g_transport_last_seek_fwd_trigger = 0.0f;
 
 // RAM-only, mirrors the audio lanes' own RAM-caching decision -- a short recorded phrase's worth
 // of note events is tiny even at this capacity, no disk streaming needed. Events are stored in
@@ -6190,7 +6238,86 @@ typedef struct {
     int event_count;
     int playback_cursor; // next event index to fire during Seq-mode playback
 } SeqMidiLane;
-static SeqMidiLane g_seq_midi[SEQ_LANE_COUNT];
+
+// ============================================================================
+// HdsEngineState -- the last "tier" of the per-synth-instance state consolidation started at
+// HdsSampleSlotState (see that struct's own comment for the full explanation of why this is
+// split into several separately-declared structs, and for the overall multi-instance-refactor
+// rationale). This tier holds the pieces that only became visible this late in the file
+// (SeqMidiLane, TransportState) plus render_audio_block's own former function-local statics
+// (FXSlotEngine, the LFO mod-state arrays, the limiter) -- everything that didn't need to move
+// to an earlier tier.
+//
+// Deliberately NOT a bounded MAX_HDS_INSTANCES array of these -- exactly one HdsEngineState (and
+// one of each earlier tier) is calloc'd/BSS-allocated per synth "session" (the standalone app's
+// own single static instance below; one embedded per CLAP plugin instance), matching CLAP's own
+// create_plugin/destroy lifecycle with no artificial instance cap.
+//
+// This phase (multi-instance Phase 2, "pure consolidation") only regroups this state into one
+// struct reached through a single new global, g_engine -- every existing global name below is
+// kept alive as a macro expanding to the matching g_engine field, so every one of this file's
+// existing read/write sites keeps compiling completely unchanged. Later phases replace these
+// macros, one subsystem at a time, with a real `engine` parameter threaded explicitly through
+// every function that needs it (see /root/.claude/plans/wobbly-marinating-prism.md, "Multi-
+// instance CLAP support").
+// ============================================================================
+typedef struct {
+    // --- Sequencer MIDI lanes (the Sequencer audio lanes / sample-streaming / pending-load
+    // pieces of this same "per-instance state" concept live on HdsSampleSlotState/
+    // HdsStreamsState/HdsPendingLoadState instead, declared earlier in this file -- see
+    // HdsSampleSlotState's own comment for why: SeqMidiLane isn't a complete type until this
+    // point, well after those subsystems' own functions already needed their globals) ---
+    SeqMidiLane   seq_midi[SEQ_LANE_COUNT];
+
+    // --- Transport ---
+    TransportState transport_state;
+    double        transport_playhead_sec;
+    float         transport_last_play_trigger, transport_last_pause_trigger, transport_last_stop_trigger;
+    float         transport_last_seek_start_trigger, transport_last_seek_back_trigger, transport_last_seek_fwd_trigger;
+
+    // --- Metronome ---
+    double        metronome_next_click_sec;
+    int           metronome_click_samples_left;
+    int           metronome_click_phase;
+
+    // --- render_audio_block's former function-local statics (see its own restructuring in
+    // multi-instance Phase 5) ---
+    float         lfo_phase_mod_state[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
+    float         lfo_rate_mod_state[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
+    float         lfo_depth_mod_state[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
+    int           lfo_decim_counter[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
+    float         lfo_decim_last_value[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
+    float         lfo_decim_target_value[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
+    float         mono_noise_tilt_lp[COMBI_PROGRAM_COUNT + 1][4];
+    FXSlotEngine  fx_engine[FX_SLOT_COUNT];
+    bool          fx_engine_initialized;
+    float         limiter_gain[OUTPUT_PAIR_MAX];
+    bool          limiter_gain_initialized;
+} HdsEngineState;
+
+// The standalone app's own single instance -- same storage duration (process lifetime) and
+// zero-initialization (BSS) as every global/static it replaces, and main() remains the only
+// caller in the whole program, reaching every value through this one unchanging pointer instead
+// of implicitly. Provably behavior-identical by construction; verified empirically per-phase via
+// the determinism-check harness (see the plan doc) rather than trusted on this reasoning alone.
+static HdsEngineState g_engine;
+
+// Temporary bridge macros (multi-instance Phase 2 only): every pre-existing g_* name below now
+// expands to the matching g_engine field, so this phase is a pure rename/regroup with zero
+// control-flow change. Removed incrementally in later phases as each subsystem's functions gain
+// a real `engine` parameter (see the plan doc's phase breakdown).
+#define g_seq_midi g_engine.seq_midi
+#define g_transport_state g_engine.transport_state
+#define g_transport_playhead_sec g_engine.transport_playhead_sec
+#define g_transport_last_play_trigger g_engine.transport_last_play_trigger
+#define g_transport_last_pause_trigger g_engine.transport_last_pause_trigger
+#define g_transport_last_stop_trigger g_engine.transport_last_stop_trigger
+#define g_transport_last_seek_start_trigger g_engine.transport_last_seek_start_trigger
+#define g_transport_last_seek_back_trigger g_engine.transport_last_seek_back_trigger
+#define g_transport_last_seek_fwd_trigger g_engine.transport_last_seek_fwd_trigger
+#define g_metronome_next_click_sec g_engine.metronome_next_click_sec
+#define g_metronome_click_samples_left g_engine.metronome_click_samples_left
+#define g_metronome_click_phase g_engine.metronome_click_phase
 
 // Actually starts (or repositions) one Seq-mode audio lane's transport-driven playback: its file
 // position is audio_offset_sec (the lane's own knob, "start reading the file from here") PLUS
@@ -6278,9 +6405,6 @@ static void transport_start_fresh(const SynthSharedControls *knobs) {
 #define METRONOME_CLICK_HZ 400.0f
 #define METRONOME_CLICK_DURATION_SEC 0.008f
 #define METRONOME_CLICK_GAIN 0.25f
-static double g_metronome_next_click_sec = 0.0; // playhead-seconds of the next scheduled click
-static int g_metronome_click_samples_left = 0;  // countdown of remaining click samples to render
-static int g_metronome_click_phase = 0;         // running square-wave sample counter, reset per click
 
 // Edge-triggered, same idiom as poll_seq_audio_preview_triggers: each button increments its own
 // counter on every click and resends the whole packet, so a genuine change (not just "button
@@ -6909,45 +7033,43 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // One-sample-delayed feedback state for LFO Phase modulation: holds each LFO's phase-shift
     // contribution from other LFOs and from its own Program's reference voice's assignable EGs
     // (voices[p] -- see the LFO-as-destination block below for why that's the reference voice).
-    // Now per-Program (LFOs are a resource shared across every voice OF THE SAME PROGRAM, not
-    // across Programs). Function-local static is safe here -- this program runs one synth engine
-    // instance on a single audio thread.
-    static float lfo_phase_mod_state[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
+    // Per-Program (LFOs are a resource shared across every voice OF THE SAME PROGRAM, not across
+    // Programs). Was a function-local `static` array (safe only because this program ran exactly
+    // one synth engine instance per process) -- now an alias bound to g_engine's own copy, part
+    // of the multi-instance refactor (see HdsEngineState's own comment). Every read/write site
+    // below keeps using the bare name unchanged; only where the storage lives changed.
+    float (*lfo_phase_mod_state)[LFO_COUNT] = g_engine.lfo_phase_mod_state;
     // Same one-sample-delayed pattern, for LFO Rate and Depth as mod destinations (targets
     // 14-21/48-71 -- see lfo_rate_target_index/lfo_depth_target_index). Applied to rate_hz/
     // mod_depth in the main per-sample LFO loop below.
-    static float lfo_rate_mod_state[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
-    static float lfo_depth_mod_state[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
+    float (*lfo_rate_mod_state)[LFO_COUNT] = g_engine.lfo_rate_mod_state;
+    float (*lfo_depth_mod_state)[LFO_COUNT] = g_engine.lfo_depth_mod_state;
 
     // Control-rate decimation state for LFOs 3-16 (index 2-15) -- see LFO_DECIMATION_FACTOR's
     // comment. counter cycles 0..LFO_DECIMATION_FACTOR-1; at 0, last_value/target_value/phase are
     // all advanced by one full decimated step, then every sample in between linearly interpolates
-    // from last_value to target_value. Function-local static for the same single-instance reason
-    // as lfo_phase_mod_state above. Per-Program now, same reason as lfo_phase_mod_state.
-    static int lfo_decim_counter[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0}};
-    static float lfo_decim_last_value[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
-    static float lfo_decim_target_value[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
+    // from last_value to target_value. Per-Program, same reason as lfo_phase_mod_state above.
+    int (*lfo_decim_counter)[LFO_COUNT] = g_engine.lfo_decim_counter;
+    float (*lfo_decim_last_value)[LFO_COUNT] = g_engine.lfo_decim_last_value;
+    float (*lfo_decim_target_value)[LFO_COUNT] = g_engine.lfo_decim_target_value;
 
     // Monophonic Noise tilt-filter state (see ProgramState.vco1_mono_noise's own comment) --
     // one shared generator per Program+oscillator, computed once per sample below (before the
-    // voice loop) rather than once per voice. Function-local static for the same single-instance
-    // reason as lfo_phase_mod_state above.
-    static float mono_noise_tilt_lp[COMBI_PROGRAM_COUNT + 1][4] = {{0.0f}};
+    // voice loop) rather than once per voice.
+    float (*mono_noise_tilt_lp)[4] = g_engine.mono_noise_tilt_lp;
 
     // FX bus engine state: persists across calls (and across FX_TYPE changes -- see
-    // process_fx_chain) for the same "single synth engine instance" reason as above.
-    static FXSlotEngine fx_engine[FX_SLOT_COUNT];
-    static bool fx_engine_initialized = false;
-    if (!fx_engine_initialized) { reset_fx_engine(fx_engine); fx_engine_initialized = true; }
+    // process_fx_chain) for the same "one synth engine instance" reason as above.
+    FXSlotEngine *fx_engine = g_engine.fx_engine;
+    if (!g_engine.fx_engine_initialized) { reset_fx_engine(fx_engine); g_engine.fx_engine_initialized = true; }
 
     // Always-on master safety limiter gain, one per output pair (evaluated after every source
     // routed to that pair has been summed in -- see its use below). Persists across calls for the
     // same reason as the state above.
-    static float limiter_gain[OUTPUT_PAIR_MAX];
-    static bool limiter_gain_initialized = false;
-    if (!limiter_gain_initialized) {
+    float *limiter_gain = g_engine.limiter_gain;
+    if (!g_engine.limiter_gain_initialized) {
         for (int p = 0; p < OUTPUT_PAIR_MAX; p++) limiter_gain[p] = 1.0f;
-        limiter_gain_initialized = true;
+        g_engine.limiter_gain_initialized = true;
     }
 
     // FX slot type-change bookkeeping (free a slot's old effect state when its Type actually
@@ -6979,14 +7101,13 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             compute_eg_derived_rates(&knobs->programs[p].eg[e], (int)knobs->programs[p].eg_mode[e], &eg_rates[p][e]);
         }
     }
-    // Sustain-chase rate: not even knob-dependent (a pure function of SAMPLE_RATE), so computed
-    // exactly once for the life of the process rather than once per block.
-    static float eg_sustain_chase_rate;
-    static bool eg_sustain_chase_rate_initialized = false;
-    if (!eg_sustain_chase_rate_initialized) {
-        eg_sustain_chase_rate = 1.0f - expf(-1.0f / (0.015f * SAMPLE_RATE));
-        eg_sustain_chase_rate_initialized = true;
-    }
+    // Sustain-chase rate: not even knob-dependent (a pure function of SAMPLE_RATE) -- a plain
+    // local, recomputed every call, rather than a function-local `static` cached "once for the
+    // life of the process" as before. Bit-identical result every call (same formula, same
+    // compile-time-constant inputs), so this is a pure simplification with zero behavior change,
+    // made possible by dropping the now-unnecessary per-instance cache as part of the
+    // multi-instance refactor (this value never needed to be instance state at all).
+    const float eg_sustain_chase_rate = 1.0f - expf(-1.0f / (0.015f * SAMPLE_RATE));
 
     int voice_limit = effective_voice_limit(knobs);
     int block_size = effective_block_size(knobs);
