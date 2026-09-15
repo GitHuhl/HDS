@@ -7996,15 +7996,18 @@ typedef enum { HDS_STREAM_PLAYBACK, HDS_STREAM_CAPTURE } HdsStreamDirection;
 // ring buffer (miniaudio's own ma_pcm_rb) sits between the two: the callback drains/fills it at
 // the device's own pace, and write_audio_block/read_capture_block below push/pull from it with a
 // short blocking wait, reproducing the same "block until the device has room/data" contract ALSA
-// already provided. The ring is sized to half a second -- far more than any realistic block --
-// so under normal load the wait is effectively never hit; it exists only to preserve correctness
-// under a transient stall, exactly like ALSA's own device-internal ring already does.
+// already provided. Sized off BUFFER_SIZE, not latency_ms -- see open_pcm_stream()'s own comment
+// for why (it bridges polling-vs-callback jitter, it's not a second latency-sized buffer).
 struct HdsPcmStream {
     ma_device device;
     ma_pcm_rb rb;
     int channels;
     bool is_capture;
     bool device_ok;
+    _Atomic uint32_t underrun_count; // incremented on the WASAPI callback thread (never fprintf's
+                                      // there -- see the comment below); read/reported from
+                                      // main()'s own loop, same cross-thread-counter pattern
+                                      // record_engine.ring.dropped_samples already uses.
 };
 
 static void hds_win_playback_callback(ma_device *device, void *output, const void *input, ma_uint32 frame_count) {
@@ -8021,7 +8024,17 @@ static void hds_win_playback_callback(ma_device *device, void *output, const voi
         out += (size_t)avail * (size_t)s->channels * sizeof(float);
         remaining -= avail;
     }
-    if (remaining > 0) memset(out, 0, (size_t)remaining * (size_t)s->channels * sizeof(float)); // underrun -- silence, matching ALSA's own xrun-then-silence gap
+    if (remaining > 0) {
+        memset(out, 0, (size_t)remaining * (size_t)s->channels * sizeof(float)); // underrun -- silence, matching ALSA's own xrun-then-silence gap
+        // Diagnostic only, never fprintf here -- this runs on WASAPI's own real-time callback
+        // thread, and stdio can block/lock; a plain atomic increment is safe and cheap. Read and
+        // reported from main()'s loop instead (same cross-thread-counter pattern already used for
+        // record_engine.ring.dropped_samples) -- this was previously the one underrun path with
+        // zero diagnostics at all (write_audio_block()'s Windows branch only logs its own
+        // "ring stayed full" producer-side case, never this consumer-side "ring went empty" one,
+        // which is what actually produces an audible click).
+        atomic_fetch_add_explicit(&s->underrun_count, 1, memory_order_relaxed);
+    }
 }
 static void hds_win_capture_callback(ma_device *device, void *output, const void *input, ma_uint32 frame_count) {
     (void)output;
@@ -8103,7 +8116,6 @@ static void write_audio_block(HdsPcmStream *pcm_handle, const float *buffer, int
     // rather than crash; main() will keep retrying the device on the next control packet.
     if (!pcm_handle) return;
 #ifdef _WIN32
-    (void)active_voices_count; (void)render_ms; // only used for the ALSA underrun log message below
     if (!pcm_handle->device_ok) return;
     uint32_t written = 0;
     int spin_guard = 0;
@@ -8118,8 +8130,15 @@ static void write_audio_block(HdsPcmStream *pcm_handle, const float *buffer, int
         } else {
             // Ring momentarily full (playback callback hasn't drained it yet) -- brief wait and
             // retry, mirroring ALSA's own blocking-until-room semantics. Bail after ~200ms so a
-            // truly stalled device (unplugged mid-block) can't hang the audio thread forever.
-            if (++spin_guard > 200) { fprintf(stderr, "[audio] WASAPI ring stayed full -- dropping the rest of this block\n"); break; }
+            // truly stalled device (unplugged mid-block) can't hang the audio thread forever. This
+            // is the PRODUCER side running dry of room (main() too slow to keep the ring drained,
+            // or the callback thread stalled) -- distinct from hds_win_playback_callback()'s own
+            // underrun_count, which is the CONSUMER side running dry of data (the actual click).
+            if (++spin_guard > 200) {
+                fprintf(stderr, "[audio] WASAPI ring stayed full -- dropping the rest of this block -- %d active voices, last render_audio_block took %.3fms\n",
+                        active_voices_count, render_ms);
+                break;
+            }
             struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
         }
     }
@@ -8980,6 +8999,9 @@ int main(int argc, char **argv) {
     bool applied_record_enable = false;
     int recorder_input_channels_at_start = 0; // detected_input_channels when recording began, for the mid-take device-change safety check
     uint64_t record_last_reported_drops = 0;
+#ifdef _WIN32
+    uint32_t win_audio_last_reported_underruns = 0; // see hds_win_playback_callback()'s own underrun_count comment
+#endif
 
     // Sample-streaming disk thread (DFD/WAVE_SAMPLE) -- same "started once, lives for the
     // process's lifetime, talked to only via atomics" pattern as the recording writer thread
@@ -9244,6 +9266,22 @@ int main(int argc, char **argv) {
                     (unsigned long long)record_dropped_now);
             record_last_reported_drops = record_dropped_now;
         }
+
+#ifdef _WIN32
+        // DIAGNOSTIC (Windows underrun/click tracking): mirrors the ALSA branch's own xrun log
+        // message below (same active_voices_count/render_ms context), for exactly the audible-
+        // click path that previously had zero visibility -- see hds_win_playback_callback()'s
+        // own underrun_count comment for why this is a polled counter instead of fprintf'ing
+        // directly from that real-time callback thread.
+        if (pcm_handle) {
+            uint32_t win_underruns_now = atomic_load_explicit(&pcm_handle->underrun_count, memory_order_relaxed);
+            if (win_underruns_now != win_audio_last_reported_underruns) {
+                fprintf(stderr, "[audio] WASAPI underrun (click) -- %u total so far, %d active voices, last render_audio_block took %.3fms\n",
+                        win_underruns_now, active_voices_count, render_ms);
+                win_audio_last_reported_underruns = win_underruns_now;
+            }
+        }
+#endif
 
         vu_decimator++;
         if (vu_decimator >= 12) {
