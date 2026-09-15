@@ -8,6 +8,7 @@ import subprocess
 import re
 import time
 import json
+import argparse
 from datetime import datetime
 import numpy as np
 from pythonosc.udp_client import SimpleUDPClient
@@ -521,8 +522,13 @@ _ROUND_ROBIN_COLORS = ["#c0392b", "#2980b9", "#27ae60", "#8e44ad", "#d35400", "#
 def _round_robin_group_color(group):
     return QColor(_ROUND_ROBIN_COLORS[(group - 1) % len(_ROUND_ROBIN_COLORS)])
 
-# OSC control protocol endpoints -- must match backend.c's --osc-listen-port/--osc-reply-port
-# defaults exactly (both localhost-only for now; see connect_to_backend()).
+# OSC control protocol endpoints -- must match whichever backend this frontend is pointed at:
+# the standalone app's --osc-listen-port/--osc-reply-port defaults (9000/9001), or a CLAP
+# plugin instance's own embedded OSC server (9010/9011 by default -- see clap_plugin.c). These
+# two module-level names are the actual, live values used everywhere below (connect_to_backend(),
+# etc.); the CLI flags parsed in __main__ (--osc-listen-port/--osc-reply-port, matching the
+# backend's own flag names exactly) override them before SynthGui() is constructed, i.e. before
+# connect_to_backend() ever reads them.
 OSC_HOST = "127.0.0.1"
 OSC_SEND_PORT = 9000  # backend's --osc-listen-port: every knob + Sample Bank catalog goes here
 OSC_RECV_PORT = 9001  # backend's --osc-reply-port: /hds/status/* feedback arrives here
@@ -6664,7 +6670,20 @@ def runtime_connect_and_bind(gui):
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
+    # parse_known_args (not parse_args): leaves any Qt-specific args (-style, -platform, etc.)
+    # untouched in sys.argv for QApplication(sys.argv) below, rather than erroring on them.
+    _arg_parser = argparse.ArgumentParser(add_help=False)
+    _arg_parser.add_argument("--osc-listen-port", type=int, default=OSC_SEND_PORT,
+                              help="Backend's OSC listen port (where this frontend sends knob/zone messages). "
+                                   "9000 for the standalone app, 9010 for the CLAP plugin's embedded server.")
+    _arg_parser.add_argument("--osc-reply-port", type=int, default=OSC_RECV_PORT,
+                              help="Backend's OSC reply port (where /hds/status/* feedback is received). "
+                                   "9001 for the standalone app, 9011 for the CLAP plugin's embedded server.")
+    _args, _qt_argv_rest = _arg_parser.parse_known_args(sys.argv[1:])
+    OSC_SEND_PORT = _args.osc_listen_port
+    OSC_RECV_PORT = _args.osc_reply_port
+
+    app = QApplication([sys.argv[0]] + _qt_argv_rest)
     main_window = SynthGui()
     runtime_connect_and_bind(main_window)
     main_window.show()
