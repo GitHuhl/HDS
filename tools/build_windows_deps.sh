@@ -75,13 +75,21 @@ cd "$WORK_DIR/wavpack-$WAVPACK_VERSION"
 # first. Needs autoconf/automake/libtool on PATH when this branch runs (shell.nix provides them).
 if [ ! -x ./configure ]; then
     echo "--- no ./configure in the WavPack tarball, bootstrapping via autoreconf ---"
-    # AUTOPOINT="autopoint --force": the checked-in config.rpath in this GitHub source snapshot
-    # differs from what the locally-installed gettext's autopoint would generate itself (they were
-    # bootstrapped against a different gettext version), so autopoint's default safety check
-    # ("File config.rpath has been locally modified... Not overwriting") refuses to proceed.
-    # autoreconf's own -f doesn't propagate down to the autopoint sub-step -- it needs its own
-    # --force, passed through via the AUTOPOINT env var autoreconf reads for this exact purpose.
-    if [ -x ./autogen.sh ]; then ./autogen.sh; else AUTOPOINT="autopoint --force" autoreconf -fi; fi
+    if [ -x ./autogen.sh ]; then
+        ./autogen.sh
+    else
+        # Run autopoint --force ourselves FIRST, directly -- the checked-in config.rpath in this
+        # GitHub source snapshot differs from what the locally-installed gettext's autopoint would
+        # generate itself (bootstrapped against a different gettext version upstream), which
+        # autopoint's default safety check ("File config.rpath has been locally modified... Not
+        # overwriting") refuses to proceed past. Passing --force via an AUTOPOINT=... env var
+        # override for autoreconf to forward doesn't work here (autoreconf has no such override for
+        # autopoint specifically, unlike ACLOCAL/AUTOCONF/AUTOMAKE/etc.) -- so reconcile the files
+        # ourselves before autoreconf gets to its own internal autopoint step, which will then find
+        # everything already in sync and pass cleanly.
+        autopoint --force
+        autoreconf -fi
+    fi
 fi
 ./configure --host=x86_64-w64-mingw32 --prefix="$DEPS_DIR/wavpack" \
     --enable-static --disable-shared --disable-apps \
