@@ -11,7 +11,10 @@ SRC := src/backend.c
 # audio/MIDI need nothing extra beyond mingw-w64 itself, see the platform-shim comments at the top
 # of src/backend.c). This is a completely separate target from `all` above -- it never runs as
 # part of a plain `make`, and touches none of the Linux build's flags/libs/output.
-WIN_CC := x86_64-w64-mingw32-gcc
+# `?=` (not `:=`): the standard x86_64-w64-mingw32-gcc name is right for Debian/Ubuntu's
+# mingw-w64 package and the nix-shell in shell.nix at the repo root, but overridable
+# (`make windows WIN_CC=...`) if some other toolchain names its cross compiler differently.
+WIN_CC ?= x86_64-w64-mingw32-gcc
 WIN_BIN := synth_engine.exe
 WIN_DEPS := third_party/win64-deps
 WIN_CFLAGS := -O2 -Wall -Wextra -std=gnu11 -I$(WIN_DEPS)/liblo/include -I$(WIN_DEPS)/wavpack/include

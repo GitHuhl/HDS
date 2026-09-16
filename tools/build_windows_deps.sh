@@ -7,8 +7,11 @@
 # These two are the only non-Windows-native dependencies synth_engine.exe needs: audio (WASAPI)
 # and MIDI (WinMM) come from the Windows SDK itself via mingw-w64, no extra library required (see
 # the "Windows audio/MIDI platform shim" comments in src/backend.c). liblo and wavpack are plain,
-# portable C libraries with no Windows-specific packaging available through apt, so this script
-# builds them from their real upstream/distro source the same way any other Linux distro would.
+# portable C libraries fetched straight from their real upstream release tarballs (SourceForge for
+# liblo, GitHub Releases for WavPack) and cross-built from source -- no distro package manager
+# involved, so this runs the same way on Ubuntu, Fedora, Arch, NixOS, etc. On NixOS specifically,
+# run this from inside `nix-shell` (see shell.nix at the repo root, which provides the mingw-w64
+# cross toolchain + curl/tar/make this script needs) rather than trying to install anything globally.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +26,7 @@ WAVPACK_VERSION=5.6.0
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     echo "error: x86_64-w64-mingw32-gcc not found -- install the mingw-w64 cross toolchain first" >&2
     echo "  (Debian/Ubuntu: sudo apt-get install mingw-w64)" >&2
+    echo "  (NixOS/Nix: run 'nix-shell' from the repo root first -- see shell.nix)" >&2
     exit 1
 fi
 
@@ -33,27 +37,25 @@ curl -fsSL -o liblo.tar.gz \
 tar xzf liblo.tar.gz
 
 echo "=== Fetching WavPack $WAVPACK_VERSION ==="
-# WavPack has no single canonical source-tarball URL as stable as liblo's SourceForge release, so
-# this uses the Debian/Ubuntu source package (same upstream release, repackaged) via apt. If your
-# system's apt sources don't have deb-src lines enabled, enable them first (e.g. add
-# "deb-src http://archive.ubuntu.com/ubuntu noble main universe" to /etc/apt/sources.list, or the
-# equivalent deb822 Types: line) and run `sudo apt-get update` -- or download
-# wavpack-$WAVPACK_VERSION.tar.bz2 manually from https://www.wavpack.com/downloads.html and drop
-# it in this directory before re-running this script.
-if ! ls "$WORK_DIR"/wavpack*"$WAVPACK_VERSION"*.tar.bz2 >/dev/null 2>&1; then
-    (cd "$WORK_DIR" && apt-get source wavpack) || true # piping this into grep for a status check risks SIGPIPE aborting a still-in-progress download -- check the resulting file directly instead
+# Straight from WavPack's own GitHub Releases (github.com/dbry/WavPack) -- a plain, versioned
+# tarball URL with no distro package manager involved (this used to shell out to
+# `apt-get source wavpack`, which only exists on Debian/Ubuntu and breaks on every other distro,
+# NixOS included -- fixed here, not worked around per-distro). If your network blocks GitHub,
+# download the same tarball by hand from
+# https://github.com/dbry/WavPack/archive/refs/tags/$WAVPACK_VERSION.tar.gz and save it as
+# "$WORK_DIR/wavpack-$WAVPACK_VERSION.tar.gz" before re-running this script.
+if ! ls "$WORK_DIR"/wavpack-"$WAVPACK_VERSION".tar.gz >/dev/null 2>&1; then
+    curl -fsSL -o "$WORK_DIR/wavpack-$WAVPACK_VERSION.tar.gz" \
+        "https://github.com/dbry/WavPack/archive/refs/tags/$WAVPACK_VERSION.tar.gz"
 fi
-# Debian's apt-get source names this wavpack_<ver>.orig.tar.bz2 (underscore); a manually
-# downloaded upstream tarball from wavpack.com is typically wavpack-<ver>.tar.bz2 (hyphen) --
-# accept either.
-WAVPACK_TARBALL=$(ls "$WORK_DIR"/wavpack*"$WAVPACK_VERSION"*.tar.bz2 2>/dev/null | head -1)
-if [ -z "$WAVPACK_TARBALL" ]; then
-    echo "error: couldn't fetch WavPack source via 'apt-get source wavpack'." >&2
-    echo "  Enable deb-src in your apt sources and 'sudo apt-get update', or manually download" >&2
-    echo "  wavpack-$WAVPACK_VERSION.tar.bz2 from https://www.wavpack.com/downloads.html into $WORK_DIR" >&2
-    exit 1
+tar xzf "$WORK_DIR/wavpack-$WAVPACK_VERSION.tar.gz"
+# GitHub's source-archive tarballs extract to "<repo>-<tag>/" (capitalized "WavPack-5.6.0", not
+# lowercase) -- normalize to the same "wavpack-$WAVPACK_VERSION" directory name the rest of this
+# script (and the Cross-building step below) already expects, matching what a real upstream
+# release tarball from wavpack.com would have been named.
+if [ -d "WavPack-$WAVPACK_VERSION" ] && [ ! -d "wavpack-$WAVPACK_VERSION" ]; then
+    mv "WavPack-$WAVPACK_VERSION" "wavpack-$WAVPACK_VERSION"
 fi
-tar xjf "$WAVPACK_TARBALL"
 
 echo "=== Cross-building liblo ==="
 mkdir -p "$DEPS_DIR/liblo"
@@ -67,6 +69,14 @@ make install
 echo "=== Cross-building WavPack (library only) ==="
 mkdir -p "$DEPS_DIR/wavpack"
 cd "$WORK_DIR/wavpack-$WAVPACK_VERSION"
+# Unlike liblo's SourceForge tarball (a real "make dist" release including the generated
+# ./configure), this is a plain GitHub source snapshot -- autotools projects routinely don't
+# commit their generated configure/Makefile.in/aclocal.m4 to git, so it may need bootstrapping
+# first. Needs autoconf/automake/libtool on PATH when this branch runs (shell.nix provides them).
+if [ ! -x ./configure ]; then
+    echo "--- no ./configure in the WavPack tarball, bootstrapping via autoreconf ---"
+    if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fi; fi
+fi
 ./configure --host=x86_64-w64-mingw32 --prefix="$DEPS_DIR/wavpack" \
     --enable-static --disable-shared --disable-apps \
     CC=x86_64-w64-mingw32-gcc
