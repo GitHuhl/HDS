@@ -481,13 +481,13 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
     // comment. Sequencer/Combi lanes are fully reachable via OSC (performance_mode, seq_lanes[],
     // etc. are ordinary knobs), so this plugin supports the same architecture as the standalone
     // app, not just a stripped-down MIDI-only mode.
-    poll_seq_audio_load_requests(&p->knobs);
-    poll_seq_audio_preview_triggers(&p->knobs);
+    poll_seq_audio_load_requests(&g_streams_state, &p->knobs);
+    poll_seq_audio_preview_triggers(&g_streams_state, &p->knobs);
     double engine_elapsed_seconds = (double)p->total_frames_rendered / (double)SAMPLE_RATE;
     float current_tempo_bpm = compute_current_tempo_bpm(&p->knobs, engine_elapsed_seconds);
-    poll_transport_triggers(&p->knobs, current_tempo_bpm);
-    poll_metronome(&p->knobs, current_tempo_bpm);
-    poll_seq_audio_transport_catchup(&p->knobs);
+    poll_transport_triggers(&g_streams_state, &g_engine, &p->knobs, current_tempo_bpm);
+    poll_metronome(&g_engine, &p->knobs, current_tempo_bpm);
+    poll_seq_audio_transport_catchup(&g_streams_state, &g_engine, &p->knobs);
     drain_pending_sample_loads(&g_sample_engine);
 
     if (process->in_events) {
@@ -500,7 +500,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
                 if (ev->key < 0 || ev->key > 127 || ev->channel < 0 || ev->channel > 15) continue; // wildcard note-on/off, not supported by this direct-mapping engine
                 double vel = ev->velocity < 0.0 ? 0.0 : (ev->velocity > 1.0 ? 1.0 : ev->velocity);
                 int velocity_127 = (int)(vel * 127.0 + 0.5);
-                dispatch_midi_event(hdr->type == CLAP_EVENT_NOTE_ON ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF,
+                dispatch_midi_event(&g_engine, &g_sample_engine, hdr->type == CLAP_EVENT_NOTE_ON ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF,
                                      (int)ev->channel + 1, (int)ev->key, velocity_127,
                                      p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
             } else if (hdr->type == CLAP_EVENT_MIDI) {
@@ -511,24 +511,24 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
                 // (see process_midi_input) -- a Note On with velocity 0 counts as Note Off.
                 if (status == 0x90 || status == 0x80) {
                     bool is_note_on = (status == 0x90 && ev->data[2] > 0);
-                    dispatch_midi_event(is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, ev->data[1], ev->data[2],
+                    dispatch_midi_event(&g_engine, &g_sample_engine, is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, ev->data[1], ev->data[2],
                                          p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
                 } else if (status == 0xB0) {
-                    dispatch_midi_event(HDS_MIDI_CC, midi_channel_1_16, ev->data[1], ev->data[2],
+                    dispatch_midi_event(&g_engine, &g_sample_engine, HDS_MIDI_CC, midi_channel_1_16, ev->data[1], ev->data[2],
                                          p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
                 } else if (status == 0xE0) {
                     int bend14 = (int)ev->data[1] | ((int)ev->data[2] << 7);
-                    dispatch_midi_event(HDS_MIDI_PITCH_BEND, midi_channel_1_16, 0, bend14 - 8192,
+                    dispatch_midi_event(&g_engine, &g_sample_engine, HDS_MIDI_PITCH_BEND, midi_channel_1_16, 0, bend14 - 8192,
                                          p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
                 } else if (status == 0xD0) {
-                    dispatch_midi_event(HDS_MIDI_CHANNEL_PRESSURE, midi_channel_1_16, 0, ev->data[1],
+                    dispatch_midi_event(&g_engine, &g_sample_engine, HDS_MIDI_CHANNEL_PRESSURE, midi_channel_1_16, 0, ev->data[1],
                                          p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
                 }
             }
         }
     }
 
-    seq_playback_midi_events(p->voices, &p->knobs, p->global_lfo_phases, &p->mono_stacks[SINGLE_PROGRAM_SLOT], &p->midi_live);
+    seq_playback_midi_events(&g_engine, &g_sample_engine, p->voices, &p->knobs, p->global_lfo_phases, &p->mono_stacks[SINGLE_PROGRAM_SLOT], &p->midi_live);
 
     float **out = NULL;
     if (process->audio_outputs_count > 0 && process->audio_outputs[0].data32 &&
@@ -552,7 +552,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         // terminates correctly either way.
         p->knobs.block_size_frames = (float)chunk;
         int block_size = effective_block_size(&p->knobs);
-        advance_transport_playhead(block_size);
+        advance_transport_playhead(&g_engine, block_size);
 
         static float chunk_buffer[BUFFER_SIZE * 2];
         float peak = render_audio_block(p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer);

@@ -4838,6 +4838,12 @@ static HdsStreamsState g_streams_state;
 typedef struct {
     int lane_index;
     char path[SEQ_AUDIO_PATH_LEN];
+    // Multi-instance refactor: which instance's HdsStreamsState (seq_audio[]/loader-thread-
+    // tracking) this in-flight load belongs to -- lets the thread write into the right instance's
+    // seq_audio[] instead of an implicit global, and lets deactivate() know which instance's
+    // tracking table to update once this thread exits (see seq_audio_loader_thread_active's own
+    // comment for the use-after-free hazard this fixes).
+    HdsStreamsState *owner;
 } SeqAudioLoadRequest;
 
 // Reads an entire WAV file into a newly malloc'd interleaved float buffer. Deliberately separate
@@ -4965,7 +4971,7 @@ static float *seq_audio_resample_linear(const float *pcm, int frames, int channe
 
 static void *seq_audio_loader_thread_main(void *arg) {
     SeqAudioLoadRequest *req = (SeqAudioLoadRequest *)arg;
-    SeqAudioLane *lane = &g_seq_audio[req->lane_index];
+    SeqAudioLane *lane = &req->owner->seq_audio[req->lane_index];
     int frames = 0, channels = 0, sample_rate = 0;
     float *pcm = seq_audio_load_wav_from_disk(req->path, &frames, &channels, &sample_rate);
     // Safe to read/free the previous buffer here without its own atomic: loads for this lane are
@@ -5013,23 +5019,33 @@ static void *seq_audio_loader_thread_main(void *arg) {
 // pattern in main()'s loop): notices when a lane's requested audio_path differs from what's
 // already loading/loaded, and spawns a loader thread for it -- never more than one in flight per
 // lane at a time. Call this from main()'s loop, same cadence as every other live-knob check.
-static void poll_seq_audio_load_requests(const SynthSharedControls *knobs) {
+static void poll_seq_audio_load_requests(HdsStreamsState *streams, const SynthSharedControls *knobs) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
-        SeqAudioLane *lane = &g_seq_audio[l];
+        SeqAudioLane *lane = &streams->seq_audio[l];
         const char *want_path = knobs->seq_lanes[l].audio_path;
         if (want_path[0] == '\0') continue;
         if (strncmp(want_path, lane->last_requested_path, SEQ_AUDIO_PATH_LEN) == 0) continue;
         int state = atomic_load_explicit(&lane->load_state, memory_order_acquire);
         if (state == SEQ_AUDIO_LOADING) continue; // catches up once the in-flight load finishes
         snprintf(lane->last_requested_path, SEQ_AUDIO_PATH_LEN, "%s", want_path);
+        // A previous load for this lane may still be un-joined (this is a later reload of the
+        // same lane) -- join it now before reusing the tracking slot below, so this instance
+        // never leaks a thread handle across repeated reloads. Cheap in practice: gated by
+        // load_state != LOADING just above, so any earlier thread already finished its work by
+        // the time control reaches here -- see SeqAudioLoadRequest.owner's own comment on why
+        // this join (not a detach) is now required at all.
+        if (streams->seq_audio_loader_thread_active[l]) {
+            pthread_join(streams->seq_audio_loader_thread[l], NULL);
+            streams->seq_audio_loader_thread_active[l] = false;
+        }
         SeqAudioLoadRequest *req = malloc(sizeof(SeqAudioLoadRequest));
         if (!req) continue;
         req->lane_index = l;
+        req->owner = streams;
         snprintf(req->path, SEQ_AUDIO_PATH_LEN, "%s", want_path);
         atomic_store_explicit(&lane->load_state, SEQ_AUDIO_LOADING, memory_order_release);
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, seq_audio_loader_thread_main, req) == 0) {
-            pthread_detach(tid);
+        if (pthread_create(&streams->seq_audio_loader_thread[l], NULL, seq_audio_loader_thread_main, req) == 0) {
+            streams->seq_audio_loader_thread_active[l] = true;
         } else {
             fprintf(stderr, "[seq-audio] failed to spawn loader thread for lane %d\n", l);
             free(req);
@@ -5082,9 +5098,9 @@ static void render_seq_audio_preview_sample(SeqAudioLane *lane, float volume_0_1
 // unlike a transport-driven lane -- auditioning a sound must never depend on whether the
 // Sequencer happens to be running. Call once per block from main()'s loop, same as
 // poll_seq_audio_load_requests.
-static void poll_seq_audio_preview_triggers(const SynthSharedControls *knobs) {
+static void poll_seq_audio_preview_triggers(HdsStreamsState *streams, const SynthSharedControls *knobs) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
-        SeqAudioLane *lane = &g_seq_audio[l];
+        SeqAudioLane *lane = &streams->seq_audio[l];
         float want_trigger = knobs->seq_lanes[l].audio_preview_trigger;
         if (want_trigger == lane->last_seen_trigger) continue;
         lane->last_seen_trigger = want_trigger;
@@ -6039,7 +6055,7 @@ static float sample_osc_zone_pan_offset(HdsSampleEngine *se, int stream_idx) {
 // simultaneously-mono-mode Combi Programs never collide on voice 0 -- a direct generalization of
 // today's hardcoded "mono always uses voice 0", byte-identical when target_program is always 0
 // (Single Program/Sequencer modes).
-static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], int target_program, int note, int velocity, bool poly_mode_active, MonoNoteStack *mono_stack) {
+static void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], int target_program, int note, int velocity, bool poly_mode_active, MonoNoteStack *mono_stack) {
     const ProgramState *prog = &knobs->programs[target_program];
     int slot = -1;
     if (poly_mode_active) {
@@ -6106,27 +6122,27 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         // and release any stream a stolen/retriggered voice was still holding from a previous
         // note even if this new note doesn't need one -- see start_sample_osc()'s comment.
         if ((WaveType)((int)prog->vco1_shape) == WAVE_SAMPLE) {
-            start_sample_osc(&g_sample_engine, &voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, note, velocity);
+            start_sample_osc(se, &voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, note, velocity);
         } else if (voices[slot].vco1_sample_stream >= 0) {
-            release_sample_stream(&g_sample_engine, voices[slot].vco1_sample_stream);
+            release_sample_stream(se, voices[slot].vco1_sample_stream);
             voices[slot].vco1_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco2_shape) == WAVE_SAMPLE) {
-            start_sample_osc(&g_sample_engine, &voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, note, velocity);
+            start_sample_osc(se, &voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, note, velocity);
         } else if (voices[slot].vco2_sample_stream >= 0) {
-            release_sample_stream(&g_sample_engine, voices[slot].vco2_sample_stream);
+            release_sample_stream(se, voices[slot].vco2_sample_stream);
             voices[slot].vco2_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco3_shape) == WAVE_SAMPLE) {
-            start_sample_osc(&g_sample_engine, &voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, note, velocity);
+            start_sample_osc(se, &voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, note, velocity);
         } else if (voices[slot].vco3_sample_stream >= 0) {
-            release_sample_stream(&g_sample_engine, voices[slot].vco3_sample_stream);
+            release_sample_stream(se, voices[slot].vco3_sample_stream);
             voices[slot].vco3_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco4_shape) == WAVE_SAMPLE) {
-            start_sample_osc(&g_sample_engine, &voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, note, velocity);
+            start_sample_osc(se, &voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, note, velocity);
         } else if (voices[slot].vco4_sample_stream >= 0) {
-            release_sample_stream(&g_sample_engine, voices[slot].vco4_sample_stream);
+            release_sample_stream(se, voices[slot].vco4_sample_stream);
             voices[slot].vco4_sample_stream = -1;
         }
         for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voices[slot].fa_low[c][f][0]=0.0f; voices[slot].fa_low[c][f][1]=0.0f; voices[slot].fa_band[c][f][0]=0.0f; voices[slot].fa_band[c][f][1]=0.0f; } voices[slot].fb_low[c][0]=0.0f; voices[slot].fb_low[c][1]=0.0f; voices[slot].fb_band[c][0]=0.0f; voices[slot].fb_band[c][1]=0.0f; }
@@ -6168,7 +6184,7 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
 // Puts a voice's envelopes into RELEASE from wherever they currently are. Factored out since
 // it's needed from three places: a normal note-off (poly and mono), and releasing every voice
 // that was deferred by the sustain pedal once it lifts (see handle_sustain_release).
-static void trigger_voice_release(SynthVoice *voice) {
+static void trigger_voice_release(HdsSampleEngine *se, SynthVoice *voice) {
     voice->vco1_eg.release_level = voice->vco1_eg.current_level; voice->vco1_eg.state = STATE_RELEASE;
     voice->vco2_eg.release_level = voice->vco2_eg.current_level; voice->vco2_eg.state = STATE_RELEASE;
     voice->vco3_eg.release_level = voice->vco3_eg.current_level; voice->vco3_eg.state = STATE_RELEASE;
@@ -6178,20 +6194,20 @@ static void trigger_voice_release(SynthVoice *voice) {
     // voice just entered release -- sample_disk_thread_main reads this to decide whether a
     // loop_release_exit zone should keep looping. A no-op for any oscillator not currently
     // playing a WAVE_SAMPLE zone (request_sample_stream_release ignores stream_index -1).
-    request_sample_stream_release(&g_sample_engine, voice->vco1_sample_stream);
-    request_sample_stream_release(&g_sample_engine, voice->vco2_sample_stream);
-    request_sample_stream_release(&g_sample_engine, voice->vco3_sample_stream);
-    request_sample_stream_release(&g_sample_engine, voice->vco4_sample_stream);
+    request_sample_stream_release(se, voice->vco1_sample_stream);
+    request_sample_stream_release(se, voice->vco2_sample_stream);
+    request_sample_stream_release(se, voice->vco3_sample_stream);
+    request_sample_stream_release(se, voice->vco4_sample_stream);
 }
 
-static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int target_program, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
+static void handle_note_off(HdsSampleEngine *se, SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int target_program, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
     if (poly_mode_active) {
         int voice_limit = effective_voice_limit(knobs);
         for (int v = 0; v < voice_limit; v++) { if (voices[v].midi_note == note && voices[v].program_index == target_program) {
             // Sustain pedal held: defer the actual release until it lifts (see
             // handle_sustain_release) instead of releasing right now.
             if (midi_live->sustain_held) voices[v].sustain_pending = true;
-            else trigger_voice_release(&voices[v]);
+            else trigger_voice_release(se, &voices[v]);
         } }
         return;
     }
@@ -6219,18 +6235,18 @@ static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knob
     } else if (midi_live->sustain_held) {
         mono_voice->sustain_pending = true;
     } else {
-        trigger_voice_release(mono_voice);
+        trigger_voice_release(se, mono_voice);
     }
 }
 
 // Called when the sustain pedal transitions held -> released: actually releases every voice
 // that had a note-off deferred while it was held.
-static void handle_sustain_release(SynthVoice voices[], const SynthSharedControls *knobs) {
+static void handle_sustain_release(HdsSampleEngine *se, SynthVoice voices[], const SynthSharedControls *knobs) {
     int voice_limit = effective_voice_limit(knobs);
     for (int v = 0; v < voice_limit; v++) {
         if (voices[v].sustain_pending) {
             voices[v].sustain_pending = false;
-            trigger_voice_release(&voices[v]);
+            trigger_voice_release(se, &voices[v]);
         }
     }
 }
@@ -6357,9 +6373,9 @@ static HdsEngineState g_engine;
 // catching up mid-song (poll_seq_audio_transport_catchup), or a Seek (transport_reposition_lanes,
 // playhead already updated by the caller before this runs). Shared by all three callers. Caller
 // must have already confirmed load_state == SEQ_AUDIO_READY.
-static void seq_audio_start_transport_playback(SeqAudioLane *al, float audio_offset_sec) {
+static void seq_audio_start_transport_playback(HdsEngineState *engine, SeqAudioLane *al, float audio_offset_sec) {
     long start_frame = 0;
-    float target_sec = audio_offset_sec + (float)g_transport_playhead_sec;
+    float target_sec = audio_offset_sec + (float)engine->transport_playhead_sec;
     if (target_sec > 0.0f && al->sample_rate > 0) {
         start_frame = (long)(target_sec * (float)al->sample_rate);
         if (start_frame >= al->frame_count) start_frame = al->frame_count - 1;
@@ -6378,30 +6394,30 @@ static void seq_audio_start_transport_playback(SeqAudioLane *al, float audio_off
 // lane does nothing at all (see SeqLaneState's own precedence comment), and a Rec-armed lane has
 // no "position" to seek to (repositioning would either discard an in-progress take or make no
 // sense for one that hasn't started), so a seek simply doesn't affect either.
-static void transport_reposition_lanes(const SynthSharedControls *knobs) {
+static void transport_reposition_lanes(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         if ((int)knobs->seq_lanes[l].seq_mode == 1) continue; // Off -- a real bypass, the transport never touches this lane
         bool is_audio_lane = (knobs->seq_lanes[l].lane_type != 0.0f);
         if (is_audio_lane) {
             // Audio lanes never record -- rec_armed is meaningless for them.
-            SeqAudioLane *al = &g_seq_audio[l];
+            SeqAudioLane *al = &streams->seq_audio[l];
             if (atomic_load_explicit(&al->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !al->pcm || al->frame_count <= 0) {
                 // Not ready yet -- arm it so poll_seq_audio_transport_catchup starts it at the
                 // right (already-updated) position the moment it becomes ready.
                 al->armed_for_transport = true;
                 continue;
             }
-            seq_audio_start_transport_playback(al, knobs->seq_lanes[l].audio_offset_sec);
+            seq_audio_start_transport_playback(engine, al, knobs->seq_lanes[l].audio_offset_sec);
         } else {
             if (knobs->seq_lanes[l].rec_armed != 0.0f) continue; // Rec-armed lanes have no playback position to reposition
-            SeqMidiLane *ml = &g_seq_midi[l];
+            SeqMidiLane *ml = &engine->seq_midi[l];
             // Events are stored in non-decreasing time order (real-time recording can't record
             // out of order -- see SeqMidiLane's own comment), so the new cursor is just "how many
             // events have a timestamp at or before the new playhead," found by a plain forward
             // scan from 0. Cheap even for a full 8192-event lane; only runs on an actual seek
             // (button click), never per-block.
             int cursor = 0;
-            while (cursor < ml->event_count && ml->events[cursor].time_sec <= (float)g_transport_playhead_sec) cursor++;
+            while (cursor < ml->event_count && ml->events[cursor].time_sec <= (float)engine->transport_playhead_sec) cursor++;
             ml->playback_cursor = cursor;
         }
     }
@@ -6415,15 +6431,15 @@ static void transport_reposition_lanes(const SynthSharedControls *knobs) {
 // take (clears its previously recorded events) UNLESS rec_overdub is set, in which case its
 // existing events are deliberately left in place -- newly recorded notes get merged into them in
 // time order instead (see seq_record_midi_event).
-static void transport_start_fresh(const SynthSharedControls *knobs) {
+static void transport_start_fresh(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         if (knobs->seq_lanes[l].lane_type != 0.0f) continue; // Audio lanes never record
         if ((int)knobs->seq_lanes[l].seq_mode == 1) continue; // Off -- untouched
         if (knobs->seq_lanes[l].rec_armed == 0.0f) continue; // not armed to Rec
         if (knobs->seq_lanes[l].rec_overdub != 0.0f) continue; // Overdub -- keep existing events
-        g_seq_midi[l].event_count = 0; // Overwrite (default) -- fresh take
+        engine->seq_midi[l].event_count = 0; // Overwrite (default) -- fresh take
     }
-    transport_reposition_lanes(knobs);
+    transport_reposition_lanes(streams, engine, knobs);
 }
 
 // --- Metronome state (declared here, ahead of poll_transport_triggers below, so a Seek can
@@ -6443,35 +6459,35 @@ static void transport_start_fresh(const SynthSharedControls *knobs) {
 // re-triggering anything. Call once per block from main()'s loop. current_tempo_bpm is this
 // block's already-resolved tempo (see the Seek Back/Forward triggers' own comment on why "right
 // now" rather than "at the seek target").
-static void poll_transport_triggers(const SynthSharedControls *knobs, float current_tempo_bpm) {
-    if (knobs->seq_transport_play_trigger != g_transport_last_play_trigger) {
-        g_transport_last_play_trigger = knobs->seq_transport_play_trigger;
-        if (g_transport_state != TRANSPORT_PLAYING) {
-            bool was_stopped = (g_transport_state == TRANSPORT_STOPPED);
-            g_transport_state = TRANSPORT_PLAYING;
-            if (was_stopped) transport_start_fresh(knobs);
+static void poll_transport_triggers(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs, float current_tempo_bpm) {
+    if (knobs->seq_transport_play_trigger != engine->transport_last_play_trigger) {
+        engine->transport_last_play_trigger = knobs->seq_transport_play_trigger;
+        if (engine->transport_state != TRANSPORT_PLAYING) {
+            bool was_stopped = (engine->transport_state == TRANSPORT_STOPPED);
+            engine->transport_state = TRANSPORT_PLAYING;
+            if (was_stopped) transport_start_fresh(streams, engine, knobs);
             // PAUSED -> PLAYING: deliberately does nothing else -- every lane's play_frame/
             // playback_cursor already holds exactly where it was paused.
         }
     }
-    if (knobs->seq_transport_pause_trigger != g_transport_last_pause_trigger) {
-        g_transport_last_pause_trigger = knobs->seq_transport_pause_trigger;
-        if (g_transport_state == TRANSPORT_PLAYING) g_transport_state = TRANSPORT_PAUSED;
+    if (knobs->seq_transport_pause_trigger != engine->transport_last_pause_trigger) {
+        engine->transport_last_pause_trigger = knobs->seq_transport_pause_trigger;
+        if (engine->transport_state == TRANSPORT_PLAYING) engine->transport_state = TRANSPORT_PAUSED;
     }
-    if (knobs->seq_transport_stop_trigger != g_transport_last_stop_trigger) {
-        g_transport_last_stop_trigger = knobs->seq_transport_stop_trigger;
-        g_transport_state = TRANSPORT_STOPPED;
-        g_transport_playhead_sec = 0.0;
+    if (knobs->seq_transport_stop_trigger != engine->transport_last_stop_trigger) {
+        engine->transport_last_stop_trigger = knobs->seq_transport_stop_trigger;
+        engine->transport_state = TRANSPORT_STOPPED;
+        engine->transport_playhead_sec = 0.0;
         for (int l = 0; l < SEQ_LANE_COUNT; l++) {
             // Only stop lanes the TRANSPORT itself started -- a manually Preview-triggered lane
             // keeps playing through Stop exactly as it already does today (Preview is fully
             // independent of transport state, per its own existing contract).
-            if (g_seq_audio[l].driven_by_transport) {
-                g_seq_audio[l].is_playing = false;
-                g_seq_audio[l].driven_by_transport = false;
+            if (streams->seq_audio[l].driven_by_transport) {
+                streams->seq_audio[l].is_playing = false;
+                streams->seq_audio[l].driven_by_transport = false;
             }
-            g_seq_audio[l].armed_for_transport = false;
-            g_seq_midi[l].playback_cursor = 0;
+            streams->seq_audio[l].armed_for_transport = false;
+            engine->seq_midi[l].playback_cursor = 0;
         }
     }
 
@@ -6484,23 +6500,23 @@ static void poll_transport_triggers(const SynthSharedControls *knobs, float curr
     // negative-duration measure.
     float measure_sec = 4.0f * 60.0f / fmaxf(1.0f, current_tempo_bpm);
     bool seeked = false;
-    if (knobs->seq_transport_seek_start_trigger != g_transport_last_seek_start_trigger) {
-        g_transport_last_seek_start_trigger = knobs->seq_transport_seek_start_trigger;
-        g_transport_playhead_sec = 0.0;
+    if (knobs->seq_transport_seek_start_trigger != engine->transport_last_seek_start_trigger) {
+        engine->transport_last_seek_start_trigger = knobs->seq_transport_seek_start_trigger;
+        engine->transport_playhead_sec = 0.0;
         seeked = true;
     }
-    if (knobs->seq_transport_seek_back_trigger != g_transport_last_seek_back_trigger) {
-        g_transport_last_seek_back_trigger = knobs->seq_transport_seek_back_trigger;
-        g_transport_playhead_sec = fmax(0.0, g_transport_playhead_sec - (double)measure_sec);
+    if (knobs->seq_transport_seek_back_trigger != engine->transport_last_seek_back_trigger) {
+        engine->transport_last_seek_back_trigger = knobs->seq_transport_seek_back_trigger;
+        engine->transport_playhead_sec = fmax(0.0, engine->transport_playhead_sec - (double)measure_sec);
         seeked = true;
     }
-    if (knobs->seq_transport_seek_fwd_trigger != g_transport_last_seek_fwd_trigger) {
-        g_transport_last_seek_fwd_trigger = knobs->seq_transport_seek_fwd_trigger;
-        g_transport_playhead_sec += (double)measure_sec;
+    if (knobs->seq_transport_seek_fwd_trigger != engine->transport_last_seek_fwd_trigger) {
+        engine->transport_last_seek_fwd_trigger = knobs->seq_transport_seek_fwd_trigger;
+        engine->transport_playhead_sec += (double)measure_sec;
         seeked = true;
     }
     if (seeked) {
-        transport_reposition_lanes(knobs);
+        transport_reposition_lanes(streams, engine, knobs);
         // Resync the metronome's own schedule to the NEW playhead position -- without this, a
         // seek backward (e.g. "to beginning") left it pinned to wherever it was scheduled BEFORE
         // the jump, now far ahead of the playhead, so it would stay silent until the playhead
@@ -6509,8 +6525,8 @@ static void poll_transport_triggers(const SynthSharedControls *knobs, float curr
         // of missed clicks at once on the very next block. Same "pin to right where the playhead
         // currently is" fix poll_metronome already applies when disabled/not-PLAYING (see its own
         // comment) -- a seek is exactly the same kind of playhead discontinuity.
-        g_metronome_next_click_sec = g_transport_playhead_sec;
-        g_metronome_click_samples_left = 0;
+        engine->metronome_next_click_sec = engine->transport_playhead_sec;
+        engine->metronome_click_samples_left = 0;
     }
 }
 
@@ -6518,20 +6534,20 @@ static void poll_transport_triggers(const SynthSharedControls *knobs, float curr
 // resolved tempo/playhead). Schedules (but does not itself render) upcoming clicks: crossing one
 // or more beat boundaries this block arms/re-arms the click-sample countdown that
 // render_audio_block's per-sample loop actually renders from.
-static void poll_metronome(const SynthSharedControls *knobs, float current_tempo_bpm) {
-    if (knobs->metronome_enable == 0.0f || g_transport_state != TRANSPORT_PLAYING) {
+static void poll_metronome(HdsEngineState *engine, const SynthSharedControls *knobs, float current_tempo_bpm) {
+    if (knobs->metronome_enable == 0.0f || engine->transport_state != TRANSPORT_PLAYING) {
         // Not engaged, or transport isn't running -- keep the next-click schedule pinned to
         // "right after wherever the playhead currently is" so re-enabling or resuming Play
         // starts cleanly on the very next beat instead of firing a backlog of missed clicks.
-        g_metronome_next_click_sec = g_transport_playhead_sec;
-        g_metronome_click_samples_left = 0;
+        engine->metronome_next_click_sec = engine->transport_playhead_sec;
+        engine->metronome_click_samples_left = 0;
         return;
     }
     float beat_sec = 60.0f / fmaxf(1.0f, current_tempo_bpm);
-    while (g_transport_playhead_sec >= g_metronome_next_click_sec) {
-        g_metronome_next_click_sec += (double)beat_sec;
-        g_metronome_click_samples_left = (int)(METRONOME_CLICK_DURATION_SEC * (float)SAMPLE_RATE);
-        g_metronome_click_phase = 0;
+    while (engine->transport_playhead_sec >= engine->metronome_next_click_sec) {
+        engine->metronome_next_click_sec += (double)beat_sec;
+        engine->metronome_click_samples_left = (int)(METRONOME_CLICK_DURATION_SEC * (float)SAMPLE_RATE);
+        engine->metronome_click_phase = 0;
     }
 }
 
@@ -6541,21 +6557,21 @@ static void poll_metronome(const SynthSharedControls *knobs, float current_tempo
 // PLAYING when that happens. A cheap, unconditional scan -- armed_for_transport is false for
 // every lane in the overwhelmingly common case (load already finished before Play was pressed),
 // so this is a no-op most of the time.
-static void poll_seq_audio_transport_catchup(const SynthSharedControls *knobs) {
-    if (g_transport_state != TRANSPORT_PLAYING) return;
+static void poll_seq_audio_transport_catchup(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
+    if (engine->transport_state != TRANSPORT_PLAYING) return;
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
-        SeqAudioLane *al = &g_seq_audio[l];
+        SeqAudioLane *al = &streams->seq_audio[l];
         if (!al->armed_for_transport) continue;
         if (atomic_load_explicit(&al->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !al->pcm || al->frame_count <= 0) continue;
-        seq_audio_start_transport_playback(al, knobs->seq_lanes[l].audio_offset_sec);
+        seq_audio_start_transport_playback(engine, al, knobs->seq_lanes[l].audio_offset_sec);
     }
 }
 
 // Advances the real playhead by exactly one block's worth of time, only while PLAYING. Call once
 // per block from main()'s loop, after block_size is known for this iteration.
-static void advance_transport_playhead(int block_size) {
-    if (g_transport_state == TRANSPORT_PLAYING) {
-        g_transport_playhead_sec += (double)block_size / (double)SAMPLE_RATE;
+static void advance_transport_playhead(HdsEngineState *engine, int block_size) {
+    if (engine->transport_state == TRANSPORT_PLAYING) {
+        engine->transport_playhead_sec += (double)block_size / (double)SAMPLE_RATE;
     }
 }
 
@@ -6567,23 +6583,23 @@ static void advance_transport_playhead(int block_size) {
 // midi_channel_1_16 is the incoming event's own MIDI channel, already converted from ALSA's
 // 0-indexed data.note.channel to this file's 1-16 convention (matching SeqLaneState.midi_channel)
 // by the caller.
-static void seq_record_midi_event(const SynthSharedControls *knobs, unsigned char type, unsigned char note, unsigned char velocity, int midi_channel_1_16) {
-    if (g_transport_state != TRANSPORT_PLAYING) return;
+static void seq_record_midi_event(HdsEngineState *engine, const SynthSharedControls *knobs, unsigned char type, unsigned char note, unsigned char velocity, int midi_channel_1_16) {
+    if (engine->transport_state != TRANSPORT_PLAYING) return;
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         if (knobs->seq_lanes[l].lane_type != 0.0f) continue; // Audio lanes don't record MIDI
         if ((int)knobs->seq_lanes[l].seq_mode == 1) continue; // Off -- a real bypass, see SeqLaneState's own precedence comment
         if (knobs->seq_lanes[l].rec_armed == 0.0f) continue; // not armed to Rec
         float lane_channel = knobs->seq_lanes[l].midi_channel;
         if (lane_channel != 0.0f && (int)lane_channel != midi_channel_1_16) continue; // 0 = Omni, else must match exactly
-        SeqMidiLane *ml = &g_seq_midi[l];
+        SeqMidiLane *ml = &engine->seq_midi[l];
         if (ml->event_count >= SEQ_MIDI_EVENT_CAPACITY) continue; // full -- silently drop further events past this documented cap
         // Insert in time order rather than a blind append: Overdub mode deliberately leaves this
         // lane's previously-recorded events in place (see transport_start_fresh), so a new note's
         // own timestamp can land anywhere relative to them, not just at the end. (This also
         // quietly closes a latent Overwrite-mode edge case: seeking the transport backward
-        // mid-take already made g_transport_playhead_sec non-monotonic relative to a blind
+        // mid-take already made engine->transport_playhead_sec non-monotonic relative to a blind
         // append, which would have stored that event out of order.)
-        float t = (float)g_transport_playhead_sec;
+        float t = (float)engine->transport_playhead_sec;
         int idx = ml->event_count;
         while (idx > 0 && ml->events[idx - 1].time_sec > t) idx--;
         for (int j = ml->event_count; j > idx; j--) ml->events[j] = ml->events[j - 1];
@@ -6596,8 +6612,8 @@ static void seq_record_midi_event(const SynthSharedControls *knobs, unsigned cha
 // lane's recorded events and fires any whose timestamp has now been reached, via the exact same
 // handle_note_on/handle_note_off functions live MIDI already calls (see this section's own scope
 // comment for why that's a deliberate choice, not a shortcut).
-static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack *mono_stack, const MidiLiveState *midi_live) {
-    if (g_transport_state != TRANSPORT_PLAYING) return;
+static void seq_playback_midi_events(HdsEngineState *engine, HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack *mono_stack, const MidiLiveState *midi_live) {
+    if (engine->transport_state != TRANSPORT_PLAYING) return;
     // Sequencer's recorded MIDI always targets Single Program mode's own dedicated ProgramState
     // (SINGLE_PROGRAM_SLOT, not any Combi lane -- see this section's scope comment and
     // ProgramState's own comment on the mutual-exclusivity fix) -- so its own poly/mono mode is
@@ -6608,8 +6624,8 @@ static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *k
         if ((int)knobs->seq_lanes[l].seq_mode == 1) continue; // Off -- a real bypass, see SeqLaneState's own precedence comment
         if (knobs->seq_lanes[l].rec_armed != 0.0f) continue; // Rec-armed lanes don't play back at all
         bool muted = (knobs->seq_lanes[l].mute != 0.0f);
-        SeqMidiLane *ml = &g_seq_midi[l];
-        while (ml->playback_cursor < ml->event_count && ml->events[ml->playback_cursor].time_sec <= (float)g_transport_playhead_sec) {
+        SeqMidiLane *ml = &engine->seq_midi[l];
+        while (ml->playback_cursor < ml->event_count && ml->events[ml->playback_cursor].time_sec <= (float)engine->transport_playhead_sec) {
             SeqMidiEvent *e = &ml->events[ml->playback_cursor];
             // Mute still walks the cursor forward in step with the playhead -- just without ever
             // calling handle_note_on/off -- so un-muting resumes wherever the playhead currently
@@ -6620,8 +6636,8 @@ static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *k
                 // Sequencer's own recorded MIDI always targets SINGLE_PROGRAM_SLOT -- see this
                 // section's scope comment (a separate, parallel concern from Combi's own live
                 // dispatch) and ProgramState's own comment on why this is no longer Program 0.
-                if (e->type == 0) handle_note_on(voices, knobs, global_lfo_phases, SINGLE_PROGRAM_SLOT, e->note, e->velocity, poly_mode_active, mono_stack);
-                else handle_note_off(voices, knobs, midi_live, SINGLE_PROGRAM_SLOT, e->note, poly_mode_active, mono_stack);
+                if (e->type == 0) handle_note_on(se, voices, knobs, global_lfo_phases, SINGLE_PROGRAM_SLOT, e->note, e->velocity, poly_mode_active, mono_stack);
+                else handle_note_off(se, voices, knobs, midi_live, SINGLE_PROGRAM_SLOT, e->note, poly_mode_active, mono_stack);
             }
             ml->playback_cursor++;
         }
@@ -6644,7 +6660,7 @@ static void seq_playback_midi_events(SynthVoice voices[], SynthSharedControls *k
 // (data1 unused); CHANNEL_PRESSURE -> raw pressure (0-127, data1 unused).
 typedef enum { HDS_MIDI_NOTE_ON, HDS_MIDI_NOTE_OFF, HDS_MIDI_CC, HDS_MIDI_PITCH_BEND, HDS_MIDI_CHANNEL_PRESSURE } HdsMidiEventType;
 
-static void dispatch_midi_event(HdsMidiEventType type, int midi_channel_1_16, int data1, int value,
+static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, HdsMidiEventType type, int midi_channel_1_16, int data1, int value,
                                  SynthVoice voices[], SynthSharedControls *knobs,
                                  float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT],
                                  MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], MidiLiveState *midi_live) {
@@ -6661,8 +6677,8 @@ static void dispatch_midi_event(HdsMidiEventType type, int midi_channel_1_16, in
                 float lane_channel = knobs->combi_lane_midi_channel[p];
                 if (lane_channel != 0.0f && (int)lane_channel != midi_channel_1_16) continue;
                 bool prog_poly_active = (knobs->programs[p].is_polyphonic != 0.0f);
-                if (is_note_on) handle_note_on(voices, knobs, global_lfo_phases, p, note, value, prog_poly_active, &mono_stacks[p]);
-                else handle_note_off(voices, knobs, midi_live, p, note, prog_poly_active, &mono_stacks[p]);
+                if (is_note_on) handle_note_on(se, voices, knobs, global_lfo_phases, p, note, value, prog_poly_active, &mono_stacks[p]);
+                else handle_note_off(se, voices, knobs, midi_live, p, note, prog_poly_active, &mono_stacks[p]);
             }
         } else {
             // Single Program / Sequencer modes: always SINGLE_PROGRAM_SLOT (Single Program
@@ -6670,11 +6686,11 @@ static void dispatch_midi_event(HdsMidiEventType type, int midi_channel_1_16, in
             // own comment on the mutual-exclusivity fix), fully channel-agnostic, exactly as
             // today.
             bool prog_poly_active = (knobs->programs[SINGLE_PROGRAM_SLOT].is_polyphonic != 0.0f);
-            if (is_note_on) handle_note_on(voices, knobs, global_lfo_phases, SINGLE_PROGRAM_SLOT, note, value, prog_poly_active, &mono_stacks[SINGLE_PROGRAM_SLOT]);
-            else handle_note_off(voices, knobs, midi_live, SINGLE_PROGRAM_SLOT, note, prog_poly_active, &mono_stacks[SINGLE_PROGRAM_SLOT]);
+            if (is_note_on) handle_note_on(se, voices, knobs, global_lfo_phases, SINGLE_PROGRAM_SLOT, note, value, prog_poly_active, &mono_stacks[SINGLE_PROGRAM_SLOT]);
+            else handle_note_off(se, voices, knobs, midi_live, SINGLE_PROGRAM_SLOT, note, prog_poly_active, &mono_stacks[SINGLE_PROGRAM_SLOT]);
         }
-        if (is_note_on) seq_record_midi_event(knobs, 0, (unsigned char)note, (unsigned char)value, midi_channel_1_16);
-        else seq_record_midi_event(knobs, 1, (unsigned char)note, 0, midi_channel_1_16);
+        if (is_note_on) seq_record_midi_event(engine, knobs, 0, (unsigned char)note, (unsigned char)value, midi_channel_1_16);
+        else seq_record_midi_event(engine, knobs, 1, (unsigned char)note, 0, midi_channel_1_16);
     } else if (type == HDS_MIDI_CC) {
         int cc_num = data1;
         if (cc_num >= 0 && cc_num < 128) midi_live->cc[cc_num] = fmaxf(0.0f, fminf(1.0f, value / 127.0f));
@@ -6687,7 +6703,7 @@ static void dispatch_midi_event(HdsMidiEventType type, int midi_channel_1_16, in
             // oversight.
             bool raw_held = value >= 64;
             bool now_held = (knobs->programs[SINGLE_PROGRAM_SLOT].sustain_pedal_polarity != 0.0f) ? !raw_held : raw_held;
-            if (midi_live->sustain_held && !now_held) handle_sustain_release(voices, knobs); // pedal just lifted
+            if (midi_live->sustain_held && !now_held) handle_sustain_release(se, voices, knobs); // pedal just lifted
             midi_live->sustain_held = now_held;
         }
     } else if (type == HDS_MIDI_PITCH_BEND) {
@@ -6810,7 +6826,7 @@ static void midi_autoconnect_scan(snd_seq_t *seq, int our_port, const char *midi
 // our port to the ALSA announce port at startup (see main()'s comment on that subscription). The
 // actual musical response to each decoded event is dispatch_midi_event() above, shared with
 // Windows -- this function's own job is purely "decode an ALSA sequencer event."
-static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live) {
+static void process_midi_input(HdsEngineState *engine, HdsSampleEngine *se, snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live) {
     snd_seq_event_t *ev = NULL;
     while (snd_seq_event_input_pending(seq_handle, 1) > 0) {
         snd_seq_event_input(seq_handle, &ev); if (ev == NULL) continue;
@@ -6820,14 +6836,14 @@ static void process_midi_input(snd_seq_t *seq_handle, SynthVoice voices[], Synth
             // for every call site inside dispatch_midi_event.
             int midi_channel_1_16 = (int)ev->data.note.channel + 1;
             bool is_note_on = (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0);
-            dispatch_midi_event(is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, ev->data.note.note, ev->data.note.velocity, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, ev->data.note.note, ev->data.note.velocity, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
         } else if (ev->type == SND_SEQ_EVENT_CONTROLLER) {
-            dispatch_midi_event(HDS_MIDI_CC, (int)ev->data.control.channel + 1, ev->data.control.param, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, HDS_MIDI_CC, (int)ev->data.control.channel + 1, ev->data.control.param, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
         } else if (ev->type == SND_SEQ_EVENT_PITCHBEND) {
             // ALSA's own sequencer convention: value is already signed, -8192..8191, 0 = centered.
-            dispatch_midi_event(HDS_MIDI_PITCH_BEND, (int)ev->data.control.channel + 1, 0, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, HDS_MIDI_PITCH_BEND, (int)ev->data.control.channel + 1, 0, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
         } else if (ev->type == SND_SEQ_EVENT_CHANPRESS) {
-            dispatch_midi_event(HDS_MIDI_CHANNEL_PRESSURE, (int)ev->data.control.channel + 1, 0, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, HDS_MIDI_CHANNEL_PRESSURE, (int)ev->data.control.channel + 1, 0, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
         } else if (ev->type == SND_SEQ_EVENT_PORT_START) {
             // A new ALSA sequencer client/port just appeared -- e.g. a USB MIDI keyboard was
             // just plugged in. Auto-connect immediately if it matches the current selection
@@ -6917,21 +6933,21 @@ static void win32_midi_rescan_if_needed(const char *device_name) {
     if (!g_win32_midi_in && midiInGetNumDevs() > 0) win32_midi_open_matching(device_name); // nothing was open (no match at startup, or the device was unplugged) -- try again
 }
 
-static void process_midi_input(SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], MidiLiveState *midi_live) {
+static void process_midi_input(HdsEngineState *engine, HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], MidiLiveState *midi_live) {
     HdsRawMidiMsg m;
     while (win32_midi_ring_pop(&m)) {
         unsigned char status = m.status & 0xF0;
         int midi_channel_1_16 = (m.status & 0x0F) + 1;
         if (status == 0x90 || status == 0x80) { // Note On / Note Off (a Note On with velocity 0 counts as Note Off, standard MIDI convention, same as the ALSA side already applied)
             bool is_note_on = (status == 0x90 && m.data2 > 0);
-            dispatch_midi_event(is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, m.data1, m.data2, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, m.data1, m.data2, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
         } else if (status == 0xB0) { // Control Change
-            dispatch_midi_event(HDS_MIDI_CC, midi_channel_1_16, m.data1, m.data2, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, HDS_MIDI_CC, midi_channel_1_16, m.data1, m.data2, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
         } else if (status == 0xE0) { // Pitch Bend -- 14-bit wire format (LSB, MSB), 0..16383, 8192=center
             int bend14 = (int)m.data1 | ((int)m.data2 << 7);
-            dispatch_midi_event(HDS_MIDI_PITCH_BEND, midi_channel_1_16, 0, bend14 - 8192, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, HDS_MIDI_PITCH_BEND, midi_channel_1_16, 0, bend14 - 8192, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
         } else if (status == 0xD0) { // Channel Pressure (Aftertouch)
-            dispatch_midi_event(HDS_MIDI_CHANNEL_PRESSURE, midi_channel_1_16, 0, m.data1, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, HDS_MIDI_CHANNEL_PRESSURE, midi_channel_1_16, 0, m.data1, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
         }
     }
 }
@@ -9257,8 +9273,8 @@ int main(int argc, char **argv) {
         // zone_remove_handler write directly into active_knobs/g_sample_slots as each message is
         // dispatched, so nothing further is needed here once this returns 0 (no more pending).
         while (lo_server_recv_noblock(osc_server, 0) > 0) {}
-        poll_seq_audio_load_requests(&active_knobs); // spawns a loader thread if a lane's audio_path changed
-        poll_seq_audio_preview_triggers(&active_knobs); // starts one-shot playback if a lane's Preview button was clicked
+        poll_seq_audio_load_requests(&g_streams_state, &active_knobs); // spawns a loader thread if a lane's audio_path changed
+        poll_seq_audio_preview_triggers(&g_streams_state, &active_knobs); // starts one-shot playback if a lane's Preview button was clicked
 
         // Programmable tempo: resolved once per block from the Tempo knob/tempo-map (see
         // compute_current_tempo_bpm()) against this engine's own running uptime. Computed here,
@@ -9271,9 +9287,9 @@ int main(int argc, char **argv) {
         double engine_elapsed_seconds = (double)total_frames_rendered / (double)SAMPLE_RATE;
         float current_tempo_bpm = compute_current_tempo_bpm(&active_knobs, engine_elapsed_seconds);
 
-        poll_transport_triggers(&active_knobs, current_tempo_bpm); // Play/Pause/Stop/Seek -- starts/freezes/resets/repositions the real Sequencer playhead
-        poll_metronome(&active_knobs, current_tempo_bpm); // schedules the next click, if engaged and PLAYING
-        poll_seq_audio_transport_catchup(&active_knobs); // starts any lane whose load finished after Play was already pressed
+        poll_transport_triggers(&g_streams_state, &g_engine, &active_knobs, current_tempo_bpm); // Play/Pause/Stop/Seek -- starts/freezes/resets/repositions the real Sequencer playhead
+        poll_metronome(&g_engine, &active_knobs, current_tempo_bpm); // schedules the next click, if engaged and PLAYING
+        poll_seq_audio_transport_catchup(&g_streams_state, &g_engine, &active_knobs); // starts any lane whose load finished after Play was already pressed
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
         // packet as every other knob. Only reopen the stream whose name actually changed.
@@ -9342,11 +9358,11 @@ int main(int argc, char **argv) {
         drain_pending_sample_loads(&g_sample_engine);
 
 #ifndef _WIN32
-        process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live);
+        process_midi_input(&g_engine, &g_sample_engine, seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live);
 #else
-        process_midi_input(voices, &active_knobs, global_lfo_phases, mono_stacks, &midi_live);
+        process_midi_input(&g_engine, &g_sample_engine, voices, &active_knobs, global_lfo_phases, mono_stacks, &midi_live);
 #endif
-        seq_playback_midi_events(voices, &active_knobs, global_lfo_phases, &mono_stacks[SINGLE_PROGRAM_SLOT], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets SINGLE_PROGRAM_SLOT)
+        seq_playback_midi_events(&g_engine, &g_sample_engine, voices, &active_knobs, global_lfo_phases, &mono_stacks[SINGLE_PROGRAM_SLOT], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets SINGLE_PROGRAM_SLOT)
 
         // block_size/voice_limit are computed fresh every iteration since both are live,
         // user-adjustable controls (Audio tab: Block Size, Polyphony) -- see
@@ -9354,7 +9370,7 @@ int main(int argc, char **argv) {
         // at the hard BUFFER_SIZE ceiling; only the first block_size frames of each are
         // actually read/written/rendered this iteration.
         int block_size = effective_block_size(&active_knobs);
-        advance_transport_playhead(block_size); // advances the real Sequencer playhead by exactly this block's worth of time, only while PLAYING
+        advance_transport_playhead(&g_engine, block_size); // advances the real Sequencer playhead by exactly this block's worth of time, only while PLAYING
 
         // Read one block of external input, ALL detected_input_channels of it -- interleaved,
         // stride detected_input_channels per frame (not always 2 anymore; see
