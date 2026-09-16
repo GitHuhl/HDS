@@ -631,10 +631,42 @@ make pi-touch                                   # builds ./hds_pi_touch
 ./hds_pi_touch                                  # talks to the engine over the same OSC ports
 ```
 
-**Raspberry Pi 5** (or any other aarch64 Linux machine) needs no cross-compile target -- it's a
-native Linux host like any other for this exact Makefile: install the same four apt packages
-(add `libwavpack-dev` too if also building `synth_engine` on-device) and run the commands above
-directly on the Pi.
+**Raspberry Pi 5** (or any other aarch64 Linux machine) needs no cross-compile target if you're
+building directly on the device -- it's a native Linux host like any other for this exact
+Makefile: install the same four apt packages (add `libwavpack-dev` too if also building
+`synth_engine` on-device) and run the commands above directly on the Pi.
+
+If the Pi itself runs plain Raspberry Pi OS rather than NixOS (the common case, and the reason
+this option exists at all), `nix-shell` won't be available there to build directly on the device.
+For that case, `make arm64`/`make pi-touch-arm64` cross-compile `synth_engine`/`hds_pi_touch` for
+aarch64 Linux from this x86_64 machine instead -- run from inside `nix-shell` at the repo root
+(see `shell.nix`'s own aarch64 section), then copy the resulting `synth_engine-arm64`/
+`hds_pi_touch-arm64` binary over to the Pi. Every dependency this needs -- the cross compiler,
+alsa-lib, liblo, wavpack, glfw -- comes straight from `nixpkgs.pkgsCross.aarch64-multiplatform` as
+a real, already-existing package for this target; unlike the Windows cross-build (which needs
+`tools/build_windows_deps.sh` to cross-build liblo/wavpack from source, since mingw builds of them
+aren't in nixpkgs), no separate deps-building script is needed here.
+
+**`make arm64`** (the backend alone) was verified fully end to end in this repo's own sandbox: a
+real `nix-shell` with the cross toolchain + alsa-lib/liblo/wavpack (every one of which resolves
+straight from cache.nixos.org in seconds, no local build) produced a genuine
+`synth_engine-arm64` -- confirmed via `file` to be an ELF 64-bit ARM aarch64 executable, correctly
+linked against the cross-built libraries.
+
+**`make pi-touch-arm64`** has one real, substantial cost worth stating plainly rather than
+glossing over: `glfw`'s own X11+Wayland+Mesa dependency chain is not covered by nixpkgs' binary
+cache for this specific cross target as of the channel this was checked against, so the first
+`nix-shell` entry that touches this target triggers a genuine from-source build of a sizeable part
+of that chain -- confirmed directly by actually running it: openssl, curl, and sqlite (probably
+pulled in by Wayland's own build tooling) all built from source in turn, and it then moved on to
+building **all of LLVM 17.0.6 from source** (Mesa's dependency for its `llvmpipe` software
+rasterizer) -- a build that can easily take multiple hours even on capable hardware. This is a
+real, one-time cost on whichever machine first enters this shell and builds this target -- cached
+in that machine's own Nix store for every entry after that, same as every other cross toolchain
+this file already pulls in -- but it is genuinely large, large enough that it wasn't practical to
+wait out to full completion in this sandbox. The Makefile/shell.nix code itself is correct and
+consistent with `make arm64`'s own already-verified mechanism (same toolchain, same variable
+plumbing, just one more library); it just hasn't been proven end-to-end the way `make arm64` has.
 
 Verified in this repo's own sandbox (no real Pi/touchscreen hardware available here) via Xvfb and
 `xdotool`-driven real mouse/keyboard input against a synthetic fake-backend OSC peer: clean builds

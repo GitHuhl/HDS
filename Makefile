@@ -77,10 +77,28 @@ PI_TOUCH_SRC := src/pi_touch_frontend.cpp \
 PI_TOUCH_CFLAGS := $(shell pkg-config --cflags glfw3) -I$(PI_TOUCH_INC) -I$(PI_TOUCH_INC)/backends
 PI_TOUCH_LDLIBS := $(shell pkg-config --libs glfw3) -llo -lGL -ldl
 
+# --- Raspberry Pi 5 / aarch64 Linux cross-build (make arm64 / make pi-touch-arm64) ---
+# Cross-compiles synth_engine and hds_pi_touch for aarch64 Linux (a Raspberry Pi 5, or any other
+# aarch64 Linux host) from this x86_64 machine -- for the common case where the Pi itself runs
+# plain Raspberry Pi OS rather than NixOS, so `nix-shell` isn't available to build directly on the
+# device: build here instead, then copy the resulting binary over. Must be run from inside
+# `nix-shell` at the repo root (see shell.nix's own aarch64 section) -- ARM64_CC/ARM64_CXX default
+# to the prefixed cross-compiler names nix-shell puts on PATH (mirrors WIN_CC's exact convention
+# above), and ARM64_CFLAGS/ARM64_LDFLAGS come from environment variables shell.nix's shellHook
+# exports (cross-built libraries live under content-addressed Nix store paths, unlike $(WIN_DEPS)'s
+# fixed relative directory, so they can't be hardcoded here). Unlike the Windows cross-build (which
+# needs tools/build_windows_deps.sh to cross-build liblo/wavpack from source, since mingw builds of
+# them aren't in nixpkgs), every dependency here -- alsa-lib, liblo, wavpack, glfw -- is already a
+# real nixpkgs package for this exact target, so no separate deps-building script is needed.
+ARM64_CC ?= aarch64-unknown-linux-gnu-gcc
+ARM64_CXX ?= aarch64-unknown-linux-gnu-g++
+ARM64_BIN := synth_engine-arm64
+ARM64_PI_TOUCH_BIN := hds_pi_touch-arm64
+
 # NOTE: `all` (immediately below) must stay the FIRST rule in this file -- Make's default goal
 # (what runs when you type plain `make` with no target) is whichever rule appears first, and
 # pi-touch is an opt-in target, never the default.
-.PHONY: all run-backend run-frontend clean windows clean-windows clap clap-windows pi-touch
+.PHONY: all run-backend run-frontend clean windows clean-windows clap clap-windows pi-touch arm64 pi-touch-arm64
 
 all: $(BIN)
 
@@ -103,6 +121,14 @@ $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a:
 	@echo "Windows dependencies not found -- run tools/build_windows_deps.sh first" >&2
 	@exit 1
 
+arm64: $(SRC)
+	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
+	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -o $(ARM64_BIN) $(SRC) $(ARM64_LDFLAGS) -lasound -lm -lpthread -lwavpack -llo
+
+pi-touch-arm64: $(PI_TOUCH_SRC)
+	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
+	$(ARM64_CXX) -O2 -Wall -Wextra -std=gnu++17 -I$(PI_TOUCH_INC) -I$(PI_TOUCH_INC)/backends $(ARM64_CFLAGS) -o $(ARM64_PI_TOUCH_BIN) $(PI_TOUCH_SRC) $(ARM64_LDFLAGS) -lglfw -llo -lGL -ldl
+
 run-backend: $(BIN)
 	./$(BIN)
 
@@ -110,7 +136,7 @@ run-frontend:
 	python3 src/frontend.py
 
 clean:
-	rm -f $(BIN) $(CLAP_BIN) $(PI_TOUCH_BIN)
+	rm -f $(BIN) $(CLAP_BIN) $(PI_TOUCH_BIN) $(ARM64_BIN) $(ARM64_PI_TOUCH_BIN)
 
 clean-windows:
 	rm -f $(WIN_BIN) $(WIN_CLAP_BIN)

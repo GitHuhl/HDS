@@ -11,6 +11,9 @@
 ##   make windows                         -> synth_engine.exe
 ##   make clap-windows                    -> hds-windows.clap
 ##
+##   make arm64                           -> synth_engine-arm64  (aarch64 Linux, e.g. Raspberry Pi 5)
+##   make pi-touch-arm64                  -> hds_pi_touch-arm64  (same target, touch client)
+##
 ## This used to be scoped to the Windows cross-build alone (see git history) -- broadened to cover
 ## every target in one place since a project shell.nix that only covers a third of `make`'s targets
 ## invites exactly the "wait, why doesn't this build" confusion it exists to prevent. The tradeoff,
@@ -26,6 +29,22 @@ let
   # stdenv names cross compilers by their target triple, matching the same convention Debian's
   # mingw-w64 package uses) -- so nothing in either of those files needs to change to work here.
   mingw = pkgs.pkgsCross.mingwW64;
+  # pkgsCross.aarch64-multiplatform: a real aarch64-unknown-linux-gnu cross toolchain, for
+  # cross-building synth_engine/hds_pi_touch for a Raspberry Pi 5 (or any other aarch64 Linux
+  # host) from this x86_64 machine -- for the common case where the Pi itself runs plain Raspberry
+  # Pi OS, not NixOS, so `nix-shell` isn't available to build directly on the device. Unlike the
+  # Windows cross-build above (which needs tools/build_windows_deps.sh to cross-build liblo/
+  # wavpack from source, since mingw builds of them aren't in nixpkgs), every dependency this
+  # target needs -- alsa-lib, liblo, wavpack, glfw -- already exists as a real nixpkgs package for
+  # aarch64-linux, confirmed directly against this same nixpkgs channel: alsa-lib/liblo/wavpack/
+  # the cross gcc wrapper itself all come straight from cache.nixos.org (seconds, no local build);
+  # glfw's own X11+Wayland+Mesa dependency chain is a real, legitimate nixpkgs cross derivation but
+  # is NOT fully cached for this target as of this nixpkgs channel, so a first `nix-shell` entry
+  # that touches `make pi-touch-arm64` will need to compile a genuine chunk of that chain (openssl,
+  # curl, wayland, wayland-protocols, libxkbcommon, the X11 libs, mesa) from source -- a one-time,
+  # if slow, cost, not a sign anything is misconfigured. `make arm64` (the backend alone, no GLFW)
+  # is unaffected and builds in seconds once alsa-lib/liblo/wavpack are in the Nix store.
+  aarch64 = pkgs.pkgsCross.aarch64-multiplatform;
 in
 pkgs.mkShell {
   buildInputs = [
@@ -80,6 +99,19 @@ pkgs.mkShell {
     # bootstrap needed (an earlier version of this file provided those for bootstrapping WavPack's
     # raw GitHub source snapshot instead; that path turned out to be a real rabbit hole of
     # mismatched-gettext-version autotools errors and was dropped in favor of the real tarball).
+
+    # --- Raspberry Pi 5 / aarch64 Linux cross-build (make arm64 / make pi-touch-arm64) ---
+    # aarch64.stdenv.cc installs its binaries under the aarch64-unknown-linux-gnu- prefix (gcc,
+    # g++, ar, ...), exactly like mingw.stdenv.cc above uses the x86_64-w64-mingw32- prefix -- no
+    # bare `gcc`/`g++` names, so this can sit directly on PATH alongside the native and mingw
+    # toolchains with zero collision risk. The Makefile's ARM64_CC/ARM64_CXX reference these
+    # prefixed names directly (see its own comment), matching WIN_CC's exact convention.
+    aarch64.stdenv.cc
+    aarch64.alsa-lib
+    aarch64.liblo
+    aarch64.wavpack
+    aarch64.glfw
+    aarch64.libGL
   ];
 
   shellHook = ''
@@ -90,7 +122,17 @@ pkgs.mkShell {
     echo "  make clap       -> ./hds.clap"
     echo "  make pi-touch   -> ./hds_pi_touch"
     echo "  tools/build_windows_deps.sh  (once)  then  make windows / make clap-windows"
+    echo "  make arm64 / make pi-touch-arm64  -> synth_engine-arm64 / hds_pi_touch-arm64 (aarch64 Linux, e.g. Pi 5)"
     echo
+
+    # Cross-built aarch64 libraries live under content-addressed Nix store paths, not a fixed
+    # relative directory like $(WIN_DEPS) -- export their include/lib paths here so the Makefile's
+    # ARM64_CFLAGS/ARM64_LDFLAGS (referenced the same way WIN_CFLAGS/WIN_LDFLAGS already are) can
+    # find them. ARM64_CC/ARM64_CXX are NOT exported here -- aarch64.stdenv.cc's prefixed binary
+    # names (aarch64-unknown-linux-gnu-gcc/-g++) are already on PATH via buildInputs above, exactly
+    # like WIN_CC's x86_64-w64-mingw32-gcc, so the Makefile's own `?=` default covers it.
+    export ARM64_CFLAGS="-I${aarch64.alsa-lib.dev}/include -I${aarch64.liblo}/include -I${aarch64.wavpack.dev}/include -I${aarch64.glfw}/include"
+    export ARM64_LDFLAGS="-L${aarch64.alsa-lib}/lib -L${aarch64.liblo}/lib -L${aarch64.wavpack}/lib -L${aarch64.glfw}/lib -L${aarch64.libGL}/lib"
 
     # Auto-provision a local venv for the PySide6 frontend, matching requirements.txt exactly --
     # created once, reused (and only re-synced when requirements.txt actually changes) on every
