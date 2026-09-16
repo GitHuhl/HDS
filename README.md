@@ -563,6 +563,11 @@ pip install -r requirements.txt
 python3 src/frontend.py # start the GUI -- talks to the engine over OSC (see below)
 ```
 
+On NixOS/Nix, `nix-shell` at the repo root provides every dependency above (plus GLFW/OpenGL for
+the Pi-touch client below and the Windows cross-toolchain) in one shell, and auto-provisions a
+`.venv/` for `requirements.txt` on entry -- see `shell.nix`'s own header comment for exactly what
+each target needs from it.
+
 ### Building for Windows
 
 Linux (with ALSA) is the primary, actively-developed platform. A Windows build of the backend
