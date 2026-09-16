@@ -7019,7 +7019,7 @@ static float compute_per_key_lfo_output(SynthVoice *voice, const PackLfoParams *
     return out;
 }
 
-static float render_audio_block(SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer) {
+static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer) {
     float peak = 0.0f;
     // Combi mode: how many of the 8 Program slots are actually "live" this block -- 1 (just
     // program 0) outside Combi mode, all 8 inside it. Every per-program precompute below loops
@@ -7085,38 +7085,38 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
     // one synth engine instance per process) -- now an alias bound to g_engine's own copy, part
     // of the multi-instance refactor (see HdsEngineState's own comment). Every read/write site
     // below keeps using the bare name unchanged; only where the storage lives changed.
-    float (*lfo_phase_mod_state)[LFO_COUNT] = g_engine.lfo_phase_mod_state;
+    float (*lfo_phase_mod_state)[LFO_COUNT] = engine->lfo_phase_mod_state;
     // Same one-sample-delayed pattern, for LFO Rate and Depth as mod destinations (targets
     // 14-21/48-71 -- see lfo_rate_target_index/lfo_depth_target_index). Applied to rate_hz/
     // mod_depth in the main per-sample LFO loop below.
-    float (*lfo_rate_mod_state)[LFO_COUNT] = g_engine.lfo_rate_mod_state;
-    float (*lfo_depth_mod_state)[LFO_COUNT] = g_engine.lfo_depth_mod_state;
+    float (*lfo_rate_mod_state)[LFO_COUNT] = engine->lfo_rate_mod_state;
+    float (*lfo_depth_mod_state)[LFO_COUNT] = engine->lfo_depth_mod_state;
 
     // Control-rate decimation state for LFOs 3-16 (index 2-15) -- see LFO_DECIMATION_FACTOR's
     // comment. counter cycles 0..LFO_DECIMATION_FACTOR-1; at 0, last_value/target_value/phase are
     // all advanced by one full decimated step, then every sample in between linearly interpolates
     // from last_value to target_value. Per-Program, same reason as lfo_phase_mod_state above.
-    int (*lfo_decim_counter)[LFO_COUNT] = g_engine.lfo_decim_counter;
-    float (*lfo_decim_last_value)[LFO_COUNT] = g_engine.lfo_decim_last_value;
-    float (*lfo_decim_target_value)[LFO_COUNT] = g_engine.lfo_decim_target_value;
+    int (*lfo_decim_counter)[LFO_COUNT] = engine->lfo_decim_counter;
+    float (*lfo_decim_last_value)[LFO_COUNT] = engine->lfo_decim_last_value;
+    float (*lfo_decim_target_value)[LFO_COUNT] = engine->lfo_decim_target_value;
 
     // Monophonic Noise tilt-filter state (see ProgramState.vco1_mono_noise's own comment) --
     // one shared generator per Program+oscillator, computed once per sample below (before the
     // voice loop) rather than once per voice.
-    float (*mono_noise_tilt_lp)[4] = g_engine.mono_noise_tilt_lp;
+    float (*mono_noise_tilt_lp)[4] = engine->mono_noise_tilt_lp;
 
     // FX bus engine state: persists across calls (and across FX_TYPE changes -- see
     // process_fx_chain) for the same "one synth engine instance" reason as above.
-    FXSlotEngine *fx_engine = g_engine.fx_engine;
-    if (!g_engine.fx_engine_initialized) { reset_fx_engine(fx_engine); g_engine.fx_engine_initialized = true; }
+    FXSlotEngine *fx_engine = engine->fx_engine;
+    if (!engine->fx_engine_initialized) { reset_fx_engine(fx_engine); engine->fx_engine_initialized = true; }
 
     // Always-on master safety limiter gain, one per output pair (evaluated after every source
     // routed to that pair has been summed in -- see its use below). Persists across calls for the
     // same reason as the state above.
-    float *limiter_gain = g_engine.limiter_gain;
-    if (!g_engine.limiter_gain_initialized) {
+    float *limiter_gain = engine->limiter_gain;
+    if (!engine->limiter_gain_initialized) {
         for (int p = 0; p < OUTPUT_PAIR_MAX; p++) limiter_gain[p] = 1.0f;
-        g_engine.limiter_gain_initialized = true;
+        engine->limiter_gain_initialized = true;
     }
 
     // FX slot type-change bookkeeping (free a slot's old effect state when its Type actually
@@ -7338,7 +7338,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 else if(e==3) tick_adsr(&voices[v].vco4_eg, &eg_rates[pidx][e], eg_sustain_chase_rate);
                 else tick_adsr(&voices[v].assign_eg[e-4], &eg_rates[pidx][e], eg_sustain_chase_rate);
             }
-            release_idle_sample_streams(&g_sample_engine, &voices[v]); // WAVE_SAMPLE: free any DFD stream this voice's oscillator(s) no longer need
+            release_idle_sample_streams(se, &voices[v]); // WAVE_SAMPLE: free any DFD stream this voice's oscillator(s) no longer need
 
             // Mono Legato glide randomization: each voice's own glide_time_multiplier (rerolled
             // per glide event in handle_note_on/off) scales the plain Glide Time knob, so
@@ -7561,10 +7561,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // which ADDS to the oscillator's own knob here rather than overriding it -- see
             // sample_osc_zone_pan_offset(). Off oscillators skip the trig calls entirely (left at
             // 0.0f -- unused, since their render/mix is skipped too).
-            float zone_pan1 = (vco1_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(&g_sample_engine, voices[v].vco1_sample_stream) : 0.0f;
-            float zone_pan2 = (vco2_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(&g_sample_engine, voices[v].vco2_sample_stream) : 0.0f;
-            float zone_pan3 = (vco3_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(&g_sample_engine, voices[v].vco3_sample_stream) : 0.0f;
-            float zone_pan4 = (vco4_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(&g_sample_engine, voices[v].vco4_sample_stream) : 0.0f;
+            float zone_pan1 = (vco1_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(se, voices[v].vco1_sample_stream) : 0.0f;
+            float zone_pan2 = (vco2_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(se, voices[v].vco2_sample_stream) : 0.0f;
+            float zone_pan3 = (vco3_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(se, voices[v].vco3_sample_stream) : 0.0f;
+            float zone_pan4 = (vco4_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(se, voices[v].vco4_sample_stream) : 0.0f;
             float pan1_l = 0.0f, pan1_r = 0.0f, pan2_l = 0.0f, pan2_r = 0.0f;
             float pan3_l = 0.0f, pan3_r = 0.0f, pan4_l = 0.0f, pan4_r = 0.0f;
             // Fall back to the once-per-block static angle (see its own comment above) whenever
@@ -7727,7 +7727,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                     modulator_sum += modulator_output[src] * depth;
                 }
                 osc_out[osc] = render_fm_oscillator(
-                    &g_sample_engine,
+                    se,
                     shape_arr[osc], own_phase_arr[osc], dt_arr[osc], phase_offset_arr[osc], modulator_sum,
                     prev_fm_phase_ptr[osc], pulse_or_tilt_arr[osc], tri_state_ptr[osc], tilt_lp_ptr[osc],
                     noise_tilt_coeff, unison_phases_ptr[osc], unison_detune_arr[osc],
@@ -9402,7 +9402,7 @@ int main(int argc, char **argv) {
         static float buffer[BUFFER_SIZE * OUTPUT_MAX_CHANNELS];
         struct timespec render_t0, render_t1;
         clock_gettime(CLOCK_MONOTONIC, &render_t0);
-        float block_peak = render_audio_block(voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer);
+        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer);
         clock_gettime(CLOCK_MONOTONIC, &render_t1);
         double render_ms = (render_t1.tv_sec - render_t0.tv_sec) * 1000.0 + (render_t1.tv_nsec - render_t0.tv_nsec) / 1e6;
         double budget_ms = (block_size / (double)SAMPLE_RATE) * 1000.0;

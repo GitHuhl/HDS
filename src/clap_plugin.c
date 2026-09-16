@@ -555,7 +555,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         advance_transport_playhead(&g_engine, block_size);
 
         static float chunk_buffer[BUFFER_SIZE * 2];
-        float peak = render_audio_block(p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer);
+        float peak = render_audio_block(&g_sample_engine, &g_engine, p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer);
         if (peak > block_peak) block_peak = peak;
 
         if (out) {
