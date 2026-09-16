@@ -423,10 +423,14 @@ static void draw_oscillator_row(int osc_num, float default_vol_pct, float fader_
     snprintf(label, sizeof(label), "Osc %d", osc_num);
     ImGui::TextUnformatted(label);
 
+    // Drag/display in real 0-100 UI units (matching the Pan knob's own convention), converting to
+    // the 0.0-1.0 wire scale only at read/send time -- VSliderFloat's format string renders `*v`
+    // directly, so driving it with the raw 0.0-1.0 wire fraction (the previous version of this
+    // code) meant "%.0f%%" could only ever print "0%" or "1%", never a real percentage.
     snprintf(addr, sizeof(addr), "/hds/vco%d/vol", osc_num);
-    float vol_frac = get_state(addr, default_vol_pct / 100.0f);
-    if (ImGui::VSliderFloat("##Vol", ImVec2(56, fader_height), &vol_frac, 0.0f, 1.0f, "%.0f%%")) {
-        send_osc_float(addr, vol_frac);
+    float vol_pct = get_state(addr, default_vol_pct / 100.0f) * 100.0f;
+    if (ImGui::VSliderFloat("##Vol", ImVec2(56, fader_height), &vol_pct, 0.0f, 100.0f, "%.0f%%")) {
+        send_osc_float(addr, vol_pct / 100.0f);
     }
 
     ImGui::EndGroup();
@@ -545,7 +549,19 @@ int main() {
                     ImGui::SameLine();
 
                     ImGui::BeginChild("OscillatorsSection", ImVec2(260, osc_panel_height), ImGuiChildFlags_Borders, kNoScrollChild);
-                    float fader_height = osc_panel_height - 60.0f;  // leave room for the label + child padding
+                    // Measure real remaining space INSIDE this child (not a guess back-derived from
+                    // the outer panel height) and subtract the label's own actual rendered height --
+                    // robust to font/DPI differences. Floored at a sane minimum so VSliderFloat can
+                    // never receive a near-zero or negative height: ImGui treats a NEGATIVE size as
+                    // "auto-stretch to remaining space", which is what caused the previous "-60.0f"
+                    // guess (wrong on a taller font/DPI setup) to make the fader's effective height
+                    // erratic and inconsistent across the 4 columns, and its clickable travel so thin
+                    // that any touch/drag snapped straight to 0% or 100% instead of a real in-between
+                    // value.
+                    float mix_avail_height = ImGui::GetContentRegionAvail().y;
+                    float label_row_height = ImGui::GetTextLineHeightWithSpacing();
+                    float fader_height = mix_avail_height - label_row_height - 4.0f;
+                    if (fader_height < 80.0f) fader_height = 80.0f;
                     draw_oscillator_row(1, 80.0f, fader_height);  // 80%   -- matches init_default_controls()
                     ImGui::SameLine();
                     draw_oscillator_row(2, 50.0f, fader_height);  // 50%
@@ -747,6 +763,26 @@ int main() {
                 break;
         }
 
+        // Live status readback -- real data from backend.c's own periodic /hds/status/* bundle,
+        // right-justified on the same top row as whatever title text this page just drew (every
+        // page's own title is the first item in the switch above, so it always starts at exactly
+        // this window's top-left content position) -- shown on every page, not tucked away in one
+        // alone, since "is the backend actually there and alive" is a global concern. Liveness
+        // mirrors frontend.py's own heuristic exactly: UDP has no connect-time signal, so infer it
+        // from whether a status message has arrived recently.
+        {
+            bool connected = (g_last_status_time != 0.0) && (glfwGetTime() - g_last_status_time < OSC_STATUS_TIMEOUT_S);
+            char status_buf[64];
+            snprintf(status_buf, sizeof(status_buf), "%s   Peak: %.2f   Tempo: %.1f BPM",
+                      connected ? "LIVE" : "NO SIGNAL", g_live_peak, g_live_tempo_bpm);
+            ImVec2 text_size = ImGui::CalcTextSize(status_buf);
+            ImGui::SetCursorPos(ImVec2(ImGui::GetStyle().WindowPadding.x, ImGui::GetStyle().WindowPadding.y));
+            float full_row_width = ImGui::GetContentRegionAvail().x;
+            float right_x = ImGui::GetStyle().WindowPadding.x + full_row_width - text_size.x;
+            ImGui::SetCursorPos(ImVec2(right_x, ImGui::GetStyle().WindowPadding.y));
+            ImGui::TextColored(connected ? ImVec4(0.3f, 0.9f, 0.4f, 1.0f) : ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "%s", status_buf);
+        }
+
         ImGui::End();
 
         // --------------------------------------------------------------------
@@ -757,15 +793,6 @@ int main() {
 
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
         ImGui::Begin("GlobalNavigationStrip", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
-
-        // Live status readback -- real data from backend.c's own periodic /hds/status/* bundle,
-        // shown on every page (not tucked away in ADSR alone) since "is the backend actually
-        // there and alive" is a global concern. Liveness mirrors frontend.py's own heuristic
-        // exactly: UDP has no connect-time signal, so infer it from whether a status message has
-        // arrived recently.
-        bool connected = (g_last_status_time != 0.0) && (glfwGetTime() - g_last_status_time < OSC_STATUS_TIMEOUT_S);
-        ImGui::TextColored(connected ? ImVec4(0.3f, 0.9f, 0.4f, 1.0f) : ImVec4(0.9f, 0.3f, 0.3f, 1.0f),
-                            "%s   Peak: %.2f   Tempo: %.1f BPM", connected ? "LIVE" : "NO SIGNAL", g_live_peak, g_live_tempo_bpm);
 
         float button_width = 101.0f;
         float button_height = 130.0f;
