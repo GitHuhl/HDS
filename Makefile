@@ -23,13 +23,24 @@ WIN_LDLIBS := -llo -lwavpack -lws2_32 -liphlpapi -lwinmm -lole32 -lm -lpthread
 # scan for it at ~/.clap/, /usr/lib/clap/, or $CLAP_PATH). #include's the whole of backend.c (see
 # src/clap_plugin.c's own header comment), so every ALSA-touching symbol still needs linking even
 # though the plugin's own vtable never calls open_pcm_stream/write_audio_block -- they're simply
-# unreferenced-but-compiled-in dead code sharing the translation unit. Linux-only for now; see the
-# plan doc's own stated Windows-out-of-scope boundary.
+# unreferenced-but-compiled-in dead code sharing the translation unit.
 CLAP_INC := third_party/clap/include
 CLAP_BIN := hds.clap
 CLAP_SRC := src/clap_plugin.c
 
-.PHONY: all run-backend run-frontend clean windows clean-windows clap
+# --- Windows CLAP plugin (cross-built from Linux) ---
+# Produces hds-windows.clap: a PE32+ DLL exporting clap_entry, built the same way synth_engine.exe
+# is (mingw-w64 + the same third_party/win64-deps/ liblo/wavpack static libs -- see `windows`
+# above; run tools/build_windows_deps.sh once first if that target hasn't been built yet). Needs
+# no platform code of its own: clap_plugin.c never touches the audio/MIDI-device paths backend.c
+# already abstracts per-OS (the host supplies buffers/note-events instead), so cross-compiling it
+# is the exact same recipe as `clap` above, just with $(WIN_CC)/$(WIN_LDLIBS) instead of
+# $(CC)/$(LDLIBS) and no -fPIC (meaningless for a Windows DLL). Distinct output name from
+# $(CLAP_BIN) so `make clap clap-windows` in one checkout never overwrites either. To install on
+# Windows: drop the .clap file into %COMMONPROGRAMFILES%\CLAP\ or %LOCALAPPDATA%\Programs\Common\CLAP\.
+WIN_CLAP_BIN := hds-windows.clap
+
+.PHONY: all run-backend run-frontend clean windows clean-windows clap clap-windows
 
 all: $(BIN)
 
@@ -41,6 +52,9 @@ clap: $(CLAP_SRC)
 
 windows: $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a
 	$(WIN_CC) $(WIN_CFLAGS) -o $(WIN_BIN) $(SRC) $(WIN_LDFLAGS) $(WIN_LDLIBS)
+
+clap-windows: $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a $(CLAP_SRC)
+	$(WIN_CC) $(WIN_CFLAGS) -shared -I$(CLAP_INC) -o $(WIN_CLAP_BIN) $(CLAP_SRC) $(WIN_LDFLAGS) $(WIN_LDLIBS)
 
 $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a:
 	@echo "Windows dependencies not found -- run tools/build_windows_deps.sh first" >&2
@@ -56,4 +70,4 @@ clean:
 	rm -f $(BIN) $(CLAP_BIN)
 
 clean-windows:
-	rm -f $(WIN_BIN)
+	rm -f $(WIN_BIN) $(WIN_CLAP_BIN)
