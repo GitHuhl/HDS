@@ -577,6 +577,12 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
     }
 
     seq_playback_midi_events(&p->engine, &p->sample_engine, p->voices, &p->knobs, p->global_lfo_phases, &p->mono_stacks[SINGLE_PROGRAM_SLOT], &p->midi_live);
+    // Coarser than the standalone app's own per-block call (main() polls once per its own,
+    // smaller render block; this fires once per this entire process() call, using the host's
+    // full frames_count as one lump elapsed-sample count) -- acceptable given a host's own
+    // process() call is typically already close to one audio-thread callback's worth of frames,
+    // same granularity this plugin already accepts elsewhere (see the chunking loop below).
+    poll_arpeggiator(&p->engine, &p->sample_engine, p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live, (int)process->frames_count);
 
     float **out = NULL;
     if (process->audio_outputs_count > 0 && process->audio_outputs[0].data32 &&

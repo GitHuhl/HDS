@@ -2519,6 +2519,19 @@ class SynthGui(QWidget):
         self.tempo_live_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.tempo_live_readout.setStyleSheet("color: #888; font-size: 9px;")
         global_layout.addWidget(self.tempo_live_readout)
+
+        # Arpeggiator on/off -- a patch property (like Hard Sync/Poly-Mono above), not a live
+        # performance override (unlike Transpose), so it's Program-scoped and saves/loads with
+        # the patch -- see ProgramState's own "Arpeggiator" comment in backend.c. This is
+        # deliberately the ONLY arp control exposed in the frontend this pass -- arp_style/
+        # arp_octave_range/arp_rate/arp_gate_pct/arp_hold are real, working, OSC-addressable
+        # backend fields already (see init_default_controls' own sensible defaults: Up, 1
+        # octave, 1/8, 70% gate, no Hold), just without dedicated knobs here yet.
+        self.arp_enabled_btn = QPushButton("ARP")
+        self.arp_enabled_btn.setCheckable(True)
+        self.arp_enabled_btn.setStyleSheet("QPushButton:checked { background-color: #2ecc71; color: black; font-weight: bold; }")
+        global_layout.addWidget(self.arp_enabled_btn)
+
         global_layout.addStretch()
 
         global_group.setLayout(global_layout)
@@ -5056,6 +5069,11 @@ class SynthGui(QWidget):
                 widgets_touched.extend([radio_if_true, radio_if_false])
 
         set_radio_from_bool("/hds/is_polyphonic", self.poly_radio, self.mono_radio)
+        if "/hds/arp/enabled" in fields:
+            self.arp_enabled_btn.blockSignals(True)
+            self.arp_enabled_btn.setChecked(fields["/hds/arp/enabled"] != 0.0)
+            self.arp_enabled_btn.blockSignals(False)
+            widgets_touched.append(self.arp_enabled_btn)
         # master_volume is deliberately never applied here -- excluded from Program scope (see
         # _is_program_scope_address), so even an older .hdsprog saved before this exclusion
         # existed won't have loading silently yank the current output level around.
@@ -6180,6 +6198,7 @@ class SynthGui(QWidget):
         # between (see compute_current_tempo_bpm() in backend.c). No marker editor UI exists yet,
         # so marker_count is always 0 and the arrays always zero -- reserved for a future editor.
         add_f("/hds/tempo/bpm", self.tempo_dial.value())
+        add_f("/hds/arp/enabled", 1.0 if self.arp_enabled_btn.isChecked() else 0.0)
         add_f("/hds/tempo/marker_count", 0.0)
         for idx in range(TEMPO_MARKER_MAX):
             add_f(f"/hds/tempo/marker/{idx}/time", 0.0)
@@ -6334,6 +6353,7 @@ def runtime_connect_and_bind(gui):
     gui.glide_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.glide_random_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.tempo_dial.valueChanged.connect(gui.transmit_knob_packet)
+    gui.arp_enabled_btn.toggled.connect(gui.transmit_knob_packet)
     gui.vco1_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco2_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco1_mono_noise.toggled.connect(gui.transmit_knob_packet)

@@ -605,6 +605,35 @@ typedef struct {
     // phase truncation). See render_audio_block's do_sync/t_wrap blocks.
     float hard_sync_mode;
 
+    // --- Arpeggiator: a minimal, from-scratch held-note arpeggiator, in the spirit of the
+    // classic "Arpeggino" hardware MIDI arpeggiator (MIT-licensed, github.com/rotenbergrr/
+    // Arpeggino / its Midier engine library) -- NOT a literal port, since Arpeggino's own actual
+    // engine plays scale-degree chords via a permutation generator, not held MIDI notes in the
+    // usual Up/Down synth-arpeggiator sense. See poll_arpeggiator()'s own header comment for the
+    // one concrete idea genuinely borrowed from it (the UpDown/DownUp ping-pong index fold). A
+    // patch property (like Hard Sync/Poly-Mono above), not a live performance override -- some
+    // patches naturally want Arp baked in, others never do. ---
+    float arp_enabled;      // 0=Off, 1=On -- while On, real note-on/off events feed the held-note
+                             // list (see arp_note_on/arp_note_off) instead of triggering voices
+                             // directly; poll_arpeggiator() triggers voices itself, on its own
+                             // musical clock.
+    float arp_style;        // 0=Up, 1=Down, 2=UpDown, 3=DownUp, 4=Random, 5=AsPlayed -- see
+                             // poll_arpeggiator()'s own per-style dispatch.
+    float arp_octave_range; // 1-4: how many octaves the held notes are spread across before the
+                             // pattern repeats (Up plays every held note in octave 0, then every
+                             // held note again in octave 1, etc.).
+    float arp_rate;         // 0=1/4, 1=1/8, 2=1/16, 3=1/8 Triplet, 4=1/16 Triplet, 5=1/32 -- note
+                             // division of the step clock, synced to this Program's own tempo_bpm
+                             // (see ARP_RATE_STEPS_PER_BEAT).
+    float arp_gate_pct;     // 1-100: how much of a step's own duration the triggered note stays
+                             // held before its own note-off fires (100 = fully legato/overlapping
+                             // with the next step's note-on for one sample; less = staccato).
+    float arp_hold;         // 0=Off, 1=On ("Latch") -- while On, releasing every physically-held
+                             // key does NOT stop the arpeggio; it keeps cycling through whatever
+                             // chord was last held. Pressing a fresh note after a fully-released
+                             // latch replaces the latched chord rather than adding to it -- see
+                             // dispatch_midi_event's own Hold-handling comment.
+
     // Phase pot per oscillator (degrees, 0-360). Modulatable by LFO/EG via the mod matrix
     // (targets 24/25); the modulated result shifts only the oscillator's read-phase, never its
     // actual running phase accumulator, so pitch/hard-sync/portamento are unaffected.
@@ -3147,6 +3176,64 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/5/hard_sync_mode", hard_sync_mode, 5),
     OSC_PSCALAR_AT("/hds/combi/6/hard_sync_mode", hard_sync_mode, 6),
     OSC_PSCALAR_AT("/hds/combi/7/hard_sync_mode", hard_sync_mode, 7),
+
+    // --- Arpeggiator (see the Arpeggiator section on ProgramState + poll_arpeggiator() for the
+    // full design) ---
+    OSC_PSCALAR("/hds/arp/enabled", arp_enabled),
+    OSC_PSCALAR_AT("/hds/combi/0/arp/enabled", arp_enabled, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/arp/enabled", arp_enabled, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/arp/enabled", arp_enabled, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/arp/enabled", arp_enabled, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/arp/enabled", arp_enabled, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/arp/enabled", arp_enabled, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/arp/enabled", arp_enabled, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/arp/enabled", arp_enabled, 7),
+    OSC_PSCALAR("/hds/arp/style", arp_style),
+    OSC_PSCALAR_AT("/hds/combi/0/arp/style", arp_style, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/arp/style", arp_style, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/arp/style", arp_style, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/arp/style", arp_style, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/arp/style", arp_style, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/arp/style", arp_style, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/arp/style", arp_style, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/arp/style", arp_style, 7),
+    OSC_PSCALAR("/hds/arp/octave_range", arp_octave_range),
+    OSC_PSCALAR_AT("/hds/combi/0/arp/octave_range", arp_octave_range, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/arp/octave_range", arp_octave_range, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/arp/octave_range", arp_octave_range, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/arp/octave_range", arp_octave_range, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/arp/octave_range", arp_octave_range, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/arp/octave_range", arp_octave_range, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/arp/octave_range", arp_octave_range, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/arp/octave_range", arp_octave_range, 7),
+    OSC_PSCALAR("/hds/arp/rate", arp_rate),
+    OSC_PSCALAR_AT("/hds/combi/0/arp/rate", arp_rate, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/arp/rate", arp_rate, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/arp/rate", arp_rate, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/arp/rate", arp_rate, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/arp/rate", arp_rate, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/arp/rate", arp_rate, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/arp/rate", arp_rate, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/arp/rate", arp_rate, 7),
+    OSC_PSCALAR("/hds/arp/gate_pct", arp_gate_pct),
+    OSC_PSCALAR_AT("/hds/combi/0/arp/gate_pct", arp_gate_pct, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/arp/gate_pct", arp_gate_pct, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/arp/gate_pct", arp_gate_pct, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/arp/gate_pct", arp_gate_pct, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/arp/gate_pct", arp_gate_pct, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/arp/gate_pct", arp_gate_pct, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/arp/gate_pct", arp_gate_pct, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/arp/gate_pct", arp_gate_pct, 7),
+    OSC_PSCALAR("/hds/arp/hold", arp_hold),
+    OSC_PSCALAR_AT("/hds/combi/0/arp/hold", arp_hold, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/arp/hold", arp_hold, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/arp/hold", arp_hold, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/arp/hold", arp_hold, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/arp/hold", arp_hold, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/arp/hold", arp_hold, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/arp/hold", arp_hold, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/arp/hold", arp_hold, 7),
+
     OSC_PSCALAR("/hds/vco1/phase_offset", vco1_phase_offset),
     OSC_PSCALAR_AT("/hds/combi/0/vco1/phase_offset", vco1_phase_offset, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/phase_offset", vco1_phase_offset, 1),
@@ -3849,6 +3936,14 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].mono_glide_random = 0.0f;
     knobs->programs[0].vco1_mute = 0.0f; knobs->programs[0].vco2_mute = 0.0f;
     knobs->programs[0].hard_sync_mode = 0.0f;
+    // Arpeggiator: off by default (byte-identical to today's behavior for every existing
+    // patch), Up/1 octave/1-8/70% gate/no Hold when a user does turn it on.
+    knobs->programs[0].arp_enabled = 0.0f;
+    knobs->programs[0].arp_style = 0.0f;       // Up
+    knobs->programs[0].arp_octave_range = 1.0f;
+    knobs->programs[0].arp_rate = 1.0f;        // 1/8
+    knobs->programs[0].arp_gate_pct = 70.0f;
+    knobs->programs[0].arp_hold = 0.0f;
     knobs->programs[0].vco1_phase_offset = 0.0f; knobs->programs[0].vco2_phase_offset = 0.0f;
 
     knobs->programs[0].vco1_pulse_width = 50.0f; knobs->programs[0].vco2_pulse_width = 50.0f;
@@ -5983,6 +6078,26 @@ typedef struct {
     bool          fx_engine_initialized;
     float         limiter_gain[OUTPUT_PAIR_MAX];
     bool          limiter_gain_initialized;
+
+    // Arpeggiator: one independent instance per Program slot (0-7 Combi lanes, 8 =
+    // SINGLE_PROGRAM_SLOT) -- see poll_arpeggiator()/arp_note_on()/arp_note_off(). Reuses
+    // MonoNoteStack (already a plain insertion-ordered, evict-oldest-when-full held-notes list --
+    // see mono_stack_push/mono_stack_remove) rather than inventing a near-identical struct.
+    MonoNoteStack arp_held_notes[COMBI_PROGRAM_COUNT + 1];
+    int           arp_keys_down[COMBI_PROGRAM_COUNT + 1];      // physically-held key count, kept
+                                                                 // even in Hold/Latch mode (where
+                                                                 // arp_held_notes itself stops
+                                                                 // tracking releases) so the NEXT
+                                                                 // fresh note-on after a full
+                                                                 // release knows to replace the
+                                                                 // latched chord instead of adding
+                                                                 // to it.
+    int           arp_step_samples_left[COMBI_PROGRAM_COUNT + 1]; // sample countdown to the next step
+    int           arp_gate_samples_left[COMBI_PROGRAM_COUNT + 1]; // sample countdown to the current step's own note-off
+    bool          arp_note_active[COMBI_PROGRAM_COUNT + 1];       // true while a synthesized arp note is currently sounding
+    int           arp_playing_note[COMBI_PROGRAM_COUNT + 1];      // only meaningful when arp_note_active is true
+    int           arp_step_cursor[COMBI_PROGRAM_COUNT + 1];       // 0..(held_count*octave_range - 1), advances every step
+    unsigned int  arp_rng_state[COMBI_PROGRAM_COUNT + 1];         // xorshift32 state for Style=Random; 0 is a degenerate seed, guarded at first use
 } HdsEngineState;
 
 // The standalone app's own single instance -- same storage duration (process lifetime) and
@@ -6287,6 +6402,187 @@ static void seq_playback_midi_events(HdsEngineState *engine, HdsSampleEngine *se
     }
 }
 
+// How many arp steps occur per quarter-note beat, indexed by ProgramState.arp_rate. Deliberately
+// a plain, even note-division rate table rather than a full swing/groove pattern system (unlike
+// Arpeggino/Midier's own 12-entry Rhythm module) -- a plain Rate is what "Rate" means on the vast
+// majority of hardware/software arpeggiators, and is the design this pass's own from-scratch
+// engine targets (see the Arpeggiator section on ProgramState for the full scope explanation).
+static const float ARP_RATE_STEPS_PER_BEAT[6] = {
+    1.0f, // 0 = 1/4
+    2.0f, // 1 = 1/8
+    4.0f, // 2 = 1/16
+    3.0f, // 3 = 1/8 Triplet
+    6.0f, // 4 = 1/16 Triplet
+    8.0f, // 5 = 1/32
+};
+
+// Simple xorshift32 PRNG -- deterministic, no external entropy needed (a musical pattern
+// generator, not cryptography) -- used only by Style=Random below.
+static unsigned int arp_xorshift32(unsigned int *state) {
+    unsigned int x = *state;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+// Arpeggiator engine: one independent musical clock per Program, called once per block (same
+// placement/shape as seq_playback_midi_events just above, not from inside render_audio_block's
+// own per-sample loop -- render_audio_block has no access to mono_stacks[], which
+// handle_note_on/handle_note_off both require, so this stays a main()-loop-level poll like
+// poll_metronome/poll_transport_triggers/seq_playback_midi_events already are).
+//
+// While a Program's arp_enabled is set, its real note-on/off events never reach
+// handle_note_on/handle_note_off directly (see dispatch_midi_event's own arp_enabled branch) --
+// they only update engine->arp_held_notes[p] via arp_note_on/arp_note_off. This function is the
+// only place that actually triggers voices for such a Program, synthesizing its own note-on/off
+// calls exactly like seq_playback_midi_events already does for recorded Sequencer events.
+static void poll_arpeggiator(HdsEngineState *engine, HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], const MidiLiveState *midi_live, int block_size) {
+    bool combi_mode_active = ((int)knobs->performance_mode == 1);
+    int active_program_count = combi_mode_active ? COMBI_PROGRAM_COUNT : 1;
+
+    for (int p_loop = 0; p_loop < active_program_count; p_loop++) {
+        int p = combi_mode_active ? p_loop : SINGLE_PROGRAM_SLOT;
+        const ProgramState *prog = &knobs->programs[p];
+        MonoNoteStack *held = &engine->arp_held_notes[p];
+        bool poly_mode_active = (prog->is_polyphonic != 0.0f);
+
+        if (prog->arp_enabled == 0.0f) {
+            // Off: release anything still sounding and reset transient state, so re-enabling
+            // later always starts a fresh phrase rather than resuming mid-pattern.
+            if (engine->arp_note_active[p]) {
+                handle_note_off(se, voices, knobs, midi_live, p, engine->arp_playing_note[p], poly_mode_active, &mono_stacks[p]);
+                engine->arp_note_active[p] = false;
+            }
+            held->count = 0;
+            engine->arp_keys_down[p] = 0;
+            engine->arp_step_samples_left[p] = 0;
+            engine->arp_step_cursor[p] = 0;
+            continue;
+        }
+
+        if (held->count == 0) {
+            // Nothing held (and nothing latched) -- idle. Re-arming the step clock to 0 means the
+            // next held note starts its own first step immediately, not partway through whatever
+            // countdown happened to be left over from the previous phrase.
+            if (engine->arp_note_active[p]) {
+                handle_note_off(se, voices, knobs, midi_live, p, engine->arp_playing_note[p], poly_mode_active, &mono_stacks[p]);
+                engine->arp_note_active[p] = false;
+            }
+            engine->arp_step_samples_left[p] = 0;
+            engine->arp_step_cursor[p] = 0;
+            continue;
+        }
+
+        // Gate: release the currently-sounding arp note once its own gate length elapses.
+        if (engine->arp_note_active[p]) {
+            engine->arp_gate_samples_left[p] -= block_size;
+            if (engine->arp_gate_samples_left[p] <= 0) {
+                handle_note_off(se, voices, knobs, midi_live, p, engine->arp_playing_note[p], poly_mode_active, &mono_stacks[p]);
+                engine->arp_note_active[p] = false;
+            }
+        }
+
+        // Step clock -- a `while`, not `if` (mirrors poll_metronome's own idiom), so an unusually
+        // fast Rate relative to this block's own sample count still fires every step it owes
+        // rather than falling behind; capped defensively so a near-zero step length can never
+        // spin this loop indefinitely.
+        engine->arp_step_samples_left[p] -= block_size;
+        int guard = 0;
+        // Strictly `< 0`, not `<= 0`: after firing, `+= samples_per_step` can land the
+        // remainder on EXACTLY 0 whenever block_size happens to divide evenly into
+        // samples_per_step (a real, unremarkable case -- e.g. block_size==samples_per_step
+        // outright). That remainder means "the following step is due at the very start of the
+        // NEXT call," not "still due within this one" -- `<= 0` would double-fire right here
+        // whenever the schedule lands exactly on a block boundary.
+        while (engine->arp_step_samples_left[p] < 0 && guard++ < 8) {
+            if (engine->arp_note_active[p]) {
+                // A still-sounding previous step's note (gate >= 100%, or simply not yet expired)
+                // is cut now -- one note at a time, never overlapping, within one Program.
+                handle_note_off(se, voices, knobs, midi_live, p, engine->arp_playing_note[p], poly_mode_active, &mono_stacks[p]);
+                engine->arp_note_active[p] = false;
+            }
+
+            int n = held->count;
+            int octave_range = (int)prog->arp_octave_range;
+            if (octave_range < 1) octave_range = 1; else if (octave_range > 4) octave_range = 4;
+            int total = n * octave_range;
+            int style = (int)prog->arp_style;
+
+            // Pitch-ascending permutation of held->notes[0..n-1]'s own indices -- Up/Down/UpDown/
+            // DownUp/Random all walk PITCH order, not press order (the classic arpeggiator
+            // meaning of "Up"); AsPlayed alone uses held->notes[] directly in MonoNoteStack's own
+            // insertion order. n <= MONO_STACK_SIZE always, so this plain insertion sort (cheap,
+            // and only run once per step fire, not per sample) never exceeds its stack array.
+            int sorted[MONO_STACK_SIZE];
+            for (int i = 0; i < n; i++) sorted[i] = i;
+            for (int i = 1; i < n; i++) {
+                int key = sorted[i], key_note = held->notes[key], j = i - 1;
+                while (j >= 0 && held->notes[sorted[j]] > key_note) { sorted[j + 1] = sorted[j]; j--; }
+                sorted[j + 1] = key;
+            }
+
+            int note_slot, octave_index;
+            if (style == 4) {
+                // Random: a fresh uniformly-random combined step every time -- no cursor to advance.
+                if (engine->arp_rng_state[p] == 0) engine->arp_rng_state[p] = (unsigned int)p * 2654435761u + 1u; // guards xorshift32's degenerate all-zero seed
+                unsigned int r = arp_xorshift32(&engine->arp_rng_state[p]);
+                int combined = (int)(r % (unsigned int)total);
+                note_slot = sorted[combined % n];
+                octave_index = combined / n;
+            } else if (style == 5) {
+                // As Played: raw press order (MonoNoteStack's own insertion order), not pitch order.
+                int combined = engine->arp_step_cursor[p] % total;
+                note_slot = combined % n;
+                octave_index = combined / n;
+                engine->arp_step_cursor[p]++;
+            } else {
+                // Up (0) / Down (1) / UpDown (2) / DownUp (3): all built from one advancing
+                // combined-step counter over the full [0, n*octave_range) span.
+                int combined;
+                if (style == 2 || style == 3) {
+                    // Ping-pong fold: play the full ascending run then the full descending run,
+                    // without repeating either end note -- the "steps*2-2, mirror past the
+                    // midpoint" trick Arpeggino's own Midier engine uses for its own UpDown-style
+                    // scale-degree permutations (src/layer/layer.cpp, Layer::click(), MIT
+                    // licensed) -- the one concrete algorithmic idea this from-scratch engine
+                    // borrows directly from it, generalized here from "scale degrees" to "held
+                    // notes x octave layers".
+                    int fold_len = (total <= 1) ? 1 : (total * 2 - 2);
+                    int c = engine->arp_step_cursor[p] % fold_len;
+                    combined = (c < total) ? c : (fold_len - c);
+                    engine->arp_step_cursor[p]++;
+                } else {
+                    combined = engine->arp_step_cursor[p] % total;
+                    engine->arp_step_cursor[p]++;
+                }
+                if (style == 1 || style == 3) combined = (total - 1) - combined; // Down/DownUp: reverse the whole mapping
+                note_slot = sorted[combined % n];
+                octave_index = combined / n;
+            }
+
+            int note = held->notes[note_slot] + 12 * octave_index;
+            if (note < 0) note = 0; else if (note > 127) note = 127;
+            int velocity = held->velocities[note_slot];
+
+            handle_note_on(se, voices, knobs, global_lfo_phases, p, note, velocity, poly_mode_active, &mono_stacks[p]);
+            engine->arp_note_active[p] = true;
+            engine->arp_playing_note[p] = note;
+
+            float bpm = compute_current_tempo_bpm(knobs, engine->transport_playhead_sec);
+            int rate_idx = (int)prog->arp_rate;
+            if (rate_idx < 0 || rate_idx > 5) rate_idx = 1;
+            float steps_per_beat = ARP_RATE_STEPS_PER_BEAT[rate_idx];
+            int samples_per_step = (int)((float)SAMPLE_RATE * 60.0f / fmaxf(1.0f, bpm) / steps_per_beat);
+            if (samples_per_step < 1) samples_per_step = 1;
+            float gate_frac = fmaxf(0.01f, fminf(1.0f, prog->arp_gate_pct / 100.0f));
+            engine->arp_gate_samples_left[p] = (int)((float)samples_per_step * gate_frac);
+            if (engine->arp_gate_samples_left[p] < 1) engine->arp_gate_samples_left[p] = 1;
+
+            engine->arp_step_samples_left[p] += samples_per_step;
+        }
+    }
+}
+
 // --- MIDI auto-connect: no more manually running aconnect ---
 //
 // --- Shared MIDI event dispatch ---
@@ -6302,6 +6598,32 @@ static void seq_playback_midi_events(HdsEngineState *engine, HdsSampleEngine *se
 // raw CC value (0-127, data1=CC number 0-127); PITCH_BEND -> signed -8192..8191, 0=centered
 // (data1 unused); CHANNEL_PRESSURE -> raw pressure (0-127, data1 unused).
 typedef enum { HDS_MIDI_NOTE_ON, HDS_MIDI_NOTE_OFF, HDS_MIDI_CC, HDS_MIDI_PITCH_BEND, HDS_MIDI_CHANNEL_PRESSURE } HdsMidiEventType;
+
+// --- Arpeggiator note-tracking (see the Arpeggiator section on ProgramState and
+// poll_arpeggiator()'s own header comment for the full design) ---
+//
+// When a Program has arp_enabled, a real note-on/off event must NOT trigger a voice directly --
+// it should only update this Program's own held-notes list, and poll_arpeggiator() (its own
+// independent musical clock) decides which note actually sounds and when, via its own synthetic
+// handle_note_on/handle_note_off calls. These two functions are dispatch_midi_event's own
+// note-on/off handling, redirected here instead of straight into handle_note_on/handle_note_off.
+static void arp_note_on(HdsEngineState *engine, int target_program, int note, int velocity) {
+    mono_stack_push(&engine->arp_held_notes[target_program], note, velocity);
+    engine->arp_keys_down[target_program]++;
+}
+
+static void arp_note_off(HdsEngineState *engine, const ProgramState *prog, int target_program, int note) {
+    if (engine->arp_keys_down[target_program] > 0) engine->arp_keys_down[target_program]--;
+    if (prog->arp_hold == 0.0f) {
+        // Not latched: track exactly which keys are physically held, same as a real arpeggiator.
+        mono_stack_remove(&engine->arp_held_notes[target_program], note);
+    }
+    // Hold/Latch engaged: deliberately leave arp_held_notes untouched so the arpeggio keeps
+    // cycling through the already-latched chord after the physical keys are released -- classic
+    // hardware "Hold" behavior. arp_keys_down still gets decremented above regardless, so the
+    // NEXT fresh note-on (arriving once every physically-held key has been released) can tell it
+    // should replace the latched chord -- see dispatch_midi_event's own Hold-handling comment.
+}
 
 static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, HdsMidiEventType type, int midi_channel_1_16, int data1, int value,
                                  SynthVoice voices[], SynthSharedControls *knobs,
@@ -6319,7 +6641,22 @@ static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, Hds
             for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
                 float lane_channel = knobs->combi_lane_midi_channel[p];
                 if (lane_channel != 0.0f && (int)lane_channel != midi_channel_1_16) continue;
-                bool prog_poly_active = (knobs->programs[p].is_polyphonic != 0.0f);
+                const ProgramState *lane_prog = &knobs->programs[p];
+                if (lane_prog->arp_enabled != 0.0f) {
+                    // Arp engaged for this lane: feed the held-note list, don't trigger a voice
+                    // directly -- poll_arpeggiator() does that on its own musical clock.
+                    if (is_note_on) {
+                        // Hold/Latch: a fresh phrase (arriving once every previously-held key has
+                        // been released) replaces the latched chord rather than piling onto it --
+                        // the standard "press a new chord to change it" Hold convention.
+                        if (lane_prog->arp_hold != 0.0f && engine->arp_keys_down[p] == 0) engine->arp_held_notes[p].count = 0;
+                        arp_note_on(engine, p, note, value);
+                    } else {
+                        arp_note_off(engine, lane_prog, p, note);
+                    }
+                    continue;
+                }
+                bool prog_poly_active = (lane_prog->is_polyphonic != 0.0f);
                 if (is_note_on) handle_note_on(se, voices, knobs, global_lfo_phases, p, note, value, prog_poly_active, &mono_stacks[p]);
                 else handle_note_off(se, voices, knobs, midi_live, p, note, prog_poly_active, &mono_stacks[p]);
             }
@@ -6328,10 +6665,25 @@ static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, Hds
             // mode's own dedicated ProgramState, never a Combi lane's -- see ProgramState's
             // own comment on the mutual-exclusivity fix), fully channel-agnostic, exactly as
             // today.
-            bool prog_poly_active = (knobs->programs[SINGLE_PROGRAM_SLOT].is_polyphonic != 0.0f);
-            if (is_note_on) handle_note_on(se, voices, knobs, global_lfo_phases, SINGLE_PROGRAM_SLOT, note, value, prog_poly_active, &mono_stacks[SINGLE_PROGRAM_SLOT]);
-            else handle_note_off(se, voices, knobs, midi_live, SINGLE_PROGRAM_SLOT, note, prog_poly_active, &mono_stacks[SINGLE_PROGRAM_SLOT]);
+            const ProgramState *prog = &knobs->programs[SINGLE_PROGRAM_SLOT];
+            if (prog->arp_enabled != 0.0f) {
+                if (is_note_on) {
+                    if (prog->arp_hold != 0.0f && engine->arp_keys_down[SINGLE_PROGRAM_SLOT] == 0) engine->arp_held_notes[SINGLE_PROGRAM_SLOT].count = 0;
+                    arp_note_on(engine, SINGLE_PROGRAM_SLOT, note, value);
+                } else {
+                    arp_note_off(engine, prog, SINGLE_PROGRAM_SLOT, note);
+                }
+            } else {
+                bool prog_poly_active = (prog->is_polyphonic != 0.0f);
+                if (is_note_on) handle_note_on(se, voices, knobs, global_lfo_phases, SINGLE_PROGRAM_SLOT, note, value, prog_poly_active, &mono_stacks[SINGLE_PROGRAM_SLOT]);
+                else handle_note_off(se, voices, knobs, midi_live, SINGLE_PROGRAM_SLOT, note, prog_poly_active, &mono_stacks[SINGLE_PROGRAM_SLOT]);
+            }
         }
+        // Deliberate scope boundary: this records the raw physical key event regardless of Arp
+        // routing above -- Sequencer recording captures what the performer played, not what the
+        // Arp subsequently generates from it. Making Sequencer-recorded/played-back events
+        // themselves feed an Arp (via seq_playback_midi_events' own separate call site) is a
+        // further extension not attempted here.
         if (is_note_on) seq_record_midi_event(engine, knobs, 0, (unsigned char)note, (unsigned char)value, midi_channel_1_16);
         else seq_record_midi_event(engine, knobs, 1, (unsigned char)note, 0, midi_channel_1_16);
     } else if (type == HDS_MIDI_CC) {
@@ -9021,6 +9373,7 @@ int main(int argc, char **argv) {
         // actually read/written/rendered this iteration.
         int block_size = effective_block_size(&active_knobs);
         advance_transport_playhead(&g_engine, block_size); // advances the real Sequencer playhead by exactly this block's worth of time, only while PLAYING
+        poll_arpeggiator(&g_engine, &g_sample_engine, voices, &active_knobs, global_lfo_phases, mono_stacks, &midi_live, block_size); // fires the next arp step(s) for every Program with arp_enabled, independent of Sequencer transport state
 
         // Read one block of external input, ALL detected_input_channels of it -- interleaved,
         // stride detected_input_channels per frame (not always 2 anymore; see
