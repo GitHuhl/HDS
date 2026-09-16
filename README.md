@@ -288,6 +288,17 @@ A digital synthesizer split into two processes:
   folder, that also cleanly clears `record_enable` on the wire rather than
   leaving the button checked against a backend that already gave up).
 
+  **`src/pi_touch_frontend.cpp`** is a second, much smaller controller for the same backend --
+  an ImGui + GLFW touch UI sized for a small square panel (720x720px, e.g. a 4" Raspberry Pi
+  touchscreen), talking real `liblo` OSC to the backend's actual `/hds/...` address space (not a
+  fictional protocol -- see the file's own header comment on the exploratory draft it replaced).
+  **Scope is deliberately narrow**: only the ADSR page (Osc 1's Amp EG, Master Volume,
+  Oscillator 1 waveform) is wired to real fields, plus a live Peak/Tempo readback from
+  `/hds/status/*` shown on every page. The Program Library browser is still a hardcoded
+  placeholder table -- reading HDS's real `~/HDS_Programs/*.hdsprog` files from C++ is a separate,
+  larger piece of work this pass didn't attempt -- and the Comb/Seq/Rec/Glob pages remain
+  placeholder text. See "Building the Pi/touchscreen client" under Build & run.
+
   The **Mapping** tab is the real Sample Bank zone editor for the DFD
   engine above: drag-and-drop a `.wav` file onto a reference piano
   keyboard to create a zone there (or use the "+ Add Sample" button as a
@@ -589,6 +600,28 @@ This produces `dist/HDS.exe`, with `synth_engine.exe` bundled inside it; `fronte
 `_maybe_launch_bundled_backend()` detects it's running from a frozen bundle and launches the
 bundled engine automatically on startup (a no-op in every other run mode, including the normal
 `python3 src/frontend.py` this project is developed against).
+
+### Building the Pi/touchscreen client
+
+`src/pi_touch_frontend.cpp` (see its own description above) is an optional third build target,
+not part of plain `make`. Needs GLFW3 + OpenGL + liblo dev headers; Dear ImGui itself is vendored
+into `third_party/imgui/` (pinned to tag `v1.91.5`, MIT licensed,
+[github.com/ocornut/imgui](https://github.com/ocornut/imgui)) rather than assumed to be a system
+package, the same vendoring precedent as `third_party/miniaudio.h`/the CLAP SDK headers.
+
+```sh
+sudo apt-get install libglfw3-dev liblo-dev    # Debian/Ubuntu
+make pi-touch                                   # builds ./hds_pi_touch
+./synth_engine &
+./hds_pi_touch                                  # talks to the engine over the same OSC ports
+```
+
+Verified in this repo's own sandbox (no real Pi/touchscreen hardware available here) via Xvfb: a
+clean build with zero warnings, a captured real `/hds/request_state` datagram on the wire at
+startup, and a screenshot confirming the ADSR sliders/waveform combo correctly update to match a
+synthetic reply and the Peak/Tempo readout flips from "NO SIGNAL" to "LIVE" on receiving a real
+`/hds/status/*` bundle -- real hardware, touch input, and 4" panel readability are still the
+user's own confirmation to make, same limitation as this project's other platform-specific work.
 
 ### Control protocol: OSC
 

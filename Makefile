@@ -1,4 +1,5 @@
 CC ?= cc
+CXX ?= g++
 CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
 LDLIBS := -lasound -lm -lpthread -lwavpack -llo
 
@@ -57,7 +58,29 @@ CLAP_SRC := src/clap_plugin.c
 # Windows: drop the .clap file into %COMMONPROGRAMFILES%\CLAP\ or %LOCALAPPDATA%\Programs\Common\CLAP\.
 WIN_CLAP_BIN := hds-windows.clap
 
-.PHONY: all run-backend run-frontend clean windows clean-windows clap clap-windows
+# --- Raspberry Pi / embedded touchscreen client (optional, not part of `all`) ---
+# An ImGui + GLFW touch UI for a small (e.g. 720x720px 4") panel, talking to the real HDS backend
+# over OSC -- see src/pi_touch_frontend.cpp's own header comment for scope/design. Needs GLFW3 +
+# OpenGL + liblo dev packages (apt: libglfw3-dev liblo-dev); Dear ImGui itself is vendored into
+# third_party/imgui/ (pinned to tag v1.91.5, MIT licensed, github.com/ocornut/imgui) rather than
+# assumed to be a system package, mirroring this project's existing CLAP-SDK/miniaudio.h vendoring
+# precedent. Compiles ImGui's own core + GLFW/OpenGL3 backend .cpp files directly alongside
+# pi_touch_frontend.cpp rather than building a separate static lib -- ImGui's own documented build
+# model (no configure step, just compile the handful of .cpp files a project actually uses), and
+# simpler than adding a whole second build system for a small vendored dependency.
+PI_TOUCH_BIN := hds_pi_touch
+PI_TOUCH_INC := third_party/imgui
+PI_TOUCH_SRC := src/pi_touch_frontend.cpp \
+                $(PI_TOUCH_INC)/imgui.cpp $(PI_TOUCH_INC)/imgui_draw.cpp \
+                $(PI_TOUCH_INC)/imgui_tables.cpp $(PI_TOUCH_INC)/imgui_widgets.cpp \
+                $(PI_TOUCH_INC)/backends/imgui_impl_glfw.cpp $(PI_TOUCH_INC)/backends/imgui_impl_opengl3.cpp
+PI_TOUCH_CFLAGS := $(shell pkg-config --cflags glfw3) -I$(PI_TOUCH_INC) -I$(PI_TOUCH_INC)/backends
+PI_TOUCH_LDLIBS := $(shell pkg-config --libs glfw3) -llo -lGL -ldl
+
+# NOTE: `all` (immediately below) must stay the FIRST rule in this file -- Make's default goal
+# (what runs when you type plain `make` with no target) is whichever rule appears first, and
+# pi-touch is an opt-in target, never the default.
+.PHONY: all run-backend run-frontend clean windows clean-windows clap clap-windows pi-touch
 
 all: $(BIN)
 
@@ -73,6 +96,9 @@ windows: $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a
 clap-windows: $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a $(CLAP_SRC)
 	$(WIN_CC) $(WIN_CFLAGS) -shared -I$(CLAP_INC) -o $(WIN_CLAP_BIN) $(CLAP_SRC) $(WIN_LDFLAGS) $(WIN_LDLIBS)
 
+pi-touch: $(PI_TOUCH_SRC)
+	$(CXX) -O2 -Wall -Wextra -std=gnu++17 $(PI_TOUCH_CFLAGS) -o $(PI_TOUCH_BIN) $(PI_TOUCH_SRC) $(PI_TOUCH_LDLIBS)
+
 $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a:
 	@echo "Windows dependencies not found -- run tools/build_windows_deps.sh first" >&2
 	@exit 1
@@ -84,7 +110,7 @@ run-frontend:
 	python3 src/frontend.py
 
 clean:
-	rm -f $(BIN) $(CLAP_BIN)
+	rm -f $(BIN) $(CLAP_BIN) $(PI_TOUCH_BIN)
 
 clean-windows:
 	rm -f $(WIN_BIN) $(WIN_CLAP_BIN)
