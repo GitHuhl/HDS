@@ -84,6 +84,11 @@ typedef struct {
     lo_address osc_reply_addr;
     bool osc_ready; // true once activate() successfully opened the OSC server this session
     int osc_listen_port, osc_reply_port; // the actual bound pair, once osc_ready (see the bind-retry in activate())
+
+    // "/hds/request_state" support -- see HdsStateRequestContext's own comment in backend.c. Lets
+    // a frontend that just connected to THIS instance's OSC port pull its current live state
+    // instead of blindly pushing GUI defaults over a DAW-restored patch.
+    HdsStateRequestContext state_request_ctx;
 } HdsClapPlugin;
 
 // ---------------------------------------------------------------------------------------------
@@ -411,6 +416,12 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         lo_server_add_method(p->osc_server, NULL, NULL, generic_osc_handler, &p->knobs);
         char reply_port_str[16]; snprintf(reply_port_str, sizeof(reply_port_str), "%d", p->osc_reply_port);
         p->osc_reply_addr = lo_address_new(CLAP_OSC_REPLY_HOST, reply_port_str);
+        // Registered here rather than in the block above -- needs p->osc_reply_addr, just resolved
+        // on the previous line. state_request_ctx lives as long as this instance does, so the
+        // pointer handed to liblo stays valid for the plugin's whole lifetime.
+        p->state_request_ctx.knobs = &p->knobs;
+        p->state_request_ctx.reply_addr = p->osc_reply_addr;
+        lo_server_add_method(p->osc_server, "/hds/request_state", "", request_state_handler, &p->state_request_ctx);
         p->osc_ready = true;
         fprintf(stderr, "[hds-clap] OSC listening on UDP port %d, status replies to %s:%d\n", p->osc_listen_port, CLAP_OSC_REPLY_HOST, p->osc_reply_port);
         if (p->host && p->host->get_extension) {

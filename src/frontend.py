@@ -2280,6 +2280,11 @@ class SynthGui(QWidget):
         # widget-reading logic. Program Save filters this through an allowlist rather than
         # re-deriving values from widgets a second time.
         self._last_wire_state = {}
+        # "Pull current state on connect" (see _apply_full_state_fields()): accumulates the
+        # backend's chunked /hds/request_state reply as it streams in across possibly several
+        # listen_for_status_frames() polls, keyed by address exactly like _last_wire_state above,
+        # until /hds/status/state_dump_complete arrives.
+        self._state_dump_buffer = {}
         # Program save/load: one subfolder per Program (~/HDS_Programs/<name>/<name>.hdsprog
         # [+ <name>.sfz]) -- mirrors the existing ~/HDS_Recordings convention (self.record_folder).
         self.programs_folder = os.path.expanduser("~/HDS_Programs")
@@ -5206,6 +5211,35 @@ class SynthGui(QWidget):
         self.program_name_field.setText(name)
         self._refresh_combi_program_combos()
 
+    def _apply_full_state_fields(self, fields):
+        """Applies a /hds/request_state reply (see listen_for_status_frames()'s sentinel
+        handling) to this GUI's own widgets, so connecting to an already-configured backend
+        instance (e.g. a DAW-hosted CLAP instance with a restored patch) pulls and displays its
+        real current state instead of overwriting it with GUI defaults -- see the boot-time call
+        site in runtime_connect_and_bind() for the connect-time flow this serves.
+
+        Deliberately reuses _apply_program_fields() rather than a second hand-maintained reverse-
+        mapping table: everything _apply_program_fields() already covers (oscillators, filters,
+        EGs, LFOs, FX, FM, glide, hard sync, pb range, sustain polarity, tempo, poly/mono) is
+        exactly what needs pulling here too. master_volume is the one field Program scope
+        deliberately excludes (see _is_program_scope_address) that DOES need pulling for this use
+        case -- applied directly here, before _apply_program_fields()'s own call, so its trailing
+        transmit_knob_packet() call round-trips the correct value along with everything else.
+
+        Known, deliberate gap (not silently dropped): Sequencer/Combi-lane fields
+        (/hds/seq/..., /hds/performance_mode) and the rig-level fields Program scope also excludes
+        (/hds/device/, /hds/record/, /hds/routing/, /hds/ext_in/, /hds/audio/) are not applied by
+        this pass -- the first because this GUI has no reverse-mapping for the Sequencer/Combi
+        lane widgets yet, the second because they're either functionally inert for a CLAP instance
+        (no audio-device I/O at all) or not landmines the way knob state is (transmit_knob_packet()
+        doesn't re-blast them, so an unsynced GUI default there is stale-but-harmless, not a
+        clobber risk)."""
+        if "/hds/master_volume" in fields:
+            self.master_vol.blockSignals(True)
+            self.master_vol.setValue(int(round(fields["/hds/master_volume"] * 100.0)))
+            self.master_vol.blockSignals(False)
+        self._apply_program_fields(fields)
+
     def _apply_program_fields(self, fields):
         """Save/Load's Load handler's field-application step -- the mirror image of
         transmit_knob_packet()'s own value-computation, in reverse: for each address in `fields`,
@@ -5961,6 +5995,18 @@ class SynthGui(QWidget):
                     except (IndexError, ValueError):
                         continue
                     seq_audio_updates.setdefault(lane_idx, {})[field] = msg.params[0]
+                elif msg.address == "/hds/status/state_dump_complete":
+                    # Sentinel closing out a /hds/request_state reply -- see
+                    # send_full_state_dump() in backend.c. Apply everything buffered so far, then
+                    # reset for next time (a stray sentinel with nothing buffered is harmless).
+                    self._apply_full_state_fields(self._state_dump_buffer)
+                    self._state_dump_buffer = {}
+                elif (msg.params and not msg.address.startswith("/hds/status/")
+                        and msg.address not in self._STATUS_ADDRESSES):
+                    # Everything else /hds/request_state's reply carries: a plain live knob
+                    # address+value, same address namespace transmit_knob_packet() itself uses --
+                    # buffer it until the sentinel above closes out the dump.
+                    self._state_dump_buffer[msg.address] = msg.params[0]
             if seq_audio_updates:
                 self._apply_seq_audio_status(seq_audio_updates)
             if "/hds/status/peak" in values:
@@ -6665,8 +6711,18 @@ def runtime_connect_and_bind(gui):
     gui.vu_timer.timeout.connect(gui.listen_for_status_frames)
     gui.vu_timer.start(25)
 
-    # Broadcast early configuration packet on boot
-    gui.transmit_knob_packet()
+    # Pull this instance's actual current state on connect, rather than broadcasting GUI defaults
+    # over it (which used to silently clobber e.g. a DAW-restored CLAP patch the instant this
+    # frontend attached -- see _apply_full_state_fields()/listen_for_status_frames()'s sentinel
+    # handling for the receiving side, and send_full_state_dump()/request_state_handler() in
+    # backend.c for the reply). A backend with nothing to report needs no reply at all: its own
+    # init_default_controls() already established sensible defaults before this frontend ever
+    # connected, so simply not transmitting is the correct fallback -- transmitting defaults is
+    # exactly the bug this replaces.
+    if gui.osc_client is not None:
+        request_msg = OscMessageBuilder(address="/hds/request_state")
+        try: gui.osc_client.send(request_msg.build())
+        except OSError: pass
 
 
 if __name__ == "__main__":

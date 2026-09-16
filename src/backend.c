@@ -4169,6 +4169,65 @@ static void osc_error_handler(int num, const char *msg, const char *path) {
     fprintf(stderr, "[osc] liblo error %d (%s): %s\n", num, path ? path : "?", msg);
 }
 
+// --- "/hds/request_state": lets a frontend that just connected pull the CURRENT live state
+// instead of blindly pushing its own GUI defaults (which used to silently overwrite, say, a DAW-
+// restored CLAP patch the instant frontend.py's old boot-time transmit_knob_packet() broadcast
+// landed -- see the fix that added this whole request/reply pair). Reuses osc_dispatch_table
+// (the exact same address->offset map generic_osc_handler() itself reads), so this can never
+// name-drift from what the live knob addresses actually mean. ---
+
+// Registered explicitly (not via the generic catch-all method) so it can carry its own per-owner
+// context -- which knobs to dump and where to reply -- mirrors zone_upsert_handler/
+// zone_remove_handler's own registration style with &g_sample_engine/&p->sample_engine.
+typedef struct {
+    const SynthSharedControls *knobs;
+    lo_address reply_addr;
+} HdsStateRequestContext;
+
+// osc_dispatch_table holds ~4100 concrete addresses -- sent as one giant bundle that would
+// exceed UDP's ~65507-byte max datagram payload (measured well over 100KB for the full set,
+// vs. transmit_knob_packet()'s own much smaller ~40KB bundle, which only covers the ~1150
+// addresses this frontend build actually has live widgets for). Chunked into many small bundles
+// instead -- the same "many small sends, not one unbounded one" shape the Sample Bank zone
+// catalog protocol already uses for its own unbounded-size data.
+#define HDS_STATE_DUMP_CHUNK_SIZE 150
+
+// Sends every currently-occupied osc_dispatch_table address's live value to reply_addr, then one
+// terminating sentinel message so the receiver knows the dump is complete (rather than guessing
+// via a timeout) -- see README.md's OSC protocol section for the full request/reply shape.
+static void send_full_state_dump(lo_address reply_addr, const SynthSharedControls *knobs) {
+    if (!reply_addr) return;
+    lo_bundle b = lo_bundle_new(LO_TT_IMMEDIATE);
+    int in_bundle = 0;
+    for (int i = 0; i < OSC_DISPATCH_TABLE_SIZE; i++) {
+        const OscDispatchSlot *slot = &osc_dispatch_table[i];
+        if (!slot->occupied) continue;
+        lo_message m = lo_message_new();
+        if (slot->kind == OSC_KIND_FLOAT) {
+            lo_message_add_float(m, *(const float *)((const char *)knobs + slot->offset));
+        } else {
+            lo_message_add_string(m, (const char *)knobs + slot->offset);
+        }
+        lo_bundle_add_message(b, slot->address, m);
+        if (++in_bundle >= HDS_STATE_DUMP_CHUNK_SIZE) {
+            lo_send_bundle(reply_addr, b);
+            lo_bundle_free_recursive(b);
+            b = lo_bundle_new(LO_TT_IMMEDIATE);
+            in_bundle = 0;
+        }
+    }
+    if (in_bundle > 0) lo_send_bundle(reply_addr, b);
+    lo_bundle_free_recursive(b);
+    lo_send(reply_addr, "/hds/status/state_dump_complete", "");
+}
+
+static int request_state_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)argv; (void)argc; (void)msg;
+    HdsStateRequestContext *ctx = (HdsStateRequestContext *)user_data;
+    send_full_state_dump(ctx->reply_addr, ctx->knobs);
+    return 0;
+}
+
 // FIXED: Restored 'init_default_controls' macro mapping setup routine missing from compilation stack
 static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].is_polyphonic = 1.0f; knobs->programs[0].vco1_shape = 0.0f; knobs->programs[0].vco2_shape = 3.0f;
@@ -9172,6 +9231,13 @@ int main(int argc, char **argv) {
     char osc_reply_port_str[16]; snprintf(osc_reply_port_str, sizeof(osc_reply_port_str), "%d", osc_reply_port);
     lo_address osc_reply_addr = lo_address_new(osc_reply_host, osc_reply_port_str);
     fprintf(stderr, "[osc] listening on UDP port %d, status replies to %s:%d\n", osc_listen_port, osc_reply_host, osc_reply_port);
+
+    // "/hds/request_state" -- registered here (not alongside the other methods above) since it
+    // needs osc_reply_addr, just resolved. state_request_ctx has this function's own full
+    // lifetime (never returns before shutdown), so a pointer to it stays valid for as long as
+    // osc_server itself does.
+    HdsStateRequestContext state_request_ctx = { &active_knobs, osc_reply_addr };
+    lo_server_add_method(osc_server, "/hds/request_state", "", request_state_handler, &state_request_ctx);
 
     // Output: opened with however many channels query_output_device_channel_count() detects --
     // see the multi-source routing model's output-pair grid (SynthSharedControls.source_routing)
