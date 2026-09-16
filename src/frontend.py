@@ -2520,17 +2520,48 @@ class SynthGui(QWidget):
         self.tempo_live_readout.setStyleSheet("color: #888; font-size: 9px;")
         global_layout.addWidget(self.tempo_live_readout)
 
-        # Arpeggiator on/off -- a patch property (like Hard Sync/Poly-Mono above), not a live
+        # Arpeggiator -- a patch property (like Hard Sync/Poly-Mono above), not a live
         # performance override (unlike Transpose), so it's Program-scoped and saves/loads with
-        # the patch -- see ProgramState's own "Arpeggiator" comment in backend.c. This is
-        # deliberately the ONLY arp control exposed in the frontend this pass -- arp_style/
-        # arp_octave_range/arp_rate/arp_gate_pct/arp_hold are real, working, OSC-addressable
-        # backend fields already (see init_default_controls' own sensible defaults: Up, 1
-        # octave, 1/8, 70% gate, no Hold), just without dedicated knobs here yet.
+        # the patch -- see ProgramState's own "Arpeggiator" comment in backend.c. On/off, Style,
+        # Velocity, and Gate are exposed here; Octave Range/Rate/Hold remain real, working,
+        # OSC-addressable backend fields (see init_default_controls' own sensible defaults: 1
+        # octave, 1/8 rate, no Hold) without dedicated widgets yet -- a deliberate scope boundary
+        # for this pass, not an oversight (see check_osc_address_parity.py's own explicit note).
+        arp_box = QGroupBox("Arpeggiator")
+        arp_lay = QVBoxLayout(); arp_lay.setContentsMargins(4, 4, 4, 4); arp_lay.setSpacing(4)
         self.arp_enabled_btn = QPushButton("ARP")
         self.arp_enabled_btn.setCheckable(True)
         self.arp_enabled_btn.setStyleSheet("QPushButton:checked { background-color: #2ecc71; color: black; font-weight: bold; }")
-        global_layout.addWidget(self.arp_enabled_btn)
+        arp_lay.addWidget(self.arp_enabled_btn)
+
+        self.arp_style_combo = QComboBox()
+        self.arp_style_combo.addItems(["Up", "Down", "Up/Down", "Down/Up", "Random", "As Played"])
+        arp_lay.addWidget(self.arp_style_combo)
+
+        arp_knob_row = QHBoxLayout(); arp_knob_row.setSpacing(4)
+        vel_col = QVBoxLayout(); vel_col.setSpacing(0)
+        vel_col.addWidget(QLabel("Velocity"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.arp_velocity_dial = PotentiometerKnob("Arp Velocity", self)
+        # 0 = "As Played" (use each held note's own captured velocity -- the default, matching
+        # today's exact behavior); 1-127 = a fixed override velocity for every arp-triggered note.
+        self.arp_velocity_dial.setRange(0, 127); self.arp_velocity_dial.setValue(0)
+        vel_col.addWidget(self.arp_velocity_dial, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.arp_velocity_readout = QLabel("As Played"); self.arp_velocity_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vel_col.addWidget(self.arp_velocity_readout)
+        arp_knob_row.addLayout(vel_col)
+
+        gate_col = QVBoxLayout(); gate_col.setSpacing(0)
+        gate_col.addWidget(QLabel("Gate"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.arp_gate_dial = PotentiometerKnob("Arp Gate", self)
+        self.arp_gate_dial.setRange(1, 100); self.arp_gate_dial.setValue(70)
+        gate_col.addWidget(self.arp_gate_dial, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.arp_gate_readout = QLabel("70%"); self.arp_gate_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        gate_col.addWidget(self.arp_gate_readout)
+        arp_knob_row.addLayout(gate_col)
+        arp_lay.addLayout(arp_knob_row)
+
+        arp_box.setLayout(arp_lay)
+        global_layout.addWidget(arp_box)
 
         global_layout.addStretch()
 
@@ -5074,6 +5105,9 @@ class SynthGui(QWidget):
             self.arp_enabled_btn.setChecked(fields["/hds/arp/enabled"] != 0.0)
             self.arp_enabled_btn.blockSignals(False)
             widgets_touched.append(self.arp_enabled_btn)
+        set_combo_index("/hds/arp/style", self.arp_style_combo)
+        set_dial("/hds/arp/velocity", self.arp_velocity_dial)
+        set_dial("/hds/arp/gate_pct", self.arp_gate_dial)
         # master_volume is deliberately never applied here -- excluded from Program scope (see
         # _is_program_scope_address), so even an older .hdsprog saved before this exclusion
         # existed won't have loading silently yank the current output level around.
@@ -5908,6 +5942,9 @@ class SynthGui(QWidget):
         self.glide_random_readout.setText(f"{glide_random_pct}%")
         self.tempo_readout.setText(f"{self.tempo_dial.value()} BPM")
         self.transpose_readout.setText(f"{self.transpose_dial.value():+d} st")
+        arp_vel = self.arp_velocity_dial.value()
+        self.arp_velocity_readout.setText("As Played" if arp_vel == 0 else str(arp_vel))
+        self.arp_gate_readout.setText(f"{self.arp_gate_dial.value()}%")
 
         bundle = OscBundleBuilder(IMMEDIATELY)
         def add_f(address, value):
@@ -6199,6 +6236,9 @@ class SynthGui(QWidget):
         # so marker_count is always 0 and the arrays always zero -- reserved for a future editor.
         add_f("/hds/tempo/bpm", self.tempo_dial.value())
         add_f("/hds/arp/enabled", 1.0 if self.arp_enabled_btn.isChecked() else 0.0)
+        add_f("/hds/arp/style", self.arp_style_combo.currentIndex())
+        add_f("/hds/arp/velocity", float(self.arp_velocity_dial.value()))
+        add_f("/hds/arp/gate_pct", float(self.arp_gate_dial.value()))
         add_f("/hds/tempo/marker_count", 0.0)
         for idx in range(TEMPO_MARKER_MAX):
             add_f(f"/hds/tempo/marker/{idx}/time", 0.0)
@@ -6354,6 +6394,9 @@ def runtime_connect_and_bind(gui):
     gui.glide_random_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.tempo_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.arp_enabled_btn.toggled.connect(gui.transmit_knob_packet)
+    gui.arp_style_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+    gui.arp_velocity_dial.valueChanged.connect(gui.transmit_knob_packet)
+    gui.arp_gate_dial.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco1_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco2_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco1_mono_noise.toggled.connect(gui.transmit_knob_packet)

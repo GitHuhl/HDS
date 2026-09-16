@@ -633,6 +633,11 @@ typedef struct {
                              // chord was last held. Pressing a fresh note after a fully-released
                              // latch replaces the latched chord rather than adding to it -- see
                              // dispatch_midi_event's own Hold-handling comment.
+    float arp_velocity;     // 0="As Played" (use each held note's own captured velocity,
+                             // held->velocities[] -- today's exact behavior); 1-127=a fixed
+                             // override velocity used for every arp-triggered note instead,
+                             // matching the classic hardware-arp "Original vs. Fixed" convention.
+                             // See poll_arpeggiator()'s own velocity-selection line.
 
     // Phase pot per oscillator (degrees, 0-360). Modulatable by LFO/EG via the mod matrix
     // (targets 24/25); the modulated result shifts only the oscillator's read-phase, never its
@@ -3233,6 +3238,15 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/5/arp/hold", arp_hold, 5),
     OSC_PSCALAR_AT("/hds/combi/6/arp/hold", arp_hold, 6),
     OSC_PSCALAR_AT("/hds/combi/7/arp/hold", arp_hold, 7),
+    OSC_PSCALAR("/hds/arp/velocity", arp_velocity),
+    OSC_PSCALAR_AT("/hds/combi/0/arp/velocity", arp_velocity, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/arp/velocity", arp_velocity, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/arp/velocity", arp_velocity, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/arp/velocity", arp_velocity, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/arp/velocity", arp_velocity, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/arp/velocity", arp_velocity, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/arp/velocity", arp_velocity, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/arp/velocity", arp_velocity, 7),
 
     OSC_PSCALAR("/hds/vco1/phase_offset", vco1_phase_offset),
     OSC_PSCALAR_AT("/hds/combi/0/vco1/phase_offset", vco1_phase_offset, 0),
@@ -3944,6 +3958,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].arp_rate = 1.0f;        // 1/8
     knobs->programs[0].arp_gate_pct = 70.0f;
     knobs->programs[0].arp_hold = 0.0f;
+    knobs->programs[0].arp_velocity = 0.0f; // As Played -- reproduces today's exact behavior
     knobs->programs[0].vco1_phase_offset = 0.0f; knobs->programs[0].vco2_phase_offset = 0.0f;
 
     knobs->programs[0].vco1_pulse_width = 50.0f; knobs->programs[0].vco2_pulse_width = 50.0f;
@@ -6562,7 +6577,9 @@ static void poll_arpeggiator(HdsEngineState *engine, HdsSampleEngine *se, SynthV
 
             int note = held->notes[note_slot] + 12 * octave_index;
             if (note < 0) note = 0; else if (note > 127) note = 127;
-            int velocity = held->velocities[note_slot];
+            int arp_vel_override = (int)prog->arp_velocity;
+            int velocity = (arp_vel_override <= 0) ? held->velocities[note_slot]
+                : (arp_vel_override > 127 ? 127 : arp_vel_override);
 
             handle_note_on(se, voices, knobs, global_lfo_phases, p, note, velocity, poly_mode_active, &mono_stacks[p]);
             engine->arp_note_active[p] = true;
