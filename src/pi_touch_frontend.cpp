@@ -9,47 +9,83 @@
 // README.md's "Control protocol: OSC" section and backend.c's --osc-listen-port/--osc-reply-port
 // flags), and the real /hds/... address space from backend.c's own OSC_PARAMS[] table.
 //
-// Scope, stated explicitly (a deliberate boundary, not an oversight): this pass wires ONLY the
-// ADSR page -- Osc 1's Amp EG (EG index 0: attack/decay/sustain/release), Master Volume, and
-// Oscillator waveform -- to real backend fields, plus a live status readback (Peak level, live
-// Tempo) via /hds/status/*. The Program Library browser's data is still the original hardcoded
-// placeholder table (program_library[]) -- HDS's real saved Programs live as
-// ~/HDS_Programs/<name>/<name>.hdsprog JSON files (see frontend.py's own _pick_and_load_program()
-// for the real format), and reading/applying those from C++ is a larger, separate piece of work
-// this pass does not attempt; its "Load Patch"/double-click actions are now clearly-marked no-ops
-// rather than silently firing a message at a nonexistent address. Comb/Seq/Rec/Glob pages remain
-// placeholder text, unchanged from the original exploratory draft.
+// Scope, stated explicitly (a deliberate boundary, not an oversight): the ADSR page (Osc 1's Amp
+// EG, Master Volume, Oscillator waveform) is wired to real backend fields, plus a live status
+// readback (Peak level, live Tempo) via /hds/status/*. The Program Library page now reads and
+// writes HDS's REAL saved Programs (~/HDS_Programs/<name>/<name>.hdsprog -- see frontend.py's own
+// _pick_and_save_program()/_load_program_from_path() for the canonical implementation this
+// mirrors): Load sends every field a loaded file has straight to the backend (a real, whole-patch
+// load, not just the handful of fields this page's own sliders show), and Save captures this
+// client's own observed backend state (see g_full_state below) through the same Program-scope
+// allowlist frontend.py's _is_program_scope_address() uses. A loaded file's colocated .sfz (Sample
+// Bank content) is NOT applied -- this client has no Mapping-tab equivalent -- and is flagged, not
+// silently dropped. Comb/Seq/Rec/Glob pages remain placeholder text, unchanged from the original
+// exploratory draft.
 //
 // Build: see the Makefile's `pi-touch` target. Needs GLFW3 + OpenGL + liblo development packages
-// (apt: libglfw3-dev liblo-dev) -- Dear ImGui itself is vendored into third_party/imgui/ (pinned
-// to tag v1.91.5, MIT licensed, github.com/ocornut/imgui) rather than assumed to be a system
-// package, mirroring this project's existing CLAP-SDK/miniaudio.h vendoring precedent.
+// (apt: libglfw3-dev liblo-dev) -- Dear ImGui (pinned v1.91.5) and nlohmann/json (pinned v3.11.3,
+// single-header, MIT licensed, github.com/nlohmann/json) are vendored into third_party/, rather
+// than assumed to be system packages, mirroring this project's existing CLAP-SDK/miniaudio.h
+// vendoring precedent.
+//
+// A Raspberry Pi 5 (or any other aarch64 Linux machine) needs no special build target at all --
+// it's just another native Linux host for this exact Makefile: install the same handful of dev
+// packages via apt and run `make`/`make pi-touch` directly on the Pi. No cross-compilation.
 
 #include <cstdio>
 #include <cstring>
 #include <cctype>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <set>
+#include <map>
+#include <algorithm>
+#include <fstream>
+#include <filesystem>
 #include <lo/lo.h>
+#include "../third_party/json/json.hpp"
 #include "../third_party/imgui/imgui.h"
 #include "../third_party/imgui/backends/imgui_impl_glfw.h"
 #include "../third_party/imgui/backends/imgui_impl_opengl3.h"
 #include <GLFW/glfw3.h>
 
+namespace fs = std::filesystem;
+
 // --------------------------------------------------------------------------------------------
 // OSC transport: liblo, matching backend.c's own transport exactly -- one lo_address to SEND
 // knob writes to the backend's listen port, one bound lo_server to RECEIVE /hds/status/*
-// (and, once at startup, a /hds/request_state reply) on the backend's reply port. Non-blocking,
-// polled once per frame from the main loop (poll_osc(), called alongside glfwPollEvents()) --
-// the same single-threaded, no-locking shape backend.c's own main() loop uses for its OSC
-// server, and frontend.py's own vu_timer-driven listen_for_status_frames() uses on the GUI side.
-// Defaults match backend.c's own --osc-listen-port/--osc-reply-port defaults (9000/9001), so
-// this client talks to a stock-launched backend with no extra flags on either side.
+// (and, once at startup or on manual Refresh, a /hds/request_state reply) on the backend's reply
+// port. Non-blocking, polled once per frame from the main loop (poll_osc(), called alongside
+// glfwPollEvents()) -- the same single-threaded, no-locking shape backend.c's own main() loop
+// uses for its OSC server, and frontend.py's own vu_timer-driven listen_for_status_frames() uses
+// on the GUI side. Defaults match backend.c's own --osc-listen-port/--osc-reply-port defaults
+// (9000/9001), so this client talks to a stock-launched backend with no extra flags on either side.
 // --------------------------------------------------------------------------------------------
 static lo_address g_hds_addr = nullptr;      // where we SEND knob writes
 static lo_server g_status_server = nullptr;  // where we RECEIVE status + request_state replies
 
+// Every real backend OSC address this client has ever observed a value for -- populated by our
+// own sends (see send_osc_float below) and by generic_state_handler's catch-all reception of
+// /hds/request_state's reply dump. This is BOTH "the last state we know the backend to be in" AND
+// "what Save Patch writes out" -- the same unification frontend.py's own _last_wire_state serves,
+// just built from a live OSC round-trip instead of a locally-computed widget snapshot, since this
+// client's own UI only edits a handful of the ~1100 real Program-scope addresses and has no local
+// widget state for the rest (filters, LFOs, FX, etc.) -- those only ever get INTO this map via an
+// actual /hds/request_state pull, never invented locally.
+static std::map<std::string, float> g_full_state;
+
 static void send_osc_float(const char* path, float value) {
+    g_full_state[path] = value;
     if (!g_hds_addr) return;
     lo_send(g_hds_addr, path, "f", value);
+}
+
+// Reads g_full_state with a fallback for an address never yet observed (before the first
+// request_state reply lands, or for a field this backend build doesn't have).
+static float get_state(const char* path, float default_val) {
+    auto it = g_full_state.find(path);
+    return it != g_full_state.end() ? it->second : default_val;
 }
 
 static void osc_error_handler(int num, const char* msg, const char* path) {
@@ -60,7 +96,9 @@ static void osc_error_handler(int num, const char* msg, const char* path) {
 // Updated from backend.c's own periodic /hds/status/* bundle (send_osc_status(), sent on the
 // same cadence the VU meter/tempo readout in frontend.py already consumes). last_status_time
 // is this client's own liveness heuristic, mirroring frontend.py's identical "no UDP connect-
-// time signal, so infer liveness from whether status has arrived recently" design.
+// time signal, so infer liveness from whether status has arrived recently" design. Deliberately
+// NOT folded into g_full_state -- these are one-way backend-to-controller telemetry, not
+// Program-scope knob state, and Save Patch must never see them.
 static float g_live_peak = 0.0f;
 static float g_live_tempo_bpm = 0.0f;
 static double g_last_status_time = 0.0;
@@ -73,26 +111,18 @@ static int status_float_handler(const char*, const char*, lo_arg** argv, int arg
     return 0;
 }
 
-// --- Pulling real current state at startup ---------------------------------------------------
-// Sending /hds/request_state (see backend.c's own comment on it) makes the backend reply with
-// its CURRENT live values for every OSC address it has, chunked across several bundles. This
-// client only cares about a handful of them (EG 0's four ADSR fields, master_volume, vco1_shape)
-// -- each gets its own exact-address liblo method registered below, via the same "one handler
-// per address, pointer to the field it writes" shape backend.c's own dispatch table already
-// uses in spirit (just direct pointers here instead of a byte-offset table, since there are only
-// six addresses to care about). Every OTHER address in the dump (there are over a thousand) has
-// no registered handler and no catch-all is registered either, so liblo silently drops them --
-// exactly what's wanted; this client isn't trying to mirror the whole backend's state, just the
-// handful of fields its own ADSR page actually shows. Pulling this way, rather than starting
-// from hardcoded widget defaults and blindly pushing them, avoids the exact bug frontend.py's own
-// request_state path was added to fix: silently overwriting a DAW-restored CLAP patch (or
-// another controller's already-live settings) the instant this client's own boot-time state
-// happened to differ.
-static float g_attack_ms = 10.0f;
-static float g_decay_ms = 150.0f;
-static float g_sustain_pct = 80.0f;
-static float g_release_ms = 300.0f;
-static float g_master_volume = 0.80f;
+// Generic catch-all for everything else liblo delivers to this server -- specifically, every
+// real knob address in a /hds/request_state reply dump. Registered with NULL path/types (liblo's
+// documented catch-all form), so it only ever sees messages the two specific handlers above
+// didn't already claim (each of those returns 0, meaning "handled, stop dispatching further" --
+// see liblo's own callback-return convention) -- /hds/status/peak and .../tempo_bpm_live never
+// reach here. Silently ignores non-float messages (string-valued addresses like /hds/device/
+// output, and the zero-arg /hds/status/state_dump_complete sentinel) -- this client has no use
+// for either.
+static int generic_state_handler(const char* path, const char* types, lo_arg** argv, int argc, lo_message, void*) {
+    if (argc == 1 && types[0] == 'f') g_full_state[path] = argv[0]->f;
+    return 0;
+}
 
 // WaveType's real enum order from backend.c (WAVE_SAW=0, WAVE_SQUARE=1, WAVE_TRIANGLE=2,
 // WAVE_SINE=3, WAVE_UNISON_SAW=4, WAVE_NOISE=5, WAVE_PULSE=6, WAVE_SAMPLE=7, WAVE_OFF=8). This
@@ -103,20 +133,6 @@ static float g_master_volume = 0.80f;
 static const char* g_wave_names[] = { "Sawtooth", "Square", "Triangle", "Sine", "Noise", "Pulse" };
 static const int g_wave_values[] = { 0, 1, 2, 3, 5, 6 };
 static const int g_wave_count = 6;
-static int g_current_wave_idx = 0; // index into g_wave_names/g_wave_values, NOT the raw WaveType value
-
-static int vco1_shape_handler(const char*, const char*, lo_arg** argv, int argc, lo_message, void* user_data) {
-    (void)user_data;
-    if (argc != 1) return 0;
-    int raw = (int)(argv[0]->f + 0.5f);
-    for (int i = 0; i < g_wave_count; i++) {
-        if (g_wave_values[i] == raw) { g_current_wave_idx = i; return 0; }
-    }
-    // A shape outside this page's six-entry subset (Unison Saw/Sample/Off) is real backend state
-    // this quick-edit page just doesn't represent -- leave the combo wherever it already was
-    // rather than silently snapping to an arbitrary entry.
-    return 0;
-}
 
 static void poll_osc() {
     if (g_status_server) {
@@ -124,29 +140,159 @@ static void poll_osc() {
     }
 }
 
+// --------------------------------------------------------------------------------------------
+// Program-scope address filtering -- a direct port of frontend.py's own _is_program_scope_
+// address() (see src/frontend.py), which is the live, already-battle-tested definition of "what
+// belongs in a saved .hdsprog" used by Program Save/Load there. Ported rather than re-derived so
+// this client's Save produces files with exactly the same field boundary frontend.py's own Save
+// does -- a Program stays a self-contained patch description, with no device/routing/session
+// state leaking in.
+// --------------------------------------------------------------------------------------------
+static bool starts_with(const std::string& s, const char* prefix) { return s.rfind(prefix, 0) == 0; }
+static bool ends_with(const std::string& s, const char* suffix) {
+    size_t n = strlen(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+static bool is_program_scope_address(const std::string& addr) {
+    if (addr == "/hds/performance_mode") return false;
+    if (starts_with(addr, "/hds/seq/")) return false;
+    if (addr == "/hds/master_volume") return false;
+    if (addr == "/hds/transpose_semitones") return false;
+    static const char* excluded_prefixes[] = { "/hds/device/", "/hds/record/", "/hds/routing/", "/hds/ext_in/", "/hds/audio/" };
+    for (const char* p : excluded_prefixes) if (starts_with(addr, p)) return false;
+    if (starts_with(addr, "/hds/fx/") && ends_with(addr, "/source")) return false;
+    if (starts_with(addr, "/hds/fx_routing/")) return addr == "/hds/fx_routing/0/mode";
+    // Combi-lane mirrors (/hds/combi/N/...) -- excluded here even though frontend.py's own
+    // _is_program_scope_address doesn't need to mention them: THAT function only ever filters
+    // frontend.py's _last_wire_state, which structurally never contains a /hds/combi/... address
+    // in the first place (no widget layer sends them -- see check_osc_address_parity.py's own
+    // comment on this). This client's g_full_state, by contrast, is populated via a full
+    // /hds/request_state dump, which DOES include every Combi lane's own mirrored copy of every
+    // Program-scoped field -- without this exclusion, Save would wrongly bundle all 8 lanes'
+    // fields into what's supposed to describe a single Program.
+    if (starts_with(addr, "/hds/combi/")) return false;
+    return true;
+}
+
+// --------------------------------------------------------------------------------------------
+// Program Library: real ~/HDS_Programs/<name>/<name>.hdsprog files (see frontend.py's own
+// programs_folder/_scan_programs_folder() -- same convention, same directory). Category is a
+// plain metadata field on the file (never applied to any OSC address, see load_program below) --
+// an open string, not a fixed enum, so the category tabs below are built from whatever's actually
+// in use across saved files rather than a hardcoded list.
+// --------------------------------------------------------------------------------------------
+struct LoadedProgram {
+    std::string name;      // JSON "name", falls back to the folder name if absent
+    std::string category;  // JSON "category", "" if the file predates this field or left it blank
+    std::string path;      // full path to the .hdsprog file
+    bool has_sfz = false;  // JSON "sfz_file" present -- flagged in the UI, never applied (see below)
+};
+
+static std::vector<LoadedProgram> g_programs;
+static std::vector<std::string> g_categories; // "All" first, then whatever's actually in use, sorted
+
+static std::string home_programs_dir() {
+    const char* home = getenv("HOME");
+    return std::string(home ? home : ".") + "/HDS_Programs";
+}
+
+static void rescan_programs() {
+    g_programs.clear();
+    std::set<std::string> cat_set;
+    std::error_code ec;
+    std::string base = home_programs_dir();
+    if (fs::is_directory(base, ec)) {
+        for (auto& entry : fs::directory_iterator(base, ec)) {
+            if (!entry.is_directory()) continue;
+            std::string name = entry.path().filename().string();
+            fs::path hdsprog_path = entry.path() / (name + ".hdsprog");
+            if (!fs::is_regular_file(hdsprog_path)) continue;
+            std::ifstream f(hdsprog_path);
+            if (!f) continue;
+            nlohmann::json j;
+            try { f >> j; } catch (...) { continue; } // skip a corrupt/partial file, don't crash the browser
+            LoadedProgram lp;
+            lp.name = j.value("name", name);
+            lp.category = j.value("category", "");
+            lp.path = hdsprog_path.string();
+            lp.has_sfz = j.contains("sfz_file") && j["sfz_file"].is_string() && !j["sfz_file"].get<std::string>().empty();
+            // Read the category BEFORE moving lp into the vector -- std::move(lp) below leaves
+            // lp's own members in an unspecified (in practice, empty-string) moved-from state,
+            // so inserting from lp.category AFTER that line would silently insert nothing.
+            if (!lp.category.empty()) cat_set.insert(lp.category);
+            g_programs.push_back(std::move(lp));
+        }
+    }
+    std::sort(g_programs.begin(), g_programs.end(), [](const LoadedProgram& a, const LoadedProgram& b) { return a.name < b.name; });
+    g_categories = { "All" };
+    for (const auto& c : cat_set) g_categories.push_back(c);
+}
+
+static std::string g_loaded_program_name = "(none loaded)";
+static std::string g_load_status; // last Load's outcome, shown in the browser -- error or a colocated-.sfz notice
+
+// Loads a real saved Program: sends EVERY address:value pair in the file's own "fields" map
+// straight to the backend, exactly matching frontend.py's own _apply_program_fields_to_combi_lane
+// in spirit -- a real whole-patch load (filters, LFOs, FX, everything the file actually has), not
+// just the handful of fields this page's own sliders show. Those sliders read live from
+// g_full_state (see get_state above), which send_osc_float already keeps in sync as a side
+// effect, so no separate "now update the widgets" step is needed here.
+static void load_program(const LoadedProgram& lp) {
+    std::ifstream f(lp.path);
+    if (!f) { g_load_status = "Could not open " + lp.path; return; }
+    nlohmann::json j;
+    try {
+        f >> j;
+    } catch (const std::exception& e) {
+        g_load_status = std::string("Could not parse ") + lp.path + ": " + e.what();
+        return;
+    }
+    if (j.contains("fields") && j["fields"].is_object()) {
+        for (auto& [addr, val] : j["fields"].items()) {
+            if (val.is_number()) send_osc_float(addr.c_str(), val.get<float>());
+        }
+    }
+    g_loaded_program_name = lp.name;
+    g_load_status = lp.has_sfz
+        ? "Loaded '" + lp.name + "' (its colocated .sfz Sample Bank was NOT applied -- this client has no Mapping-tab equivalent)"
+        : "Loaded '" + lp.name + "'";
+}
+
+// Saves this client's own observed backend state (g_full_state, Program-scope-filtered) as a new
+// .hdsprog -- the real file format frontend.py's own Save writes, so either app can load what the
+// other saved. No colocated .sfz is ever written (this client tracks no Sample Bank state at all).
+static std::string g_save_status;
+
+static void save_program(const std::string& name, const std::string& category) {
+    if (name.empty()) { g_save_status = "Name cannot be empty"; return; }
+    nlohmann::json fields = nlohmann::json::object();
+    for (const auto& [addr, val] : g_full_state) {
+        if (is_program_scope_address(addr)) fields[addr] = val;
+    }
+    nlohmann::json j;
+    j["format_version"] = 1;
+    j["name"] = name;
+    j["category"] = category;
+    j["fields"] = fields;
+
+    std::string dir = home_programs_dir() + "/" + name;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) { g_save_status = "Could not create " + dir + ": " + ec.message(); return; }
+    std::string path = dir + "/" + name + ".hdsprog";
+    std::ofstream out(path);
+    if (!out) { g_save_status = "Could not write " + path; return; }
+    out << j.dump(2);
+    g_save_status = fields.empty()
+        ? "Saved '" + name + "' -- but g_full_state was empty (no /hds/request_state reply received "
+          "yet?). Try Refresh, then Save again."
+        : "Saved '" + name + "' (" + std::to_string(fields.size()) + " fields)";
+    g_loaded_program_name = name;
+    rescan_programs();
+}
+
 enum SynthPage { PAGE_PROG, PAGE_COMB, PAGE_SEQ, PAGE_REC, PAGE_ADSR, PAGE_GLOB };
-
-struct ProgramEntry {
-    const char* slot;
-    const char* name;
-    const char* category;
-    const char* author;
-    const char* coreType;
-    const char* tags;
-};
-
-ProgramEntry program_library[] = {
-    { "A001", "Neon Horizon Bass", "Bass", "SubFreq", "Sawtooth", "Warm, Analog" },
-    { "A002", "Deep Sub Drops", "Bass", "WaveGen", "Sine Wave", "Sub, Clean" },
-    { "A003", "Cinematic Pad 5", "Pads", "M.Vinci", "Triangle", "Ethereal, Soft" },
-    { "A004", "Cosmic Stardust", "Pads", "Astro", "Sine Wave", "Ambient, Bright" },
-    { "A005", "Cyber Shred Lead", "Leads", "PixelBit", "Square Wave", "Aggressive" },
-    { "A006", "Plucked Mallets", "Plucks", "SubFreq", "Triangle", "Percussive" },
-    { "A007", "Glitch Matrix FX", "FX", "Noisizer", "Noise", "Modulated" }
-};
-const int total_programs = sizeof(program_library) / sizeof(ProgramEntry);
-
-const char* selector_categories[] = { "All", "Bass", "Pads", "Leads", "Plucks", "FX" };
 
 const char* custom_strcasestr(const char* haystack, const char* needle) {
     if (!haystack || !needle) return nullptr;
@@ -174,14 +320,10 @@ int main() {
     } else {
         lo_server_add_method(g_status_server, "/hds/status/peak", "f", status_float_handler, &g_live_peak);
         lo_server_add_method(g_status_server, "/hds/status/tempo_bpm_live", "f", status_float_handler, &g_live_tempo_bpm);
-        lo_server_add_method(g_status_server, "/hds/eg/0/attack", "f", status_float_handler, &g_attack_ms);
-        lo_server_add_method(g_status_server, "/hds/eg/0/decay", "f", status_float_handler, &g_decay_ms);
-        lo_server_add_method(g_status_server, "/hds/eg/0/sustain", "f", status_float_handler, &g_sustain_pct);
-        lo_server_add_method(g_status_server, "/hds/eg/0/release", "f", status_float_handler, &g_release_ms);
-        lo_server_add_method(g_status_server, "/hds/master_volume", "f", status_float_handler, &g_master_volume);
-        lo_server_add_method(g_status_server, "/hds/vco1/shape", "f", vco1_shape_handler, nullptr);
+        lo_server_add_method(g_status_server, NULL, NULL, generic_state_handler, nullptr);
         lo_send(g_hds_addr, "/hds/request_state", "");
     }
+    rescan_programs();
 
     if (!glfwInit()) return -1;
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
@@ -206,9 +348,12 @@ int main() {
     SynthPage currentPage = PAGE_ADSR;
 
     bool show_program_selector = false;
-    int selected_program_idx = 0;
+    bool show_save_popup = false;
+    int selected_program_idx = -1;
     int current_category_tab = 0;
     char search_query[64] = "";
+    char save_name_buf[128] = "";
+    char save_category_buf[64] = "";
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -224,29 +369,52 @@ int main() {
         switch (currentPage) {
             case PAGE_PROG:
             {
-                ImGui::Text("PROGRAM SETTINGS [PROG]");
+                ImGui::Text("PROGRAM LIBRARY [PROG]");
                 ImGui::Separator(); ImGui::Spacing();
-                ImGui::TextDisabled("Browsing a placeholder patch list -- not yet reading HDS's");
-                ImGui::TextDisabled("real ~/HDS_Programs/*.hdsprog files (see this file's own");
-                ImGui::TextDisabled("header comment for why that's a separate, later piece of work).");
-                ImGui::Spacing();
 
-                ImGui::Text("Active Program Profile:");
+                ImGui::Text("Loaded Program:");
                 ImGui::PushItemWidth(680);
-
-                char strip_label[128];
-                snprintf(strip_label, sizeof(strip_label), "%s - %s [Tap to Browse...]",
-                         program_library[selected_program_idx].slot,
-                         program_library[selected_program_idx].name);
-
+                char strip_label[160];
+                snprintf(strip_label, sizeof(strip_label), "%s  [Tap to Browse...]", g_loaded_program_name.c_str());
                 if (ImGui::Button(strip_label, ImVec2(680, 0))) {
                     show_program_selector = true;
                 }
                 ImGui::PopItemWidth();
-
                 ImGui::Spacing();
-                ImGui::TextDisabled("Allocated Core Model: %s", program_library[selected_program_idx].coreType);
-                ImGui::TextDisabled("Designer / Author: %s", program_library[selected_program_idx].author);
+
+                if (ImGui::Button("Save Patch As...", ImVec2(220, 44))) {
+                    save_name_buf[0] = '\0';
+                    strncpy(save_name_buf, g_loaded_program_name == "(none loaded)" ? "" : g_loaded_program_name.c_str(), sizeof(save_name_buf) - 1);
+                    save_category_buf[0] = '\0';
+                    show_save_popup = true;
+                    g_save_status.clear();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Refresh", ImVec2(140, 44))) {
+                    rescan_programs();
+                    if (g_hds_addr) lo_send(g_hds_addr, "/hds/request_state", "");
+                }
+
+                if (!g_load_status.empty()) { ImGui::Spacing(); ImGui::TextWrapped("%s", g_load_status.c_str()); }
+
+                if (show_save_popup) ImGui::OpenPopup("Save Program");
+                if (ImGui::BeginPopupModal("Save Program", &show_save_popup, ImGuiWindowFlags_AlwaysAutoResize)) {
+                    ImGui::Text("Name:");
+                    ImGui::SetNextItemWidth(400);
+                    ImGui::InputText("##SaveName", save_name_buf, sizeof(save_name_buf));
+                    ImGui::Text("Category (optional):");
+                    ImGui::SetNextItemWidth(400);
+                    ImGui::InputText("##SaveCategory", save_category_buf, sizeof(save_category_buf));
+                    if (!g_save_status.empty()) { ImGui::Spacing(); ImGui::TextWrapped("%s", g_save_status.c_str()); }
+                    ImGui::Spacing();
+                    if (ImGui::Button("Save", ImVec2(150, 44))) {
+                        save_program(save_name_buf, save_category_buf);
+                        if (starts_with(g_save_status, "Saved '")) { show_save_popup = false; ImGui::CloseCurrentPopup(); }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel", ImVec2(150, 44))) { show_save_popup = false; ImGui::CloseCurrentPopup(); }
+                    ImGui::EndPopup();
+                }
 
                 if (show_program_selector) {
                     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
@@ -256,7 +424,7 @@ int main() {
 
                     if (ImGui::Begin("FullPageProgramSelectorModal", &show_program_selector, modal_flags)) {
 
-                        ImGui::Text("PROGRAM LIBRARY SELECTOR");
+                        ImGui::Text("PROGRAM LIBRARY  (%d saved)", (int)g_programs.size());
                         ImGui::SameLine(ImGui::GetWindowWidth() - 50);
                         if (ImGui::Button("X", ImVec2(35, 35))) { show_program_selector = false; }
                         ImGui::Separator(); ImGui::Spacing();
@@ -268,88 +436,74 @@ int main() {
                         ImGui::Spacing();
 
                         ImGui::Text("Category:"); ImGui::SameLine();
-                        for (int i = 0; i < IM_ARRAYSIZE(selector_categories); i++) {
+                        if (current_category_tab >= (int)g_categories.size()) current_category_tab = 0;
+                        for (int i = 0; i < (int)g_categories.size(); i++) {
                             bool is_selected = (current_category_tab == i);
                             if (is_selected) { ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]); }
 
-                            if (ImGui::Button(selector_categories[i], ImVec2(80, 0))) {
+                            if (ImGui::Button(g_categories[i].c_str(), ImVec2(0, 0))) {
                                 current_category_tab = i;
                             }
 
                             if (is_selected) { ImGui::PopStyleColor(); }
-                            if (i < IM_ARRAYSIZE(selector_categories) - 1) { ImGui::SameLine(); }
+                            if (i < (int)g_categories.size() - 1) { ImGui::SameLine(); }
                         }
                         ImGui::Spacing(); ImGui::Separator();
 
                         ImGuiTableFlags table_flags = ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY;
                         float table_height = ImGui::GetContentRegionAvail().y - 65.0f;
 
-                        if (ImGui::BeginTable("SpreadsheetSelector", 6, table_flags, ImVec2(0, table_height))) {
-                            ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                        if (ImGui::BeginTable("SpreadsheetSelector", 2, table_flags, ImVec2(0, table_height))) {
                             ImGui::TableSetupColumn("Patch Name", ImGuiTableColumnFlags_WidthStretch);
-                            ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-                            ImGui::TableSetupColumn("Author", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-                            ImGui::TableSetupColumn("Engine Core", ImGuiTableColumnFlags_WidthFixed, 100.0f);
-                            ImGui::TableSetupColumn("Sound Tags", ImGuiTableColumnFlags_WidthStretch);
+                            ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 140.0f);
                             ImGui::TableHeadersRow();
 
-                            for (int row = 0; row < total_programs; row++) {
-                                ProgramEntry& prog = program_library[row];
+                            for (int row = 0; row < (int)g_programs.size(); row++) {
+                                const LoadedProgram& prog = g_programs[row];
 
-                                if (current_category_tab != 0 && strcmp(prog.category, selector_categories[current_category_tab]) != 0) {
+                                if (current_category_tab != 0 && prog.category != g_categories[current_category_tab]) {
                                     continue;
                                 }
-
-                                if (strlen(search_query) > 0) {
-                                    if (custom_strcasestr(prog.name, search_query) == nullptr &&
-                                        custom_strcasestr(prog.tags, search_query) == nullptr &&
-                                        custom_strcasestr(prog.author, search_query) == nullptr) {
-                                        continue;
-                                        }
+                                if (strlen(search_query) > 0 && custom_strcasestr(prog.name.c_str(), search_query) == nullptr) {
+                                    continue;
                                 }
 
                                 ImGui::TableNextRow();
 
                                 ImGui::TableSetColumnIndex(0);
                                 bool is_row_selected = (selected_program_idx == row);
-
-                                char select_id[32];
-                                snprintf(select_id, sizeof(select_id), "%s##row_%d", prog.slot, row);
+                                char select_id[192];
+                                snprintf(select_id, sizeof(select_id), "%s##row_%d", prog.name.c_str(), row);
                                 if (ImGui::Selectable(select_id, is_row_selected, ImGuiSelectableFlags_SpanAllColumns)) {
                                     selected_program_idx = row;
                                 }
-
                                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                                    // NOT wired to anything real this pass -- there is no
-                                    // "/hds/program/change" address in HDS's real OSC surface
-                                    // (a Program is loaded by pushing its whole field set, not one
-                                    // integer index -- see this file's header comment). Selecting a
-                                    // row just closes the browser; loading real saved Programs from
-                                    // this client is future work.
+                                    load_program(prog);
                                     show_program_selector = false;
                                 }
 
-                                ImGui::TableSetColumnIndex(1); ImGui::Text("%s", prog.name);
-                                ImGui::TableSetColumnIndex(2); ImGui::Text("%s", prog.category);
-                                ImGui::TableSetColumnIndex(3); ImGui::Text("%s", prog.author);
-                                ImGui::TableSetColumnIndex(4); ImGui::Text("%s", prog.coreType);
-                                ImGui::TableSetColumnIndex(5); ImGui::Text("%s", prog.tags);
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::Text("%s", prog.category.empty() ? "-" : prog.category.c_str());
                             }
                             ImGui::EndTable();
                         }
 
                         ImGui::Separator();
-                        ImGui::TextDisabled("Selected: Slot %s", program_library[selected_program_idx].slot);
+                        ImGui::TextDisabled("Selected: %s", selected_program_idx >= 0 && selected_program_idx < (int)g_programs.size()
+                                                                 ? g_programs[selected_program_idx].name.c_str() : "(none)");
                         ImGui::SameLine(ImGui::GetWindowWidth() - 260);
 
                         if (ImGui::Button("Cancel", ImVec2(100, 44))) {
                             show_program_selector = false;
                         }
                         ImGui::SameLine();
+                        bool have_selection = selected_program_idx >= 0 && selected_program_idx < (int)g_programs.size();
+                        ImGui::BeginDisabled(!have_selection);
                         if (ImGui::Button("Load Patch", ImVec2(120, 44))) {
-                            // See the double-click handler's own comment above -- not wired yet.
+                            load_program(g_programs[selected_program_idx]);
                             show_program_selector = false;
                         }
+                        ImGui::EndDisabled();
 
                         ImGui::End();
                     }
@@ -381,8 +535,11 @@ int main() {
 
                 ImGui::Text("Oscillator 1 Waveform:");
                 ImGui::PushItemWidth(680);
-                if (ImGui::Combo("##WaveformCombo", &g_current_wave_idx, g_wave_names, g_wave_count)) {
-                    send_osc_float("/hds/vco1/shape", (float)g_wave_values[g_current_wave_idx]);
+                float shape_raw = get_state("/hds/vco1/shape", 0.0f);
+                int wave_idx = 0;
+                for (int i = 0; i < g_wave_count; i++) if (g_wave_values[i] == (int)(shape_raw + 0.5f)) { wave_idx = i; break; }
+                if (ImGui::Combo("##WaveformCombo", &wave_idx, g_wave_names, g_wave_count)) {
+                    send_osc_float("/hds/vco1/shape", (float)g_wave_values[wave_idx]);
                 }
                 ImGui::PopItemWidth();
                 ImGui::Spacing(); ImGui::Spacing();
@@ -396,24 +553,29 @@ int main() {
                 ImGui::Text("Osc 1 Amp Envelope (EG 0):");
                 float slider_width = 145.0f, slider_height = 240.0f;
 
-                if (ImGui::VSliderFloat("A##Attack", ImVec2(slider_width, slider_height), &g_attack_ms, 1.0f, 1000.0f, "%.0f ms")) {
-                    send_osc_float("/hds/eg/0/attack", g_attack_ms);
+                float attack_ms = get_state("/hds/eg/0/attack", 10.0f);
+                if (ImGui::VSliderFloat("A##Attack", ImVec2(slider_width, slider_height), &attack_ms, 1.0f, 1000.0f, "%.0f ms")) {
+                    send_osc_float("/hds/eg/0/attack", attack_ms);
                 } ImGui::SameLine(0, 20);
-                if (ImGui::VSliderFloat("D##Decay", ImVec2(slider_width, slider_height), &g_decay_ms, 1.0f, 2000.0f, "%.0f ms")) {
-                    send_osc_float("/hds/eg/0/decay", g_decay_ms);
+                float decay_ms = get_state("/hds/eg/0/decay", 150.0f);
+                if (ImGui::VSliderFloat("D##Decay", ImVec2(slider_width, slider_height), &decay_ms, 1.0f, 2000.0f, "%.0f ms")) {
+                    send_osc_float("/hds/eg/0/decay", decay_ms);
                 } ImGui::SameLine(0, 20);
-                if (ImGui::VSliderFloat("S##Sustain", ImVec2(slider_width, slider_height), &g_sustain_pct, 0.0f, 100.0f, "%.0f%%")) {
-                    send_osc_float("/hds/eg/0/sustain", g_sustain_pct);
+                float sustain_pct = get_state("/hds/eg/0/sustain", 80.0f);
+                if (ImGui::VSliderFloat("S##Sustain", ImVec2(slider_width, slider_height), &sustain_pct, 0.0f, 100.0f, "%.0f%%")) {
+                    send_osc_float("/hds/eg/0/sustain", sustain_pct);
                 } ImGui::SameLine(0, 20);
-                if (ImGui::VSliderFloat("R##Release", ImVec2(slider_width, slider_height), &g_release_ms, 1.0f, 2000.0f, "%.0f ms")) {
-                    send_osc_float("/hds/eg/0/release", g_release_ms);
+                float release_ms = get_state("/hds/eg/0/release", 300.0f);
+                if (ImGui::VSliderFloat("R##Release", ImVec2(slider_width, slider_height), &release_ms, 1.0f, 2000.0f, "%.0f ms")) {
+                    send_osc_float("/hds/eg/0/release", release_ms);
                 }
                 ImGui::Spacing(); ImGui::Spacing();
 
                 ImGui::Text("Master Gain Level:");
                 ImGui::PushItemWidth(680);
-                if (ImGui::SliderFloat("##MasterVolSlider", &g_master_volume, 0.0f, 1.0f, "%.2f")) {
-                    send_osc_float("/hds/master_volume", g_master_volume);
+                float master_volume = get_state("/hds/master_volume", 0.80f);
+                if (ImGui::SliderFloat("##MasterVolSlider", &master_volume, 0.0f, 1.0f, "%.2f")) {
+                    send_osc_float("/hds/master_volume", master_volume);
                 }
                 ImGui::PopItemWidth();
             }

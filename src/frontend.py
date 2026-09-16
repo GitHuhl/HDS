@@ -2293,6 +2293,10 @@ class SynthGui(QWidget):
         # Program save/load: one subfolder per Program (~/HDS_Programs/<name>/<name>.hdsprog
         # [+ <name>.sfz]) -- mirrors the existing ~/HDS_Recordings convention (self.record_folder).
         self.programs_folder = os.path.expanduser("~/HDS_Programs")
+        # The currently-loaded Program's category (schema field alongside "fields"/"name" --
+        # pure metadata, never applied to any OSC address), so re-saving after a Load defaults
+        # to the category it was already filed under instead of forgetting it every time.
+        self._current_program_category = ""
         self._maybe_launch_bundled_backend()
         self.connect_to_backend()
 
@@ -5008,6 +5012,24 @@ class SynthGui(QWidget):
                 widgets["status_label"].setText(f"Loading {name}…")
                 widgets["offset_widget"].setVisible(False)
 
+    def _scan_program_categories(self):
+        """Reads every saved Program's own "category" field (skipping ones that don't have one --
+        older files, or ones deliberately left uncategorized) to seed the Save dialog's category
+        picker with whatever categories are actually in use, rather than a fixed invented list --
+        the same "real, data-driven categories" the Pi-touch client's own Program Library page
+        builds its category tabs from (see src/pi_touch_frontend.cpp)."""
+        seen = []
+        for name in self._scan_programs_folder():
+            path = os.path.join(self.programs_folder, name, f"{name}.hdsprog")
+            try:
+                with open(path) as f:
+                    cat = json.load(f).get("category", "").strip()
+            except (OSError, json.JSONDecodeError):
+                continue
+            if cat and cat not in seen:
+                seen.append(cat)
+        return sorted(seen)
+
     def _pick_and_save_program(self):
         """Save/Load's Save handler -- writes the current Program (every field
         _is_program_scope_address() allows) to ~/HDS_Programs/<name>/<name>.hdsprog, plus a
@@ -5020,12 +5042,26 @@ class SynthGui(QWidget):
         if not ok or not name.strip():
             return
         name = name.strip()
+
+        # Category: a plain metadata field (never applied to any OSC address, see the "fields"
+        # dict below) -- an editable combo, not a fixed enum, so it's a convenience list of
+        # what's already in use plus whatever the user types, not a rigid taxonomy.
+        categories = self._scan_program_categories()
+        default_cat = self._current_program_category
+        combo_items = categories if default_cat in categories or not default_cat else categories + [default_cat]
+        start_idx = combo_items.index(default_cat) if default_cat in combo_items else 0
+        category, ok = QInputDialog.getItem(self, "Save Program", "Category (optional, type to add a new one):",
+                                             combo_items, start_idx, True)
+        if not ok:
+            return
+        category = category.strip()
+
         self.transmit_knob_packet()  # freshen self._last_wire_state before capturing it
         fields = {addr: value for addr, value in self._last_wire_state.items() if _is_program_scope_address(addr)}
         prog_dir = os.path.join(self.programs_folder, name)
         try:
             os.makedirs(prog_dir, exist_ok=True)
-            data = {"format_version": 1, "name": name, "fields": fields}
+            data = {"format_version": 1, "name": name, "category": category, "fields": fields}
             if self.mapping_grid.sample_zones:
                 sfz_filename = f"{name}.sfz"
                 with open(os.path.join(prog_dir, sfz_filename), "w") as f:
@@ -5037,6 +5073,7 @@ class SynthGui(QWidget):
             QMessageBox.warning(self, "Save Program", f"Could not save '{name}':\n{e}")
             return
         self.program_name_field.setText(name)
+        self._current_program_category = category
         self._refresh_combi_program_combos()
 
     def _apply_full_state_fields(self, fields):
@@ -5446,6 +5483,7 @@ class SynthGui(QWidget):
             self.set_mapping_status(None)
 
         self.program_name_field.setText(data.get("name", os.path.splitext(os.path.basename(path))[0]))
+        self._current_program_category = data.get("category", "")
 
     def _cycle_program(self, delta):
         """'◀'/'▶' buttons: load the previous/next saved Program alphabetically from

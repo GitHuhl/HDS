@@ -292,12 +292,22 @@ A digital synthesizer split into two processes:
   an ImGui + GLFW touch UI sized for a small square panel (720x720px, e.g. a 4" Raspberry Pi
   touchscreen), talking real `liblo` OSC to the backend's actual `/hds/...` address space (not a
   fictional protocol -- see the file's own header comment on the exploratory draft it replaced).
-  **Scope is deliberately narrow**: only the ADSR page (Osc 1's Amp EG, Master Volume,
-  Oscillator 1 waveform) is wired to real fields, plus a live Peak/Tempo readback from
-  `/hds/status/*` shown on every page. The Program Library browser is still a hardcoded
-  placeholder table -- reading HDS's real `~/HDS_Programs/*.hdsprog` files from C++ is a separate,
-  larger piece of work this pass didn't attempt -- and the Comb/Seq/Rec/Glob pages remain
-  placeholder text. See "Building the Pi/touchscreen client" under Build & run.
+  The ADSR page (Osc 1's Amp EG, Master Volume, Oscillator 1 waveform) is wired to real fields,
+  plus a live Peak/Tempo readback from `/hds/status/*` shown on every page. The **Program
+  Library** page reads and writes HDS's real `~/HDS_Programs/<name>/<name>.hdsprog` files (the
+  same format `frontend.py`'s own Save/Load uses, JSON-parsed via a vendored nlohmann/json) --
+  Load sends a saved file's entire field set straight to the backend (a real whole-patch load,
+  not just the handful of fields this page's own sliders show); Save captures this client's own
+  observed backend state (see `g_full_state`/`/hds/request_state` in the file) through a C++ port
+  of `frontend.py`'s own `_is_program_scope_address()` allowlist, so either app can load what the
+  other saved. Category is a real, open (not fixed-enum) metadata field on the file, extending the
+  schema `frontend.py`'s own Save dialog now also writes -- the Program Library's category tabs
+  are built from whatever's actually in use across saved files, not a hardcoded list. A loaded
+  file's colocated `.sfz` (Sample Bank content) is flagged, not applied -- this client has no
+  Mapping-tab equivalent. The Comb/Seq/Rec/Glob pages remain placeholder text. A Raspberry Pi 5
+  (or any other aarch64 Linux box) needs no cross-compile target -- it's just another native Linux
+  host for this same Makefile: install the same apt packages and run `make`/`make pi-touch`
+  directly on the Pi. See "Building the Pi/touchscreen client" under Build & run.
 
   The **Mapping** tab is the real Sample Bank zone editor for the DFD
   engine above: drag-and-drop a `.wav` file onto a reference piano
@@ -609,10 +619,10 @@ bundled engine automatically on startup (a no-op in every other run mode, includ
 ### Building the Pi/touchscreen client
 
 `src/pi_touch_frontend.cpp` (see its own description above) is an optional third build target,
-not part of plain `make`. Needs GLFW3 + OpenGL + liblo dev headers; Dear ImGui itself is vendored
-into `third_party/imgui/` (pinned to tag `v1.91.5`, MIT licensed,
-[github.com/ocornut/imgui](https://github.com/ocornut/imgui)) rather than assumed to be a system
-package, the same vendoring precedent as `third_party/miniaudio.h`/the CLAP SDK headers.
+not part of plain `make`. Needs GLFW3 + OpenGL + liblo dev headers; Dear ImGui (pinned `v1.91.5`)
+and [nlohmann/json](https://github.com/nlohmann/json) (pinned `v3.11.3`, single-header, MIT
+licensed, used to read/write real `.hdsprog` files) are vendored into `third_party/` rather than
+assumed to be system packages, the same precedent as `third_party/miniaudio.h`/the CLAP SDK headers.
 
 ```sh
 sudo apt-get install libglfw3-dev liblo-dev    # Debian/Ubuntu
@@ -621,12 +631,24 @@ make pi-touch                                   # builds ./hds_pi_touch
 ./hds_pi_touch                                  # talks to the engine over the same OSC ports
 ```
 
-Verified in this repo's own sandbox (no real Pi/touchscreen hardware available here) via Xvfb: a
-clean build with zero warnings, a captured real `/hds/request_state` datagram on the wire at
-startup, and a screenshot confirming the ADSR sliders/waveform combo correctly update to match a
-synthetic reply and the Peak/Tempo readout flips from "NO SIGNAL" to "LIVE" on receiving a real
-`/hds/status/*` bundle -- real hardware, touch input, and 4" panel readability are still the
-user's own confirmation to make, same limitation as this project's other platform-specific work.
+**Raspberry Pi 5** (or any other aarch64 Linux machine) needs no cross-compile target -- it's a
+native Linux host like any other for this exact Makefile: install the same four apt packages
+(add `libwavpack-dev` too if also building `synth_engine` on-device) and run the commands above
+directly on the Pi.
+
+Verified in this repo's own sandbox (no real Pi/touchscreen hardware available here) via Xvfb and
+`xdotool`-driven real mouse/keyboard input against a synthetic fake-backend OSC peer: clean builds
+with zero warnings across `make`/`make clap`/`make pi-touch`; a captured real `/hds/request_state`
+datagram on the wire at startup; screenshots confirming the ADSR sliders/waveform combo update to
+match a synthetic reply and the Peak/Tempo readout flips "NO SIGNAL"->"LIVE" on a real
+`/hds/status/*` bundle; the Program Library's category tabs building themselves correctly from two
+real `.hdsprog` files with different categories; a real double-click Load sending a loaded file's
+entire field set over OSC (not just the fields this page's own sliders show) and the ADSR page
+updating to match; and a real Save round-trip whose written file correctly includes a Program-scope
+field the UI never displays while correctly excluding `master_volume`, an `/hds/audio/`-prefixed
+field, and a `/hds/combi/`-lane mirror -- proving the ported allowlist filter matches
+`frontend.py`'s own. Real hardware, touch input, and 4" panel readability are still the user's own
+confirmation to make, same limitation as this project's other platform-specific work.
 
 ### Control protocol: OSC
 
