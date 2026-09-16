@@ -268,7 +268,7 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
     // means "this project's own samples," not "add these on top of whatever was already there"
     // (same posture frontend.py's own Program-load-with-SFZ path already established).
     for (int s = 0; s < g_sample_slot_count; s++) {
-        if (g_sample_slots[s].active) apply_zone_remove(g_sample_slots[s].zone_id);
+        if (g_sample_slots[s].active) apply_zone_remove(&g_sample_engine, g_sample_slots[s].zone_id);
     }
 
     int applied_knobs = 0, skipped_knobs = 0, applied_zones = 0;
@@ -315,7 +315,7 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
                 rec.loop_release_exit = loop_release_exit_i ? 1.0f : 0.0f;
                 rec.end_frac = (float)end_frac;
                 snprintf(rec.path, sizeof(rec.path), "%s", path);
-                apply_zone_upsert(&rec); // brand-new zone -> queued via enqueue_pending_sample_load, picked up by this instance's own drain_pending_sample_loads() poll in process()
+                apply_zone_upsert(&g_sample_engine, &rec); // brand-new zone -> queued via enqueue_pending_sample_load, picked up by this instance's own drain_pending_sample_loads() poll in process()
                 applied_zones++;
             }
         }
@@ -390,8 +390,8 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
     char listen_port_str[16]; snprintf(listen_port_str, sizeof(listen_port_str), "%d", CLAP_OSC_LISTEN_PORT);
     p->osc_server = lo_server_new_with_proto(listen_port_str, LO_UDP, osc_error_handler);
     if (p->osc_server) {
-        lo_server_add_method(p->osc_server, "/hds/zone/upsert", "ifffffffffffffffffs", zone_upsert_handler, NULL);
-        lo_server_add_method(p->osc_server, "/hds/zone/remove", "i", zone_remove_handler, NULL);
+        lo_server_add_method(p->osc_server, "/hds/zone/upsert", "ifffffffffffffffffs", zone_upsert_handler, &g_sample_engine);
+        lo_server_add_method(p->osc_server, "/hds/zone/remove", "i", zone_remove_handler, &g_sample_engine);
         lo_server_add_method(p->osc_server, NULL, NULL, generic_osc_handler, &p->knobs);
         char reply_port_str[16]; snprintf(reply_port_str, sizeof(reply_port_str), "%d", CLAP_OSC_REPLY_PORT);
         p->osc_reply_addr = lo_address_new(CLAP_OSC_REPLY_HOST, reply_port_str);
@@ -410,7 +410,7 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
     // requested and exit immediately. Safe: deactivate() only sets it after pthread_join()
     // confirms the old thread has fully exited.
     atomic_store_explicit(&g_sample_disk_thread_shutdown, false, memory_order_release);
-    bool disk_thread_ok = (pthread_create(&g_sample_disk_thread, NULL, sample_disk_thread_main, NULL) == 0);
+    bool disk_thread_ok = (pthread_create(&g_sample_disk_thread, NULL, sample_disk_thread_main, &g_sample_engine) == 0);
     if (!disk_thread_ok) {
         fprintf(stderr, "[hds-clap] failed to start sample disk streaming thread -- WAVE_SAMPLE playback unavailable this session\n");
     }
@@ -488,7 +488,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
     poll_transport_triggers(&p->knobs, current_tempo_bpm);
     poll_metronome(&p->knobs, current_tempo_bpm);
     poll_seq_audio_transport_catchup(&p->knobs);
-    drain_pending_sample_loads();
+    drain_pending_sample_loads(&g_sample_engine);
 
     if (process->in_events) {
         uint32_t ev_count = process->in_events->size(process->in_events);

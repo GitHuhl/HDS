@@ -4512,6 +4512,27 @@ static HdsSampleSlotState g_sample_slot_state;
 #define g_sample_slots g_sample_slot_state.sample_slots
 #define g_sample_slot_count g_sample_slot_state.sample_slot_count
 
+// Multi-instance refactor, Phase 3: bundles the three sample-streaming tiers (each already a
+// separate global for pure struct-ordering reasons -- see this struct's own comment above) into
+// one handle so the sample-streaming functions below only need ONE new parameter each, not up to
+// three. Forward-declares HdsStreamsState/HdsPendingLoadState (defined further down, once their
+// own member types are complete) as bare struct tags -- legal here because HdsSampleEngine only
+// holds POINTERS to them, which are a complete type regardless of whether the pointed-to struct
+// itself is complete yet. Can't bundle all four HdsEngineState tiers together (HdsEngineState
+// itself isn't declared until much later, after SeqMidiLane) -- this bundle covers exactly the
+// tiers load_sample_slot() and its neighbors, declared right after this, need. The actual
+// g_sample_engine global instance is declared much further down (see its own comment), once
+// HdsStreamsState/HdsPendingLoadState's own globals actually exist to point at -- still just one
+// shared instance for now (identical to before this phase, same as HdsEngineState itself); real
+// per-instance allocation is Phase 6's job.
+typedef struct HdsStreamsState HdsStreamsState;
+typedef struct HdsPendingLoadState HdsPendingLoadState;
+typedef struct {
+    HdsSampleSlotState *slots;
+    HdsStreamsState *streams;
+    HdsPendingLoadState *pending;
+} HdsSampleEngine;
+
 #define SAMPLE_CHECK_READ(ptr, size, count, stream) \
     do { if (fread(ptr, size, count, stream) != (size_t)(count)) { fclose(stream); return false; } } while (0)
 
@@ -4523,9 +4544,9 @@ static HdsSampleSlotState g_sample_slot_state;
 // reset to a safe "off, full-range" placeholder here -- the real per-zone loop points get
 // reapplied by the caller immediately after this returns (see the OSC zone handlers'
 // throttled load drain), once total_frames (just parsed below) makes that conversion possible.
-static bool load_sample_slot(int index, const char *path, int root_note) {
+static bool load_sample_slot(HdsSampleEngine *se, int index, const char *path, int root_note) {
     if (index < 0 || index >= SAMPLE_SLOT_CAPACITY) return false;
-    SampleSlot *slot = &g_sample_slots[index];
+    SampleSlot *slot = &se->slots->sample_slots[index];
 
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[sample] failed to open '%s': %s\n", path, strerror(errno)); return false; }
@@ -4793,7 +4814,7 @@ typedef struct {
 // be visible before the functions right after this point start using them, and SampleStream was
 // already ready by the time SeqAudioLane became available, so one combined declaration here
 // covers both with no further splitting needed.
-typedef struct {
+typedef struct HdsStreamsState {
     SampleStream sample_streams[MAX_SAMPLE_STREAMS];
     pthread_t    sample_disk_thread;
     _Atomic bool sample_disk_thread_shutdown;
@@ -5086,16 +5107,17 @@ static void poll_seq_audio_preview_triggers(const SynthSharedControls *knobs) {
 // handle_note_on). Returns -1 if the pool is exhausted -- a real possibility if someone tries to
 // play more simultaneous WAVE_SAMPLE oscillators than MAX_SAMPLE_STREAMS; the caller treats -1
 // as "this oscillator stays silent until a slot frees up," never a crash.
-static int claim_sample_stream(int slot_index, unsigned int start_frame) {
+static int claim_sample_stream(HdsSampleEngine *se, int slot_index, unsigned int start_frame) {
+    SampleStream *streams = se->streams->sample_streams;
     for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
-        if (!g_sample_streams[i].in_use) {
-            g_sample_streams[i].in_use = true;
-            atomic_store_explicit(&g_sample_streams[i].slot_index, slot_index, memory_order_relaxed);
-            atomic_store_explicit(&g_sample_streams[i].start_frame, start_frame, memory_order_relaxed);
+        if (!streams[i].in_use) {
+            streams[i].in_use = true;
+            atomic_store_explicit(&streams[i].slot_index, slot_index, memory_order_relaxed);
+            atomic_store_explicit(&streams[i].start_frame, start_frame, memory_order_relaxed);
             // Fresh note, fresh session -- a reclaimed pool entry must not inherit a stale `true`
             // left over from whatever earlier note last released this same slot.
-            atomic_store_explicit(&g_sample_streams[i].release_requested, false, memory_order_relaxed);
-            atomic_store_explicit(&g_sample_streams[i].command, SAMPLE_CMD_START, memory_order_release);
+            atomic_store_explicit(&streams[i].release_requested, false, memory_order_relaxed);
+            atomic_store_explicit(&streams[i].command, SAMPLE_CMD_START, memory_order_release);
             return i;
         }
     }
@@ -5104,10 +5126,10 @@ static int claim_sample_stream(int slot_index, unsigned int start_frame) {
 
 // Releases a claimed stream back to the pool (audio-thread only) and tells the disk thread to
 // close its file. Safe to call even if a STOP is already pending/being processed.
-static void release_sample_stream(int stream_index) {
+static void release_sample_stream(HdsSampleEngine *se, int stream_index) {
     if (stream_index < 0 || stream_index >= MAX_SAMPLE_STREAMS) return;
-    atomic_store_explicit(&g_sample_streams[stream_index].command, SAMPLE_CMD_STOP, memory_order_release);
-    g_sample_streams[stream_index].in_use = false;
+    atomic_store_explicit(&se->streams->sample_streams[stream_index].command, SAMPLE_CMD_STOP, memory_order_release);
+    se->streams->sample_streams[stream_index].in_use = false;
 }
 
 // Marks a claimed stream's note as having entered RELEASE (audio-thread only, called once from
@@ -5115,17 +5137,17 @@ static void release_sample_stream(int stream_index) {
 // loop_release_exit zone should keep honoring its loop or fall through to its natural end -- see
 // SampleSlot.loop_release_exit's own comment. A no-op on an already-released/invalid stream index,
 // same defensive shape as release_sample_stream() above.
-static void request_sample_stream_release(int stream_index) {
+static void request_sample_stream_release(HdsSampleEngine *se, int stream_index) {
     if (stream_index < 0 || stream_index >= MAX_SAMPLE_STREAMS) return;
-    atomic_store_explicit(&g_sample_streams[stream_index].release_requested, true, memory_order_release);
+    atomic_store_explicit(&se->streams->sample_streams[stream_index].release_requested, true, memory_order_release);
 }
 
 static void *sample_disk_thread_main(void *arg) {
-    (void)arg;
+    HdsSampleEngine *se = (HdsSampleEngine *)arg;
     for (;;) {
         bool work_done = false;
         for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
-            SampleStream *st = &g_sample_streams[i];
+            SampleStream *st = &se->streams->sample_streams[i];
 
             int cmd = atomic_exchange_explicit(&st->command, SAMPLE_CMD_NONE, memory_order_acquire);
             if (cmd == SAMPLE_CMD_START) {
@@ -5138,7 +5160,7 @@ static void *sample_disk_thread_main(void *arg) {
                 st->active_slot_index = atomic_load_explicit(&st->slot_index, memory_order_acquire);
                 st->active_start_frame = atomic_load_explicit(&st->start_frame, memory_order_acquire);
                 st->disk_reverse_exhausted = false;
-                SampleSlot *slot = (st->active_slot_index >= 0 && st->active_slot_index < SAMPLE_SLOT_CAPACITY) ? &g_sample_slots[st->active_slot_index] : NULL;
+                SampleSlot *slot = (st->active_slot_index >= 0 && st->active_slot_index < SAMPLE_SLOT_CAPACITY) ? &se->slots->sample_slots[st->active_slot_index] : NULL;
                 if (slot && slot->loaded) {
                     st->disk_file_handle = fopen(slot->file_path, "rb");
                     // Forward zones still get the pre-roll optimization (always covers frames
@@ -5158,7 +5180,7 @@ static void *sample_disk_thread_main(void *arg) {
             }
 
             if (!st->disk_file_handle) continue;
-            SampleSlot *slot = &g_sample_slots[st->active_slot_index];
+            SampleSlot *slot = &se->slots->sample_slots[st->active_slot_index];
             int bytes_per_frame_unit = slot->bits_per_sample / 8;
             int bytes_per_frame = bytes_per_frame_unit * slot->num_channels;
 
@@ -5297,7 +5319,7 @@ static void *sample_disk_thread_main(void *arg) {
             work_done = true;
         }
 
-        if (atomic_load_explicit(&g_sample_disk_thread_shutdown, memory_order_acquire)) break;
+        if (atomic_load_explicit(&se->streams->sample_disk_thread_shutdown, memory_order_acquire)) break;
         if (!work_done) { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); } // 1ms idle poll
     }
     return NULL;
@@ -5365,7 +5387,7 @@ typedef struct {
 // This tier (see HdsSampleSlotState's own comment for why this is split into several structs):
 // the throttled sample-load queue plus round-robin cycling state, grouped together since both
 // need PendingSampleLoad (just declared) and nothing later.
-typedef struct {
+typedef struct HdsPendingLoadState {
     PendingSampleLoad pending_loads[PENDING_SAMPLE_LOAD_CAPACITY];
     int          pending_load_head, pending_load_tail, pending_load_count;
     unsigned int round_robin_hit_count[MAX_ROUND_ROBIN_GROUPS + 1];
@@ -5377,12 +5399,18 @@ static HdsPendingLoadState g_pending_load_state;
 #define g_pending_load_count g_pending_load_state.pending_load_count
 #define g_round_robin_hit_count g_pending_load_state.round_robin_hit_count
 
-static void enqueue_pending_sample_load(int slot_index, const ZoneRecordWire *rec) {
-    if (g_pending_load_count >= PENDING_SAMPLE_LOAD_CAPACITY) {
+// The actual HdsSampleEngine global instance -- the type itself is forward-declared much earlier
+// (right after HdsSampleSlotState, see that comment for why) so load_sample_slot() and friends
+// can take it as a parameter; the instance is only declared here, now that all three tiers'
+// globals it points at actually exist.
+static HdsSampleEngine g_sample_engine = { &g_sample_slot_state, &g_streams_state, &g_pending_load_state };
+
+static void enqueue_pending_sample_load(HdsSampleEngine *se, int slot_index, const ZoneRecordWire *rec) {
+    if (se->pending->pending_load_count >= PENDING_SAMPLE_LOAD_CAPACITY) {
         fprintf(stderr, "[samples] pending-load queue full -- dropping load for zone_id %d (re-send to retry)\n", rec->zone_id);
         return;
     }
-    PendingSampleLoad *p = &g_pending_loads[g_pending_load_tail];
+    PendingSampleLoad *p = &se->pending->pending_loads[se->pending->pending_load_tail];
     p->slot_index = slot_index;
     p->zone_id = rec->zone_id;
     snprintf(p->path, SAMPLE_PATH_LEN, "%s", rec->path);
@@ -5398,8 +5426,8 @@ static void enqueue_pending_sample_load(int slot_index, const ZoneRecordWire *re
     p->reverse = rec->reverse != 0.0f;
     p->loop_release_exit = rec->loop_release_exit != 0.0f;
     p->end_frac = rec->end_frac;
-    g_pending_load_tail = (g_pending_load_tail + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
-    g_pending_load_count++;
+    se->pending->pending_load_tail = (se->pending->pending_load_tail + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
+    se->pending->pending_load_count++;
 }
 
 // Converts loop-point fractions to real frame indices (shared by drain_pending_sample_loads() and
@@ -5442,11 +5470,11 @@ static void apply_playback_end(SampleSlot *slot, float end_frac) {
 // this only at message-receipt time (like the old apply_sample_slot_zone_metadata() did every
 // block) would leave a sample that was still queued when its metadata arrived stuck on the
 // load-time placeholder loop points forever.
-static void drain_pending_sample_loads(void) {
-    for (int i = 0; i < SAMPLE_LOADS_PER_BLOCK && g_pending_load_count > 0; i++) {
-        PendingSampleLoad *p = &g_pending_loads[g_pending_load_head];
-        g_pending_load_head = (g_pending_load_head + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
-        g_pending_load_count--;
+static void drain_pending_sample_loads(HdsSampleEngine *se) {
+    for (int i = 0; i < SAMPLE_LOADS_PER_BLOCK && se->pending->pending_load_count > 0; i++) {
+        PendingSampleLoad *p = &se->pending->pending_loads[se->pending->pending_load_head];
+        se->pending->pending_load_head = (se->pending->pending_load_head + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
+        se->pending->pending_load_count--;
 
         // A ZONE_OP_REMOVE can tombstone this slot_index while its load is still sitting in the
         // queue (added, then removed again before its throttled turn comes up) -- the removal
@@ -5454,10 +5482,10 @@ static void drain_pending_sample_loads(void) {
         // setting active back to true. Safe under the append-only invariant (a slot_index is
         // never reused for a different zone_id), so this can only be the same zone this load was
         // originally queued for.
-        if (!g_sample_slots[p->slot_index].active) continue;
+        if (!se->slots->sample_slots[p->slot_index].active) continue;
 
-        if (load_sample_slot(p->slot_index, p->path, p->root_note)) {
-            SampleSlot *slot = &g_sample_slots[p->slot_index];
+        if (load_sample_slot(se, p->slot_index, p->path, p->root_note)) {
+            SampleSlot *slot = &se->slots->sample_slots[p->slot_index];
             slot->min_note = p->min_note; slot->max_note = p->max_note;
             slot->min_velocity = p->min_velocity; slot->max_velocity = p->max_velocity;
             slot->unpitched = p->unpitched;
@@ -5471,7 +5499,7 @@ static void drain_pending_sample_loads(void) {
             apply_playback_end(slot, p->end_frac);
         } else {
             fprintf(stderr, "[samples] failed to load queued sample '%s' (zone_id %d)\n", p->path, p->zone_id);
-            g_sample_slots[p->slot_index].active = false;
+            se->slots->sample_slots[p->slot_index].active = false;
         }
     }
 }
@@ -5479,32 +5507,32 @@ static void drain_pending_sample_loads(void) {
 // Applies one zone upsert -- unchanged logic from the old wire-parsed version, just fed an
 // already-populated ZoneRecordWire (built from OSC args in zone_upsert_handler() below) instead
 // of parsing one out of a raw byte buffer.
-static void apply_zone_upsert(const ZoneRecordWire *rec) {
+static void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     int found_index = -1;
-    for (int s = 0; s < g_sample_slot_count; s++) {
-        if (g_sample_slots[s].active && g_sample_slots[s].zone_id == rec->zone_id) { found_index = s; break; }
+    for (int s = 0; s < se->slots->sample_slot_count; s++) {
+        if (se->slots->sample_slots[s].active && se->slots->sample_slots[s].zone_id == rec->zone_id) { found_index = s; break; }
     }
 
     if (found_index < 0) {
-        // Brand new zone -- append. g_sample_slots is a plain static array (zero-initialized
+        // Brand new zone -- append. sample_slots is a plain static array (zero-initialized
         // BSS), so a never-before-used position already has loaded=false, pre_roll_l/r=NULL,
         // etc.; only zone_id/active need setting explicitly here.
-        if (g_sample_slot_count >= SAMPLE_SLOT_CAPACITY) {
+        if (se->slots->sample_slot_count >= SAMPLE_SLOT_CAPACITY) {
             fprintf(stderr, "[samples] Sample Bank at its %d-zone capacity -- ignoring zone_id %d\n", SAMPLE_SLOT_CAPACITY, rec->zone_id);
             return;
         }
-        found_index = g_sample_slot_count++;
-        g_sample_slots[found_index].zone_id = rec->zone_id;
-        g_sample_slots[found_index].active = true;
-        enqueue_pending_sample_load(found_index, rec);
+        found_index = se->slots->sample_slot_count++;
+        se->slots->sample_slots[found_index].zone_id = rec->zone_id;
+        se->slots->sample_slots[found_index].active = true;
+        enqueue_pending_sample_load(se, found_index, rec);
         return;
     }
 
-    SampleSlot *slot = &g_sample_slots[found_index];
+    SampleSlot *slot = &se->slots->sample_slots[found_index];
     if (strncmp(slot->file_path, rec->path, SAMPLE_PATH_LEN) != 0 || !slot->loaded) {
         // Path changed (or a previous load of this same slot never finished/failed) -- (re)queue
         // rather than apply cheap fields in place.
-        enqueue_pending_sample_load(found_index, rec);
+        enqueue_pending_sample_load(se, found_index, rec);
         return;
     }
 
@@ -5523,13 +5551,13 @@ static void apply_zone_upsert(const ZoneRecordWire *rec) {
     apply_playback_end(slot, rec->end_frac);
 }
 
-static void apply_zone_remove(int32_t zone_id) {
-    for (int s = 0; s < g_sample_slot_count; s++) {
-        if (g_sample_slots[s].active && g_sample_slots[s].zone_id == zone_id) {
-            g_sample_slots[s].active = false;
-            g_sample_slots[s].loaded = false; // matches the pre-existing "empty path" unload behavior
-            free(g_sample_slots[s].pre_roll_l); g_sample_slots[s].pre_roll_l = NULL;
-            free(g_sample_slots[s].pre_roll_r); g_sample_slots[s].pre_roll_r = NULL;
+static void apply_zone_remove(HdsSampleEngine *se, int32_t zone_id) {
+    for (int s = 0; s < se->slots->sample_slot_count; s++) {
+        if (se->slots->sample_slots[s].active && se->slots->sample_slots[s].zone_id == zone_id) {
+            se->slots->sample_slots[s].active = false;
+            se->slots->sample_slots[s].loaded = false; // matches the pre-existing "empty path" unload behavior
+            free(se->slots->sample_slots[s].pre_roll_l); se->slots->sample_slots[s].pre_roll_l = NULL;
+            free(se->slots->sample_slots[s].pre_roll_r); se->slots->sample_slots[s].pre_roll_r = NULL;
             break;
         }
     }
@@ -5542,19 +5570,21 @@ static void apply_zone_remove(int32_t zone_id) {
 // matches exactly, so argc/types are already guaranteed correct -- no manual validation needed,
 // unlike generic_osc_handler's table.
 static int zone_upsert_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
-    (void)path; (void)types; (void)argc; (void)msg; (void)user_data;
+    (void)path; (void)types; (void)argc; (void)msg;
+    HdsSampleEngine *se = (HdsSampleEngine *)user_data;
     ZoneRecordWire rec;
     rec.zone_id = argv[0]->i;
     float *f = &rec.root_note; // root_note..end_frac are 17 consecutive floats
     for (int i = 0; i < 17; i++) f[i] = argv[1 + i]->f;
     snprintf(rec.path, SAMPLE_PATH_LEN, "%s", (const char *)&argv[18]->s);
-    apply_zone_upsert(&rec);
+    apply_zone_upsert(se, &rec);
     return 0;
 }
 // "/hds/zone/remove" i -- a single zone_id.
 static int zone_remove_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
-    (void)path; (void)types; (void)argc; (void)msg; (void)user_data;
-    apply_zone_remove(argv[0]->i);
+    (void)path; (void)types; (void)argc; (void)msg;
+    HdsSampleEngine *se = (HdsSampleEngine *)user_data;
+    apply_zone_remove(se, argv[0]->i);
     return 0;
 }
 
@@ -5580,12 +5610,12 @@ static int zone_remove_handler(const char *path, const char *types, lo_arg **arg
 // here because g_sample_slots is strictly append-only (see its own comment) -- array index order
 // and zone_id creation order are the same thing. That invariant would need revisiting if slot
 // reuse/compaction is ever added later.
-static int find_matching_sample_slot(int note, int velocity) {
+static int find_matching_sample_slot(HdsSampleEngine *se, int note, int velocity) {
     long best_area = -1; // -1 sentinel: "no candidate yet", distinct from a real zero-area zone
     int first_best_idx = -1;
     int tie_count = 0;
-    for (int i = 0; i < g_sample_slot_count; i++) {
-        SampleSlot *slot = &g_sample_slots[i];
+    for (int i = 0; i < se->slots->sample_slot_count; i++) {
+        SampleSlot *slot = &se->slots->sample_slots[i];
         if (!slot->active || !slot->loaded) continue;
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
@@ -5596,12 +5626,12 @@ static int find_matching_sample_slot(int note, int velocity) {
     if (tie_count == 0) return -1;
     if (tie_count == 1) return first_best_idx;
 
-    int group = g_sample_slots[first_best_idx].round_robin_group;
+    int group = se->slots->sample_slots[first_best_idx].round_robin_group;
     if (group <= 0) return first_best_idx;
 
     int member_count = 0;
-    for (int i = 0; i < g_sample_slot_count; i++) {
-        SampleSlot *slot = &g_sample_slots[i];
+    for (int i = 0; i < se->slots->sample_slot_count; i++) {
+        SampleSlot *slot = &se->slots->sample_slots[i];
         if (!slot->active || !slot->loaded) continue;
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
@@ -5612,11 +5642,11 @@ static int find_matching_sample_slot(int note, int velocity) {
 
     int group_idx = group;
     if (group_idx < 1) group_idx = 1; else if (group_idx > MAX_ROUND_ROBIN_GROUPS) group_idx = MAX_ROUND_ROBIN_GROUPS;
-    unsigned int hit = g_round_robin_hit_count[group_idx]++;
+    unsigned int hit = se->pending->round_robin_hit_count[group_idx]++;
     unsigned int target_ordinal = hit % (unsigned int)member_count;
     unsigned int ordinal = 0;
-    for (int i = 0; i < g_sample_slot_count; i++) {
-        SampleSlot *slot = &g_sample_slots[i];
+    for (int i = 0; i < se->slots->sample_slot_count; i++) {
+        SampleSlot *slot = &se->slots->sample_slots[i];
         if (!slot->active || !slot->loaded) continue;
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
@@ -5634,12 +5664,12 @@ static int find_matching_sample_slot(int note, int velocity) {
 // find_matching_sample_slot finds a zone covering this note+velocity. Leaves *stream_idx at -1
 // (silent) if nothing matches or the stream pool is exhausted, rather than failing the whole
 // note-on.
-static void start_sample_osc(int *stream_idx, double *ptr, bool *preroll, int note, int velocity) {
-    if (*stream_idx >= 0) { release_sample_stream(*stream_idx); *stream_idx = -1; }
-    int slot_idx = find_matching_sample_slot(note, velocity);
+static void start_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr, bool *preroll, int note, int velocity) {
+    if (*stream_idx >= 0) { release_sample_stream(se, *stream_idx); *stream_idx = -1; }
+    int slot_idx = find_matching_sample_slot(se, note, velocity);
     unsigned int start_frame = 0;
     if (slot_idx >= 0) {
-        SampleSlot *slot = &g_sample_slots[slot_idx];
+        SampleSlot *slot = &se->slots->sample_slots[slot_idx];
         // start_offset_frac is where in the file playback begins, in the travel direction (see
         // SampleSlot.reverse's comment) -- computed ONCE here, on the audio thread, from the one
         // live copy of this field, then handed to the disk thread atomically via
@@ -5668,28 +5698,28 @@ static void start_sample_osc(int *stream_idx, double *ptr, bool *preroll, int no
         *ptr = 0.0;
         *preroll = true;
     }
-    *stream_idx = (slot_idx >= 0) ? claim_sample_stream(slot_idx, start_frame) : -1;
+    *stream_idx = (slot_idx >= 0) ? claim_sample_stream(se, slot_idx, start_frame) : -1;
 }
 
 // Called once per active voice per sample from render_audio_block, right after the EG tick loop
 // -- if an oscillator's amp envelope has gone idle but it's still holding a claimed sample
 // stream, releases it. Idempotent (stream_index stays -1 afterward, so this is a cheap no-op on
 // every subsequent call) and cheap enough to run unconditionally.
-static void release_idle_sample_streams(SynthVoice *voice) {
+static void release_idle_sample_streams(HdsSampleEngine *se, SynthVoice *voice) {
     if (voice->vco1_eg.state == STATE_IDLE && voice->vco1_sample_stream >= 0) {
-        release_sample_stream(voice->vco1_sample_stream);
+        release_sample_stream(se, voice->vco1_sample_stream);
         voice->vco1_sample_stream = -1;
     }
     if (voice->vco2_eg.state == STATE_IDLE && voice->vco2_sample_stream >= 0) {
-        release_sample_stream(voice->vco2_sample_stream);
+        release_sample_stream(se, voice->vco2_sample_stream);
         voice->vco2_sample_stream = -1;
     }
     if (voice->vco3_eg.state == STATE_IDLE && voice->vco3_sample_stream >= 0) {
-        release_sample_stream(voice->vco3_sample_stream);
+        release_sample_stream(se, voice->vco3_sample_stream);
         voice->vco3_sample_stream = -1;
     }
     if (voice->vco4_eg.state == STATE_IDLE && voice->vco4_sample_stream >= 0) {
-        release_sample_stream(voice->vco4_sample_stream);
+        release_sample_stream(se, voice->vco4_sample_stream);
         voice->vco4_sample_stream = -1;
     }
 }
@@ -5711,11 +5741,11 @@ static void release_idle_sample_streams(SynthVoice *voice) {
 // independently end to end (interpolation, loop-splice crossfade, everything); mono is only
 // ever collapsed at the very last step here, so a stereo drum loop or pad keeps its real width
 // instead of being downmixed, the same fix WAVE_UNISON_SAW's own stereo image needed earlier.
-static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll_inout, float hz, float *out_l_ptr, float *out_r_ptr) {
+static float render_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr_inout, bool *preroll_inout, float hz, float *out_l_ptr, float *out_r_ptr) {
     if (*stream_idx < 0) { if (out_l_ptr) *out_l_ptr = 0.0f; if (out_r_ptr) *out_r_ptr = 0.0f; return 0.0f; }
-    SampleStream *stream = &g_sample_streams[*stream_idx];
+    SampleStream *stream = &se->streams->sample_streams[*stream_idx];
     if (!stream->in_use) { *stream_idx = -1; if (out_l_ptr) *out_l_ptr = 0.0f; if (out_r_ptr) *out_r_ptr = 0.0f; return 0.0f; } // reclaimed elsewhere -- defensive, shouldn't happen
-    SampleSlot *slot = &g_sample_slots[atomic_load_explicit(&stream->slot_index, memory_order_relaxed)];
+    SampleSlot *slot = &se->slots->sample_slots[atomic_load_explicit(&stream->slot_index, memory_order_relaxed)];
     if (!slot->loaded) { if (out_l_ptr) *out_l_ptr = 0.0f; if (out_r_ptr) *out_r_ptr = 0.0f; return 0.0f; }
 
     float ratio;
@@ -5771,7 +5801,7 @@ static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll
                 // read past what's actually been written. A genuinely-behind disk thread on a
                 // LOOPING sample instead just holds silent below rather than tearing the voice
                 // down (vanishingly rare given the pre-roll head start and the ring's depth).
-                release_sample_stream(*stream_idx);
+                release_sample_stream(se, *stream_idx);
                 *stream_idx = -1;
                 *ptr_inout = ptr; *preroll_inout = preroll;
                 if (out_l_ptr) *out_l_ptr = 0.0f;
@@ -5840,6 +5870,7 @@ static float render_sample_osc(int *stream_idx, double *ptr_inout, bool *preroll
 // [-100,100] for Tilt) -- this function applies the /100 scaling itself so callers never need to
 // know which of the two meanings currently applies.
 static float render_fm_oscillator(
+    HdsSampleEngine *se,
     WaveType shape, float own_phase, float dt, float phase_offset, float modulator_sum,
     float *prev_fm_phase, float pulse_or_tilt_input, float *tri_state, float *tilt_lp,
     float noise_tilt_coeff, float unison_saw_phases[UNISON_SAW_VOICES], float unison_detune_final,
@@ -5853,7 +5884,7 @@ static float render_fm_oscillator(
         return render_unison_saw(unison_saw_phases, dt, unison_detune_final, unison_pan_l, unison_pan_r, phase_offset, out_side_l, out_side_r);
     }
     if (shape == WAVE_SAMPLE) {
-        return render_sample_osc(sample_stream, sample_ptr, sample_preroll, hz, out_side_l, out_side_r);
+        return render_sample_osc(se, sample_stream, sample_ptr, sample_preroll, hz, out_side_l, out_side_r);
     }
 
     float mod_phase = own_phase + modulator_sum;
@@ -5989,13 +6020,13 @@ static void assert_fm_algorithms_acyclic(void) {
 // since that function is shared with the unison-saw/periodic-wave branches which depend on state
 // (fm_phase, phase_offset) not available until later in the per-voice loop; special-casing WAVE_
 // SAMPLE there to emit early would be a bigger, riskier change than this one small duplication.
-static float sample_osc_zone_pan_offset(int stream_idx) {
+static float sample_osc_zone_pan_offset(HdsSampleEngine *se, int stream_idx) {
     if (stream_idx < 0) return 0.0f;
-    SampleStream *stream = &g_sample_streams[stream_idx];
+    SampleStream *stream = &se->streams->sample_streams[stream_idx];
     if (!stream->in_use) return 0.0f;
     int slot_idx = atomic_load_explicit(&stream->slot_index, memory_order_relaxed);
     if (slot_idx < 0 || slot_idx >= SAMPLE_SLOT_CAPACITY) return 0.0f;
-    SampleSlot *slot = &g_sample_slots[slot_idx];
+    SampleSlot *slot = &se->slots->sample_slots[slot_idx];
     return slot->loaded ? slot->pan : 0.0f;
 }
 
@@ -6075,27 +6106,27 @@ static void handle_note_on(SynthVoice voices[], SynthSharedControls *knobs, floa
         // and release any stream a stolen/retriggered voice was still holding from a previous
         // note even if this new note doesn't need one -- see start_sample_osc()'s comment.
         if ((WaveType)((int)prog->vco1_shape) == WAVE_SAMPLE) {
-            start_sample_osc(&voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, note, velocity);
+            start_sample_osc(&g_sample_engine, &voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, note, velocity);
         } else if (voices[slot].vco1_sample_stream >= 0) {
-            release_sample_stream(voices[slot].vco1_sample_stream);
+            release_sample_stream(&g_sample_engine, voices[slot].vco1_sample_stream);
             voices[slot].vco1_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco2_shape) == WAVE_SAMPLE) {
-            start_sample_osc(&voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, note, velocity);
+            start_sample_osc(&g_sample_engine, &voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, note, velocity);
         } else if (voices[slot].vco2_sample_stream >= 0) {
-            release_sample_stream(voices[slot].vco2_sample_stream);
+            release_sample_stream(&g_sample_engine, voices[slot].vco2_sample_stream);
             voices[slot].vco2_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco3_shape) == WAVE_SAMPLE) {
-            start_sample_osc(&voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, note, velocity);
+            start_sample_osc(&g_sample_engine, &voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, note, velocity);
         } else if (voices[slot].vco3_sample_stream >= 0) {
-            release_sample_stream(voices[slot].vco3_sample_stream);
+            release_sample_stream(&g_sample_engine, voices[slot].vco3_sample_stream);
             voices[slot].vco3_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco4_shape) == WAVE_SAMPLE) {
-            start_sample_osc(&voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, note, velocity);
+            start_sample_osc(&g_sample_engine, &voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, note, velocity);
         } else if (voices[slot].vco4_sample_stream >= 0) {
-            release_sample_stream(voices[slot].vco4_sample_stream);
+            release_sample_stream(&g_sample_engine, voices[slot].vco4_sample_stream);
             voices[slot].vco4_sample_stream = -1;
         }
         for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voices[slot].fa_low[c][f][0]=0.0f; voices[slot].fa_low[c][f][1]=0.0f; voices[slot].fa_band[c][f][0]=0.0f; voices[slot].fa_band[c][f][1]=0.0f; } voices[slot].fb_low[c][0]=0.0f; voices[slot].fb_low[c][1]=0.0f; voices[slot].fb_band[c][0]=0.0f; voices[slot].fb_band[c][1]=0.0f; }
@@ -6147,10 +6178,10 @@ static void trigger_voice_release(SynthVoice *voice) {
     // voice just entered release -- sample_disk_thread_main reads this to decide whether a
     // loop_release_exit zone should keep looping. A no-op for any oscillator not currently
     // playing a WAVE_SAMPLE zone (request_sample_stream_release ignores stream_index -1).
-    request_sample_stream_release(voice->vco1_sample_stream);
-    request_sample_stream_release(voice->vco2_sample_stream);
-    request_sample_stream_release(voice->vco3_sample_stream);
-    request_sample_stream_release(voice->vco4_sample_stream);
+    request_sample_stream_release(&g_sample_engine, voice->vco1_sample_stream);
+    request_sample_stream_release(&g_sample_engine, voice->vco2_sample_stream);
+    request_sample_stream_release(&g_sample_engine, voice->vco3_sample_stream);
+    request_sample_stream_release(&g_sample_engine, voice->vco4_sample_stream);
 }
 
 static void handle_note_off(SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int target_program, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
@@ -7291,7 +7322,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                 else if(e==3) tick_adsr(&voices[v].vco4_eg, &eg_rates[pidx][e], eg_sustain_chase_rate);
                 else tick_adsr(&voices[v].assign_eg[e-4], &eg_rates[pidx][e], eg_sustain_chase_rate);
             }
-            release_idle_sample_streams(&voices[v]); // WAVE_SAMPLE: free any DFD stream this voice's oscillator(s) no longer need
+            release_idle_sample_streams(&g_sample_engine, &voices[v]); // WAVE_SAMPLE: free any DFD stream this voice's oscillator(s) no longer need
 
             // Mono Legato glide randomization: each voice's own glide_time_multiplier (rerolled
             // per glide event in handle_note_on/off) scales the plain Glide Time knob, so
@@ -7514,10 +7545,10 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
             // which ADDS to the oscillator's own knob here rather than overriding it -- see
             // sample_osc_zone_pan_offset(). Off oscillators skip the trig calls entirely (left at
             // 0.0f -- unused, since their render/mix is skipped too).
-            float zone_pan1 = (vco1_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(voices[v].vco1_sample_stream) : 0.0f;
-            float zone_pan2 = (vco2_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(voices[v].vco2_sample_stream) : 0.0f;
-            float zone_pan3 = (vco3_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(voices[v].vco3_sample_stream) : 0.0f;
-            float zone_pan4 = (vco4_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(voices[v].vco4_sample_stream) : 0.0f;
+            float zone_pan1 = (vco1_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(&g_sample_engine, voices[v].vco1_sample_stream) : 0.0f;
+            float zone_pan2 = (vco2_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(&g_sample_engine, voices[v].vco2_sample_stream) : 0.0f;
+            float zone_pan3 = (vco3_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(&g_sample_engine, voices[v].vco3_sample_stream) : 0.0f;
+            float zone_pan4 = (vco4_shape_now == WAVE_SAMPLE) ? sample_osc_zone_pan_offset(&g_sample_engine, voices[v].vco4_sample_stream) : 0.0f;
             float pan1_l = 0.0f, pan1_r = 0.0f, pan2_l = 0.0f, pan2_r = 0.0f;
             float pan3_l = 0.0f, pan3_r = 0.0f, pan4_l = 0.0f, pan4_r = 0.0f;
             // Fall back to the once-per-block static angle (see its own comment above) whenever
@@ -7680,6 +7711,7 @@ static float render_audio_block(SynthVoice voices[], const SynthSharedControls *
                     modulator_sum += modulator_output[src] * depth;
                 }
                 osc_out[osc] = render_fm_oscillator(
+                    &g_sample_engine,
                     shape_arr[osc], own_phase_arr[osc], dt_arr[osc], phase_offset_arr[osc], modulator_sum,
                     prev_fm_phase_ptr[osc], pulse_or_tilt_arr[osc], tri_state_ptr[osc], tilt_lp_ptr[osc],
                     noise_tilt_coeff, unison_phases_ptr[osc], unison_detune_arr[osc],
@@ -9117,8 +9149,8 @@ int main(int argc, char **argv) {
     char osc_listen_port_str[16]; snprintf(osc_listen_port_str, sizeof(osc_listen_port_str), "%d", osc_listen_port);
     lo_server osc_server = lo_server_new_with_proto(osc_listen_port_str, LO_UDP, osc_error_handler);
     if (!osc_server) { fprintf(stderr, "Cannot continue without an OSC listen socket on port %d.\n", osc_listen_port); return 1; }
-    lo_server_add_method(osc_server, "/hds/zone/upsert", "ifffffffffffffffffs", zone_upsert_handler, NULL);
-    lo_server_add_method(osc_server, "/hds/zone/remove", "i", zone_remove_handler, NULL);
+    lo_server_add_method(osc_server, "/hds/zone/upsert", "ifffffffffffffffffs", zone_upsert_handler, &g_sample_engine);
+    lo_server_add_method(osc_server, "/hds/zone/remove", "i", zone_remove_handler, &g_sample_engine);
     lo_server_add_method(osc_server, NULL, NULL, generic_osc_handler, &active_knobs);
 
     char osc_reply_port_str[16]; snprintf(osc_reply_port_str, sizeof(osc_reply_port_str), "%d", osc_reply_port);
@@ -9175,7 +9207,7 @@ int main(int argc, char **argv) {
     // process's lifetime, talked to only via atomics" pattern as the recording writer thread
     // above. g_sample_streams/g_sample_slots are static/global (not local here) since they're
     // shared with handle_note_on/render_sample_osc, which don't have access to main()'s locals.
-    bool sample_disk_thread_ok = (pthread_create(&g_sample_disk_thread, NULL, sample_disk_thread_main, NULL) == 0);
+    bool sample_disk_thread_ok = (pthread_create(&g_sample_disk_thread, NULL, sample_disk_thread_main, &g_sample_engine) == 0);
     if (!sample_disk_thread_ok) {
         fprintf(stderr, "[sample] failed to start disk streaming thread -- WAVE_SAMPLE playback will be unavailable this session\n");
     }
@@ -9307,7 +9339,7 @@ int main(int argc, char **argv) {
         // that got throttled into the pending-loads queue; that's drained here, at most
         // SAMPLE_LOADS_PER_BLOCK entries per
         // block (see its #define for the real-time trade-off this bounds).
-        drain_pending_sample_loads();
+        drain_pending_sample_loads(&g_sample_engine);
 
 #ifndef _WIN32
         process_midi_input(seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live);
