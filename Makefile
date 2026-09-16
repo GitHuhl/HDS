@@ -17,9 +17,23 @@ SRC := src/backend.c
 WIN_CC ?= x86_64-w64-mingw32-gcc
 WIN_BIN := synth_engine.exe
 WIN_DEPS := third_party/win64-deps
+# Some mingw-w64 cross-toolchains (confirmed: some nixpkgs pkgsCross.mingwW64 builds) ship the
+# "win32" threading model -- no winpthreads, no pthread.h at all -- unlike Debian/Ubuntu's
+# mingw-w64 package, which defaults to "posix" (winpthreads bundled in). When that's missing,
+# build_windows_deps.sh cross-builds winpthreads from source into $(WIN_DEPS)/winpthreads/ (see
+# its own comments); this $(wildcard) check picks that up automatically -- add its include/lib
+# path and link -lwinpthread instead of the plain -lpthread a posix-model toolchain already
+# provides for free. Nothing to configure by hand either way.
+WIN_HAS_WINPTHREADS := $(wildcard $(WIN_DEPS)/winpthreads/lib/libwinpthread.a)
+ifneq ($(WIN_HAS_WINPTHREADS),)
+WIN_CFLAGS := -O2 -Wall -Wextra -std=gnu11 -I$(WIN_DEPS)/liblo/include -I$(WIN_DEPS)/wavpack/include -I$(WIN_DEPS)/winpthreads/include
+WIN_LDFLAGS := -L$(WIN_DEPS)/liblo/lib -L$(WIN_DEPS)/wavpack/lib -L$(WIN_DEPS)/winpthreads/lib
+WIN_LDLIBS := -llo -lwavpack -lws2_32 -liphlpapi -lwinmm -lole32 -lm -lwinpthread
+else
 WIN_CFLAGS := -O2 -Wall -Wextra -std=gnu11 -I$(WIN_DEPS)/liblo/include -I$(WIN_DEPS)/wavpack/include
 WIN_LDFLAGS := -L$(WIN_DEPS)/liblo/lib -L$(WIN_DEPS)/wavpack/lib
 WIN_LDLIBS := -llo -lwavpack -lws2_32 -liphlpapi -lwinmm -lole32 -lm -lpthread
+endif
 
 # --- Linux CLAP plugin ---
 # Produces hds.clap (a plain ELF shared object under the required .clap extension -- real hosts

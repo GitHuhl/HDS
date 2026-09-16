@@ -24,12 +24,31 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 
 LIBLO_VERSION=0.32
 WAVPACK_VERSION=5.6.0
+# Matches whatever mingw-w64 headers/CRT version your cross-compiler was already built against
+# (check with `x86_64-w64-mingw32-gcc -print-search-dirs` -- look for a
+# "mingw-w64-x86_64-w64-mingw32-<version>" store path in the "libraries" line) -- winpthreads'
+# ABI is stable across nearby releases, but keeping this aligned avoids any doubt. Override with
+# `MINGW_W64_VERSION=... tools/build_windows_deps.sh` if yours differs from the current default.
+MINGW_W64_VERSION="${MINGW_W64_VERSION:-13.0.0}"
 
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     echo "error: x86_64-w64-mingw32-gcc not found -- install the mingw-w64 cross toolchain first" >&2
     echo "  (Debian/Ubuntu: sudo apt-get install mingw-w64)" >&2
     echo "  (NixOS/Nix: run 'nix-shell' from the repo root first -- see shell.nix)" >&2
     exit 1
+fi
+
+# Some mingw-w64 cross-toolchain builds (confirmed: nixpkgs' pkgsCross.mingwW64, at least as of
+# some revisions) ship only the "win32" threading model -- no winpthreads, no pthread.h at all --
+# rather than the "posix" model most Linux-distro mingw-w64 packages default to. backend.c uses
+# pthread_create/join/mutexes uniformly across platforms (the sample disk thread, Sequencer
+# loader threads), relying on winpthreads' real POSIX-threads-on-Windows implementation, so this
+# is a hard requirement, not optional. Detect the gap here rather than failing deep inside a
+# `make windows`/`make clap-windows` compile with a bare "pthread.h: No such file or directory".
+NEED_WINPTHREADS=0
+if ! echo '#include <pthread.h>' | x86_64-w64-mingw32-gcc -x c -E - >/dev/null 2>&1; then
+    NEED_WINPTHREADS=1
+    echo "--- x86_64-w64-mingw32-gcc has no pthread.h (win32 threading model) -- will cross-build winpthreads from source ---"
 fi
 
 echo "=== Fetching liblo $LIBLO_VERSION ==="
@@ -54,6 +73,21 @@ if ! ls "$WORK_DIR"/wavpack-"$WAVPACK_VERSION".tar.bz2 >/dev/null 2>&1; then
         "https://www.wavpack.com/wavpack-$WAVPACK_VERSION.tar.bz2"
 fi
 tar xjf "$WORK_DIR/wavpack-$WAVPACK_VERSION.tar.bz2"
+
+if [ "$NEED_WINPTHREADS" = "1" ]; then
+    echo "=== Fetching mingw-w64 $MINGW_W64_VERSION source (winpthreads only) ==="
+    # winpthreads is a self-contained subdirectory of the official mingw-w64 project release, with
+    # its own ./configure, buildable standalone against an already-existing cross-compiler (exactly
+    # our situation: x86_64-w64-mingw32-gcc + headers/CRT already on PATH, just missing this one
+    # component) -- the same technique Debian/Fedora's own mingw-w64 packaging uses internally to
+    # produce a posix-threaded toolchain from a win32-threaded stage-1 gcc. Only extracting this one
+    # subdirectory from the full tarball, not the whole mingw-w64-headers/crt/tools tree (already
+    # have those from the cross-compiler itself).
+    curl -fsSL -o "$WORK_DIR/mingw-w64.tar.bz2" \
+        "https://sourceforge.net/projects/mingw-w64/files/mingw-w64/mingw-w64-release/mingw-w64-v$MINGW_W64_VERSION.tar.bz2/download"
+    tar xjf "$WORK_DIR/mingw-w64.tar.bz2" -C "$WORK_DIR" \
+        "mingw-w64-v$MINGW_W64_VERSION/mingw-w64-libraries/winpthreads"
+fi
 
 echo "=== Cross-building liblo ==="
 mkdir -p "$DEPS_DIR/liblo"
@@ -84,5 +118,20 @@ fi
 make -j"$(nproc)"
 make install
 
-echo "=== Done. liblo and wavpack installed under $DEPS_DIR ==="
-echo "You can now run: make windows"
+if [ "$NEED_WINPTHREADS" = "1" ]; then
+    echo "=== Cross-building winpthreads (pthread.h + libwinpthread) ==="
+    mkdir -p "$DEPS_DIR/winpthreads"
+    cd "$WORK_DIR/mingw-w64-v$MINGW_W64_VERSION/mingw-w64-libraries/winpthreads"
+    ./configure --host=x86_64-w64-mingw32 --prefix="$DEPS_DIR/winpthreads" \
+        --enable-static --disable-shared \
+        CC=x86_64-w64-mingw32-gcc
+    make -j"$(nproc)"
+    make install
+    echo "=== Done. liblo, wavpack, and winpthreads installed under $DEPS_DIR ==="
+    echo "IMPORTANT: your toolchain needed winpthreads built from source (see above) -- make sure"
+    echo "you're using the updated Makefile that adds \$(DEPS_DIR)/winpthreads/include and"
+    echo "-lwinpthread for the Windows targets, not a plain -lpthread."
+else
+    echo "=== Done. liblo and wavpack installed under $DEPS_DIR ==="
+fi
+echo "You can now run: make windows / make clap-windows"
