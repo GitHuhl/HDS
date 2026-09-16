@@ -27,17 +27,11 @@ pkgs.mkShell {
     pkgs.gnutar
     pkgs.gzip
     pkgs.bzip2
-    # WavPack's GitHub source snapshot doesn't ship a pre-generated ./configure (unlike liblo's
-    # real SourceForge release tarball) -- build_windows_deps.sh bootstraps it via autoreconf/
-    # autogen.sh when needed, which needs these on PATH. gettext specifically provides the
-    # AM_ICONV aclocal macro WavPack's own configure.ac references -- without it, `autoreconf`
-    # fails with "undefined or overquoted macro: AM_ICONV" before configure is even generated
-    # (nix-shell's setup hooks put gettext's m4 macros on aclocal's search path automatically
-    # just by listing it here, same as autoconf/automake/libtool's own hooks do).
-    pkgs.autoconf
-    pkgs.automake
-    pkgs.libtool
-    pkgs.gettext
+    # Both liblo (SourceForge) and WavPack (wavpack.com) are fetched as real "make dist" release
+    # tarballs that already ship a working ./configure -- no autoconf/automake/libtool/gettext
+    # bootstrap needed (an earlier version of this file provided those for bootstrapping WavPack's
+    # raw GitHub source snapshot instead; that path turned out to be a real rabbit hole of
+    # mismatched-gettext-version autotools errors and was dropped in favor of the real tarball).
   ];
 
   shellHook = ''
