@@ -36,6 +36,7 @@
 #include <cstring>
 #include <cctype>
 #include <cstdlib>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <set>
@@ -311,6 +312,121 @@ const char* custom_strcasestr(const char* haystack, const char* needle) {
     return nullptr;
 }
 
+// Small rotary-knob widget -- Dear ImGui core has no built-in rotary control (only sliders), so
+// this draws one directly via ImDrawList (a filled circle + a line indicator at the current
+// angle) and reads input through a plain InvisibleButton, matching this file's own established
+// habit of building the UI primitives it needs directly rather than pulling in a separate
+// vendored knob library. Touch/drag convention: dragging vertically changes the value (the same
+// gesture every touch-synth knob already uses), which works identically for mouse and touch since
+// GLFW/ImGui report a touch drag as ordinary mouse-delta input.
+static bool draw_pan_knob(const char* str_id, float* value, float min_val, float max_val, float diameter) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    float radius = diameter * 0.5f;
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImVec2 center = ImVec2(pos.x + radius, pos.y + radius);
+
+    ImGui::InvisibleButton(str_id, ImVec2(diameter, diameter));
+    bool active = ImGui::IsItemActive();
+    bool hovered = ImGui::IsItemHovered();
+    bool changed = false;
+    if (active && io.MouseDelta.y != 0.0f) {
+        float range = max_val - min_val;
+        *value -= io.MouseDelta.y * (range / 200.0f);
+        if (*value < min_val) *value = min_val;
+        if (*value > max_val) *value = max_val;
+        changed = true;
+    }
+
+    float t = (*value - min_val) / (max_val - min_val);
+    // 270-degree sweep, starting 135 degrees clockwise from straight up (a standard knob arc).
+    float angle = 0.75f * (float)M_PI + t * 1.5f * (float)M_PI;
+    ImU32 col_bg = ImGui::GetColorU32(active ? ImGuiCol_FrameBgActive : (hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg));
+    draw_list->AddCircleFilled(center, radius, col_bg, 32);
+    draw_list->AddCircle(center, radius, ImGui::GetColorU32(ImGuiCol_Border), 32, 2.0f);
+    ImVec2 tip = ImVec2(center.x + cosf(angle) * radius * 0.75f, center.y + sinf(angle) * radius * 0.75f);
+    draw_list->AddLine(center, tip, ImGui::GetColorU32(ImGuiCol_Text), 3.0f);
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.0f", *value);
+    ImVec2 tsize = ImGui::CalcTextSize(buf);
+    draw_list->AddText(ImVec2(center.x - tsize.x * 0.5f, pos.y + diameter + 2.0f), ImGui::GetColorU32(ImGuiCol_Text), buf);
+    ImGui::Dummy(ImVec2(diameter, tsize.y + 4.0f));  // reserve the value-text row below the circle
+    return changed;
+}
+
+// --------------------------------------------------------------------------------------------
+// Program page: quick-edit Oscillator controls (Shape/Volume/Pan/Mute for all 4 oscillators) --
+// the same real backend fields frontend.py's own Oscillators tab edits, not just the single Osc
+// 1 waveform combo the ADSR page already had. Defaults match backend.c's init_default_controls()
+// exactly per oscillator (Osc1: Saw/80%, Osc2: Sine/50%, Osc3: Noise/0%, Osc4: Off/0%) -- Osc4's
+// real default shape (WAVE_OFF=8) isn't one of the six shapes g_wave_values offers (see its own
+// comment), so it shows as "Sawtooth" until a real /hds/vco4/shape value arrives, the same
+// documented limitation the ADSR page's own waveform combo already has for Unison Saw/Sample/Off.
+//
+// Split into two panels: draw_osc_type_row (a simple Osc-N/Shape-combo list, its own bordered
+// panel -- "Oscillator Type") and draw_oscillator_row (Mute + a vertical Vol fader with the Pan
+// knob directly below it, its own bordered panel -- "Oscillator Mix"), rather than one combined
+// row -- keeps the type selector's touch target uncluttered from the fader/knob's own drag area.
+// --------------------------------------------------------------------------------------------
+static void draw_osc_type_row(int osc_num, int default_shape_value) {
+    char addr[64];
+    ImGui::PushID(osc_num);
+
+    char label[16];
+    snprintf(label, sizeof(label), "Osc %d", osc_num);
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(70);
+
+    snprintf(addr, sizeof(addr), "/hds/vco%d/shape", osc_num);
+    float shape_raw = get_state(addr, (float)default_shape_value);
+    int wave_idx = 0;
+    for (int i = 0; i < g_wave_count; i++) if (g_wave_values[i] == (int)(shape_raw + 0.5f)) { wave_idx = i; break; }
+    ImGui::SetNextItemWidth(190);
+    if (ImGui::Combo("##Shape", &wave_idx, g_wave_names, g_wave_count)) {
+        send_osc_float(addr, (float)g_wave_values[wave_idx]);
+    }
+
+    ImGui::PopID();
+}
+
+// One compact mixer-strip column per oscillator (Osc N label, a small Mute toggle, a vertical
+// Vol fader, and the Pan knob directly below it) -- sized to stack 4 of these side by side inside
+// a fixed-height, non-scrolling panel (see the "Oscillator Mix:" call site), matching a real
+// hardware mixer's column layout rather than one row per oscillator.
+static void draw_oscillator_row(int osc_num, float default_vol_pct) {
+    char addr[64];
+    ImGui::PushID(osc_num);
+    ImGui::BeginGroup();
+
+    char label[16];
+    snprintf(label, sizeof(label), "Osc %d", osc_num);
+    ImGui::TextUnformatted(label);
+
+    snprintf(addr, sizeof(addr), "/hds/vco%d/mute", osc_num);
+    bool muted = get_state(addr, 0.0f) != 0.0f;
+    if (ImGui::Checkbox("M", &muted)) {
+        send_osc_float(addr, muted ? 1.0f : 0.0f);
+    }
+
+    snprintf(addr, sizeof(addr), "/hds/vco%d/vol", osc_num);
+    float vol_frac = get_state(addr, default_vol_pct / 100.0f);
+    if (ImGui::VSliderFloat("##Vol", ImVec2(56, 90), &vol_frac, 0.0f, 1.0f, "%.0f%%")) {
+        send_osc_float(addr, vol_frac);
+    }
+
+    snprintf(addr, sizeof(addr), "/hds/vco%d/pan", osc_num);
+    float pan_pct = get_state(addr, 0.0f) * 100.0f;
+    float pan_before = pan_pct;
+    draw_pan_knob("##Pan", &pan_pct, -100.0f, 100.0f, 44.0f);
+    if (pan_pct != pan_before) {
+        send_osc_float(addr, pan_pct / 100.0f);
+    }
+
+    ImGui::EndGroup();
+    ImGui::PopID();
+}
+
 int main() {
     g_hds_addr = lo_address_new("127.0.0.1", "9000");
     g_status_server = lo_server_new_with_proto("9001", LO_UDP, osc_error_handler);
@@ -364,7 +480,9 @@ int main() {
 
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ImVec2(720, 540));
-        ImGui::Begin("ActiveViewPanel", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+        // NoScrollbar/NoScrollWithMouse: this is a locked kiosk touchscreen with no scroll gesture
+        // available on the physical device, so no page may ever rely on scrolling to reach a control.
+        ImGui::Begin("ActiveViewPanel", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
         switch (currentPage) {
             case PAGE_PROG:
@@ -396,6 +514,36 @@ int main() {
                 }
 
                 if (!g_load_status.empty()) { ImGui::Spacing(); ImGui::TextWrapped("%s", g_load_status.c_str()); }
+                ImGui::Spacing();
+
+                // Type and Mix panels sit side by side (not stacked) and are both fixed-height,
+                // non-scrolling children -- this is a locked kiosk touchscreen with no scroll
+                // gesture available, so every control must be reachable without one.
+                const ImGuiWindowFlags kNoScrollChild = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+                const float kOscPanelHeight = 280.0f;
+
+                ImGui::Text("Oscillator Type:");
+                ImGui::SameLine(300);
+                ImGui::Text("Oscillator Mix:");
+
+                ImGui::BeginChild("OscTypesSection", ImVec2(290, kOscPanelHeight), ImGuiChildFlags_Borders, kNoScrollChild);
+                draw_osc_type_row(1, 0);  // Saw    -- matches init_default_controls()
+                draw_osc_type_row(2, 3);  // Sine
+                draw_osc_type_row(3, 5);  // Noise
+                draw_osc_type_row(4, 8);  // Off
+                ImGui::EndChild();
+
+                ImGui::SameLine();
+
+                ImGui::BeginChild("OscillatorsSection", ImVec2(360, kOscPanelHeight), ImGuiChildFlags_Borders, kNoScrollChild);
+                draw_oscillator_row(1, 80.0f);  // 80%   -- matches init_default_controls()
+                ImGui::SameLine();
+                draw_oscillator_row(2, 50.0f);  // 50%
+                ImGui::SameLine();
+                draw_oscillator_row(3, 0.0f);   // 0%
+                ImGui::SameLine();
+                draw_oscillator_row(4, 0.0f);   // 0%
+                ImGui::EndChild();
 
                 if (show_save_popup) ImGui::OpenPopup("Save Program");
                 if (ImGui::BeginPopupModal("Save Program", &show_save_popup, ImGuiWindowFlags_AlwaysAutoResize)) {
