@@ -364,37 +364,57 @@ static bool draw_pan_knob(const char* str_id, float* value, float min_val, float
 // comment), so it shows as "Sawtooth" until a real /hds/vco4/shape value arrives, the same
 // documented limitation the ADSR page's own waveform combo already has for Unison Saw/Sample/Off.
 //
-// Split into two panels: draw_osc_type_row (a simple Osc-N/Shape-combo list, its own bordered
-// panel -- "Oscillator Type") and draw_oscillator_row (Mute + a vertical Vol fader with the Pan
-// knob directly below it, its own bordered panel -- "Oscillator Mix"), rather than one combined
-// row -- keeps the type selector's touch target uncluttered from the fader/knob's own drag area.
+// Split into two panels: draw_osc_type_row (its own bordered panel -- "Oscillator Type" -- an
+// Osc-N label with a small Mute toggle directly below it on the far left, then the Shape combo,
+// then the Pan knob) and draw_oscillator_row (its own bordered panel -- "Oscillator Mix" -- just
+// the Osc-N label and a vertical Vol fader, sized to fill essentially the whole panel height).
+// Keeping Mute/Pan out of the Mix panel is what lets its fader actually use the available height
+// instead of splitting it three ways with a checkbox and a knob.
 // --------------------------------------------------------------------------------------------
 static void draw_osc_type_row(int osc_num, int default_shape_value) {
     char addr[64];
     ImGui::PushID(osc_num);
 
+    ImGui::BeginGroup();  // Osc N label + Mute, stacked, so SameLine after it aligns to the top
     char label[16];
     snprintf(label, sizeof(label), "Osc %d", osc_num);
     ImGui::TextUnformatted(label);
-    ImGui::SameLine(70);
+
+    snprintf(addr, sizeof(addr), "/hds/vco%d/mute", osc_num);
+    bool muted = get_state(addr, 0.0f) != 0.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 6.0f));  // shrink from the global touch size
+    if (ImGui::Checkbox("M", &muted)) {
+        send_osc_float(addr, muted ? 1.0f : 0.0f);
+    }
+    ImGui::PopStyleVar();
+    ImGui::EndGroup();
+    ImGui::SameLine();
 
     snprintf(addr, sizeof(addr), "/hds/vco%d/shape", osc_num);
     float shape_raw = get_state(addr, (float)default_shape_value);
     int wave_idx = 0;
     for (int i = 0; i < g_wave_count; i++) if (g_wave_values[i] == (int)(shape_raw + 0.5f)) { wave_idx = i; break; }
-    ImGui::SetNextItemWidth(190);
+    ImGui::SetNextItemWidth(130);
     if (ImGui::Combo("##Shape", &wave_idx, g_wave_names, g_wave_count)) {
         send_osc_float(addr, (float)g_wave_values[wave_idx]);
+    }
+    ImGui::SameLine();
+
+    snprintf(addr, sizeof(addr), "/hds/vco%d/pan", osc_num);
+    float pan_pct = get_state(addr, 0.0f) * 100.0f;
+    float pan_before = pan_pct;
+    draw_pan_knob("##Pan", &pan_pct, -100.0f, 100.0f, 40.0f);
+    if (pan_pct != pan_before) {
+        send_osc_float(addr, pan_pct / 100.0f);
     }
 
     ImGui::PopID();
 }
 
-// One compact mixer-strip column per oscillator (Osc N label, a small Mute toggle, a vertical
-// Vol fader, and the Pan knob directly below it) -- sized to stack 4 of these side by side inside
-// a fixed-height, non-scrolling panel (see the "Oscillator Mix:" call site), matching a real
-// hardware mixer's column layout rather than one row per oscillator.
-static void draw_oscillator_row(int osc_num, float default_vol_pct) {
+// One column per oscillator (Osc N label + a vertical Vol fader) -- the fader's height is passed
+// in from the call site as essentially the whole available panel height, since Mute/Pan no longer
+// compete with it for vertical space.
+static void draw_oscillator_row(int osc_num, float default_vol_pct, float fader_height) {
     char addr[64];
     ImGui::PushID(osc_num);
     ImGui::BeginGroup();
@@ -403,24 +423,10 @@ static void draw_oscillator_row(int osc_num, float default_vol_pct) {
     snprintf(label, sizeof(label), "Osc %d", osc_num);
     ImGui::TextUnformatted(label);
 
-    snprintf(addr, sizeof(addr), "/hds/vco%d/mute", osc_num);
-    bool muted = get_state(addr, 0.0f) != 0.0f;
-    if (ImGui::Checkbox("M", &muted)) {
-        send_osc_float(addr, muted ? 1.0f : 0.0f);
-    }
-
     snprintf(addr, sizeof(addr), "/hds/vco%d/vol", osc_num);
     float vol_frac = get_state(addr, default_vol_pct / 100.0f);
-    if (ImGui::VSliderFloat("##Vol", ImVec2(56, 90), &vol_frac, 0.0f, 1.0f, "%.0f%%")) {
+    if (ImGui::VSliderFloat("##Vol", ImVec2(56, fader_height), &vol_frac, 0.0f, 1.0f, "%.0f%%")) {
         send_osc_float(addr, vol_frac);
-    }
-
-    snprintf(addr, sizeof(addr), "/hds/vco%d/pan", osc_num);
-    float pan_pct = get_state(addr, 0.0f) * 100.0f;
-    float pan_before = pan_pct;
-    draw_pan_knob("##Pan", &pan_pct, -100.0f, 100.0f, 44.0f);
-    if (pan_pct != pan_before) {
-        send_osc_float(addr, pan_pct / 100.0f);
     }
 
     ImGui::EndGroup();
@@ -516,34 +522,39 @@ int main() {
                 if (!g_load_status.empty()) { ImGui::Spacing(); ImGui::TextWrapped("%s", g_load_status.c_str()); }
                 ImGui::Spacing();
 
-                // Type and Mix panels sit side by side (not stacked) and are both fixed-height,
-                // non-scrolling children -- this is a locked kiosk touchscreen with no scroll
-                // gesture available, so every control must be reachable without one.
+                // Type and Mix panels sit side by side (not stacked) and are both non-scrolling
+                // children -- this is a locked kiosk touchscreen with no scroll gesture available,
+                // so every control must be reachable without one. Height is whatever's actually
+                // left in the page (not a hardcoded guess), so the Mix panel's faders can use
+                // essentially the whole remaining height rather than a cramped fixed amount.
                 const ImGuiWindowFlags kNoScrollChild = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
-                const float kOscPanelHeight = 280.0f;
+                float osc_panel_height = ImGui::GetContentRegionAvail().y - 10.0f;
 
                 ImGui::Text("Oscillator Type:");
-                ImGui::SameLine(300);
+                ImGui::SameLine(330);
                 ImGui::Text("Oscillator Mix:");
 
-                ImGui::BeginChild("OscTypesSection", ImVec2(290, kOscPanelHeight), ImGuiChildFlags_Borders, kNoScrollChild);
-                draw_osc_type_row(1, 0);  // Saw    -- matches init_default_controls()
-                draw_osc_type_row(2, 3);  // Sine
-                draw_osc_type_row(3, 5);  // Noise
-                draw_osc_type_row(4, 8);  // Off
-                ImGui::EndChild();
+                if (osc_panel_height > 40.0f) {
+                    ImGui::BeginChild("OscTypesSection", ImVec2(320, osc_panel_height), ImGuiChildFlags_Borders, kNoScrollChild);
+                    draw_osc_type_row(1, 0);  // Saw    -- matches init_default_controls()
+                    draw_osc_type_row(2, 3);  // Sine
+                    draw_osc_type_row(3, 5);  // Noise
+                    draw_osc_type_row(4, 8);  // Off
+                    ImGui::EndChild();
 
-                ImGui::SameLine();
+                    ImGui::SameLine();
 
-                ImGui::BeginChild("OscillatorsSection", ImVec2(360, kOscPanelHeight), ImGuiChildFlags_Borders, kNoScrollChild);
-                draw_oscillator_row(1, 80.0f);  // 80%   -- matches init_default_controls()
-                ImGui::SameLine();
-                draw_oscillator_row(2, 50.0f);  // 50%
-                ImGui::SameLine();
-                draw_oscillator_row(3, 0.0f);   // 0%
-                ImGui::SameLine();
-                draw_oscillator_row(4, 0.0f);   // 0%
-                ImGui::EndChild();
+                    ImGui::BeginChild("OscillatorsSection", ImVec2(260, osc_panel_height), ImGuiChildFlags_Borders, kNoScrollChild);
+                    float fader_height = osc_panel_height - 60.0f;  // leave room for the label + child padding
+                    draw_oscillator_row(1, 80.0f, fader_height);  // 80%   -- matches init_default_controls()
+                    ImGui::SameLine();
+                    draw_oscillator_row(2, 50.0f, fader_height);  // 50%
+                    ImGui::SameLine();
+                    draw_oscillator_row(3, 0.0f, fader_height);   // 0%
+                    ImGui::SameLine();
+                    draw_oscillator_row(4, 0.0f, fader_height);   // 0%
+                    ImGui::EndChild();
+                }
 
                 if (show_save_popup) ImGui::OpenPopup("Save Program");
                 if (ImGui::BeginPopupModal("Save Program", &show_save_popup, ImGuiWindowFlags_AlwaysAutoResize)) {
