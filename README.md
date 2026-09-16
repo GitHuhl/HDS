@@ -687,14 +687,36 @@ will refuse to start with a `GLIBC_2.39' not found` error -- check the Pi's glib
 (`ldd --version`) against this if a binary that has the right interpreter and libraries still
 won't run.
 
+4. **`shell.nix` used to resolve `<nixpkgs>` unpinned** -- whatever nixpkgs revision each
+   machine's own `nix-channel` state happened to have registered, which is exactly what it says:
+   not reproducible across machines or across time on the same machine. Hit for real: a
+   `synth_engine-arm64` built on one machine needed `liblo.so.7` (matching its own freshly-copied
+   `arm64-libs/liblo.so.7`, so that one machine's own build was internally consistent), while a
+   separately-built copy on another machine needed a completely different SONAME,
+   `liblo.so.3` -- an old liblo ABI from a nixpkgs revision several years older, resolved from
+   whatever channel state that second machine happened to have. `shell.nix` now pins nixpkgs to a
+   fixed, hash-verified `nixos-24.05` release tarball via `builtins.fetchTarball`, so every
+   `nix-shell` entry -- on this machine, a developer's machine, or the same machine a year from now
+   -- resolves the exact same dependency versions (and SONAMEs) every time. This closes the
+   cross-machine/cross-time drift risk, not the "I copied a stale `arm64-libs/` next to a newer
+   binary" risk -- always build and copy a binary and its own `arm64-libs/` together, from the same
+   `make arm64` run.
+
 **`make arm64`** (the backend alone) was verified fully end to end in this repo's own sandbox,
-including the full deployment fix above: a real `nix-shell` with the cross toolchain +
-alsa-lib/liblo/wavpack (every one of which resolves straight from cache.nixos.org in seconds, no
-local build) produced a genuine `synth_engine-arm64` -- confirmed via `file` to be an ELF 64-bit
-ARM aarch64 executable correctly linked against the cross-built libraries, then confirmed via
-`readelf -d` and `strings` that after the `patchelf`/bundling step it carries a `$ORIGIN`-relative
-RPATH, a standard system interpreter path, and zero remaining `/nix/store` references anywhere in
-the binary.
+including the full deployment fix above and the nixpkgs-pin fix: a real `nix-shell` (against the
+now-pinned `shell.nix`) with the cross toolchain + alsa-lib/liblo/wavpack (every one of which
+resolves straight from cache.nixos.org in seconds, no local build) produced a genuine
+`synth_engine-arm64` -- confirmed via `file` to be an ELF 64-bit ARM aarch64 executable correctly
+linked against the cross-built libraries, then confirmed via `readelf -d` and `strings` that after
+the `patchelf`/bundling step it carries a `$ORIGIN`-relative RPATH, a standard system interpreter
+path, and zero remaining `/nix/store` references anywhere in the binary. Verified one step further
+than ELF-header inspection this time: actually **executed** under `qemu-aarch64-static` (with only
+a real aarch64 glibc + loader supplied as the emulated "system," and the binary's own
+`arm64-libs/` sitting next to it exactly as a real deployment would have it, nothing else) -- the
+process starts, `liblo.so.7`/`libwavpack.so.1` resolve correctly from the bundle, the OSC listener
+comes up, and the only failure is the audio device open (`libasound.so.2` / a real sound card),
+which is the expected, documented, by-design gap this environment can't supply either (no real ALSA
+hardware in a sandbox, same as the Pi needs its own `apt-get install libasound2`).
 
 **`make pi-touch-arm64`** is correct by the exact same mechanism (same toolchain, same
 RPATH/interpreter fix, same variable plumbing, just one more library), but has NOT been proven

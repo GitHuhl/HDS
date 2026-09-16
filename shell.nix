@@ -21,7 +21,26 @@
 ## runs `make`/`make clap`/`make pi-touch` -- a real but one-time download/build-closure cost, not a
 ## correctness problem, and simpler than maintaining several separate shell.nix entry points that
 ## could silently drift out of sync with each other.
-{ pkgs ? import <nixpkgs> {} }:
+## `pkgs` is pinned to a fixed nixpkgs-24.05 release tarball (URL + content hash below) rather
+## than the unpinned `<nixpkgs>` this file used to use. Root-caused directly: two `nix-shell`
+## entries against unpinned `<nixpkgs>` -- one on this build machine, one on a developer's own
+## machine, at two different times -- resolved two genuinely different nixpkgs revisions (whatever
+## each machine's own `nix-channel` state happened to be), which cross-built liblo/wavpack/
+## alsa-lib/glfw at different upstream VERSIONS with different SONAMEs (confirmed: one such
+## mismatch produced a binary whose NEEDED entry was `liblo.so.3` while a separately-built
+## `arm64-libs/` bundle only shipped `liblo.so.7` -- two builds of the "same" cross target, from
+## two unpinned nix-shell entries, silently incompatible with each other). A fixed nixpkgs
+## revision makes `nix-shell` fully reproducible -- the exact same dependency versions (and
+## SONAMEs) every time, on every machine -- which is what makes it safe to ever build
+## `synth_engine-arm64` and `arm64-libs/` in two SEPARATE `make arm64` runs (e.g. once here, once
+## later on the user's own machine) and still have them match. Still: always copy a binary and
+## its OWN freshly-built `arm64-libs/` to the Pi together, from the same `make arm64` run, rather
+## than mixing an old bundle with a new binary -- this pin closes the cross-machine/cross-time
+## drift risk, not the "I copied stale files" risk.
+{ pkgs ? import (builtins.fetchTarball {
+    url = "https://releases.nixos.org/nixos/24.05/nixos-24.05.7376.b134951a4c9f/nixexprs.tar.xz";
+    sha256 = "1f8j7fh0nl4qmqlxn6lis8zf7dnckm6jri4rwmj0qm1qivhr58lv";
+  }) {} }:
 
 let
   # pkgsCross.mingwW64's wrapped gcc is what actually provides the x86_64-w64-mingw32-gcc binary
@@ -112,10 +131,13 @@ pkgs.mkShell {
     aarch64.wavpack
     aarch64.glfw
     aarch64.libGL
-    pkgs.patchelf   # strips the Nix store RPATH the cross linker bakes into arm64/pi-touch-arm64 --
-                     # those store paths don't exist on the Pi, so the Makefile's arm64/
-                     # pi-touch-arm64 rules run `patchelf --remove-rpath` on the output as a final
-                     # step (see their own comment for why this alone isn't the whole story).
+    pkgs.patchelf   # rewrites the Nix store RPATH/interpreter the cross linker bakes into
+                     # arm64/pi-touch-arm64 -- those store paths don't exist on the Pi. The
+                     # Makefile's arm64/pi-touch-arm64 rules run `patchelf --set-rpath
+                     # '$ORIGIN/arm64-libs' --set-interpreter /lib/ld-linux-aarch64.so.1` on the
+                     # output as a final step (see the Makefile's own comment for the full story --
+                     # a wrong/missing interpreter is what actually stops the binary from starting
+                     # at all, not just a missing RPATH entry).
   ];
 
   shellHook = ''
