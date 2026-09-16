@@ -3608,326 +3608,64 @@ class SynthGui(QWidget):
         for i, lane in enumerate(self.seq_lane_rows):
             lane[3].currentIndexChanged.connect(lambda new_index, idx=i: _enforce_seq_lane_type_cap(idx, new_index))
         # ----------------------------------------------------
-        # FILTERS TAB CONTENT (2-FILTER OVERHAUL)
+        # FILTERS TAB CONTENT (flat 5-slot chain, exclusive Off/LPF/HPF/BPF/Notch per slot)
         # ----------------------------------------------------
         filters_outer_lay = QVBoxLayout(self.tab_filters)
         filters_column = QVBoxLayout()
         filters_column.setSpacing(6)
 
-        # Filter Routing Matrix: governs how Filter A and Filter B combine (Series/Parallel) --
-        # filter-specific, so it lives here rather than in the Global sidebar.
-        routing_box = QGroupBox("Filter Routing Matrix")
-        routing_lay = QVBoxLayout(); routing_lay.setSpacing(2); routing_lay.setContentsMargins(4, 4, 4, 4)
+        # Chain Mode: governs how the 5 filter slots combine -- Series (0->1->2->3->4, each slot
+        # fed by the previous one's output) or Parallel (all 5 read the same mixer input, summed
+        # and averaged over however many are actually active -- an Off slot is silent, excluded
+        # from both the sum and the divisor, per the user's own explicit choice). Deliberately
+        # simple: no A/B distinction, no blend weights, no Multi sub-engine -- see backend.c's
+        # own comments on ProgramState.filters/FilterParams for the full design.
+        chain_mode_row = QHBoxLayout()
+        chain_mode_row.addWidget(QLabel("<b>Filter Chain Mode:</b>"))
+        self.filter_chain_mode_combo = QComboBox()
+        self.filter_chain_mode_combo.addItems(["Series (1->2->3->4->5)", "Parallel (Summed)"])
+        chain_mode_row.addWidget(self.filter_chain_mode_combo)
+        chain_mode_row.addStretch()
+        filters_column.addLayout(chain_mode_row)
 
-        # Filter Routing quick-pick: a convenience preset on top of the detailed Signal Mode
-        # combo below (never a separate source of truth -- picking one just sets Signal Mode /
-        # Filter B's Off-Active / Filter A's Slope, the same knobs the detailed controls edit
-        # directly). Mirrors a classic hardware synth's own 4-way "Filter Routing" parameter
-        # (Single/Serial/Parallel/24dB-oct); "Custom" is never user-selectable -- it's what this
-        # combo falls back to (see _sync_filter_routing_preset_combo below) whenever the
-        # underlying knobs don't match one of the 4 named combinations, so it can never silently
-        # lie about the current state.
-        preset_row = QHBoxLayout()
-        preset_row.addWidget(QLabel("Filter Routing:"))
-        self.filter_routing_preset_combo = QComboBox()
-        self.filter_routing_preset_combo.addItems(["Single", "Serial", "Parallel", "24dB/oct", "Custom"])
-        preset_row.addWidget(self.filter_routing_preset_combo)
-        preset_row.addStretch()
-        routing_lay.addLayout(preset_row)
+        # Key Track and ext-MIDI CC/aftertouch modulation have no dedicated always-visible knob --
+        # both live inside each slot's own Cutoff right-click menu (_show_filter_cutoff_menu), a
+        # short preset list mirroring the existing CC-source preset list's own UI pattern. Cached
+        # here as plain Python lists (not widget-backed), same shape as self.lfo_mod_source_cc.
+        self.filter_key_track = [0.0] * 5
+        self.filter_cutoff_mod_source_cc = [-1.0] * 5
+        self._KEY_TRACK_PRESETS = [("Off", 0.0), ("50%", 50.0), ("100%", 100.0), ("150%", 150.0)]
 
-        routing_header_row = QHBoxLayout()
-        routing_header_row.addWidget(QLabel("Signal Mode:"))
-        routing_header_row.addStretch()
-        routing_lay.addLayout(routing_header_row)
+        self.filter_cutoff_dials, self.filter_res_dials = [], []
+        self.filter_type_combos, self.filter_slope_combos = [], []
 
-        self.filter_routing_mode = QComboBox()
-        self.filter_routing_mode.addItems([
-            "Series (mixer -> A -> B)",
-            "Series Reversed (mixer -> B -> A)",
-            "Parallel (A // B, level/pan below)",
-        ])
-        routing_lay.addWidget(self.filter_routing_mode)
+        for i in range(5):
+            box = QGroupBox(f"Filter {i + 1}")
+            lay = QHBoxLayout(); lay.setSpacing(4); lay.setContentsMargins(4, 4, 4, 4)
 
-        # Independent level/pan only matter in Parallel mode -- in either Series mode the chain
-        # order alone decides which filter is heard last, so these are hidden rather than just
-        # disabled. Replaces the old single A/B Blend knob (see the Filter Routing plan) with
-        # real independent control per filter, matching a classic hardware synth's own Parallel
-        # filter routing description ("individual control over both level and pan").
-        self.filter_parallel_box = QWidget()
-        par_lay = QHBoxLayout(self.filter_parallel_box)
-        par_lay.setContentsMargins(0, 4, 0, 0); par_lay.setSpacing(6)
-        par_lay.addWidget(QLabel("A Level:"))
-        self.filter_a_level_dial = PotentiometerKnob("Filter A Level", self)
-        self.filter_a_level_dial.setRange(0, 100); self.filter_a_level_dial.setValue(50)
-        par_lay.addWidget(self.filter_a_level_dial)
-        par_lay.addWidget(QLabel("A Pan:"))
-        self.filter_a_pan_dial = PotentiometerKnob("Filter A Pan", self)
-        self.filter_a_pan_dial.setRange(-100, 100); self.filter_a_pan_dial.setValue(0)
-        par_lay.addWidget(self.filter_a_pan_dial)
-        par_lay.addWidget(QLabel("B Level:"))
-        self.filter_b_level_dial = PotentiometerKnob("Filter B Level", self)
-        self.filter_b_level_dial.setRange(0, 100); self.filter_b_level_dial.setValue(50)
-        par_lay.addWidget(self.filter_b_level_dial)
-        par_lay.addWidget(QLabel("B Pan:"))
-        self.filter_b_pan_dial = PotentiometerKnob("Filter B Pan", self)
-        self.filter_b_pan_dial.setRange(-100, 100); self.filter_b_pan_dial.setValue(0)
-        par_lay.addWidget(self.filter_b_pan_dial)
-        par_lay.addStretch()
-        routing_lay.addWidget(self.filter_parallel_box)
-        self.filter_routing_mode.currentIndexChanged.connect(
-            lambda idx: self.filter_parallel_box.setVisible(idx == 2)
-        )
-        self.filter_parallel_box.setVisible(False)
+            c_dial = PotentiometerKnob(f"F{i + 1} Freq", self)
+            c_dial.setRange(40, 18000); c_dial.setValue(800 if i == 0 else 2000)
+            c_dial.setContextMenuCallback(lambda pos, idx=i: self._show_filter_cutoff_menu(idx, pos))
+            self.filter_cutoff_dials.append(c_dial)
 
-        routing_box.setLayout(routing_lay)
-        filters_column.addWidget(routing_box)
+            q_dial = PotentiometerKnob(f"F{i + 1} Res", self)
+            q_dial.setRange(0, 100); q_dial.setValue(20)
+            q_dial.setContextMenuCallback(lambda pos, idx=i: self._show_dest_assign_menu(91 + idx * 2, pos))
+            self.filter_res_dials.append(q_dial)
 
-        # Container list definitions for loop compilation connections
-        self.cutoff_dials, self.q_dials, self.vcf_poles, self.vcf_types = [], [], [], []
-        # Multi Filter blend: 5 filter-unit entries (index order matches cutoff_dials/vcf_types
-        # above exactly -- 0=Filter A Normal, 1-3=Filter A Multi units 0-2, 4=Filter B), each a
-        # (mode1_knobs[5], mode2_knobs[5], crossfade_knob, container_box) tuple. Container boxes
-        # are shown only when that unit's Type combo is "Active", mirroring the existing
-        # filter_a_multi_view show/hide convention one level up.
-        self.filter_blend_units = []
+            v_slope = QComboBox(); v_slope.addItems(["2-Pole (12dB/oct)", "4-Pole (24dB/oct)"])
+            self.filter_slope_combos.append(v_slope)
 
-        def _build_filter_blend_row(crossfade_target):
-            box = QWidget()
-            lay = QVBoxLayout(box); lay.setContentsMargins(0, 2, 0, 2); lay.setSpacing(2)
-            mode1_knobs, mode2_knobs = [], []
-            for mode_label, knob_list in (("Mode 1:", mode1_knobs), ("Mode 2:", mode2_knobs)):
-                row = QHBoxLayout(); row.setSpacing(3)
-                row.addWidget(QLabel(f"<b>{mode_label}</b>"))
-                for tap_label in ["LP", "BP", "HP", "Notch", "Dry"]:
-                    k = PotentiometerKnob(f"{mode_label} {tap_label}", self)
-                    k.setRange(-100, 100); k.setValue(0)
-                    row.addWidget(QLabel(tap_label + ":")); row.addWidget(k)
-                    knob_list.append(k)
-                row.addStretch()
-                lay.addLayout(row)
-            if mode1_knobs:
-                mode1_knobs[0].setValue(100)  # default one-hot Low Pass, matches the backend default
-            xf_row = QHBoxLayout(); xf_row.setSpacing(3)
-            xf_row.addWidget(QLabel("Crossfade:"))
-            xf_dial = PotentiometerKnob("Mode 1 <-> Mode 2 Crossfade", self)
-            xf_dial.setRange(0, 100); xf_dial.setValue(0)
-            xf_dial.setContextMenuCallback(lambda pos, t=crossfade_target: self._show_dest_assign_menu(t, pos))
-            xf_row.addWidget(xf_dial)
-            xf_row.addStretch()
-            lay.addLayout(xf_row)
-            self.filter_blend_units.append((mode1_knobs, mode2_knobs, xf_dial, box))
-            return box
+            v_type = QComboBox(); v_type.addItems(["Off", "LPF", "HPF", "BPF", "Notch"])
+            v_type.setCurrentIndex(1 if i == 0 else 0)  # Filter 1 defaults to an active LPF, rest Off
+            self.filter_type_combos.append(v_type)
 
-        # --- FILTER A VIEW PANEL ---
-        filter_a_box = QGroupBox("VCF Filter A")
-        filter_a_lay = QVBoxLayout()
-        filter_a_lay.setSpacing(2); filter_a_lay.setContentsMargins(4, 4, 4, 4)
-
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("<b>Engine Mode:</b>"))
-        self.filter_a_mode_combo = QComboBox()
-        self.filter_a_mode_combo.addItems(["Normal (Single Filter Core)", "Multi (3-Filter Cascade)"])
-        mode_row.addWidget(self.filter_a_mode_combo)
-        mode_row.addStretch()
-        filter_a_lay.addLayout(mode_row)
-
-        # View sub-widget stack for Engine Modes
-        self.filter_a_stack_widget = QWidget()
-        a_stack_lay = QVBoxLayout(self.filter_a_stack_widget)
-        a_stack_lay.setContentsMargins(0, 0, 0, 0); a_stack_lay.setSpacing(4)
-
-        # Filter A Sub-Widget: Normal (Single filter parameters mapped onto cutoff index 0),
-        # stacked vertically over its own Multi Filter blend row (a0_blend_box below) so both
-        # share this view's own show/hide with filter_a_multi_view.
-        self.filter_a_normal_view = QWidget()
-        a_norm_outer = QVBoxLayout(self.filter_a_normal_view)
-        a_norm_outer.setContentsMargins(0, 0, 0, 0); a_norm_outer.setSpacing(2)
-        a_norm_lay = QHBoxLayout()
-        a_norm_lay.setContentsMargins(0, 4, 0, 4)
-
-        c_dial_a0 = PotentiometerKnob("FA Freq", self)
-        c_dial_a0.setRange(40, 18000); c_dial_a0.setValue(800)
-        c_dial_a0.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(8, pos))
-        self.cutoff_dials.append(c_dial_a0)
-
-        q_dial_a0 = PotentiometerKnob("FA Res", self)
-        q_dial_a0.setRange(0, 100); q_dial_a0.setValue(20)
-        q_dial_a0.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(9, pos))
-        self.q_dials.append(q_dial_a0)
-
-        v_pole_a0 = QComboBox(); v_pole_a0.addItems(["2-Pole (12dB/oct)", "4-Pole (24dB/oct)"])
-        self.vcf_poles.append(v_pole_a0)
-
-        # Type is now just Off/Active -- the actual filter shape (Low/High/Band Pass, Notch, any
-        # manual blend of them) comes from the Multi Filter blend row below, not an exclusive pick.
-        v_type_a0 = QComboBox(); v_type_a0.addItems(["Off", "Active (Blend)"])
-        v_type_a0.setCurrentIndex(1)
-        self.vcf_types.append(v_type_a0)
-
-        a_norm_lay.addWidget(QLabel("Freq:")); a_norm_lay.addWidget(c_dial_a0)
-        a_norm_lay.addWidget(QLabel("Res:")); a_norm_lay.addWidget(q_dial_a0)
-        a_norm_lay.addWidget(QLabel("Slope:")); a_norm_lay.addWidget(v_pole_a0)
-        a_norm_lay.addWidget(QLabel("Type:")); a_norm_lay.addWidget(v_type_a0)
-        a_norm_outer.addLayout(a_norm_lay)
-
-        a0_blend_box = _build_filter_blend_row(86)  # target 86 = Filter A Crossfade
-        v_type_a0.currentIndexChanged.connect(lambda idx: a0_blend_box.setVisible(idx == 1))
-        a_norm_outer.addWidget(a0_blend_box)
-        a_stack_lay.addWidget(self.filter_a_normal_view)
-
-        # Filter A Sub-Widget: Multi engine (deploys 3 distinct filter blocks in a sub-grid)
-        self.filter_a_multi_view = QWidget()
-        a_mult_outer = QVBoxLayout(self.filter_a_multi_view)
-        a_mult_outer.setContentsMargins(0, 4, 0, 4); a_mult_outer.setSpacing(4)
-
-        routing_row = QHBoxLayout()
-        routing_row.addWidget(QLabel("Internal Topology Mode:"))
-        self.filter_a_multi_route_combo = QComboBox()
-        self.filter_a_multi_route_combo.addItems(["Series (0->1->2)", "Parallel (Summed)", "Split (0//1 -> 2)"])
-        routing_row.addWidget(self.filter_a_multi_route_combo)
-        routing_row.addStretch()
-        a_mult_outer.addLayout(routing_row)
-
-        for m_idx in range(3):
-            sub_row = QHBoxLayout()
-            c_dial_am = PotentiometerKnob(f"F1.M{m_idx} Freq", self)
-            c_dial_am.setRange(40, 18000); c_dial_am.setValue(400 + (m_idx * 200))
-            # Multi unit 0 shares Filter A's own mod slot (targets 8/9, since Normal and Multi
-            # unit 0 are mutually exclusive -- only one is ever active); unit 1 (middle) is the
-            # new Filter A-M2 slot (84/85); unit 2 keeps its existing slot (12/13).
-            multi_freq_target = {0: 8, 1: 84, 2: 12}[m_idx]
-            multi_res_target = {0: 9, 1: 85, 2: 13}[m_idx]
-            c_dial_am.setContextMenuCallback(lambda pos, t=multi_freq_target: self._show_dest_assign_menu(t, pos))
-            self.cutoff_dials.append(c_dial_am)
-
-            q_dial_am = PotentiometerKnob(f"F1.M{m_idx} Res", self)
-            q_dial_am.setRange(0, 100); q_dial_am.setValue(20)
-            q_dial_am.setContextMenuCallback(lambda pos, t=multi_res_target: self._show_dest_assign_menu(t, pos))
-            self.q_dials.append(q_dial_am)
-
-            v_pole_am = QComboBox(); v_pole_am.addItems(["2-Pole", "4-Pole"])
-            self.vcf_poles.append(v_pole_am)
-
-            v_type_am = QComboBox(); v_type_am.addItems(["Off", "Active (Blend)"])
-            v_type_am.setCurrentIndex(1)
-            self.vcf_types.append(v_type_am)
-
-            sub_row.addWidget(QLabel(f"Unit {m_idx} Freq:")); sub_row.addWidget(c_dial_am)
-            sub_row.addWidget(QLabel("Res:")); sub_row.addWidget(q_dial_am)
-            sub_row.addWidget(QLabel("Slope:")); sub_row.addWidget(v_pole_am)
-            sub_row.addWidget(QLabel("Type:")); sub_row.addWidget(v_type_am)
-            a_mult_outer.addLayout(sub_row)
-
-            # Crossfade mod target mirrors the same per-unit slot the Freq/Res dials above use:
-            # unit 0 shares Filter A's own slot (86, since Normal and Multi unit 0 are mutually
-            # exclusive), unit 1 (middle) is the new Filter A-M2 slot (89), unit 2 keeps 88.
-            am_crossfade_target = {0: 86, 1: 89, 2: 88}[m_idx]
-            am_blend_box = _build_filter_blend_row(am_crossfade_target)
-            v_type_am.currentIndexChanged.connect(lambda idx, box=am_blend_box: box.setVisible(idx == 1))
-            a_mult_outer.addWidget(am_blend_box)
-
-        a_stack_lay.addWidget(self.filter_a_multi_view)
-        filter_a_lay.addWidget(self.filter_a_stack_widget)
-        filter_a_box.setLayout(filter_a_lay)
-        filters_column.addWidget(filter_a_box)
-
-        self.filter_a_mode_combo.currentIndexChanged.connect(
-            lambda idx: (self.filter_a_normal_view.setVisible(idx == 0), self.filter_a_multi_view.setVisible(idx == 1))
-        )
-        self.filter_a_multi_view.setVisible(False)
-        # --- FILTER B VIEW PANEL ---
-        filter_b_box = QGroupBox("VCF Filter B (Secondary Global Filter Core)")
-        filter_b_outer = QVBoxLayout()
-        filter_b_outer.setContentsMargins(0, 0, 0, 0); filter_b_outer.setSpacing(2)
-        filter_b_lay = QHBoxLayout()
-        filter_b_lay.setSpacing(4); filter_b_lay.setContentsMargins(4, 4, 4, 4)
-
-        c_dial_b = PotentiometerKnob("FB Freq", self)
-        c_dial_b.setRange(40, 18000); c_dial_b.setValue(4000)
-        c_dial_b.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(10, pos))
-        self.cutoff_dials.append(c_dial_b)
-
-        q_dial_b = PotentiometerKnob("FB Res", self)
-        q_dial_b.setRange(0, 100); q_dial_b.setValue(20)
-        q_dial_b.setContextMenuCallback(lambda pos: self._show_dest_assign_menu(11, pos))
-        self.q_dials.append(q_dial_b)
-
-        v_pole_b = QComboBox(); v_pole_b.addItems(["2-Pole (12dB/oct)", "4-Pole (24dB/oct)"])
-        self.vcf_poles.append(v_pole_b)
-
-        v_type_b = QComboBox(); v_type_b.addItems(["Off", "Active (Blend)"])
-        v_type_b.setCurrentIndex(0)  # Off by default to match C default presets cleanly
-        self.vcf_types.append(v_type_b)
-
-        filter_b_lay.addWidget(QLabel("Freq:")); filter_b_lay.addWidget(c_dial_b)
-        filter_b_lay.addWidget(QLabel("Res:")); filter_b_lay.addWidget(q_dial_b)
-        filter_b_lay.addWidget(QLabel("Slope:")); filter_b_lay.addWidget(v_pole_b)
-        filter_b_lay.addWidget(QLabel("Type:")); filter_b_lay.addWidget(v_type_b)
-        filter_b_outer.addLayout(filter_b_lay)
-
-        b_blend_box = _build_filter_blend_row(87)  # target 87 = Filter B Crossfade
-        v_type_b.currentIndexChanged.connect(lambda idx: b_blend_box.setVisible(idx == 1))
-        b_blend_box.setVisible(False)  # Filter B defaults to Off -- matches v_type_b's own default index
-        filter_b_outer.addWidget(b_blend_box)
-        filter_b_box.setLayout(filter_b_outer)
-        filters_column.addWidget(filter_b_box)
-
-        # Filter B's Freq/Res/Slope controls (not its own Off/Active combo, which must stay
-        # reachable) grey out whenever it's Off -- matches a classic hardware synth's own "Filter
-        # B controls will be grayed out" behavior for both Single and 24dB/oct, generalized to
-        # whenever Filter B is Off for any reason (not just via the preset selector below).
-        def _sync_filter_b_enabled(idx):
-            active = (idx == 1)
-            c_dial_b.setEnabled(active); q_dial_b.setEnabled(active); v_pole_b.setEnabled(active)
-        v_type_b.currentIndexChanged.connect(_sync_filter_b_enabled)
-        _sync_filter_b_enabled(v_type_b.currentIndex())
-
-        # Filter Routing preset selector (see its own construction comment above): applies the
-        # underlying knob combination for each named preset, and the reverse comparator that
-        # keeps the combo honest about "Custom" whenever the knobs drift away from a preset.
-        def _apply_filter_routing_preset(idx):
-            if idx == 4:  # Custom is never user-applied -- only ever landed on by the comparator
-                return
-            self.filter_routing_mode.blockSignals(True)
-            v_type_b.blockSignals(True)
-            self.vcf_poles[0].blockSignals(True)
-            if idx == 0:    # Single: Filter A alone, forced 2-pole, Filter B off
-                self.filter_routing_mode.setCurrentIndex(0); v_type_b.setCurrentIndex(0); self.vcf_poles[0].setCurrentIndex(0)
-            elif idx == 1:  # Serial: both filters, A's output feeds B
-                self.filter_routing_mode.setCurrentIndex(0); v_type_b.setCurrentIndex(1); self.vcf_poles[0].setCurrentIndex(0)
-            elif idx == 2:  # Parallel: both filters, independent level/pan below
-                self.filter_routing_mode.setCurrentIndex(2); v_type_b.setCurrentIndex(1); self.vcf_poles[0].setCurrentIndex(0)
-            elif idx == 3:  # 24dB/oct: Filter A alone at 4-pole, Filter B off
-                self.filter_routing_mode.setCurrentIndex(0); v_type_b.setCurrentIndex(0); self.vcf_poles[0].setCurrentIndex(1)
-            self.filter_routing_mode.blockSignals(False)
-            v_type_b.blockSignals(False)
-            self.vcf_poles[0].blockSignals(False)
-            # Signals were blocked above (to avoid re-entrant preset-sync churn while applying),
-            # so the dependent visibility/enabled state each of those combos normally drives on
-            # its own currentIndexChanged needs one explicit refresh here.
-            self.filter_parallel_box.setVisible(self.filter_routing_mode.currentIndex() == 2)
-            b_blend_box.setVisible(v_type_b.currentIndex() == 1)
-            _sync_filter_b_enabled(v_type_b.currentIndex())
-            self.transmit_knob_packet()
-
-        def _sync_filter_routing_preset_combo():
-            mode = self.filter_routing_mode.currentIndex()
-            b_active = v_type_b.currentIndex() == 1
-            a_4pole = self.vcf_poles[0].currentIndex() == 1
-            if not b_active and not a_4pole and mode in (0, 1): preset = 0       # Single
-            elif b_active and not a_4pole and mode in (0, 1): preset = 1         # Serial
-            elif mode == 2 and not a_4pole: preset = 2                           # Parallel
-            elif not b_active and a_4pole and mode in (0, 1): preset = 3         # 24dB/oct
-            else: preset = 4                                                     # Custom
-            self.filter_routing_preset_combo.blockSignals(True)
-            self.filter_routing_preset_combo.setCurrentIndex(preset)
-            self.filter_routing_preset_combo.blockSignals(False)
-
-        self.filter_routing_preset_combo.currentIndexChanged.connect(_apply_filter_routing_preset)
-        self.filter_routing_mode.currentIndexChanged.connect(lambda idx: _sync_filter_routing_preset_combo())
-        v_type_b.currentIndexChanged.connect(lambda idx: _sync_filter_routing_preset_combo())
-        self.vcf_poles[0].currentIndexChanged.connect(lambda idx: _sync_filter_routing_preset_combo())
-        _sync_filter_routing_preset_combo()
+            lay.addWidget(QLabel("Freq:")); lay.addWidget(c_dial)
+            lay.addWidget(QLabel("Res:")); lay.addWidget(q_dial)
+            lay.addWidget(QLabel("Slope:")); lay.addWidget(v_slope)
+            lay.addWidget(QLabel("Type:")); lay.addWidget(v_type)
+            box.setLayout(lay)
+            filters_column.addWidget(box)
 
         filters_column.addStretch()
         filters_outer_lay.addLayout(filters_column)
@@ -3971,16 +3709,14 @@ class SynthGui(QWidget):
 
         matrix_shared_routes = [
             "None", "Osc 1 Pitch", "Osc 2 Pitch", "Osc 1+2 Pitch", "O1 Fine", "O2 Fine", "Osc 1 Amp", "Osc 2 Amp",
-            # FIXED: these 6 slots are stale leftovers from the old "3 equal stacked filters"
-            # model. The backend's filter overhaul repurposed these exact same numeric targets
-            # (8-13) to mean: 8/9 = Filter A's primary filter (filter_a when Normal, or the
-            # first internal filter when Filter A is in Multi mode), 10/11 = Filter B, 12/13 =
-            # Filter A's 3rd internal filter (Multi mode only -- a no-op otherwise). The old
-            # "F1/F2/F3" labels didn't reflect that at all, so picking e.g. "F2 Freq" (which
-            # sounds like "the second stacked filter") silently modulated Filter B instead, and
-            # "F3 Freq" did nothing unless Filter A happened to be in Multi mode.
-            "Filter A Freq", "Filter A Res (Q)", "Filter B Freq", "Filter B Res (Q)",
-            "Filter A-M3 Freq (Multi)", "Filter A-M3 Res (Multi)",
+            # Targets 8-13 are retired -- the old Filter A/B/Multi-unit slots these used to name no
+            # longer exist (see the filter section simplification: 5 flat filter slots replaced
+            # the whole Filter A Normal/Multi + Filter B system). Left as harmless neutral
+            # placeholders, list position unchanged, rather than reused for something else, so an
+            # old saved Program's LFO/EG still pointed at one of these becomes a no-op, not a
+            # crash or a silent reinterpretation -- see backend.c's own retired-target comment.
+            "(unused)", "(unused)", "(unused)", "(unused)",
+            "(unused)", "(unused)",
             "LFO 1 Rate", "LFO 2 Rate", "LFO 3 Rate", "LFO 4 Rate",
             "LFO 1 Dp", "LFO 2 Dp", "LFO 3 Dp", "LFO 4 Dp", "FM Depth", "Mix Balance",
             "Osc 1 Phase", "Osc 2 Phase", "O1 Unison Detune", "O2 Unison Detune",
@@ -4003,10 +3739,14 @@ class SynthGui(QWidget):
             # unwired in the backend; LFO 1-4 Phase, 28-31, already worked). All 16 LFOs now
             # support all three as mod destinations -- see lfo_rate_target_index/
             # lfo_depth_target_index/lfo_phase_target_index in backend.c.
-            "Filter A-M2 Freq (Multi)", "Filter A-M2 Res (Multi)",
-            # Targets 86-89: Multi Filter blend Crossfade, one per filter unit (mirrors the same
-            # 4-slot grouping filter_cutoff_mods/filter_res_mods already use).
-            "Filter A Crossfade", "Filter B Crossfade", "Filter A-M3 Crossfade", "Filter A-M2 Crossfade",
+            # Targets 84-89 are retired (see the 8-13 comment above -- same filter simplification).
+            "(unused)", "(unused)",
+            "(unused)", "(unused)", "(unused)", "(unused)",
+            # Targets 90-99: Filter 1-5 Cutoff/Resonance, one flat slot per filter -- the new
+            # 5-slot filter chain's own mod destinations (see ProgramState.filters in backend.c).
+            "Filter 1 Freq", "Filter 1 Res", "Filter 2 Freq", "Filter 2 Res",
+            "Filter 3 Freq", "Filter 3 Res", "Filter 4 Freq", "Filter 4 Res",
+            "Filter 5 Freq", "Filter 5 Res",
         ]
         # Stored on self -- the generalized right-click "Modulate From" menu (see
         # _show_dest_assign_menu) needs this list later, well outside __init__, to render each
@@ -5393,15 +5133,17 @@ class SynthGui(QWidget):
         # a value change) makes the GUI actually recall exactly as if it had been set that way by
         # hand -- matches every other widget class's real-time behavior.
         for combo in (self.vco1_combo, self.vco2_combo, self.vco3_combo, self.vco4_combo,
-                      *self.vcf_types, self.filter_routing_mode):
+                      *self.filter_type_combos, self.filter_chain_mode_combo):
             combo.currentIndexChanged.emit(combo.currentIndex())
 
         self.transmit_knob_packet()
 
     def _apply_program_fields_filters(self, fields):
-        """Mirrors transmit_knob_packet()'s own Filter A/B section (incl. the Multi Filter blend
-        loop) in reverse -- same cutoff_dials/q_dials/vcf_poles/vcf_types/filter_blend_units
-        index convention (0=Filter A Normal, 1-3=Filter A Multi units 0-2, 4=Filter B)."""
+        """Mirrors transmit_knob_packet()'s own flat 5-slot filter section in reverse -- same
+        filter_cutoff_dials/filter_res_dials/filter_slope_combos/filter_type_combos index
+        convention (one entry per filter slot, 0-4). filter_key_track/filter_cutoff_mod_source_cc
+        aren't widget-backed (see their own construction comment), so they're restored directly
+        into their cache lists rather than through a dial/combo setter."""
         def sd(addr, dial, scale=1.0):
             if addr in fields:
                 dial.blockSignals(True); dial.setValue(int(round(fields[addr] * scale))); dial.blockSignals(False)
@@ -5409,42 +5151,18 @@ class SynthGui(QWidget):
             if addr in fields:
                 combo.blockSignals(True); combo.setCurrentIndex(int(round(fields[addr]))); combo.blockSignals(False)
 
-        sc("/hds/filter/ab_routing_mode", self.filter_routing_mode)
-        sd("/hds/filter/a/level", self.filter_a_level_dial)
-        sd("/hds/filter/b/level", self.filter_b_level_dial)
-        sd("/hds/filter/a/pan", self.filter_a_pan_dial, 100.0)
-        sd("/hds/filter/b/pan", self.filter_b_pan_dial, 100.0)
-        sc("/hds/filter/a/mode", self.filter_a_mode_combo)
-
-        blend_taps = ["lp", "bp", "hp", "notch", "dry"]
-        def apply_blend(addr_prefix, unit_idx):
-            mode1_knobs, mode2_knobs, xf_dial, _box = self.filter_blend_units[unit_idx]
-            for tap, k in zip(blend_taps, mode1_knobs):
-                sd(f"{addr_prefix}/mode1/{tap}", k)
-            for tap, k in zip(blend_taps, mode2_knobs):
-                sd(f"{addr_prefix}/mode2/{tap}", k)
-            sd(f"{addr_prefix}/crossfade", xf_dial)
-
-        sd("/hds/filter/a/cutoff", self.cutoff_dials[0])
-        sd("/hds/filter/a/res_q", self.q_dials[0])
-        sc("/hds/filter/a/slope", self.vcf_poles[0])
-        sc("/hds/filter/a/type", self.vcf_types[0])
-        apply_blend("/hds/filter/a", 0)
-        sc("/hds/filter/a_multi/routing", self.filter_a_multi_route_combo)
-
-        for m_idx in range(1, 4):
-            backend_idx = m_idx - 1
-            sd(f"/hds/filter/a_multi/{backend_idx}/cutoff", self.cutoff_dials[m_idx])
-            sd(f"/hds/filter/a_multi/{backend_idx}/res_q", self.q_dials[m_idx])
-            sc(f"/hds/filter/a_multi/{backend_idx}/slope", self.vcf_poles[m_idx])
-            sc(f"/hds/filter/a_multi/{backend_idx}/type", self.vcf_types[m_idx])
-            apply_blend(f"/hds/filter/a_multi/{backend_idx}", m_idx)
-
-        sd("/hds/filter/b/cutoff", self.cutoff_dials[4])
-        sd("/hds/filter/b/res_q", self.q_dials[4])
-        sc("/hds/filter/b/slope", self.vcf_poles[4])
-        sc("/hds/filter/b/type", self.vcf_types[4])
-        apply_blend("/hds/filter/b", 4)
+        sc("/hds/filter/chain_mode", self.filter_chain_mode_combo)
+        for i in range(5):
+            sd(f"/hds/filter/{i}/cutoff", self.filter_cutoff_dials[i])
+            sd(f"/hds/filter/{i}/res_q", self.filter_res_dials[i])
+            sc(f"/hds/filter/{i}/slope", self.filter_slope_combos[i])
+            sc(f"/hds/filter/{i}/type", self.filter_type_combos[i])
+            key_track_addr = f"/hds/filter/{i}/key_track"
+            if key_track_addr in fields:
+                self.filter_key_track[i] = fields[key_track_addr]
+            cc_source_addr = f"/hds/filter/{i}/cc_source"
+            if cc_source_addr in fields:
+                self.filter_cutoff_mod_source_cc[i] = fields[cc_source_addr]
 
     def _apply_program_fields_egs(self, fields):
         """Mirrors transmit_knob_packet()'s EG-params loop, reusing each EG panel's own existing
@@ -5903,6 +5621,57 @@ class SynthGui(QWidget):
         self._populate_modulate_from_menu(menu, target)
         menu.exec(global_pos)
 
+    # --- Filter Cutoff right-click menu: Key Track preset list + ext-MIDI CC/aftertouch source +
+    # the generic "Modulate From" section, mirroring _show_lfo_row_menu's 'depth' case exactly
+    # (same three-section shape). Resonance has no Key Track/ext-MIDI section of its own -- its
+    # right-click stays on the plain _show_dest_assign_menu above, per the literal ask ("right
+    # click menu on cutoff freqs").
+
+    def _filter_cutoff_dest_target(self, filter_idx):
+        return 90 + filter_idx * 2  # 90, 92, 94, 96, 98 -- matches backend.c's case labels exactly
+
+    def _set_filter_key_track(self, filter_idx, value):
+        self.filter_key_track[filter_idx] = value
+        self.transmit_knob_packet()
+
+    def _set_filter_mod_source(self, filter_idx, cc_value):
+        self.filter_cutoff_mod_source_cc[filter_idx] = cc_value
+        self.transmit_knob_packet()
+
+    def _prompt_custom_filter_cc(self, filter_idx):
+        current_cc = self.filter_cutoff_mod_source_cc[filter_idx]
+        current = int(current_cc) if 0 <= current_cc < 128 else 1
+        cc_num, ok = QInputDialog.getInt(self, "Custom MIDI CC", "CC number (0-127):", current, 0, 127, 1)
+        if ok:
+            self._set_filter_mod_source(filter_idx, float(cc_num))
+
+    def _show_filter_cutoff_menu(self, filter_idx, global_pos):
+        menu = QMenu(self)
+        menu.addSection("Key Track")
+        current_kt = self.filter_key_track[filter_idx]
+        for label, val in self._KEY_TRACK_PRESETS:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(current_kt == val)
+            action.triggered.connect(lambda checked, i=filter_idx, v=val: self._set_filter_key_track(i, v))
+            menu.addAction(action)
+        menu.addSection("Modulation Source (ext MIDI)")
+        current_cc = self.filter_cutoff_mod_source_cc[filter_idx]
+        for label, val in self._MOD_SOURCE_PRESETS:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(current_cc == val)
+            action.triggered.connect(lambda checked, i=filter_idx, v=val: self._set_filter_mod_source(i, v))
+            menu.addAction(action)
+        menu.addSeparator()
+        custom_action = QAction("Custom CC…", self)
+        custom_action.setCheckable(True)
+        custom_action.setChecked(current_cc >= 0.0 and current_cc < 128.0 and current_cc not in (1.0, 2.0, 4.0, 11.0))
+        custom_action.triggered.connect(lambda checked, i=filter_idx: self._prompt_custom_filter_cc(i))
+        menu.addAction(custom_action)
+        self._populate_modulate_from_menu(menu, self._filter_cutoff_dest_target(filter_idx))
+        menu.exec(global_pos)
+
     # --- Osc 1 Amp EG -> Osc 2/3/4 copy/sync ---
 
     def _copy_amp_eg_to_all(self):
@@ -6157,52 +5926,17 @@ class SynthGui(QWidget):
             add_f(f"/hds/eg/{eg_idx}/attack_start_pct", panel.attack_level_pct)
             add_f(f"/hds/eg/{eg_idx}/attack_peak_pct", panel.attack_peak_pct)
 
-        # --- Filter A/B ---
-        add_f("/hds/filter/ab_routing_mode", self.filter_routing_mode.currentIndex())
-        # Independent Parallel-mode level/pan (replaces the old single A/B Blend knob).
-        add_f("/hds/filter/a/level", self.filter_a_level_dial.value())
-        add_f("/hds/filter/b/level", self.filter_b_level_dial.value())
-        add_f("/hds/filter/a/pan", float(self.filter_a_pan_dial.value()) / 100.0)
-        add_f("/hds/filter/b/pan", float(self.filter_b_pan_dial.value()) / 100.0)
-        add_f("/hds/filter/a/mode", self.filter_a_mode_combo.currentIndex())
-
-        # Multi Filter blend: filter_blend_units[i] is a (mode1_knobs[5], mode2_knobs[5],
-        # crossfade_knob, box) tuple in LP/BP/HP/Notch/Dry order, index-aligned with
-        # cutoff_dials/q_dials/vcf_poles/vcf_types (0=Filter A Normal, 1-3=Filter A Multi
-        # units 0-2, 4=Filter B) -- built alongside those widgets in the Filters tab.
-        blend_taps = ["lp", "bp", "hp", "notch", "dry"]
-        def add_blend(addr_prefix, unit_idx):
-            mode1_knobs, mode2_knobs, xf_dial, _box = self.filter_blend_units[unit_idx]
-            for tap, k in zip(blend_taps, mode1_knobs):
-                add_f(f"{addr_prefix}/mode1/{tap}", k.value())
-            for tap, k in zip(blend_taps, mode2_knobs):
-                add_f(f"{addr_prefix}/mode2/{tap}", k.value())
-            add_f(f"{addr_prefix}/crossfade", xf_dial.value())
-
-        # Filter A Normal Parameters
-        add_f("/hds/filter/a/cutoff", self.cutoff_dials[0].value())
-        add_f("/hds/filter/a/res_q", self.q_dials[0].value())
-        add_f("/hds/filter/a/slope", self.vcf_poles[0].currentIndex())
-        add_f("/hds/filter/a/type", self.vcf_types[0].currentIndex())
-        add_blend("/hds/filter/a", 0)
-        add_f("/hds/filter/a_multi/routing", self.filter_a_multi_route_combo.currentIndex())
-
-        # Filter A Multi Engine sub-units: Python's cutoff_dials[1..3] are backend's
-        # filter_a_multi[0..2] -- index 0 there is Filter A Normal, index 4 is Filter B.
-        for m_idx in range(1, 4):
-            backend_idx = m_idx - 1
-            add_f(f"/hds/filter/a_multi/{backend_idx}/cutoff", self.cutoff_dials[m_idx].value())
-            add_f(f"/hds/filter/a_multi/{backend_idx}/res_q", self.q_dials[m_idx].value())
-            add_f(f"/hds/filter/a_multi/{backend_idx}/slope", self.vcf_poles[m_idx].currentIndex())
-            add_f(f"/hds/filter/a_multi/{backend_idx}/type", self.vcf_types[m_idx].currentIndex())
-            add_blend(f"/hds/filter/a_multi/{backend_idx}", m_idx)
-
-        # Filter B Engine Parameters (index 4 in these Python arrays)
-        add_f("/hds/filter/b/cutoff", self.cutoff_dials[4].value())
-        add_f("/hds/filter/b/res_q", self.q_dials[4].value())
-        add_f("/hds/filter/b/slope", self.vcf_poles[4].currentIndex())
-        add_f("/hds/filter/b/type", self.vcf_types[4].currentIndex())
-        add_blend("/hds/filter/b", 4)
+        # --- Filters: 5 flat, interchangeable slots, chained in Series or summed in Parallel
+        # (filter_chain_mode) -- see backend.c's own comments on ProgramState.filters/
+        # FilterParams for the design this mirrors. ---
+        add_f("/hds/filter/chain_mode", self.filter_chain_mode_combo.currentIndex())
+        for i in range(5):
+            add_f(f"/hds/filter/{i}/cutoff", self.filter_cutoff_dials[i].value())
+            add_f(f"/hds/filter/{i}/res_q", self.filter_res_dials[i].value())
+            add_f(f"/hds/filter/{i}/slope", self.filter_slope_combos[i].currentIndex())
+            add_f(f"/hds/filter/{i}/type", self.filter_type_combos[i].currentIndex())
+            add_f(f"/hds/filter/{i}/key_track", self.filter_key_track[i])
+            add_f(f"/hds/filter/{i}/cc_source", self.filter_cutoff_mod_source_cc[i])
 
         # --- Combi/Sequencer scaffolding (see backend.c's SEQ_LANE_COUNT comment) ---
         if self.osc_combi_radio.isChecked():
@@ -6627,28 +6361,16 @@ def runtime_connect_and_bind(gui):
     gui.vco2_pitch.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_pitch.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_pitch.valueChanged.connect(gui.transmit_knob_packet)
-    gui.filter_routing_mode.currentIndexChanged.connect(gui.transmit_knob_packet)
-    gui.filter_a_level_dial.valueChanged.connect(gui.transmit_knob_packet)
-    gui.filter_b_level_dial.valueChanged.connect(gui.transmit_knob_packet)
-    gui.filter_a_pan_dial.valueChanged.connect(gui.transmit_knob_packet)
-    gui.filter_b_pan_dial.valueChanged.connect(gui.transmit_knob_packet)
-
-    # Active filter configuration bindings
-    gui.filter_a_mode_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
-    gui.filter_a_multi_route_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
-    for dial in gui.cutoff_dials:
+    # Filters: 5 flat, interchangeable slots + the Series/Parallel chain-mode combo.
+    gui.filter_chain_mode_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+    for dial in gui.filter_cutoff_dials:
         dial.valueChanged.connect(gui.transmit_knob_packet)
-    for dial in gui.q_dials:
+    for dial in gui.filter_res_dials:
         dial.valueChanged.connect(gui.transmit_knob_packet)
-    for combo in gui.vcf_poles:
+    for combo in gui.filter_slope_combos:
         combo.currentIndexChanged.connect(gui.transmit_knob_packet)
-    for combo in gui.vcf_types:
+    for combo in gui.filter_type_combos:
         combo.currentIndexChanged.connect(gui.transmit_knob_packet)
-    # Multi Filter blend knobs (Mode 1/Mode 2 taps + Crossfade), one set per filter unit.
-    for mode1_knobs, mode2_knobs, xf_dial, _box in gui.filter_blend_units:
-        for k in mode1_knobs + mode2_knobs:
-            k.valueChanged.connect(gui.transmit_knob_packet)
-        xf_dial.valueChanged.connect(gui.transmit_knob_packet)
 
     # Combi/Sequencer lane scaffolding: fader/pan (both views) + type/seq-mode combos
     # (Sequencer view only -- Combi's rows have None in those two tuple slots).

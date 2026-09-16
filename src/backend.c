@@ -225,28 +225,33 @@ typedef struct {
     float vel_track;
 } PackLfoParams;
 
-// A single filter's parameters: State-Variable Filter (SVF) core, cutoff/resonance/type, plus
-// a slope switch. slope_poles cascades the same 2-pole (12dB/oct) SVF core twice back-to-back
-// to get a 4-pole (24dB/oct) slope -- see run_svf_filter().
+// A single filter's parameters: State-Variable Filter (SVF) core, cutoff/resonance/exclusive
+// type, plus a slope switch. slope_poles cascades the same 2-pole (12dB/oct) SVF core twice
+// back-to-back to get a 4-pole (24dB/oct) slope -- see run_svf_filter(). Deliberately simple --
+// a prior "Multimode blend" design (5-tap weighted Mode1/Mode2/Crossfade mix per filter) plus a
+// whole Filter A(Normal/Multi)/Filter B routing system on top of it was scrapped per the user's
+// own direct assessment ("genuinely doesn't make sense anymore") in favor of this: 5 flat,
+// interchangeable filter slots (see ProgramState.filters[5]), each an exclusive Off/LP/HP/BP/
+// Notch pick, chained in Series or summed in Parallel -- see render_audio_block's filter dispatch.
 typedef struct {
     float cutoff;
     float res_q;
     float slope_poles; // 0 = 2-pole (12dB/oct), 1 = 4-pole (24dB/oct)
-    // Repurposed (not renamed -- same field, same OSC address, matching how hard_sync was
-    // reinterpreted into hard_sync_mode previously): 0 = Off (bypass -- passes the signal through
-    // unfiltered, unchanged), 1 = Active (uses the Multi Filter blend below instead of an
-    // exclusive Low/High/Band Pass pick).
-    float filter_type;
-    // Multi Filter blend: run_svf_filter's SVF core already produces Low/Band/High simultaneously
-    // every sample (Notch = Low+High is a free, standard SVF identity); rather than pick one
-    // exclusively, each of these 5 weights (-100..100, bipolar so a phase-inverted combination is
-    // possible) says how much of that tap the final output carries. "Dry" is this filter's own
-    // pre-stage input. Two independent blends (Mode 1 / Mode 2) let `crossfade` (0-100, modulatable
-    // -- see filter_crossfade_mods in render_audio_block) morph between two hand-built combinations
-    // live, e.g. from an EG/LFO/real-time controller.
-    float mode1_lp, mode1_bp, mode1_hp, mode1_notch, mode1_dry;
-    float mode2_lp, mode2_bp, mode2_hp, mode2_notch, mode2_dry;
-    float crossfade; // 0 = all Mode 1, 100 = all Mode 2
+    float filter_type; // 0=Off (bypass -- signal passes through unfiltered, unchanged), 1=LPF,
+                        // 2=HPF, 3=BPF, 4=Notch -- exclusive pick, no blending between taps.
+    // Cutoff keyboard tracking (-100..100): same formula/convention as PackLfoParams' own
+    // key_track (see its use in render_audio_block) -- 0 = no tracking (this filter's cutoff is
+    // fixed regardless of which note plays), +-100 = a full octave-per-octave-of-keyboard
+    // multiplier, centered on note 60 (middle C). The frontend exposes this as a short preset
+    // list (Off/50%/100%/150%) in the Cutoff knob's own right-click menu rather than a separate
+    // always-visible knob, but the backend just applies whatever value arrives.
+    float key_track;
+    // "ext MIDI": additive cutoff modulation from a live MIDI CC or channel aftertouch, same
+    // convention as PackLfoParams.mod_source_cc (-1=none, 0-127=CC number, 128=channel
+    // aftertouch -- see MidiLiveState.cc[128]/channel_pressure). Unlike mod_source_cc's own
+    // multiplicative LFO-depth scale, this is a direct additive cutoff offset (see
+    // render_audio_block) -- "more mod wheel/aftertouch = brighter" is the near-universal use.
+    float cutoff_mod_source_cc;
 } FilterParams;
 
 // One lane in the Combi/Sequencer 32-lane pool (see SEQ_LANE_COUNT's own comment above). Purely
@@ -556,44 +561,14 @@ typedef struct {
     // 80 Envelope Parameter Items (ENV_COUNT=10 Envelopes * 8 Parameters, incl. attack start/peak level)
     PackEGParams eg[ENV_COUNT];
 
-    // --- FILTER SECTION: 4 oscillators -> mixer -> Filter A -> Filter B, with A and B routable
-    // in Series (either order) or Parallel with each other.
-    //
-    // Filter A / Filter B outer routing: 0 = Series A->B (mixer -> A -> B -> output),
-    // 1 = Series B->A (mixer -> B -> A -> output -- same two filters, reversed order, e.g. to
-    // put Filter A's Multi mode after Filter B instead of before it), 2 = Parallel (mixer -> A,
-    // mixer -> B independently, each with its own level/pan below -> output).
-    float filter_ab_routing_mode;
-
-    // Parallel-mode independent level (0-100) and pan (-1..1, equal-power) per filter -- each
-    // filter can be placed at its own level AND stereo position, matching a classic hardware
-    // synth's own "Parallel" filter routing description ("individual control over both level and
-    // pan"). Unused in either Series mode, where the chain order alone decides which filter is
-    // "heard last". Defaults (50/50 level, centered pan) reproduce the historical blend=50
-    // default output level exactly -- see run_svf_filter's Parallel-combine comment in
-    // render_audio_block for the sqrt(2)-normalized pan formula that makes pan=0 a true no-op on
-    // an already-stereo signal.
-    float filter_a_level;
-    float filter_b_level;
-    float filter_a_pan;
-    float filter_b_pan;
-
-    // Filter A: a single Normal filter by default. Switching filter_a_mode to 1 ("Multi")
-    // replaces it with the 3-filter Multi engine below instead of filter_a -- the original
-    // 3-filter-stack design, now scoped down to being one of Filter A's two modes.
-    float filter_a_mode; // 0 = Normal (uses filter_a below), 1 = Multi (uses filter_a_multi* below)
-    FilterParams filter_a;
-
-    // Filter A's internal 3-filter "Multi" engine (used only when filter_a_mode == 1). Because
-    // the 4 oscillators are already summed into one signal before reaching Filter A, all 3 of
-    // these take the SAME post-mixer input -- unlike the old engine, they can no longer see
-    // individual oscillators separately, so there's no more "independent per-oscillator" option.
-    float filter_a_multi_routing; // 0 = Series (in0->in1->in2), 1 = Parallel (all 3, summed),
-                                   // 2 = Split (in0 // in1 summed, -> in2)
-    FilterParams filter_a_multi[3];
-
-    // Filter B: always a single, normal filter -- no Multi mode of its own.
-    FilterParams filter_b;
+    // --- FILTER SECTION: 4 oscillators -> mixer -> 5 flat, interchangeable filter slots, chained
+    // in Series (0->1->2->3->4) or summed in Parallel -- see render_audio_block's filter
+    // dispatch. Deliberately simple: no A/B distinction, no Multi sub-engine, no blend weights
+    // -- each slot is FilterParams' own plain exclusive Off/LPF/HPF/BPF/Notch pick. ---
+    float filter_chain_mode; // 0 = Series (0->1->2->3->4), 1 = Parallel (summed; an Off slot
+                              // contributes nothing to the sum, and isn't counted in the
+                              // divisor that averages however many slots are actually active).
+    FilterParams filters[5];
 
     // Active LFO Mapping Items (LFO_COUNT=16 LFOs * 7 Properties, incl. phase offset + mod source CC)
     PackLfoParams lfo[LFO_COUNT];
@@ -1075,18 +1050,13 @@ typedef struct {
     float vco4_unison_saw_phases[UNISON_SAW_VOICES];
     ADSR vco4_eg;
 
-    // Filter A's SVF register banks: [channel: 0=L,1=R][unit: 3 "units", unit 0 used alone in
-    // Normal mode, all 3 used as the Multi engine in Multi mode][cascade stage: 2, 2nd stage
-    // only used when a unit's slope is set to 4-pole]. Independent per-voice AND per-channel --
-    // Filter A/B now run as two fully independent mono filters (one per stereo channel) so that
-    // each oscillator's Pan placement survives the trip through the filters instead of being
-    // collapsed to mono first.
-    float fa_low[2][3][2];
-    float fa_band[2][3][2];
-
-    // Filter B's SVF register bank: [channel][cascade stage].
-    float fb_low[2][2];
-    float fb_band[2][2];
+    // The 5 filter slots' SVF register banks: [channel: 0=L,1=R][filter slot: 0-4][cascade
+    // stage: 2, 2nd stage only used when that slot's slope is set to 4-pole]. Independent per-
+    // voice AND per-channel -- each of the 5 filters runs as two fully independent mono filters
+    // (one per stereo channel) so that each oscillator's Pan placement survives the trip through
+    // the filters instead of being collapsed to mono first.
+    float f_low[2][5][2];
+    float f_band[2][5][2];
 
     // Assignable envelope instances 1-ASSIGNABLE_EG_COUNT
     ADSR assign_eg[ASSIGNABLE_EG_COUNT];
@@ -1264,15 +1234,11 @@ static float band_limited_pulse(float phase, float dt, float duty_frac) {
 // core cascaded twice back-to-back for a 4-pole (24dB/oct) slope. low_state/band_state must be
 // 2-element arrays (per-voice, persistent between calls); only element 0 is touched at 2-pole,
 // both at 4-pole -- so switching slopes live doesn't require resetting anything.
-static float run_svf_filter(float input, float cutoff_hz, float res_q, int active, const float mode1[5], const float mode2[5], float crossfade, int slope_poles, float low_state[2], float band_state[2]) {
-    // FIXED (catastrophic bug): "Off" used to return 0.0f -- silencing the signal entirely --
-    // carried over unexamined from the old 3-filter engine's convention. In the new 2-filter
-    // (A/B) architecture, Filter B defaults to Off, and EVERY voice's signal passes through
-    // both A and B (in series by default) -- so any filter left in its default Off state
-    // multiplied the whole synth's output by zero, and there was no way to hear anything with
-    // both filters off. "Off" now means bypass: the signal passes through completely
-    // unmodified, matching what "Off" obviously should mean.
-    if (!active) return input;
+static float run_svf_filter(float input, float cutoff_hz, float res_q, int filter_type, int slope_poles, float low_state[2], float band_state[2]) {
+    // "Off" (filter_type==0) means true bypass: the signal passes through completely unmodified
+    // -- with 5 independent filter slots (see ProgramState.filters[5]) now able to each be
+    // independently on/off, an unused slot must contribute nothing but a pass-through, not silence.
+    if (filter_type == 0) return input;
     cutoff_hz = fmaxf(40.0f, fminf(18000.0f, cutoff_hz));
     // FIXED (catastrophic bug -- "total audio failure when changing filter knobs"): this used to
     // be the classic "naive" Chamberlin SVF (forward-Euler integration of the analog SVF ODEs,
@@ -1311,25 +1277,9 @@ static float run_svf_filter(float input, float cutoff_hz, float res_q, int activ
     float a1 = 1.0f / (1.0f + g * (g + k));
     float a2 = g * a1;
     float a3 = g * a2;
-    // Multi Filter blend: the SVF core below already produces Low/Band/High simultaneously every
-    // sample: rather than pick one exclusively (the old behavior, still reproduced exactly by a
-    // one-hot Mode 1 with crossfade=0 -- see init_default_controls), weight-sum all of them plus
-    // Notch (= Low + High, a free standard SVF identity) and Dry (this stage's own input).
-    // Interpolating the 5 weights Mode1->Mode2 is hoisted here, outside the per-stage loop below,
-    // since it depends only on the two mode vectors + crossfade, never on per-stage state -- so
-    // it's computed once per call and reused for both stages in 4-pole mode, not recomputed per
-    // stage. mode1[]/mode2[] are {lp, bp, hp, notch, dry}, each -100..100 (bipolar -- a negative
-    // weight phase-inverts that tap into the mix, a deliberate extra degree of freedom).
-    float xf = fmaxf(0.0f, fminf(100.0f, crossfade)) / 100.0f;
-    float m_lp    = (mode1[0] + (mode2[0] - mode1[0]) * xf) / 100.0f;
-    float m_bp    = (mode1[1] + (mode2[1] - mode1[1]) * xf) / 100.0f;
-    float m_hp    = (mode1[2] + (mode2[2] - mode1[2]) * xf) / 100.0f;
-    float m_notch = (mode1[3] + (mode2[3] - mode1[3]) * xf) / 100.0f;
-    float m_dry   = (mode1[4] + (mode2[4] - mode1[4]) * xf) / 100.0f;
     int stages = (slope_poles != 0) ? 2 : 1;
     float sig = input;
     for (int s = 0; s < stages; s++) {
-        float dry = sig; // this stage's own pre-filter input -- "Dry" in the blend
         float v3 = sig - low_state[s];
         float v1 = a1 * band_state[s] + a2 * v3; // bandpass output
         float v2 = low_state[s] + a2 * band_state[s] + a3 * v3; // lowpass output
@@ -1345,45 +1295,24 @@ static float run_svf_filter(float input, float cutoff_hz, float res_q, int activ
         band_state[s] = fmaxf(-1.0e6f, fminf(1.0e6f, band_state[s]));
         low_state[s] = fmaxf(-1.0e6f, fminf(1.0e6f, low_state[s]));
         float high = sig - k * v1 - v2; // highpass output
-        float notch = v2 + high; // standard SVF identity: Notch = Low + High
-        sig = m_lp*v2 + m_bp*v1 + m_hp*high + m_notch*notch + m_dry*dry;
+        // Exclusive pick -- no blending between taps (see FilterParams.filter_type's own
+        // comment). Notch (= Low + High) is a free standard SVF identity; filter_type==0
+        // (Off) already bypassed above, so only 1-4 reach here.
+        switch (filter_type) {
+            case 1:  sig = v2; break;        // LPF
+            case 2:  sig = high; break;      // HPF
+            case 3:  sig = v1; break;        // BPF
+            default: sig = v2 + high; break; // Notch (filter_type==4)
+        }
     }
     return sig;
 }
 
-// Small convenience wrapper: builds run_svf_filter's mode1[]/mode2[] arrays from a FilterParams
-// instance and applies knob+mod combination for cutoff/res/crossfade, matching the existing
+// Small convenience wrapper: applies knob+mod combination for cutoff/res, matching the existing
 // "*_mods[]" additive-modulation convention used everywhere else in this file. Every call site
-// that drives a FilterParams-backed filter (Filter A Normal, each Filter A Multi unit, Filter B)
-// goes through this instead of repeating the 10-field array-building boilerplate 5 times over.
-static float run_svf_filter_p(float input, const FilterParams *p, float cutoff_mod, float res_mod, float crossfade_mod, float low_state[2], float band_state[2]) {
-    float mode1[5] = { p->mode1_lp, p->mode1_bp, p->mode1_hp, p->mode1_notch, p->mode1_dry };
-    float mode2[5] = { p->mode2_lp, p->mode2_bp, p->mode2_hp, p->mode2_notch, p->mode2_dry };
-    return run_svf_filter(input, p->cutoff + cutoff_mod, p->res_q + res_mod, (int)p->filter_type, mode1, mode2, p->crossfade + crossfade_mod, (int)p->slope_poles, low_state, band_state);
-}
-
-// Filter A's "Multi" mode: the original 3-filter engine, now scoped down to being one of Filter
-// A's two modes (see the FilterParams/filter_a_multi comments in the struct). Processes a
-// single channel (called once for L, once for R -- see render_audio_block); each channel keeps
-// its own independent state so panning survives filtering.
-static float run_filter_a_multi(float in, int routing, const FilterParams multi[3], const float cutoff_mods[3], const float res_mods[3], const float crossfade_mods[3], float low[3][2], float band[3][2]) {
-    float u0 = run_svf_filter_p(in, &multi[0], cutoff_mods[0], res_mods[0], crossfade_mods[0], low[0], band[0]);
-
-    if (routing == 0) {
-        // Series: unit 0 -> unit 1 -> unit 2
-        float u1 = run_svf_filter_p(u0, &multi[1], cutoff_mods[1], res_mods[1], crossfade_mods[1], low[1], band[1]);
-        return run_svf_filter_p(u1, &multi[2], cutoff_mods[2], res_mods[2], crossfade_mods[2], low[2], band[2]);
-    } else if (routing == 1) {
-        // Parallel: all 3 units take the same input directly, summed evenly
-        float u1 = run_svf_filter_p(in, &multi[1], cutoff_mods[1], res_mods[1], crossfade_mods[1], low[1], band[1]);
-        float u2 = run_svf_filter_p(in, &multi[2], cutoff_mods[2], res_mods[2], crossfade_mods[2], low[2], band[2]);
-        return (u0 + u1 + u2) / 3.0f;
-    } else {
-        // Split: unit 0 // unit 1 (both take the same input directly), summed 50/50, -> unit 2
-        float u1 = run_svf_filter_p(in, &multi[1], cutoff_mods[1], res_mods[1], crossfade_mods[1], low[1], band[1]);
-        float blended = (u0 + u1) * 0.5f;
-        return run_svf_filter_p(blended, &multi[2], cutoff_mods[2], res_mods[2], crossfade_mods[2], low[2], band[2]);
-    }
+// that drives one of the 5 filter slots goes through this.
+static float run_svf_filter_p(float input, const FilterParams *p, float cutoff_mod, float res_mod, float low_state[2], float band_state[2]) {
+    return run_svf_filter(input, p->cutoff + cutoff_mod, p->res_q + res_mod, (int)p->filter_type, (int)p->slope_poles, low_state, band_state);
 }
 
 // Persistent per-slot engine state for the FX bus -- deliberately kept OUT of the wire struct
@@ -2466,8 +2395,9 @@ static void run_fx_stereodoubler(FXSlotEngine *engine, const FXSlotParams *param
 // so Series order among a source's own slots is still exactly array order), *l/*r updated in
 // place after every owned slot. 1 = Parallel, every one of this source's slots fed the SAME
 // original dry input independently (an Off/bypassed slot in Parallel contributes its own
-// unprocessed dry copy, same convention as run_filter_a_multi's Parallel routing), all of this
-// source's results summed and averaged into *l/*r at the end -- averaged over however many slots
+// unprocessed dry copy -- unlike the flat filter chain's own Parallel mode, see render_audio_block's
+// filter dispatch, where an Off slot is excluded from the sum entirely rather than passed through
+// dry), all of this source's results summed and averaged into *l/*r at the end -- averaged over however many slots
 // THIS source actually owns, not FX_SLOT_COUNT, so a source using only 1 or 2 slots in Parallel
 // isn't attenuated as if all 12 had participated. A source that owns zero slots (Series or
 // Parallel alike) is a correct no-op: *l/*r pass through unchanged.
@@ -2916,477 +2846,72 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PARRAY_AT("/hds/combi/6/eg/%d/topology_mode", eg_mode, ENV_COUNT, 6),
     OSC_PARRAY_AT("/hds/combi/7/eg/%d/topology_mode", eg_mode, ENV_COUNT, 7),
 
-    // --- Filter A/B ---
-    OSC_PSCALAR("/hds/filter/ab_routing_mode", filter_ab_routing_mode),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/ab_routing_mode", filter_ab_routing_mode, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/ab_routing_mode", filter_ab_routing_mode, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/ab_routing_mode", filter_ab_routing_mode, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/ab_routing_mode", filter_ab_routing_mode, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/ab_routing_mode", filter_ab_routing_mode, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/ab_routing_mode", filter_ab_routing_mode, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/ab_routing_mode", filter_ab_routing_mode, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/ab_routing_mode", filter_ab_routing_mode, 7),
-    // Parallel-mode independent level/pan (replaces the old single filter_ab_blend crossfade).
-    OSC_PSCALAR("/hds/filter/a/level", filter_a_level),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/level", filter_a_level, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/level", filter_a_level, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/level", filter_a_level, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/level", filter_a_level, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/level", filter_a_level, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/level", filter_a_level, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/level", filter_a_level, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/level", filter_a_level, 7),
-    OSC_PSCALAR("/hds/filter/b/level", filter_b_level),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/level", filter_b_level, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/level", filter_b_level, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/level", filter_b_level, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/level", filter_b_level, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/level", filter_b_level, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/level", filter_b_level, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/level", filter_b_level, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/level", filter_b_level, 7),
-    OSC_PSCALAR("/hds/filter/a/pan", filter_a_pan),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/pan", filter_a_pan, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/pan", filter_a_pan, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/pan", filter_a_pan, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/pan", filter_a_pan, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/pan", filter_a_pan, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/pan", filter_a_pan, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/pan", filter_a_pan, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/pan", filter_a_pan, 7),
-    OSC_PSCALAR("/hds/filter/b/pan", filter_b_pan),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/pan", filter_b_pan, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/pan", filter_b_pan, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/pan", filter_b_pan, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/pan", filter_b_pan, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/pan", filter_b_pan, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/pan", filter_b_pan, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/pan", filter_b_pan, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/pan", filter_b_pan, 7),
-    OSC_PSCALAR("/hds/filter/a/mode", filter_a_mode),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode", filter_a_mode, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode", filter_a_mode, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode", filter_a_mode, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode", filter_a_mode, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/mode", filter_a_mode, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/mode", filter_a_mode, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode", filter_a_mode, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode", filter_a_mode, 7),
-    OSC_PSCALAR("/hds/filter/a/cutoff", filter_a.cutoff),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/cutoff", filter_a.cutoff, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/cutoff", filter_a.cutoff, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/cutoff", filter_a.cutoff, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/cutoff", filter_a.cutoff, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/cutoff", filter_a.cutoff, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/cutoff", filter_a.cutoff, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/cutoff", filter_a.cutoff, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/cutoff", filter_a.cutoff, 7),
-    OSC_PSCALAR("/hds/filter/a/res_q", filter_a.res_q),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/res_q", filter_a.res_q, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/res_q", filter_a.res_q, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/res_q", filter_a.res_q, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/res_q", filter_a.res_q, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/res_q", filter_a.res_q, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/res_q", filter_a.res_q, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/res_q", filter_a.res_q, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/res_q", filter_a.res_q, 7),
-    OSC_PSCALAR("/hds/filter/a/slope", filter_a.slope_poles),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/slope", filter_a.slope_poles, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/slope", filter_a.slope_poles, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/slope", filter_a.slope_poles, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/slope", filter_a.slope_poles, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/slope", filter_a.slope_poles, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/slope", filter_a.slope_poles, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/slope", filter_a.slope_poles, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/slope", filter_a.slope_poles, 7),
-    OSC_PSCALAR("/hds/filter/a/type", filter_a.filter_type),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/type", filter_a.filter_type, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/type", filter_a.filter_type, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/type", filter_a.filter_type, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/type", filter_a.filter_type, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/type", filter_a.filter_type, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/type", filter_a.filter_type, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/type", filter_a.filter_type, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/type", filter_a.filter_type, 7),
-    // Multi Filter blend (Mode 1/Mode 2/Crossfade) -- one set of 11 addresses per filter unit.
-    OSC_PSCALAR("/hds/filter/a/mode1/lp", filter_a.mode1_lp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode1/lp", filter_a.mode1_lp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode1/lp", filter_a.mode1_lp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode1/lp", filter_a.mode1_lp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode1/lp", filter_a.mode1_lp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/mode1/lp", filter_a.mode1_lp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/mode1/lp", filter_a.mode1_lp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode1/lp", filter_a.mode1_lp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode1/lp", filter_a.mode1_lp, 7),
-    OSC_PSCALAR("/hds/filter/a/mode1/bp", filter_a.mode1_bp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode1/bp", filter_a.mode1_bp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode1/bp", filter_a.mode1_bp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode1/bp", filter_a.mode1_bp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode1/bp", filter_a.mode1_bp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/mode1/bp", filter_a.mode1_bp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/mode1/bp", filter_a.mode1_bp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode1/bp", filter_a.mode1_bp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode1/bp", filter_a.mode1_bp, 7),
-    OSC_PSCALAR("/hds/filter/a/mode1/hp", filter_a.mode1_hp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode1/hp", filter_a.mode1_hp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode1/hp", filter_a.mode1_hp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode1/hp", filter_a.mode1_hp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode1/hp", filter_a.mode1_hp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/mode1/hp", filter_a.mode1_hp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/mode1/hp", filter_a.mode1_hp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode1/hp", filter_a.mode1_hp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode1/hp", filter_a.mode1_hp, 7),
-    OSC_PSCALAR("/hds/filter/a/mode1/notch", filter_a.mode1_notch),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode1/notch", filter_a.mode1_notch, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode1/notch", filter_a.mode1_notch, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode1/notch", filter_a.mode1_notch, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode1/notch", filter_a.mode1_notch, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/mode1/notch", filter_a.mode1_notch, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/mode1/notch", filter_a.mode1_notch, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode1/notch", filter_a.mode1_notch, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode1/notch", filter_a.mode1_notch, 7),
-    OSC_PSCALAR("/hds/filter/a/mode1/dry", filter_a.mode1_dry),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode1/dry", filter_a.mode1_dry, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode1/dry", filter_a.mode1_dry, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode1/dry", filter_a.mode1_dry, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode1/dry", filter_a.mode1_dry, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/mode1/dry", filter_a.mode1_dry, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/mode1/dry", filter_a.mode1_dry, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode1/dry", filter_a.mode1_dry, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode1/dry", filter_a.mode1_dry, 7),
-    OSC_PSCALAR("/hds/filter/a/mode2/lp", filter_a.mode2_lp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode2/lp", filter_a.mode2_lp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode2/lp", filter_a.mode2_lp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode2/lp", filter_a.mode2_lp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode2/lp", filter_a.mode2_lp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/mode2/lp", filter_a.mode2_lp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/mode2/lp", filter_a.mode2_lp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode2/lp", filter_a.mode2_lp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode2/lp", filter_a.mode2_lp, 7),
-    OSC_PSCALAR("/hds/filter/a/mode2/bp", filter_a.mode2_bp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode2/bp", filter_a.mode2_bp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode2/bp", filter_a.mode2_bp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode2/bp", filter_a.mode2_bp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode2/bp", filter_a.mode2_bp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/mode2/bp", filter_a.mode2_bp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/mode2/bp", filter_a.mode2_bp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode2/bp", filter_a.mode2_bp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode2/bp", filter_a.mode2_bp, 7),
-    OSC_PSCALAR("/hds/filter/a/mode2/hp", filter_a.mode2_hp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode2/hp", filter_a.mode2_hp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode2/hp", filter_a.mode2_hp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode2/hp", filter_a.mode2_hp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode2/hp", filter_a.mode2_hp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/mode2/hp", filter_a.mode2_hp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/mode2/hp", filter_a.mode2_hp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode2/hp", filter_a.mode2_hp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode2/hp", filter_a.mode2_hp, 7),
-    OSC_PSCALAR("/hds/filter/a/mode2/notch", filter_a.mode2_notch),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode2/notch", filter_a.mode2_notch, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode2/notch", filter_a.mode2_notch, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode2/notch", filter_a.mode2_notch, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode2/notch", filter_a.mode2_notch, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/mode2/notch", filter_a.mode2_notch, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/mode2/notch", filter_a.mode2_notch, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode2/notch", filter_a.mode2_notch, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode2/notch", filter_a.mode2_notch, 7),
-    OSC_PSCALAR("/hds/filter/a/mode2/dry", filter_a.mode2_dry),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/mode2/dry", filter_a.mode2_dry, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/mode2/dry", filter_a.mode2_dry, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/mode2/dry", filter_a.mode2_dry, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/mode2/dry", filter_a.mode2_dry, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/mode2/dry", filter_a.mode2_dry, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/mode2/dry", filter_a.mode2_dry, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/mode2/dry", filter_a.mode2_dry, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/mode2/dry", filter_a.mode2_dry, 7),
-    OSC_PSCALAR("/hds/filter/a/crossfade", filter_a.crossfade),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a/crossfade", filter_a.crossfade, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a/crossfade", filter_a.crossfade, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a/crossfade", filter_a.crossfade, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a/crossfade", filter_a.crossfade, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a/crossfade", filter_a.crossfade, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a/crossfade", filter_a.crossfade, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a/crossfade", filter_a.crossfade, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a/crossfade", filter_a.crossfade, 7),
-    OSC_PSCALAR("/hds/filter/a_multi/routing", filter_a_multi_routing),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/a_multi/routing", filter_a_multi_routing, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/a_multi/routing", filter_a_multi_routing, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/a_multi/routing", filter_a_multi_routing, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/a_multi/routing", filter_a_multi_routing, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/a_multi/routing", filter_a_multi_routing, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/a_multi/routing", filter_a_multi_routing, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/a_multi/routing", filter_a_multi_routing, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/a_multi/routing", filter_a_multi_routing, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/cutoff", filter_a_multi, FilterParams, cutoff, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/res_q", filter_a_multi, FilterParams, res_q, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/slope", filter_a_multi, FilterParams, slope_poles, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/type", filter_a_multi, FilterParams, filter_type, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode1/lp", filter_a_multi, FilterParams, mode1_lp, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode1/bp", filter_a_multi, FilterParams, mode1_bp, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode1/hp", filter_a_multi, FilterParams, mode1_hp, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode1/notch", filter_a_multi, FilterParams, mode1_notch, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode1/dry", filter_a_multi, FilterParams, mode1_dry, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode2/lp", filter_a_multi, FilterParams, mode2_lp, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode2/bp", filter_a_multi, FilterParams, mode2_bp, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode2/hp", filter_a_multi, FilterParams, mode2_hp, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode2/notch", filter_a_multi, FilterParams, mode2_notch, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/mode2/dry", filter_a_multi, FilterParams, mode2_dry, 3, 7),
-    OSC_PSUBARRAY("/hds/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/0/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 0),
-    OSC_PSUBARRAY_AT("/hds/combi/1/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 1),
-    OSC_PSUBARRAY_AT("/hds/combi/2/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 2),
-    OSC_PSUBARRAY_AT("/hds/combi/3/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 3),
-    OSC_PSUBARRAY_AT("/hds/combi/4/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 4),
-    OSC_PSUBARRAY_AT("/hds/combi/5/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 5),
-    OSC_PSUBARRAY_AT("/hds/combi/6/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 6),
-    OSC_PSUBARRAY_AT("/hds/combi/7/filter/a_multi/%d/crossfade", filter_a_multi, FilterParams, crossfade, 3, 7),
-    OSC_PSCALAR("/hds/filter/b/cutoff", filter_b.cutoff),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/cutoff", filter_b.cutoff, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/cutoff", filter_b.cutoff, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/cutoff", filter_b.cutoff, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/cutoff", filter_b.cutoff, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/cutoff", filter_b.cutoff, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/cutoff", filter_b.cutoff, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/cutoff", filter_b.cutoff, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/cutoff", filter_b.cutoff, 7),
-    OSC_PSCALAR("/hds/filter/b/res_q", filter_b.res_q),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/res_q", filter_b.res_q, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/res_q", filter_b.res_q, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/res_q", filter_b.res_q, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/res_q", filter_b.res_q, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/res_q", filter_b.res_q, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/res_q", filter_b.res_q, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/res_q", filter_b.res_q, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/res_q", filter_b.res_q, 7),
-    OSC_PSCALAR("/hds/filter/b/slope", filter_b.slope_poles),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/slope", filter_b.slope_poles, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/slope", filter_b.slope_poles, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/slope", filter_b.slope_poles, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/slope", filter_b.slope_poles, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/slope", filter_b.slope_poles, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/slope", filter_b.slope_poles, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/slope", filter_b.slope_poles, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/slope", filter_b.slope_poles, 7),
-    OSC_PSCALAR("/hds/filter/b/type", filter_b.filter_type),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/type", filter_b.filter_type, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/type", filter_b.filter_type, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/type", filter_b.filter_type, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/type", filter_b.filter_type, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/type", filter_b.filter_type, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/type", filter_b.filter_type, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/type", filter_b.filter_type, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/type", filter_b.filter_type, 7),
-    OSC_PSCALAR("/hds/filter/b/mode1/lp", filter_b.mode1_lp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode1/lp", filter_b.mode1_lp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode1/lp", filter_b.mode1_lp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode1/lp", filter_b.mode1_lp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode1/lp", filter_b.mode1_lp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/mode1/lp", filter_b.mode1_lp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/mode1/lp", filter_b.mode1_lp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode1/lp", filter_b.mode1_lp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode1/lp", filter_b.mode1_lp, 7),
-    OSC_PSCALAR("/hds/filter/b/mode1/bp", filter_b.mode1_bp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode1/bp", filter_b.mode1_bp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode1/bp", filter_b.mode1_bp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode1/bp", filter_b.mode1_bp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode1/bp", filter_b.mode1_bp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/mode1/bp", filter_b.mode1_bp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/mode1/bp", filter_b.mode1_bp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode1/bp", filter_b.mode1_bp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode1/bp", filter_b.mode1_bp, 7),
-    OSC_PSCALAR("/hds/filter/b/mode1/hp", filter_b.mode1_hp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode1/hp", filter_b.mode1_hp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode1/hp", filter_b.mode1_hp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode1/hp", filter_b.mode1_hp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode1/hp", filter_b.mode1_hp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/mode1/hp", filter_b.mode1_hp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/mode1/hp", filter_b.mode1_hp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode1/hp", filter_b.mode1_hp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode1/hp", filter_b.mode1_hp, 7),
-    OSC_PSCALAR("/hds/filter/b/mode1/notch", filter_b.mode1_notch),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode1/notch", filter_b.mode1_notch, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode1/notch", filter_b.mode1_notch, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode1/notch", filter_b.mode1_notch, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode1/notch", filter_b.mode1_notch, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/mode1/notch", filter_b.mode1_notch, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/mode1/notch", filter_b.mode1_notch, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode1/notch", filter_b.mode1_notch, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode1/notch", filter_b.mode1_notch, 7),
-    OSC_PSCALAR("/hds/filter/b/mode1/dry", filter_b.mode1_dry),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode1/dry", filter_b.mode1_dry, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode1/dry", filter_b.mode1_dry, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode1/dry", filter_b.mode1_dry, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode1/dry", filter_b.mode1_dry, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/mode1/dry", filter_b.mode1_dry, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/mode1/dry", filter_b.mode1_dry, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode1/dry", filter_b.mode1_dry, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode1/dry", filter_b.mode1_dry, 7),
-    OSC_PSCALAR("/hds/filter/b/mode2/lp", filter_b.mode2_lp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode2/lp", filter_b.mode2_lp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode2/lp", filter_b.mode2_lp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode2/lp", filter_b.mode2_lp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode2/lp", filter_b.mode2_lp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/mode2/lp", filter_b.mode2_lp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/mode2/lp", filter_b.mode2_lp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode2/lp", filter_b.mode2_lp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode2/lp", filter_b.mode2_lp, 7),
-    OSC_PSCALAR("/hds/filter/b/mode2/bp", filter_b.mode2_bp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode2/bp", filter_b.mode2_bp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode2/bp", filter_b.mode2_bp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode2/bp", filter_b.mode2_bp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode2/bp", filter_b.mode2_bp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/mode2/bp", filter_b.mode2_bp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/mode2/bp", filter_b.mode2_bp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode2/bp", filter_b.mode2_bp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode2/bp", filter_b.mode2_bp, 7),
-    OSC_PSCALAR("/hds/filter/b/mode2/hp", filter_b.mode2_hp),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode2/hp", filter_b.mode2_hp, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode2/hp", filter_b.mode2_hp, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode2/hp", filter_b.mode2_hp, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode2/hp", filter_b.mode2_hp, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/mode2/hp", filter_b.mode2_hp, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/mode2/hp", filter_b.mode2_hp, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode2/hp", filter_b.mode2_hp, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode2/hp", filter_b.mode2_hp, 7),
-    OSC_PSCALAR("/hds/filter/b/mode2/notch", filter_b.mode2_notch),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode2/notch", filter_b.mode2_notch, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode2/notch", filter_b.mode2_notch, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode2/notch", filter_b.mode2_notch, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode2/notch", filter_b.mode2_notch, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/mode2/notch", filter_b.mode2_notch, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/mode2/notch", filter_b.mode2_notch, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode2/notch", filter_b.mode2_notch, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode2/notch", filter_b.mode2_notch, 7),
-    OSC_PSCALAR("/hds/filter/b/mode2/dry", filter_b.mode2_dry),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/mode2/dry", filter_b.mode2_dry, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/mode2/dry", filter_b.mode2_dry, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/mode2/dry", filter_b.mode2_dry, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/mode2/dry", filter_b.mode2_dry, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/mode2/dry", filter_b.mode2_dry, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/mode2/dry", filter_b.mode2_dry, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/mode2/dry", filter_b.mode2_dry, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/mode2/dry", filter_b.mode2_dry, 7),
-    OSC_PSCALAR("/hds/filter/b/crossfade", filter_b.crossfade),
-    OSC_PSCALAR_AT("/hds/combi/0/filter/b/crossfade", filter_b.crossfade, 0),
-    OSC_PSCALAR_AT("/hds/combi/1/filter/b/crossfade", filter_b.crossfade, 1),
-    OSC_PSCALAR_AT("/hds/combi/2/filter/b/crossfade", filter_b.crossfade, 2),
-    OSC_PSCALAR_AT("/hds/combi/3/filter/b/crossfade", filter_b.crossfade, 3),
-    OSC_PSCALAR_AT("/hds/combi/4/filter/b/crossfade", filter_b.crossfade, 4),
-    OSC_PSCALAR_AT("/hds/combi/5/filter/b/crossfade", filter_b.crossfade, 5),
-    OSC_PSCALAR_AT("/hds/combi/6/filter/b/crossfade", filter_b.crossfade, 6),
-    OSC_PSCALAR_AT("/hds/combi/7/filter/b/crossfade", filter_b.crossfade, 7),
+    // --- Filters: 5 flat, interchangeable slots (filters[5]), chained in Series or
+    // summed in Parallel (filter_chain_mode) -- see the filter section simplification's
+    // own comments on ProgramState.filters/FilterParams. ---
+    OSC_PSCALAR("/hds/filter/chain_mode", filter_chain_mode),
+    OSC_PSCALAR_AT("/hds/combi/0/filter/chain_mode", filter_chain_mode, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/filter/chain_mode", filter_chain_mode, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/filter/chain_mode", filter_chain_mode, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/filter/chain_mode", filter_chain_mode, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/filter/chain_mode", filter_chain_mode, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/filter/chain_mode", filter_chain_mode, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/filter/chain_mode", filter_chain_mode, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/filter/chain_mode", filter_chain_mode, 7),
+    OSC_PSUBARRAY("/hds/filter/%d/cutoff", filters, FilterParams, cutoff, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/%d/cutoff", filters, FilterParams, cutoff, 5, 0),
+    OSC_PSUBARRAY_AT("/hds/combi/1/filter/%d/cutoff", filters, FilterParams, cutoff, 5, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/filter/%d/cutoff", filters, FilterParams, cutoff, 5, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/filter/%d/cutoff", filters, FilterParams, cutoff, 5, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/filter/%d/cutoff", filters, FilterParams, cutoff, 5, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/filter/%d/cutoff", filters, FilterParams, cutoff, 5, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/filter/%d/cutoff", filters, FilterParams, cutoff, 5, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/filter/%d/cutoff", filters, FilterParams, cutoff, 5, 7),
+    OSC_PSUBARRAY("/hds/filter/%d/res_q", filters, FilterParams, res_q, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/%d/res_q", filters, FilterParams, res_q, 5, 0),
+    OSC_PSUBARRAY_AT("/hds/combi/1/filter/%d/res_q", filters, FilterParams, res_q, 5, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/filter/%d/res_q", filters, FilterParams, res_q, 5, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/filter/%d/res_q", filters, FilterParams, res_q, 5, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/filter/%d/res_q", filters, FilterParams, res_q, 5, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/filter/%d/res_q", filters, FilterParams, res_q, 5, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/filter/%d/res_q", filters, FilterParams, res_q, 5, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/filter/%d/res_q", filters, FilterParams, res_q, 5, 7),
+    OSC_PSUBARRAY("/hds/filter/%d/slope", filters, FilterParams, slope_poles, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/%d/slope", filters, FilterParams, slope_poles, 5, 0),
+    OSC_PSUBARRAY_AT("/hds/combi/1/filter/%d/slope", filters, FilterParams, slope_poles, 5, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/filter/%d/slope", filters, FilterParams, slope_poles, 5, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/filter/%d/slope", filters, FilterParams, slope_poles, 5, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/filter/%d/slope", filters, FilterParams, slope_poles, 5, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/filter/%d/slope", filters, FilterParams, slope_poles, 5, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/filter/%d/slope", filters, FilterParams, slope_poles, 5, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/filter/%d/slope", filters, FilterParams, slope_poles, 5, 7),
+    OSC_PSUBARRAY("/hds/filter/%d/type", filters, FilterParams, filter_type, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/%d/type", filters, FilterParams, filter_type, 5, 0),
+    OSC_PSUBARRAY_AT("/hds/combi/1/filter/%d/type", filters, FilterParams, filter_type, 5, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/filter/%d/type", filters, FilterParams, filter_type, 5, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/filter/%d/type", filters, FilterParams, filter_type, 5, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/filter/%d/type", filters, FilterParams, filter_type, 5, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/filter/%d/type", filters, FilterParams, filter_type, 5, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/filter/%d/type", filters, FilterParams, filter_type, 5, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/filter/%d/type", filters, FilterParams, filter_type, 5, 7),
+    OSC_PSUBARRAY("/hds/filter/%d/key_track", filters, FilterParams, key_track, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/%d/key_track", filters, FilterParams, key_track, 5, 0),
+    OSC_PSUBARRAY_AT("/hds/combi/1/filter/%d/key_track", filters, FilterParams, key_track, 5, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/filter/%d/key_track", filters, FilterParams, key_track, 5, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/filter/%d/key_track", filters, FilterParams, key_track, 5, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/filter/%d/key_track", filters, FilterParams, key_track, 5, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/filter/%d/key_track", filters, FilterParams, key_track, 5, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/filter/%d/key_track", filters, FilterParams, key_track, 5, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/filter/%d/key_track", filters, FilterParams, key_track, 5, 7),
+    OSC_PSUBARRAY("/hds/filter/%d/cc_source", filters, FilterParams, cutoff_mod_source_cc, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/0/filter/%d/cc_source", filters, FilterParams, cutoff_mod_source_cc, 5, 0),
+    OSC_PSUBARRAY_AT("/hds/combi/1/filter/%d/cc_source", filters, FilterParams, cutoff_mod_source_cc, 5, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/filter/%d/cc_source", filters, FilterParams, cutoff_mod_source_cc, 5, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/filter/%d/cc_source", filters, FilterParams, cutoff_mod_source_cc, 5, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/filter/%d/cc_source", filters, FilterParams, cutoff_mod_source_cc, 5, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/filter/%d/cc_source", filters, FilterParams, cutoff_mod_source_cc, 5, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/filter/%d/cc_source", filters, FilterParams, cutoff_mod_source_cc, 5, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/filter/%d/cc_source", filters, FilterParams, cutoff_mod_source_cc, 5, 7),
 
     // --- LFOs (lfo[LFO_COUNT], PackLfoParams) ---
     OSC_PSUBARRAY("/hds/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT),
@@ -4290,31 +3815,18 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].portamento_time_ms = 150.0f; knobs->master_volume = 0.50f;
     knobs->programs[0].vco1_pan = 0.0f; knobs->programs[0].vco2_pan = 0.0f;
     knobs->programs[0].vco1_fine_tune = 0.0f; knobs->programs[0].vco2_pitch_offset = 0.0f; knobs->programs[0].vco2_fine_tune = 0.0f;
-    knobs->programs[0].filter_ab_routing_mode = 0.0f; // Series A->B: mixer -> A -> B
-    // Independent Parallel-mode level/pan (replaces the old single filter_ab_blend crossfade --
-    // see the Filter Routing plan). 50/50 level, centered pan reproduces the old blend=50 default
-    // output level exactly (the pan formula is unity-gain at pan=0 by construction).
-    knobs->programs[0].filter_a_level = 50.0f; knobs->programs[0].filter_b_level = 50.0f;
-    knobs->programs[0].filter_a_pan = 0.0f; knobs->programs[0].filter_b_pan = 0.0f;
-    knobs->programs[0].filter_a_mode = 0.0f; // Normal (single filter)
-    // Multi Filter blend defaults: every filter unit below reproduces its exact old behavior as a
-    // one-hot Mode 1 blend (100% of exactly the tap the old exclusive filter_type picked) with
-    // crossfade=0, so Mode 2's own values never contribute at the default and are left zeroed.
-    knobs->programs[0].filter_a.cutoff = 800.0f; knobs->programs[0].filter_a.res_q = 20.0f; knobs->programs[0].filter_a.slope_poles = 0.0f; knobs->programs[0].filter_a.filter_type = 1.0f;
-    knobs->programs[0].filter_a.mode1_lp = 100.0f; knobs->programs[0].filter_a.mode1_bp = 0.0f; knobs->programs[0].filter_a.mode1_hp = 0.0f; knobs->programs[0].filter_a.mode1_notch = 0.0f; knobs->programs[0].filter_a.mode1_dry = 0.0f;
-    knobs->programs[0].filter_a.mode2_lp = 0.0f; knobs->programs[0].filter_a.mode2_bp = 0.0f; knobs->programs[0].filter_a.mode2_hp = 0.0f; knobs->programs[0].filter_a.mode2_notch = 0.0f; knobs->programs[0].filter_a.mode2_dry = 0.0f;
-    knobs->programs[0].filter_a.crossfade = 0.0f;
-    knobs->programs[0].filter_a_multi_routing = 0.0f; // Series, matching the old default 3-filter behavior
-    for(int f=0; f<3; f++) {
-        knobs->programs[0].filter_a_multi[f].cutoff = 400.0f + (f*200); knobs->programs[0].filter_a_multi[f].res_q = 20.0f; knobs->programs[0].filter_a_multi[f].slope_poles = 0.0f; knobs->programs[0].filter_a_multi[f].filter_type = 1.0f;
-        knobs->programs[0].filter_a_multi[f].mode1_lp = 100.0f; knobs->programs[0].filter_a_multi[f].mode1_bp = 0.0f; knobs->programs[0].filter_a_multi[f].mode1_hp = 0.0f; knobs->programs[0].filter_a_multi[f].mode1_notch = 0.0f; knobs->programs[0].filter_a_multi[f].mode1_dry = 0.0f;
-        knobs->programs[0].filter_a_multi[f].mode2_lp = 0.0f; knobs->programs[0].filter_a_multi[f].mode2_bp = 0.0f; knobs->programs[0].filter_a_multi[f].mode2_hp = 0.0f; knobs->programs[0].filter_a_multi[f].mode2_notch = 0.0f; knobs->programs[0].filter_a_multi[f].mode2_dry = 0.0f;
-        knobs->programs[0].filter_a_multi[f].crossfade = 0.0f;
+    // Filters: 5 flat slots, Series by default. Filter 0 reproduces today's exact single-LPF
+    // default (800Hz, Q20, 2-pole); filters 1-4 default Off, matching today's inert
+    // Filter B/Multi units -- see the filter section simplification's own comments.
+    knobs->programs[0].filter_chain_mode = 0.0f; // Series
+    knobs->programs[0].filters[0].cutoff = 800.0f; knobs->programs[0].filters[0].res_q = 20.0f;
+    knobs->programs[0].filters[0].slope_poles = 0.0f; knobs->programs[0].filters[0].filter_type = 1.0f; // LPF
+    knobs->programs[0].filters[0].key_track = 0.0f; knobs->programs[0].filters[0].cutoff_mod_source_cc = -1.0f;
+    for (int f = 1; f < 5; f++) {
+        knobs->programs[0].filters[f].cutoff = 2000.0f; knobs->programs[0].filters[f].res_q = 20.0f;
+        knobs->programs[0].filters[f].slope_poles = 0.0f; knobs->programs[0].filters[f].filter_type = 0.0f; // Off
+        knobs->programs[0].filters[f].key_track = 0.0f; knobs->programs[0].filters[f].cutoff_mod_source_cc = -1.0f;
     }
-    knobs->programs[0].filter_b.cutoff = 4000.0f; knobs->programs[0].filter_b.res_q = 20.0f; knobs->programs[0].filter_b.slope_poles = 0.0f; knobs->programs[0].filter_b.filter_type = 0.0f; // Off by default -- Filter A alone matches old single-filter-ish defaults
-    knobs->programs[0].filter_b.mode1_lp = 100.0f; knobs->programs[0].filter_b.mode1_bp = 0.0f; knobs->programs[0].filter_b.mode1_hp = 0.0f; knobs->programs[0].filter_b.mode1_notch = 0.0f; knobs->programs[0].filter_b.mode1_dry = 0.0f;
-    knobs->programs[0].filter_b.mode2_lp = 0.0f; knobs->programs[0].filter_b.mode2_bp = 0.0f; knobs->programs[0].filter_b.mode2_hp = 0.0f; knobs->programs[0].filter_b.mode2_notch = 0.0f; knobs->programs[0].filter_b.mode2_dry = 0.0f;
-    knobs->programs[0].filter_b.crossfade = 0.0f;
     for(int l=0; l<LFO_COUNT; l++) { knobs->programs[0].lfo[l].wave_type = 0.0f; knobs->programs[0].lfo[l].rate_hz = 5.0f; knobs->programs[0].lfo[l].mod_depth = 0.0f; knobs->programs[0].lfo[l].key_sync = 1.0f; knobs->programs[0].lfo[l].dest_target = 0.0f; knobs->programs[0].lfo[l].phase_offset = 0.0f; knobs->programs[0].lfo[l].mod_source_cc = -1.0f; knobs->programs[0].lfo[l].per_key_mode = 0.0f; knobs->programs[0].lfo[l].key_track = 0.0f; knobs->programs[0].lfo[l].vel_track = 0.0f; }
     for(int e=0; e<ENV_COUNT; e++) { knobs->programs[0].eg[e].d = 0.0f; knobs->programs[0].eg[e].h = 0.0f; knobs->programs[0].eg[e].a = 10.0f; knobs->programs[0].eg[e].dec = 150.0f; knobs->programs[0].eg[e].s = 80.0f; knobs->programs[0].eg[e].r = 300.0f; knobs->programs[0].eg[e].al = 0.0f; knobs->programs[0].eg[e].pk = 100.0f; knobs->programs[0].eg_mode[e] = 0.0f; }
     for(int i=0; i<ASSIGNABLE_EG_COUNT; i++) { knobs->programs[0].eg_intensity[i] = 1.0f; knobs->programs[0].eg_dest_target[i] = 0.0f; }
@@ -4441,7 +3953,7 @@ static void init_voice(SynthVoice *voice) {
     voice->vco3_phase = 0.0f; voice->vco3_target_freq = 0.0f; voice->vco3_current_freq = 0.0f; voice->vco3_tri_state = 0.0f; voice->vco3_prev_fm_phase = 0.0f; voice->vco3_pending_sync_correction = 0.0f;
     voice->vco4_phase = 0.0f; voice->vco4_target_freq = 0.0f; voice->vco4_current_freq = 0.0f; voice->vco4_tri_state = 0.0f; voice->vco4_prev_fm_phase = 0.0f; voice->vco4_pending_sync_correction = 0.0f;
     for(int u=0; u<UNISON_SAW_VOICES; u++) { voice->vco1_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco2_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco3_unison_saw_phases[u] = (float)rand()/RAND_MAX; voice->vco4_unison_saw_phases[u] = (float)rand()/RAND_MAX; }
-    for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voice->fa_low[c][f][0]=0.0f; voice->fa_low[c][f][1]=0.0f; voice->fa_band[c][f][0]=0.0f; voice->fa_band[c][f][1]=0.0f; } voice->fb_low[c][0]=0.0f; voice->fb_low[c][1]=0.0f; voice->fb_band[c][0]=0.0f; voice->fb_band[c][1]=0.0f; }
+    for(int c=0; c<2; c++) { for(int f=0; f<5; f++) { voice->f_low[c][f][0]=0.0f; voice->f_low[c][f][1]=0.0f; voice->f_band[c][f][0]=0.0f; voice->f_band[c][f][1]=0.0f; } }
     voice->glide_time_multiplier = 1.0f;
     voice->sustain_pending = false;
     voice->vco1_eg.state = STATE_IDLE; voice->vco1_eg.current_level = 0.0f; voice->vco1_eg.release_level = 0.0f;
@@ -6263,7 +5775,7 @@ static void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthShared
             release_sample_stream(se, voices[slot].vco4_sample_stream);
             voices[slot].vco4_sample_stream = -1;
         }
-        for(int c=0; c<2; c++) { for(int f=0; f<3; f++) { voices[slot].fa_low[c][f][0]=0.0f; voices[slot].fa_low[c][f][1]=0.0f; voices[slot].fa_band[c][f][0]=0.0f; voices[slot].fa_band[c][f][1]=0.0f; } voices[slot].fb_low[c][0]=0.0f; voices[slot].fb_low[c][1]=0.0f; voices[slot].fb_band[c][0]=0.0f; voices[slot].fb_band[c][1]=0.0f; }
+        for(int c=0; c<2; c++) { for(int f=0; f<5; f++) { voices[slot].f_low[c][f][0]=0.0f; voices[slot].f_low[c][f][1]=0.0f; voices[slot].f_band[c][f][0]=0.0f; voices[slot].f_band[c][f][1]=0.0f; } }
         for (int l = 0; l < LFO_COUNT; l++) {
             if (prog->lfo[l].key_sync == 0.0f) continue;
             // Per-Key mode: reset only THIS voice's own phase (every other voice's own per-key
@@ -7149,12 +6661,12 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
     // and behavior to before this pass.
     int active_program_count = ((int)knobs->performance_mode == 1) ? COMBI_PROGRAM_COUNT : 1;
 
-    // Each oscillator is panned to stereo AT THE MIXER, before the signal reaches Filter A/B --
-    // Filter A/B then run as two fully independent mono filters (one per channel, see fa_low/
-    // fb_low's [channel] dimension) so that placement survives filtering instead of collapsing
-    // to mono first. Pan is a mod destination (targets 32/33/37/40 -- see the per-voice mod
-    // accumulation below), so unlike most per-block constants here it's computed per-voice,
-    // per-sample instead of once for the whole buffer.
+    // Each oscillator is panned to stereo AT THE MIXER, before the signal reaches the filter
+    // chain -- each of the 5 filter slots then runs as two fully independent mono filters (one
+    // per channel, see voices[v].f_low/f_band's [channel] dimension) so that placement survives
+    // filtering instead of collapsing to mono first. Pan is a mod destination (targets
+    // 32/33/37/40 -- see the per-voice mod accumulation below), so unlike most per-block
+    // constants here it's computed per-voice, per-sample instead of once for the whole buffer.
 
     // PERF: Unison Saw's per-unison pan (cosf/sinf) only depends on the Width knob, which is
     // constant across the whole buffer -- computed once here instead of every sample, for
@@ -7476,23 +6988,14 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             float mod_vco3_pitch = prog->vco3_fine_tune + (prog->vco3_pitch_offset * 100.0f) + prog->vco3_pitch + pb_bend_cents[pidx];
             float mod_vco4_pitch = prog->vco4_fine_tune + (prog->vco4_pitch_offset * 100.0f) + prog->vco4_pitch + pb_bend_cents[pidx];
             float mod_vco1_amp = 0.0f, mod_vco2_amp = 0.0f, fm_mod = 0.0f, mix_bal = 0.0f;
-            // Filter cutoff/resonance mod destinations, 4 slots:
-            //   slot 0 (targets 8/9)   = Filter A's PRIMARY filter: filter_a when Normal, or
-            //                            filter_a_multi[0] (1st internal filter) when Multi
-            //   slot 1 (targets 10/11) = Filter B
-            //   slot 2 (targets 12/13) = filter_a_multi[2] (3rd internal filter, Multi mode only)
-            //   slot 3 (targets 84/85) = filter_a_multi[1] (2nd/middle internal filter, Multi
-            //                            mode only -- appended after target 47, the previously
-            //                            unmoddable "middle sub-filter" gap this pass closes)
-            // FIXED: resonance destinations (odd targets 9/11/13) used to fall into the same
-            // slot as their neighboring Freq destination via integer division, so picking e.g.
-            // "F1 Res" as an LFO destination silently modulated cutoff instead of resonance and
-            // resonance itself was never actually modulatable by anything.
-            float filter_cutoff_mods[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            float filter_res_mods[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            // Multi Filter blend Crossfade as a mod destination (targets 86-89), same 4-slot
-            // grouping as filter_cutoff_mods/filter_res_mods above (0=primary, 1=B, 2=M3, 3=M2).
-            float filter_crossfade_mods[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            // Filter cutoff/resonance mod destinations -- one flat slot per filter (0-4), targets
+            // 90-99 (see the frontend's matrix_shared_routes comment). Key Track and ext-MIDI CC/
+            // aftertouch modulation (see FilterParams.key_track/cutoff_mod_source_cc) are folded
+            // additively into filter_cutoff_mods too, right before the filter dispatch below --
+            // same accumulator, so a knob's own key-track/CC setting and live LFO/EG modulation
+            // of the same filter's cutoff simply sum.
+            float filter_cutoff_mods[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            float filter_res_mods[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
             // Phase Modulation (new): a bipolar mod value shifts where in the cycle each
             // oscillator currently reads from, without touching its actual running phase
             // accumulator (that distinction matters -- it keeps pitch, hard sync, and portamento
@@ -7541,12 +7044,6 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                     case 5: mod_vco2_pitch += val * 100.0f; break;
                     case 6: mod_vco1_amp += val; break;
                     case 7: mod_vco2_amp += val; break;
-                    case 8: case 9: case 10: case 11: case 12: case 13: {
-                        int slot = (target - 8) / 2;
-                        if (((target - 8) % 2) == 1) filter_res_mods[slot] += val * 50.0f;
-                        else filter_cutoff_mods[slot] += val * 5000.0f;
-                        break;
-                    }
                     // FIXED: this used to check target 20/21 (which are actually "LFO 3/4 Depth"
                     // in the GUI's destination list), so FM Depth and Mix Balance (the real 22/23)
                     // could never be reached as destinations, while picking "LFO 3/4 Depth"
@@ -7573,16 +7070,19 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                     case 45: mod_vco3_unison_detune += val * 2000.0f; break;
                     case 46: mod_vco4_unison_detune += val * 2000.0f; break;
                     case 47: mod_vco4_tilt += val * 100.0f; break;
-                    // Filter A-M2 (Multi mode's middle sub-filter) -- see filter_cutoff_mods'
-                    // slot-3 comment above.
-                    case 84: filter_cutoff_mods[3] += val * 5000.0f; break;
-                    case 85: filter_res_mods[3] += val * 50.0f; break;
-                    // Multi Filter blend Crossfade -- same 4-slot grouping as the cutoff/res mods
-                    // above (0=Filter A primary, 1=Filter B, 2=Filter A-M3, 3=Filter A-M2).
-                    case 86: filter_crossfade_mods[0] += val * 50.0f; break;
-                    case 87: filter_crossfade_mods[1] += val * 50.0f; break;
-                    case 88: filter_crossfade_mods[2] += val * 50.0f; break;
-                    case 89: filter_crossfade_mods[3] += val * 50.0f; break;
+                    // Filter 1-5 Cutoff/Resonance (targets 90-99, one flat slot per filter --
+                    // the old Filter A/B/Multi-unit targets 8-13/84-89 are retired, see the
+                    // filter section simplification's own comments on ProgramState.filters).
+                    case 90: filter_cutoff_mods[0] += val * 5000.0f; break;
+                    case 91: filter_res_mods[0] += val * 50.0f; break;
+                    case 92: filter_cutoff_mods[1] += val * 5000.0f; break;
+                    case 93: filter_res_mods[1] += val * 50.0f; break;
+                    case 94: filter_cutoff_mods[2] += val * 5000.0f; break;
+                    case 95: filter_res_mods[2] += val * 50.0f; break;
+                    case 96: filter_cutoff_mods[3] += val * 5000.0f; break;
+                    case 97: filter_res_mods[3] += val * 50.0f; break;
+                    case 98: filter_cutoff_mods[4] += val * 5000.0f; break;
+                    case 99: filter_res_mods[4] += val * 50.0f; break;
                     default: break;
                 }
             }
@@ -7605,12 +7105,6 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                     case 5: mod_vco2_pitch += val * 100.0f; break;
                     case 6: mod_vco1_amp += val; break;
                     case 7: mod_vco2_amp += val; break;
-                    case 8: case 9: case 10: case 11: case 12: case 13: {
-                        int slot = (target - 8) / 2;
-                        if (((target - 8) % 2) == 1) filter_res_mods[slot] += val * 50.0f;
-                        else filter_cutoff_mods[slot] += val * 5000.0f;
-                        break;
-                    }
                     case 22: fm_mod += val; break;
                     case 23: mix_bal += val; break;
                     case 24: mod_vco1_phase += val; break;
@@ -7633,14 +7127,19 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                     case 45: mod_vco3_unison_detune += val * 2000.0f; break;
                     case 46: mod_vco4_unison_detune += val * 2000.0f; break;
                     case 47: mod_vco4_tilt += val * 100.0f; break;
-                    case 84: filter_cutoff_mods[3] += val * 5000.0f; break;
-                    case 85: filter_res_mods[3] += val * 50.0f; break;
-                    // Multi Filter blend Crossfade -- same 4-slot grouping as the cutoff/res mods
-                    // above (0=Filter A primary, 1=Filter B, 2=Filter A-M3, 3=Filter A-M2).
-                    case 86: filter_crossfade_mods[0] += val * 50.0f; break;
-                    case 87: filter_crossfade_mods[1] += val * 50.0f; break;
-                    case 88: filter_crossfade_mods[2] += val * 50.0f; break;
-                    case 89: filter_crossfade_mods[3] += val * 50.0f; break;
+                    // Filter 1-5 Cutoff/Resonance (targets 90-99, one flat slot per filter --
+                    // the old Filter A/B/Multi-unit targets 8-13/84-89 are retired, see the
+                    // filter section simplification's own comments on ProgramState.filters).
+                    case 90: filter_cutoff_mods[0] += val * 5000.0f; break;
+                    case 91: filter_res_mods[0] += val * 50.0f; break;
+                    case 92: filter_cutoff_mods[1] += val * 5000.0f; break;
+                    case 93: filter_res_mods[1] += val * 50.0f; break;
+                    case 94: filter_cutoff_mods[2] += val * 5000.0f; break;
+                    case 95: filter_res_mods[2] += val * 50.0f; break;
+                    case 96: filter_cutoff_mods[3] += val * 5000.0f; break;
+                    case 97: filter_res_mods[3] += val * 50.0f; break;
+                    case 98: filter_cutoff_mods[4] += val * 5000.0f; break;
+                    case 99: filter_res_mods[4] += val * 50.0f; break;
                     default: break;
                 }
             }
@@ -7858,8 +7357,8 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             }
 
             // --- Stereo mixer: each oscillator is panned to L/R here, before anything reaches
-            // the filters, so its placement survives filtering (Filter A/B run as two
-            // independent mono filters, one per channel -- see the fa_low/fb_low state). Unison
+            // the filters, so its placement survives filtering (each of the 5 filter slots runs
+            // as two independent mono filters, one per channel -- see the f_low/f_band state). Unison
             // Saw/Sample's own internal stereo pair (side_l/r) is used directly as the
             // oscillator's L/R image, with its Pan knob then applied as an overall balance shift
             // on top of that existing width, rather than collapsing it to mono first. A WAVE_OFF
@@ -7965,70 +7464,67 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             float stage_in_l = osc_l[0] + osc_l[1] + osc_l[2] + osc_l[3];
             float stage_in_r = osc_r[0] + osc_r[1] + osc_r[2] + osc_r[3];
 
-            // --- Filter A/B: Filter A is Normal (single filter) or Multi (3-filter engine);
-            // Filter B is always a single Normal filter. Each runs once per channel -- every
-            // channel keeps fully independent filter state (fa_low/fa_band/fb_low/fb_band's
-            // [channel] dimension) so stereo placement isn't lost going through the filters.
-            //
-            // All 3 units of Filter A's Multi engine now have a dedicated mod destination (see
-            // the comment by filter_cutoff_mods above) -- unit 1 (the middle sub-filter) reads
-            // from slot 3 (targets 84/85), appended after target 47 in this pass.
-            float multi_cutoff_mods[3] = { filter_cutoff_mods[0], filter_cutoff_mods[3], filter_cutoff_mods[2] };
-            float multi_res_mods[3] = { filter_res_mods[0], filter_res_mods[3], filter_res_mods[2] };
-            float multi_crossfade_mods[3] = { filter_crossfade_mods[0], filter_crossfade_mods[3], filter_crossfade_mods[2] };
-
-            float a_out_l, a_out_r, b_out_l, b_out_r;
-            int ab_mode = (int)prog->filter_ab_routing_mode; // 0=Series A->B, 1=Series B->A, 2=Parallel
-            if (ab_mode == 1) {
-                // Series B -> A: run B first on the raw mix, then A on B's output -- the same
-                // two filters as mode 0, just reversed, e.g. to put Filter A's Multi engine
-                // after Filter B instead of before it.
-                b_out_l = run_svf_filter_p(stage_in_l, &prog->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
-                b_out_r = run_svf_filter_p(stage_in_r, &prog->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
-                if ((int)prog->filter_a_mode == 0) {
-                    a_out_l = run_svf_filter_p(b_out_l, &prog->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
-                    a_out_r = run_svf_filter_p(b_out_r, &prog->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
-                } else {
-                    a_out_l = run_filter_a_multi(b_out_l, (int)prog->filter_a_multi_routing, prog->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
-                    a_out_r = run_filter_a_multi(b_out_r, (int)prog->filter_a_multi_routing, prog->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
+            // --- Filters: 5 flat, interchangeable slots, each an exclusive Off/LPF/HPF/BPF/Notch
+            // pick (FilterParams.filter_type), chained in Series (0->1->2->3->4) or summed in
+            // Parallel (prog->filter_chain_mode). Each slot runs once per channel -- every
+            // channel keeps fully independent filter state (voices[v].f_low/f_band's [channel]
+            // dimension) so stereo placement isn't lost going through the filters. Key Track and
+            // ext-MIDI CC/aftertouch modulation (FilterParams.key_track/cutoff_mod_source_cc) are
+            // additive cutoff offsets folded into the same filter_cutoff_mods[] accumulator the
+            // mod-matrix (targets 90-99) already writes into, so a knob's own key-track/CC
+            // setting and live LFO/EG modulation of the same filter's cutoff simply sum. ---
+            for (int i = 0; i < 5; i++) {
+                float kt = prog->filters[i].key_track;
+                if (kt != 0.0f) {
+                    // Same formula PackLfoParams' own key_track already uses for LFO rate (see
+                    // compute_per_key_lfo_output) -- centered on note 60 (middle C), +-100 = a
+                    // full octave-per-octave-of-keyboard multiplier. Applied as a cutoff OFFSET
+                    // (cutoff * (multiplier - 1)) rather than a separate multiplicative path, so
+                    // it composes additively with LFO/EG modulation and the raw knob value.
+                    float key_mult = powf(2.0f, ((float)(voices[v].midi_note - 60) / 12.0f) * (kt / 100.0f));
+                    filter_cutoff_mods[i] += prog->filters[i].cutoff * (key_mult - 1.0f);
                 }
-            } else {
-                // Series A -> B (0), or Parallel (2): run A first on the raw mix.
-                if ((int)prog->filter_a_mode == 0) {
-                    a_out_l = run_svf_filter_p(stage_in_l, &prog->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[0][0], voices[v].fa_band[0][0]);
-                    a_out_r = run_svf_filter_p(stage_in_r, &prog->filter_a, filter_cutoff_mods[0], filter_res_mods[0], filter_crossfade_mods[0], voices[v].fa_low[1][0], voices[v].fa_band[1][0]);
-                } else {
-                    a_out_l = run_filter_a_multi(stage_in_l, (int)prog->filter_a_multi_routing, prog->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[0], voices[v].fa_band[0]);
-                    a_out_r = run_filter_a_multi(stage_in_r, (int)prog->filter_a_multi_routing, prog->filter_a_multi, multi_cutoff_mods, multi_res_mods, multi_crossfade_mods, voices[v].fa_low[1], voices[v].fa_band[1]);
-                }
-                // Series: B fed from A's output. Parallel: B fed straight from the mixer, same as A.
-                float b_in_l = (ab_mode == 0) ? a_out_l : stage_in_l;
-                float b_in_r = (ab_mode == 0) ? a_out_r : stage_in_r;
-                b_out_l = run_svf_filter_p(b_in_l, &prog->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[0], voices[v].fb_band[0]);
-                b_out_r = run_svf_filter_p(b_in_r, &prog->filter_b, filter_cutoff_mods[1], filter_res_mods[1], filter_crossfade_mods[1], voices[v].fb_low[1], voices[v].fb_band[1]);
+                int mod_src = (int)prog->filters[i].cutoff_mod_source_cc;
+                float cc_val = 0.0f;
+                if (mod_src == 128) cc_val = midi_live->channel_pressure;
+                else if (mod_src >= 0 && mod_src < 128) cc_val = midi_live->cc[mod_src];
+                // Unipolar (0 at CC=0, full range at CC=127) -- "more mod wheel/aftertouch =
+                // brighter" is the near-universal expectation, unlike LFO/EG modulation's own
+                // bipolar +-5000Hz range.
+                if (cc_val != 0.0f) filter_cutoff_mods[i] += cc_val * 5000.0f;
             }
 
-            // --- Combine A and B: either Series mode means whichever filter ran last is simply
-            // the final stage; Parallel means both are heard side by side, each at its own
-            // independent level (filter_a_level/filter_b_level, 0-100) and stereo position
-            // (filter_a_pan/filter_b_pan, -1..1) -- matches a classic hardware synth's own
-            // Parallel filter routing description ("individual control over both level and
-            // pan"), replacing the old single filter_ab_blend crossfade. The pan gain is
-            // sqrt(2)-normalized (unlike the plain cos/sin oscillator-pan formula) so pan=0 is an
-            // exact no-op on this ALREADY-stereo signal -- level=50/pan=0 (the default for both)
-            // reproduces the old blend=50 default output level exactly. ---
-            if (ab_mode == 2) {
-                float a_lvl = fmaxf(0.0f, prog->filter_a_level) / 100.0f;
-                float b_lvl = fmaxf(0.0f, prog->filter_b_level) / 100.0f;
-                float a_angle = (fmaxf(-1.0f, fminf(1.0f, prog->filter_a_pan)) + 1.0f) * ((float)M_PI / 4.0f);
-                float b_angle = (fmaxf(-1.0f, fminf(1.0f, prog->filter_b_pan)) + 1.0f) * ((float)M_PI / 4.0f);
-                float a_gain_l = cosf(a_angle) * 1.41421356f, a_gain_r = sinf(a_angle) * 1.41421356f;
-                float b_gain_l = cosf(b_angle) * 1.41421356f, b_gain_r = sinf(b_angle) * 1.41421356f;
-                mixed_l[pidx] += a_out_l * a_lvl * a_gain_l + b_out_l * b_lvl * b_gain_l;
-                mixed_r[pidx] += a_out_r * a_lvl * a_gain_r + b_out_r * b_lvl * b_gain_r;
+            int chain_mode = (int)prog->filter_chain_mode; // 0 = Series, 1 = Parallel
+            if (chain_mode == 0) {
+                // Series: 0 -> 1 -> 2 -> 3 -> 4, each fed by the previous stage's output. An Off
+                // slot (filter_type==0) is a true bypass (run_svf_filter's own guard), so it just
+                // passes the previous stage's signal through unchanged.
+                float sig_l = stage_in_l, sig_r = stage_in_r;
+                for (int i = 0; i < 5; i++) {
+                    sig_l = run_svf_filter_p(sig_l, &prog->filters[i], filter_cutoff_mods[i], filter_res_mods[i], voices[v].f_low[0][i], voices[v].f_band[0][i]);
+                    sig_r = run_svf_filter_p(sig_r, &prog->filters[i], filter_cutoff_mods[i], filter_res_mods[i], voices[v].f_low[1][i], voices[v].f_band[1][i]);
+                }
+                mixed_l[pidx] += sig_l;
+                mixed_r[pidx] += sig_r;
             } else {
-                mixed_l[pidx] += (ab_mode == 1) ? a_out_l : b_out_l;
-                mixed_r[pidx] += (ab_mode == 1) ? a_out_r : b_out_r;
+                // Parallel: each slot reads the SAME shared mixer input directly. An Off slot is
+                // silent -- excluded from both the sum and the divisor (per the user's explicit
+                // choice) -- but run_svf_filter_p is still called unconditionally for every slot
+                // (cheap; keeps state consistent if the slot is re-enabled later, same "always
+                // tick, conditionally use" posture this codebase already uses for WAVE_OFF
+                // oscillators). This is what makes 5x Parallel BPF work: 5 filters all set to BPF
+                // at independent cutoffs, each contributing its own band, averaged down so 5
+                // active bands don't sum to 5x the level of 1.
+                float sum_l = 0.0f, sum_r = 0.0f;
+                int active_count = 0;
+                for (int i = 0; i < 5; i++) {
+                    float out_l = run_svf_filter_p(stage_in_l, &prog->filters[i], filter_cutoff_mods[i], filter_res_mods[i], voices[v].f_low[0][i], voices[v].f_band[0][i]);
+                    float out_r = run_svf_filter_p(stage_in_r, &prog->filters[i], filter_cutoff_mods[i], filter_res_mods[i], voices[v].f_low[1][i], voices[v].f_band[1][i]);
+                    if ((int)prog->filters[i].filter_type != 0) { sum_l += out_l; sum_r += out_r; active_count++; }
+                }
+                if (active_count > 0) { sum_l /= (float)active_count; sum_r /= (float)active_count; }
+                mixed_l[pidx] += sum_l;
+                mixed_r[pidx] += sum_r;
             }
         }
         // LFO Phase/Rate/Depth as mod destinations (targets 14-21/28-31/48-71/72-83): computed
