@@ -2,6 +2,9 @@ synth_engine
 synth_engine.exe
 hds.clap
 hds_pi_touch
+synth_engine-arm64
+hds_pi_touch-arm64
+/arm64-libs/
 *.o
 __pycache__/
 *.pyc

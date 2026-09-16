@@ -90,10 +90,48 @@ PI_TOUCH_LDLIBS := $(shell pkg-config --libs glfw3) -llo -lGL -ldl
 # needs tools/build_windows_deps.sh to cross-build liblo/wavpack from source, since mingw builds of
 # them aren't in nixpkgs), every dependency here -- alsa-lib, liblo, wavpack, glfw -- is already a
 # real nixpkgs package for this exact target, so no separate deps-building script is needed.
+#
+# Deploying the output binary -- confirmed directly by inspecting a real built binary's own ELF
+# headers, not assumed. Two separate Nix-specific paths get baked in by the cross linker, neither
+# of which exists on the Pi:
+#   1. An RPATH pointing at this build machine's own /nix/store/... library directories.
+#   2. The ELF interpreter itself (PT_INTERP) -- literally the dynamic loader the kernel execve()s
+#      to start the program -- set to this build machine's own /nix/store/...-glibc.../ld-linux-
+#      aarch64.so.1. This is the more consequential of the two: a missing RPATH entry just means
+#      the loader falls through to the next search path, but an interpreter path that doesn't
+#      exist means the kernel can't start the binary AT ALL, and most shells report that as
+#      "No such file or directory" -- easily (and reasonably) mistaken for the binary itself being
+#      missing, even though `ls`/`file` show it's right there.
+# Both targets' rules run `patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter
+# $(ARM64_INTERP)` on their output as a last step: `/lib/ld-linux-aarch64.so.1` is the standard,
+# well-known path glibc-based aarch64 Debian/Ubuntu/Raspberry Pi OS systems already have their own
+# real dynamic loader installed at, and the $ORIGIN-relative RPATH points at $(ARM64_LIBDIR)/
+# (copied alongside the binary by these same rules -- see that variable's own comment) instead of
+# this build machine's own /nix/store/... paths.
+#
+# $(ARM64_LIBDIR) bundles liblo/wavpack only -- pure protocol/codec libraries with no external
+# config files or hardware coupling, confirmed safe to ship as plain .so files. alsa-lib/libGL/
+# glfw are deliberately NOT bundled (see shell.nix's own ARM64_BUNDLE_LIBS comment for why alsa
+# specifically is a real, confirmed risk to bundle, not just an unnecessary one -- its compiled-in
+# config path points at THIS build machine's own Nix store, and even if that path existed on the
+# Pi it would describe the wrong sound hardware). These three need the Pi's own apt-installed
+# copies instead: `sudo apt-get install libasound2` for synth_engine-arm64 (add `libglfw3
+# libgl1-mesa-dri` for hds_pi_touch-arm64) -- "cross compiles but the Pi complains about missing
+# files" after confirming the interpreter/RPATH fix above almost always means this step was
+# skipped, not a build problem. One more real caveat, not yet hit but worth stating plainly: this
+# cross toolchain's glibc (2.39, from nixpkgs nixos-24.05) needs to be no newer than the Pi's own
+# installed glibc, or the binary will refuse to start with a GLIBC_2.39-not-found error -- check
+# the Pi's glibc version (`ldd --version`) against this if a binary that has the right interpreter
+# and libraries still won't run.
 ARM64_CC ?= aarch64-unknown-linux-gnu-gcc
 ARM64_CXX ?= aarch64-unknown-linux-gnu-g++
 ARM64_BIN := synth_engine-arm64
 ARM64_PI_TOUCH_BIN := hds_pi_touch-arm64
+# Where alsa-lib/liblo/wavpack get copied to, alongside the binary, so the Pi needs no apt-get
+# for these three (see shell.nix's own ARM64_BUNDLE_LIBS comment for why libGL/glfw are excluded
+# from this bundle on purpose). Copy this directory to the Pi together with the binary, keeping
+# them in the same relative layout -- the RPATH below is $ORIGIN-relative, i.e. "next to me".
+ARM64_LIBDIR := arm64-libs
 
 # NOTE: `all` (immediately below) must stay the FIRST rule in this file -- Make's default goal
 # (what runs when you type plain `make` with no target) is whichever rule appears first, and
@@ -121,13 +159,21 @@ $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a:
 	@echo "Windows dependencies not found -- run tools/build_windows_deps.sh first" >&2
 	@exit 1
 
+ARM64_INTERP := /lib/ld-linux-aarch64.so.1
+
 arm64: $(SRC)
 	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -o $(ARM64_BIN) $(SRC) $(ARM64_LDFLAGS) -lasound -lm -lpthread -lwavpack -llo
+	mkdir -p $(ARM64_LIBDIR)
+	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
+	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_BIN)
 
 pi-touch-arm64: $(PI_TOUCH_SRC)
 	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
 	$(ARM64_CXX) -O2 -Wall -Wextra -std=gnu++17 -I$(PI_TOUCH_INC) -I$(PI_TOUCH_INC)/backends $(ARM64_CFLAGS) -o $(ARM64_PI_TOUCH_BIN) $(PI_TOUCH_SRC) $(ARM64_LDFLAGS) -lglfw -llo -lGL -ldl
+	mkdir -p $(ARM64_LIBDIR)
+	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
+	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_PI_TOUCH_BIN)
 
 run-backend: $(BIN)
 	./$(BIN)
@@ -137,6 +183,7 @@ run-frontend:
 
 clean:
 	rm -f $(BIN) $(CLAP_BIN) $(PI_TOUCH_BIN) $(ARM64_BIN) $(ARM64_PI_TOUCH_BIN)
+	rm -rf $(ARM64_LIBDIR)
 
 clean-windows:
 	rm -f $(WIN_BIN) $(WIN_CLAP_BIN)

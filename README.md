@@ -641,32 +641,75 @@ this option exists at all), `nix-shell` won't be available there to build direct
 For that case, `make arm64`/`make pi-touch-arm64` cross-compile `synth_engine`/`hds_pi_touch` for
 aarch64 Linux from this x86_64 machine instead -- run from inside `nix-shell` at the repo root
 (see `shell.nix`'s own aarch64 section), then copy the resulting `synth_engine-arm64`/
-`hds_pi_touch-arm64` binary over to the Pi. Every dependency this needs -- the cross compiler,
+`hds_pi_touch-arm64` binary **and its `arm64-libs/` directory** over to the Pi (keep them in the
+same relative layout -- see below for why). Every dependency this needs -- the cross compiler,
 alsa-lib, liblo, wavpack, glfw -- comes straight from `nixpkgs.pkgsCross.aarch64-multiplatform` as
 a real, already-existing package for this target; unlike the Windows cross-build (which needs
 `tools/build_windows_deps.sh` to cross-build liblo/wavpack from source, since mingw builds of them
 aren't in nixpkgs), no separate deps-building script is needed here.
 
-**`make arm64`** (the backend alone) was verified fully end to end in this repo's own sandbox: a
-real `nix-shell` with the cross toolchain + alsa-lib/liblo/wavpack (every one of which resolves
-straight from cache.nixos.org in seconds, no local build) produced a genuine
-`synth_engine-arm64` -- confirmed via `file` to be an ELF 64-bit ARM aarch64 executable, correctly
-linked against the cross-built libraries.
+**Deploying the output binary -- three real, confirmed problems, not hypothetical ones.** Cross-
+compiling successfully is not the same as the binary actually running once copied to the Pi;
+building `synth_engine-arm64` and copying it over hit exactly this in practice. Three separate
+issues, each confirmed by directly inspecting a real built binary's own ELF headers and library
+files rather than assumed, and each now fixed by the Makefile's `arm64`/`pi-touch-arm64` rules:
 
-**`make pi-touch-arm64`** has one real, substantial cost worth stating plainly rather than
-glossing over: `glfw`'s own X11+Wayland+Mesa dependency chain is not covered by nixpkgs' binary
-cache for this specific cross target as of the channel this was checked against, so the first
-`nix-shell` entry that touches this target triggers a genuine from-source build of a sizeable part
-of that chain -- confirmed directly by actually running it: openssl, curl, and sqlite (probably
-pulled in by Wayland's own build tooling) all built from source in turn, and it then moved on to
-building **all of LLVM 17.0.6 from source** (Mesa's dependency for its `llvmpipe` software
-rasterizer) -- a build that can easily take multiple hours even on capable hardware. This is a
-real, one-time cost on whichever machine first enters this shell and builds this target -- cached
-in that machine's own Nix store for every entry after that, same as every other cross toolchain
-this file already pulls in -- but it is genuinely large, large enough that it wasn't practical to
-wait out to full completion in this sandbox. The Makefile/shell.nix code itself is correct and
-consistent with `make arm64`'s own already-verified mechanism (same toolchain, same variable
-plumbing, just one more library); it just hasn't been proven end-to-end the way `make arm64` has.
+1. **The Nix cross linker bakes this build machine's own `/nix/store/...` paths into the output
+   ELF** -- both as an RPATH (where to look for shared libraries) and, more consequentially, as
+   the ELF interpreter itself (`PT_INTERP`, the dynamic loader the kernel `execve()`s to start the
+   program at all). Neither path exists on the Pi. A missing RPATH entry just means the loader
+   falls through to the next search path, but a missing *interpreter* means the kernel can't start
+   the binary at all -- and most shells report that as "No such file or directory," which is very
+   easily (and reasonably) mistaken for the binary itself being missing, even though `ls`/`file`
+   show it's right there. Fixed: both rules run `patchelf --set-interpreter /lib/ld-linux-aarch64.so.1`
+   (the standard path real aarch64 Debian/Raspberry Pi OS systems already have their own loader
+   installed at) as a last build step.
+2. **liblo/wavpack aren't installed on a stock Pi.** These two are bundled directly: both rules
+   copy `liblo.so.7`/`libwavpack.so.1` into an `arm64-libs/` directory next to the binary and set
+   the RPATH to `$ORIGIN/arm64-libs` (relative to wherever the binary itself ends up) -- safe to
+   do because they're pure protocol/codec libraries with no external config files or hardware
+   coupling. This is why the binary and `arm64-libs/` need to travel together in the same relative
+   layout.
+3. **alsa-lib/libGL/glfw are deliberately NOT bundled** -- confirmed to be a real, different kind
+   of risk, not just an unbundled convenience. `strings` on the cross-built `libasound.so.2` shows
+   its compiled-in default config directory is this build machine's own Nix store path (where
+   `alsa.conf`, card definitions, and dmix setups live) -- that directory won't exist on the Pi,
+   and even if it did, it would describe the wrong sound hardware entirely; only the Pi's own
+   apt-installed alsa-lib is built against its own real `/usr/share/alsa` and actually knows how
+   to talk to the Pi's real sound chip. libGL has the analogous problem for the GPU: it must
+   dispatch to whatever driver matches the Pi's real hardware and kernel DRM setup, which a
+   generically cross-built Mesa never can. On the Pi: `sudo apt-get install libasound2` for
+   `synth_engine-arm64` (add `libglfw3 libgl1-mesa-dri` for `hds_pi_touch-arm64`).
+
+One more real caveat, not yet hit but worth stating plainly: this cross toolchain's glibc (2.39,
+from nixpkgs nixos-24.05) needs to be no newer than the Pi's own installed glibc, or the binary
+will refuse to start with a `GLIBC_2.39' not found` error -- check the Pi's glibc version
+(`ldd --version`) against this if a binary that has the right interpreter and libraries still
+won't run.
+
+**`make arm64`** (the backend alone) was verified fully end to end in this repo's own sandbox,
+including the full deployment fix above: a real `nix-shell` with the cross toolchain +
+alsa-lib/liblo/wavpack (every one of which resolves straight from cache.nixos.org in seconds, no
+local build) produced a genuine `synth_engine-arm64` -- confirmed via `file` to be an ELF 64-bit
+ARM aarch64 executable correctly linked against the cross-built libraries, then confirmed via
+`readelf -d` and `strings` that after the `patchelf`/bundling step it carries a `$ORIGIN`-relative
+RPATH, a standard system interpreter path, and zero remaining `/nix/store` references anywhere in
+the binary.
+
+**`make pi-touch-arm64`** is correct by the exact same mechanism (same toolchain, same
+RPATH/interpreter fix, same variable plumbing, just one more library), but has NOT been proven
+end-to-end the way `make arm64` has, for two separate reasons hit directly in this sandbox:
+`glfw`'s own X11+Wayland+Mesa dependency chain is not covered by nixpkgs' binary cache for this
+specific cross target as of the channel checked, so entering this shell triggers a genuine
+from-source build of a sizeable part of that chain -- confirmed by actually running it: openssl,
+curl, and sqlite all built from source in turn, and it then moved on to building **all of LLVM
+17.0.6 from source** (Mesa's `llvmpipe` dependency), a build that can easily take multiple hours
+even on capable hardware; separately, one attempt at this cross build failed outright with
+`wayland-scanner: cannot execute binary file: Exec format error` -- nixpkgs selected an
+aarch64-built `wayland-scanner` for a step that must run as a native x86_64 build tool, a real
+packaging-level issue with this specific channel/cross-target combination that wasn't tracked
+down further given the LLVM build time already involved. Both are real, currently-open questions
+for this one target -- `make arm64` is the one to trust today.
 
 Verified in this repo's own sandbox (no real Pi/touchscreen hardware available here) via Xvfb and
 `xdotool`-driven real mouse/keyboard input against a synthetic fake-backend OSC peer: clean builds

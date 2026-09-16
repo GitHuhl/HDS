@@ -112,6 +112,10 @@ pkgs.mkShell {
     aarch64.wavpack
     aarch64.glfw
     aarch64.libGL
+    pkgs.patchelf   # strips the Nix store RPATH the cross linker bakes into arm64/pi-touch-arm64 --
+                     # those store paths don't exist on the Pi, so the Makefile's arm64/
+                     # pi-touch-arm64 rules run `patchelf --remove-rpath` on the output as a final
+                     # step (see their own comment for why this alone isn't the whole story).
   ];
 
   shellHook = ''
@@ -133,6 +137,26 @@ pkgs.mkShell {
     # like WIN_CC's x86_64-w64-mingw32-gcc, so the Makefile's own `?=` default covers it.
     export ARM64_CFLAGS="-I${aarch64.alsa-lib.dev}/include -I${aarch64.liblo}/include -I${aarch64.wavpack.dev}/include -I${aarch64.glfw}/include"
     export ARM64_LDFLAGS="-L${aarch64.alsa-lib}/lib -L${aarch64.liblo}/lib -L${aarch64.wavpack}/lib -L${aarch64.glfw}/lib -L${aarch64.libGL}/lib"
+
+    # liblo/wavpack are pure protocol/codec libraries -- no external config files, no hardware
+    # coupling -- safe (and worth doing) to bundle straight alongside the output binary via a
+    # $ORIGIN-relative RPATH, so the Pi needs no `apt-get install` for these two. alsa-lib/libGL/
+    # glfw are deliberately NOT bundled, for two different reasons confirmed by direct inspection
+    # rather than assumed:
+    #   - alsa-lib is NOT just an ABI-compatible .so -- `strings` on this cross-built
+    #     libasound.so.2 shows its compiled-in default config directory is THIS BUILD MACHINE's
+    #     own /nix/store/...-alsa-lib-.../share/alsa path (where alsa.conf, card definitions, and
+    #     dmix/plug setups live). That directory won't exist on the Pi, and even if it did, it
+    #     would describe the WRONG hardware -- the Pi's own apt-installed alsa-lib is compiled
+    #     with the correct /usr/share/alsa path and is what actually knows how to talk to the
+    #     Pi's real sound chip. Bundling this one wouldn't just risk "missing files" the way
+    #     liblo/wavpack's absence would -- it risks the audio device silently behaving wrong.
+    #   - libGL must dispatch to whatever driver actually matches the Pi's real GPU/kernel DRM
+    #     setup, which a generically cross-built Mesa never can -- bundling it risks shipping the
+    #     wrong driver, not just an unnecessary one.
+    # See the Makefile's own comment and the README's apt-get instructions for what the Pi needs
+    # installed for these three instead.
+    export ARM64_BUNDLE_LIBS="${aarch64.liblo}/lib/liblo.so.7 ${aarch64.wavpack}/lib/libwavpack.so.1"
 
     # Auto-provision a local venv for the PySide6 frontend, matching requirements.txt exactly --
     # created once, reused (and only re-synced when requirements.txt actually changes) on every
