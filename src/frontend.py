@@ -3173,6 +3173,33 @@ class SynthGui(QWidget):
             sync_btn_spacer.setVisible(False)
             panel.title_layout.addWidget(sync_btn_spacer)
 
+        # Velocity -> Amp, per oscillator (-100..100, bipolar; 0 = velocity-insensitive, matching
+        # today's exact behavior by default -- see ProgramState.vco{1-4}_vel_to_amp's own comment
+        # in backend.c). Lives on each oscillator's own Amp EG title row rather than inside
+        # ADSRPanel itself, since that class is shared with the 6 assignable EGs, which have no
+        # oscillator of their own to scale -- this is oscillator-specific, not EG-generic. Deliberately
+        # NOT wired to _show_dest_assign_menu/setContextMenuCallback like the modulatable knobs
+        # around it: velocity is a one-shot value captured at note-on, not a continuously-varying
+        # per-sample signal an LFO/EG can substitute for, so it doesn't fit that "Modulate From"
+        # source-menu system -- it's a plain, direct knob, same as Fine Tune or Pan.
+        for osc_n, panel in ((1, self.vco1_amp_eg), (2, self.vco2_amp_eg), (3, self.vco3_amp_eg), (4, self.vco4_amp_eg)):
+            vel_box = QWidget()
+            vel_lay = QVBoxLayout(vel_box); vel_lay.setContentsMargins(0, 0, 0, 0); vel_lay.setSpacing(0)
+            vel_lbl = QLabel("Vel→Amp"); vel_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            vel_lbl.setStyleSheet("font-size: 8px; font-weight: bold;")
+            vel_lay.addWidget(vel_lbl)
+            vel_knob = PotentiometerKnob(f"O{osc_n} Vel→Amp", self)
+            vel_knob.setRange(-100, 100)
+            vel_knob.setValue(0)
+            vel_knob.setToolTip(
+                f"Osc {osc_n}: how much MIDI note velocity scales this oscillator's output level. "
+                "0 = insensitive (today's default behavior). Positive = harder hits louder, "
+                "negative = harder hits quieter."
+            )
+            vel_lay.addWidget(vel_knob, alignment=Qt.AlignmentFlag.AlignCenter)
+            panel.title_layout.addWidget(vel_box)
+            setattr(self, f"vco{osc_n}_vel_to_amp", vel_knob)
+
         amp_eg_lay.addWidget(self.vco1_amp_eg)
         amp_eg_lay.addWidget(self.vco2_amp_eg)
         amp_eg_lay.addWidget(self.vco3_amp_eg)
@@ -5336,6 +5363,10 @@ class SynthGui(QWidget):
                          ("/hds/vco3/mono_noise", self.vco3_mono_noise), ("/hds/vco4/mono_noise", self.vco4_mono_noise)):
             if addr in fields:
                 cb.blockSignals(True); cb.setChecked(fields[addr] != 0.0); cb.blockSignals(False)
+        for addr, dial in (("/hds/vco1/vel_to_amp", self.vco1_vel_to_amp), ("/hds/vco2/vel_to_amp", self.vco2_vel_to_amp),
+                           ("/hds/vco3/vel_to_amp", self.vco3_vel_to_amp), ("/hds/vco4/vel_to_amp", self.vco4_vel_to_amp)):
+            if addr in fields:
+                dial.blockSignals(True); dial.setValue(int(round(fields[addr]))); dial.blockSignals(False)
         for addr, dial in (("/hds/vco1/vol", self.vco1_vol), ("/hds/vco2/vol", self.vco2_vol),
                            ("/hds/vco3/vol", self.vco3_vol), ("/hds/vco4/vol", self.vco4_vol)):
             if addr in fields:
@@ -6294,6 +6325,9 @@ class SynthGui(QWidget):
         # Monophonic Noise (Noise shape only -- see the checkbox's own tooltip/comment)
         add_f("/hds/vco1/mono_noise", 1.0 if self.vco1_mono_noise.isChecked() else 0.0)
         add_f("/hds/vco2/mono_noise", 1.0 if self.vco2_mono_noise.isChecked() else 0.0)
+        # Velocity -> Amp (see the knob's own tooltip/comment, on each Amp EG's title row)
+        add_f("/hds/vco1/vel_to_amp", self.vco1_vel_to_amp.value())
+        add_f("/hds/vco2/vel_to_amp", self.vco2_vel_to_amp.value())
 
         # Osc 3: vol, pan, mute, pulse-width-or-tilt
         add_f("/hds/vco3/vol", self.vco3_vol.value() / 100.0)
@@ -6301,6 +6335,7 @@ class SynthGui(QWidget):
         add_f("/hds/vco3/mute", 1.0 if self.vco3_mute.isChecked() else 0.0)
         add_f("/hds/vco3/pulse_width", self.vco3_pulse_width.value())
         add_f("/hds/vco3/mono_noise", 1.0 if self.vco3_mono_noise.isChecked() else 0.0)
+        add_f("/hds/vco3/vel_to_amp", self.vco3_vel_to_amp.value())
 
         # Osc 4: vol, pan, mute, pulse-width-or-tilt
         add_f("/hds/vco4/vol", self.vco4_vol.value() / 100.0)
@@ -6308,6 +6343,7 @@ class SynthGui(QWidget):
         add_f("/hds/vco4/mute", 1.0 if self.vco4_mute.isChecked() else 0.0)
         add_f("/hds/vco4/pulse_width", self.vco4_pulse_width.value())
         add_f("/hds/vco4/mono_noise", 1.0 if self.vco4_mono_noise.isChecked() else 0.0)
+        add_f("/hds/vco4/vel_to_amp", self.vco4_vel_to_amp.value())
 
         # External Audio Input: enable + gain per ext-in pair (Routing tab). Ext-in pairs sit at
         # source ids COMBI_PROGRAM_COUNT+1..+8 (9-16), after the 8 Combi Programs + Combi Mix.
@@ -6543,6 +6579,8 @@ def runtime_connect_and_bind(gui):
     gui.vco2_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco1_mono_noise.toggled.connect(gui.transmit_knob_packet)
     gui.vco2_mono_noise.toggled.connect(gui.transmit_knob_packet)
+    gui.vco1_vel_to_amp.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco2_vel_to_amp.valueChanged.connect(gui.transmit_knob_packet)
 
     # Oscillator 3 (full peer of Osc 1/2 now, was the dedicated Noise oscillator)
     gui.vco3_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
@@ -6551,6 +6589,7 @@ def runtime_connect_and_bind(gui):
     gui.vco3_mute.toggled.connect(gui.transmit_knob_packet)
     gui.vco3_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_mono_noise.toggled.connect(gui.transmit_knob_packet)
+    gui.vco3_vel_to_amp.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_fine_tune.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_pitch_offset.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_phase.valueChanged.connect(gui.transmit_knob_packet)
@@ -6564,6 +6603,7 @@ def runtime_connect_and_bind(gui):
     gui.vco4_mute.toggled.connect(gui.transmit_knob_packet)
     gui.vco4_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_mono_noise.toggled.connect(gui.transmit_knob_packet)
+    gui.vco4_vel_to_amp.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_fine_tune.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_pitch_offset.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_phase.valueChanged.connect(gui.transmit_knob_packet)

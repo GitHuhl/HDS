@@ -737,6 +737,23 @@ typedef struct {
     float vco2_mono_noise;
     float vco3_mono_noise;
     float vco4_mono_noise;
+
+    // Velocity -> Amp, per oscillator (-100..100, bipolar -- same convention as PackLfoParams'
+    // own vel_track knob). 0 (default) means a note's velocity has zero effect on this
+    // oscillator's output level, reproducing today's exact velocity-insensitive behavior; positive
+    // makes harder hits louder, negative makes harder hits quieter. Deliberately per-oscillator
+    // rather than one global depth: since all 4 oscillators already read the SAME note's velocity
+    // (MIDI gives one velocity per note-on, not per-oscillator), independent depths let a patch
+    // velocity-crossfade BETWEEN oscillator layers -- e.g. a sub layer staying constant while a
+    // brighter overtone layer fades in on harder hits -- not just scale the whole voice uniformly.
+    // Applied as a per-voice gain multiplier alongside each oscillator's own Amp EG in
+    // render_audio_block (see the vel_mult computation there), not as a mod-matrix destination --
+    // velocity is a one-shot value captured at note-on (voice->midi_velocity), not a continuously-
+    // varying signal like an LFO/EG, so it doesn't fit that per-sample-modulated system.
+    float vco1_vel_to_amp;
+    float vco2_vel_to_amp;
+    float vco3_vel_to_amp;
+    float vco4_vel_to_amp;
 } ProgramState;
 
 typedef struct {
@@ -4013,6 +4030,44 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco4/mono_noise", vco4_mono_noise, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco4/mono_noise", vco4_mono_noise, 7),
 
+    // --- Velocity -> Amp, per oscillator (see ProgramState.vco{1-4}_vel_to_amp's own comment) ---
+    OSC_PSCALAR("/hds/vco1/vel_to_amp", vco1_vel_to_amp),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/vel_to_amp", vco1_vel_to_amp, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco1/vel_to_amp", vco1_vel_to_amp, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco1/vel_to_amp", vco1_vel_to_amp, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco1/vel_to_amp", vco1_vel_to_amp, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco1/vel_to_amp", vco1_vel_to_amp, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco1/vel_to_amp", vco1_vel_to_amp, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco1/vel_to_amp", vco1_vel_to_amp, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco1/vel_to_amp", vco1_vel_to_amp, 7),
+    OSC_PSCALAR("/hds/vco2/vel_to_amp", vco2_vel_to_amp),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/vel_to_amp", vco2_vel_to_amp, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco2/vel_to_amp", vco2_vel_to_amp, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco2/vel_to_amp", vco2_vel_to_amp, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco2/vel_to_amp", vco2_vel_to_amp, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco2/vel_to_amp", vco2_vel_to_amp, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco2/vel_to_amp", vco2_vel_to_amp, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco2/vel_to_amp", vco2_vel_to_amp, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco2/vel_to_amp", vco2_vel_to_amp, 7),
+    OSC_PSCALAR("/hds/vco3/vel_to_amp", vco3_vel_to_amp),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/vel_to_amp", vco3_vel_to_amp, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco3/vel_to_amp", vco3_vel_to_amp, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco3/vel_to_amp", vco3_vel_to_amp, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco3/vel_to_amp", vco3_vel_to_amp, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco3/vel_to_amp", vco3_vel_to_amp, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco3/vel_to_amp", vco3_vel_to_amp, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco3/vel_to_amp", vco3_vel_to_amp, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco3/vel_to_amp", vco3_vel_to_amp, 7),
+    OSC_PSCALAR("/hds/vco4/vel_to_amp", vco4_vel_to_amp),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/vel_to_amp", vco4_vel_to_amp, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco4/vel_to_amp", vco4_vel_to_amp, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco4/vel_to_amp", vco4_vel_to_amp, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco4/vel_to_amp", vco4_vel_to_amp, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco4/vel_to_amp", vco4_vel_to_amp, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco4/vel_to_amp", vco4_vel_to_amp, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco4/vel_to_amp", vco4_vel_to_amp, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco4/vel_to_amp", vco4_vel_to_amp, 7),
+
     // --- Combi/Sequencer scaffolding (see SEQ_LANE_COUNT's own comment) ---
     OSC_SCALAR("/hds/performance_mode", performance_mode),
     OSC_SUBARRAY("/hds/seq/%d/lane_type", seq_lanes, SeqLaneState, lane_type, SEQ_LANE_COUNT),
@@ -4285,6 +4340,10 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].vco1_pitch = 0.0f; knobs->programs[0].vco2_pitch = 0.0f; knobs->programs[0].vco3_pitch = 0.0f; knobs->programs[0].vco4_pitch = 0.0f;
     knobs->programs[0].vco1_mono_noise = 0.0f; knobs->programs[0].vco2_mono_noise = 0.0f;
     knobs->programs[0].vco3_mono_noise = 0.0f; knobs->programs[0].vco4_mono_noise = 0.0f;
+    // Velocity -> Amp: 0 reproduces today's exact velocity-insensitive output level regardless of
+    // what velocity value a note-on carries -- see ProgramState.vco{1-4}_vel_to_amp's own comment.
+    knobs->programs[0].vco1_vel_to_amp = 0.0f; knobs->programs[0].vco2_vel_to_amp = 0.0f;
+    knobs->programs[0].vco3_vel_to_amp = 0.0f; knobs->programs[0].vco4_vel_to_amp = 0.0f;
     // Osc 3/4 Amp envelopes live at eg[2]/eg[3] (and eg_mode[2]/eg_mode[3]) and were covered by
     // the generic `for(int e=0; e<ENV_COUNT; e++)` default-fill loop above -- nothing extra
     // needed here.
@@ -7820,9 +7879,19 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             };
             float pan_l_arr[4] = { pan1_l, pan2_l, pan3_l, pan4_l };
             float pan_r_arr[4] = { pan1_r, pan2_r, pan3_r, pan4_r };
+            // Velocity -> Amp (see ProgramState.vco{1-4}_vel_to_amp's own comment): a per-voice,
+            // per-oscillator gain multiplier, 1.0 at vel_to_amp=0 for every velocity (byte-
+            // identical to pre-existing behavior by construction) or at velocity=64 ("normal")
+            // regardless of depth. Clamped to non-negative -- an extreme depth at a very low
+            // velocity could otherwise go slightly negative and phase-invert the oscillator.
+            float vel_to_amp_arr[4] = { prog->vco1_vel_to_amp, prog->vco2_vel_to_amp, prog->vco3_vel_to_amp, prog->vco4_vel_to_amp };
+            float vel_amp_mult_arr[4];
+            for (int osc = 0; osc < 4; osc++) {
+                vel_amp_mult_arr[osc] = fmaxf(0.0f, 1.0f + (vel_to_amp_arr[osc] / 100.0f) * ((float)(voices[v].midi_velocity - 64) / 63.0f));
+            }
             float osc_l[4], osc_r[4];
             for (int osc = 0; osc < 4; osc++) {
-                float amp = gain_audible_arr[osc] * eg_level_arr[osc];
+                float amp = gain_audible_arr[osc] * eg_level_arr[osc] * vel_amp_mult_arr[osc];
                 // Unison Saw/Sample's side_l/r are ALREADY a full stereo image (unlike every
                 // other shape's osc_out, which is mono until this Pan multiply gives it width) --
                 // reusing the plain mono-source pan law here would silently cut an untouched
