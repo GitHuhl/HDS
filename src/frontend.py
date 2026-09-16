@@ -2246,6 +2246,11 @@ def _is_program_scope_address(addr):
     # current output level out from under whatever it was set to.
     if addr == "/hds/master_volume":
         return False
+    # transpose_semitones is deliberately excluded too -- a live performance control (like a
+    # hardware keyboard's own Transpose button), not a patch property, so switching Programs
+    # never yanks the performer's current transposition out from under them.
+    if addr == "/hds/transpose_semitones":
+        return False
     if addr.startswith(_PROGRAM_SCOPE_EXCLUDED_PREFIXES):
         return False
     if addr.startswith("/hds/fx/") and addr.endswith("/source"):
@@ -2403,6 +2408,18 @@ class SynthGui(QWidget):
 
         pb_box.setLayout(pb_lay)
         global_layout.addWidget(pb_box)
+        global_layout.addSpacing(4)
+
+        # Global performance Transpose (-16..16 semitones, centered at 0) -- a live performance
+        # control, not a patch property (mirrors master_volume's own "session-level, excluded
+        # from Program save/load" design -- see _is_program_scope_address), so switching
+        # Programs never yanks the performer's current transposition out from under them.
+        global_layout.addWidget(QLabel("Transpose"), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.transpose_dial = PotentiometerKnob("Transpose", self)
+        self.transpose_dial.setRange(-16, 16); self.transpose_dial.setValue(0)
+        global_layout.addWidget(self.transpose_dial, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.transpose_readout = QLabel("0 st"); self.transpose_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        global_layout.addWidget(self.transpose_readout)
         global_layout.addSpacing(4)
 
         sustain_box = QGroupBox("Sustain Pedal Polarity")
@@ -4988,10 +5005,11 @@ class SynthGui(QWidget):
         Deliberately reuses _apply_program_fields() rather than a second hand-maintained reverse-
         mapping table: everything _apply_program_fields() already covers (oscillators, filters,
         EGs, LFOs, FX, FM, glide, hard sync, pb range, sustain polarity, tempo, poly/mono) is
-        exactly what needs pulling here too. master_volume is the one field Program scope
-        deliberately excludes (see _is_program_scope_address) that DOES need pulling for this use
-        case -- applied directly here, before _apply_program_fields()'s own call, so its trailing
-        transmit_knob_packet() call round-trips the correct value along with everything else.
+        exactly what needs pulling here too. master_volume and transpose_semitones are the two
+        fields Program scope deliberately excludes (see _is_program_scope_address) that DO need
+        pulling for this use case -- applied directly here, before _apply_program_fields()'s own
+        call, so its trailing transmit_knob_packet() call round-trips the correct values along
+        with everything else.
 
         Known, deliberate gap (not silently dropped): Sequencer/Combi-lane fields
         (/hds/seq/..., /hds/performance_mode) and the rig-level fields Program scope also excludes
@@ -5005,6 +5023,10 @@ class SynthGui(QWidget):
             self.master_vol.blockSignals(True)
             self.master_vol.setValue(int(round(fields["/hds/master_volume"] * 100.0)))
             self.master_vol.blockSignals(False)
+        if "/hds/transpose_semitones" in fields:
+            self.transpose_dial.blockSignals(True)
+            self.transpose_dial.setValue(int(round(fields["/hds/transpose_semitones"])))
+            self.transpose_dial.blockSignals(False)
         self._apply_program_fields(fields)
 
     def _apply_program_fields(self, fields):
@@ -5867,6 +5889,7 @@ class SynthGui(QWidget):
         glide_random_pct = self.glide_random_dial.value()
         self.glide_random_readout.setText(f"{glide_random_pct}%")
         self.tempo_readout.setText(f"{self.tempo_dial.value()} BPM")
+        self.transpose_readout.setText(f"{self.transpose_dial.value():+d} st")
 
         bundle = OscBundleBuilder(IMMEDIATELY)
         def add_f(address, value):
@@ -5906,6 +5929,7 @@ class SynthGui(QWidget):
         add_f("/hds/vco2/vol", v2_vol)
         add_f("/hds/portamento_time_ms", g_time)
         add_f("/hds/master_volume", m_vol)
+        add_f("/hds/transpose_semitones", self.transpose_dial.value())
         add_f("/hds/vco1/pan", v1_p)
         add_f("/hds/vco2/pan", v2_p)
         add_f("/hds/vco1/fine_tune", v1_fine)
@@ -6293,6 +6317,7 @@ def runtime_connect_and_bind(gui):
     gui.sustain_polarity_normal.toggled.connect(gui.transmit_knob_packet)
     gui.sustain_polarity_inverted.toggled.connect(gui.transmit_knob_packet)
     gui.master_vol.valueChanged.connect(gui.transmit_knob_packet)
+    gui.transpose_dial.valueChanged.connect(gui.transmit_knob_packet)
 
     # Oscillator selection changes
     gui.vco1_combo.currentIndexChanged.connect(gui.transmit_knob_packet)

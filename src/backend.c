@@ -746,6 +746,17 @@ typedef struct {
     // set to.
     float master_volume;
 
+    // Global performance transpose, in semitones (-16..16, centered at 0) -- same "deliberately
+    // NOT part of ProgramState" reasoning as master_volume just above: a live performance
+    // control (like a hardware keyboard's own Transpose button), not a property of any one
+    // patch, so switching Programs never yanks the current transposition out from under
+    // whatever the performer set it to. Applied every block, alongside pitch bend, as an
+    // additive cents offset (see mod_vco{1-4}_pitch in render_audio_block) -- not baked into
+    // voice->midi_note -- so it retunes already-held notes live and never disturbs Key Track,
+    // Per-Key LFO, or note-off voice matching, all of which depend on midi_note reflecting the
+    // physically played key.
+    float transpose_semitones;
+
     // --- FX Bus + Multi-Source Routing Architecture --- deliberately session/rig-level, not
     // per-Program (see ProgramState's own comment for why): FX slots are shared, physical-insert-
     // like resources any source (a Program, the whole Combi stack, or an ext-in pair) can be
@@ -2716,6 +2727,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/portamento_time_ms", portamento_time_ms, 6),
     OSC_PSCALAR_AT("/hds/combi/7/portamento_time_ms", portamento_time_ms, 7),
     OSC_SCALAR("/hds/master_volume", master_volume),
+    OSC_SCALAR("/hds/transpose_semitones", transpose_semitones),
     OSC_PSCALAR("/hds/vco1/pan", vco1_pan),
     OSC_PSCALAR_AT("/hds/combi/0/vco1/pan", vco1_pan, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/pan", vco1_pan, 1),
@@ -3813,6 +3825,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].is_polyphonic = 1.0f; knobs->programs[0].vco1_shape = 0.0f; knobs->programs[0].vco2_shape = 3.0f;
     knobs->programs[0].fm_intensity = 0.0f; knobs->programs[0].vco1_vol = 0.8f; knobs->programs[0].vco2_vol = 0.5f;
     knobs->programs[0].portamento_time_ms = 150.0f; knobs->master_volume = 0.50f;
+    knobs->transpose_semitones = 0.0f; // centered, no transposition
     knobs->programs[0].vco1_pan = 0.0f; knobs->programs[0].vco2_pan = 0.0f;
     knobs->programs[0].vco1_fine_tune = 0.0f; knobs->programs[0].vco2_pitch_offset = 0.0f; knobs->programs[0].vco2_fine_tune = 0.0f;
     // Filters: 5 flat slots, Series by default. Filter 0 reproduces today's exact single-LPF
@@ -6983,10 +6996,16 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             // vco{N}_pitch: the manual Pitch knob (cents, +-2400 = +-24 semitones), added in
             // alongside fine_tune/pitch_offset/pitch-bend -- an LFO/EG targeting "Osc N Pitch"
             // sums into this same accumulator further down, so knob + live modulation just add.
-            float mod_vco1_pitch = prog->vco1_fine_tune + prog->vco1_pitch + pb_bend_cents[pidx];
-            float mod_vco2_pitch = prog->vco2_fine_tune + (prog->vco2_pitch_offset * 100.0f) + prog->vco2_pitch + pb_bend_cents[pidx];
-            float mod_vco3_pitch = prog->vco3_fine_tune + (prog->vco3_pitch_offset * 100.0f) + prog->vco3_pitch + pb_bend_cents[pidx];
-            float mod_vco4_pitch = prog->vco4_fine_tune + (prog->vco4_pitch_offset * 100.0f) + prog->vco4_pitch + pb_bend_cents[pidx];
+            // transpose_cents: the global performance Transpose knob (-16..16 semitones,
+            // session-level -- see SynthSharedControls.transpose_semitones), applied the same
+            // way pitch bend is: an additive cents offset here, never touching voice->midi_note,
+            // so it retunes already-held notes live without disturbing Key Track/note-off
+            // matching (both of which read midi_note directly).
+            float transpose_cents = knobs->transpose_semitones * 100.0f;
+            float mod_vco1_pitch = prog->vco1_fine_tune + prog->vco1_pitch + pb_bend_cents[pidx] + transpose_cents;
+            float mod_vco2_pitch = prog->vco2_fine_tune + (prog->vco2_pitch_offset * 100.0f) + prog->vco2_pitch + pb_bend_cents[pidx] + transpose_cents;
+            float mod_vco3_pitch = prog->vco3_fine_tune + (prog->vco3_pitch_offset * 100.0f) + prog->vco3_pitch + pb_bend_cents[pidx] + transpose_cents;
+            float mod_vco4_pitch = prog->vco4_fine_tune + (prog->vco4_pitch_offset * 100.0f) + prog->vco4_pitch + pb_bend_cents[pidx] + transpose_cents;
             float mod_vco1_amp = 0.0f, mod_vco2_amp = 0.0f, fm_mod = 0.0f, mix_bal = 0.0f;
             // Filter cutoff/resonance mod destinations -- one flat slot per filter (0-4), targets
             // 90-99 (see the frontend's matrix_shared_routes comment). Key Track and ext-MIDI CC/
