@@ -9089,11 +9089,11 @@ static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
 // set -- only lanes with a non-idle load_state (at most SEQ_LANE_COUNT, in practice usually 0)
 // get a message, so an unused Sequencer session costs nothing extra on this reply port. Sent at
 // the same vu_decimator cadence as send_osc_status(), from the same call site.
-static void send_seq_audio_status(lo_address reply_addr) {
+static void send_seq_audio_status(HdsStreamsState *streams, lo_address reply_addr) {
     lo_bundle b = lo_bundle_new(LO_TT_IMMEDIATE);
     bool any = false;
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
-        int state = atomic_load_explicit(&g_seq_audio[l].load_state, memory_order_acquire);
+        int state = atomic_load_explicit(&streams->seq_audio[l].load_state, memory_order_acquire);
         if (state == SEQ_AUDIO_EMPTY) continue;
         any = true;
         char addr[64];
@@ -9101,11 +9101,11 @@ static void send_seq_audio_status(lo_address reply_addr) {
         lo_message m = lo_message_new(); lo_message_add_float(m, (float)state); lo_bundle_add_message(b, addr, m);
         if (state == SEQ_AUDIO_READY) {
             snprintf(addr, sizeof(addr), "/hds/status/seq_audio/%d/frames", l);
-            m = lo_message_new(); lo_message_add_float(m, (float)g_seq_audio[l].frame_count); lo_bundle_add_message(b, addr, m);
+            m = lo_message_new(); lo_message_add_float(m, (float)streams->seq_audio[l].frame_count); lo_bundle_add_message(b, addr, m);
             snprintf(addr, sizeof(addr), "/hds/status/seq_audio/%d/channels", l);
-            m = lo_message_new(); lo_message_add_float(m, (float)g_seq_audio[l].channels); lo_bundle_add_message(b, addr, m);
+            m = lo_message_new(); lo_message_add_float(m, (float)streams->seq_audio[l].channels); lo_bundle_add_message(b, addr, m);
             snprintf(addr, sizeof(addr), "/hds/status/seq_audio/%d/sample_rate", l);
-            m = lo_message_new(); lo_message_add_float(m, (float)g_seq_audio[l].sample_rate); lo_bundle_add_message(b, addr, m);
+            m = lo_message_new(); lo_message_add_float(m, (float)streams->seq_audio[l].sample_rate); lo_bundle_add_message(b, addr, m);
         }
     }
     if (any) lo_send_bundle(reply_addr, b);
@@ -9514,7 +9514,7 @@ int main(int argc, char **argv) {
                 .seq_transport_state = (float)g_transport_state,
             };
             send_osc_status(osc_reply_addr, &status);
-            send_seq_audio_status(osc_reply_addr);
+            send_seq_audio_status(&g_streams_state, osc_reply_addr);
             vu_decimator = 0;
         }
         write_audio_block(pcm_handle, buffer, detected_output_channels, block_size, active_voices_count, render_ms);

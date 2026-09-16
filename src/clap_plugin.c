@@ -29,37 +29,36 @@
 #undef main
 
 // ---------------------------------------------------------------------------------------------
-// Single-instance-per-process guard
-// ---------------------------------------------------------------------------------------------
-// backend.c has substantial file-scope/process-wide global state that was never built for two
-// independent synth "sessions" to coexist in one address space -- g_sample_slots[]/
-// g_sample_streams[]/g_sample_disk_thread (the DFD sample-streaming engine), g_seq_audio[]/
-// g_seq_midi[] (Sequencer lanes), g_transport_state/g_transport_playhead_sec, g_pending_loads[],
-// the OSC dispatch table, etc. This is invisible in the standalone app (always exactly one
-// process, one synth) but a CLAP host loading TWO plugin instances into the same process (e.g.
-// two DAW tracks) would silently share/corrupt this state. Rather than allow that, a second
-// concurrent instance is refused outright at activate() time -- loud, not silent -- matching the
-// user's own stated test plan (one instance, in one host, tested by hand first). Real
-// multi-instance support (threading an instance context through every global) is a much bigger
-// follow-up, explicitly out of scope here.
-static _Atomic int g_clap_instance_count = 0;
-
 // build_osc_dispatch_table() builds a process-wide static table and calls exit(1) on a duplicate
 // insert -- calling it more than once per process would hit that path. It only needs to run once
 // ever, regardless of how many plugin instances get created/destroyed in this process (the table
-// maps OSC address strings to struct-member byte offsets, which is identical for every instance),
-// so it's built once here rather than per-instance.
+// maps OSC address strings to struct-member byte offsets, which is identical for every instance,
+// since SynthSharedControls's own layout doesn't vary per instance), so it's built once here
+// rather than per-instance.
+// ---------------------------------------------------------------------------------------------
 static bool g_osc_dispatch_table_ready = false;
 
 // Default embedded OSC ports -- distinct from the standalone app's 9000/9001 (see this file's own
-// header comment) so both could in principle run side by side without colliding. A plugin has no
-// argv (hosts don't pass command-line flags), so this is a fixed default, not configurable.
-#define CLAP_OSC_LISTEN_PORT 9010
+// header comment). A plugin has no argv (hosts don't pass command-line flags), so these are the
+// starting point for the sequential bind-retry every instance performs at activate() time (see
+// clap_plugin_activate()'s own comment) -- instance 0 gets 9010/9011 exactly as before this pass,
+// a second concurrent instance lands on 9012/9013, and so on, rather than colliding.
+#define CLAP_OSC_LISTEN_PORT_BASE 9010
 #define CLAP_OSC_REPLY_HOST "127.0.0.1"
-#define CLAP_OSC_REPLY_PORT 9011
+#define CLAP_OSC_REPLY_PORT_BASE 9011
+#define CLAP_OSC_PORT_RETRY_COUNT 32 // how many (listen, reply) port pairs to try before giving up
 
 // ---------------------------------------------------------------------------------------------
 // Plugin instance
+// ---------------------------------------------------------------------------------------------
+// Multi-instance refactor: every piece of process-wide state the engine's call graph reaches
+// (the sample-streaming tiers, the Sequencer/transport tier) is now a field of this struct instead
+// of a file-scope global -- see HdsSampleSlotState/HdsStreamsState/HdsPendingLoadState/
+// HdsEngineState's own comments in backend.c for why each is its own separately-declared tier.
+// sample_engine is the small bundle of pointers into the three sample-streaming tiers that the
+// engine's own functions take as a single parameter (see HdsSampleEngine's comment) -- it's set up
+// once in clap_factory_create_plugin() right after this struct is allocated, since its pointer
+// members depend on this instance's own address.
 // ---------------------------------------------------------------------------------------------
 
 typedef struct {
@@ -72,14 +71,19 @@ typedef struct {
     float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
     MidiLiveState midi_live;
 
+    HdsSampleSlotState sample_slot_state;
+    HdsStreamsState streams_state;
+    HdsPendingLoadState pending_load_state;
+    HdsEngineState engine;
+    HdsSampleEngine sample_engine;
+
     uint64_t total_frames_rendered;
     int vu_decimator;
 
     lo_server osc_server;
     lo_address osc_reply_addr;
     bool osc_ready; // true once activate() successfully opened the OSC server this session
-
-    bool holds_instance_slot; // did this instance claim g_clap_instance_count? (only true instance may release it)
+    int osc_listen_port, osc_reply_port; // the actual bound pair, once osc_ready (see the bind-retry in activate())
 } HdsClapPlugin;
 
 // ---------------------------------------------------------------------------------------------
@@ -139,7 +143,7 @@ static const clap_plugin_note_ports_t k_note_ports_ext = {
 
 // ---------------------------------------------------------------------------------------------
 // state extension: real save/load. Round-trips every knob in `p->knobs` PLUS the Sample Bank
-// (g_sample_slots[]) so a DAW project reopens with the patch -- oscillators, filters, EGs, LFOs,
+// (p->sample_slot_state) so a DAW project reopens with the patch -- oscillators, filters, EGs, LFOs,
 // FX, Combi/Sequencer state, WAVE_SAMPLE zone mappings -- intact, not the default patch.
 //
 // Format is text, one line per record, addressed by NAME (the same OSC address strings
@@ -215,8 +219,8 @@ static bool clap_state_save(const clap_plugin_t *plugin, const clap_ostream_t *s
     // exactly. loop_start/loop_end/playback_end_frame are stored on SampleSlot as frame indices
     // (only meaningful once total_frames is known) -- converted back to the 0-1 fractions the
     // wire format uses, the direct inverse of apply_loop_points()/apply_playback_end().
-    for (int s = 0; s < g_sample_slot_count; s++) {
-        SampleSlot *slot = &g_sample_slots[s];
+    for (int s = 0; s < p->sample_slot_state.sample_slot_count; s++) {
+        SampleSlot *slot = &p->sample_slot_state.sample_slots[s];
         if (!slot->active || !slot->loaded) continue;
         float loop_start_frac = (slot->total_frames > 1) ? (float)slot->loop_start / (float)(slot->total_frames - 1) : 0.0f;
         float loop_end_frac   = (slot->total_frames > 1) ? (float)slot->loop_end   / (float)(slot->total_frames - 1) : 0.0f;
@@ -267,8 +271,8 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
     // Clear whatever's currently loaded before applying the saved zones -- loading a project
     // means "this project's own samples," not "add these on top of whatever was already there"
     // (same posture frontend.py's own Program-load-with-SFZ path already established).
-    for (int s = 0; s < g_sample_slot_count; s++) {
-        if (g_sample_slots[s].active) apply_zone_remove(&g_sample_engine, g_sample_slots[s].zone_id);
+    for (int s = 0; s < p->sample_slot_state.sample_slot_count; s++) {
+        if (p->sample_slot_state.sample_slots[s].active) apply_zone_remove(&p->sample_engine, p->sample_slot_state.sample_slots[s].zone_id);
     }
 
     int applied_knobs = 0, skipped_knobs = 0, applied_zones = 0;
@@ -315,7 +319,7 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
                 rec.loop_release_exit = loop_release_exit_i ? 1.0f : 0.0f;
                 rec.end_frac = (float)end_frac;
                 snprintf(rec.path, sizeof(rec.path), "%s", path);
-                apply_zone_upsert(&g_sample_engine, &rec); // brand-new zone -> queued via enqueue_pending_sample_load, picked up by this instance's own drain_pending_sample_loads() poll in process()
+                apply_zone_upsert(&p->sample_engine, &rec); // brand-new zone -> queued via enqueue_pending_sample_load, picked up by this instance's own drain_pending_sample_loads() poll in process()
                 applied_zones++;
             }
         }
@@ -367,50 +371,70 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         return false;
     }
 
-    // Single-instance-per-process guard -- see its own top-of-file comment.
-    int expected = 0;
-    if (!atomic_compare_exchange_strong(&g_clap_instance_count, &expected, 1)) {
-        fprintf(stderr, "[hds-clap] refusing to activate a second concurrent HDS instance in this process "
-                        "(v1 limitation -- backend.c's sample-streaming/Sequencer/transport state is process-wide, "
-                        "not per-instance; use only one HDS instance per host process for now)\n");
-        return false;
-    }
-    p->holds_instance_slot = true;
-
     // Embedded OSC server -- same non-threaded, drained-once-per-block-from-the-audio-thread
-    // design main() uses (see main()'s own comment on why: only one thread ever touches
-    // active_knobs/g_sample_slots, no locking needed). Bind failure is logged but not fatal to
-    // activation: the synth can still make sound (default patch, MIDI-driven) with no external
-    // control surface, which is strictly better than refusing to activate at all.
+    // design main() uses (see main()'s own comment on why: only one thread ever touches its own
+    // active_knobs/sample slots, no locking needed -- now true per-instance rather than
+    // process-wide). Bind failure is logged but not fatal to activation: the synth can still make
+    // sound (default patch, MIDI-driven) with no external control surface, which is strictly
+    // better than refusing to activate at all.
     // build_osc_dispatch_table() is NOT called here: it's a call-once-ever-per-process function
     // (a second call hits its own internal "duplicate address" fatal check and calls exit(1) --
     // fatal inside a plugin loaded into a host, unlike the standalone app where it's genuinely
     // fatal-and-correct at startup). plugin.init() already guarantees it ran once before any
-    // activate() call can happen, per the CLAP spec's own init-before-activate ordering.
-    char listen_port_str[16]; snprintf(listen_port_str, sizeof(listen_port_str), "%d", CLAP_OSC_LISTEN_PORT);
-    p->osc_server = lo_server_new_with_proto(listen_port_str, LO_UDP, osc_error_handler);
+    // activate() call can happen, per the CLAP spec's own init-before-activate ordering. The table
+    // itself only maps OSC address strings to struct-member byte OFFSETS (not instance-specific
+    // addresses), so sharing it across instances is correct -- generic_osc_handler resolves an
+    // offset against whichever &p->knobs it was registered with below.
+    //
+    // Multi-instance OSC port allocation: sequential bind-retry starting at
+    // CLAP_OSC_LISTEN_PORT_BASE/CLAP_OSC_REPLY_PORT_BASE (9010/9011) -- the single-instance guard
+    // this file used to have is gone, so a second concurrent instance must land on a genuinely
+    // different port pair rather than silently losing its control surface to the first instance
+    // that grabbed 9010. Each candidate pair is tried together (listen bound only if paired with a
+    // free reply port too) so a host's several tracks end up on predictable, sequential pairs
+    // (9010/9011, 9012/9013, 9014/9015, ...) rather than mismatched listen/reply numbers.
+    for (int i = 0; i < CLAP_OSC_PORT_RETRY_COUNT; i++) {
+        int listen_port = CLAP_OSC_LISTEN_PORT_BASE + 2 * i;
+        int reply_port = CLAP_OSC_REPLY_PORT_BASE + 2 * i;
+        char listen_port_str[16]; snprintf(listen_port_str, sizeof(listen_port_str), "%d", listen_port);
+        lo_server candidate = lo_server_new_with_proto(listen_port_str, LO_UDP, osc_error_handler);
+        if (candidate) {
+            p->osc_server = candidate;
+            p->osc_listen_port = listen_port;
+            p->osc_reply_port = reply_port;
+            break;
+        }
+    }
     if (p->osc_server) {
-        lo_server_add_method(p->osc_server, "/hds/zone/upsert", "ifffffffffffffffffs", zone_upsert_handler, &g_sample_engine);
-        lo_server_add_method(p->osc_server, "/hds/zone/remove", "i", zone_remove_handler, &g_sample_engine);
+        lo_server_add_method(p->osc_server, "/hds/zone/upsert", "ifffffffffffffffffs", zone_upsert_handler, &p->sample_engine);
+        lo_server_add_method(p->osc_server, "/hds/zone/remove", "i", zone_remove_handler, &p->sample_engine);
         lo_server_add_method(p->osc_server, NULL, NULL, generic_osc_handler, &p->knobs);
-        char reply_port_str[16]; snprintf(reply_port_str, sizeof(reply_port_str), "%d", CLAP_OSC_REPLY_PORT);
+        char reply_port_str[16]; snprintf(reply_port_str, sizeof(reply_port_str), "%d", p->osc_reply_port);
         p->osc_reply_addr = lo_address_new(CLAP_OSC_REPLY_HOST, reply_port_str);
         p->osc_ready = true;
-        fprintf(stderr, "[hds-clap] OSC listening on UDP port %d, status replies to %s:%d\n", CLAP_OSC_LISTEN_PORT, CLAP_OSC_REPLY_HOST, CLAP_OSC_REPLY_PORT);
+        fprintf(stderr, "[hds-clap] OSC listening on UDP port %d, status replies to %s:%d\n", p->osc_listen_port, CLAP_OSC_REPLY_HOST, p->osc_reply_port);
+        if (p->host && p->host->get_extension) {
+            const clap_host_log_t *log = (const clap_host_log_t *)p->host->get_extension(p->host, CLAP_EXT_LOG);
+            if (log && log->log) {
+                char msg[128]; snprintf(msg, sizeof(msg), "HDS OSC control surface on UDP port %d (status replies to port %d)", p->osc_listen_port, p->osc_reply_port);
+                log->log(p->host, CLAP_LOG_INFO, msg);
+            }
+        }
     } else {
-        fprintf(stderr, "[hds-clap] failed to open OSC listen socket on port %d (already in use by another HDS instance?) "
-                        "-- continuing with no external control surface\n", CLAP_OSC_LISTEN_PORT);
+        fprintf(stderr, "[hds-clap] failed to open an OSC listen socket in the %d..%d range -- continuing with no external control surface\n",
+                CLAP_OSC_LISTEN_PORT_BASE, CLAP_OSC_LISTEN_PORT_BASE + 2 * (CLAP_OSC_PORT_RETRY_COUNT - 1));
         p->osc_ready = false;
     }
 
     // Sample-streaming disk thread (DFD/WAVE_SAMPLE) -- same "started once, talked to only via
-    // atomics" pattern main() uses. g_sample_disk_thread_shutdown may still be `true` from a
-    // PREVIOUS activate()/deactivate() cycle of this same instance (or an earlier instance in
-    // this process) -- reset it before starting, or the thread would see shutdown already
-    // requested and exit immediately. Safe: deactivate() only sets it after pthread_join()
-    // confirms the old thread has fully exited.
-    atomic_store_explicit(&g_sample_disk_thread_shutdown, false, memory_order_release);
-    bool disk_thread_ok = (pthread_create(&g_sample_disk_thread, NULL, sample_disk_thread_main, &g_sample_engine) == 0);
+    // atomics" pattern main() uses, now started against this instance's own HdsStreamsState
+    // instead of a process-wide global. sample_disk_thread_shutdown may still be `true` from a
+    // PREVIOUS activate()/deactivate() cycle of this same instance -- reset it before starting, or
+    // the thread would see shutdown already requested and exit immediately. Safe: deactivate()
+    // only sets it after pthread_join() confirms the old thread has fully exited.
+    atomic_store_explicit(&p->streams_state.sample_disk_thread_shutdown, false, memory_order_release);
+    bool disk_thread_ok = (pthread_create(&p->streams_state.sample_disk_thread, NULL, sample_disk_thread_main, &p->sample_engine) == 0);
+    p->streams_state.sample_disk_thread_running = disk_thread_ok;
     if (!disk_thread_ok) {
         fprintf(stderr, "[hds-clap] failed to start sample disk streaming thread -- WAVE_SAMPLE playback unavailable this session\n");
     }
@@ -423,19 +447,32 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
 static void clap_plugin_deactivate(const clap_plugin_t *plugin) {
     HdsClapPlugin *p = (HdsClapPlugin *)plugin->plugin_data;
 
-    atomic_store_explicit(&g_sample_disk_thread_shutdown, true, memory_order_release);
-    pthread_join(g_sample_disk_thread, NULL);
-    atomic_store_explicit(&g_sample_disk_thread_shutdown, false, memory_order_release); // see activate()'s own comment on why this must be reset for a future reactivation
+    if (p->streams_state.sample_disk_thread_running) {
+        atomic_store_explicit(&p->streams_state.sample_disk_thread_shutdown, true, memory_order_release);
+        pthread_join(p->streams_state.sample_disk_thread, NULL);
+        atomic_store_explicit(&p->streams_state.sample_disk_thread_shutdown, false, memory_order_release); // see activate()'s own comment on why this must be reset for a future reactivation
+        p->streams_state.sample_disk_thread_running = false;
+    }
+
+    // Join any still-in-flight Sequencer audio-lane loader thread before this instance's own
+    // HdsStreamsState can be freed (destroy() calls free(p) right after a final deactivate()) --
+    // the fix for the use-after-free hazard flagged when detach was replaced with tracking in
+    // poll_seq_audio_load_requests() (see SeqAudioLoadRequest.owner's own comment): a still-
+    // running detached thread writing into req->owner->seq_audio[] after this instance was freed
+    // would corrupt whatever memory now occupies that address. Safe to join unconditionally here
+    // even for a lane that finished long ago (pthread_join on an already-exited thread returns
+    // immediately).
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        if (p->streams_state.seq_audio_loader_thread_active[l]) {
+            pthread_join(p->streams_state.seq_audio_loader_thread[l], NULL);
+            p->streams_state.seq_audio_loader_thread_active[l] = false;
+        }
+    }
 
     if (p->osc_ready) {
         if (p->osc_reply_addr) { lo_address_free(p->osc_reply_addr); p->osc_reply_addr = NULL; }
         lo_server_free(p->osc_server); p->osc_server = NULL;
         p->osc_ready = false;
-    }
-
-    if (p->holds_instance_slot) {
-        atomic_store_explicit(&g_clap_instance_count, 0, memory_order_release);
-        p->holds_instance_slot = false;
     }
 }
 
@@ -481,14 +518,14 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
     // comment. Sequencer/Combi lanes are fully reachable via OSC (performance_mode, seq_lanes[],
     // etc. are ordinary knobs), so this plugin supports the same architecture as the standalone
     // app, not just a stripped-down MIDI-only mode.
-    poll_seq_audio_load_requests(&g_streams_state, &p->knobs);
-    poll_seq_audio_preview_triggers(&g_streams_state, &p->knobs);
+    poll_seq_audio_load_requests(&p->streams_state, &p->knobs);
+    poll_seq_audio_preview_triggers(&p->streams_state, &p->knobs);
     double engine_elapsed_seconds = (double)p->total_frames_rendered / (double)SAMPLE_RATE;
     float current_tempo_bpm = compute_current_tempo_bpm(&p->knobs, engine_elapsed_seconds);
-    poll_transport_triggers(&g_streams_state, &g_engine, &p->knobs, current_tempo_bpm);
-    poll_metronome(&g_engine, &p->knobs, current_tempo_bpm);
-    poll_seq_audio_transport_catchup(&g_streams_state, &g_engine, &p->knobs);
-    drain_pending_sample_loads(&g_sample_engine);
+    poll_transport_triggers(&p->streams_state, &p->engine, &p->knobs, current_tempo_bpm);
+    poll_metronome(&p->engine, &p->knobs, current_tempo_bpm);
+    poll_seq_audio_transport_catchup(&p->streams_state, &p->engine, &p->knobs);
+    drain_pending_sample_loads(&p->sample_engine);
 
     if (process->in_events) {
         uint32_t ev_count = process->in_events->size(process->in_events);
@@ -500,7 +537,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
                 if (ev->key < 0 || ev->key > 127 || ev->channel < 0 || ev->channel > 15) continue; // wildcard note-on/off, not supported by this direct-mapping engine
                 double vel = ev->velocity < 0.0 ? 0.0 : (ev->velocity > 1.0 ? 1.0 : ev->velocity);
                 int velocity_127 = (int)(vel * 127.0 + 0.5);
-                dispatch_midi_event(&g_engine, &g_sample_engine, hdr->type == CLAP_EVENT_NOTE_ON ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF,
+                dispatch_midi_event(&p->engine, &p->sample_engine, hdr->type == CLAP_EVENT_NOTE_ON ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF,
                                      (int)ev->channel + 1, (int)ev->key, velocity_127,
                                      p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
             } else if (hdr->type == CLAP_EVENT_MIDI) {
@@ -511,24 +548,24 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
                 // (see process_midi_input) -- a Note On with velocity 0 counts as Note Off.
                 if (status == 0x90 || status == 0x80) {
                     bool is_note_on = (status == 0x90 && ev->data[2] > 0);
-                    dispatch_midi_event(&g_engine, &g_sample_engine, is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, ev->data[1], ev->data[2],
+                    dispatch_midi_event(&p->engine, &p->sample_engine, is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, ev->data[1], ev->data[2],
                                          p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
                 } else if (status == 0xB0) {
-                    dispatch_midi_event(&g_engine, &g_sample_engine, HDS_MIDI_CC, midi_channel_1_16, ev->data[1], ev->data[2],
+                    dispatch_midi_event(&p->engine, &p->sample_engine, HDS_MIDI_CC, midi_channel_1_16, ev->data[1], ev->data[2],
                                          p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
                 } else if (status == 0xE0) {
                     int bend14 = (int)ev->data[1] | ((int)ev->data[2] << 7);
-                    dispatch_midi_event(&g_engine, &g_sample_engine, HDS_MIDI_PITCH_BEND, midi_channel_1_16, 0, bend14 - 8192,
+                    dispatch_midi_event(&p->engine, &p->sample_engine, HDS_MIDI_PITCH_BEND, midi_channel_1_16, 0, bend14 - 8192,
                                          p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
                 } else if (status == 0xD0) {
-                    dispatch_midi_event(&g_engine, &g_sample_engine, HDS_MIDI_CHANNEL_PRESSURE, midi_channel_1_16, 0, ev->data[1],
+                    dispatch_midi_event(&p->engine, &p->sample_engine, HDS_MIDI_CHANNEL_PRESSURE, midi_channel_1_16, 0, ev->data[1],
                                          p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
                 }
             }
         }
     }
 
-    seq_playback_midi_events(&g_engine, &g_sample_engine, p->voices, &p->knobs, p->global_lfo_phases, &p->mono_stacks[SINGLE_PROGRAM_SLOT], &p->midi_live);
+    seq_playback_midi_events(&p->engine, &p->sample_engine, p->voices, &p->knobs, p->global_lfo_phases, &p->mono_stacks[SINGLE_PROGRAM_SLOT], &p->midi_live);
 
     float **out = NULL;
     if (process->audio_outputs_count > 0 && process->audio_outputs[0].data32 &&
@@ -552,10 +589,14 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         // terminates correctly either way.
         p->knobs.block_size_frames = (float)chunk;
         int block_size = effective_block_size(&p->knobs);
-        advance_transport_playhead(&g_engine, block_size);
+        advance_transport_playhead(&p->engine, block_size);
 
-        static float chunk_buffer[BUFFER_SIZE * 2];
-        float peak = render_audio_block(&g_sample_engine, &g_engine, p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer);
+        // Not `static`: this buffer must be per-instance (and per-call), since two HdsClapPlugin
+        // instances can now genuinely render concurrently -- a `static` buffer here would let one
+        // instance's render clobber another's mid-flight, a real cross-instance data race this
+        // multi-instance pass exists to eliminate, not reintroduce.
+        float chunk_buffer[BUFFER_SIZE * 2];
+        float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer);
         if (peak > block_peak) block_peak = peak;
 
         if (out) {
@@ -576,10 +617,10 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
             status.peak = block_peak;
             status.detected_output_channels = 2.0f;
             status.tempo_bpm_live = current_tempo_bpm;
-            status.seq_elapsed_seconds = (float)g_transport_playhead_sec;
-            status.seq_transport_state = (float)g_transport_state;
+            status.seq_elapsed_seconds = (float)p->engine.transport_playhead_sec;
+            status.seq_transport_state = (float)p->engine.transport_state;
             send_osc_status(p->osc_reply_addr, &status);
-            send_seq_audio_status(p->osc_reply_addr);
+            send_seq_audio_status(&p->streams_state, p->osc_reply_addr);
             p->vu_decimator = 0;
         }
     }
@@ -628,6 +669,13 @@ static const clap_plugin_t *clap_factory_create_plugin(const clap_plugin_factory
     init_default_controls(&p->knobs);
     for (int i = 0; i < MAX_VOICES; i++) init_voice(&p->voices[i]);
     for (int i = 0; i <= COMBI_PROGRAM_COUNT; i++) p->mono_stacks[i] = (MonoNoteStack){0};
+
+    // Points this instance's HdsSampleEngine bundle at its OWN three sample-streaming tiers --
+    // can't be a static initializer (the plan's original design for the process-wide
+    // g_sample_engine) since these addresses depend on where THIS calloc landed.
+    p->sample_engine.slots = &p->sample_slot_state;
+    p->sample_engine.streams = &p->streams_state;
+    p->sample_engine.pending = &p->pending_load_state;
 
     p->plugin.desc = &k_descriptor;
     p->plugin.plugin_data = p;
