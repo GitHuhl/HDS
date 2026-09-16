@@ -75,7 +75,13 @@ cd "$WORK_DIR/wavpack-$WAVPACK_VERSION"
 # first. Needs autoconf/automake/libtool on PATH when this branch runs (shell.nix provides them).
 if [ ! -x ./configure ]; then
     echo "--- no ./configure in the WavPack tarball, bootstrapping via autoreconf ---"
-    if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fi; fi
+    # AUTOPOINT="autopoint --force": the checked-in config.rpath in this GitHub source snapshot
+    # differs from what the locally-installed gettext's autopoint would generate itself (they were
+    # bootstrapped against a different gettext version), so autopoint's default safety check
+    # ("File config.rpath has been locally modified... Not overwriting") refuses to proceed.
+    # autoreconf's own -f doesn't propagate down to the autopoint sub-step -- it needs its own
+    # --force, passed through via the AUTOPOINT env var autoreconf reads for this exact purpose.
+    if [ -x ./autogen.sh ]; then ./autogen.sh; else AUTOPOINT="autopoint --force" autoreconf -fi; fi
 fi
 ./configure --host=x86_64-w64-mingw32 --prefix="$DEPS_DIR/wavpack" \
     --enable-static --disable-shared --disable-apps \
