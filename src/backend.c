@@ -9159,13 +9159,29 @@ int main(int argc, char **argv) {
     int osc_listen_port = 9000;
     const char *osc_reply_host = "127.0.0.1";
     int osc_reply_port = 9001;
+    // --output-device/--input-device: override the "default" ALSA/miniaudio device name
+    // init_default_controls() otherwise starts with. Exists specifically because an output
+    // device that fails to open is FATAL at startup (see the open_pcm_stream() call below --
+    // the process exits before the OSC server has a chance to receive any /hds/device/output
+    // message that could fix it live) -- without this flag, a machine whose "default" device
+    // doesn't work at all (e.g. a fresh headless Pi with a USB audio interface that ALSA's
+    // dmix/"default" plugin chain can't open cleanly) has no way to even get the process to
+    // start long enough to be pointed at a working device name from a connected frontend.
+    // `aplay -l`/`arecord -l` on the target machine lists the real card/device numbers to try
+    // here (e.g. `--output-device hw:1,0` or `--output-device plughw:1,0`).
+    const char *cli_output_device = NULL;
+    const char *cli_input_device = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--osc-listen-port") == 0 && i + 1 < argc) osc_listen_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--osc-reply-host") == 0 && i + 1 < argc) osc_reply_host = argv[++i];
         else if (strcmp(argv[i], "--osc-reply-port") == 0 && i + 1 < argc) osc_reply_port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--output-device") == 0 && i + 1 < argc) cli_output_device = argv[++i];
+        else if (strcmp(argv[i], "--input-device") == 0 && i + 1 < argc) cli_input_device = argv[++i];
     }
 
     SynthSharedControls active_knobs; init_default_controls(&active_knobs);
+    if (cli_output_device) snprintf(active_knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", cli_output_device);
+    if (cli_input_device) snprintf(active_knobs.input_device, AUDIO_DEVICE_NAME_LEN, "%s", cli_input_device);
 
     // Non-threaded lo_server, polled once per audio block from the main loop below (see the
     // "while (lo_server_recv_noblock(...))" call site) -- deliberately NOT lo_server_thread, so
