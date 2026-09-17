@@ -106,6 +106,16 @@ static void osc_error_handler(int num, const char* msg, const char* path) {
     fprintf(stderr, "[osc] liblo error %d (%s): %s\n", num, path ? path : "?", msg);
 }
 
+// BUG FIX: glfwInit()/glfwCreateWindow() failing was completely silent -- neither call site ever
+// checked for or printed a reason, just `return -1`, so a real failure (no usable display/GL
+// platform reachable at all, e.g. a Wayland-only session GLFW can't create a window under) showed
+// up as "it just doesn't come up," indistinguishable from a hang. GLFW itself never prints
+// anything on its own unless an error callback is registered first -- this is that callback,
+// registered as the very first GLFW call in main(), below.
+static void glfw_error_callback(int error, const char* description) {
+    fprintf(stderr, "[glfw] error %d: %s\n", error, description);
+}
+
 // --- Live status readback -----------------------------------------------------------------
 // Updated from backend.c's own periodic /hds/status/* bundle (send_osc_status(), sent on the
 // same cadence the VU meter/tempo readout in frontend.py already consumes). last_status_time
@@ -625,12 +635,13 @@ int main() {
     }
     rescan_programs();
 
-    if (!glfwInit()) return -1;
+    glfwSetErrorCallback(glfw_error_callback);
+    if (!glfwInit()) { fprintf(stderr, "[glfw] glfwInit() failed -- see the error above.\n"); return -1; }
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 
     GLFWwindow* window = glfwCreateWindow(720, 720, "HDS Touch Console", NULL, NULL);
-    if (!window) { glfwTerminate(); return -1; }
+    if (!window) { fprintf(stderr, "[glfw] glfwCreateWindow() failed -- see the error above.\n"); glfwTerminate(); return -1; }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
