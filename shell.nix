@@ -55,15 +55,45 @@ let
   # Windows cross-build above (which needs tools/build_windows_deps.sh to cross-build liblo/
   # wavpack from source, since mingw builds of them aren't in nixpkgs), every dependency this
   # target needs -- alsa-lib, liblo, wavpack, glfw -- already exists as a real nixpkgs package for
-  # aarch64-linux, confirmed directly against this same nixpkgs channel: alsa-lib/liblo/wavpack/
-  # the cross gcc wrapper itself all come straight from cache.nixos.org (seconds, no local build);
-  # glfw's own X11+Wayland+Mesa dependency chain is a real, legitimate nixpkgs cross derivation but
-  # is NOT fully cached for this target as of this nixpkgs channel, so a first `nix-shell` entry
-  # that touches `make pi-touch-arm64` will need to compile a genuine chunk of that chain (openssl,
-  # curl, wayland, wayland-protocols, libxkbcommon, the X11 libs, mesa) from source -- a one-time,
-  # if slow, cost, not a sign anything is misconfigured. `make arm64` (the backend alone, no GLFW)
-  # is unaffected and builds in seconds once alsa-lib/liblo/wavpack are in the Nix store.
+  # aarch64-linux: alsa-lib/liblo/wavpack/the cross gcc wrapper itself all come straight from
+  # cache.nixos.org (seconds, no local build). `make arm64` (the backend alone, no GLFW) is
+  # unaffected either way and builds in seconds.
   aarch64 = pkgs.pkgsCross.aarch64-multiplatform;
+
+  # aarch64's plain `glfw` package unconditionally cross-builds Wayland support (nixpkgs'
+  # glfw/3.x.nix has no toggle for this -- it's ON by default on every non-Darwin Unix, per
+  # upstream GLFW's own CMakeLists.txt). Two real, confirmed problems with that, not
+  # hypothetical ones -- hit directly building `hds_pi_touch-arm64` for real:
+  #   1. nixpkgs' cross-splicing of `wayland-scanner` (a NativeBuildInput -- a tool that must run
+  #      on THIS build machine, x86_64, to generate C headers from Wayland's XML protocol specs
+  #      at build time) is broken for this target: it resolves to an aarch64-CROSS-BUILT
+  #      wayland-scanner instead of a native x86_64 one, which the build then tries to *execute*
+  #      on this x86_64 machine and fails outright with `cannot execute binary file: Exec format
+  #      error` -- a real nixpkgs packaging bug for this specific package/cross-target
+  #      combination, not a local misconfiguration.
+  #   2. Even before hitting that crash, cross-building Wayland's own dependency chain
+  #      (wayland-protocols, libxkbcommon, and what they pull in) triggered a genuine, multi-hour
+  #      from-source build (confirmed by directly watching it: openssl, curl, sqlite, then all of
+  #      LLVM 17.0.6) -- NOT because of `libGL` (nixpkgs' `libGL` is a lightweight `libglvnd`
+  #      dispatch stub, confirmed by reading its own derivation -- not full Mesa at all), but
+  #      because of the Wayland deps specifically.
+  # Fix: override glfw with `-DGLFW_BUILD_WAYLAND=OFF` (a real, independent upstream CMake option
+  # -- confirmed against GLFW 3.4's own src/CMakeLists.txt that every `wayland-scanner`
+  # invocation is gated behind `if (GLFW_BUILD_WAYLAND)`, so this fully skips the broken codegen
+  # step) and drop wayland/wayland-protocols/libxkbcommon/wayland-scanner from the derivation's
+  # own build inputs entirely, so Nix never even tries to build that chain. X11 support
+  # (`GLFW_BUILD_X11`, a separate, independent option) is untouched and stays on -- confirmed this
+  # rebuilds in under two minutes with zero LLVM/Mesa involvement, and Raspberry Pi OS's Wayland
+  # desktop (labwc, the Bookworm-and-later default) already runs X11-only apps transparently via
+  # XWayland, so this is a real, low-cost trade, not a functionality loss for the Pi's own touch
+  # display.
+  aarch64Glfw = aarch64.glfw.overrideAttrs (old: {
+    cmakeFlags = (old.cmakeFlags or [ ]) ++ [ "-DGLFW_BUILD_WAYLAND=OFF" ];
+    nativeBuildInputs = pkgs.lib.subtractLists [ aarch64.wayland-scanner ] (old.nativeBuildInputs or [ ]);
+    buildInputs = pkgs.lib.subtractLists
+      [ aarch64.wayland aarch64.wayland-protocols aarch64.libxkbcommon ]
+      (old.buildInputs or [ ]);
+  });
 in
 pkgs.mkShell {
   buildInputs = [
@@ -129,7 +159,7 @@ pkgs.mkShell {
     aarch64.alsa-lib
     aarch64.liblo
     aarch64.wavpack
-    aarch64.glfw
+    aarch64Glfw
     aarch64.libGL
     pkgs.patchelf   # rewrites the Nix store RPATH/interpreter the cross linker bakes into
                      # arm64/pi-touch-arm64 -- those store paths don't exist on the Pi. The
@@ -157,8 +187,8 @@ pkgs.mkShell {
     # find them. ARM64_CC/ARM64_CXX are NOT exported here -- aarch64.stdenv.cc's prefixed binary
     # names (aarch64-unknown-linux-gnu-gcc/-g++) are already on PATH via buildInputs above, exactly
     # like WIN_CC's x86_64-w64-mingw32-gcc, so the Makefile's own `?=` default covers it.
-    export ARM64_CFLAGS="-I${aarch64.alsa-lib.dev}/include -I${aarch64.liblo}/include -I${aarch64.wavpack.dev}/include -I${aarch64.glfw}/include"
-    export ARM64_LDFLAGS="-L${aarch64.alsa-lib}/lib -L${aarch64.liblo}/lib -L${aarch64.wavpack}/lib -L${aarch64.glfw}/lib -L${aarch64.libGL}/lib"
+    export ARM64_CFLAGS="-I${aarch64.alsa-lib.dev}/include -I${aarch64.liblo}/include -I${aarch64.wavpack.dev}/include -I${aarch64Glfw}/include"
+    export ARM64_LDFLAGS="-L${aarch64.alsa-lib}/lib -L${aarch64.liblo}/lib -L${aarch64.wavpack}/lib -L${aarch64Glfw}/lib -L${aarch64.libGL}/lib"
 
     # liblo/wavpack are pure protocol/codec libraries -- no external config files, no hardware
     # coupling -- safe (and worth doing) to bundle straight alongside the output binary via a

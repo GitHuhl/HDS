@@ -718,20 +718,38 @@ comes up, and the only failure is the audio device open (`libasound.so.2` / a re
 which is the expected, documented, by-design gap this environment can't supply either (no real ALSA
 hardware in a sandbox, same as the Pi needs its own `apt-get install libasound2`).
 
-**`make pi-touch-arm64`** is correct by the exact same mechanism (same toolchain, same
-RPATH/interpreter fix, same variable plumbing, just one more library), but has NOT been proven
-end-to-end the way `make arm64` has, for two separate reasons hit directly in this sandbox:
-`glfw`'s own X11+Wayland+Mesa dependency chain is not covered by nixpkgs' binary cache for this
-specific cross target as of the channel checked, so entering this shell triggers a genuine
-from-source build of a sizeable part of that chain -- confirmed by actually running it: openssl,
-curl, and sqlite all built from source in turn, and it then moved on to building **all of LLVM
-17.0.6 from source** (Mesa's `llvmpipe` dependency), a build that can easily take multiple hours
-even on capable hardware; separately, one attempt at this cross build failed outright with
-`wayland-scanner: cannot execute binary file: Exec format error` -- nixpkgs selected an
-aarch64-built `wayland-scanner` for a step that must run as a native x86_64 build tool, a real
-packaging-level issue with this specific channel/cross-target combination that wasn't tracked
-down further given the LLVM build time already involved. Both are real, currently-open questions
-for this one target -- `make arm64` is the one to trust today.
+**`make pi-touch-arm64`** hit two real, confirmed problems the first time it was attempted, both
+now fixed and verified. `glfw`'s plain nixpkgs package unconditionally cross-builds Wayland
+support (no toggle for it upstream in nixpkgs' own `glfw/3.x.nix` -- it's on by default), which
+first triggered a genuine multi-hour from-source build (openssl, curl, sqlite, then all of LLVM
+17.0.6) and then, after all that time, crashed outright with `wayland-scanner: cannot execute
+binary file: Exec format error` -- nixpkgs' cross-splicing of `wayland-scanner` (a build-time tool
+that must run natively on the x86_64 build machine to generate C headers from Wayland's XML
+protocol specs) resolved to an aarch64-CROSS-BUILT `wayland-scanner` instead, which the build then
+tried to execute on x86_64 and failed. Root-caused directly (read GLFW 3.4's own upstream
+`src/CMakeLists.txt`: every `wayland-scanner` invocation is gated behind
+`if (GLFW_BUILD_WAYLAND)`, a real, independent CMake option, separate from `GLFW_BUILD_X11`) and
+fixed in `shell.nix`: `aarch64.glfw` is overridden with `-DGLFW_BUILD_WAYLAND=OFF` and has
+wayland/wayland-protocols/libxkbcommon/wayland-scanner dropped from its own build inputs entirely,
+so Nix never tries to build that chain at all. X11 support is untouched. This also revealed the
+LLVM build was never actually about `libGL` (confirmed by reading its own nixpkgs derivation:
+`libGL` is a lightweight `libglvnd` dispatch stub, not full Mesa) -- it was purely a Wayland-deps
+side effect, so removing them also eliminated the multi-hour cost, not just the crash: the fixed
+shell rebuilds `glfw` from a clean Nix store in well under two minutes.
+
+**Verified in this repo's own sandbox**: a real `nix-shell` (against the fixed, pinned
+`shell.nix`) produced both `synth_engine-arm64` and `hds_pi_touch-arm64` in one `make arm64
+pi-touch-arm64` run, confirmed via `readelf -d` to link against the expected libraries
+(`libglfw.so.3`, `liblo.so.7`, `libGL.so.1`, `libdl`/`libstdc++`/`libm`/`libgcc_s`/`libc`) with the
+same `$ORIGIN`-relative RPATH and standard interpreter as `make arm64`'s own verified build. Not
+run under `qemu-aarch64` the way `make arm64` was -- a full GLFW window-creation test needs a real
+X server (or XWayland under Raspberry Pi OS's Wayland desktop), which this sandbox doesn't have,
+same standing limitation as every other piece of real display/audio hardware this project's tests
+can't reach. `libglfw.so.3`/`libGL.so.1` are deliberately NOT bundled (same reasoning as
+`alsa-lib` above -- `libGL` must dispatch to the Pi's real GPU driver) -- install them on the Pi
+with `sudo apt-get install libglfw3 libgl1-mesa-dri`. GLFW's SONAME (`libglfw.so.3`) has been
+stable across the entire 3.x line for years, unlike liblo's history -- much lower version-drift
+risk even before the nixpkgs pin above.
 
 Verified in this repo's own sandbox (no real Pi/touchscreen hardware available here) via Xvfb and
 `xdotool`-driven real mouse/keyboard input against a synthetic fake-backend OSC peer: clean builds
