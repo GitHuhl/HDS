@@ -19,8 +19,10 @@
 // client's own observed backend state (see g_full_state below) through the same Program-scope
 // allowlist frontend.py's _is_program_scope_address() uses. A loaded file's colocated .sfz (Sample
 // Bank content) is NOT applied -- this client has no Mapping-tab equivalent -- and is flagged, not
-// silently dropped. Comb/Seq/Rec/Glob pages remain placeholder text, unchanged from the original
-// exploratory draft.
+// silently dropped. The Recording page is fully wired to the real backend record_* fields (source
+// selection, multichannel/downmix, WAV/WavPack, start/stop, live elapsed-time/error feedback) --
+// same ~/HDS_Recordings convention and field set as frontend.py's own Recording tab. Comb/Seq/Glob
+// pages remain placeholder text, unchanged from the original exploratory draft.
 //
 // Build: see the Makefile's `pi-touch` target. Needs GLFW3 + OpenGL + liblo development packages
 // (apt: libglfw3-dev liblo-dev) -- Dear ImGui (pinned v1.91.5) and nlohmann/json (pinned v3.11.3,
@@ -44,6 +46,7 @@
 #include <algorithm>
 #include <fstream>
 #include <filesystem>
+#include <ctime>
 #include <lo/lo.h>
 #include "../third_party/json/json.hpp"
 #include "../third_party/imgui/imgui.h"
@@ -82,6 +85,16 @@ static void send_osc_float(const char* path, float value) {
     lo_send(g_hds_addr, path, "f", value);
 }
 
+// String-valued addresses (record_path, device names) -- NOT tracked in g_full_state (that map is
+// float-only, see generic_state_handler's own comment), so there's no read-back for these, only
+// send. Fine for record_path specifically: this client computes it locally right before a
+// recording starts (mirrors frontend.py's own _current_record_path, which is likewise never read
+// back from the backend either).
+static void send_osc_string(const char* path, const std::string& value) {
+    if (!g_hds_addr) return;
+    lo_send(g_hds_addr, path, "s", value.c_str());
+}
+
 // Reads g_full_state with a fallback for an address never yet observed (before the first
 // request_state reply lands, or for a field this backend build doesn't have).
 static float get_state(const char* path, float default_val) {
@@ -104,6 +117,13 @@ static float g_live_peak = 0.0f;
 static float g_live_tempo_bpm = 0.0f;
 static double g_last_status_time = 0.0;
 static const double OSC_STATUS_TIMEOUT_S = 1.5;
+
+// Recording tab's own live feedback (see backend.c's send_osc_status()'s is_recording/
+// elapsed_seconds/record_error/detected_input_channels fields).
+static float g_live_is_recording = 0.0f;
+static float g_live_record_elapsed = 0.0f;
+static float g_live_record_error = 0.0f;
+static float g_live_detected_input_channels = 0.0f;
 
 static int status_float_handler(const char*, const char*, lo_arg** argv, int argc, lo_message, void* user_data) {
     if (argc != 1) return 0;
@@ -293,6 +313,156 @@ static void save_program(const std::string& name, const std::string& category) {
     rescan_programs();
 }
 
+// --------------------------------------------------------------------------------------------
+// Recording tab: real /hds/record/* control + live /hds/status/* feedback, matching backend.c's
+// RecordEngine and frontend.py's own Recording tab (src/frontend.py, the "RECORDING TAB CONTENT"
+// section) in behavior -- same field set, same folder convention (~/HDS_Recordings), same
+// edge-triggered record_enable start/stop. Config state (which sources/channels, downmix vs
+// multichannel, WAV vs WavPack, the current take's path) lives here as plain client-local state,
+// same posture frontend.py's own Qt widgets already have -- none of this round-trips through the
+// backend (record_path is a string, invisible to g_full_state's float-only map; the others are
+// genuine "what this session intends," reset to sensible defaults on launch, not restored from a
+// live backend pull, exactly matching frontend.py's own unrestored QCheckBox/QRadioButton state).
+// --------------------------------------------------------------------------------------------
+#define REC_MAX_CHANNELS 16 // matches RECORD_MAX_CHANNELS in backend.c
+
+static bool g_rec_synth_output = true;                          // record_include_synth_output
+static bool g_rec_channel_enable[REC_MAX_CHANNELS] = { false };  // record_input_channel_enable[]
+static bool g_rec_downmix = false;                               // false=Multichannel WAV, true=Stereo Downmix
+static int g_rec_format = 0;                                     // 0=WAV, 1=WavPack
+static bool g_rec_active = false;                                // this client's own record_enable intent
+static std::string g_rec_current_path;
+
+static std::string home_recordings_dir() {
+    const char* home = getenv("HOME");
+    return std::string(home ? home : ".") + "/HDS_Recordings";
+}
+
+// Mirrors frontend.py's own _generate_record_filename() exactly: HDS_<timestamp>.wav/.wv in
+// ~/HDS_Recordings, so consecutive takes from either controller never collide.
+static std::string generate_record_filename() {
+    std::error_code ec;
+    fs::create_directories(home_recordings_dir(), ec);
+    time_t t = time(nullptr);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char stamp[32];
+    strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &tmv);
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s/HDS_%s.%s", home_recordings_dir().c_str(), stamp, g_rec_format == 1 ? "wv" : "wav");
+    return buf;
+}
+
+// Sends every recording-config address -- called on every source/format/channel change so the
+// backend's own snapshot (active_knobs) already matches this page's widgets by the time
+// record_enable's 0->1 edge fires and reads them (see main()'s own record-start block in
+// backend.c, which reads record_path/record_include_synth_output/record_downmix_stereo/
+// record_input_channel_enable[]/record_format as a plain snapshot at that instant -- these must
+// already be current, not still in flight, which is why this always runs ahead of any
+// record_enable=1 send, never after).
+static void transmit_record_config() {
+    send_osc_float("/hds/record/include_synth_output", g_rec_synth_output ? 1.0f : 0.0f);
+    send_osc_float("/hds/record/downmix_stereo", g_rec_downmix ? 1.0f : 0.0f);
+    send_osc_float("/hds/record/format", (float)g_rec_format);
+    char addr[64];
+    for (int c = 0; c < REC_MAX_CHANNELS; c++) {
+        snprintf(addr, sizeof(addr), "/hds/record/channel/%d/enable", c);
+        send_osc_float(addr, g_rec_channel_enable[c] ? 1.0f : 0.0f);
+    }
+}
+
+static void set_record_active(bool active) {
+    g_rec_active = active;
+    if (active) {
+        g_rec_current_path = generate_record_filename();
+        transmit_record_config();                              // config settled first...
+        send_osc_string("/hds/record/path", g_rec_current_path);
+    }
+    send_osc_float("/hds/record/enable", active ? 1.0f : 0.0f); // ...enable's 0->1 edge last
+}
+
+static void draw_record_tab() {
+    ImGui::Text("RECORDER MODULE [REC]");
+    ImGui::Separator(); ImGui::Spacing();
+
+    // A record_error from the backend means record_enable never actually caught (no channels
+    // selected, or a write failure) -- revert this client's own intent so the button doesn't sit
+    // showing "STOP" for a recording that never started, matching frontend.py's own
+    // _update_recording_status() auto-revert exactly.
+    if (g_live_record_error != 0.0f && g_rec_active) {
+        g_rec_active = false;
+        send_osc_float("/hds/record/enable", 0.0f);
+    }
+
+    int detected = (int)(g_live_detected_input_channels + 0.5f);
+    if (detected < 0) detected = 0;
+    if (detected > REC_MAX_CHANNELS) detected = REC_MAX_CHANNELS;
+
+    bool any_source = g_rec_synth_output;
+    for (int c = 0; !any_source && c < detected; c++) any_source = g_rec_channel_enable[c];
+
+    // Only gate the ability to START a new take -- never yank Stop out from under one already
+    // running just because every source got unchecked live (same rule frontend.py's own
+    // _update_record_button_enabled documents).
+    ImGui::BeginDisabled(!any_source && !g_rec_active);
+    ImVec4 btn_color = g_rec_active ? ImVec4(0.69f, 0.0f, 0.13f, 1.0f) : ImVec4(0.16f, 0.42f, 0.16f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, btn_color);
+    if (ImGui::Button(g_rec_active ? "STOP" : "RECORD", ImVec2(200, 60))) {
+        set_record_active(!g_rec_active);
+    }
+    ImGui::PopStyleColor();
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    ImGui::Dummy(ImVec2(1, 8)); // nudge the status text down to roughly center against the tall button
+    if (g_live_record_error != 0.0f) {
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Recording failed to start --\ncheck sources/folder.");
+    } else if (g_live_is_recording != 0.0f) {
+        int mins = (int)g_live_record_elapsed / 60, secs = (int)g_live_record_elapsed % 60;
+        std::string fname = g_rec_current_path.empty() ? "" : fs::path(g_rec_current_path).filename().string();
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Recording %s", fname.c_str());
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%02d:%02d", mins, secs);
+    } else if (g_rec_active) {
+        ImGui::TextColored(ImVec4(0.71f, 0.54f, 0.0f, 1.0f), "Starting...");
+    } else {
+        ImGui::TextDisabled("Not recording");
+    }
+    ImGui::EndGroup();
+
+    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+    ImGui::Text("Sources:");
+    if (ImGui::Checkbox("Synth Output (post-FX, L/R)", &g_rec_synth_output)) transmit_record_config();
+
+    if (detected > 0) {
+        ImGui::Text("Raw Input Channels (from the Input device, Devices tab):");
+        for (int c = 0; c < detected; c++) {
+            if (c % 4 != 0) ImGui::SameLine();
+            char id[24];
+            snprintf(id, sizeof(id), "In %d##rc%d", c + 1, c);
+            if (ImGui::Checkbox(id, &g_rec_channel_enable[c])) transmit_record_config();
+        }
+    } else {
+        ImGui::TextDisabled("No input channels detected.");
+    }
+
+    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+    ImGui::Text("Output:");
+    if (ImGui::RadioButton("Multichannel WAV", !g_rec_downmix)) { g_rec_downmix = false; transmit_record_config(); }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Stereo Downmix", g_rec_downmix)) { g_rec_downmix = true; transmit_record_config(); }
+
+    if (ImGui::RadioButton("WAV", g_rec_format == 0)) { g_rec_format = 0; transmit_record_config(); }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("WavPack (smaller)", g_rec_format == 1)) { g_rec_format = 1; transmit_record_config(); }
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Folder: %s", home_recordings_dir().c_str());
+    ImGui::TextDisabled("Filename: HDS_<timestamp>.%s", g_rec_format == 1 ? "wv" : "wav");
+}
+
 enum SynthPage { PAGE_PROG, PAGE_COMB, PAGE_SEQ, PAGE_REC, PAGE_ADSR, PAGE_GLOB };
 
 const char* custom_strcasestr(const char* haystack, const char* needle) {
@@ -446,6 +616,10 @@ int main() {
     } else {
         lo_server_add_method(g_status_server, "/hds/status/peak", "f", status_float_handler, &g_live_peak);
         lo_server_add_method(g_status_server, "/hds/status/tempo_bpm_live", "f", status_float_handler, &g_live_tempo_bpm);
+        lo_server_add_method(g_status_server, "/hds/status/is_recording", "f", status_float_handler, &g_live_is_recording);
+        lo_server_add_method(g_status_server, "/hds/status/elapsed_seconds", "f", status_float_handler, &g_live_record_elapsed);
+        lo_server_add_method(g_status_server, "/hds/status/record_error", "f", status_float_handler, &g_live_record_error);
+        lo_server_add_method(g_status_server, "/hds/status/detected_input_channels", "f", status_float_handler, &g_live_detected_input_channels);
         lo_server_add_method(g_status_server, NULL, NULL, generic_state_handler, nullptr);
         lo_send(g_hds_addr, "/hds/request_state", "");
     }
@@ -698,9 +872,7 @@ int main() {
                 break;
 
             case PAGE_REC:
-                ImGui::Text("RECORDER MODULE [REC]");
-                ImGui::Separator();
-                ImGui::Text("Placeholder for session capture controls and buffer looping.");
+                draw_record_tab();
                 break;
 
             case PAGE_ADSR:
