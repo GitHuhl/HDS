@@ -576,7 +576,20 @@ python3 src/frontend.py # start the GUI -- talks to the engine over OSC (see bel
 On NixOS/Nix, `nix-shell` at the repo root provides every dependency above (plus GLFW/OpenGL for
 the Pi-touch client below and the Windows cross-toolchain) in one shell, and auto-provisions a
 `.venv/` for `requirements.txt` on entry -- see `shell.nix`'s own header comment for exactly what
-each target needs from it.
+each target needs from it. **`nix-shell` is only actually needed for the cross-compile targets**
+(`make windows`/`make clap-windows`/`make arm64`/`make pi-touch-arm64`) -- for plain `make`/
+`make clap`/`make pi-touch` on your own machine, `nix-shell` is not required at all, and on a real
+NixOS desktop, building `hds_pi_touch` *through* it is actively the wrong move: confirmed directly
+(a real `ldd ./hds_pi_touch` on a NixOS laptop) that doing so links the binary against nixpkgs' own
+isolated `libglvnd`/Mesa copies from the Nix store, not the system's own properly-configured GPU
+driver (`/run/opengl-driver`, what plain `glxinfo` run outside any shell correctly reaches) -- the
+binary starts and even opens an OSC connection, but its GL context creation fails outright (GLX
+reports zero usable framebuffer configs, even though the same system's own driver stack works
+fine for every other GL application). On NixOS, install `glfw`/`libGL`/`liblo`/`wavpack` as regular
+system packages (`environment.systemPackages` or an equivalent profile install, NOT `nix-shell`)
+and build `make pi-touch` from a plain shell outside any `nix-shell`; if you'd rather stay inside
+one, wrap the built binary's launch with [`nixGL`](https://github.com/nix-community/nixGL), the
+standard community tool for exactly this nix-shell-vs-real-driver mismatch.
 
 ### Building for Windows
 

@@ -635,39 +635,18 @@ int main() {
     }
     rescan_programs();
 
+    // Two earlier attempts here (forcing GLFW_PLATFORM_X11, then also zeroing alpha/depth/stencil)
+    // were both reverted -- neither fixed anything, and a real working reference build on the same
+    // Plasma/Wayland machine, using plain GLFW defaults with no platform forcing, proved neither
+    // was ever the actual problem. The real cause: a `nix-shell`-built hds_pi_touch links against
+    // nixpkgs' own isolated libglvnd/Mesa (confirmed via `ldd`: /nix/store/...-libglvnd-.../
+    // libGLX.so.0, not the system's own properly-configured driver `glxinfo` reaches outside any
+    // shell) -- a library-resolution problem, not a GLFW window-hint problem. See README.md's Pi-
+    // touch build section for the actual fix (build outside `nix-shell`, or wrap with `nixGL`).
     glfwSetErrorCallback(glfw_error_callback);
-#if defined(GLFW_VERSION_MAJOR) && (GLFW_VERSION_MAJOR > 3 || (GLFW_VERSION_MAJOR == 3 && GLFW_VERSION_MINOR >= 4))
-    // BUG FIX: GLFW 3.4+ auto-detects Wayland (via $WAYLAND_DISPLAY) and dynamically dlopen()s
-    // libwayland-client at glfwInit() time -- confirmed directly, not guessed: a real run on a
-    // Wayland desktop (KDE Plasma) produced glfwSetErrorCallback's own "error 65544 (Wayland:
-    // Failed to load libwayland-client)" and glfwInit() returning false, with NO fallback to X11
-    // on its own. This client has never had -- and doesn't need -- anything Wayland-specific (no
-    // fractional scaling, no native Wayland decorations; it's a plain fixed-size window), so force
-    // the X11 backend unconditionally: every mainstream Wayland desktop (KDE Plasma, GNOME, Labwc,
-    // sway, ...) ships XWayland precisely for X11-only apps like this one to keep working, which
-    // sidesteps whatever's broken about libwayland-client loading on a given machine entirely
-    // rather than depending on it. `GLFW_PLATFORM`/`GLFW_PLATFORM_X11` only exist from GLFW 3.4
-    // onward (the version that introduced runtime backend selection at all -- 3.3 picks Wayland
-    // vs. X11 at the PACKAGE's own build time, with no app-level override possible), hence the
-    // version guard -- on an older GLFW this block compiles to nothing and behavior is whatever
-    // that system's own GLFW package was already built for, same as before this fix.
-    glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
-#endif
     if (!glfwInit()) { fprintf(stderr, "[glfw] glfwInit() failed -- see the error above.\n"); return -1; }
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
-    // BUG FIX: "GLX: No GLXFBConfigs returned" / "GLX: Failed to find a suitable GLXFBConfig" --
-    // hit for real on a working AMD/amdgpu system (glxinfo confirmed GLX itself works fine) once
-    // forced onto X11/XWayland. GLFW's own defaults request an 8-bit alpha channel plus a 24-bit
-    // depth + 8-bit stencil buffer in the chosen framebuffer config; XWayland's GLX implementation
-    // is well known (a frequently-reported GLFW/XWayland issue, not specific to this machine) for
-    // only exposing FBConfigs WITHOUT some of those on certain driver/compositor combinations --
-    // zero matching configs means glXChooseFBConfig legitimately returns nothing. None of this is
-    // actually needed here: this is a plain 2D ImGui UI (scissor-clipped, no depth testing, no
-    // transparency), so ask for none of it rather than requiring it.
-    glfwWindowHint(GLFW_ALPHA_BITS, 0);
-    glfwWindowHint(GLFW_DEPTH_BITS, 0);
-    glfwWindowHint(GLFW_STENCIL_BITS, 0);
 
     GLFWwindow* window = glfwCreateWindow(720, 720, "HDS Touch Console", NULL, NULL);
     if (!window) { fprintf(stderr, "[glfw] glfwCreateWindow() failed -- see the error above.\n"); glfwTerminate(); return -1; }
