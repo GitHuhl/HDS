@@ -6,17 +6,11 @@ LDLIBS := -lasound -lm -lpthread -lwavpack -llo
 BIN := synth_engine
 SRC := src/backend.c
 
-# --- Windows cross-build ---
-# Produces synth_engine.exe via the mingw-w64 cross-compiler. Needs `tools/build_windows_deps.sh`
-# run once first (fetches + cross-builds liblo/wavpack for Windows into third_party/win64-deps/ --
-# audio/MIDI need nothing extra beyond mingw-w64 itself, see the platform-shim comments at the top
-# of src/backend.c). This is a completely separate target from `all` above -- it never runs as
-# part of a plain `make`, and touches none of the Linux build's flags/libs/output.
+# --- Windows cross-build (CLAP plugin only -- standalone synth_engine.exe dropped from scope) ---
 # `?=` (not `:=`): the standard x86_64-w64-mingw32-gcc name is right for Debian/Ubuntu's
 # mingw-w64 package and the nix-shell in shell.nix at the repo root, but overridable
-# (`make windows WIN_CC=...`) if some other toolchain names its cross compiler differently.
+# (`make clap-windows WIN_CC=...`) if some other toolchain names its cross compiler differently.
 WIN_CC ?= x86_64-w64-mingw32-gcc
-WIN_BIN := synth_engine.exe
 WIN_DEPS := third_party/win64-deps
 # Some mingw-w64 cross-toolchains (confirmed: some nixpkgs pkgsCross.mingwW64 builds) ship the
 # "win32" threading model -- no winpthreads, no pthread.h at all -- unlike Debian/Ubuntu's
@@ -47,56 +41,27 @@ CLAP_BIN := hds.clap
 CLAP_SRC := src/clap_plugin.c
 
 # --- Windows CLAP plugin (cross-built from Linux) ---
-# Produces hds-windows.clap: a PE32+ DLL exporting clap_entry, built the same way synth_engine.exe
-# is (mingw-w64 + the same third_party/win64-deps/ liblo/wavpack static libs -- see `windows`
-# above; run tools/build_windows_deps.sh once first if that target hasn't been built yet). Needs
-# no platform code of its own: clap_plugin.c never touches the audio/MIDI-device paths backend.c
-# already abstracts per-OS (the host supplies buffers/note-events instead), so cross-compiling it
-# is the exact same recipe as `clap` above, just with $(WIN_CC)/$(WIN_LDLIBS) instead of
-# $(CC)/$(LDLIBS) and no -fPIC (meaningless for a Windows DLL). Distinct output name from
-# $(CLAP_BIN) so `make clap clap-windows` in one checkout never overwrites either. To install on
-# Windows: drop the .clap file into %COMMONPROGRAMFILES%\CLAP\ or %LOCALAPPDATA%\Programs\Common\CLAP\.
+# Produces hds-windows.clap: a PE32+ DLL exporting clap_entry, built with mingw-w64 + the
+# third_party/win64-deps/ liblo/wavpack static libs (run tools/build_windows_deps.sh once first).
+# Needs no platform code of its own: clap_plugin.c never touches the audio/MIDI-device paths
+# backend.c already abstracts per-OS (the host supplies buffers/note-events instead), so
+# cross-compiling it is the exact same recipe as `clap` above, just with $(WIN_CC)/$(WIN_LDLIBS)
+# instead of $(CC)/$(LDLIBS) and no -fPIC (meaningless for a Windows DLL). To install on Windows:
+# drop the .clap file into %COMMONPROGRAMFILES%\CLAP\ or %LOCALAPPDATA%\Programs\Common\CLAP\.
 WIN_CLAP_BIN := hds-windows.clap
 
-# --- Raspberry Pi / embedded touchscreen client (optional, not part of `all`) ---
-# An ImGui + GLFW touch UI for a small (e.g. 720x720px 4") panel, talking to the real HDS backend
-# over OSC -- see src/pi_touch_frontend.cpp's own header comment for scope/design. Needs GLFW3 +
-# OpenGL + liblo dev packages (apt: libglfw3-dev liblo-dev); Dear ImGui itself is vendored into
-# third_party/imgui/ (pinned to tag v1.91.5, MIT licensed, github.com/ocornut/imgui) rather than
-# assumed to be a system package, mirroring this project's existing CLAP-SDK/miniaudio.h vendoring
-# precedent. Compiles ImGui's own core + GLFW/OpenGL3 backend .cpp files directly alongside
-# pi_touch_frontend.cpp rather than building a separate static lib -- ImGui's own documented build
-# model (no configure step, just compile the handful of .cpp files a project actually uses), and
-# simpler than adding a whole second build system for a small vendored dependency.
-PI_TOUCH_BIN := hds_pi_touch
-PI_TOUCH_INC := third_party/imgui
-PI_TOUCH_SRC := src/pi_touch_frontend.cpp \
-                $(PI_TOUCH_INC)/imgui.cpp $(PI_TOUCH_INC)/imgui_draw.cpp \
-                $(PI_TOUCH_INC)/imgui_tables.cpp $(PI_TOUCH_INC)/imgui_widgets.cpp \
-                $(PI_TOUCH_INC)/backends/imgui_impl_glfw.cpp $(PI_TOUCH_INC)/backends/imgui_impl_opengl3.cpp
-PI_TOUCH_CFLAGS := $(shell pkg-config --cflags glfw3) -I$(PI_TOUCH_INC) -I$(PI_TOUCH_INC)/backends
-# PI_TOUCH_RPATH (set by shell.nix's shellHook, native-Linux target only -- NOT the arm64 target,
-# which uses patchelf's own $ORIGIN-relative rpath instead) bakes the real NixOS GPU driver's
-# library directory directly into hds_pi_touch's own ELF RPATH at LINK time, so GLX (used via
-# X11/XWayland -- see pi_touch_frontend.cpp's own comment on why this project doesn't fight GLFW's
-# platform auto-detection towards Wayland/EGL) finds the real driver regardless of LD_LIBRARY_PATH,
-# needed because this binary is built inside nix-shell but always RUN outside it, where nothing
-# from shell.nix's shellHook is present at all.
-PI_TOUCH_LDLIBS := $(shell pkg-config --libs glfw3) -llo -lGL -ldl $(PI_TOUCH_RPATH)
-
-# --- Raspberry Pi 5 / aarch64 Linux cross-build (make arm64 / make pi-touch-arm64) ---
-# Cross-compiles synth_engine and hds_pi_touch for aarch64 Linux (a Raspberry Pi 5, or any other
-# aarch64 Linux host) from this x86_64 machine -- for the common case where the Pi itself runs
-# plain Raspberry Pi OS rather than NixOS, so `nix-shell` isn't available to build directly on the
-# device: build here instead, then copy the resulting binary over. Must be run from inside
-# `nix-shell` at the repo root (see shell.nix's own aarch64 section) -- ARM64_CC/ARM64_CXX default
-# to the prefixed cross-compiler names nix-shell puts on PATH (mirrors WIN_CC's exact convention
-# above), and ARM64_CFLAGS/ARM64_LDFLAGS come from environment variables shell.nix's shellHook
-# exports (cross-built libraries live under content-addressed Nix store paths, unlike $(WIN_DEPS)'s
-# fixed relative directory, so they can't be hardcoded here). Unlike the Windows cross-build (which
-# needs tools/build_windows_deps.sh to cross-build liblo/wavpack from source, since mingw builds of
-# them aren't in nixpkgs), every dependency here -- alsa-lib, liblo, wavpack, glfw -- is already a
-# real nixpkgs package for this exact target, so no separate deps-building script is needed.
+# --- Raspberry Pi 5 / aarch64 Linux cross-build (make arm64) ---
+# Cross-compiles synth_engine (the backend engine only -- no GUI client for this target) for
+# aarch64 Linux (a Raspberry Pi 5, or any other aarch64 Linux host) from this x86_64 machine --
+# for the common case where the Pi itself runs plain Raspberry Pi OS rather than NixOS, so
+# `nix-shell` isn't available to build directly on the device: build here instead, then copy the
+# resulting binary over. Must be run from inside `nix-shell` at the repo root (see shell.nix's own
+# aarch64 section) -- ARM64_CC defaults to the prefixed cross-compiler name nix-shell puts on PATH
+# (mirrors WIN_CC's exact convention above), and ARM64_CFLAGS/ARM64_LDFLAGS come from environment
+# variables shell.nix's shellHook exports (cross-built libraries live under content-addressed Nix
+# store paths, unlike $(WIN_DEPS)'s fixed relative directory, so they can't be hardcoded here).
+# Every dependency here -- alsa-lib, liblo, wavpack -- is already a real nixpkgs package for this
+# exact target, so no separate deps-building script is needed.
 #
 # Deploying the output binary -- confirmed directly by inspecting a real built binary's own ELF
 # headers, not assumed. Two separate Nix-specific paths get baked in by the cross linker, neither
@@ -109,41 +74,36 @@ PI_TOUCH_LDLIBS := $(shell pkg-config --libs glfw3) -llo -lGL -ldl $(PI_TOUCH_RP
 #      exist means the kernel can't start the binary AT ALL, and most shells report that as
 #      "No such file or directory" -- easily (and reasonably) mistaken for the binary itself being
 #      missing, even though `ls`/`file` show it's right there.
-# Both targets' rules run `patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter
-# $(ARM64_INTERP)` on their output as a last step: `/lib/ld-linux-aarch64.so.1` is the standard,
+# The `arm64` rule runs `patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter
+# $(ARM64_INTERP)` on its output as a last step: `/lib/ld-linux-aarch64.so.1` is the standard,
 # well-known path glibc-based aarch64 Debian/Ubuntu/Raspberry Pi OS systems already have their own
 # real dynamic loader installed at, and the $ORIGIN-relative RPATH points at $(ARM64_LIBDIR)/
-# (copied alongside the binary by these same rules -- see that variable's own comment) instead of
+# (copied alongside the binary by this same rule -- see that variable's own comment) instead of
 # this build machine's own /nix/store/... paths.
 #
 # $(ARM64_LIBDIR) bundles liblo/wavpack only -- pure protocol/codec libraries with no external
-# config files or hardware coupling, confirmed safe to ship as plain .so files. alsa-lib/libGL/
-# glfw are deliberately NOT bundled (see shell.nix's own ARM64_BUNDLE_LIBS comment for why alsa
-# specifically is a real, confirmed risk to bundle, not just an unnecessary one -- its compiled-in
-# config path points at THIS build machine's own Nix store, and even if that path existed on the
-# Pi it would describe the wrong sound hardware). These three need the Pi's own apt-installed
-# copies instead: `sudo apt-get install libasound2` for synth_engine-arm64 (add `libglfw3
-# libgl1-mesa-dri` for hds_pi_touch-arm64) -- "cross compiles but the Pi complains about missing
-# files" after confirming the interpreter/RPATH fix above almost always means this step was
+# config files or hardware coupling, confirmed safe to ship as plain .so files. alsa-lib is
+# deliberately NOT bundled -- `strings` on the cross-built libasound.so.2 shows its compiled-in
+# default config directory is THIS BUILD MACHINE's own Nix store path (where alsa.conf, card
+# definitions, and dmix/plug setups live). That directory won't exist on the Pi, and even if it
+# did, it would describe the wrong hardware -- the Pi's own apt-installed alsa-lib is compiled with
+# the correct /usr/share/alsa path and is what actually knows how to talk to the Pi's real sound
+# chip: `sudo apt-get install libasound2` on the Pi -- "cross compiles but the Pi complains about
+# missing files" after confirming the interpreter/RPATH fix above almost always means this step was
 # skipped, not a build problem. One more real caveat, not yet hit but worth stating plainly: this
 # cross toolchain's glibc (2.39, from nixpkgs nixos-24.05) needs to be no newer than the Pi's own
 # installed glibc, or the binary will refuse to start with a GLIBC_2.39-not-found error -- check
 # the Pi's glibc version (`ldd --version`) against this if a binary that has the right interpreter
 # and libraries still won't run.
 ARM64_CC ?= aarch64-unknown-linux-gnu-gcc
-ARM64_CXX ?= aarch64-unknown-linux-gnu-g++
 ARM64_BIN := synth_engine-arm64
-ARM64_PI_TOUCH_BIN := hds_pi_touch-arm64
 # Where alsa-lib/liblo/wavpack get copied to, alongside the binary, so the Pi needs no apt-get
-# for these three (see shell.nix's own ARM64_BUNDLE_LIBS comment for why libGL/glfw are excluded
-# from this bundle on purpose). Copy this directory to the Pi together with the binary, keeping
-# them in the same relative layout -- the RPATH below is $ORIGIN-relative, i.e. "next to me".
+# for liblo/wavpack (see above for why alsa-lib itself is excluded from this bundle on purpose).
+# Copy this directory to the Pi together with the binary, keeping them in the same relative
+# layout -- the RPATH below is $ORIGIN-relative, i.e. "next to me".
 ARM64_LIBDIR := arm64-libs
 
-# NOTE: `all` (immediately below) must stay the FIRST rule in this file -- Make's default goal
-# (what runs when you type plain `make` with no target) is whichever rule appears first, and
-# pi-touch is an opt-in target, never the default.
-.PHONY: all run-backend run-frontend clean windows clean-windows clap clap-windows pi-touch arm64 pi-touch-arm64
+.PHONY: all run-backend run-frontend clean clean-windows clap clap-windows arm64
 
 all: $(BIN)
 
@@ -153,14 +113,8 @@ $(BIN): $(SRC)
 clap: $(CLAP_SRC)
 	$(CC) $(CFLAGS) -fPIC -shared -I$(CLAP_INC) -o $(CLAP_BIN) $(CLAP_SRC) $(LDLIBS)
 
-windows: $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a
-	$(WIN_CC) $(WIN_CFLAGS) -o $(WIN_BIN) $(SRC) $(WIN_LDFLAGS) $(WIN_LDLIBS)
-
 clap-windows: $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a $(CLAP_SRC)
 	$(WIN_CC) $(WIN_CFLAGS) -shared -I$(CLAP_INC) -o $(WIN_CLAP_BIN) $(CLAP_SRC) $(WIN_LDFLAGS) $(WIN_LDLIBS)
-
-pi-touch: $(PI_TOUCH_SRC)
-	$(CXX) -O2 -Wall -Wextra -std=gnu++17 $(PI_TOUCH_CFLAGS) -o $(PI_TOUCH_BIN) $(PI_TOUCH_SRC) $(PI_TOUCH_LDLIBS)
 
 $(WIN_DEPS)/liblo/lib/liblo.a $(WIN_DEPS)/wavpack/lib/libwavpack.a:
 	@echo "Windows dependencies not found -- run tools/build_windows_deps.sh first" >&2
@@ -175,13 +129,6 @@ arm64: $(SRC)
 	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
 	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_BIN)
 
-pi-touch-arm64: $(PI_TOUCH_SRC)
-	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
-	$(ARM64_CXX) -O2 -Wall -Wextra -std=gnu++17 -I$(PI_TOUCH_INC) -I$(PI_TOUCH_INC)/backends $(ARM64_CFLAGS) -o $(ARM64_PI_TOUCH_BIN) $(PI_TOUCH_SRC) $(ARM64_LDFLAGS) -lglfw -llo -lGL -ldl
-	mkdir -p $(ARM64_LIBDIR)
-	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
-	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_PI_TOUCH_BIN)
-
 run-backend: $(BIN)
 	./$(BIN)
 
@@ -189,8 +136,8 @@ run-frontend:
 	python3 src/frontend.py
 
 clean:
-	rm -f $(BIN) $(CLAP_BIN) $(PI_TOUCH_BIN) $(PI_TOUCH_REAL_BIN) $(ARM64_BIN) $(ARM64_PI_TOUCH_BIN)
+	rm -f $(BIN) $(CLAP_BIN) $(ARM64_BIN)
 	rm -rf $(ARM64_LIBDIR)
 
 clean-windows:
-	rm -f $(WIN_BIN) $(WIN_CLAP_BIN)
+	rm -f $(WIN_CLAP_BIN)

@@ -1,12 +1,13 @@
 #!/bin/bash
 # Cross-builds liblo (OSC) and libwavpack (recording) as static libraries for the Windows target
 # (x86_64-w64-mingw32), and installs them under third_party/win64-deps/{liblo,wavpack}/. Run this
-# ONCE before `make windows` -- it's a separate step (not folded into the Makefile itself) so a
-# plain `make windows` stays fast and doesn't need network access on every build, only the first.
+# ONCE before `make clap-windows` -- it's a separate step (not folded into the Makefile itself) so
+# a plain `make clap-windows` stays fast and doesn't need network access on every build, only the
+# first.
 #
-# These two are the only non-Windows-native dependencies synth_engine.exe needs: audio (WASAPI)
-# and MIDI (WinMM) come from the Windows SDK itself via mingw-w64, no extra library required (see
-# the "Windows audio/MIDI platform shim" comments in src/backend.c). liblo and wavpack are plain,
+# These two are the only non-Windows-native dependencies hds-windows.clap needs -- the CLAP plugin
+# has no platform audio/MIDI code of its own (the host supplies buffers/note-events instead, see
+# src/clap_plugin.c's own header comment). liblo and wavpack are plain,
 # portable C libraries fetched straight from their real upstream release tarballs (SourceForge for
 # liblo, wavpack.com for WavPack -- both real "make dist" releases shipping a working ./configure
 # already, deliberately not a raw GitHub source snapshot, which doesn't) and cross-built from
@@ -44,7 +45,7 @@ fi
 # pthread_create/join/mutexes uniformly across platforms (the sample disk thread, Sequencer
 # loader threads), relying on winpthreads' real POSIX-threads-on-Windows implementation, so this
 # is a hard requirement, not optional. Detect the gap here rather than failing deep inside a
-# `make windows`/`make clap-windows` compile with a bare "pthread.h: No such file or directory".
+# `make clap-windows` compile with a bare "pthread.h: No such file or directory".
 NEED_WINPTHREADS=0
 if ! echo '#include <pthread.h>' | x86_64-w64-mingw32-gcc -x c -E - >/dev/null 2>&1; then
     NEED_WINPTHREADS=1
@@ -134,4 +135,4 @@ if [ "$NEED_WINPTHREADS" = "1" ]; then
 else
     echo "=== Done. liblo and wavpack installed under $DEPS_DIR ==="
 fi
-echo "You can now run: make windows / make clap-windows"
+echo "You can now run: make clap-windows"

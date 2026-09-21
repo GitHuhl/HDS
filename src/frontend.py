@@ -679,71 +679,10 @@ FX_TYPE_METADATA = [
 # must match the backend's own "auto"/empty-string convention in midi_client_should_autoconnect.
 MIDI_AUTO_LABEL = "Auto (recommended)"
 
-def _find_windows_backend_exe():
-    """Locates synth_engine.exe so _list_windows_devices() below can spawn it for
-    `--list-devices`. Mirrors _maybe_launch_bundled_backend()'s own bundle_dir lookup for a frozen
-    PyInstaller build; for a plain `python src\\frontend.py` dev run (no bundle), falls back to
-    looking next to this script's own repo checkout -- the `make windows` output location -- and
-    then the current working directory. Returns None if none of those panned out; callers treat
-    that the same as the executable failing to run at all."""
-    bundle_dir = getattr(sys, "_MEIPASS", None)
-    candidates = []
-    if bundle_dir:
-        candidates.append(os.path.join(bundle_dir, "synth_engine.exe"))
-    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "synth_engine.exe"))
-    candidates.append(os.path.join(os.getcwd(), "synth_engine.exe"))
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-_windows_devices_cache = {"time": 0.0, "data": None}
-
-def _list_windows_devices():
-    """Runs `synth_engine.exe --list-devices` (backend.c's hds_win_print_device_list(), gated
-    behind that CLI flag in main()) and parses its [output]/[input]/[midi] sections -- the Windows
-    equivalent of _list_alsa_devices()/_list_midi_input_devices()'s aplay/arecord/aconnect calls,
-    none of which exist on Windows (they fail silently and those functions were falling back to
-    their single "default"/"Auto" entry always, making the Devices tab's dropdowns look inert).
-    Cached for a second so a burst of calls (startup builds all 3 combos back to back; so does a
-    single Refresh click) spawns the exe once, not three times. Falls back to the same safe
-    single-entry lists on any failure (exe not found, timeout, nonzero exit)."""
-    now = time.monotonic()
-    if _windows_devices_cache["data"] is not None and now - _windows_devices_cache["time"] < 1.0:
-        return _windows_devices_cache["data"]
-    fallback = {"output": ["default"], "input": ["default"], "midi": [MIDI_AUTO_LABEL]}
-    exe = _find_windows_backend_exe()
-    devices = fallback
-    if exe:
-        try:
-            result = subprocess.run([exe, "--list-devices"], capture_output=True, text=True, timeout=5)
-            devices = {"output": [], "input": [], "midi": []}
-            section = None
-            for line in result.stdout.splitlines():
-                line = line.rstrip("\r\n")
-                if line in ("[output]", "[input]", "[midi]"):
-                    section = line[1:-1]
-                elif section and line:
-                    devices[section].append(line)
-            if "default" not in devices["output"]:
-                devices["output"].insert(0, "default")
-            if "default" not in devices["input"]:
-                devices["input"].insert(0, "default")
-            if not devices["midi"]:
-                devices["midi"] = [MIDI_AUTO_LABEL]
-        except (OSError, subprocess.SubprocessError):
-            devices = fallback
-    _windows_devices_cache["time"] = now
-    _windows_devices_cache["data"] = devices
-    return devices
-
 def _list_alsa_devices(list_cmd):
-    """Best-effort enumeration of PCM device names. On Windows, delegates to
-    _list_windows_devices() (aplay/arecord don't exist there); on Linux, via `aplay -L` /
-    `arecord -L`. Falls back to just ["default"] if the tool isn't installed, times out, or
-    returns nothing -- "default" is always a safe starting point."""
-    if sys.platform == "win32":
-        return _list_windows_devices()["output" if list_cmd[0] == "aplay" else "input"]
+    """Best-effort enumeration of PCM device names via `aplay -L` / `arecord -L`. Falls back to
+    just ["default"] if the tool isn't installed, times out, or returns nothing -- "default" is
+    always a safe starting point."""
     names = []
     try:
         result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=2)
@@ -759,15 +698,12 @@ def _list_alsa_devices(list_cmd):
 _ACONNECT_CLIENT_RE = re.compile(r"^client\s+(\d+):\s*'(.*)'\s*\[type=(\w+)")
 
 def _list_midi_input_devices():
-    """Best-effort enumeration of real MIDI source device names. On Windows, delegates to
-    _list_windows_devices() (`aconnect` doesn't exist there). On Linux, via `aconnect -i` (lists
+    """Best-effort enumeration of real MIDI source device names via `aconnect -i` (lists
     input-capable clients, i.e. things that GENERATE MIDI -- keyboards/controllers -- as opposed
     to `aconnect -o`'s output-capable/receiving clients). Falls back to just [MIDI_AUTO_LABEL] if
     the tool isn't installed, times out, or nothing qualifies -- backend.c applies the exact same
     System-client/kernel-type/"Midi Through" filtering independently when it does its own live
     scan, so this list is a preview of what auto-connect would pick up, not the source of truth."""
-    if sys.platform == "win32":
-        return _list_windows_devices()["midi"]
     names = []
     try:
         result = subprocess.run(["aconnect", "-i"], capture_output=True, text=True, timeout=2)
@@ -2297,7 +2233,6 @@ class SynthGui(QWidget):
         # pure metadata, never applied to any OSC address), so re-saving after a Load defaults
         # to the category it was already filed under instead of forgetting it every time.
         self._current_program_category = ""
-        self._maybe_launch_bundled_backend()
         self.connect_to_backend()
 
         # The master outer structural layout
@@ -5015,9 +4950,7 @@ class SynthGui(QWidget):
     def _scan_program_categories(self):
         """Reads every saved Program's own "category" field (skipping ones that don't have one --
         older files, or ones deliberately left uncategorized) to seed the Save dialog's category
-        picker with whatever categories are actually in use, rather than a fixed invented list --
-        the same "real, data-driven categories" the Pi-touch client's own Program Library page
-        builds its category tabs from (see src/pi_touch_frontend.cpp)."""
+        picker with whatever categories are actually in use, rather than a fixed invented list."""
         seen = []
         for name in self._scan_programs_folder():
             path = os.path.join(self.programs_folder, name, f"{name}.hdsprog")
@@ -5821,30 +5754,6 @@ class SynthGui(QWidget):
             for panel in targets:
                 panel.setEnabled(True)
 
-    # Windows packaging: a PyInstaller --onefile build of this file can bundle synth_engine.exe
-    # alongside it as a data file (see tools/build_windows_deps.sh + the README's Windows build
-    # section) so the whole app ships as one double-clickable .exe. On every other run mode --
-    # the normal `python3 src/frontend.py` on Linux this project is developed against, or a
-    # frozen build with no bundled backend present -- this is a complete no-op: the user (or a
-    # dev) starts synth_engine themselves, exactly as today, and frontend.py just connects to it
-    # over OSC same as always. sys.frozen/sys._MEIPASS are PyInstaller's own documented markers
-    # for "am I running from a frozen bundle, and where did it unpack to."
-    def _maybe_launch_bundled_backend(self):
-        self._bundled_backend_proc = None
-        if not (getattr(sys, "frozen", False) and sys.platform == "win32"):
-            return
-        bundle_dir = getattr(sys, "_MEIPASS", None)
-        if not bundle_dir:
-            return
-        backend_path = os.path.join(bundle_dir, "synth_engine.exe")
-        if not os.path.isfile(backend_path):
-            return
-        try:
-            self._bundled_backend_proc = subprocess.Popen([backend_path])
-            print(f"launched bundled backend: {backend_path}")
-        except OSError as e:
-            print(f"--- failed to launch bundled backend {backend_path}: {e} ---")
-
     def connect_to_backend(self):
         # UDP: construction never fails just because nothing's listening yet (unlike the old
         # AF_UNIX SOCK_STREAM connect(), whose success/failure used to BE the mock-mode signal).
@@ -6395,8 +6304,6 @@ class SynthGui(QWidget):
     def closeEvent(self, event):
         if self.osc_client is not None: self.osc_client.close()
         if self.status_sock is not None: self.status_sock.close()
-        if getattr(self, "_bundled_backend_proc", None) is not None:
-            self._bundled_backend_proc.terminate()  # only ever set when this GUI itself launched it -- see _maybe_launch_bundled_backend()
         event.accept()
 def runtime_connect_and_bind(gui):
     # Program save/load

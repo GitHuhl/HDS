@@ -3,24 +3,25 @@
 ##
 ##   make                  -> ./synth_engine        (native Linux backend, ALSA)
 ##   make clap             -> ./hds.clap            (Linux CLAP plugin)
-##   make pi-touch         -> ./hds_pi_touch         (ImGui/GLFW touch client)
 ##   python3 src/frontend.py                        (PySide6 GUI -- see the auto-venv shellHook below)
 ##
 ##   nix-shell                            # once, to enter the shell
-##   tools/build_windows_deps.sh          # once, to cross-build liblo/wavpack for Windows
-##   make windows                         -> synth_engine.exe
+##   tools/build_windows_deps.sh          # once, to cross-build liblo/wavpack for the Windows CLAP
 ##   make clap-windows                    -> hds-windows.clap
 ##
 ##   make arm64                           -> synth_engine-arm64  (aarch64 Linux, e.g. Raspberry Pi 5)
-##   make pi-touch-arm64                  -> hds_pi_touch-arm64  (same target, touch client)
 ##
+## Scope note: standalone Windows (synth_engine.exe) and the ImGui/GLFW touch client (hds_pi_touch)
+## have both been dropped entirely -- Windows support is CLAP-plugin-only now, and the Pi target is
+## backend-only (synth_engine-arm64, no GUI client for that target). See git history for the prior,
+## broader scope if either is ever revived.
 ## This used to be scoped to the Windows cross-build alone (see git history) -- broadened to cover
 ## every target in one place since a project shell.nix that only covers a third of `make`'s targets
 ## invites exactly the "wait, why doesn't this build" confusion it exists to prevent. The tradeoff,
 ## stated plainly: this pulls in the full mingw-w64 cross toolchain even for someone who only ever
-## runs `make`/`make clap`/`make pi-touch` -- a real but one-time download/build-closure cost, not a
-## correctness problem, and simpler than maintaining several separate shell.nix entry points that
-## could silently drift out of sync with each other.
+## runs `make`/`make clap` -- a real but one-time download/build-closure cost, not a correctness
+## problem, and simpler than maintaining several separate shell.nix entry points that could
+## silently drift out of sync with each other.
 ## `pkgs` is pinned to a fixed nixpkgs-24.05 release tarball (URL + content hash below) rather
 ## than the unpinned `<nixpkgs>` this file used to use. Root-caused directly: two `nix-shell`
 ## entries against unpinned `<nixpkgs>` -- one on this build machine, one on a developer's own
@@ -28,7 +29,7 @@
 ## each machine's own `nix-channel` state happened to be), which cross-built liblo/wavpack/
 ## alsa-lib/glfw at different upstream VERSIONS with different SONAMEs (confirmed: one such
 ## mismatch produced a binary whose NEEDED entry was `liblo.so.3` while a separately-built
-## `arm64-libs/` bundle only shipped `liblo.so.7` -- two builds of the "same" cross target, from
+## `arm64-libs/` bundle only shipped `liblo.so.7` -- two builds of the "same" cross target from
 ## two unpinned nix-shell entries, silently incompatible with each other). A fixed nixpkgs
 ## revision makes `nix-shell` fully reproducible -- the exact same dependency versions (and
 ## SONAMEs) every time, on every machine -- which is what makes it safe to ever build
@@ -49,51 +50,13 @@ let
   # mingw-w64 package uses) -- so nothing in either of those files needs to change to work here.
   mingw = pkgs.pkgsCross.mingwW64;
   # pkgsCross.aarch64-multiplatform: a real aarch64-unknown-linux-gnu cross toolchain, for
-  # cross-building synth_engine/hds_pi_touch for a Raspberry Pi 5 (or any other aarch64 Linux
-  # host) from this x86_64 machine -- for the common case where the Pi itself runs plain Raspberry
-  # Pi OS, not NixOS, so `nix-shell` isn't available to build directly on the device. Unlike the
-  # Windows cross-build above (which needs tools/build_windows_deps.sh to cross-build liblo/
-  # wavpack from source, since mingw builds of them aren't in nixpkgs), every dependency this
-  # target needs -- alsa-lib, liblo, wavpack, glfw -- already exists as a real nixpkgs package for
-  # aarch64-linux: alsa-lib/liblo/wavpack/the cross gcc wrapper itself all come straight from
-  # cache.nixos.org (seconds, no local build). `make arm64` (the backend alone, no GLFW) is
-  # unaffected either way and builds in seconds.
+  # cross-building synth_engine (the backend engine only -- no GUI client for this target) for a
+  # Raspberry Pi 5 (or any other aarch64 Linux host) from this x86_64 machine -- for the common
+  # case where the Pi itself runs plain Raspberry Pi OS, not NixOS, so `nix-shell` isn't available
+  # to build directly on the device. Every dependency this target needs -- alsa-lib, liblo,
+  # wavpack -- already exists as a real nixpkgs package for aarch64-linux, straight from
+  # cache.nixos.org (seconds, no local build).
   aarch64 = pkgs.pkgsCross.aarch64-multiplatform;
-
-  # aarch64's plain `glfw` package unconditionally cross-builds Wayland support (nixpkgs'
-  # glfw/3.x.nix has no toggle for this -- it's ON by default on every non-Darwin Unix, per
-  # upstream GLFW's own CMakeLists.txt). Two real, confirmed problems with that, not
-  # hypothetical ones -- hit directly building `hds_pi_touch-arm64` for real:
-  #   1. nixpkgs' cross-splicing of `wayland-scanner` (a NativeBuildInput -- a tool that must run
-  #      on THIS build machine, x86_64, to generate C headers from Wayland's XML protocol specs
-  #      at build time) is broken for this target: it resolves to an aarch64-CROSS-BUILT
-  #      wayland-scanner instead of a native x86_64 one, which the build then tries to *execute*
-  #      on this x86_64 machine and fails outright with `cannot execute binary file: Exec format
-  #      error` -- a real nixpkgs packaging bug for this specific package/cross-target
-  #      combination, not a local misconfiguration.
-  #   2. Even before hitting that crash, cross-building Wayland's own dependency chain
-  #      (wayland-protocols, libxkbcommon, and what they pull in) triggered a genuine, multi-hour
-  #      from-source build (confirmed by directly watching it: openssl, curl, sqlite, then all of
-  #      LLVM 17.0.6) -- NOT because of `libGL` (nixpkgs' `libGL` is a lightweight `libglvnd`
-  #      dispatch stub, confirmed by reading its own derivation -- not full Mesa at all), but
-  #      because of the Wayland deps specifically.
-  # Fix: override glfw with `-DGLFW_BUILD_WAYLAND=OFF` (a real, independent upstream CMake option
-  # -- confirmed against GLFW 3.4's own src/CMakeLists.txt that every `wayland-scanner`
-  # invocation is gated behind `if (GLFW_BUILD_WAYLAND)`, so this fully skips the broken codegen
-  # step) and drop wayland/wayland-protocols/libxkbcommon/wayland-scanner from the derivation's
-  # own build inputs entirely, so Nix never even tries to build that chain. X11 support
-  # (`GLFW_BUILD_X11`, a separate, independent option) is untouched and stays on -- confirmed this
-  # rebuilds in under two minutes with zero LLVM/Mesa involvement, and Raspberry Pi OS's Wayland
-  # desktop (labwc, the Bookworm-and-later default) already runs X11-only apps transparently via
-  # XWayland, so this is a real, low-cost trade, not a functionality loss for the Pi's own touch
-  # display.
-  aarch64Glfw = aarch64.glfw.overrideAttrs (old: {
-    cmakeFlags = (old.cmakeFlags or [ ]) ++ [ "-DGLFW_BUILD_WAYLAND=OFF" ];
-    nativeBuildInputs = pkgs.lib.subtractLists [ aarch64.wayland-scanner ] (old.nativeBuildInputs or [ ]);
-    buildInputs = pkgs.lib.subtractLists
-      [ aarch64.wayland aarch64.wayland-protocols aarch64.libxkbcommon ]
-      (old.buildInputs or [ ]);
-  });
 in
 pkgs.mkShell {
   buildInputs = [
@@ -103,28 +66,9 @@ pkgs.mkShell {
     # rather than depending on stdenv's implicit defaults staying the way they are.
     pkgs.gcc
     pkgs.gnumake
-    pkgs.pkg-config       # only pi-touch's Makefile target actually invokes pkg-config (for
-                           # glfw3's cflags/libs) -- backend.c/clap_plugin.c link -lasound/-llo/
-                           # -lwavpack directly via hardcoded LDLIBS, no pkg-config lookup needed
-                           # for those, but nix's cc-wrapper still needs the matching dev packages
-                           # below on its search path either way.
     pkgs.alsa-lib          # backend.c's audio I/O (ALSA) -- headers + lib in one nixpkgs derivation
-    pkgs.liblo              # the OSC control protocol, both backend.c and pi_touch_frontend.cpp
+    pkgs.liblo              # the OSC control protocol (backend.c's embedded control surface)
     pkgs.wavpack             # Recording tab's WavPack format option
-
-    # --- Pi/touchscreen client (make pi-touch) -- see src/pi_touch_frontend.cpp's own header
-    # comment for what this target actually builds. Dear ImGui itself is vendored into
-    # third_party/imgui/ (not a nixpkgs dependency) -- only its own system deps are needed here.
-    pkgs.glfw               # nixpkgs attribute is `glfw`, but its pkg-config module is still
-                             # named `glfw3` (upstream's own naming, unchanged across distros) --
-                             # matches exactly what the Makefile's pi-touch target looks up.
-    pkgs.libGL               # -lGL at link time; GLVND dispatches to the real driver at runtime.
-                              # pkgs.wayland is deliberately NOT a dependency here -- GLFW's own
-                              # platform auto-detection is left to fall through from Wayland to
-                              # X11/GLX (via XWayland) on its own, matching a known-working
-                              # reference program's behavior; see PI_TOUCH_RPATH's own comment
-                              # below for the full story of why forcing Wayland to succeed was
-                              # actively counterproductive here.
 
     # --- Python frontend (python3 src/frontend.py) --- PySide6/python-osc's exact pinned
     # versions (see requirements.txt) aren't reliably both present/current in every nixpkgs
@@ -136,7 +80,7 @@ pkgs.mkShell {
     pkgs.python3Packages.pip
     pkgs.python3Packages.virtualenv
 
-    # --- Windows cross-build (make windows / make clap-windows) ---
+    # --- Windows CLAP cross-build (make clap-windows) ---
     mingw.stdenv.cc      # x86_64-w64-mingw32-gcc / -g++ / -ar / -windres
     pkgs.curl             # fetches the liblo/WavPack release tarballs
     pkgs.gnutar
@@ -148,82 +92,57 @@ pkgs.mkShell {
     # raw GitHub source snapshot instead; that path turned out to be a real rabbit hole of
     # mismatched-gettext-version autotools errors and was dropped in favor of the real tarball).
 
-    # --- Raspberry Pi 5 / aarch64 Linux cross-build (make arm64 / make pi-touch-arm64) ---
+    # --- Raspberry Pi 5 / aarch64 Linux cross-build (make arm64) ---
     # aarch64.stdenv.cc installs its binaries under the aarch64-unknown-linux-gnu- prefix (gcc,
     # g++, ar, ...), exactly like mingw.stdenv.cc above uses the x86_64-w64-mingw32- prefix -- no
     # bare `gcc`/`g++` names, so this can sit directly on PATH alongside the native and mingw
-    # toolchains with zero collision risk. The Makefile's ARM64_CC/ARM64_CXX reference these
-    # prefixed names directly (see its own comment), matching WIN_CC's exact convention.
+    # toolchains with zero collision risk. The Makefile's ARM64_CC references this prefixed name
+    # directly (see its own comment), matching WIN_CC's exact convention.
     aarch64.stdenv.cc
     aarch64.alsa-lib
     aarch64.liblo
     aarch64.wavpack
-    aarch64Glfw
-    aarch64.libGL
-    pkgs.patchelf   # rewrites the Nix store RPATH/interpreter the cross linker bakes into
-                     # arm64/pi-touch-arm64 -- those store paths don't exist on the Pi. The
-                     # Makefile's arm64/pi-touch-arm64 rules run `patchelf --set-rpath
-                     # '$ORIGIN/arm64-libs' --set-interpreter /lib/ld-linux-aarch64.so.1` on the
-                     # output as a final step (see the Makefile's own comment for the full story --
-                     # a wrong/missing interpreter is what actually stops the binary from starting
-                     # at all, not just a missing RPATH entry).
+    pkgs.patchelf   # rewrites the Nix store RPATH/interpreter the cross linker bakes into arm64 --
+                     # those store paths don't exist on the Pi. The Makefile's arm64 rule runs
+                     # `patchelf --set-rpath '$ORIGIN/arm64-libs' --set-interpreter
+                     # /lib/ld-linux-aarch64.so.1` on the output as a final step (see the
+                     # Makefile's own comment for the full story -- a wrong/missing interpreter is
+                     # what actually stops the binary from starting at all, not just a missing
+                     # RPATH entry).
   ];
 
   shellHook = ''
-    echo "HDS dev shell -- native Linux build, CLAP plugin, Pi-touch client, Python frontend,"
-    echo "and Windows cross-build toolchain all ready."
+    echo "HDS dev shell -- native Linux build, CLAP plugin, Python frontend, Raspberry Pi 5"
+    echo "backend cross-build, and Windows CLAP cross-build toolchain all ready."
     echo
     echo "  make            -> ./synth_engine"
     echo "  make clap       -> ./hds.clap"
-    echo "  make pi-touch   -> ./hds_pi_touch"
-    echo "  tools/build_windows_deps.sh  (once)  then  make windows / make clap-windows"
-    echo "  make arm64 / make pi-touch-arm64  -> synth_engine-arm64 / hds_pi_touch-arm64 (aarch64 Linux, e.g. Pi 5)"
+    echo "  tools/build_windows_deps.sh  (once)  then  make clap-windows"
+    echo "  make arm64      -> synth_engine-arm64 (aarch64 Linux backend, e.g. Raspberry Pi 5)"
     echo
-
-    # hds_pi_touch is built here but ALWAYS run outside nix-shell (this project's standing
-    # workflow) -- so any env var set in this shellHook (LD_LIBRARY_PATH included) never reaches
-    # the binary at all; that's not something an env var fix can paper over, which is why this is
-    # a link-time RPATH, not a runtime export. Root cause, found directly by comparing against a
-    # known-working reference GLFW/ImGui program with ZERO Wayland/EGL-specific code of any kind:
-    # GLFW's platform auto-detection (no GLFW_PLATFORM hint set, same as that reference) tries
-    # Wayland first, then falls through to X11 (via XWayland) if Wayland's own
-    # dlopen("libwayland-client") doesn't succeed -- X11's GLX path needs only a real driver on
-    # the library path (confirmed working directly: "GLX works with lots of outputs" once
-    # /run/opengl-driver/lib is reachable), NOT a GLVND EGL vendor ICD manifest at all. An earlier
-    # version of this file put libwayland-client on LD_LIBRARY_PATH/RPATH to fix its dlopen
-    # failure -- that was actively counterproductive: it let GLFW succeed at selecting the Wayland
-    # backend, which then hits EGL vendor-discovery failures nix-shell can't reliably fix for a
-    # binary that's always run outside it. Deliberately NOT fixing the Wayland dlopen lets GLFW
-    # fail that path cleanly and land on GLX instead, matching the known-working reference.
-    export PI_TOUCH_RPATH="-Wl,-rpath,/run/opengl-driver/lib -Wl,-rpath,${pkgs.libGL}/lib"
 
     # Cross-built aarch64 libraries live under content-addressed Nix store paths, not a fixed
     # relative directory like $(WIN_DEPS) -- export their include/lib paths here so the Makefile's
     # ARM64_CFLAGS/ARM64_LDFLAGS (referenced the same way WIN_CFLAGS/WIN_LDFLAGS already are) can
-    # find them. ARM64_CC/ARM64_CXX are NOT exported here -- aarch64.stdenv.cc's prefixed binary
-    # names (aarch64-unknown-linux-gnu-gcc/-g++) are already on PATH via buildInputs above, exactly
-    # like WIN_CC's x86_64-w64-mingw32-gcc, so the Makefile's own `?=` default covers it.
-    export ARM64_CFLAGS="-I${aarch64.alsa-lib.dev}/include -I${aarch64.liblo}/include -I${aarch64.wavpack.dev}/include -I${aarch64Glfw}/include"
-    export ARM64_LDFLAGS="-L${aarch64.alsa-lib}/lib -L${aarch64.liblo}/lib -L${aarch64.wavpack}/lib -L${aarch64Glfw}/lib -L${aarch64.libGL}/lib"
+    # find them. ARM64_CC is NOT exported here -- aarch64.stdenv.cc's prefixed binary name
+    # (aarch64-unknown-linux-gnu-gcc) is already on PATH via buildInputs above, exactly like
+    # WIN_CC's x86_64-w64-mingw32-gcc, so the Makefile's own `?=` default covers it.
+    export ARM64_CFLAGS="-I${aarch64.alsa-lib.dev}/include -I${aarch64.liblo}/include -I${aarch64.wavpack.dev}/include"
+    export ARM64_LDFLAGS="-L${aarch64.alsa-lib}/lib -L${aarch64.liblo}/lib -L${aarch64.wavpack}/lib"
 
     # liblo/wavpack are pure protocol/codec libraries -- no external config files, no hardware
     # coupling -- safe (and worth doing) to bundle straight alongside the output binary via a
-    # $ORIGIN-relative RPATH, so the Pi needs no `apt-get install` for these two. alsa-lib/libGL/
-    # glfw are deliberately NOT bundled, for two different reasons confirmed by direct inspection
-    # rather than assumed:
-    #   - alsa-lib is NOT just an ABI-compatible .so -- `strings` on this cross-built
-    #     libasound.so.2 shows its compiled-in default config directory is THIS BUILD MACHINE's
-    #     own /nix/store/...-alsa-lib-.../share/alsa path (where alsa.conf, card definitions, and
-    #     dmix/plug setups live). That directory won't exist on the Pi, and even if it did, it
-    #     would describe the WRONG hardware -- the Pi's own apt-installed alsa-lib is compiled
-    #     with the correct /usr/share/alsa path and is what actually knows how to talk to the
-    #     Pi's real sound chip. Bundling this one wouldn't just risk "missing files" the way
-    #     liblo/wavpack's absence would -- it risks the audio device silently behaving wrong.
-    #   - libGL must dispatch to whatever driver actually matches the Pi's real GPU/kernel DRM
-    #     setup, which a generically cross-built Mesa never can -- bundling it risks shipping the
-    #     wrong driver, not just an unnecessary one.
-    # See the Makefile's own comment and the README's apt-get instructions for what the Pi needs
-    # installed for these three instead.
+    # $ORIGIN-relative RPATH, so the Pi needs no `apt-get install` for these two. alsa-lib is
+    # deliberately NOT bundled -- it's not just an ABI-compatible .so: `strings` on this
+    # cross-built libasound.so.2 shows its compiled-in default config directory is THIS BUILD
+    # MACHINE's own /nix/store/...-alsa-lib-.../share/alsa path (where alsa.conf, card
+    # definitions, and dmix/plug setups live). That directory won't exist on the Pi, and even if
+    # it did, it would describe the WRONG hardware -- the Pi's own apt-installed alsa-lib is
+    # compiled with the correct /usr/share/alsa path and is what actually knows how to talk to the
+    # Pi's real sound chip. Bundling this one wouldn't just risk "missing files" the way
+    # liblo/wavpack's absence would -- it risks the audio device silently behaving wrong. See the
+    # Makefile's own comment and the README's apt-get instructions for what the Pi needs installed
+    # for alsa-lib instead.
     export ARM64_BUNDLE_LIBS="${aarch64.liblo}/lib/liblo.so.7 ${aarch64.wavpack}/lib/libwavpack.so.1"
 
     # Auto-provision a local venv for the PySide6 frontend, matching requirements.txt exactly --

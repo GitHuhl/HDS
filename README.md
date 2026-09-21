@@ -288,27 +288,6 @@ A digital synthesizer split into two processes:
   folder, that also cleanly clears `record_enable` on the wire rather than
   leaving the button checked against a backend that already gave up).
 
-  **`src/pi_touch_frontend.cpp`** is a second, much smaller controller for the same backend --
-  an ImGui + GLFW touch UI sized for a small square panel (720x720px, e.g. a 4" Raspberry Pi
-  touchscreen), talking real `liblo` OSC to the backend's actual `/hds/...` address space (not a
-  fictional protocol -- see the file's own header comment on the exploratory draft it replaced).
-  The ADSR page (Osc 1's Amp EG, Master Volume, Oscillator 1 waveform) is wired to real fields,
-  plus a live Peak/Tempo readback from `/hds/status/*` shown on every page. The **Program
-  Library** page reads and writes HDS's real `~/HDS_Programs/<name>/<name>.hdsprog` files (the
-  same format `frontend.py`'s own Save/Load uses, JSON-parsed via a vendored nlohmann/json) --
-  Load sends a saved file's entire field set straight to the backend (a real whole-patch load,
-  not just the handful of fields this page's own sliders show); Save captures this client's own
-  observed backend state (see `g_full_state`/`/hds/request_state` in the file) through a C++ port
-  of `frontend.py`'s own `_is_program_scope_address()` allowlist, so either app can load what the
-  other saved. Category is a real, open (not fixed-enum) metadata field on the file, extending the
-  schema `frontend.py`'s own Save dialog now also writes -- the Program Library's category tabs
-  are built from whatever's actually in use across saved files, not a hardcoded list. A loaded
-  file's colocated `.sfz` (Sample Bank content) is flagged, not applied -- this client has no
-  Mapping-tab equivalent. The Comb/Seq/Rec/Glob pages remain placeholder text. A Raspberry Pi 5
-  (or any other aarch64 Linux box) needs no cross-compile target -- it's just another native Linux
-  host for this same Makefile: install the same apt packages and run `make`/`make pi-touch`
-  directly on the Pi. See "Building the Pi/touchscreen client" under Build & run.
-
   The **Mapping** tab is the real Sample Bank zone editor for the DFD
   engine above: drag-and-drop a `.wav` file onto a reference piano
   keyboard to create a zone there (or use the "+ Add Sample" button as a
@@ -573,102 +552,48 @@ pip install -r requirements.txt
 python3 src/frontend.py # start the GUI -- talks to the engine over OSC (see below)
 ```
 
-On NixOS/Nix, `nix-shell` at the repo root provides every dependency above (plus GLFW/OpenGL for
-the Pi-touch client below and the Windows cross-toolchain) in one shell, and auto-provisions a
-`.venv/` for `requirements.txt` on entry -- see `shell.nix`'s own header comment for exactly what
-each target needs from it. **`nix-shell` is the only supported way to build every target in this
-repo, including plain `make`/`make clap`/`make pi-touch`** -- there is no "build outside nix-shell"
+On NixOS/Nix, `nix-shell` at the repo root provides every dependency above (plus the Windows
+CLAP cross-toolchain and the Raspberry Pi backend cross-toolchain) in one shell, and
+auto-provisions a `.venv/` for `requirements.txt` on entry -- see `shell.nix`'s own header comment
+for exactly what each target needs from it. **`nix-shell` is the only supported way to build every
+target in this repo, including plain `make`/`make clap`** -- there is no "build outside nix-shell"
 path, and none should ever be suggested again.
-
-**Three real, NixOS-specific `hds_pi_touch` gotchas, all confirmed directly on a real NixOS/Plasma-
-Wayland laptop and all fixed automatically by `shell.nix`'s own `shellHook` now (no manual steps
-needed -- just `nix-shell` normally, then `make pi-touch && ./hds_pi_touch`):**
-1. GLFW's Wayland backend is loaded via `dlopen("libwayland-client.so")` at *runtime*, not a
-   link-time dependency -- confirmed to fail outright ("Wayland: Failed to load
-   libwayland-client") purely because NixOS keeps every package's libraries in an isolated Nix
-   store path with no traditional `/usr/lib` a bare-filename `dlopen()` can search, even though
-   the library is right there on the very same Wayland desktop the app is running on. Fixed by
-   putting the real `wayland` package's own lib directory on `LD_LIBRARY_PATH`.
-2. A `nix-shell`-built `hds_pi_touch` can link against nixpkgs' own isolated `libglvnd`/Mesa
-   copies instead of the system's own properly-configured GPU driver (what plain `glxinfo`
-   reaches on the same machine), so GLX context creation (X11's own GL path) can fail outright
-   (GLX reports zero usable framebuffer configs). Fixed by putting NixOS's own published
-   real-driver location (`/run/opengl-driver/lib`) on `LD_LIBRARY_PATH` too, ahead of anything
-   else.
-3. Even with the real driver's library reachable, GLFW's Wayland backend uses EGL exclusively
-   (never GLX), and GLVND's EGL loader needs a *separate* discovery mechanism from GLX's --
-   it scans for vendor ICD JSON manifest files, not just a library path, so `LD_LIBRARY_PATH`
-   alone isn't enough for it: confirmed directly ("EGL: Failed to get EGL display: Success" --
-   `eglGetDisplay()` silently returning no display). Fixed by pointing GLVND's own
-   `__EGL_VENDOR_LIBRARY_DIRS` at NixOS's real manifest location
-   (`/run/opengl-driver/share/glvnd/egl_vendor.d`).
 
 ### Building for Windows
 
-Linux (with ALSA) is the primary, actively-developed platform. A Windows build of the backend
-also exists, using WASAPI (via the vendored [miniaudio](https://miniaudio.h) single-header
-library, `third_party/miniaudio.h`) for audio and WinMM for MIDI instead of ALSA -- see the
-"Windows audio/MIDI platform shim" comments near the top of `src/backend.c` for how that's kept
-completely isolated from the DSP/synth code, which is identical on both platforms. This is
-cross-compiled and link-verified in CI-like conditions, but has **not** been run on real Windows
-hardware yet -- treat it as a first real smoke test to confirm on an actual machine, same
-limitation as this project's other platform-specific work (real multichannel audio hardware,
-etc.).
+Linux (with ALSA) is the primary, actively-developed platform. Windows support is **CLAP-plugin
+only** -- there is no standalone Windows build of the backend/GUI. The CLAP plugin needs no
+platform audio/MIDI code of its own (the host supplies buffers/note-events instead), so
+cross-compiling it needs nothing beyond the mingw-w64 toolchain and liblo/wavpack.
 
 Cross-compiling from Linux (or WSL) needs the mingw-w64 toolchain:
 
 ```sh
 sudo apt-get install mingw-w64       # Debian/Ubuntu
 tools/build_windows_deps.sh          # one-time: cross-builds liblo + wavpack for Windows
-make windows                         # produces synth_engine.exe
+make clap-windows                    # produces hds-windows.clap
 ```
 
 `tools/build_windows_deps.sh` fetches liblo and WavPack's own source (the same portable C
 libraries used on Linux -- there's no Windows-specific fork of either) and cross-builds them as
 static libraries under `third_party/win64-deps/` (not committed -- see the script's own header
-comment). Audio and MIDI need nothing beyond mingw-w64 itself.
+comment). To install on Windows: drop the `.clap` file into
+`%COMMONPROGRAMFILES%\CLAP\` or `%LOCALAPPDATA%\Programs\Common\CLAP\`.
 
-To ship the GUI alongside it as a single double-clickable `.exe`, build `synth_engine.exe` first
-(above), then **on an actual Windows machine** (PyInstaller does not cross-compile):
-
-```sh
-pip install -r requirements.txt pyinstaller
-pyinstaller frontend.spec
-```
-
-This produces `dist/HDS.exe`, with `synth_engine.exe` bundled inside it; `frontend.py`'s own
-`_maybe_launch_bundled_backend()` detects it's running from a frozen bundle and launches the
-bundled engine automatically on startup (a no-op in every other run mode, including the normal
-`python3 src/frontend.py` this project is developed against).
-
-### Building the Pi/touchscreen client
-
-`src/pi_touch_frontend.cpp` (see its own description above) is an optional third build target,
-not part of plain `make`. Needs GLFW3 + OpenGL + liblo dev headers; Dear ImGui (pinned `v1.91.5`)
-and [nlohmann/json](https://github.com/nlohmann/json) (pinned `v3.11.3`, single-header, MIT
-licensed, used to read/write real `.hdsprog` files) are vendored into `third_party/` rather than
-assumed to be system packages, the same precedent as `third_party/miniaudio.h`/the CLAP SDK headers.
-
-```sh
-sudo apt-get install libglfw3-dev liblo-dev    # Debian/Ubuntu
-make pi-touch                                   # builds ./hds_pi_touch
-./synth_engine &
-./hds_pi_touch                                  # talks to the engine over the same OSC ports
-```
+### Building for Raspberry Pi
 
 **Raspberry Pi 5** (or any other aarch64 Linux machine) needs no cross-compile target if you're
 building directly on the device -- it's a native Linux host like any other for this exact
-Makefile: install the same four apt packages (add `libwavpack-dev` too if also building
-`synth_engine` on-device) and run the commands above directly on the Pi.
+Makefile: `sudo apt-get install libasound2-dev liblo-dev libwavpack-dev` then plain `make`.
 
 If the Pi itself runs plain Raspberry Pi OS rather than NixOS (the common case, and the reason
 this option exists at all), `nix-shell` won't be available there to build directly on the device.
-For that case, `make arm64`/`make pi-touch-arm64` cross-compile `synth_engine`/`hds_pi_touch` for
-aarch64 Linux from this x86_64 machine instead -- run from inside `nix-shell` at the repo root
-(see `shell.nix`'s own aarch64 section), then copy the resulting `synth_engine-arm64`/
-`hds_pi_touch-arm64` binary **and its `arm64-libs/` directory** over to the Pi (keep them in the
+For that case, `make arm64` cross-compiles `synth_engine` (the backend engine only -- no GUI
+client for this target) for aarch64 Linux from this x86_64 machine instead -- run from inside
+`nix-shell` at the repo root (see `shell.nix`'s own aarch64 section), then copy the resulting
+`synth_engine-arm64` binary **and its `arm64-libs/` directory** over to the Pi (keep them in the
 same relative layout -- see below for why). Every dependency this needs -- the cross compiler,
-alsa-lib, liblo, wavpack, glfw -- comes straight from `nixpkgs.pkgsCross.aarch64-multiplatform` as
+alsa-lib, liblo, wavpack -- comes straight from `nixpkgs.pkgsCross.aarch64-multiplatform` as
 a real, already-existing package for this target; unlike the Windows cross-build (which needs
 `tools/build_windows_deps.sh` to cross-build liblo/wavpack from source, since mingw builds of them
 aren't in nixpkgs), no separate deps-building script is needed here.
@@ -677,7 +602,7 @@ aren't in nixpkgs), no separate deps-building script is needed here.
 compiling successfully is not the same as the binary actually running once copied to the Pi;
 building `synth_engine-arm64` and copying it over hit exactly this in practice. Three separate
 issues, each confirmed by directly inspecting a real built binary's own ELF headers and library
-files rather than assumed, and each now fixed by the Makefile's `arm64`/`pi-touch-arm64` rules:
+files rather than assumed, and each now fixed by the Makefile's `arm64` rule:
 
 1. **The Nix cross linker bakes this build machine's own `/nix/store/...` paths into the output
    ELF** -- both as an RPATH (where to look for shared libraries) and, more consequentially, as
@@ -695,16 +620,13 @@ files rather than assumed, and each now fixed by the Makefile's `arm64`/`pi-touc
    do because they're pure protocol/codec libraries with no external config files or hardware
    coupling. This is why the binary and `arm64-libs/` need to travel together in the same relative
    layout.
-3. **alsa-lib/libGL/glfw are deliberately NOT bundled** -- confirmed to be a real, different kind
-   of risk, not just an unbundled convenience. `strings` on the cross-built `libasound.so.2` shows
-   its compiled-in default config directory is this build machine's own Nix store path (where
+3. **alsa-lib is deliberately NOT bundled** -- confirmed to be a real, different kind of risk, not
+   just an unbundled convenience. `strings` on the cross-built `libasound.so.2` shows its
+   compiled-in default config directory is this build machine's own Nix store path (where
    `alsa.conf`, card definitions, and dmix setups live) -- that directory won't exist on the Pi,
    and even if it did, it would describe the wrong sound hardware entirely; only the Pi's own
    apt-installed alsa-lib is built against its own real `/usr/share/alsa` and actually knows how
-   to talk to the Pi's real sound chip. libGL has the analogous problem for the GPU: it must
-   dispatch to whatever driver matches the Pi's real hardware and kernel DRM setup, which a
-   generically cross-built Mesa never can. On the Pi: `sudo apt-get install libasound2` for
-   `synth_engine-arm64` (add `libglfw3 libgl1-mesa-dri` for `hds_pi_touch-arm64`).
+   to talk to the Pi's real sound chip. On the Pi: `sudo apt-get install libasound2`.
 
 One more real caveat, not yet hit but worth stating plainly: this cross toolchain's glibc (2.39,
 from nixpkgs nixos-24.05) needs to be no newer than the Pi's own installed glibc, or the binary
@@ -742,53 +664,6 @@ process starts, `liblo.so.7`/`libwavpack.so.1` resolve correctly from the bundle
 comes up, and the only failure is the audio device open (`libasound.so.2` / a real sound card),
 which is the expected, documented, by-design gap this environment can't supply either (no real ALSA
 hardware in a sandbox, same as the Pi needs its own `apt-get install libasound2`).
-
-**`make pi-touch-arm64`** hit two real, confirmed problems the first time it was attempted, both
-now fixed and verified. `glfw`'s plain nixpkgs package unconditionally cross-builds Wayland
-support (no toggle for it upstream in nixpkgs' own `glfw/3.x.nix` -- it's on by default), which
-first triggered a genuine multi-hour from-source build (openssl, curl, sqlite, then all of LLVM
-17.0.6) and then, after all that time, crashed outright with `wayland-scanner: cannot execute
-binary file: Exec format error` -- nixpkgs' cross-splicing of `wayland-scanner` (a build-time tool
-that must run natively on the x86_64 build machine to generate C headers from Wayland's XML
-protocol specs) resolved to an aarch64-CROSS-BUILT `wayland-scanner` instead, which the build then
-tried to execute on x86_64 and failed. Root-caused directly (read GLFW 3.4's own upstream
-`src/CMakeLists.txt`: every `wayland-scanner` invocation is gated behind
-`if (GLFW_BUILD_WAYLAND)`, a real, independent CMake option, separate from `GLFW_BUILD_X11`) and
-fixed in `shell.nix`: `aarch64.glfw` is overridden with `-DGLFW_BUILD_WAYLAND=OFF` and has
-wayland/wayland-protocols/libxkbcommon/wayland-scanner dropped from its own build inputs entirely,
-so Nix never tries to build that chain at all. X11 support is untouched. This also revealed the
-LLVM build was never actually about `libGL` (confirmed by reading its own nixpkgs derivation:
-`libGL` is a lightweight `libglvnd` dispatch stub, not full Mesa) -- it was purely a Wayland-deps
-side effect, so removing them also eliminated the multi-hour cost, not just the crash: the fixed
-shell rebuilds `glfw` from a clean Nix store in well under two minutes.
-
-**Verified in this repo's own sandbox**: a real `nix-shell` (against the fixed, pinned
-`shell.nix`) produced both `synth_engine-arm64` and `hds_pi_touch-arm64` in one `make arm64
-pi-touch-arm64` run, confirmed via `readelf -d` to link against the expected libraries
-(`libglfw.so.3`, `liblo.so.7`, `libGL.so.1`, `libdl`/`libstdc++`/`libm`/`libgcc_s`/`libc`) with the
-same `$ORIGIN`-relative RPATH and standard interpreter as `make arm64`'s own verified build. Not
-run under `qemu-aarch64` the way `make arm64` was -- a full GLFW window-creation test needs a real
-X server (or XWayland under Raspberry Pi OS's Wayland desktop), which this sandbox doesn't have,
-same standing limitation as every other piece of real display/audio hardware this project's tests
-can't reach. `libglfw.so.3`/`libGL.so.1` are deliberately NOT bundled (same reasoning as
-`alsa-lib` above -- `libGL` must dispatch to the Pi's real GPU driver) -- install them on the Pi
-with `sudo apt-get install libglfw3 libgl1-mesa-dri`. GLFW's SONAME (`libglfw.so.3`) has been
-stable across the entire 3.x line for years, unlike liblo's history -- much lower version-drift
-risk even before the nixpkgs pin above.
-
-Verified in this repo's own sandbox (no real Pi/touchscreen hardware available here) via Xvfb and
-`xdotool`-driven real mouse/keyboard input against a synthetic fake-backend OSC peer: clean builds
-with zero warnings across `make`/`make clap`/`make pi-touch`; a captured real `/hds/request_state`
-datagram on the wire at startup; screenshots confirming the ADSR sliders/waveform combo update to
-match a synthetic reply and the Peak/Tempo readout flips "NO SIGNAL"->"LIVE" on a real
-`/hds/status/*` bundle; the Program Library's category tabs building themselves correctly from two
-real `.hdsprog` files with different categories; a real double-click Load sending a loaded file's
-entire field set over OSC (not just the fields this page's own sliders show) and the ADSR page
-updating to match; and a real Save round-trip whose written file correctly includes a Program-scope
-field the UI never displays while correctly excluding `master_volume`, an `/hds/audio/`-prefixed
-field, and a `/hds/combi/`-lane mirror -- proving the ported allowlist filter matches
-`frontend.py`'s own. Real hardware, touch input, and 4" panel readability are still the user's own
-confirmation to make, same limitation as this project's other platform-specific work.
 
 ### Control protocol: OSC
 
