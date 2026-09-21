@@ -59,16 +59,15 @@ A digital synthesizer split into two processes:
   buffer is (the real floor on output latency), Block Size is how many
   frames get rendered and handed to ALSA per main-loop iteration.
 
-  **Recording** (`Recording` tab) writes either 32-bit float WAV
+  **Recording** (`Recording` tab) writes 32-bit float WAV
   (`WavRecorder` in backend.c -- IEEE float format tag, so no int
-  conversion/dithering, and natively readable by any modern DAW/editor) or
-  WavPack (`WavPackRecorder`, an additional lossless format alongside WAV,
-  ~40-60% smaller; converted to 24-bit PCM before encoding since WavPack --
-  like FLAC -- losslessly compresses integer PCM, not float), picked via
-  the Output section's Format radio buttons. Both formats reuse the exact
-  same realtime-safe ring/writer-thread architecture -- only the writer
-  thread's start/write/stop calls branch on the format, so there's no
-  additional realtime-thread exposure. Two source kinds, freely
+  conversion/dithering, and natively readable by any modern DAW/editor).
+  A second, lossless WavPack format (`WavPackRecorder`, reusing the exact
+  same realtime-safe ring/writer-thread architecture, just branching the
+  writer thread's start/write/stop calls) exists in the code but is
+  currently disabled (`HDS_WAVPACK_ENABLED` in backend.c) -- the Format
+  radio button for it is greyed out in the GUI until this is revisited.
+  Two source kinds, freely
   combinable in one take: the Program's own final post-FX output (output
   pair 0 specifically -- see "Multi-source/multi-output audio routing"
   below; External Input pairs are their own independent sources and are
@@ -540,9 +539,10 @@ knobs a given effect actually uses instead of 8 generic "P1..P8" dials.
 
 ## Build & run
 
-Requires ALSA dev headers (`libasound2-dev` on Debian/Ubuntu), WavPack dev
-headers (`libwavpack-dev`, for the Recording tab's WavPack format option),
-and liblo dev headers (`liblo-dev`, the OSC control protocol -- see below).
+Requires ALSA dev headers (`libasound2-dev` on Debian/Ubuntu) and liblo dev
+headers (`liblo-dev`, the OSC control protocol -- see below). WavPack dev
+headers are NOT required -- WavPack recording support is currently disabled
+(see `HDS_WAVPACK_ENABLED` in `backend.c`).
 
 ```sh
 make                    # builds ./synth_engine
@@ -552,39 +552,22 @@ pip install -r requirements.txt
 python3 src/frontend.py # start the GUI -- talks to the engine over OSC (see below)
 ```
 
-On NixOS/Nix, `nix-shell` at the repo root provides every dependency above (plus the Windows
-CLAP cross-toolchain and the Raspberry Pi backend cross-toolchain) in one shell, and
-auto-provisions a `.venv/` for `requirements.txt` on entry -- see `shell.nix`'s own header comment
-for exactly what each target needs from it. **`nix-shell` is the only supported way to build every
-target in this repo, including plain `make`/`make clap`** -- there is no "build outside nix-shell"
-path, and none should ever be suggested again.
+On NixOS/Nix, `nix-shell` at the repo root provides every dependency above (plus the Raspberry Pi
+backend cross-toolchain) in one shell, and auto-provisions a `.venv/` for `requirements.txt` on
+entry -- see `shell.nix`'s own header comment for exactly what each target needs from it.
+**`nix-shell` is the only supported way to build every target in this repo, including plain
+`make`/`make clap`** -- there is no "build outside nix-shell" path, and none should ever be
+suggested again.
 
-### Building for Windows
-
-Linux (with ALSA) is the primary, actively-developed platform. Windows support is **CLAP-plugin
-only** -- there is no standalone Windows build of the backend/GUI. The CLAP plugin needs no
-platform audio/MIDI code of its own (the host supplies buffers/note-events instead), so
-cross-compiling it needs nothing beyond the mingw-w64 toolchain and liblo/wavpack.
-
-Cross-compiling from Linux (or WSL) needs the mingw-w64 toolchain:
-
-```sh
-sudo apt-get install mingw-w64       # Debian/Ubuntu
-tools/build_windows_deps.sh          # one-time: cross-builds liblo + wavpack for Windows
-make clap-windows                    # produces hds-windows.clap
-```
-
-`tools/build_windows_deps.sh` fetches liblo and WavPack's own source (the same portable C
-libraries used on Linux -- there's no Windows-specific fork of either) and cross-builds them as
-static libraries under `third_party/win64-deps/` (not committed -- see the script's own header
-comment). To install on Windows: drop the `.clap` file into
-`%COMMONPROGRAMFILES%\CLAP\` or `%LOCALAPPDATA%\Programs\Common\CLAP\`.
+Linux (with ALSA) is the only supported platform -- there is no Windows build of any kind
+(standalone or CLAP), and none is planned: this project will not maintain a second platform audio
+backend (WASAPI) alongside ALSA.
 
 ### Building for Raspberry Pi
 
 **Raspberry Pi 5** (or any other aarch64 Linux machine) needs no cross-compile target if you're
 building directly on the device -- it's a native Linux host like any other for this exact
-Makefile: `sudo apt-get install libasound2-dev liblo-dev libwavpack-dev` then plain `make`.
+Makefile: `sudo apt-get install libasound2-dev liblo-dev` then plain `make`.
 
 If the Pi itself runs plain Raspberry Pi OS rather than NixOS (the common case, and the reason
 this option exists at all), `nix-shell` won't be available there to build directly on the device.
@@ -593,10 +576,8 @@ client for this target) for aarch64 Linux from this x86_64 machine instead -- ru
 `nix-shell` at the repo root (see `shell.nix`'s own aarch64 section), then copy the resulting
 `synth_engine-arm64` binary **and its `arm64-libs/` directory** over to the Pi (keep them in the
 same relative layout -- see below for why). Every dependency this needs -- the cross compiler,
-alsa-lib, liblo, wavpack -- comes straight from `nixpkgs.pkgsCross.aarch64-multiplatform` as
-a real, already-existing package for this target; unlike the Windows cross-build (which needs
-`tools/build_windows_deps.sh` to cross-build liblo/wavpack from source, since mingw builds of them
-aren't in nixpkgs), no separate deps-building script is needed here.
+alsa-lib, liblo -- comes straight from `nixpkgs.pkgsCross.aarch64-multiplatform` as a real,
+already-existing package for this target.
 
 **Deploying the output binary -- three real, confirmed problems, not hypothetical ones.** Cross-
 compiling successfully is not the same as the binary actually running once copied to the Pi;
@@ -614,12 +595,11 @@ files rather than assumed, and each now fixed by the Makefile's `arm64` rule:
    show it's right there. Fixed: both rules run `patchelf --set-interpreter /lib/ld-linux-aarch64.so.1`
    (the standard path real aarch64 Debian/Raspberry Pi OS systems already have their own loader
    installed at) as a last build step.
-2. **liblo/wavpack aren't installed on a stock Pi.** These two are bundled directly: both rules
-   copy `liblo.so.7`/`libwavpack.so.1` into an `arm64-libs/` directory next to the binary and set
-   the RPATH to `$ORIGIN/arm64-libs` (relative to wherever the binary itself ends up) -- safe to
-   do because they're pure protocol/codec libraries with no external config files or hardware
-   coupling. This is why the binary and `arm64-libs/` need to travel together in the same relative
-   layout.
+2. **liblo isn't installed on a stock Pi.** It's bundled directly: the `arm64` rule copies
+   `liblo.so.7` into an `arm64-libs/` directory next to the binary and sets the RPATH to
+   `$ORIGIN/arm64-libs` (relative to wherever the binary itself ends up) -- safe to do because it's
+   a pure protocol library with no external config files or hardware coupling. This is why the
+   binary and `arm64-libs/` need to travel together in the same relative layout.
 3. **alsa-lib is deliberately NOT bundled** -- confirmed to be a real, different kind of risk, not
    just an unbundled convenience. `strings` on the cross-built `libasound.so.2` shows its
    compiled-in default config directory is this build machine's own Nix store path (where
@@ -651,19 +631,19 @@ won't run.
 
 **`make arm64`** (the backend alone) was verified fully end to end in this repo's own sandbox,
 including the full deployment fix above and the nixpkgs-pin fix: a real `nix-shell` (against the
-now-pinned `shell.nix`) with the cross toolchain + alsa-lib/liblo/wavpack (every one of which
-resolves straight from cache.nixos.org in seconds, no local build) produced a genuine
-`synth_engine-arm64` -- confirmed via `file` to be an ELF 64-bit ARM aarch64 executable correctly
-linked against the cross-built libraries, then confirmed via `readelf -d` and `strings` that after
-the `patchelf`/bundling step it carries a `$ORIGIN`-relative RPATH, a standard system interpreter
+now-pinned `shell.nix`) with the cross toolchain + alsa-lib/liblo (every one of which resolves
+straight from cache.nixos.org in seconds, no local build) produced a genuine `synth_engine-arm64`
+-- confirmed via `file` to be an ELF 64-bit ARM aarch64 executable correctly linked against the
+cross-built libraries, then confirmed via `readelf -d` and `strings` that after the
+`patchelf`/bundling step it carries a `$ORIGIN`-relative RPATH, a standard system interpreter
 path, and zero remaining `/nix/store` references anywhere in the binary. Verified one step further
 than ELF-header inspection this time: actually **executed** under `qemu-aarch64-static` (with only
 a real aarch64 glibc + loader supplied as the emulated "system," and the binary's own
 `arm64-libs/` sitting next to it exactly as a real deployment would have it, nothing else) -- the
-process starts, `liblo.so.7`/`libwavpack.so.1` resolve correctly from the bundle, the OSC listener
-comes up, and the only failure is the audio device open (`libasound.so.2` / a real sound card),
-which is the expected, documented, by-design gap this environment can't supply either (no real ALSA
-hardware in a sandbox, same as the Pi needs its own `apt-get install libasound2`).
+process starts, `liblo.so.7` resolves correctly from the bundle, the OSC listener comes up, and
+the only failure is the audio device open (`libasound.so.2` / a real sound card), which is the
+expected, documented, by-design gap this environment can't supply either (no real ALSA hardware in
+a sandbox, same as the Pi needs its own `apt-get install libasound2`).
 
 ### Control protocol: OSC
 

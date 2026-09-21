@@ -1,6 +1,5 @@
 synth_engine
 hds.clap
-hds-windows.clap
 synth_engine-arm64
 /arm64-libs/
 *.o
@@ -8,6 +7,3 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-# Cross-built Windows dependencies (liblo/wavpack) -- built from source by
-# tools/build_windows_deps.sh, not committed (see that script's own header comment for why).
-/third_party/win64-deps/

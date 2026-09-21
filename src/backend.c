@@ -37,7 +37,14 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
+// WavPack recording is disabled for now (commented out via this single guard, not deleted --
+// flip to 1, re-add -lwavpack to the Makefile's LDLIBS, and re-enable the frontend.py format
+// radio button to bring it back). See WavPackRecorder further down for the real implementation
+// this guards, kept intact behind #if HDS_WAVPACK_ENABLED rather than removed.
+#define HDS_WAVPACK_ENABLED 0
+#if HDS_WAVPACK_ENABLED
 #include <wavpack/wavpack.h>
+#endif
 #include <lo/lo.h>
 
 #define SAMPLE_RATE 48000
@@ -8795,7 +8802,13 @@ static void wav_recorder_stop(WavRecorder *rec) {
 // 24-bit (packed in int32_t) just before handing them to the encoder. Uses libwavpack's
 // callback-based block output (WavpackOpenFileOutput) rather than the RIFF-style
 // open-now/backpatch-on-stop approach WAV uses -- WavPack's own format has no equivalent
-// backpatch step, so the encoder is simply flushed and closed on stop. ---
+// backpatch step, so the encoder is simply flushed and closed on stop.
+//
+// DISABLED for now (HDS_WAVPACK_ENABLED, defined near the top of this file, is 0) -- kept intact
+// below rather than deleted so it can come back with a one-line flip. Below the real
+// implementation is a small stub with the identical signatures/struct shape, so every call site
+// (record_writer_drain, record_writer_thread_main) needs zero changes either way. ---
+#if HDS_WAVPACK_ENABLED
 typedef struct {
     WavpackContext *ctx;
     FILE *file;
@@ -8888,6 +8901,22 @@ static void wavpack_recorder_stop(WavPackRecorder *rec) {
     rec->active = false;
     fprintf(stderr, "[record] stopped (WavPack): %u frames (%.2fs), %d channel(s)\n", rec->frames_written, rec->frames_written / (float)SAMPLE_RATE, rec->channels);
 }
+#else // !HDS_WAVPACK_ENABLED -- stub with the same shape, never reached from the frontend since
+      // its format radio button is disabled, but wavpack_recorder_start() fails loudly (not
+      // silently) if ever reached directly via raw OSC.
+typedef struct {
+    int channels;
+    uint32_t frames_written;
+    bool active;
+} WavPackRecorder;
+static bool wavpack_recorder_start(WavPackRecorder *rec, const char *path, bool include_synth_output, bool downmix_stereo, const bool *input_channel_enable, int input_channel_count) {
+    (void)rec; (void)path; (void)include_synth_output; (void)downmix_stereo; (void)input_channel_enable; (void)input_channel_count;
+    fprintf(stderr, "[record] WavPack support is currently disabled (HDS_WAVPACK_ENABLED=0) -- recording not started\n");
+    return false;
+}
+static void wavpack_recorder_write(WavPackRecorder *rec, const float *interleaved, int num_frames) { (void)rec; (void)interleaved; (void)num_frames; }
+static void wavpack_recorder_stop(WavPackRecorder *rec) { (void)rec; }
+#endif
 
 // Audio-thread-side mirror of a WavRecorder's selection (NOT its file state -- the audio thread
 // never touches a FILE*). Set synchronously on the record-start edge from the same live knobs
