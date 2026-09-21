@@ -2233,7 +2233,15 @@ class ZoneInspectorPanel(QWidget):
 # behind each exclusion. One exception that isn't a plain prefix rule: /hds/fx_routing/%d/mode is
 # per-SOURCE (0=Program, 1-8=ext-in pairs) -- index 0 is genuinely patch content (the Program's
 # own FX Series/Parallel choice), the rest are rig-level.
-_PROGRAM_SCOPE_EXCLUDED_PREFIXES = ("/hds/device/", "/hds/record/", "/hds/routing/", "/hds/ext_in/", "/hds/audio/")
+_PROGRAM_SCOPE_EXCLUDED_PREFIXES = ("/hds/device/", "/hds/record/", "/hds/routing/", "/hds/ext_in/", "/hds/audio/",
+                                    # combi_lane_midi_channel/key_lo/key_hi/vel_lo/vel_hi (the
+                                    # only /hds/combi/ addresses transmit_knob_packet's own
+                                    # widget loop ever populates into _last_wire_state -- a
+                                    # lane's own ProgramState content, e.g. /hds/combi/0/vco1/
+                                    # shape, is sent separately by _apply_program_fields_to_
+                                    # combi_lane and never reaches _last_wire_state at all) are
+                                    # session-level Combi performance setup, not patch content.
+                                    "/hds/combi/")
 def _is_program_scope_address(addr):
     if addr == "/hds/performance_mode" or addr.startswith("/hds/seq/"):
         return False
@@ -3519,6 +3527,13 @@ class SynthGui(QWidget):
         # 1-16, filtering which Combi lane(s) a live incoming note dispatches to
         # (process_midi_input's Combi-mode branch in backend.c).
         self.combi_lane_midi_channel_combos = []  # COMBI_PROGRAM_COUNT x QComboBox
+        # Per-lane Key/Velocity zones: lets a lane act as a keyboard split ("only sound above
+        # C3") and/or a velocity switch ("only sound on hits above 100"), gating live note
+        # dispatch alongside the MIDI channel filter above (see dispatch_midi_event's Combi-mode
+        # branch in backend.c). Defaults (0-127 key, 1-127 velocity) are the full range,
+        # reproducing today's exact unconditional dispatch.
+        self.combi_lane_key_lo_spins, self.combi_lane_key_hi_spins = [], []
+        self.combi_lane_vel_lo_spins, self.combi_lane_vel_hi_spins = [], []
         combi_strips_widget = QWidget()
         combi_strips_lay = QHBoxLayout(combi_strips_widget)
         combi_strips_lay.setContentsMargins(0, 0, 0, 0); combi_strips_lay.setSpacing(3)
@@ -3545,6 +3560,56 @@ class SynthGui(QWidget):
             channel_combo.setToolTip("Which incoming MIDI channel plays this lane (Omni = every channel)")
             lane[0].layout().addWidget(channel_combo)
             self.combi_lane_midi_channel_combos.append(channel_combo)
+
+            def _make_zone_spin(lo, hi, default, width=32):
+                spin = QSpinBox()
+                spin.setRange(lo, hi)
+                spin.setValue(default)
+                spin.setFixedWidth(width)
+                spin.setStyleSheet("font-size: 9px;")
+                return spin
+
+            zone_box = QWidget()
+            zone_lay = QVBoxLayout(zone_box)
+            zone_lay.setContentsMargins(0, 0, 0, 0)
+            zone_lay.setSpacing(1)
+
+            key_row = QHBoxLayout(); key_row.setSpacing(1)
+            key_lo_spin = _make_zone_spin(0, 127, 0)
+            key_hi_spin = _make_zone_spin(0, 127, 127)
+            key_row.addWidget(QLabel("Key:"))
+            key_row.addWidget(key_lo_spin)
+            key_row.addWidget(QLabel("-"))
+            key_row.addWidget(key_hi_spin)
+            zone_lay.addLayout(key_row)
+
+            vel_row = QHBoxLayout(); vel_row.setSpacing(1)
+            vel_lo_spin = _make_zone_spin(1, 127, 1)
+            vel_hi_spin = _make_zone_spin(1, 127, 127)
+            vel_row.addWidget(QLabel("Vel:"))
+            vel_row.addWidget(vel_lo_spin)
+            vel_row.addWidget(QLabel("-"))
+            vel_row.addWidget(vel_hi_spin)
+            zone_lay.addLayout(vel_row)
+
+            zone_box.setToolTip(
+                "Keyboard split / velocity switch for this lane -- only notes inside BOTH ranges\n"
+                "trigger it (0=C-1, 60=Middle C/C4, 127=G9; velocity 1-127, harder hits = higher).\n"
+                "Defaults (0-127 / 1-127) are the full range -- every note reaches this lane."
+            )
+            # Keep lo <= hi always true (a widget that can silently disagree with itself is worse
+            # than just clamping) -- moving one bound past the other drags the other along with it.
+            key_lo_spin.valueChanged.connect(lambda v, hi=key_hi_spin: hi.setValue(v) if v > hi.value() else None)
+            key_hi_spin.valueChanged.connect(lambda v, lo=key_lo_spin: lo.setValue(v) if v < lo.value() else None)
+            vel_lo_spin.valueChanged.connect(lambda v, hi=vel_hi_spin: hi.setValue(v) if v > hi.value() else None)
+            vel_hi_spin.valueChanged.connect(lambda v, lo=vel_lo_spin: lo.setValue(v) if v < lo.value() else None)
+
+            lane[0].layout().addWidget(zone_box)
+            self.combi_lane_key_lo_spins.append(key_lo_spin)
+            self.combi_lane_key_hi_spins.append(key_hi_spin)
+            self.combi_lane_vel_lo_spins.append(vel_lo_spin)
+            self.combi_lane_vel_hi_spins.append(vel_hi_spin)
+
             combi_strips_lay.addWidget(lane[0])
             self.combi_lane_rows.append(lane)
         combi_strips_lay.addStretch()
@@ -6250,6 +6315,15 @@ class SynthGui(QWidget):
         for i, combo in enumerate(self.combi_lane_midi_channel_combos):
             add_f(f"/hds/combi/{i}/midi_channel", combo.currentIndex())
 
+        # Combi lanes' own Key/Velocity zones (keyboard split / velocity switch) -- see the
+        # spinboxes' own construction comment. Sent unconditionally, same convention as every
+        # other knob here.
+        for i in range(COMBI_PROGRAM_COUNT):
+            add_f(f"/hds/combi/{i}/key_lo", self.combi_lane_key_lo_spins[i].value())
+            add_f(f"/hds/combi/{i}/key_hi", self.combi_lane_key_hi_spins[i].value())
+            add_f(f"/hds/combi/{i}/vel_lo", self.combi_lane_vel_lo_spins[i].value())
+            add_f(f"/hds/combi/{i}/vel_hi", self.combi_lane_vel_hi_spins[i].value())
+
         # Sequencer transport -- edge-triggered counters, same idiom as each audio lane's own
         # Preview trigger (see poll_transport_triggers in backend.c).
         add_f("/hds/seq/transport/play", self.seq_transport_play_trigger)
@@ -6670,6 +6744,16 @@ def runtime_connect_and_bind(gui):
             mode_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
     for channel_combo in gui.seq_lane_midi_channel_combos:
         channel_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+    # Combi lanes' own MIDI channel selector was never wired to transmit_knob_packet -- a
+    # pre-existing gap (only seq_lane_midi_channel_combos, above, was) that would otherwise leave
+    # a changed channel silently unsent until some other control happened to transmit. Fixed here
+    # alongside the closely-related Key/Velocity zone spinboxes below, for the same reason.
+    for channel_combo in gui.combi_lane_midi_channel_combos:
+        channel_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+    for spin_list in (gui.combi_lane_key_lo_spins, gui.combi_lane_key_hi_spins,
+                      gui.combi_lane_vel_lo_spins, gui.combi_lane_vel_hi_spins):
+        for spin in spin_list:
+            spin.valueChanged.connect(gui.transmit_knob_packet)
     for mute_btn, rec_btn, overdub_combo in zip(gui.seq_lane_mute_buttons, gui.seq_lane_rec_buttons, gui.seq_lane_overdub_combos):
         mute_btn.toggled.connect(gui.transmit_knob_packet)
         rec_btn.toggled.connect(gui.transmit_knob_packet)

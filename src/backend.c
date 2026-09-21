@@ -961,6 +961,22 @@ typedef struct {
     // itself.
     float combi_lane_midi_channel[COMBI_PROGRAM_COUNT];
 
+    // Combi mode: per-lane key range (MIDI note 0-127, inclusive) and velocity range (1-127,
+    // inclusive) -- lets a lane act as a keyboard split ("only sound above C3") and/or a
+    // velocity switch ("only sound on hits above 100"), same session-level, not-part-of-any-
+    // Program placement as combi_lane_midi_channel just above (a keyboard split is a property of
+    // this particular Combi setup, not of the patch itself). Defaults (0-127 / 1-127, the full
+    // range) reproduce today's exact "every note/velocity reaches every channel-matched lane"
+    // behavior -- see dispatch_midi_event's Combi-mode branch, the only place these are read.
+    // Velocity range gates note-ON only, deliberately never note-OFF (a note-off's own "velocity"
+    // is release velocity, an unrelated value -- gating release by it would risk a stuck note);
+    // key range gates both note-on and note-off identically, since a note's pitch never changes
+    // between its own on/off pair.
+    float combi_lane_key_lo[COMBI_PROGRAM_COUNT];
+    float combi_lane_key_hi[COMBI_PROGRAM_COUNT];
+    float combi_lane_vel_lo[COMBI_PROGRAM_COUNT];
+    float combi_lane_vel_hi[COMBI_PROGRAM_COUNT];
+
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
     // it last opened each stream with, and closes/reopens that stream on a live change via
@@ -3900,6 +3916,10 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/seq/transport/metronome", metronome_enable),
 
     OSC_ARRAY("/hds/combi/%d/midi_channel", combi_lane_midi_channel, COMBI_PROGRAM_COUNT),
+    OSC_ARRAY("/hds/combi/%d/key_lo", combi_lane_key_lo, COMBI_PROGRAM_COUNT),
+    OSC_ARRAY("/hds/combi/%d/key_hi", combi_lane_key_hi, COMBI_PROGRAM_COUNT),
+    OSC_ARRAY("/hds/combi/%d/vel_lo", combi_lane_vel_lo, COMBI_PROGRAM_COUNT),
+    OSC_ARRAY("/hds/combi/%d/vel_hi", combi_lane_vel_hi, COMBI_PROGRAM_COUNT),
 
     OSC_STRING("/hds/device/output", output_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/input", input_device, AUDIO_DEVICE_NAME_LEN),
@@ -4237,7 +4257,11 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->seq_transport_seek_back_trigger = 0.0f;
     knobs->seq_transport_seek_fwd_trigger = 0.0f;
     knobs->metronome_enable = 0.0f;
-    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) knobs->combi_lane_midi_channel[p] = 0.0f; // Omni
+    for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+        knobs->combi_lane_midi_channel[p] = 0.0f; // Omni
+        knobs->combi_lane_key_lo[p] = 0.0f; knobs->combi_lane_key_hi[p] = 127.0f; // full range
+        knobs->combi_lane_vel_lo[p] = 1.0f; knobs->combi_lane_vel_hi[p] = 127.0f; // full range
+    }
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
@@ -6874,6 +6898,13 @@ static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, Hds
             for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
                 float lane_channel = knobs->combi_lane_midi_channel[p];
                 if (lane_channel != 0.0f && (int)lane_channel != midi_channel_1_16) continue;
+                // Key range gates both note-on and note-off identically (a note's pitch is the
+                // same for its own on/off pair). Velocity range gates note-on ONLY -- see
+                // combi_lane_vel_lo/hi's own comment for why note-off must never be gated by it
+                // (a note-off's "velocity" is release velocity, an unrelated value; gating by it
+                // would risk a stuck note for a lane this note-on legitimately sounded on).
+                if (note < (int)knobs->combi_lane_key_lo[p] || note > (int)knobs->combi_lane_key_hi[p]) continue;
+                if (is_note_on && (value < (int)knobs->combi_lane_vel_lo[p] || value > (int)knobs->combi_lane_vel_hi[p])) continue;
                 const ProgramState *lane_prog = &knobs->programs[p];
                 if (lane_prog->arp_enabled != 0.0f) {
                     // Arp engaged for this lane: feed the held-note list, don't trigger a voice
