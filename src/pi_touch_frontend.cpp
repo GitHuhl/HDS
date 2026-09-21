@@ -656,6 +656,18 @@ int main() {
     if (!glfwInit()) { fprintf(stderr, "[glfw] glfwInit() failed -- see the error above.\n"); return -1; }
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+    // BUG FIX: "GLX: No GLXFBConfigs returned" / "GLX: Failed to find a suitable GLXFBConfig" --
+    // hit for real on a working AMD/amdgpu system (glxinfo confirmed GLX itself works fine) once
+    // forced onto X11/XWayland. GLFW's own defaults request an 8-bit alpha channel plus a 24-bit
+    // depth + 8-bit stencil buffer in the chosen framebuffer config; XWayland's GLX implementation
+    // is well known (a frequently-reported GLFW/XWayland issue, not specific to this machine) for
+    // only exposing FBConfigs WITHOUT some of those on certain driver/compositor combinations --
+    // zero matching configs means glXChooseFBConfig legitimately returns nothing. None of this is
+    // actually needed here: this is a plain 2D ImGui UI (scissor-clipped, no depth testing, no
+    // transparency), so ask for none of it rather than requiring it.
+    glfwWindowHint(GLFW_ALPHA_BITS, 0);
+    glfwWindowHint(GLFW_DEPTH_BITS, 0);
+    glfwWindowHint(GLFW_STENCIL_BITS, 0);
 
     GLFWwindow* window = glfwCreateWindow(720, 720, "HDS Touch Console", NULL, NULL);
     if (!window) { fprintf(stderr, "[glfw] glfwCreateWindow() failed -- see the error above.\n"); glfwTerminate(); return -1; }
