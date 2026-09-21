@@ -119,17 +119,27 @@ pkgs.mkShell {
                              # named `glfw3` (upstream's own naming, unchanged across distros) --
                              # matches exactly what the Makefile's pi-touch target looks up.
     pkgs.libGL               # -lGL at link time; GLVND dispatches to the real driver at runtime.
-                              # NOTE: confirmed directly on a real NixOS machine (not just a
-                              # non-NixOS host) -- a nix-shell-built hds_pi_touch can link against
-                              # nixpkgs' own isolated libglvnd/Mesa instead of the system's real,
-                              # properly-configured GPU driver, so `./hds_pi_touch` fails to create
-                              # a GL context (GLX reports zero usable framebuffer configs) even
-                              # though the same system's driver stack works fine for every other GL
-                              # app. Nix-shell is the only supported way to build/run this project's
-                              # targets -- the fix stays inside it: prefix LD_LIBRARY_PATH with
-                              # NixOS's own published real-driver location before running, e.g.
-                              # `nix-shell --run 'LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH" ./hds_pi_touch'`
-                              # -- see README.md's Pi-touch build section for the full explanation.
+    pkgs.wayland             # NOT linked into hds_pi_touch at all (no DT_NEEDED entry) -- GLFW's
+                              # own Wayland backend is loaded via dlopen("libwayland-client.so") at
+                              # RUNTIME, by design, so ONE glfw build can support multiple backends.
+                              # Confirmed directly on a real NixOS/Plasma-Wayland machine: that
+                              # dlopen() call fails ("Wayland: Failed to load libwayland-client")
+                              # purely because NixOS keeps every package's libraries in an isolated
+                              # Nix store path -- there is no traditional "/usr/lib" a bare-filename
+                              # dlopen() can just find things in, so the library needs to be
+                              # explicitly put on LD_LIBRARY_PATH (see the shellHook below) even
+                              # though it's already present on the very same Wayland desktop the
+                              # app is running on. Nix-shell is the only supported way to build/run
+                              # this project's targets -- this is fixed inside it, not by leaving it.
+
+                              # NOTE, separately: also confirmed directly on the same NixOS machine
+                              # -- a nix-shell-built hds_pi_touch can link against nixpkgs' own
+                              # isolated libglvnd/Mesa instead of the system's real, properly-
+                              # configured GPU driver, so GL context creation can fail outright (GLX
+                              # reports zero usable framebuffer configs) even though the same
+                              # system's driver stack works fine for every other GL app. Also fixed
+                              # via LD_LIBRARY_PATH below (NixOS's own published real-driver
+                              # location, /run/opengl-driver/lib) rather than leaving nix-shell.
 
     # --- Python frontend (python3 src/frontend.py) --- PySide6/python-osc's exact pinned
     # versions (see requirements.txt) aren't reliably both present/current in every nixpkgs
@@ -184,6 +194,19 @@ pkgs.mkShell {
     echo "  tools/build_windows_deps.sh  (once)  then  make windows / make clap-windows"
     echo "  make arm64 / make pi-touch-arm64  -> synth_engine-arm64 / hds_pi_touch-arm64 (aarch64 Linux, e.g. Pi 5)"
     echo
+
+    # hds_pi_touch (native, this machine's own architecture -- NOT the aarch64 cross-build below)
+    # needs two libraries findable by bare-filename dlopen() at RUNTIME, neither of which shows up
+    # as a link-time NEEDED dependency: GLFW's own Wayland backend (libwayland-client.so, see
+    # pkgs.wayland's own comment above) and, separately, a real GLX/EGL driver vendor library for
+    # GL context creation (nixpkgs' own isolated libglvnd/Mesa can fail to find the system's real
+    # one). Both are fixed the same way: put the real library directory on LD_LIBRARY_PATH ahead of
+    # anything else, every time this shell is entered, so `make pi-touch && ./hds_pi_touch` just
+    # works with no manual per-invocation environment juggling ever needed again.
+    # `/run/opengl-driver/lib` is NixOS's own published real-driver location (harmless to prepend
+    # even when it doesn't exist, e.g. on a non-NixOS host running this same shell.nix -- an absent
+    # directory on LD_LIBRARY_PATH is silently skipped by the dynamic loader, not an error).
+    export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.wayland}/lib:$LD_LIBRARY_PATH"
 
     # Cross-built aarch64 libraries live under content-addressed Nix store paths, not a fixed
     # relative directory like $(WIN_DEPS) -- export their include/lib paths here so the Makefile's

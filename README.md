@@ -580,17 +580,23 @@ each target needs from it. **`nix-shell` is the only supported way to build ever
 repo, including plain `make`/`make clap`/`make pi-touch`** -- there is no "build outside nix-shell"
 path, and none should ever be suggested again.
 
-**A real, NixOS-specific `hds_pi_touch` gotcha, confirmed directly (`ldd ./hds_pi_touch` on a
-NixOS laptop) and fixed while staying inside `nix-shell`, not by leaving it:** a `nix-shell`-built
-`hds_pi_touch` links against nixpkgs' own isolated `libglvnd`/Mesa copies from the Nix store, not
-the system's own properly-configured GPU driver (what plain `glxinfo` reaches on the same
-machine), so GL context creation can fail outright (GLX reports zero usable framebuffer configs)
-even though the system's own driver stack works fine for every other GL application. Fix: point
-`LD_LIBRARY_PATH` at NixOS's own published driver location (`/run/opengl-driver/lib`) BEFORE the
-`nix-shell`-provided libraries, still fully inside `nix-shell` --
-```sh
-nix-shell --run 'LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH" make pi-touch && LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH" ./hds_pi_touch'
-```
+**Two real, NixOS-specific `hds_pi_touch` gotchas, both confirmed directly on a real NixOS/Plasma-
+Wayland laptop and both fixed automatically by `shell.nix`'s own `shellHook` now (no manual steps
+needed -- just `nix-shell` normally, then `make pi-touch && ./hds_pi_touch`):**
+1. GLFW's Wayland backend is loaded via `dlopen("libwayland-client.so")` at *runtime*, not a
+   link-time dependency -- confirmed to fail outright ("Wayland: Failed to load
+   libwayland-client") purely because NixOS keeps every package's libraries in an isolated Nix
+   store path with no traditional `/usr/lib` a bare-filename `dlopen()` can search, even though
+   the library is right there on the very same Wayland desktop the app is running on.
+2. A `nix-shell`-built `hds_pi_touch` can link against nixpkgs' own isolated `libglvnd`/Mesa
+   copies instead of the system's own properly-configured GPU driver (what plain `glxinfo`
+   reaches on the same machine), so GL context creation can fail outright (GLX reports zero
+   usable framebuffer configs) even though the system's own driver stack works fine for every
+   other GL application.
+
+Both are fixed the same way -- `shell.nix`'s `shellHook` now puts NixOS's own published real
+driver location (`/run/opengl-driver/lib`) and the real `wayland` package's own lib directory on
+`LD_LIBRARY_PATH`, ahead of anything else, on every `nix-shell` entry.
 
 ### Building for Windows
 
