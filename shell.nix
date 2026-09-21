@@ -119,13 +119,17 @@ pkgs.mkShell {
                              # named `glfw3` (upstream's own naming, unchanged across distros) --
                              # matches exactly what the Makefile's pi-touch target looks up.
     pkgs.libGL               # -lGL at link time; GLVND dispatches to the real driver at runtime.
-                              # NOTE: on a non-NixOS host (this project's usual dev machine target
-                              # per README), OpenGL apps built inside nix-shell sometimes can't find
-                              # the system's real GPU driver through nixpkgs' own libGL stub -- if
-                              # `./hds_pi_touch` fails to create a GL context from inside this shell
-                              # but runs fine built outside it, wrap it with `nixGL` (a small,
-                              # well-known community tool for exactly this non-NixOS-OpenGL
-                              # mismatch) rather than fighting nixpkgs' Mesa packaging directly.
+                              # NOTE: confirmed directly on a real NixOS machine (not just a
+                              # non-NixOS host) -- a nix-shell-built hds_pi_touch can link against
+                              # nixpkgs' own isolated libglvnd/Mesa instead of the system's real,
+                              # properly-configured GPU driver, so `./hds_pi_touch` fails to create
+                              # a GL context (GLX reports zero usable framebuffer configs) even
+                              # though the same system's driver stack works fine for every other GL
+                              # app. Nix-shell is the only supported way to build/run this project's
+                              # targets -- the fix stays inside it: prefix LD_LIBRARY_PATH with
+                              # NixOS's own published real-driver location before running, e.g.
+                              # `nix-shell --run 'LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH" ./hds_pi_touch'`
+                              # -- see README.md's Pi-touch build section for the full explanation.
 
     # --- Python frontend (python3 src/frontend.py) --- PySide6/python-osc's exact pinned
     # versions (see requirements.txt) aren't reliably both present/current in every nixpkgs

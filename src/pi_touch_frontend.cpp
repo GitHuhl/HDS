@@ -641,8 +641,10 @@ int main() {
     // was ever the actual problem. The real cause: a `nix-shell`-built hds_pi_touch links against
     // nixpkgs' own isolated libglvnd/Mesa (confirmed via `ldd`: /nix/store/...-libglvnd-.../
     // libGLX.so.0, not the system's own properly-configured driver `glxinfo` reaches outside any
-    // shell) -- a library-resolution problem, not a GLFW window-hint problem. See README.md's Pi-
-    // touch build section for the actual fix (build outside `nix-shell`, or wrap with `nixGL`).
+    // shell) -- a library-resolution problem, not a GLFW window-hint problem. `nix-shell` is the
+    // only supported way to build/run this project's targets (never "build it outside nix-shell
+    // instead") -- see README.md's Pi-touch build section for the real, still-inside-nix-shell fix
+    // (LD_LIBRARY_PATH=/run/opengl-driver/lib, NixOS's own published real-driver location).
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) { fprintf(stderr, "[glfw] glfwInit() failed -- see the error above.\n"); return -1; }
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
