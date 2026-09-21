@@ -670,6 +670,31 @@ MSP, Pure Data, `python-osc`, `liblo` itself) can act as a controller --
 `src/frontend.py` is one such controller (via `python-osc`), but nothing
 about the protocol is specific to it.
 
+#### Running the frontend and backend on separate machines
+
+Both sides support this today -- the backend's OSC listener already binds
+to all network interfaces (not just loopback), and `frontend.py`'s own
+status-reply listener does too, so nothing in either program is
+loopback-only. To run them on two different machines:
+
+1. On the backend machine, start `synth_engine` (or `synth_engine-arm64`)
+   with `--osc-reply-host <frontend-machine-IP>`, pointing status replies
+   back at the machine that will run the GUI.
+2. On the frontend machine, run `python3 src/frontend.py --osc-host
+   <backend-machine-IP>`, pointing outgoing knob/zone traffic at the
+   backend machine.
+
+`--osc-listen-port`/`--osc-reply-port` (on the backend) and
+`--osc-listen-port`/`--osc-reply-port` (on `frontend.py`, same flag names,
+controlling the same two ports from the opposite end of the wire) only
+need to change from their defaults if you're running more than one
+backend/frontend pair that would otherwise collide on the same machine or
+network.
+
+Only run this across machines/networks you trust -- like the rest of this
+protocol (see the liveness note below), OSC here has no authentication,
+so anything that can reach the listening port can send it commands.
+
 Since UDP has no connect-time liveness signal, a controller can't tell
 "backend not running" from "backend running but I haven't heard from it
 yet" just from sending -- `frontend.py` infers this from whether a status

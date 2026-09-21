@@ -525,11 +525,27 @@ def _round_robin_group_color(group):
 # OSC control protocol endpoints -- must match whichever backend this frontend is pointed at:
 # the standalone app's --osc-listen-port/--osc-reply-port defaults (9000/9001), or a CLAP
 # plugin instance's own embedded OSC server (9010/9011 by default -- see clap_plugin.c). These
-# two module-level names are the actual, live values used everywhere below (connect_to_backend(),
-# etc.); the CLI flags parsed in __main__ (--osc-listen-port/--osc-reply-port, matching the
-# backend's own flag names exactly) override them before SynthGui() is constructed, i.e. before
-# connect_to_backend() ever reads them.
+# module-level names are the actual, live values used everywhere below (connect_to_backend(),
+# etc.); the CLI flags parsed in __main__ (--osc-host/--osc-listen-port/--osc-reply-port, the
+# latter two matching the backend's own flag names exactly) override them before SynthGui() is
+# constructed, i.e. before connect_to_backend() ever reads them.
+#
+# OSC_HOST is where the BACKEND lives -- defaults to localhost (the historical, still-most-common
+# case), but is NOT the only supported value: the backend's own OSC listener already binds to all
+# interfaces (lo_server_new_with_proto() with no host given -- confirmed directly against
+# backend.c), so pointing OSC_HOST at a real LAN address via --osc-host and starting the backend
+# with a matching --osc-reply-host (its own existing flag, pointed back at THIS machine) is a
+# fully supported way to run the two on separate machines, not a hack.
 OSC_HOST = "127.0.0.1"
+# OSC_BIND_HOST is where THIS frontend's own status-reply listener binds -- deliberately always
+# "0.0.0.0" (every interface), not OSC_HOST, and not independently configurable: binding to
+# 127.0.0.1 only accepts loopback traffic, which would silently discard every /hds/status/* reply
+# from a backend running on a different machine even after OSC_HOST above is pointed at it. This
+# was the second (and, until fixed, undiscovered) half of what made cross-machine operation not
+# actually work -- OSC_HOST alone being configurable wasn't enough. "0.0.0.0" is strictly more
+# permissive than "127.0.0.1" and behaves identically for the local-only case too, so there's no
+# real reason to ever want the narrower binding -- no flag needed for it.
+OSC_BIND_HOST = "0.0.0.0"
 OSC_SEND_PORT = 9000  # backend's --osc-listen-port: every knob + Sample Bank catalog goes here
 OSC_RECV_PORT = 9001  # backend's --osc-reply-port: /hds/status/* feedback arrives here
 # How long without a status bundle before the GUI considers the backend gone (a few missed
@@ -2204,8 +2220,9 @@ class SynthGui(QWidget):
         # OSC control protocol (see backend.c's OSC_PARAMS[]/the "Control protocol: OSC" section
         # of README.md): one UDP client sends every knob + the Sample Bank catalog to the
         # backend's --osc-listen-port (default 9000); one plain non-blocking UDP socket receives
-        # /hds/status/* feedback on --osc-reply-port (default 9001). Both ends are on localhost --
-        # see OSC_HOST/OSC_SEND_PORT/OSC_RECV_PORT below the imports for where to change that.
+        # /hds/status/* feedback on --osc-reply-port (default 9001). Defaults to localhost, but
+        # this frontend and the backend can run on separate machines -- see
+        # OSC_HOST/OSC_BIND_HOST/OSC_SEND_PORT/OSC_RECV_PORT below the imports for how.
         self.osc_client = None
         self.status_sock = None
         self.mock_mode = True  # connect_to_backend() below owns the real initial value
@@ -5767,12 +5784,12 @@ class SynthGui(QWidget):
         self.status_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.status_sock.setblocking(False)
         try:
-            self.status_sock.bind((OSC_HOST, OSC_RECV_PORT))
+            self.status_sock.bind((OSC_BIND_HOST, OSC_RECV_PORT))
         except OSError as e:
             print(f"--- could not bind OSC status port {OSC_RECV_PORT}: {e} ---")
             self.status_sock = None
         self.mock_mode = True  # flips to False the first time a real status bundle arrives
-        print(f"OSC client -> {OSC_HOST}:{OSC_SEND_PORT}, status listener on {OSC_RECV_PORT}")
+        print(f"OSC client -> {OSC_HOST}:{OSC_SEND_PORT}, status listener on {OSC_BIND_HOST}:{OSC_RECV_PORT}")
 
     # Status feedback: 7 /hds/status/* messages (peak, is_recording, elapsed_seconds,
     # record_error, detected_input_channels, detected_output_channels, tempo_bpm_live) sent as
@@ -5894,17 +5911,43 @@ class SynthGui(QWidget):
         self.arp_velocity_readout.setText("As Played" if arp_vel == 0 else str(arp_vel))
         self.arp_gate_readout.setText(f"{self.arp_gate_dial.value()}%")
 
+        # BUG FIX: this used to unconditionally build and queue a message for every single
+        # address below (~700+ of them) on EVERY call -- and this function is called on every
+        # single widget change, including every intermediate value a knob/dial emits while being
+        # dragged (dozens of times a second). A UDP packet that size, that often, sent
+        # synchronously from the same widget-drag event loop, is exactly the kind of load that
+        # can visibly compete with the backend's own per-block OSC drain for real-time budget --
+        # more prone to show up as an audible glitch on whichever feature happens to be most
+        # timing-sensitive at that moment (the arpeggiator, reported directly). It also silently
+        # blocked ever running the frontend and backend on separate machines: flooding a real
+        # network link (not loopback) with a full ~700-field resend on every mouse-move of a
+        # knob drag is a real, not theoretical, problem the moment this stops being localhost.
+        # Fixed at the root: only add a message for an address whose value actually changed since
+        # the last transmit (self._last_wire_state already tracks exactly that, see __init__'s own
+        # comment on it) -- a knob drag now sends a bundle containing just the one changed field,
+        # not the entire control surface, every single time. First call after startup (or after a
+        # fresh connect/Program load) still sends everything, since _last_wire_state starts empty
+        # -- a genuine one-time full sync, not a regression.
         bundle = OscBundleBuilder(IMMEDIATELY)
+        bundle_has_content = [False]  # list, not bool: mutable from the nested closures below
         def add_f(address, value):
+            value = float(value)
+            if self._last_wire_state.get(address) == value:
+                return
             msg = OscMessageBuilder(address=address)
-            msg.add_arg(float(value), "f")
+            msg.add_arg(value, "f")
             bundle.add_content(msg.build())
-            self._last_wire_state[address] = float(value)  # see __init__'s own comment on this dict
+            bundle_has_content[0] = True
+            self._last_wire_state[address] = value  # see __init__'s own comment on this dict
         def add_s(address, value):
+            value = str(value)
+            if self._last_wire_state.get(address) == value:
+                return
             msg = OscMessageBuilder(address=address)
-            msg.add_arg(str(value), "s")
+            msg.add_arg(value, "s")
             bundle.add_content(msg.build())
-            self._last_wire_state[address] = str(value)
+            bundle_has_content[0] = True
+            self._last_wire_state[address] = value
 
         vassign = 1.0 if self.poly_radio.isChecked() else 0.0
         v1_shape = float(self.vco1_combo.currentIndex())
@@ -6245,7 +6288,7 @@ class SynthGui(QWidget):
         add_s("/hds/device/midi", midi_wire_value)
         add_s("/hds/record/path", self._current_record_path)
 
-        if self.osc_client is not None:
+        if self.osc_client is not None and bundle_has_content[0]:
             try: self.osc_client.send(bundle.build())
             except OSError: pass
 
@@ -6525,6 +6568,12 @@ if __name__ == "__main__":
     # parse_known_args (not parse_args): leaves any Qt-specific args (-style, -platform, etc.)
     # untouched in sys.argv for QApplication(sys.argv) below, rather than erroring on them.
     _arg_parser = argparse.ArgumentParser(add_help=False)
+    _arg_parser.add_argument("--osc-host", type=str, default=OSC_HOST,
+                              help="Hostname/IP the backend is running on. Defaults to localhost; set this "
+                                   "to run the frontend and backend on separate machines -- the backend's "
+                                   "own OSC listener already accepts remote connections, but its "
+                                   "--osc-reply-host must be pointed back at THIS machine for status "
+                                   "feedback (VU meter, tempo, recording state) to find its way back.")
     _arg_parser.add_argument("--osc-listen-port", type=int, default=OSC_SEND_PORT,
                               help="Backend's OSC listen port (where this frontend sends knob/zone messages). "
                                    "9000 for the standalone app, 9010 for the CLAP plugin's embedded server.")
@@ -6532,6 +6581,7 @@ if __name__ == "__main__":
                               help="Backend's OSC reply port (where /hds/status/* feedback is received). "
                                    "9001 for the standalone app, 9011 for the CLAP plugin's embedded server.")
     _args, _qt_argv_rest = _arg_parser.parse_known_args(sys.argv[1:])
+    OSC_HOST = _args.osc_host
     OSC_SEND_PORT = _args.osc_listen_port
     OSC_RECV_PORT = _args.osc_reply_port
 
