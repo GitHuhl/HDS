@@ -636,6 +636,23 @@ int main() {
     rescan_programs();
 
     glfwSetErrorCallback(glfw_error_callback);
+#if defined(GLFW_VERSION_MAJOR) && (GLFW_VERSION_MAJOR > 3 || (GLFW_VERSION_MAJOR == 3 && GLFW_VERSION_MINOR >= 4))
+    // BUG FIX: GLFW 3.4+ auto-detects Wayland (via $WAYLAND_DISPLAY) and dynamically dlopen()s
+    // libwayland-client at glfwInit() time -- confirmed directly, not guessed: a real run on a
+    // Wayland desktop (KDE Plasma) produced glfwSetErrorCallback's own "error 65544 (Wayland:
+    // Failed to load libwayland-client)" and glfwInit() returning false, with NO fallback to X11
+    // on its own. This client has never had -- and doesn't need -- anything Wayland-specific (no
+    // fractional scaling, no native Wayland decorations; it's a plain fixed-size window), so force
+    // the X11 backend unconditionally: every mainstream Wayland desktop (KDE Plasma, GNOME, Labwc,
+    // sway, ...) ships XWayland precisely for X11-only apps like this one to keep working, which
+    // sidesteps whatever's broken about libwayland-client loading on a given machine entirely
+    // rather than depending on it. `GLFW_PLATFORM`/`GLFW_PLATFORM_X11` only exist from GLFW 3.4
+    // onward (the version that introduced runtime backend selection at all -- 3.3 picks Wayland
+    // vs. X11 at the PACKAGE's own build time, with no app-level override possible), hence the
+    // version guard -- on an older GLFW this block compiles to nothing and behavior is whatever
+    // that system's own GLFW package was already built for, same as before this fix.
+    glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
+#endif
     if (!glfwInit()) { fprintf(stderr, "[glfw] glfwInit() failed -- see the error above.\n"); return -1; }
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
