@@ -6100,6 +6100,11 @@ typedef struct {
     bool          fx_engine_initialized;
     float         limiter_gain[OUTPUT_PAIR_MAX];
     bool          limiter_gain_initialized;
+    float         master_volume_smoothed; // chases knobs->master_volume over a short time
+                                            // constant instead of applying it instantly -- see
+                                            // its own comment at the point of use for the click
+                                            // this fixes.
+    bool          master_volume_smoothed_initialized;
 
     // Arpeggiator: one independent instance per Program slot (0-7 Combi lanes, 8 =
     // SINGLE_PROGRAM_SLOT) -- see poll_arpeggiator()/arp_note_on()/arp_note_off(). Reuses
@@ -6120,6 +6125,13 @@ typedef struct {
     int           arp_playing_note[COMBI_PROGRAM_COUNT + 1];      // only meaningful when arp_note_active is true
     int           arp_step_cursor[COMBI_PROGRAM_COUNT + 1];       // 0..(held_count*octave_range - 1), advances every step
     unsigned int  arp_rng_state[COMBI_PROGRAM_COUNT + 1];         // xorshift32 state for Style=Random; 0 is a degenerate seed, guarded at first use
+    float         arp_tempo_smoothed;        // chases compute_current_tempo_bpm()'s live result
+                                               // over a short time constant -- see poll_arpeggiator's
+                                               // own comment for the glitch this fixes. One shared
+                                               // value, not per-Program: compute_current_tempo_bpm()
+                                               // itself always resolves to a single "current tempo"
+                                               // slot regardless of which Program's arp is asking.
+    bool          arp_tempo_smoothed_initialized;
 } HdsEngineState;
 
 // The standalone app's own single instance -- same storage duration (process lifetime) and
@@ -6462,6 +6474,30 @@ static void poll_arpeggiator(HdsEngineState *engine, HdsSampleEngine *se, SynthV
     bool combi_mode_active = ((int)knobs->performance_mode == 1);
     int active_program_count = combi_mode_active ? COMBI_PROGRAM_COUNT : 1;
 
+    // BUG FIX: each step used to call compute_current_tempo_bpm() directly and immediately bake
+    // its raw, instantaneous result into that step's own samples_per_step -- so a fast Tempo knob
+    // move (or any large single jump, e.g. a fast drag across the dial's 20-300 range) landed on
+    // the very next step boundary as a hard, un-smoothed discontinuity in the arp's own clock
+    // rate. Musically that reads as exactly the "glitchy"/"reset"-feeling jump reported: the
+    // pattern doesn't glide to the new tempo, it snaps. Chased here instead, once per block (this
+    // function's own natural granularity -- poll_arpeggiator runs once per audio block, not once
+    // per sample), over a ~120ms time constant: fast enough that turning the knob still feels
+    // live and responsive, slow enough that the step clock always arrives at the new tempo
+    // smoothly rather than jumping straight to it. The chase-rate formula (1 - exp(-block_size /
+    // (SAMPLE_RATE * tau))) is the block-granularity equivalent of the same per-sample one-pole
+    // chase used elsewhere in this file (see tick_adsr's sustain-chase and master_volume_smoothed
+    // above) -- applying the per-sample version block_size times in a row is mathematically
+    // identical to one application of this formula, so this stays correct regardless of the
+    // live-adjustable Block Size knob's own current value.
+    float raw_tempo_bpm = compute_current_tempo_bpm(knobs, engine->transport_playhead_sec);
+    if (!engine->arp_tempo_smoothed_initialized) {
+        engine->arp_tempo_smoothed = raw_tempo_bpm;
+        engine->arp_tempo_smoothed_initialized = true;
+    } else {
+        const float tempo_chase_rate = 1.0f - expf(-(float)block_size / (SAMPLE_RATE * 0.120f));
+        engine->arp_tempo_smoothed += (raw_tempo_bpm - engine->arp_tempo_smoothed) * tempo_chase_rate;
+    }
+
     for (int p_loop = 0; p_loop < active_program_count; p_loop++) {
         int p = combi_mode_active ? p_loop : SINGLE_PROGRAM_SLOT;
         const ProgramState *prog = &knobs->programs[p];
@@ -6592,7 +6628,7 @@ static void poll_arpeggiator(HdsEngineState *engine, HdsSampleEngine *se, SynthV
             engine->arp_note_active[p] = true;
             engine->arp_playing_note[p] = note;
 
-            float bpm = compute_current_tempo_bpm(knobs, engine->transport_playhead_sec);
+            float bpm = engine->arp_tempo_smoothed; // smoothed, not raw -- see this function's own header comment
             int rate_idx = (int)prog->arp_rate;
             if (rate_idx < 0 || rate_idx > 5) rate_idx = 1;
             float steps_per_beat = ARP_RATE_STEPS_PER_BEAT[rate_idx];
@@ -7137,6 +7173,18 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         for (int p = 0; p < OUTPUT_PAIR_MAX; p++) limiter_gain[p] = 1.0f;
         engine->limiter_gain_initialized = true;
     }
+
+    // Master Volume smoothing: chases the live knob value over a ~10ms time constant instead of
+    // applying it instantly (see its use below) -- fixes an audible click on every Volume knob
+    // move. Snaps straight to the current knob value on the very first call (not ramping up from
+    // 0), same "initialize to the right starting point, don't fade in at startup" reasoning
+    // limiter_gain/fx_engine's own init blocks already use just above.
+    float *master_volume_smoothed = &engine->master_volume_smoothed;
+    if (!engine->master_volume_smoothed_initialized) {
+        *master_volume_smoothed = knobs->master_volume;
+        engine->master_volume_smoothed_initialized = true;
+    }
+    const float master_volume_chase_rate = 1.0f - expf(-1.0f / (0.010f * SAMPLE_RATE));
 
     // FX slot type-change bookkeeping (free a slot's old effect state when its Type actually
     // changed) and "which sources own any FX slot at all" both only ever change in response to an
@@ -7985,11 +8033,18 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // contribution to Combi Mix always matches its own individually-routed bus). Generalizes
         // today's Program-only `bus_l[0] *= knobs->master_volume;` cleanly. Ext-in pairs rely
         // solely on their own per-pair gain (below) as their equivalent "volume" knob, unchanged.
+        // Uses the SMOOTHED value (chased toward the live knob every sample, see its own comment
+        // above) rather than knobs->master_volume directly -- the raw knob value is constant for
+        // an entire block and can jump by a large amount between two consecutive blocks (e.g. a
+        // fast slider drag), which applied instantly is a real discontinuity in a continuous
+        // audio signal -- an audible click, not just a theoretical one. Chasing it removes the
+        // discontinuity while still reaching the target in ~10ms, imperceptible as a fade.
+        *master_volume_smoothed += (knobs->master_volume - *master_volume_smoothed) * master_volume_chase_rate;
         float bus_l[SOURCE_COUNT], bus_r[SOURCE_COUNT];
         float combi_mix_l = 0.0f, combi_mix_r = 0.0f;
         for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
-            bus_l[p] = mixed_l[p] * knobs->master_volume * combi_lane_gain_l[p];
-            bus_r[p] = mixed_r[p] * knobs->master_volume * combi_lane_gain_r[p];
+            bus_l[p] = mixed_l[p] * (*master_volume_smoothed) * combi_lane_gain_l[p];
+            bus_r[p] = mixed_r[p] * (*master_volume_smoothed) * combi_lane_gain_r[p];
             combi_mix_l += bus_l[p];
             combi_mix_r += bus_r[p];
         }
@@ -7999,8 +8054,8 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // ("Program" in the FX/Routing UI) and Combi Mix must still carry Single Program mode's
         // own audio here, exactly as they always have -- pull it from its real home instead.
         if (!combi_mode_active) {
-            bus_l[0] = mixed_l[SINGLE_PROGRAM_SLOT] * knobs->master_volume;
-            bus_r[0] = mixed_r[SINGLE_PROGRAM_SLOT] * knobs->master_volume;
+            bus_l[0] = mixed_l[SINGLE_PROGRAM_SLOT] * (*master_volume_smoothed);
+            bus_r[0] = mixed_r[SINGLE_PROGRAM_SLOT] * (*master_volume_smoothed);
             combi_mix_l = bus_l[0];
             combi_mix_r = bus_r[0];
         }
