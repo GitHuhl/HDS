@@ -208,6 +208,17 @@ pkgs.mkShell {
     # directory on LD_LIBRARY_PATH is silently skipped by the dynamic loader, not an error).
     export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.wayland}/lib:$LD_LIBRARY_PATH"
 
+    # BUG FIX: LD_LIBRARY_PATH alone fixed GLX (X11's vendor selection is a simpler
+    # extension-string probe) but NOT EGL, confirmed directly ("EGL: Failed to get EGL display:
+    # Success" -- eglGetDisplay() returning EGL_NO_DISPLAY with no real error code set, GLFW's
+    # Wayland backend uses EGL exclusively, never GLX, so this is the actual remaining blocker).
+    # GLVND's EGL loader doesn't just need the real vendor .so reachable on a library path -- it
+    # separately needs to find the vendor's own ICD JSON manifest (what tells it WHICH .so is the
+    # real one to dispatch to at all), normally scanned from /usr/share/glvnd/egl_vendor.d/ on an
+    # FHS system, which doesn't exist on NixOS. NixOS's own /run/opengl-driver carries this same
+    # manifest at share/glvnd/egl_vendor.d/ -- point GLVND's own directory-scan variable at it.
+    export __EGL_VENDOR_LIBRARY_DIRS="/run/opengl-driver/share/glvnd/egl_vendor.d"
+
     # Cross-built aarch64 libraries live under content-addressed Nix store paths, not a fixed
     # relative directory like $(WIN_DEPS) -- export their include/lib paths here so the Makefile's
     # ARM64_CFLAGS/ARM64_LDFLAGS (referenced the same way WIN_CFLAGS/WIN_LDFLAGS already are) can

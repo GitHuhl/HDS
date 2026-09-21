@@ -580,23 +580,28 @@ each target needs from it. **`nix-shell` is the only supported way to build ever
 repo, including plain `make`/`make clap`/`make pi-touch`** -- there is no "build outside nix-shell"
 path, and none should ever be suggested again.
 
-**Two real, NixOS-specific `hds_pi_touch` gotchas, both confirmed directly on a real NixOS/Plasma-
-Wayland laptop and both fixed automatically by `shell.nix`'s own `shellHook` now (no manual steps
+**Three real, NixOS-specific `hds_pi_touch` gotchas, all confirmed directly on a real NixOS/Plasma-
+Wayland laptop and all fixed automatically by `shell.nix`'s own `shellHook` now (no manual steps
 needed -- just `nix-shell` normally, then `make pi-touch && ./hds_pi_touch`):**
 1. GLFW's Wayland backend is loaded via `dlopen("libwayland-client.so")` at *runtime*, not a
    link-time dependency -- confirmed to fail outright ("Wayland: Failed to load
    libwayland-client") purely because NixOS keeps every package's libraries in an isolated Nix
    store path with no traditional `/usr/lib` a bare-filename `dlopen()` can search, even though
-   the library is right there on the very same Wayland desktop the app is running on.
+   the library is right there on the very same Wayland desktop the app is running on. Fixed by
+   putting the real `wayland` package's own lib directory on `LD_LIBRARY_PATH`.
 2. A `nix-shell`-built `hds_pi_touch` can link against nixpkgs' own isolated `libglvnd`/Mesa
    copies instead of the system's own properly-configured GPU driver (what plain `glxinfo`
-   reaches on the same machine), so GL context creation can fail outright (GLX reports zero
-   usable framebuffer configs) even though the system's own driver stack works fine for every
-   other GL application.
-
-Both are fixed the same way -- `shell.nix`'s `shellHook` now puts NixOS's own published real
-driver location (`/run/opengl-driver/lib`) and the real `wayland` package's own lib directory on
-`LD_LIBRARY_PATH`, ahead of anything else, on every `nix-shell` entry.
+   reaches on the same machine), so GLX context creation (X11's own GL path) can fail outright
+   (GLX reports zero usable framebuffer configs). Fixed by putting NixOS's own published
+   real-driver location (`/run/opengl-driver/lib`) on `LD_LIBRARY_PATH` too, ahead of anything
+   else.
+3. Even with the real driver's library reachable, GLFW's Wayland backend uses EGL exclusively
+   (never GLX), and GLVND's EGL loader needs a *separate* discovery mechanism from GLX's --
+   it scans for vendor ICD JSON manifest files, not just a library path, so `LD_LIBRARY_PATH`
+   alone isn't enough for it: confirmed directly ("EGL: Failed to get EGL display: Success" --
+   `eglGetDisplay()` silently returning no display). Fixed by pointing GLVND's own
+   `__EGL_VENDOR_LIBRARY_DIRS` at NixOS's real manifest location
+   (`/run/opengl-driver/share/glvnd/egl_vendor.d`).
 
 ### Building for Windows
 
