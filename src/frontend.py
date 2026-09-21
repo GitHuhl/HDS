@@ -35,6 +35,31 @@ def _retain_hidden(widget):
     widget.setSizePolicy(policy)
     return widget
 
+# Oscillator Volume taper: vco1_vol/vco2_vol/vco3_vol/vco4_vol's sliders used to send their raw
+# 0-100 position straight through as a 0.0-1.0 linear gain fraction (pos/100.0). Linear taper on
+# a volume control is the classic reason a "quiet" setting is nearly impossible to dial in by
+# hand: equal steps of knob travel do NOT correspond to equal steps of perceived loudness, so
+# almost the entire audible-but-quiet range (roughly -40dB to -60dB) got crushed into under 1% of
+# the slider's own travel -- under a single pixel on an 80px-tall slider. A power-law (audio)
+# taper fixes this by spreading that same quiet range across much more of the slider's travel,
+# while still hitting exactly 0.0 at position 0 and exactly 1.0 at position 100. This is a GUI-
+# side mapping ONLY -- backend.c's gain math, the FM sidechain scaling, mix_bal, and every mod-
+# matrix amp-modulation path all keep reading/writing the exact same plain linear 0.0-1.0
+# fraction they always have; nothing about how that fraction is actually used as a gain changed.
+OSC_VOL_TAPER_EXPONENT = 3.0  # cubic -- a common, simple approximation of a real log/audio pot
+
+def _osc_vol_taper(slider_pos):
+    """Oscillator Volume slider position (0-100) -> linear gain fraction (0.0-1.0)."""
+    t = max(0.0, min(100.0, float(slider_pos))) / 100.0
+    return t ** OSC_VOL_TAPER_EXPONENT
+
+def _osc_vol_untaper(linear_gain):
+    """Exact inverse of _osc_vol_taper: linear gain fraction (0.0-1.0) -> slider position
+    (0-100) -- used when a saved Program's/Combi lane's real gain value needs to be reflected
+    back onto the slider so a later transmit_knob_packet() reproduces that exact gain again."""
+    t = max(0.0, min(1.0, float(linear_gain))) ** (1.0 / OSC_VOL_TAPER_EXPONENT)
+    return int(round(t * 100.0))
+
 def _decode_wav_peaks(path, num_buckets=600):
     """Reads a WAV file's audio data (mirroring backend.c's load_sample_slot format support --
     PCM 16/24/32-bit integer or 32-bit IEEE float, any channel count) and downsamples it to
@@ -2724,7 +2749,10 @@ class SynthGui(QWidget):
         v1_vol_layout = QVBoxLayout()
         v1_vol_layout.setSpacing(2)
         v1_vol_layout.addWidget(QLabel("Vol:"), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.vco1_vol = ResetSlider(Qt.Orientation.Vertical, 80)
+        # Reset position 93, not 80: _osc_vol_untaper(0.8) -- the audio taper (see its own
+        # comment) changed what slider position produces the backend's default 0.8 linear gain,
+        # so this double-click-reset target is recomputed to still land on that exact same gain.
+        self.vco1_vol = ResetSlider(Qt.Orientation.Vertical, 93)
         self.vco1_vol.setRange(0, 100)
         self.vco1_vol.setFixedHeight(80)
         v1_vol_layout.addWidget(self.vco1_vol, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -2853,7 +2881,9 @@ class SynthGui(QWidget):
         v2_vol_layout = QVBoxLayout()
         v2_vol_layout.setSpacing(2)
         v2_vol_layout.addWidget(QLabel("Vol:"), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.vco2_vol = ResetSlider(Qt.Orientation.Vertical, 80)
+        # Reset position 79, not 80: _osc_vol_untaper(0.5) -- see the matching comment on
+        # vco1_vol's own construction above.
+        self.vco2_vol = ResetSlider(Qt.Orientation.Vertical, 79)
         self.vco2_vol.setRange(0, 100)
         self.vco2_vol.setFixedHeight(80)
         v2_vol_layout.addWidget(self.vco2_vol, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -5172,7 +5202,10 @@ class SynthGui(QWidget):
         for addr, dial in (("/hds/vco1/vol", self.vco1_vol), ("/hds/vco2/vol", self.vco2_vol),
                            ("/hds/vco3/vol", self.vco3_vol), ("/hds/vco4/vol", self.vco4_vol)):
             if addr in fields:
-                dial.blockSignals(True); dial.setValue(int(round(fields[addr] * 100.0))); dial.blockSignals(False)
+                # Inverse of _osc_vol_taper -- fields[addr] is the real linear gain a saved
+                # Program stored, so the slider's own position has to be un-tapered to land back
+                # on the exact same audible gain when transmit_knob_packet() re-tapers it.
+                dial.blockSignals(True); dial.setValue(_osc_vol_untaper(fields[addr])); dial.blockSignals(False)
         for addr, dial in (("/hds/vco1/pan", self.vco1_pan), ("/hds/vco2/pan", self.vco2_pan),
                            ("/hds/vco3/pan", self.vco3_pan), ("/hds/vco4/pan", self.vco4_pan)):
             if addr in fields:
@@ -5954,9 +5987,10 @@ class SynthGui(QWidget):
         v2_shape = float(self.vco2_combo.currentIndex())
         fm = float(self.fm_depth_dials["fm_intensity"].value()) / 100.0
 
-        # Raw layout mixing levels
-        v1_vol = float(self.vco1_vol.value()) / 100.0
-        v2_vol = float(self.vco2_vol.value()) / 100.0
+        # Raw layout mixing levels. vco1_vol/vco2_vol go through the audio (power-law) taper --
+        # see _osc_vol_taper's own comment -- NOT a plain /100.0 fraction like master_vol below.
+        v1_vol = _osc_vol_taper(self.vco1_vol.value())
+        v2_vol = _osc_vol_taper(self.vco2_vol.value())
         g_time = float(glide_ms)
         m_vol = float(self.master_vol.value()) / 100.0
         v1_p = float(self.vco1_pan.value()) / 100.0
@@ -6133,16 +6167,18 @@ class SynthGui(QWidget):
         add_f("/hds/vco1/vel_to_amp", self.vco1_vel_to_amp.value())
         add_f("/hds/vco2/vel_to_amp", self.vco2_vel_to_amp.value())
 
-        # Osc 3: vol, pan, mute, pulse-width-or-tilt
-        add_f("/hds/vco3/vol", self.vco3_vol.value() / 100.0)
+        # Osc 3: vol, pan, mute, pulse-width-or-tilt. vol goes through the audio taper, same as
+        # Osc 1/2 above -- see _osc_vol_taper's own comment.
+        add_f("/hds/vco3/vol", _osc_vol_taper(self.vco3_vol.value()))
         add_f("/hds/vco3/pan", self.vco3_pan.value() / 100.0)
         add_f("/hds/vco3/mute", 1.0 if self.vco3_mute.isChecked() else 0.0)
         add_f("/hds/vco3/pulse_width", self.vco3_pulse_width.value())
         add_f("/hds/vco3/mono_noise", 1.0 if self.vco3_mono_noise.isChecked() else 0.0)
         add_f("/hds/vco3/vel_to_amp", self.vco3_vel_to_amp.value())
 
-        # Osc 4: vol, pan, mute, pulse-width-or-tilt
-        add_f("/hds/vco4/vol", self.vco4_vol.value() / 100.0)
+        # Osc 4: vol, pan, mute, pulse-width-or-tilt. vol goes through the audio taper, same as
+        # Osc 1/2/3 above -- see _osc_vol_taper's own comment.
+        add_f("/hds/vco4/vol", _osc_vol_taper(self.vco4_vol.value()))
         add_f("/hds/vco4/pan", self.vco4_pan.value() / 100.0)
         add_f("/hds/vco4/mute", 1.0 if self.vco4_mute.isChecked() else 0.0)
         add_f("/hds/vco4/pulse_width", self.vco4_pulse_width.value())
