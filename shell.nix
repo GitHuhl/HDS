@@ -119,27 +119,12 @@ pkgs.mkShell {
                              # named `glfw3` (upstream's own naming, unchanged across distros) --
                              # matches exactly what the Makefile's pi-touch target looks up.
     pkgs.libGL               # -lGL at link time; GLVND dispatches to the real driver at runtime.
-    pkgs.wayland             # NOT linked into hds_pi_touch at all (no DT_NEEDED entry) -- GLFW's
-                              # own Wayland backend is loaded via dlopen("libwayland-client.so") at
-                              # RUNTIME, by design, so ONE glfw build can support multiple backends.
-                              # Confirmed directly on a real NixOS/Plasma-Wayland machine: that
-                              # dlopen() call fails ("Wayland: Failed to load libwayland-client")
-                              # purely because NixOS keeps every package's libraries in an isolated
-                              # Nix store path -- there is no traditional "/usr/lib" a bare-filename
-                              # dlopen() can just find things in, so the library needs to be
-                              # explicitly put on LD_LIBRARY_PATH (see the shellHook below) even
-                              # though it's already present on the very same Wayland desktop the
-                              # app is running on. Nix-shell is the only supported way to build/run
-                              # this project's targets -- this is fixed inside it, not by leaving it.
-
-                              # NOTE, separately: also confirmed directly on the same NixOS machine
-                              # -- a nix-shell-built hds_pi_touch can link against nixpkgs' own
-                              # isolated libglvnd/Mesa instead of the system's real, properly-
-                              # configured GPU driver, so GL context creation can fail outright (GLX
-                              # reports zero usable framebuffer configs) even though the same
-                              # system's driver stack works fine for every other GL app. Also fixed
-                              # via LD_LIBRARY_PATH below (NixOS's own published real-driver
-                              # location, /run/opengl-driver/lib) rather than leaving nix-shell.
+                              # pkgs.wayland is deliberately NOT a dependency here -- GLFW's own
+                              # platform auto-detection is left to fall through from Wayland to
+                              # X11/GLX (via XWayland) on its own, matching a known-working
+                              # reference program's behavior; see PI_TOUCH_RPATH's own comment
+                              # below for the full story of why forcing Wayland to succeed was
+                              # actively counterproductive here.
 
     # --- Python frontend (python3 src/frontend.py) --- PySide6/python-osc's exact pinned
     # versions (see requirements.txt) aren't reliably both present/current in every nixpkgs
@@ -195,50 +180,21 @@ pkgs.mkShell {
     echo "  make arm64 / make pi-touch-arm64  -> synth_engine-arm64 / hds_pi_touch-arm64 (aarch64 Linux, e.g. Pi 5)"
     echo
 
-    # hds_pi_touch (native, this machine's own architecture -- NOT the aarch64 cross-build below)
-    # needs two libraries findable by bare-filename dlopen() at RUNTIME, neither of which shows up
-    # as a link-time NEEDED dependency: GLFW's own Wayland backend (libwayland-client.so, see
-    # pkgs.wayland's own comment above) and, separately, a real GLX/EGL driver vendor library for
-    # GL context creation (nixpkgs' own isolated libglvnd/Mesa can fail to find the system's real
-    # one). Both are fixed the same way: put the real library directory on LD_LIBRARY_PATH ahead of
-    # anything else, every time this shell is entered, so `make pi-touch && ./hds_pi_touch` just
-    # works with no manual per-invocation environment juggling ever needed again.
-    # `/run/opengl-driver/lib` is NixOS's own published real-driver location (harmless to prepend
-    # even when it doesn't exist, e.g. on a non-NixOS host running this same shell.nix -- an absent
-    # directory on LD_LIBRARY_PATH is silently skipped by the dynamic loader, not an error).
-    export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.wayland}/lib:$LD_LIBRARY_PATH"
-
-    # BUG FIX: LD_LIBRARY_PATH alone fixed GLX (X11's vendor selection is a simpler
-    # extension-string probe) but NOT EGL, confirmed directly ("EGL: Failed to get EGL display:
-    # Success" -- eglGetDisplay() returning EGL_NO_DISPLAY with no real error code set, GLFW's
-    # Wayland backend uses EGL exclusively, never GLX, so this is the actual remaining blocker).
-    # GLVND's EGL loader doesn't just need the real vendor .so reachable on a library path -- it
-    # separately needs to find the vendor's own ICD JSON manifest (what tells it WHICH .so is the
-    # real one to dispatch to at all), normally scanned from /usr/share/glvnd/egl_vendor.d/ on an
-    # FHS system, which doesn't exist on NixOS. NixOS's own /run/opengl-driver carries this same
-    # manifest at share/glvnd/egl_vendor.d/ -- point GLVND's own directory-scan variable at it.
-    #
-    # BUG FIX: __EGL_VENDOR_LIBRARY_DIRS alone did NOT fix it -- confirmed the manifest itself is
-    # real and valid (a real libEGL_mesa.so.0 in the Nix store), so GLVND's directory-scan mode
-    # specifically isn't taking effect in this libglvnd build. __EGL_VENDOR_LIBRARY_FILENAMES (an
-    # explicit, colon-separated list of the exact JSON files -- the older, more universally
-    # honored of the two GLVND env vars) is set alongside it, computed from a real shell glob at
-    # shell-entry time (this can't be done in the Nix expression itself -- /run/opengl-driver is a
-    # runtime symlink target, invisible at Nix eval time).
     # hds_pi_touch is built here but ALWAYS run outside nix-shell (this project's standing
-    # workflow) -- so env vars set in this shellHook (like the two lines this replaced,
-    # __EGL_VENDOR_LIBRARY_DIRS/FILENAMES) never reach the binary at all; that's not something an
-    # env var fix can paper over. Root cause, found directly by comparing against a known-working
-    # reference GLFW/ImGui program that has ZERO Wayland/EGL-specific code of any kind: GLFW's
-    # platform auto-detection (no GLFW_PLATFORM hint set, same as that reference) tries Wayland
-    # first, then falls through to X11 (via XWayland) if Wayland's own dlopen("libwayland-client")
-    # doesn't succeed -- X11's GLX path needs only a real driver on the library path (fixed below,
-    # confirmed working directly: "GLX works with lots of outputs" once /run/opengl-driver/lib is
-    # reachable), NOT a GLVND EGL vendor ICD manifest at all. Making libwayland-client.so
-    # dlopen-able (an earlier version of this file did, via RPATH) actively made things WORSE: it
-    # let GLFW succeed at selecting the Wayland backend, which then hit the much harder EGL vendor-
-    # discovery problem this comment used to describe. Letting Wayland dlopen fail on purpose and
-    # land on GLX instead is what actually matches the known-working reference's real behavior.
+    # workflow) -- so any env var set in this shellHook (LD_LIBRARY_PATH included) never reaches
+    # the binary at all; that's not something an env var fix can paper over, which is why this is
+    # a link-time RPATH, not a runtime export. Root cause, found directly by comparing against a
+    # known-working reference GLFW/ImGui program with ZERO Wayland/EGL-specific code of any kind:
+    # GLFW's platform auto-detection (no GLFW_PLATFORM hint set, same as that reference) tries
+    # Wayland first, then falls through to X11 (via XWayland) if Wayland's own
+    # dlopen("libwayland-client") doesn't succeed -- X11's GLX path needs only a real driver on
+    # the library path (confirmed working directly: "GLX works with lots of outputs" once
+    # /run/opengl-driver/lib is reachable), NOT a GLVND EGL vendor ICD manifest at all. An earlier
+    # version of this file put libwayland-client on LD_LIBRARY_PATH/RPATH to fix its dlopen
+    # failure -- that was actively counterproductive: it let GLFW succeed at selecting the Wayland
+    # backend, which then hits EGL vendor-discovery failures nix-shell can't reliably fix for a
+    # binary that's always run outside it. Deliberately NOT fixing the Wayland dlopen lets GLFW
+    # fail that path cleanly and land on GLX instead, matching the known-working reference.
     export PI_TOUCH_RPATH="-Wl,-rpath,/run/opengl-driver/lib -Wl,-rpath,${pkgs.libGL}/lib"
 
     # Cross-built aarch64 libraries live under content-addressed Nix store paths, not a fixed
