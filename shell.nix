@@ -225,8 +225,21 @@ pkgs.mkShell {
     # honored of the two GLVND env vars) is set alongside it, computed from a real shell glob at
     # shell-entry time (this can't be done in the Nix expression itself -- /run/opengl-driver is a
     # runtime symlink target, invisible at Nix eval time).
-    export __EGL_VENDOR_LIBRARY_DIRS="/run/opengl-driver/share/glvnd/egl_vendor.d"
-    export __EGL_VENDOR_LIBRARY_FILENAMES="$(echo /run/opengl-driver/share/glvnd/egl_vendor.d/*.json 2>/dev/null | tr ' ' ':')"
+    # hds_pi_touch is built here but ALWAYS run outside nix-shell (this project's standing
+    # workflow) -- so env vars set in this shellHook (like the two lines this replaced,
+    # __EGL_VENDOR_LIBRARY_DIRS/FILENAMES) never reach the binary at all; that's not something an
+    # env var fix can paper over. Root cause, found directly by comparing against a known-working
+    # reference GLFW/ImGui program that has ZERO Wayland/EGL-specific code of any kind: GLFW's
+    # platform auto-detection (no GLFW_PLATFORM hint set, same as that reference) tries Wayland
+    # first, then falls through to X11 (via XWayland) if Wayland's own dlopen("libwayland-client")
+    # doesn't succeed -- X11's GLX path needs only a real driver on the library path (fixed below,
+    # confirmed working directly: "GLX works with lots of outputs" once /run/opengl-driver/lib is
+    # reachable), NOT a GLVND EGL vendor ICD manifest at all. Making libwayland-client.so
+    # dlopen-able (an earlier version of this file did, via RPATH) actively made things WORSE: it
+    # let GLFW succeed at selecting the Wayland backend, which then hit the much harder EGL vendor-
+    # discovery problem this comment used to describe. Letting Wayland dlopen fail on purpose and
+    # land on GLX instead is what actually matches the known-working reference's real behavior.
+    export PI_TOUCH_RPATH="-Wl,-rpath,/run/opengl-driver/lib -Wl,-rpath,${pkgs.libGL}/lib"
 
     # Cross-built aarch64 libraries live under content-addressed Nix store paths, not a fixed
     # relative directory like $(WIN_DEPS) -- export their include/lib paths here so the Makefile's

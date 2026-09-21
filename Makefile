@@ -75,7 +75,14 @@ PI_TOUCH_SRC := src/pi_touch_frontend.cpp \
                 $(PI_TOUCH_INC)/imgui_tables.cpp $(PI_TOUCH_INC)/imgui_widgets.cpp \
                 $(PI_TOUCH_INC)/backends/imgui_impl_glfw.cpp $(PI_TOUCH_INC)/backends/imgui_impl_opengl3.cpp
 PI_TOUCH_CFLAGS := $(shell pkg-config --cflags glfw3) -I$(PI_TOUCH_INC) -I$(PI_TOUCH_INC)/backends
-PI_TOUCH_LDLIBS := $(shell pkg-config --libs glfw3) -llo -lGL -ldl
+# PI_TOUCH_RPATH (set by shell.nix's shellHook, native-Linux target only -- NOT the arm64 target,
+# which uses patchelf's own $ORIGIN-relative rpath instead) bakes the real NixOS GPU driver's
+# library directory directly into hds_pi_touch's own ELF RPATH at LINK time, so GLX (used via
+# X11/XWayland -- see pi_touch_frontend.cpp's own comment on why this project doesn't fight GLFW's
+# platform auto-detection towards Wayland/EGL) finds the real driver regardless of LD_LIBRARY_PATH,
+# needed because this binary is built inside nix-shell but always RUN outside it, where nothing
+# from shell.nix's shellHook is present at all.
+PI_TOUCH_LDLIBS := $(shell pkg-config --libs glfw3) -llo -lGL -ldl $(PI_TOUCH_RPATH)
 
 # --- Raspberry Pi 5 / aarch64 Linux cross-build (make arm64 / make pi-touch-arm64) ---
 # Cross-compiles synth_engine and hds_pi_touch for aarch64 Linux (a Raspberry Pi 5, or any other
@@ -182,7 +189,7 @@ run-frontend:
 	python3 src/frontend.py
 
 clean:
-	rm -f $(BIN) $(CLAP_BIN) $(PI_TOUCH_BIN) $(ARM64_BIN) $(ARM64_PI_TOUCH_BIN)
+	rm -f $(BIN) $(CLAP_BIN) $(PI_TOUCH_BIN) $(PI_TOUCH_REAL_BIN) $(ARM64_BIN) $(ARM64_PI_TOUCH_BIN)
 	rm -rf $(ARM64_LIBDIR)
 
 clean-windows:
