@@ -7,8 +7,7 @@
 // Phase 1: every function main() calls to drive the engine one block at a time --
 // poll_seq_audio_load_requests, drain_pending_sample_loads, dispatch_midi_event,
 // render_audio_block, etc. -- is already a standalone function with explicit parameters, so this
-// file just calls those same functions directly instead of main()'s own ALSA/WASAPI device-I/O
-// loop.
+// file just calls those same functions directly instead of main()'s own ALSA device-I/O loop.
 //
 // As a plugin, HDS stops owning audio device I/O and MIDI device I/O entirely -- the host
 // supplies both via CLAP's audio-ports/note-ports extensions -- but keeps its own control
@@ -17,9 +16,10 @@
 // the standalone app, just pointed at a different port. There is no CLAP `params` extension in
 // this first version; the ~1150 knobs stay 100% OSC-driven.
 //
-// Windows CLAP support and a CLAP `params` extension (host-automatable knobs) are explicitly out
-// of scope for this version -- see the plan doc's own stated scope boundaries. `state` (DAW
-// project save/load) IS implemented -- see its own section below.
+// A CLAP `params` extension (host-automatable knobs) is explicitly out of scope for this version
+// -- see the plan doc's own stated scope boundaries. `state` (DAW project save/load) IS
+// implemented -- see its own section below. This project targets Linux only (see shell.nix's own
+// header comment), so there is no Windows build of this plugin, now or planned.
 
 #include <stdarg.h>
 #include "../third_party/clap/include/clap/clap.h"
@@ -555,8 +555,8 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
                 const clap_event_midi_t *ev = (const clap_event_midi_t *)hdr;
                 unsigned char status = ev->data[0] & 0xF0;
                 int midi_channel_1_16 = (ev->data[0] & 0x0F) + 1;
-                // Same raw-byte decode convention backend.c's own ALSA/WinMM readers already use
-                // (see process_midi_input) -- a Note On with velocity 0 counts as Note Off.
+                // Same raw-byte decode convention backend.c's own ALSA reader already uses (see
+                // process_midi_input) -- a Note On with velocity 0 counts as Note Off.
                 if (status == 0x90 || status == 0x80) {
                     bool is_note_on = (status == 0x90 && ev->data[2] > 0);
                     dispatch_midi_event(&p->engine, &p->sample_engine, is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, ev->data[1], ev->data[2],

@@ -4343,25 +4343,6 @@ class SynthGui(QWidget):
         latency_row.addWidget(self.audio_latency_combo, stretch=1)
         perf_lay.addLayout(latency_row)
 
-        # WASAPI Exclusive Mode: Windows-only concept (see wasapi_exclusive_mode's own comment in
-        # backend.c) -- Shared mode goes through the Windows audio engine's own mixer, which
-        # historically clamps the effective minimum period higher than whatever Latency alone
-        # requests; Exclusive mode hands the stream the hardware directly, bypassing that mixer,
-        # at the cost of no other application being able to use the device at the same time.
-        # Hidden entirely on Linux/macOS, where this has no ALSA/CoreAudio equivalent at this
-        # layer -- matching every other platform-specific control's own show/hide convention in
-        # this file (still always transmitted over OSC, defaulting to off/Shared, so the backend
-        # never has to guess a value the frontend never sent).
-        self.wasapi_exclusive_check = QCheckBox("Exclusive Mode (WASAPI)")
-        self.wasapi_exclusive_check.setToolTip(
-            "Windows only. Bypasses the Windows audio engine's mixer for lower real-world latency\n"
-            "than Shared mode can reach, even at the same Latency setting above. No other\n"
-            "application can use this device while HDS has it open exclusively. Falls back to\n"
-            "Shared automatically if the device/driver doesn't support Exclusive mode."
-        )
-        self.wasapi_exclusive_check.setVisible(sys.platform == "win32")
-        perf_lay.addWidget(self.wasapi_exclusive_check)
-
         perf_note = QLabel("Polyphony and Block Size apply on the next block, no reopen needed. Latency applies live too — the backend closes and reopens the output/input stream(s).")
         perf_note.setStyleSheet("font-size: 9px; color: #888;")
         perf_note.setWordWrap(True)
@@ -6241,11 +6222,6 @@ class SynthGui(QWidget):
         latency_ms = self._LATENCY_PRESETS[latency_idx][1] if 0 <= latency_idx < len(self._LATENCY_PRESETS) else 25.0
         add_f("/hds/audio/latency_ms", latency_ms)
 
-        # WASAPI Shared/Exclusive -- see wasapi_exclusive_mode in backend.c. Always sent (not
-        # gated on sys.platform) so the field's wire presence never depends on which OS the
-        # frontend happens to be running on; the checkbox itself is what's hidden on non-Windows.
-        add_f("/hds/audio/wasapi_exclusive_mode", 1 if self.wasapi_exclusive_check.isChecked() else 0)
-
         # Live polyphony ceiling -- see active_voice_limit in backend.c
         add_f("/hds/audio/polyphony", self.polyphony_spin.value())
 
@@ -6572,7 +6548,6 @@ def runtime_connect_and_bind(gui):
     gui.output_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
     gui.input_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)
     gui.audio_latency_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
-    gui.wasapi_exclusive_check.toggled.connect(gui.transmit_knob_packet)
     gui.polyphony_spin.valueChanged.connect(gui.transmit_knob_packet)
     gui.block_size_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
 

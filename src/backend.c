@@ -1,28 +1,13 @@
-// --- Platform split (audio + MIDI I/O only) ---
-// Everything below this block -- every oscillator, filter, EG, LFO, FM algorithm, voice, and the
-// whole OSC parameter surface -- is platform-neutral C and compiles/behaves identically on both
-// platforms. The ONLY things that differ per platform are how a block of audio gets in/out of the
-// process (ALSA on Linux, WASAPI via miniaudio on Windows) and how a MIDI byte stream gets in
-// (ALSA sequencer on Linux, WinMM on Windows) -- both isolated behind small platform shims further
-// down (see "Windows audio platform shim" and "Windows MIDI platform shim"), never touched by any
-// DSP code. sys/ioctl.h, sys/socket.h, sys/un.h are leftovers from the old pre-OSC Unix-socket
-// protocol and are already unused by anything in this file (grep confirms zero call sites) -- they
-// simply don't exist on Windows, so they're guarded out here rather than removed outright, to keep
-// this diff scoped to platform support rather than an unrelated dead-code cleanup.
-#ifdef _WIN32
-#include <winsock2.h> // must precede windows.h (which miniaudio.h below pulls in internally) -- avoids the "include winsock2.h before windows.h" warning liblo's own headers would otherwise trigger
-#define MINIAUDIO_IMPLEMENTATION
-#define MA_NO_DECODING
-#define MA_NO_ENCODING
-#include "../third_party/miniaudio.h"
-#include <windows.h>
-#include <mmsystem.h>
-#else
+// This project targets Linux only -- see shell.nix's own header comment for why Windows support
+// was dropped entirely (the real, ongoing cost of maintaining a second audio backend, WASAPI vs.
+// ALSA). sys/ioctl.h, sys/socket.h, sys/un.h are leftovers from the old pre-OSC Unix-socket
+// protocol and are already unused by anything in this file (grep confirms zero call sites) --
+// left as-is here since removing them is an unrelated dead-code cleanup, not part of dropping
+// Windows support.
 #include <alsa/asoundlib.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#endif
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -838,20 +823,6 @@ typedef struct {
     // marginal overruns (a block that only sometimes takes a little too long) at the cost of
     // added latency. See the Audio tab's Latency control.
     float audio_latency_ms;
-
-    // WASAPI-only (Windows): 0 = Shared (default -- goes through the Windows audio engine's own
-    // mixer, which historically imposes a higher effective minimum period than what
-    // audio_latency_ms alone requests, regardless of that setting), 1 = Exclusive (this stream
-    // gets the hardware directly, bypassing the mixer -- the real way to get audio_latency_ms's
-    // requested period actually honored close to its floor on Windows, at the cost of no other
-    // application being able to use the device at the same time). Meaningless/ignored on Linux
-    // (ALSA has no equivalent shared/exclusive split at this layer) -- see open_pcm_stream()'s
-    // Windows branch, the only place this is ever read. If the device or driver doesn't actually
-    // support Exclusive mode, ma_device_init() fails outright (miniaudio's own documented
-    // behavior, it does not silently fall back) -- open_pcm_stream() retries once in Shared mode
-    // before giving up, so a bad Exclusive request degrades gracefully instead of leaving the
-    // user with no audio at all.
-    float wasapi_exclusive_mode;
 
     // Live polyphony ceiling: how many voices are allowed to be simultaneously ACTIVE, clamped
     // into [1, MAX_VOICES] by effective_voice_limit(). MAX_VOICES itself is just the hard array
@@ -3409,7 +3380,6 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/audio/latency_ms", audio_latency_ms),
     OSC_SCALAR("/hds/audio/polyphony", active_voice_limit),
     OSC_SCALAR("/hds/audio/block_size", block_size_frames),
-    OSC_SCALAR("/hds/audio/wasapi_exclusive_mode", wasapi_exclusive_mode),
 
     OSC_SCALAR("/hds/record/enable", record_enable),
     OSC_SCALAR("/hds/record/include_synth_output", record_include_synth_output),
@@ -4031,7 +4001,6 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].pb_range_up = 2.0f; knobs->programs[0].pb_range_down = 2.0f; // standard +/-2 semitone default
     knobs->programs[0].sustain_pedal_polarity = 0.0f; // Normal
     knobs->audio_latency_ms = 25.0f; // matches the old hardcoded 25ms target -- no behavior change by default
-    knobs->wasapi_exclusive_mode = 0.0f; // Shared -- matches every prior build's only behavior (this field didn't exist before), and is the only choice that can't fail to open (see open_pcm_stream()'s own comment on Exclusive mode's fallback)
     knobs->active_voice_limit = 32.0f; // matches the last-measured-safe default -- live-adjustable from here
     knobs->block_size_frames = 128.0f; // matches the old hardcoded BUFFER_SIZE -- no behavior change by default
     knobs->record_enable = 0.0f;
@@ -6648,11 +6617,8 @@ static void poll_arpeggiator(HdsEngineState *engine, HdsSampleEngine *se, SynthV
 // --- Shared MIDI event dispatch ---
 // Everything about WHAT happens once a MIDI event is decoded -- Combi-lane channel fan-out,
 // Single Program/Sequencer dispatch, sustain-pedal polarity, pitch-bend/channel-pressure scaling,
-// Sequencer recording -- lives in this ONE function, called by both platforms' event readers
-// below. This is a pure refactor of what used to be process_midi_input's own inline body (see the
-// git history for the byte-identical original) -- extracted so the actual musical behavior is
-// written exactly once and can never drift between platforms; only HOW a raw MIDI event reaches
-// this function differs (ALSA sequencer events on Linux, raw WinMM bytes on Windows).
+// Sequencer recording -- lives in this ONE function, called by process_midi_input below once it
+// has decoded a raw ALSA sequencer event into this neutral shape.
 // `value`'s meaning depends on `type`, matching the exact units the ALSA sequencer already
 // delivered before this pass: NOTE_ON/NOTE_OFF -> velocity (0-127, data1=note 0-127); CC ->
 // raw CC value (0-127, data1=CC number 0-127); PITCH_BEND -> signed -8192..8191, 0=centered
@@ -6768,12 +6734,10 @@ static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, Hds
     }
 }
 
-#ifndef _WIN32
 // Keeps track of which ALSA sequencer client:port pairs are currently subscribed to feed our
 // own MIDI input port, so a full rescan (on startup, or when the user's midi_device selection
 // changes) can cleanly tear down exactly what it previously connected before reconnecting under
-// the new selection. ALSA-only -- WinMM has no client/port graph to track (see the Windows MIDI
-// platform shim further down).
+// the new selection.
 #define MAX_TRACKED_MIDI_SOURCES 32
 typedef struct {
     int count;
@@ -6879,8 +6843,8 @@ static void midi_autoconnect_scan(snd_seq_t *seq, int our_port, const char *midi
 // our_midi_port/midi_sources are only needed for hotplug auto-connect (SND_SEQ_EVENT_PORT_START/
 // PORT_EXIT) -- these arrive on the same event stream as NOTEON/NOTEOFF because main() subscribes
 // our port to the ALSA announce port at startup (see main()'s comment on that subscription). The
-// actual musical response to each decoded event is dispatch_midi_event() above, shared with
-// Windows -- this function's own job is purely "decode an ALSA sequencer event."
+// actual musical response to each decoded event is dispatch_midi_event() above -- this function's
+// own job is purely "decode an ALSA sequencer event."
 static void process_midi_input(HdsEngineState *engine, HdsSampleEngine *se, snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live) {
     snd_seq_event_t *ev = NULL;
     while (snd_seq_event_input_pending(seq_handle, 1) > 0) {
@@ -6915,98 +6879,6 @@ static void process_midi_input(HdsEngineState *engine, HdsSampleEngine *se, snd_
         snd_seq_free_event(ev);
     }
 }
-#else // _WIN32
-// --- Windows MIDI platform shim (WinMM) ---
-// WinMM's midiInOpen() takes a numeric device index (no client/port graph like ALSA's sequencer,
-// so there's nothing here to mirror MidiSourceList/midi_autoconnect_scan's multi-source tracking
-// -- exactly one device is opened at a time, matching what a synth like this actually needs). Its
-// callback (win32_midi_in_proc below) runs on a system-managed thread, NOT ours, and Microsoft's
-// own docs warn against calling any MIDI API function or doing extensive work from inside it --
-// so, exactly like this file's existing sample-disk-thread/record-writer-thread pattern, the
-// callback only pushes raw 3-byte messages into a small lock-free ring; process_midi_input (called
-// once per audio block from main(), same call site and cadence as the Linux version) drains that
-// ring on the audio thread and decodes each message into the same neutral shape dispatch_midi_
-// event() above expects -- so the actual musical response is the identical, shared code path.
-typedef struct { unsigned char status, data1, data2; } HdsRawMidiMsg;
-#define HDS_MIDI_RING_CAPACITY 1024
-static HdsRawMidiMsg g_win32_midi_ring[HDS_MIDI_RING_CAPACITY];
-static _Atomic uint32_t g_win32_midi_write_idx = 0, g_win32_midi_read_idx = 0;
-static HMIDIIN g_win32_midi_in = NULL;
-static UINT g_win32_midi_device_id = (UINT)-1;
-
-static void CALLBACK win32_midi_in_proc(HMIDIIN hMidiIn, UINT wMsg, DWORD_PTR dwInstance, DWORD_PTR dwParam1, DWORD_PTR dwParam2) {
-    (void)hMidiIn; (void)dwInstance; (void)dwParam2;
-    if (wMsg != MIM_DATA) return; // ignore MIM_OPEN/CLOSE/ERROR/LONGDATA -- this engine has no SysEx use
-    DWORD packed = (DWORD)dwParam1;
-    uint32_t w = atomic_load_explicit(&g_win32_midi_write_idx, memory_order_relaxed);
-    uint32_t next = (w + 1) % HDS_MIDI_RING_CAPACITY;
-    if (next == atomic_load_explicit(&g_win32_midi_read_idx, memory_order_acquire)) return; // ring full -- drop rather than block a system callback thread
-    g_win32_midi_ring[w] = (HdsRawMidiMsg){ (unsigned char)(packed & 0xFF), (unsigned char)((packed >> 8) & 0xFF), (unsigned char)((packed >> 16) & 0xFF) };
-    atomic_store_explicit(&g_win32_midi_write_idx, next, memory_order_release);
-}
-static bool win32_midi_ring_pop(HdsRawMidiMsg *out) {
-    uint32_t r = atomic_load_explicit(&g_win32_midi_read_idx, memory_order_relaxed);
-    if (r == atomic_load_explicit(&g_win32_midi_write_idx, memory_order_acquire)) return false;
-    *out = g_win32_midi_ring[r];
-    atomic_store_explicit(&g_win32_midi_read_idx, (r + 1) % HDS_MIDI_RING_CAPACITY, memory_order_release);
-    return true;
-}
-static void win32_midi_close(void) {
-    if (g_win32_midi_in) { midiInStop(g_win32_midi_in); midiInClose(g_win32_midi_in); g_win32_midi_in = NULL; }
-    g_win32_midi_device_id = (UINT)-1;
-}
-// device_name is free text, matching the exact "auto"/exact-name convention the ALSA side already
-// established: ""/"auto" picks the first available device (WinMM has no equivalent of ALSA's
-// "Midi Through" passthrough client to skip); anything else must match a device name exactly.
-static void win32_midi_open_matching(const char *device_name) {
-    win32_midi_close();
-    UINT n = midiInGetNumDevs();
-    if (n == 0) return;
-    bool auto_mode = (!device_name || device_name[0] == '\0' || strcmp(device_name, "auto") == 0);
-    UINT chosen = (UINT)-1;
-    for (UINT i = 0; i < n; i++) {
-        MIDIINCAPSA caps;
-        if (midiInGetDevCapsA(i, &caps, sizeof(caps)) != MMSYSERR_NOERROR) continue;
-        if (auto_mode || strcmp(caps.szPname, device_name) == 0) { chosen = i; break; }
-    }
-    if (chosen == (UINT)-1) return; // nothing matched -- stays closed, same silent best-effort behavior as ALSA autoconnect finding nothing
-    if (midiInOpen(&g_win32_midi_in, chosen, (DWORD_PTR)win32_midi_in_proc, 0, CALLBACK_FUNCTION) != MMSYSERR_NOERROR) { g_win32_midi_in = NULL; return; }
-    midiInStart(g_win32_midi_in);
-    g_win32_midi_device_id = chosen;
-}
-// Best-effort hotplug: WinMM has no live announce-port event stream like ALSA's, so this
-// approximates it by re-running the same match-and-open logic on a plain wall-clock cadence
-// (roughly once a second) rather than instantly on plug/unplug -- a real, if less immediate,
-// approximation of the Linux behavior, not a silent regression. Called from main()'s loop
-// alongside the existing live-device-reselect check.
-static void win32_midi_rescan_if_needed(const char *device_name) {
-    static double last_check_sec = 0.0;
-    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-    double now_sec = now.tv_sec + now.tv_nsec / 1e9;
-    if (now_sec - last_check_sec < 1.0) return;
-    last_check_sec = now_sec;
-    if (!g_win32_midi_in && midiInGetNumDevs() > 0) win32_midi_open_matching(device_name); // nothing was open (no match at startup, or the device was unplugged) -- try again
-}
-
-static void process_midi_input(HdsEngineState *engine, HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], MidiLiveState *midi_live) {
-    HdsRawMidiMsg m;
-    while (win32_midi_ring_pop(&m)) {
-        unsigned char status = m.status & 0xF0;
-        int midi_channel_1_16 = (m.status & 0x0F) + 1;
-        if (status == 0x90 || status == 0x80) { // Note On / Note Off (a Note On with velocity 0 counts as Note Off, standard MIDI convention, same as the ALSA side already applied)
-            bool is_note_on = (status == 0x90 && m.data2 > 0);
-            dispatch_midi_event(engine, se, is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, m.data1, m.data2, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
-        } else if (status == 0xB0) { // Control Change
-            dispatch_midi_event(engine, se, HDS_MIDI_CC, midi_channel_1_16, m.data1, m.data2, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
-        } else if (status == 0xE0) { // Pitch Bend -- 14-bit wire format (LSB, MSB), 0..16383, 8192=center
-            int bend14 = (int)m.data1 | ((int)m.data2 << 7);
-            dispatch_midi_event(engine, se, HDS_MIDI_PITCH_BEND, midi_channel_1_16, 0, bend14 - 8192, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
-        } else if (status == 0xD0) { // Channel Pressure (Aftertouch)
-            dispatch_midi_event(engine, se, HDS_MIDI_CHANNEL_PRESSURE, midi_channel_1_16, 0, m.data1, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
-        }
-    }
-}
-#endif // _WIN32
 // LFO Rate/Depth/Phase-as-mod-destination target -> LFO index mapping. Each of the three
 // destination "families" spans two disjoint target-number ranges -- the original LFO 1-4 slots
 // (14-17/18-21/28-31, from before LFO_COUNT grew to 16) and the LFO 5-16 slots appended after
@@ -8217,142 +8089,10 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
 }
 // --- Audio platform shim ---
 // HdsPcmStream/HdsStreamDirection are the ONLY audio-I/O types anything outside this shim (main()
-// included) ever names. On Linux, HdsPcmStream is literally snd_pcm_t (a type alias, zero
-// overhead, zero behavior change) and every function below is exactly the ALSA code that lived
-// here before this pass, unmodified. On Windows, HdsPcmStream wraps a miniaudio device (WASAPI)
-// -- see the "Windows audio platform shim" block right below for why and how.
-#ifdef _WIN32
-typedef struct HdsPcmStream HdsPcmStream;
-#else
+// included) ever names -- HdsPcmStream is literally snd_pcm_t (a type alias, zero overhead, zero
+// behavior change); every function below is exactly the ALSA code that has always lived here.
 typedef snd_pcm_t HdsPcmStream;
-#endif
 typedef enum { HDS_STREAM_PLAYBACK, HDS_STREAM_CAPTURE } HdsStreamDirection;
-
-#ifdef _WIN32
-// --- Windows audio platform shim (WASAPI via miniaudio) ---
-// main()'s loop is written around ALSA's synchronous, blocking snd_pcm_writei/readi: one call
-// per block that blocks until the device has taken (or produced) that many frames, which is also
-// what paces the whole engine to real time -- there's no separate clock/scheduler anywhere else
-// in this file. miniaudio's device I/O is the opposite shape: a callback that WASAPI invokes on
-// its own thread whenever it wants more/has more data. To keep main()'s loop, its real-time
-// pacing assumption, and every DSP/timing function downstream of it completely unchanged, a small
-// ring buffer (miniaudio's own ma_pcm_rb) sits between the two: the callback drains/fills it at
-// the device's own pace, and write_audio_block/read_capture_block below push/pull from it with a
-// short blocking wait, reproducing the same "block until the device has room/data" contract ALSA
-// already provided. Sized off the device's own ACTUAL negotiated period (known only once
-// ma_device_init() succeeds), not a pre-negotiation guess or latency_ms -- see open_pcm_stream()'s
-// own comment for why (it bridges polling-vs-callback jitter; the period WASAPI actually grants,
-// especially in Exclusive mode, can differ a lot from what was requested).
-struct HdsPcmStream {
-    ma_device device;
-    ma_pcm_rb rb;
-    int channels;
-    bool is_capture;
-    bool device_ok;
-    _Atomic uint32_t underrun_count; // incremented on the WASAPI callback thread (never fprintf's
-                                      // there -- see the comment below); read/reported from
-                                      // main()'s own loop, same cross-thread-counter pattern
-                                      // record_engine.ring.dropped_samples already uses.
-    ma_uint32 target_occupancy_frames; // see write_audio_block()'s own comment -- the steady-state
-                                        // depth writes are throttled to hover around, NOT the
-                                        // ring's full capacity (which exists purely as a transient-
-                                        // stall cushion, same role ALSA's own hardware ring plays).
-};
-
-static void hds_win_playback_callback(ma_device *device, void *output, const void *input, ma_uint32 frame_count) {
-    (void)input;
-    HdsPcmStream *s = (HdsPcmStream *)device->pUserData;
-    ma_uint32 remaining = frame_count;
-    ma_uint8 *out = (ma_uint8 *)output;
-    while (remaining > 0) {
-        ma_uint32 avail = remaining;
-        void *read_ptr;
-        if (ma_pcm_rb_acquire_read(&s->rb, &avail, &read_ptr) != MA_SUCCESS || avail == 0) break;
-        memcpy(out, read_ptr, (size_t)avail * (size_t)s->channels * sizeof(float));
-        ma_pcm_rb_commit_read(&s->rb, avail);
-        out += (size_t)avail * (size_t)s->channels * sizeof(float);
-        remaining -= avail;
-    }
-    if (remaining > 0) {
-        memset(out, 0, (size_t)remaining * (size_t)s->channels * sizeof(float)); // underrun -- silence, matching ALSA's own xrun-then-silence gap
-        // Diagnostic only, never fprintf here -- this runs on WASAPI's own real-time callback
-        // thread, and stdio can block/lock; a plain atomic increment is safe and cheap. Read and
-        // reported from main()'s loop instead (same cross-thread-counter pattern already used for
-        // record_engine.ring.dropped_samples) -- this was previously the one underrun path with
-        // zero diagnostics at all (write_audio_block()'s Windows branch only logs its own
-        // "ring stayed full" producer-side case, never this consumer-side "ring went empty" one,
-        // which is what actually produces an audible click).
-        atomic_fetch_add_explicit(&s->underrun_count, 1, memory_order_relaxed);
-    }
-}
-static void hds_win_capture_callback(ma_device *device, void *output, const void *input, ma_uint32 frame_count) {
-    (void)output;
-    HdsPcmStream *s = (HdsPcmStream *)device->pUserData;
-    ma_uint32 remaining = frame_count;
-    const ma_uint8 *in = (const ma_uint8 *)input;
-    while (remaining > 0) {
-        ma_uint32 avail = remaining;
-        void *write_ptr;
-        if (ma_pcm_rb_acquire_write(&s->rb, &avail, &write_ptr) != MA_SUCCESS || avail == 0) break; // ring full -- drop the rest of this block, matching ALSA capture overrun behavior (external input degrading to silence, never stalling)
-        memcpy(write_ptr, in, (size_t)avail * (size_t)s->channels * sizeof(float));
-        ma_pcm_rb_commit_write(&s->rb, avail);
-        in += (size_t)avail * (size_t)s->channels * sizeof(float);
-        remaining -= avail;
-    }
-}
-
-// device_name is free text, matching the exact same convention ALSA device names already use on
-// this engine's Devices tab ("" or "default" = system default; anything else is matched, best-
-// effort, against each enumerated device's own name) -- so Windows needs zero frontend changes to
-// pick a device: the same text field works, just against Windows device names instead of ALSA
-// ones.
-static ma_context g_hds_ma_context;
-static bool g_hds_ma_context_ok = false;
-static void hds_win_ensure_context(void) {
-    if (g_hds_ma_context_ok) return;
-    g_hds_ma_context_ok = (ma_context_init(NULL, 0, NULL, &g_hds_ma_context) == MA_SUCCESS);
-}
-static bool hds_win_find_device_id(const char *device_name, bool capture, ma_device_id *out_id) {
-    hds_win_ensure_context();
-    if (!g_hds_ma_context_ok) return false;
-    if (!device_name || device_name[0] == '\0' || strcmp(device_name, "default") == 0) return false; // caller passes NULL pDeviceID -> system default
-    ma_device_info *playback_infos, *capture_infos; ma_uint32 playback_count, capture_count;
-    if (ma_context_get_devices(&g_hds_ma_context, &playback_infos, &playback_count, &capture_infos, &capture_count) != MA_SUCCESS) return false;
-    ma_device_info *infos = capture ? capture_infos : playback_infos;
-    ma_uint32 count = capture ? capture_count : playback_count;
-    for (ma_uint32 i = 0; i < count; i++) {
-        if (strstr(infos[i].name, device_name) != NULL) { *out_id = infos[i].id; return true; }
-    }
-    return false;
-}
-
-// `synth_engine.exe --list-devices` (see main()'s CLI handling below): prints every real
-// output/input/MIDI-input device name this machine currently has, one per line, grouped under a
-// bracketed section header. frontend.py's Devices tab populates its combo boxes this way on
-// Windows instead of shelling out to the ALSA-only `aplay -L`/`arecord -L`/`aconnect -i` tools it
-// already uses on Linux (which don't exist here and would otherwise silently leave every combo
-// showing nothing but its single "default"/"Auto" fallback entry, making device selection look
-// like it does nothing). Reuses the exact same enumeration calls hds_win_find_device_id() and the
-// WinMM MIDI shim's own win32_midi_open_matching() already use -- this is a read-only listing of
-// the same data, not a new enumeration mechanism.
-static void hds_win_print_device_list(void) {
-    hds_win_ensure_context();
-    printf("[output]\n");
-    ma_device_info *playback_infos = NULL, *capture_infos = NULL; ma_uint32 playback_count = 0, capture_count = 0;
-    bool got_devices = g_hds_ma_context_ok &&
-        ma_context_get_devices(&g_hds_ma_context, &playback_infos, &playback_count, &capture_infos, &capture_count) == MA_SUCCESS;
-    if (got_devices) for (ma_uint32 i = 0; i < playback_count; i++) printf("%s\n", playback_infos[i].name);
-    printf("[input]\n");
-    if (got_devices) for (ma_uint32 i = 0; i < capture_count; i++) printf("%s\n", capture_infos[i].name);
-    printf("[midi]\n");
-    UINT midi_count = midiInGetNumDevs();
-    for (UINT i = 0; i < midi_count; i++) {
-        MIDIINCAPSA caps;
-        if (midiInGetDevCapsA(i, &caps, sizeof(caps)) == MMSYSERR_NOERROR) printf("%s\n", caps.szPname);
-    }
-    fflush(stdout);
-}
-#endif // _WIN32
 
 // DIAGNOSTIC: active_voices_count and render_ms are purely informational (see their computation
 // in main()'s loop) -- passed through so an underrun/xrun can be reported alongside what the
@@ -8364,56 +8104,6 @@ static void write_audio_block(HdsPcmStream *pcm_handle, const float *buffer, int
     // failed (e.g. a USB audio interface was physically unplugged) -- silently drop this block
     // rather than crash; main() will keep retrying the device on the next control packet.
     if (!pcm_handle) return;
-#ifdef _WIN32
-    if (!pcm_handle->device_ok) return;
-    uint32_t written = 0;
-    int spin_guard = 0;
-    while (written < frame_count && g_synth_running) {
-        // BUG FIX (Windows latency + post-stall "drain delay"): writing eagerly whenever the ring
-        // had ANY room (the old behavior here) let occupancy creep up toward the ring's full
-        // capacity in steady state, since nothing throttled it below that -- the ring's whole
-        // depth (sized generously as a transient-stall cushion, see open_pcm_stream()'s own
-        // comment) became the ADDED latency sitting in front of WASAPI's own hardware buffer,
-        // continuously, not just during a stall. It also meant that after any real stall, the
-        // render loop (running far faster than real time) would refill the ring all the way back
-        // to full as fast as it could -- an audible "glitch, then extra delay that has to drain
-        // back down" on top of the original glitch. Waiting here once occupancy has already
-        // reached target_occupancy_frames (one real period, not the whole cushion) keeps the ring
-        // hovering near that single-period depth in steady state -- matching ALSA's own blocking-
-        // write behavior -- and caps how far a stall can push it ahead, since a write is never
-        // released faster than the ring can actually drain toward that target.
-        if (ma_pcm_rb_available_read(&pcm_handle->rb) >= pcm_handle->target_occupancy_frames) {
-            if (++spin_guard > 200) {
-                fprintf(stderr, "[audio] WASAPI ring stayed backed up past target occupancy -- dropping the rest of this block -- %d active voices, last render_audio_block took %.3fms\n",
-                        active_voices_count, render_ms);
-                break;
-            }
-            struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
-            continue;
-        }
-        ma_uint32 avail = frame_count - written;
-        void *write_ptr;
-        if (ma_pcm_rb_acquire_write(&pcm_handle->rb, &avail, &write_ptr) == MA_SUCCESS && avail > 0) {
-            memcpy(write_ptr, buffer + ((size_t)written * (size_t)channels), (size_t)avail * (size_t)channels * sizeof(float));
-            ma_pcm_rb_commit_write(&pcm_handle->rb, avail);
-            written += avail;
-            spin_guard = 0;
-        } else {
-            // Ring genuinely full (playback callback hasn't drained it at all, or a real stall) --
-            // brief wait and retry, mirroring ALSA's own blocking-until-room semantics. Bail after
-            // ~200ms so a truly stalled device (unplugged mid-block) can't hang the audio thread
-            // forever. This is the PRODUCER side running dry of room -- distinct from
-            // hds_win_playback_callback()'s own underrun_count, which is the CONSUMER side running
-            // dry of data (the actual click).
-            if (++spin_guard > 200) {
-                fprintf(stderr, "[audio] WASAPI ring stayed full -- dropping the rest of this block -- %d active voices, last render_audio_block took %.3fms\n",
-                        active_voices_count, render_ms);
-                break;
-            }
-            struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
-        }
-    }
-#else
     snd_pcm_uframes_t written = 0;
     while (written < frame_count && g_synth_running) {
         snd_pcm_sframes_t res = snd_pcm_writei(pcm_handle, buffer + (written * (size_t)channels), frame_count - written);
@@ -8424,32 +8114,19 @@ static void write_audio_block(HdsPcmStream *pcm_handle, const float *buffer, int
         }
         else { written += res; }
     }
-#endif
 }
 
 // Reads up to block_size frames of capture audio, interleaved, `channels` per frame -- the exact
 // shape main()'s loop already builds capture_buffer around. Returns the number of frames actually
 // filled; the caller (main()) zero-fills the remainder on a short read, same as it always has.
-// This is a NEW named function (replacing what used to be a 3-line inline snd_pcm_readi call in
-// main()) purely so main() itself never needs to know which platform it's running on -- see the
-// "Windows needs a completely different read path than a bare snd_pcm_readi call" reasoning in
-// the shim above.
+// A NEW named function (replacing what used to be a 3-line inline snd_pcm_readi call in main())
+// so device I/O stays isolated behind this shim rather than inlined into main()'s own loop.
 static uint32_t read_capture_block(HdsPcmStream *pcm_capture_handle, float *capture_buffer, int channels, uint32_t block_size) {
     if (!pcm_capture_handle) return 0;
-#ifdef _WIN32
-    if (!pcm_capture_handle->device_ok) return 0;
-    ma_uint32 avail = block_size;
-    void *read_ptr;
-    if (ma_pcm_rb_acquire_read(&pcm_capture_handle->rb, &avail, &read_ptr) != MA_SUCCESS) return 0;
-    memcpy(capture_buffer, read_ptr, (size_t)avail * (size_t)channels * sizeof(float));
-    ma_pcm_rb_commit_read(&pcm_capture_handle->rb, avail);
-    return (uint32_t)avail;
-#else
     (void)channels;
     snd_pcm_sframes_t got = snd_pcm_readi(pcm_capture_handle, capture_buffer, block_size);
     if (got < 0) { snd_pcm_recover(pcm_capture_handle, (int)got, 0); return 0; }
     return (uint32_t)got;
-#endif
 }
 
 // Closes and frees a stream opened by open_pcm_stream() -- a NEW named function replacing
@@ -8457,12 +8134,7 @@ static uint32_t read_capture_block(HdsPcmStream *pcm_capture_handle, float *capt
 // Safe to call with NULL.
 static void close_pcm_stream(HdsPcmStream *handle) {
     if (!handle) return;
-#ifdef _WIN32
-    ma_device_uninit(&handle->device);
-    free(handle);
-#else
     snd_pcm_close(handle);
-#endif
 }
 
 // Queries how many capture channels a device actually offers (opens it briefly just to ask, then
@@ -8471,18 +8143,6 @@ static void close_pcm_stream(HdsPcmStream *handle) {
 // guess. Falls back to 2 (plain stereo) on any failure -- an unopenable device will fail again,
 // loudly, when open_pcm_stream() itself tries.
 static int query_device_channel_count(const char *device_name) {
-#ifdef _WIN32
-    hds_win_ensure_context();
-    if (!g_hds_ma_context_ok) return 2;
-    ma_device_id id; bool have_id = hds_win_find_device_id(device_name, true, &id);
-    ma_device_info info;
-    if (ma_context_get_device_info(&g_hds_ma_context, ma_device_type_capture, have_id ? &id : NULL, &info) != MA_SUCCESS) return 2;
-    ma_uint32 max_channels = 2;
-    for (ma_uint32 f = 0; f < info.nativeDataFormatCount; f++) if (info.nativeDataFormats[f].channels > max_channels) max_channels = info.nativeDataFormats[f].channels;
-    if (max_channels < 1) max_channels = 1;
-    if (max_channels > (ma_uint32)RECORD_MAX_CHANNELS) max_channels = (ma_uint32)RECORD_MAX_CHANNELS;
-    return (int)max_channels;
-#else
     snd_pcm_t *probe = NULL;
     if (snd_pcm_open(&probe, device_name, SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK) < 0) return 2;
     snd_pcm_hw_params_t *hw_params = NULL;
@@ -8500,7 +8160,6 @@ static int query_device_channel_count(const char *device_name) {
     }
     snd_pcm_close(probe);
     return result;
-#endif
 }
 
 // Symmetric with query_device_channel_count() above, but for the playback stream -- used to size
@@ -8509,18 +8168,6 @@ static int query_device_channel_count(const char *device_name) {
 // interface's extra outputs need to actually be reachable, not just its first stereo pair. Falls
 // back to 2 (plain stereo) on any failure, same convention as the input side.
 static int query_output_device_channel_count(const char *device_name) {
-#ifdef _WIN32
-    hds_win_ensure_context();
-    if (!g_hds_ma_context_ok) return 2;
-    ma_device_id id; bool have_id = hds_win_find_device_id(device_name, false, &id);
-    ma_device_info info;
-    if (ma_context_get_device_info(&g_hds_ma_context, ma_device_type_playback, have_id ? &id : NULL, &info) != MA_SUCCESS) return 2;
-    ma_uint32 max_channels = 2;
-    for (ma_uint32 f = 0; f < info.nativeDataFormatCount; f++) if (info.nativeDataFormats[f].channels > max_channels) max_channels = info.nativeDataFormats[f].channels;
-    if (max_channels < 1) max_channels = 1;
-    if (max_channels > (ma_uint32)OUTPUT_MAX_CHANNELS) max_channels = (ma_uint32)OUTPUT_MAX_CHANNELS;
-    return (int)max_channels;
-#else
     snd_pcm_t *probe = NULL;
     if (snd_pcm_open(&probe, device_name, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) return 2;
     snd_pcm_hw_params_t *hw_params = NULL;
@@ -8538,7 +8185,6 @@ static int query_output_device_channel_count(const char *device_name) {
     }
     snd_pcm_close(probe);
     return result;
-#endif
 }
 
 // (Re)opens a float PCM stream by device name, closing *handle first if it was already open.
@@ -8550,108 +8196,7 @@ static int query_output_device_channel_count(const char *device_name) {
 // return values at all -- an unavailable "default" device (no sound card, no PulseAudio/ALSA
 // routing) left pcm_handle uninitialized/unusable and the very first snd_pcm_writei() call
 // would segfault or hang instead of failing with a clear message.
-static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, HdsPcmStream **handle, float latency_ms, int channels, bool wasapi_exclusive) {
-#ifdef _WIN32
-    if (*handle) { close_pcm_stream(*handle); *handle = NULL; }
-    HdsPcmStream *s = (HdsPcmStream *)calloc(1, sizeof(HdsPcmStream));
-    if (!s) return false;
-    s->channels = channels; s->is_capture = (stream == HDS_STREAM_CAPTURE);
-
-    ma_device_id chosen_id; bool have_id = hds_win_find_device_id(device_name, s->is_capture, &chosen_id);
-    ma_device_config config = ma_device_config_init(s->is_capture ? ma_device_type_capture : ma_device_type_playback);
-    if (s->is_capture) {
-        config.capture.format = ma_format_f32; config.capture.channels = (ma_uint32)channels;
-        config.capture.pDeviceID = have_id ? &chosen_id : NULL;
-        config.capture.shareMode = wasapi_exclusive ? ma_share_mode_exclusive : ma_share_mode_shared;
-        config.dataCallback = hds_win_capture_callback;
-    } else {
-        config.playback.format = ma_format_f32; config.playback.channels = (ma_uint32)channels;
-        config.playback.pDeviceID = have_id ? &chosen_id : NULL;
-        config.playback.shareMode = wasapi_exclusive ? ma_share_mode_exclusive : ma_share_mode_shared;
-        config.dataCallback = hds_win_playback_callback;
-    }
-    config.sampleRate = SAMPLE_RATE;
-    config.periodSizeInMilliseconds = (ma_uint32)fmaxf(1.0f, latency_ms);
-    config.pUserData = s;
-    // BUG FIX (Windows Exclusive-mode crackle): without this, miniaudio never registers its
-    // WASAPI callback thread with MMCSS at all (ma_to_usage_string__wasapi() returns NULL for
-    // the default ma_wasapi_usage_default, so its own internal AvSetMmThreadCharacteristicsA
-    // call is skipped entirely) -- the callback thread runs at a plain Windows priority CLASS
-    // with no real-time scheduling guarantee. Shared mode tolerates that because the Windows
-    // audio engine's own mixer sits between us and the hardware, absorbing a late callback;
-    // Exclusive mode hands the hardware directly to this thread with none of that safety net, so
-    // even a brief preemption by ordinary background activity is enough to underrun -- exactly
-    // the "crackle got worse specifically in Exclusive mode" symptom. "Pro Audio" is the standard
-    // MMCSS task class for this (same one Windows' own low-latency audio apps register under),
-    // giving the callback thread guaranteed scheduling quantum instead of just a priority hint.
-    config.wasapi.usage = ma_wasapi_usage_pro_audio;
-
-    // Exclusive mode fails outright at ma_device_init() if the device/driver doesn't actually
-    // support it (miniaudio's own documented behavior -- it never silently falls back on its
-    // own). Retry once in Shared mode rather than leaving the caller with no audio at all; a
-    // second failure past that point is a real "can't open this device" error, not an
-    // Exclusive-mode-specific one.
-    if (ma_device_init(NULL, &config, &s->device) != MA_SUCCESS) {
-        if (wasapi_exclusive) {
-            fprintf(stderr, "%s device '%s' failed to open in Exclusive mode -- falling back to Shared\n", s->is_capture ? "Input" : "Output", device_name);
-            if (s->is_capture) config.capture.shareMode = ma_share_mode_shared; else config.playback.shareMode = ma_share_mode_shared;
-        }
-        if (!wasapi_exclusive || ma_device_init(NULL, &config, &s->device) != MA_SUCCESS) {
-            fprintf(stderr, "%s device '%s' failed to open\n", s->is_capture ? "Input" : "Output", device_name);
-            free(s);
-            *handle = NULL;
-            return false;
-        }
-    }
-
-    // BUG FIX (Windows underruns even at idle, 0 voices): the ring used to be sized BEFORE
-    // ma_device_init() off a guessed constant (first BUFFER_SIZE*2, before that latency_ms*4) --
-    // but the period WASAPI actually grants (device.playback/capture.internalPeriodSizeInFrames,
-    // only known once ma_device_init() succeeds) can differ substantially from what was
-    // requested, especially in Exclusive mode where the DEVICE dictates which periods are even
-    // available at all, not the request. If the real negotiated period is close to or bigger than
-    // whatever fixed guess the ring used, the callback thread structurally can never be kept fed
-    // -- underruns climb continuously even rendering pure silence, since it's not a speed problem
-    // at all, it's the ring being the wrong size for what WASAPI is actually asking for. Now
-    // sized off the real, post-negotiation period every time (including on a live Shared<->
-    // Exclusive switch, since that's a full reopen through this same function) instead of a
-    // pre-negotiation guess.
-    ma_uint32 actual_period_frames = s->is_capture ? s->device.capture.internalPeriodSizeInFrames : s->device.playback.internalPeriodSizeInFrames;
-    if (actual_period_frames == 0) actual_period_frames = (ma_uint32)BUFFER_SIZE; // defensive: some backends/paths may not populate this -- BUFFER_SIZE is still a sane worst-case single-write size
-    ma_uint32 rb_frames = actual_period_frames * 4;
-    s->target_occupancy_frames = actual_period_frames; // the ring's *resting* depth -- see write_audio_block()'s own comment
-
-    // DIAGNOSTIC: every previous fix only ever touched the software ring sitting IN FRONT OF
-    // WASAPI's own hardware buffer -- none of them ever measured what WASAPI itself actually
-    // granted for that buffer. If the real negotiated period/buffer here is far bigger than
-    // latency_ms (a real possibility -- some drivers/devices enforce their own floor regardless
-    // of what's requested; Bluetooth output is the extreme case, with 100ms+ baked into the
-    // transport itself, no software fix reaches that) then every ring-side change is downstream
-    // of a bottleneck that was never actually measured. Logged once per open so a report of "no
-    // change" can be checked against real numbers instead of guessed at again.
-    ma_uint32 actual_buffer_frames = s->is_capture ? s->device.wasapi.actualBufferSizeInFramesCapture : s->device.wasapi.actualBufferSizeInFramesPlayback;
-    fprintf(stderr, "[audio] %s opened (%s): requested %.1fms, WASAPI granted period=%u frames (%.1fms), full buffer=%u frames (%.1fms)\n",
-            s->is_capture ? "Input" : "Output", wasapi_exclusive ? "Exclusive" : "Shared", (double)latency_ms,
-            actual_period_frames, (double)actual_period_frames * 1000.0 / SAMPLE_RATE,
-            actual_buffer_frames, (double)actual_buffer_frames * 1000.0 / SAMPLE_RATE);
-    if (ma_pcm_rb_init(ma_format_f32, (ma_uint32)channels, rb_frames, NULL, NULL, &s->rb) != MA_SUCCESS) {
-        fprintf(stderr, "%s device '%s': failed to allocate its internal ring buffer\n", s->is_capture ? "Input" : "Output", device_name);
-        ma_device_uninit(&s->device); free(s);
-        *handle = NULL;
-        return false;
-    }
-
-    if (ma_device_start(&s->device) != MA_SUCCESS) {
-        fprintf(stderr, "%s device '%s' failed to start\n", s->is_capture ? "Input" : "Output", device_name);
-        ma_device_uninit(&s->device); ma_pcm_rb_uninit(&s->rb); free(s);
-        *handle = NULL;
-        return false;
-    }
-    s->device_ok = true;
-    *handle = s;
-    return true;
-#else
-    (void)wasapi_exclusive; // WASAPI-only concept, see the field's own comment on SynthSharedControls
+static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, HdsPcmStream **handle, float latency_ms, int channels) {
     if (*handle) { snd_pcm_close(*handle); *handle = NULL; }
     snd_pcm_stream_t alsa_stream = (stream == HDS_STREAM_PLAYBACK) ? SND_PCM_STREAM_PLAYBACK : SND_PCM_STREAM_CAPTURE;
     int err = snd_pcm_open(handle, device_name, alsa_stream, 0);
@@ -8680,7 +8225,6 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
         return false;
     }
     return true;
-#endif
 }
 
 // --- WAV recording (Recording tab) ---
@@ -9212,38 +8756,13 @@ int main(int argc, char **argv) {
     assert_fm_algorithms_acyclic();
     signal(SIGINT, handle_sigint);
 
-#ifdef _WIN32
-    // Handled before anything else starts (OSC server, audio devices, etc.) -- this is a pure
-    // one-shot query mode frontend.py spawns and reads stdout from, never a real synth session.
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--list-devices") == 0) { hds_win_print_device_list(); return 0; }
-    }
-
-    // BUG FIX (Windows "crunchy" audio / underruns): write_audio_block()'s WASAPI branch waits
-    // for ring room via nanosleep(1ms) retries when the (now deliberately small, see
-    // open_pcm_stream()'s own comment) ring is momentarily full. MinGW's nanosleep() on Windows
-    // bottoms out on Sleep(), which is bound by the OS's system timer resolution -- by default
-    // ~15.6ms, not 1ms, on most Windows installs, unless a process explicitly asks for better.
-    // Without this call, every "1ms" retry could actually take up to ~15ms, meaning the render
-    // thread can stall over 10x longer than intended whenever the ring fills -- long enough for
-    // WASAPI's own callback to drain it dry and zero-fill (an audible click/crackle) before the
-    // render thread wakes back up. This is very likely why shrinking the ring (the previous fix,
-    // needed to stop double-buffering latency) traded "laggy" for "crunchy": the ring's now
-    // small enough that it empties fast, and this timer-resolution gap was the thing stopping the
-    // render thread from refilling it in time. timeBeginPeriod(1) requests 1ms system timer
-    // resolution for this whole process (matched by timeEndPeriod(1) at clean shutdown, near
-    // main()'s own return 0 below) -- the standard, documented fix for exactly this class of
-    // Windows audio-glitch bug.
-    timeBeginPeriod(1);
-#endif
-
     // OSC transport configuration -- see the "OSC Control Protocol" comment above OSC_PARAMS[].
     // Two independent, explicitly-configured ports (not "reply to whoever last sent a message"),
     // matching how real OSC tools (TouchOSC, Max, Pd, python-osc) already expect to be wired up.
     int osc_listen_port = 9000;
     const char *osc_reply_host = "127.0.0.1";
     int osc_reply_port = 9001;
-    // --output-device/--input-device: override the "default" ALSA/miniaudio device name
+    // --output-device/--input-device: override the "default" ALSA device name
     // init_default_controls() otherwise starts with. Exists specifically because an output
     // device that fails to open is FATAL at startup (see the open_pcm_stream() call below --
     // the process exits before the OSC server has a chance to receive any /hds/device/output
@@ -9298,7 +8817,7 @@ int main(int argc, char **argv) {
     // actually reachable, not just its first pair. Symmetric with the input side just below.
     int detected_output_channels = query_output_device_channel_count(active_knobs.output_device);
     HdsPcmStream *pcm_handle = NULL;
-    if (!open_pcm_stream(active_knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels, active_knobs.wasapi_exclusive_mode != 0.0f)) {
+    if (!open_pcm_stream(active_knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels)) {
         fprintf(stderr, "Cannot continue without an output device.\n");
         lo_address_free(osc_reply_addr); lo_server_free(osc_server); return 1;
     }
@@ -9313,11 +8832,10 @@ int main(int argc, char **argv) {
     // actually reachable, not just its first two.
     HdsPcmStream *pcm_capture_handle = NULL;
     int detected_input_channels = query_device_channel_count(active_knobs.input_device);
-    open_pcm_stream(active_knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels, active_knobs.wasapi_exclusive_mode != 0.0f);
+    open_pcm_stream(active_knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels);
     char applied_input_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
     float applied_audio_latency_ms = active_knobs.audio_latency_ms;
-    bool applied_wasapi_exclusive_mode = active_knobs.wasapi_exclusive_mode != 0.0f;
 
     // Recording engine: `record_ring`/writer thread state must be static -- RecordEngine embeds
     // a RECORD_RING_CAPACITY(1<<22)-float ring buffer (16MB), far too large for main()'s stack.
@@ -9334,9 +8852,6 @@ int main(int argc, char **argv) {
     bool applied_record_enable = false;
     int recorder_input_channels_at_start = 0; // detected_input_channels when recording began, for the mid-take device-change safety check
     uint64_t record_last_reported_drops = 0;
-#ifdef _WIN32
-    uint32_t win_audio_last_reported_underruns = 0; // see hds_win_playback_callback()'s own underrun_count comment
-#endif
 
     // Sample-streaming disk thread (DFD/WAVE_SAMPLE) -- same "started once, lives for the
     // process's lifetime, talked to only via atomics" pattern as the recording writer thread
@@ -9347,7 +8862,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[sample] failed to start disk streaming thread -- WAVE_SAMPLE playback will be unavailable this session\n");
     }
 
-#ifndef _WIN32
     snd_seq_t *seq_handle;
     int seq_err = snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
     if (seq_err < 0) {
@@ -9367,13 +8881,6 @@ int main(int argc, char **argv) {
 
     MidiSourceList midi_sources = {0};
     midi_autoconnect_scan(seq_handle, our_midi_port, active_knobs.midi_device, &midi_sources);
-#else
-    // Windows: WinMM has no ALSA-sequencer-subsystem-level failure mode to guard against here
-    // (midiInGetNumDevs()/midiInOpen() are always callable APIs; "no device matched" is already
-    // the same silent, best-effort outcome ALSA's own autoconnect gives when nothing matches) --
-    // so, unlike the ALSA open above, there is no fatal early-return case on this platform.
-    win32_midi_open_matching(active_knobs.midi_device);
-#endif
     MidiLiveState midi_live = {0}; // pitch_bend/channel_pressure/cc[] all start at their "centered/off" 0.0
     char applied_midi_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
@@ -9413,12 +8920,8 @@ int main(int argc, char **argv) {
         // Live device switching: the Audio tab writes these as plain fields on the same control
         // packet as every other knob. Only reopen the stream whose name actually changed.
         // A latency change reopens BOTH streams (it's not tied to one device name), since
-        // snd_pcm_set_params' latency target can only be applied at stream-open time. A live
-        // Shared<->Exclusive WASAPI toggle needs exactly the same reopen (Windows-only in
-        // effect, but reads harmlessly as always-false on Linux -- see wasapi_exclusive_mode's
-        // own comment).
-        bool latency_changed = active_knobs.audio_latency_ms != applied_audio_latency_ms
-            || (active_knobs.wasapi_exclusive_mode != 0.0f) != applied_wasapi_exclusive_mode;
+        // snd_pcm_set_params' latency target can only be applied at stream-open time.
+        bool latency_changed = active_knobs.audio_latency_ms != applied_audio_latency_ms;
         // Defensive: an empty device name is never a real selection (unlike midi_device, which
         // has a genuine "auto" meaning for ""; see midi_client_should_autoconnect) -- it can only
         // mean a control packet arrived with this field not meaningfully set yet. Treat it as "no
@@ -9430,42 +8933,35 @@ int main(int argc, char **argv) {
             // Re-detect channel count too -- a device switch can mean a completely different
             // interface with a different channel count, not just a renamed same one.
             int candidate_output_channels = query_output_device_channel_count(active_knobs.output_device);
-            if (open_pcm_stream(active_knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, candidate_output_channels, active_knobs.wasapi_exclusive_mode != 0.0f)) {
+            if (open_pcm_stream(active_knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, candidate_output_channels)) {
                 detected_output_channels = candidate_output_channels;
                 snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
             } else {
                 // Failed -- fall back to the last device that was actually working rather than
                 // leaving pcm_handle NULL, and stop retrying this same bad name every block.
-                open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels, active_knobs.wasapi_exclusive_mode != 0.0f);
+                open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels);
                 snprintf(active_knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", applied_output_device);
             }
         } else if (latency_changed) {
             // Latency-only change with no valid device name yet -- still worth reapplying to
             // whatever's already open rather than silently doing nothing.
-            open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels, active_knobs.wasapi_exclusive_mode != 0.0f);
+            open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels);
         }
         bool input_device_valid = active_knobs.input_device[0] != '\0';
         if (input_device_valid && (latency_changed || strncmp(active_knobs.input_device, applied_input_device, AUDIO_DEVICE_NAME_LEN) != 0)) {
             // Re-detect channel count too -- a device switch can mean a completely different
             // interface with a different channel count, not just a renamed same one.
             detected_input_channels = query_device_channel_count(active_knobs.input_device);
-            open_pcm_stream(active_knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels, active_knobs.wasapi_exclusive_mode != 0.0f); // best-effort
+            open_pcm_stream(active_knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels); // best-effort
             snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
         }
-        if (latency_changed) { applied_audio_latency_ms = active_knobs.audio_latency_ms; applied_wasapi_exclusive_mode = active_knobs.wasapi_exclusive_mode != 0.0f; }
+        if (latency_changed) { applied_audio_latency_ms = active_knobs.audio_latency_ms; }
         if (strncmp(active_knobs.midi_device, applied_midi_device, AUDIO_DEVICE_NAME_LEN) != 0) {
             // Selection changed live from the Audio tab -- drop whatever was auto-connected
             // under the old selection and rescan under the new one.
-#ifndef _WIN32
             midi_autoconnect_scan(seq_handle, our_midi_port, active_knobs.midi_device, &midi_sources);
-#else
-            win32_midi_open_matching(active_knobs.midi_device);
-#endif
             snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
         }
-#ifdef _WIN32
-        win32_midi_rescan_if_needed(active_knobs.midi_device); // best-effort hotplug approximation -- see the shim's own comment on why this is periodic, not event-driven, on Windows
-#endif
 
         // Sample Bank: reconciliation now happens once per "/hds/zone/upsert"/"/hds/zone/remove"
         // OSC message (dispatched inline inside the lo_server_recv_noblock() drain above, at
@@ -9476,11 +8972,7 @@ int main(int argc, char **argv) {
         // block (see its #define for the real-time trade-off this bounds).
         drain_pending_sample_loads(&g_sample_engine);
 
-#ifndef _WIN32
         process_midi_input(&g_engine, &g_sample_engine, seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live);
-#else
-        process_midi_input(&g_engine, &g_sample_engine, voices, &active_knobs, global_lfo_phases, mono_stacks, &midi_live);
-#endif
         seq_playback_midi_events(&g_engine, &g_sample_engine, voices, &active_knobs, global_lfo_phases, &mono_stacks[SINGLE_PROGRAM_SLOT], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets SINGLE_PROGRAM_SLOT)
 
         // block_size/voice_limit are computed fresh every iteration since both are live,
@@ -9603,22 +9095,6 @@ int main(int argc, char **argv) {
             record_last_reported_drops = record_dropped_now;
         }
 
-#ifdef _WIN32
-        // DIAGNOSTIC (Windows underrun/click tracking): mirrors the ALSA branch's own xrun log
-        // message below (same active_voices_count/render_ms context), for exactly the audible-
-        // click path that previously had zero visibility -- see hds_win_playback_callback()'s
-        // own underrun_count comment for why this is a polled counter instead of fprintf'ing
-        // directly from that real-time callback thread.
-        if (pcm_handle) {
-            uint32_t win_underruns_now = atomic_load_explicit(&pcm_handle->underrun_count, memory_order_relaxed);
-            if (win_underruns_now != win_audio_last_reported_underruns) {
-                fprintf(stderr, "[audio] WASAPI underrun (click) -- %u total so far, %d active voices, last render_audio_block took %.3fms\n",
-                        win_underruns_now, active_voices_count, render_ms);
-                win_audio_last_reported_underruns = win_underruns_now;
-            }
-        }
-#endif
-
         vu_decimator++;
         if (vu_decimator >= 12) {
             bool engine_active = atomic_load_explicit(&record_engine.is_active, memory_order_acquire);
@@ -9660,15 +9136,8 @@ int main(int argc, char **argv) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) free(g_seq_audio[l].pcm);
     lo_server_free(osc_server);
     lo_address_free(osc_reply_addr);
-#ifndef _WIN32
     snd_seq_close(seq_handle);
-#else
-    win32_midi_close();
-#endif
     close_pcm_stream(pcm_handle);
     if (pcm_capture_handle) close_pcm_stream(pcm_capture_handle);
-#ifdef _WIN32
-    timeEndPeriod(1); // matches timeBeginPeriod(1) near the top of main()
-#endif
     return 0;
 }
