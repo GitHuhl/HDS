@@ -217,7 +217,16 @@ pkgs.mkShell {
     # real one to dispatch to at all), normally scanned from /usr/share/glvnd/egl_vendor.d/ on an
     # FHS system, which doesn't exist on NixOS. NixOS's own /run/opengl-driver carries this same
     # manifest at share/glvnd/egl_vendor.d/ -- point GLVND's own directory-scan variable at it.
+    #
+    # BUG FIX: __EGL_VENDOR_LIBRARY_DIRS alone did NOT fix it -- confirmed the manifest itself is
+    # real and valid (a real libEGL_mesa.so.0 in the Nix store), so GLVND's directory-scan mode
+    # specifically isn't taking effect in this libglvnd build. __EGL_VENDOR_LIBRARY_FILENAMES (an
+    # explicit, colon-separated list of the exact JSON files -- the older, more universally
+    # honored of the two GLVND env vars) is set alongside it, computed from a real shell glob at
+    # shell-entry time (this can't be done in the Nix expression itself -- /run/opengl-driver is a
+    # runtime symlink target, invisible at Nix eval time).
     export __EGL_VENDOR_LIBRARY_DIRS="/run/opengl-driver/share/glvnd/egl_vendor.d"
+    export __EGL_VENDOR_LIBRARY_FILENAMES="$(echo /run/opengl-driver/share/glvnd/egl_vendor.d/*.json 2>/dev/null | tr ' ' ':')"
 
     # Cross-built aarch64 libraries live under content-addressed Nix store paths, not a fixed
     # relative directory like $(WIN_DEPS) -- export their include/lib paths here so the Makefile's
