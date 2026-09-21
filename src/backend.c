@@ -222,6 +222,11 @@ typedef struct {
     // at the selected note division. See resolve_lfo_rate_hz(), the single place both Free and
     // Synced modes resolve to an actual Hz value.
     float tempo_sync_division;
+    // Curve/Drive: one physical pot, reinterpreted by wave_type -- bipolar Curve (-1..1, center
+    // detent = linear) for Triangle/Saw, unipolar Drive/Saturation (0..1, default 0 = clean) for
+    // Sine, ignored for Square/Off. See apply_wave_curve()/apply_sine_drive() and
+    // lookup_lfo_waveform().
+    float curve_drive;
 } PackLfoParams;
 
 // A single filter's parameters: State-Variable Filter (SVF) core, cutoff/resonance/exclusive
@@ -772,6 +777,15 @@ typedef struct {
     float vco2_vel_to_amp;
     float vco3_vel_to_amp;
     float vco4_vel_to_amp;
+
+    // Curve/Drive: one physical pot per oscillator, reinterpreted by that oscillator's own Shape
+    // -- bipolar Curve (-1..1, center detent = perfectly linear ramp/slope) for Sawtooth/
+    // Triangle, unipolar Drive/Saturation (0..1, default 0 = pure clean sine) for Sine, ignored
+    // for every other shape. See apply_wave_curve()/apply_sine_drive() (lookup_osc_sample).
+    float vco1_curve_drive;
+    float vco2_curve_drive;
+    float vco3_curve_drive;
+    float vco4_curve_drive;
 } ProgramState;
 
 typedef struct {
@@ -2556,9 +2570,51 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
     }
 }
 
-float lookup_osc_sample(WaveType type, float phase, float dt, float pulse_width_frac, float *tri_integrator) {
+// --- Curve/Drive: a single physical pot per oscillator/LFO (curve_drive, -1..1 in the struct),
+// reinterpreted by the currently-active waveform -- see lookup_osc_sample()/lookup_lfo_waveform()
+// below, the two places that dispatch on shape and therefore know which meaning applies:
+//   Sawtooth/Triangle: bipolar Curve, center detent at 0 = perfectly linear ramp/slope. Negative
+//   morphs into a concave (fast-start/slow-finish) curve, positive into a convex (slow-start/
+//   fast-finish) curve -- see apply_wave_curve().
+//   Sine: only the unipolar 0..1 half of the same stored value is meaningful (UI clamps the
+//   knob's own range to 0..1 when a Sine shape is selected, so a negative stored value can only
+//   arise from switching shapes with the knob left turned down-left -- apply_sine_drive() clamps
+//   it right back to 0 in that case, reproducing "no drive" rather than doing anything strange).
+//   0 = pure clean sine (the default for every sine osc/LFO). Toward 1 = soft-clip saturation,
+//   flattening the peaks/troughs -- warm harmonic drive for audio, longer peak/trough dwell time
+//   for an LFO. See apply_sine_drive().
+// Every other shape (Square, Pulse, Unison Saw, Noise, Sample, Off) ignores curve_drive entirely
+// -- out of scope for this control, matching the literal "Triangle/Sawtooth" and "Sine" ask.
+
+// Warps a linear ramp t in [0,1] into a concave/convex curve. curve==0 is an exact identity (t
+// unchanged, so Sawtooth/Triangle's curve=0 default reproduces their historical output exactly).
+// 2^(curve*CURVE_STRENGTH) is always a strictly positive, finite exponent across the whole -1..1
+// range (no singularity to guard), and a curve/-curve pair are exact reciprocal exponents of one
+// another -- the standard mirror relationship between a matched concave/convex curve pair.
+#define WAVE_CURVE_STRENGTH 3.0f
+static inline float apply_wave_curve(float t, float curve) {
+    if (curve == 0.0f) return t;
+    float c = fmaxf(-1.0f, fminf(1.0f, curve));
+    float exponent = powf(2.0f, c * WAVE_CURVE_STRENGTH);
+    return powf(fmaxf(0.0f, fminf(1.0f, t)), exponent);
+}
+
+// Soft-clip saturation for Sine. drive<=0 is an exact identity (pure sine, the default). pre_gain
+// scales linearly from 0 (at drive=0) so the tanh-based shaping smoothly reproduces the identity
+// in the drive->0 limit (tanh(y)/tanh(y) -> linear as y->0, avoiding any discontinuity right as
+// the knob leaves its detent) up to a deeply-saturating gain of 8 at drive=1. Dividing by
+// tanh(pre_gain) renormalizes the shaped peak back to exactly +-1 (sine's own peak), so the wave
+// visibly squares off toward drive=1 without its overall level dropping.
+static inline float apply_sine_drive(float sine_val, float drive) {
+    float d = fmaxf(0.0f, fminf(1.0f, drive));
+    if (d <= 0.0f) return sine_val;
+    float pre_gain = d * 8.0f;
+    return tanhf(sine_val * pre_gain) / tanhf(pre_gain);
+}
+
+float lookup_osc_sample(WaveType type, float phase, float dt, float pulse_width_frac, float *tri_integrator, float curve_drive) {
     switch (type) {
-        case WAVE_SAW: { float n = (phase * 2.0f) - 1.0f; return n - poly_blep_step(phase, dt); }
+        case WAVE_SAW: { float warped = apply_wave_curve(phase, curve_drive); float n = (warped * 2.0f) - 1.0f; return n - poly_blep_step(phase, dt); }
         case WAVE_SQUARE: return band_limited_pulse(phase, dt, 0.5f);
         case WAVE_PULSE: {
             // Clamped away from the extremes: at duty 0 or 1 the pulse degenerates to DC (no
@@ -2567,11 +2623,26 @@ float lookup_osc_sample(WaveType type, float phase, float dt, float pulse_width_
             return band_limited_pulse(phase, dt, duty);
         }
         case WAVE_TRIANGLE: {
-            float n = (phase < 0.5f) ? 1.0f : -1.0f; n += poly_blep_step(phase, dt);
-            float pf = phase + 0.5f; if (pf >= 1.0f) pf -= 1.0f; n -= poly_blep_step(pf, dt);
-            *tri_integrator = 0.99f * (*tri_integrator) + (n * dt * 4.0f); return *tri_integrator;
+            if (curve_drive == 0.0f) {
+                // Curve at center: exact original anti-aliased (leaky-integrator, BLEP-corrected
+                // at both slope-reversal corners) Triangle -- byte-identical historical output.
+                float n = (phase < 0.5f) ? 1.0f : -1.0f; n += poly_blep_step(phase, dt);
+                float pf = phase + 0.5f; if (pf >= 1.0f) pf -= 1.0f; n -= poly_blep_step(pf, dt);
+                *tri_integrator = 0.99f * (*tri_integrator) + (n * dt * 4.0f); return *tri_integrator;
+            }
+            // Curve engaged: warp each ramp half's own sub-phase through apply_wave_curve()
+            // before reading it as a direct linear ramp -- a non-linear ramp has no simple
+            // derivative-domain equivalent the leaky-integrator trick above could reuse, so this
+            // trades that path's BLEP-corrected corners for a plain phase-domain construction
+            // while curve != 0 (a triangle's corners are a slope discontinuity, not a value jump
+            // like Saw/Square's, so the added aliasing risk is far smaller -- an accepted,
+            // documented tradeoff, not a silent regression, since curve=0 stays exact).
+            bool rising = phase < 0.5f;
+            float sub = rising ? (phase * 2.0f) : ((phase - 0.5f) * 2.0f);
+            float warped = apply_wave_curve(sub, curve_drive);
+            return rising ? (warped * 2.0f - 1.0f) : (1.0f - warped * 2.0f);
         }
-        case WAVE_SINE: return sinf(phase * 2.0f * M_PI);
+        case WAVE_SINE: return apply_sine_drive(sinf(phase * 2.0f * M_PI), curve_drive);
         case WAVE_NOISE: return (((float)rand() / (float)RAND_MAX) * 2.0f) - 1.0f;
         default: return 0.0f;
     }
@@ -2643,13 +2714,23 @@ float render_unison_saw(float phases[UNISON_SAW_VOICES], float base_dt, float de
     return sum_mono * inv_n;
 }
 
-float lookup_lfo_waveform(int type, float phase) {
+// wave_type: 0=Triangle, 1=Sine, 2=Saw (descending ramp), 3=Square, 4=Off (never reaches here --
+// callers short-circuit type==4 before calling). curve_drive: same single-pot, shape-reinterpreted
+// value as lookup_osc_sample's own -- meaningful for Triangle/Saw (bipolar Curve) and Sine
+// (unipolar Drive, clamped internally), ignored for Square.
+float lookup_lfo_waveform(int type, float phase, float curve_drive) {
     switch (type) {
-        case 1:  return sinf(phase * 2.0f * M_PI);
-        case 2:  return 1.0f - (phase * 2.0f);
-        case 3:  return (phase < 0.5f) ? 1.0f : -1.0f;
+        case 1: return apply_sine_drive(sinf(phase * 2.0f * M_PI), curve_drive);
+        case 2: { float warped = apply_wave_curve(1.0f - phase, curve_drive); return (warped * 2.0f) - 1.0f; }
+        case 3: return (phase < 0.5f) ? 1.0f : -1.0f;
         case 0:
-        default: return (phase < 0.5f) ? (phase * 4.0f) - 1.0f : 3.0f - (phase * 4.0f);
+        default: {
+            if (curve_drive == 0.0f) return (phase < 0.5f) ? (phase * 4.0f) - 1.0f : 3.0f - (phase * 4.0f);
+            bool rising = phase < 0.5f;
+            float sub = rising ? (phase * 2.0f) : ((phase - 0.5f) * 2.0f);
+            float warped = apply_wave_curve(sub, curve_drive);
+            return rising ? (warped * 2.0f - 1.0f) : (1.0f - warped * 2.0f);
+        }
     }
 }
 // ============================================================================
@@ -3748,6 +3829,55 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco4/vel_to_amp", vco4_vel_to_amp, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco4/vel_to_amp", vco4_vel_to_amp, 7),
 
+    // --- Curve/Drive, per oscillator (see ProgramState.vco{1-4}_curve_drive's own comment) ---
+    OSC_PSCALAR("/hds/vco1/curve_drive", vco1_curve_drive),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/curve_drive", vco1_curve_drive, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco1/curve_drive", vco1_curve_drive, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco1/curve_drive", vco1_curve_drive, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco1/curve_drive", vco1_curve_drive, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco1/curve_drive", vco1_curve_drive, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco1/curve_drive", vco1_curve_drive, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco1/curve_drive", vco1_curve_drive, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco1/curve_drive", vco1_curve_drive, 7),
+    OSC_PSCALAR("/hds/vco2/curve_drive", vco2_curve_drive),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/curve_drive", vco2_curve_drive, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco2/curve_drive", vco2_curve_drive, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco2/curve_drive", vco2_curve_drive, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco2/curve_drive", vco2_curve_drive, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco2/curve_drive", vco2_curve_drive, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco2/curve_drive", vco2_curve_drive, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco2/curve_drive", vco2_curve_drive, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco2/curve_drive", vco2_curve_drive, 7),
+    OSC_PSCALAR("/hds/vco3/curve_drive", vco3_curve_drive),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/curve_drive", vco3_curve_drive, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco3/curve_drive", vco3_curve_drive, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco3/curve_drive", vco3_curve_drive, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco3/curve_drive", vco3_curve_drive, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco3/curve_drive", vco3_curve_drive, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco3/curve_drive", vco3_curve_drive, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco3/curve_drive", vco3_curve_drive, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco3/curve_drive", vco3_curve_drive, 7),
+    OSC_PSCALAR("/hds/vco4/curve_drive", vco4_curve_drive),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/curve_drive", vco4_curve_drive, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco4/curve_drive", vco4_curve_drive, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco4/curve_drive", vco4_curve_drive, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco4/curve_drive", vco4_curve_drive, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco4/curve_drive", vco4_curve_drive, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco4/curve_drive", vco4_curve_drive, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco4/curve_drive", vco4_curve_drive, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco4/curve_drive", vco4_curve_drive, 7),
+
+    // --- Curve/Drive, per LFO (see PackLfoParams.curve_drive's own comment) ---
+    OSC_PSUBARRAY("/hds/lfo/%d/curve_drive", lfo, PackLfoParams, curve_drive, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/curve_drive", lfo, PackLfoParams, curve_drive, LFO_COUNT, 0),
+    OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/curve_drive", lfo, PackLfoParams, curve_drive, LFO_COUNT, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/curve_drive", lfo, PackLfoParams, curve_drive, LFO_COUNT, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/curve_drive", lfo, PackLfoParams, curve_drive, LFO_COUNT, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/lfo/%d/curve_drive", lfo, PackLfoParams, curve_drive, LFO_COUNT, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/lfo/%d/curve_drive", lfo, PackLfoParams, curve_drive, LFO_COUNT, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/curve_drive", lfo, PackLfoParams, curve_drive, LFO_COUNT, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/curve_drive", lfo, PackLfoParams, curve_drive, LFO_COUNT, 7),
+
     // --- Combi/Sequencer scaffolding (see SEQ_LANE_COUNT's own comment) ---
     OSC_SCALAR("/hds/performance_mode", performance_mode),
     OSC_SUBARRAY("/hds/seq/%d/lane_type", seq_lanes, SeqLaneState, lane_type, SEQ_LANE_COUNT),
@@ -3983,7 +4113,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->programs[0].filters[f].slope_poles = 0.0f; knobs->programs[0].filters[f].filter_type = 0.0f; // Off
         knobs->programs[0].filters[f].key_track = 0.0f; knobs->programs[0].filters[f].cutoff_mod_source_cc = -1.0f;
     }
-    for(int l=0; l<LFO_COUNT; l++) { knobs->programs[0].lfo[l].wave_type = 0.0f; knobs->programs[0].lfo[l].rate_hz = 5.0f; knobs->programs[0].lfo[l].mod_depth = 0.0f; knobs->programs[0].lfo[l].key_sync = 1.0f; knobs->programs[0].lfo[l].dest_target = 0.0f; knobs->programs[0].lfo[l].phase_offset = 0.0f; knobs->programs[0].lfo[l].mod_source_cc = -1.0f; knobs->programs[0].lfo[l].per_key_mode = 0.0f; knobs->programs[0].lfo[l].key_track = 0.0f; knobs->programs[0].lfo[l].vel_track = 0.0f; knobs->programs[0].lfo[l].tempo_sync_division = 0.0f; }
+    for(int l=0; l<LFO_COUNT; l++) { knobs->programs[0].lfo[l].wave_type = 0.0f; knobs->programs[0].lfo[l].rate_hz = 5.0f; knobs->programs[0].lfo[l].mod_depth = 0.0f; knobs->programs[0].lfo[l].key_sync = 1.0f; knobs->programs[0].lfo[l].dest_target = 0.0f; knobs->programs[0].lfo[l].phase_offset = 0.0f; knobs->programs[0].lfo[l].mod_source_cc = -1.0f; knobs->programs[0].lfo[l].per_key_mode = 0.0f; knobs->programs[0].lfo[l].key_track = 0.0f; knobs->programs[0].lfo[l].vel_track = 0.0f; knobs->programs[0].lfo[l].tempo_sync_division = 0.0f; knobs->programs[0].lfo[l].curve_drive = 0.0f; }
     for(int e=0; e<ENV_COUNT; e++) { knobs->programs[0].eg[e].d = 0.0f; knobs->programs[0].eg[e].h = 0.0f; knobs->programs[0].eg[e].a = 10.0f; knobs->programs[0].eg[e].dec = 150.0f; knobs->programs[0].eg[e].s = 80.0f; knobs->programs[0].eg[e].r = 300.0f; knobs->programs[0].eg[e].al = 0.0f; knobs->programs[0].eg[e].pk = 100.0f; knobs->programs[0].eg_mode[e] = 0.0f; }
     for(int i=0; i<ASSIGNABLE_EG_COUNT; i++) { knobs->programs[0].eg_intensity[i] = 1.0f; knobs->programs[0].eg_dest_target[i] = 0.0f; }
     // Subtle default detune (matches the old fixed +/-1.5% spread) and no width until the user asks for it
@@ -4021,6 +4151,10 @@ static void init_default_controls(SynthSharedControls *knobs) {
     // what velocity value a note-on carries -- see ProgramState.vco{1-4}_vel_to_amp's own comment.
     knobs->programs[0].vco1_vel_to_amp = 0.0f; knobs->programs[0].vco2_vel_to_amp = 0.0f;
     knobs->programs[0].vco3_vel_to_amp = 0.0f; knobs->programs[0].vco4_vel_to_amp = 0.0f;
+    // Curve/Drive: 0.0f = linear ramp (Saw/Tri) / clean sine, reproducing today's exact output on
+    // every shape -- see ProgramState.vco{1-4}_curve_drive's own comment.
+    knobs->programs[0].vco1_curve_drive = 0.0f; knobs->programs[0].vco2_curve_drive = 0.0f;
+    knobs->programs[0].vco3_curve_drive = 0.0f; knobs->programs[0].vco4_curve_drive = 0.0f;
     // Osc 3/4 Amp envelopes live at eg[2]/eg[3] (and eg_mode[2]/eg_mode[3]) and were covered by
     // the generic `for(int e=0; e<ENV_COUNT; e++)` default-fill loop above -- nothing extra
     // needed here.
@@ -5689,6 +5823,7 @@ static float render_fm_oscillator(
     int *sample_stream, double *sample_ptr, bool *sample_preroll, float hz,
     bool do_sync, float t_wrap, float *pending_sync_correction,
     bool mono_noise_active, float mono_noise_value,
+    float curve_drive,
     float *out_side_l, float *out_side_r)
 {
     if (shape == WAVE_UNISON_SAW) {
@@ -5729,7 +5864,7 @@ static float render_fm_oscillator(
         return *tilt_lp * (1.0f - tilt_frac) + tilt_high * (1.0f + tilt_frac);
     }
 
-    float out = lookup_osc_sample(shape, mod_phase, adaptive_dt, pulse_or_tilt_input / 100.0f, tri_state);
+    float out = lookup_osc_sample(shape, mod_phase, adaptive_dt, pulse_or_tilt_input / 100.0f, tri_state, curve_drive);
 
     // Full alias-free hard sync amplitude correction (Saw/Square/Pulse only), generalized from
     // the original Osc2-only block -- see that block's own original comment (still present on
@@ -7054,7 +7189,7 @@ static float compute_per_key_lfo_output(SynthVoice *voice, const PackLfoParams *
         float cc_source_scale = 1.0f;
         if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
         else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
-        voice->lfo_decim_target_value[lfo_idx] = lookup_lfo_waveform(wave_type, read_phase) * effective_mod_depth * cc_source_scale;
+        voice->lfo_decim_target_value[lfo_idx] = lookup_lfo_waveform(wave_type, read_phase, lp->curve_drive) * effective_mod_depth * cc_source_scale;
         voice->lfo_phase[lfo_idx] += (effective_rate_hz / (float)SAMPLE_RATE) * (float)LFO_DECIMATION_FACTOR;
         if (voice->lfo_phase[lfo_idx] >= 1.0f) voice->lfo_phase[lfo_idx] = fmodf(voice->lfo_phase[lfo_idx], 1.0f);
     }
@@ -7335,7 +7470,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                 float cc_source_scale = 1.0f;
                 if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
                 else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
-                lfo_out[p][l] = lookup_lfo_waveform(wave_type, read_phase) * effective_mod_depth * cc_source_scale;
+                lfo_out[p][l] = lookup_lfo_waveform(wave_type, read_phase, knobs->programs[p].lfo[l].curve_drive) * effective_mod_depth * cc_source_scale;
                 global_lfo_phases[p][l] += effective_rate_hz / (float)SAMPLE_RATE;
                 if (global_lfo_phases[p][l] >= 1.0f) global_lfo_phases[p][l] -= 1.0f;
             } else {
@@ -7351,7 +7486,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                     float cc_source_scale = 1.0f;
                     if (mod_src == 128) cc_source_scale = midi_live->channel_pressure;
                     else if (mod_src >= 0 && mod_src < 128) cc_source_scale = midi_live->cc[mod_src];
-                    lfo_decim_target_value[p][l] = lookup_lfo_waveform(wave_type, read_phase) * effective_mod_depth * cc_source_scale;
+                    lfo_decim_target_value[p][l] = lookup_lfo_waveform(wave_type, read_phase, knobs->programs[p].lfo[l].curve_drive) * effective_mod_depth * cc_source_scale;
                     // Phase advances by DECIMATION_FACTOR steps at once, since we're about to
                     // skip that many samples' worth of recomputation -- this keeps the LFO's
                     // real-world rate correct despite only sampling it every 24th sample.
@@ -7745,6 +7880,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             float dt_arr[4] = { dt1, dt2, dt3, dt4 };
             float phase_offset_arr[4] = { phase_offset1, phase_offset2, phase_offset3, phase_offset4 };
             float pulse_or_tilt_arr[4] = { vco1_pulse_width_final, vco2_pulse_width_final, vco3_pulse_width_final, vco4_pulse_width_final };
+            float curve_drive_arr[4] = { prog->vco1_curve_drive, prog->vco2_curve_drive, prog->vco3_curve_drive, prog->vco4_curve_drive };
             float unison_detune_arr[4] = { vco1_unison_detune_final, vco2_unison_detune_final, vco3_unison_detune_final, vco4_unison_detune_final };
             float hz_arr[4] = { hz1, hz2, hz3, hz4 };
             bool do_sync_arr[4] = { false, do_sync2, do_sync3, do_sync4 };
@@ -7800,6 +7936,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                     sample_stream_ptr[osc], sample_ptr_ptr[osc], sample_preroll_ptr[osc], hz_arr[osc],
                     do_sync_arr[osc], t_wrap_arr[osc], pending_sync_correction_ptr[osc],
                     mono_noise_flag_arr[osc], mono_noise_out[pidx][osc],
+                    curve_drive_arr[osc],
                     &osc_side_l[osc], &osc_side_r[osc]);
                 modulator_output[osc] = osc_out[osc] * gain_for_fm_arr[osc] * eg_level_arr[osc];
             }

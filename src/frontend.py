@@ -2690,6 +2690,23 @@ class SynthGui(QWidget):
         _retain_hidden(self.vco1_pulse_box)
         v1_strip.addWidget(self.vco1_pulse_box)
 
+        # Curve/Drive: one physical pot, reinterpreted by Shape -- Curve (bipolar, center=linear
+        # ramp) for Sawtooth/Triangle, Drive/Saturation (only the right/positive half has effect,
+        # 0=clean) for Sine. See ProgramState.vco1_curve_drive's own comment (backend.c).
+        self.vco1_curve_box = QWidget()
+        v1_cd_lay = QVBoxLayout(self.vco1_curve_box)
+        v1_cd_lay.setContentsMargins(0, 2, 0, 0)
+        self.vco1_curve_label = QLabel("Curve")
+        self.vco1_curve_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v1_cd_lay.addWidget(self.vco1_curve_label)
+        self.vco1_curve_drive = PotentiometerKnob("O1 Curve/Drive", self)
+        self.vco1_curve_drive.setRange(-100, 100)
+        self.vco1_curve_drive.setValue(0)
+        self.vco1_curve_drive.setToolTip("Sawtooth/Triangle: bipolar Curve, center = linear ramp, left = concave, right = convex.\nSine: Drive/Saturation -- only the right half (0..100) has effect, 0 = clean sine.")
+        v1_cd_lay.addWidget(self.vco1_curve_drive, alignment=Qt.AlignmentFlag.AlignCenter)
+        _retain_hidden(self.vco1_curve_box)
+        v1_strip.addWidget(self.vco1_curve_box)
+
         v1_tune_block = QVBoxLayout()
         v1_pitch_placeholder_lbl = QLabel("Pitch Offset")
         v1_pitch_placeholder_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2826,6 +2843,20 @@ class SynthGui(QWidget):
         _retain_hidden(self.vco2_pulse_box)
         v2_strip.addWidget(self.vco2_pulse_box)
 
+        self.vco2_curve_box = QWidget()
+        v2_cd_lay = QVBoxLayout(self.vco2_curve_box)
+        v2_cd_lay.setContentsMargins(0, 2, 0, 0)
+        self.vco2_curve_label = QLabel("Curve")
+        self.vco2_curve_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v2_cd_lay.addWidget(self.vco2_curve_label)
+        self.vco2_curve_drive = PotentiometerKnob("O2 Curve/Drive", self)
+        self.vco2_curve_drive.setRange(-100, 100)
+        self.vco2_curve_drive.setValue(0)
+        self.vco2_curve_drive.setToolTip("Sawtooth/Triangle: bipolar Curve, center = linear ramp, left = concave, right = convex.\nSine: Drive/Saturation -- only the right half (0..100) has effect, 0 = clean sine.")
+        v2_cd_lay.addWidget(self.vco2_curve_drive, alignment=Qt.AlignmentFlag.AlignCenter)
+        _retain_hidden(self.vco2_curve_box)
+        v2_strip.addWidget(self.vco2_curve_box)
+
         v2_tune_block = QVBoxLayout()
         v2_tune_block.addWidget(QLabel("Pitch Offset"), alignment=Qt.AlignmentFlag.AlignCenter)
         self.vco2_pitch_offset = QSpinBox()
@@ -2961,6 +2992,20 @@ class SynthGui(QWidget):
         _retain_hidden(self.vco3_pulse_box)
         v3_strip.addWidget(self.vco3_pulse_box)
 
+        self.vco3_curve_box = QWidget()
+        v3_cd_lay = QVBoxLayout(self.vco3_curve_box)
+        v3_cd_lay.setContentsMargins(0, 2, 0, 0)
+        self.vco3_curve_label = QLabel("Curve")
+        self.vco3_curve_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v3_cd_lay.addWidget(self.vco3_curve_label)
+        self.vco3_curve_drive = PotentiometerKnob("O3 Curve/Drive", self)
+        self.vco3_curve_drive.setRange(-100, 100)
+        self.vco3_curve_drive.setValue(0)
+        self.vco3_curve_drive.setToolTip("Sawtooth/Triangle: bipolar Curve, center = linear ramp, left = concave, right = convex.\nSine: Drive/Saturation -- only the right half (0..100) has effect, 0 = clean sine.")
+        v3_cd_lay.addWidget(self.vco3_curve_drive, alignment=Qt.AlignmentFlag.AlignCenter)
+        _retain_hidden(self.vco3_curve_box)
+        v3_strip.addWidget(self.vco3_curve_box)
+
         v3_tune_block = QVBoxLayout()
         v3_tune_block.addWidget(QLabel("Pitch Offset"), alignment=Qt.AlignmentFlag.AlignCenter)
         self.vco3_pitch_offset = QSpinBox()
@@ -3091,6 +3136,20 @@ class SynthGui(QWidget):
         v4_pw_lay.addWidget(self.vco4_mono_noise, alignment=Qt.AlignmentFlag.AlignCenter)
         _retain_hidden(self.vco4_pulse_box)
         v4_strip.addWidget(self.vco4_pulse_box)
+
+        self.vco4_curve_box = QWidget()
+        v4_cd_lay = QVBoxLayout(self.vco4_curve_box)
+        v4_cd_lay.setContentsMargins(0, 2, 0, 0)
+        self.vco4_curve_label = QLabel("Curve")
+        self.vco4_curve_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v4_cd_lay.addWidget(self.vco4_curve_label)
+        self.vco4_curve_drive = PotentiometerKnob("O4 Curve/Drive", self)
+        self.vco4_curve_drive.setRange(-100, 100)
+        self.vco4_curve_drive.setValue(0)
+        self.vco4_curve_drive.setToolTip("Sawtooth/Triangle: bipolar Curve, center = linear ramp, left = concave, right = convex.\nSine: Drive/Saturation -- only the right half (0..100) has effect, 0 = clean sine.")
+        v4_cd_lay.addWidget(self.vco4_curve_drive, alignment=Qt.AlignmentFlag.AlignCenter)
+        _retain_hidden(self.vco4_curve_box)
+        v4_strip.addWidget(self.vco4_curve_box)
 
         v4_tune_block = QVBoxLayout()
         v4_tune_block.addWidget(QLabel("Pitch Offset"), alignment=Qt.AlignmentFlag.AlignCenter)
@@ -3765,6 +3824,10 @@ class SynthGui(QWidget):
         # note-on phase-reset toggle): this instead decides whether Rate is a free Hz value or a
         # note-division of the current tempo. See LFO_SYNC_DIVISION_LABELS' own comment.
         self.lfo_tempo_sync_combos = []
+        # Curve/Drive: same single physical pot, reinterpreted by wave -- bipolar Curve
+        # (center=linear ramp) for Tri/Saw, Drive/Saturation (right half only) for Sine, hidden
+        # for Square/Off. See PackLfoParams.curve_drive's own comment (backend.c).
+        self.lfo_curve_labels, self.lfo_curve_dials = [], []
         self.lfo_per_key_checks, self.lfo_key_track_dials, self.lfo_vel_track_dials, self.lfo_key_track_boxes = [], [], [], []
         self.lfo_phase_dials = []
         # Modulation Source (right-click on an LFO's Depth pot): -1.0 = None, 0.0-127.0 = that
@@ -3840,6 +3903,20 @@ class SynthGui(QWidget):
             lfo_row.addWidget(combo)
             lfo_row.addWidget(vis)
             self.lfo_combos.append(combo)
+
+            # Curve/Drive: visible only for Tri/Sine/Saw (indices 0/1/2), hidden for Sq/Off --
+            # see PackLfoParams.curve_drive's own comment. Label swaps "Curve"<->"Drive" on wave
+            # change (wired in the shared post-construction signal loop, below).
+            curve_label = QLabel("Curve")
+            curve_label.setStyleSheet("font-size: 9px;")
+            curve_dial = PotentiometerKnob(f"LFO {x} Curve/Drive", self)
+            curve_dial.setRange(-100, 100)
+            curve_dial.setValue(0)
+            curve_dial.setToolTip("Tri/Saw: bipolar Curve, center = linear. Sine: Drive/Saturation, only the right half (0..100) has effect.")
+            lfo_row.addWidget(curve_label)
+            lfo_row.addWidget(curve_dial)
+            self.lfo_curve_labels.append(curve_label)
+            self.lfo_curve_dials.append(curve_dial)
 
             lfo_idx_for_menu = x - 1
 
@@ -4650,8 +4727,11 @@ class SynthGui(QWidget):
         UNISON_SAW_INDEX = OSC_SHAPE_NAMES.index("Unison Saw")
         NOISE_INDEX = OSC_SHAPE_NAMES.index("Noise")
         PULSE_INDEX = OSC_SHAPE_NAMES.index("Pulse")
+        SAW_INDEX = OSC_SHAPE_NAMES.index("Saw")
+        TRIANGLE_INDEX = OSC_SHAPE_NAMES.index("Triangle")
+        SINE_INDEX = OSC_SHAPE_NAMES.index("Sine")
 
-        def _wire_osc_strip(combo, vis, unison_box, pulse_box, pulse_label, pulse_knob, mono_check):
+        def _wire_osc_strip(combo, vis, unison_box, pulse_box, pulse_label, pulse_knob, mono_check, curve_box, curve_label):
             def on_shape_changed(idx):
                 vis.set_waveform(idx, is_lfo=False)
                 unison_box.setVisible(idx == UNISON_SAW_INDEX)
@@ -4667,13 +4747,18 @@ class SynthGui(QWidget):
                     pulse_label.setText("Tilt")
                 else:
                     pulse_label.setText("Pulse Width")
+                # Curve/Drive: same single physical pot, reinterpreted by Shape (see
+                # ProgramState.vco{1-4}_curve_drive's own comment, backend.c) -- visible only for
+                # the 3 shapes it applies to, label swaps between the two meanings.
+                curve_box.setVisible(idx in (SAW_INDEX, TRIANGLE_INDEX, SINE_INDEX))
+                curve_label.setText("Drive" if idx == SINE_INDEX else "Curve")
             combo.currentIndexChanged.connect(on_shape_changed)
             on_shape_changed(combo.currentIndex())
 
-        _wire_osc_strip(self.vco1_combo, self.vco1_vis, self.vco1_unison_box, self.vco1_pulse_box, self.vco1_pulse_label, self.vco1_pulse_width, self.vco1_mono_noise)
-        _wire_osc_strip(self.vco2_combo, self.vco2_vis, self.vco2_unison_box, self.vco2_pulse_box, self.vco2_pulse_label, self.vco2_pulse_width, self.vco2_mono_noise)
-        _wire_osc_strip(self.vco3_combo, self.vco3_vis, self.vco3_unison_box, self.vco3_pulse_box, self.vco3_pulse_label, self.vco3_pulse_width, self.vco3_mono_noise)
-        _wire_osc_strip(self.vco4_combo, self.vco4_vis, self.vco4_unison_box, self.vco4_pulse_box, self.vco4_pulse_label, self.vco4_pulse_width, self.vco4_mono_noise)
+        _wire_osc_strip(self.vco1_combo, self.vco1_vis, self.vco1_unison_box, self.vco1_pulse_box, self.vco1_pulse_label, self.vco1_pulse_width, self.vco1_mono_noise, self.vco1_curve_box, self.vco1_curve_label)
+        _wire_osc_strip(self.vco2_combo, self.vco2_vis, self.vco2_unison_box, self.vco2_pulse_box, self.vco2_pulse_label, self.vco2_pulse_width, self.vco2_mono_noise, self.vco2_curve_box, self.vco2_curve_label)
+        _wire_osc_strip(self.vco3_combo, self.vco3_vis, self.vco3_unison_box, self.vco3_pulse_box, self.vco3_pulse_label, self.vco3_pulse_width, self.vco3_mono_noise, self.vco3_curve_box, self.vco3_curve_label)
+        _wire_osc_strip(self.vco4_combo, self.vco4_vis, self.vco4_unison_box, self.vco4_pulse_box, self.vco4_pulse_label, self.vco4_pulse_width, self.vco4_mono_noise, self.vco4_curve_box, self.vco4_curve_label)
 
         # FM Algorithm: show only the depth dial(s) the selected algorithm actually uses.
         def _on_fm_algorithm_changed(idx):
@@ -5264,6 +5349,10 @@ class SynthGui(QWidget):
                            ("/hds/vco3/pan", self.vco3_pan), ("/hds/vco4/pan", self.vco4_pan)):
             if addr in fields:
                 dial.blockSignals(True); dial.setValue(int(round(fields[addr] * 100.0))); dial.blockSignals(False)
+        for addr, dial in (("/hds/vco1/curve_drive", self.vco1_curve_drive), ("/hds/vco2/curve_drive", self.vco2_curve_drive),
+                           ("/hds/vco3/curve_drive", self.vco3_curve_drive), ("/hds/vco4/curve_drive", self.vco4_curve_drive)):
+            if addr in fields:
+                dial.blockSignals(True); dial.setValue(int(round(fields[addr] * 100.0))); dial.blockSignals(False)
         for addr, combo in (("/hds/vco1/shape", self.vco1_combo), ("/hds/vco2/shape", self.vco2_combo),
                             ("/hds/vco3/shape", self.vco3_combo), ("/hds/vco4/shape", self.vco4_combo)):
             if addr in fields:
@@ -5338,9 +5427,19 @@ class SynthGui(QWidget):
         """Mirrors transmit_knob_packet()'s LFO loop in reverse."""
         for idx in range(LFO_COUNT):
             if f"/hds/lfo/{idx}/wave" in fields:
+                wave_idx = int(round(fields[f"/hds/lfo/{idx}/wave"]))
                 self.lfo_combos[idx].blockSignals(True)
-                self.lfo_combos[idx].setCurrentIndex(int(round(fields[f"/hds/lfo/{idx}/wave"])))
+                self.lfo_combos[idx].setCurrentIndex(wave_idx)
                 self.lfo_combos[idx].blockSignals(False)
+                # Curve/Drive box visibility + label don't ride the (blocked) currentIndexChanged
+                # signal -- set directly, mirroring _on_lfo_wave_changed's own logic.
+                self.lfo_curve_labels[idx].setVisible(wave_idx in (0, 1, 2))
+                self.lfo_curve_dials[idx].setVisible(wave_idx in (0, 1, 2))
+                self.lfo_curve_labels[idx].setText("Drive" if wave_idx == 1 else "Curve")
+            if f"/hds/lfo/{idx}/curve_drive" in fields:
+                self.lfo_curve_dials[idx].blockSignals(True)
+                self.lfo_curve_dials[idx].setValue(int(round(fields[f"/hds/lfo/{idx}/curve_drive"] * 100.0)))
+                self.lfo_curve_dials[idx].blockSignals(False)
             if f"/hds/lfo/{idx}/rate" in fields:
                 self.lfo_dials[idx].blockSignals(True)
                 self.lfo_dials[idx].setValue(int(round(fields[f"/hds/lfo/{idx}/rate"] * 10.0)))
@@ -6180,6 +6279,7 @@ class SynthGui(QWidget):
             add_f(f"/hds/lfo/{idx}/key_track", self.lfo_key_track_dials[idx].value())
             add_f(f"/hds/lfo/{idx}/vel_track", self.lfo_vel_track_dials[idx].value())
             add_f(f"/hds/lfo/{idx}/tempo_sync", sync_div_idx)
+            add_f(f"/hds/lfo/{idx}/curve_drive", self.lfo_curve_dials[idx].value() / 100.0)
 
         # 6 custom EG intensity multipliers
         for idx in range(6):
@@ -6234,6 +6334,10 @@ class SynthGui(QWidget):
         # Velocity -> Amp (see the knob's own tooltip/comment, on each Amp EG's title row)
         add_f("/hds/vco1/vel_to_amp", self.vco1_vel_to_amp.value())
         add_f("/hds/vco2/vel_to_amp", self.vco2_vel_to_amp.value())
+        # Curve/Drive (see each box's own tooltip; dial range -100..100 -> wire -1.0..1.0, same
+        # convention as Pan)
+        add_f("/hds/vco1/curve_drive", self.vco1_curve_drive.value() / 100.0)
+        add_f("/hds/vco2/curve_drive", self.vco2_curve_drive.value() / 100.0)
 
         # Osc 3: vol, pan, mute, pulse-width-or-tilt. vol goes through the audio taper, same as
         # Osc 1/2 above -- see _audio_vol_taper's own comment.
@@ -6243,6 +6347,7 @@ class SynthGui(QWidget):
         add_f("/hds/vco3/pulse_width", self.vco3_pulse_width.value())
         add_f("/hds/vco3/mono_noise", 1.0 if self.vco3_mono_noise.isChecked() else 0.0)
         add_f("/hds/vco3/vel_to_amp", self.vco3_vel_to_amp.value())
+        add_f("/hds/vco3/curve_drive", self.vco3_curve_drive.value() / 100.0)
 
         # Osc 4: vol, pan, mute, pulse-width-or-tilt. vol goes through the audio taper, same as
         # Osc 1/2/3 above -- see _audio_vol_taper's own comment.
@@ -6252,6 +6357,7 @@ class SynthGui(QWidget):
         add_f("/hds/vco4/pulse_width", self.vco4_pulse_width.value())
         add_f("/hds/vco4/mono_noise", 1.0 if self.vco4_mono_noise.isChecked() else 0.0)
         add_f("/hds/vco4/vel_to_amp", self.vco4_vel_to_amp.value())
+        add_f("/hds/vco4/curve_drive", self.vco4_curve_drive.value() / 100.0)
 
         # External Audio Input: enable + gain per ext-in pair (Routing tab). Ext-in pairs sit at
         # source ids COMBI_PROGRAM_COUNT+1..+8 (9-16), after the 8 Combi Programs + Combi Mix.
@@ -6492,6 +6598,8 @@ def runtime_connect_and_bind(gui):
     gui.vco2_mono_noise.toggled.connect(gui.transmit_knob_packet)
     gui.vco1_vel_to_amp.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco2_vel_to_amp.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco1_curve_drive.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco2_curve_drive.valueChanged.connect(gui.transmit_knob_packet)
 
     # Oscillator 3 (full peer of Osc 1/2 now, was the dedicated Noise oscillator)
     gui.vco3_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
@@ -6501,6 +6609,7 @@ def runtime_connect_and_bind(gui):
     gui.vco3_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_mono_noise.toggled.connect(gui.transmit_knob_packet)
     gui.vco3_vel_to_amp.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco3_curve_drive.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_fine_tune.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_pitch_offset.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco3_phase.valueChanged.connect(gui.transmit_knob_packet)
@@ -6515,6 +6624,7 @@ def runtime_connect_and_bind(gui):
     gui.vco4_pulse_width.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_mono_noise.toggled.connect(gui.transmit_knob_packet)
     gui.vco4_vel_to_amp.valueChanged.connect(gui.transmit_knob_packet)
+    gui.vco4_curve_drive.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_fine_tune.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_pitch_offset.valueChanged.connect(gui.transmit_knob_packet)
     gui.vco4_phase.valueChanged.connect(gui.transmit_knob_packet)
@@ -6589,6 +6699,15 @@ def runtime_connect_and_bind(gui):
             lambda idx_cb, i=idx: gui.lfo_visualizers[i].set_waveform(idx_cb, is_lfo=True)
         )
         gui.lfo_visualizers[idx].set_waveform(gui.lfo_combos[idx].currentIndex(), is_lfo=True)
+        # Curve/Drive visibility + label ("Curve" for Tri/Saw = idx 0/2, "Drive" for Sine = idx 1,
+        # hidden for Sq/Off = idx 3/4) -- combo indices match LFO_WAVE order ["Tri","Sine","Saw","Sq","Off"].
+        def _on_lfo_wave_changed(wave_idx, i=idx):
+            gui.lfo_curve_labels[i].setVisible(wave_idx in (0, 1, 2))
+            gui.lfo_curve_dials[i].setVisible(wave_idx in (0, 1, 2))
+            gui.lfo_curve_labels[i].setText("Drive" if wave_idx == 1 else "Curve")
+        gui.lfo_combos[idx].currentIndexChanged.connect(_on_lfo_wave_changed)
+        _on_lfo_wave_changed(gui.lfo_combos[idx].currentIndex())
+        gui.lfo_curve_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.lfo_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.lfo_depth_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.lfo_phase_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
