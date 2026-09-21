@@ -215,6 +215,13 @@ typedef struct {
     // 1 + (key_velocity-64)/63 * vel_track/100 -- 0 = no tracking, +-100 = full range from half
     // to double rate (approx) across the velocity range, centered on a "normal" velocity of 64.
     float vel_track;
+    // Tempo Sync: 0 = Free (today's only behavior -- rate_hz sets this LFO's speed directly,
+    // in Hz). 1..LFO_SYNC_DIVISION_COUNT = a 1-based index into LFO_SYNC_BEATS_PER_CYCLE --
+    // rate_hz is ignored entirely and this LFO's speed instead tracks the Program's own current
+    // tempo (compute_current_tempo_bpm(), smoothed the same way arp_tempo_smoothed already is)
+    // at the selected note division. See resolve_lfo_rate_hz(), the single place both Free and
+    // Synced modes resolve to an actual Hz value.
+    float tempo_sync_division;
 } PackLfoParams;
 
 // A single filter's parameters: State-Variable Filter (SVF) core, cutoff/resonance/exclusive
@@ -365,6 +372,16 @@ typedef struct {
     // reproduces today's exact behavior (every slot processing the one shared Program mix) when
     // no ext-in sources are in use.
     float fx_source;
+    // Chain To Next (0/1, default 0): only meaningful when this slot's source is running in
+    // Parallel mode (fx_source_routing_mode[source]==1) -- when set, the NEXT owned slot (this
+    // source's own next slot in array order, not necessarily the physically-adjacent one) is fed
+    // THIS slot's own output instead of starting a fresh parallel branch from the shared dry
+    // input, continuing the same branch in series. Lets several slots be chained in series while
+    // that whole chain still runs as ONE branch alongside a source's other parallel slots/chains
+    // -- e.g. two independent 3-slot serial chains summed together. Ignored entirely in Series
+    // mode (every slot there is already chained unconditionally) and on the last slot in the
+    // array (there is no "next" to chain into). See process_fx_chain()'s own comment.
+    float chain_to_next;
 } FXSlotParams;
 
 // One source's assignment onto the hardware output pairs -- a many-to-many grid (a source can
@@ -2416,14 +2433,30 @@ static void run_fx_stereodoubler(FXSlotEngine *engine, const FXSlotParams *param
 // comment on SynthSharedControls): 0 = Series, each of this source's slots fed the previous one's
 // output (in physical slot-array order -- a slot not assigned to this source is simply skipped,
 // so Series order among a source's own slots is still exactly array order), *l/*r updated in
-// place after every owned slot. 1 = Parallel, every one of this source's slots fed the SAME
-// original dry input independently (an Off/bypassed slot in Parallel contributes its own
-// unprocessed dry copy -- unlike the flat filter chain's own Parallel mode, see render_audio_block's
-// filter dispatch, where an Off slot is excluded from the sum entirely rather than passed through
-// dry), all of this source's results summed and averaged into *l/*r at the end -- averaged over however many slots
-// THIS source actually owns, not FX_SLOT_COUNT, so a source using only 1 or 2 slots in Parallel
-// isn't attenuated as if all 12 had participated. A source that owns zero slots (Series or
-// Parallel alike) is a correct no-op: *l/*r pass through unchanged.
+// place after every owned slot. FXSlotParams.chain_to_next is entirely IGNORED in this mode --
+// every slot is already chained unconditionally, so there's nothing left for it to express.
+//
+// 1 = Parallel, GROUPED: each owned slot starts a fresh "branch" fed by the SAME original dry
+// input, UNLESS the previous owned slot had chain_to_next set, in which case this slot instead
+// continues that branch -- fed by the previous slot's own output, not the shared dry input --
+// exactly like Series would, just scoped to this one branch. A branch closes (and its final
+// result is added into the running sum) the moment a slot doesn't continue it: either the next
+// owned slot didn't ask to (chain_to_next left off, the default), or there is no next owned slot.
+// The sum is then divided by the number of BRANCHES that closed, not the number of raw slots that
+// participated -- chaining N slots together still counts as exactly one branch in the average, the
+// same weight a single unchained slot would carry, matching how a parallel mixer bus should treat
+// "one processed signal" whether it took one plugin or three to get there. An Off/bypassed slot
+// still passes its own dry input through as its output unchanged (same "contributes its own
+// unprocessed dry copy" rule this mode has always had -- unlike the flat filter chain's own
+// Parallel mode, see render_audio_block's filter dispatch, where an Off slot is excluded from the
+// sum entirely) and the branch it's part of continues exactly as if it had done real work.
+// With no slot anywhere setting chain_to_next (every FXSlotParams' own default), every owned slot
+// opens and immediately closes its own one-slot branch -- reproducing today's original Parallel
+// behavior byte-for-byte, just computed through the more general branch bookkeeping.
+//
+// Both modes: a source using only 1 or 2 slots in Parallel isn't attenuated as if all 12 had
+// participated (the divisor is real branch count, not FX_SLOT_COUNT). A source that owns zero
+// slots (Series or Parallel alike) is a correct no-op: *l/*r pass through unchanged.
 //
 // Called once per source per sample (not per voice) -- see render_audio_block, which loops this
 // over every source (Program + each ext-in pair) on that source's own dry bus, after all voices
@@ -2458,47 +2491,69 @@ static void sync_fx_engine_types(const FXSlotParams fx_params[FX_SLOT_COUNT], FX
 static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, float *l, float *r) {
     float parallel_in_l = *l, parallel_in_r = *r;
     float parallel_sum_l = 0.0f, parallel_sum_r = 0.0f;
-    int parallel_slot_count = 0;
+    int parallel_branch_count = 0;
+
+    // Parallel-only branch state (unused, and harmless, in Series mode): branch_l/r is the
+    // running output of whichever branch is currently open; branch_open is false until the first
+    // owned slot of a new branch runs; continue_branch is true when the PREVIOUS owned slot's own
+    // chain_to_next asked THIS slot to continue its branch rather than start a fresh one.
+    float branch_l = parallel_in_l, branch_r = parallel_in_r;
+    bool branch_open = false;
+    bool continue_branch = false;
 
     for (int s = 0; s < FX_SLOT_COUNT; s++) {
         if ((int)fx_params[s].fx_source != source_id) continue; // not this source's slot
         int type = fx_engine[s].active_type;
-        if (routing_mode == 1) parallel_slot_count++;
 
-        float dry_l = (routing_mode == 0) ? *l : parallel_in_l;
-        float dry_r = (routing_mode == 0) ? *r : parallel_in_r;
+        float dry_l, dry_r;
+        if (routing_mode == 0) {
+            dry_l = *l; dry_r = *r; // Series -- chain_to_next ignored, always the running chain result
+        } else if (continue_branch) {
+            dry_l = branch_l; dry_r = branch_r; // Parallel, continuing an already-open branch
+        } else {
+            if (branch_open) { parallel_sum_l += branch_l; parallel_sum_r += branch_r; parallel_branch_count++; }
+            dry_l = parallel_in_l; dry_r = parallel_in_r; // Parallel, starting a fresh branch
+            branch_open = true;
+        }
 
+        float out_l, out_r;
         if (fx_params[s].bypass != 0.0f || type == FX_TYPE_OFF) {
-            if (routing_mode == 1) { parallel_sum_l += dry_l; parallel_sum_r += dry_r; }
-            continue; // Series: *l/*r simply untouched by this slot
+            out_l = dry_l; out_r = dry_r; // pass-through, dry
+        } else {
+            float wet_l = dry_l, wet_r = dry_r;
+            switch (type) {
+                case FX_TYPE_ENSEMBLE: run_fx_ensemble(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_CREAMCOAT: run_fx_creamcoat(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_DENSITY3: run_fx_density3(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_STEREOCHORUS: run_fx_stereochorus(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_STEREODOUBLER: run_fx_stereodoubler(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_OFF:
+                default:
+                    break; // pass-through
+            }
+            float mix = fmaxf(0.0f, fminf(100.0f, fx_params[s].mix)) / 100.0f;
+            out_l = dry_l * (1.0f - mix) + wet_l * mix;
+            out_r = dry_r * (1.0f - mix) + wet_r * mix;
         }
 
-        float wet_l = dry_l, wet_r = dry_r;
-        switch (type) {
-            case FX_TYPE_ENSEMBLE: run_fx_ensemble(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
-            case FX_TYPE_CREAMCOAT: run_fx_creamcoat(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
-            case FX_TYPE_DENSITY3: run_fx_density3(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
-            case FX_TYPE_STEREOCHORUS: run_fx_stereochorus(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
-            case FX_TYPE_STEREODOUBLER: run_fx_stereodoubler(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
-            case FX_TYPE_OFF:
-            default:
-                break; // pass-through
+        if (routing_mode == 0) {
+            *l = out_l;
+            *r = out_r;
+        } else {
+            branch_l = out_l; branch_r = out_r;
+            continue_branch = (fx_params[s].chain_to_next != 0.0f);
         }
-        float mix = fmaxf(0.0f, fminf(100.0f, fx_params[s].mix)) / 100.0f;
-        float out_l = dry_l * (1.0f - mix) + wet_l * mix;
-        float out_r = dry_r * (1.0f - mix) + wet_r * mix;
-
-        if (routing_mode == 1) { parallel_sum_l += out_l; parallel_sum_r += out_r; continue; }
-        *l = out_l;
-        *r = out_r;
     }
 
-    if (routing_mode == 1 && parallel_slot_count > 0) {
-        *l = parallel_sum_l / (float)parallel_slot_count;
-        *r = parallel_sum_r / (float)parallel_slot_count;
+    if (routing_mode == 1) {
+        if (branch_open) { parallel_sum_l += branch_l; parallel_sum_r += branch_r; parallel_branch_count++; } // close the final still-open branch
+        if (parallel_branch_count > 0) {
+            *l = parallel_sum_l / (float)parallel_branch_count;
+            *r = parallel_sum_r / (float)parallel_branch_count;
+        }
+        // parallel_branch_count == 0: *l/*r already untouched (still the original dry input),
+        // which is the correct "this source owns no slots" passthrough.
     }
-    // routing_mode == 1 with parallel_slot_count == 0: *l/*r already untouched (still the
-    // original dry input), which is the correct "this source owns no slots" passthrough.
 }
 
 float lookup_osc_sample(WaveType type, float phase, float dt, float pulse_width_frac, float *tri_integrator) {
@@ -3028,6 +3083,15 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/5/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 5),
     OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/vel_track", lfo, PackLfoParams, vel_track, LFO_COUNT, 7),
+    OSC_PSUBARRAY("/hds/lfo/%d/tempo_sync", lfo, PackLfoParams, tempo_sync_division, LFO_COUNT),
+    OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/tempo_sync", lfo, PackLfoParams, tempo_sync_division, LFO_COUNT, 0),
+    OSC_PSUBARRAY_AT("/hds/combi/1/lfo/%d/tempo_sync", lfo, PackLfoParams, tempo_sync_division, LFO_COUNT, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/lfo/%d/tempo_sync", lfo, PackLfoParams, tempo_sync_division, LFO_COUNT, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/lfo/%d/tempo_sync", lfo, PackLfoParams, tempo_sync_division, LFO_COUNT, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/lfo/%d/tempo_sync", lfo, PackLfoParams, tempo_sync_division, LFO_COUNT, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/lfo/%d/tempo_sync", lfo, PackLfoParams, tempo_sync_division, LFO_COUNT, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/lfo/%d/tempo_sync", lfo, PackLfoParams, tempo_sync_division, LFO_COUNT, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/lfo/%d/tempo_sync", lfo, PackLfoParams, tempo_sync_division, LFO_COUNT, 7),
 
     // --- Assignable EG modulators ---
     OSC_PARRAY("/hds/eg_mod/%d/intensity", eg_intensity, ASSIGNABLE_EG_COUNT),
@@ -3344,6 +3408,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SUBARRAY("/hds/fx/%d/mix", fx, FXSlotParams, mix, FX_SLOT_COUNT),
     OSC_SUBARRAY("/hds/fx/%d/bypass", fx, FXSlotParams, bypass, FX_SLOT_COUNT),
     OSC_SUBARRAY("/hds/fx/%d/source", fx, FXSlotParams, fx_source, FX_SLOT_COUNT),
+    OSC_SUBARRAY("/hds/fx/%d/chain_to_next", fx, FXSlotParams, chain_to_next, FX_SLOT_COUNT),
     OSC_NESTED("/hds/fx/%d/param/%d", fx, FXSlotParams, param, FX_SLOT_COUNT, FX_SLOT_PARAM_COUNT),
     OSC_ARRAY("/hds/fx_routing/%d/mode", fx_source_routing_mode, SOURCE_COUNT),
 
@@ -3918,7 +3983,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->programs[0].filters[f].slope_poles = 0.0f; knobs->programs[0].filters[f].filter_type = 0.0f; // Off
         knobs->programs[0].filters[f].key_track = 0.0f; knobs->programs[0].filters[f].cutoff_mod_source_cc = -1.0f;
     }
-    for(int l=0; l<LFO_COUNT; l++) { knobs->programs[0].lfo[l].wave_type = 0.0f; knobs->programs[0].lfo[l].rate_hz = 5.0f; knobs->programs[0].lfo[l].mod_depth = 0.0f; knobs->programs[0].lfo[l].key_sync = 1.0f; knobs->programs[0].lfo[l].dest_target = 0.0f; knobs->programs[0].lfo[l].phase_offset = 0.0f; knobs->programs[0].lfo[l].mod_source_cc = -1.0f; knobs->programs[0].lfo[l].per_key_mode = 0.0f; knobs->programs[0].lfo[l].key_track = 0.0f; knobs->programs[0].lfo[l].vel_track = 0.0f; }
+    for(int l=0; l<LFO_COUNT; l++) { knobs->programs[0].lfo[l].wave_type = 0.0f; knobs->programs[0].lfo[l].rate_hz = 5.0f; knobs->programs[0].lfo[l].mod_depth = 0.0f; knobs->programs[0].lfo[l].key_sync = 1.0f; knobs->programs[0].lfo[l].dest_target = 0.0f; knobs->programs[0].lfo[l].phase_offset = 0.0f; knobs->programs[0].lfo[l].mod_source_cc = -1.0f; knobs->programs[0].lfo[l].per_key_mode = 0.0f; knobs->programs[0].lfo[l].key_track = 0.0f; knobs->programs[0].lfo[l].vel_track = 0.0f; knobs->programs[0].lfo[l].tempo_sync_division = 0.0f; }
     for(int e=0; e<ENV_COUNT; e++) { knobs->programs[0].eg[e].d = 0.0f; knobs->programs[0].eg[e].h = 0.0f; knobs->programs[0].eg[e].a = 10.0f; knobs->programs[0].eg[e].dec = 150.0f; knobs->programs[0].eg[e].s = 80.0f; knobs->programs[0].eg[e].r = 300.0f; knobs->programs[0].eg[e].al = 0.0f; knobs->programs[0].eg[e].pk = 100.0f; knobs->programs[0].eg_mode[e] = 0.0f; }
     for(int i=0; i<ASSIGNABLE_EG_COUNT; i++) { knobs->programs[0].eg_intensity[i] = 1.0f; knobs->programs[0].eg_dest_target[i] = 0.0f; }
     // Subtle default detune (matches the old fixed +/-1.5% spread) and no width until the user asks for it
@@ -3981,6 +4046,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->fx[f].mix = 100.0f; // fully wet once a real effect is assigned to this slot
         knobs->fx[f].bypass = 0.0f;
         knobs->fx[f].fx_source = 0.0f; // Program -- reproduces today's exact behavior by default
+        knobs->fx[f].chain_to_next = 0.0f; // every slot its own one-slot branch in Parallel mode -- today's exact behavior
     }
     // Routing defaults: only the Program is routed anywhere (to output pair 0, i.e. today's only
     // output pair), every ext-in pair unrouted, every source's own FX chain in Series -- this
@@ -6101,6 +6167,12 @@ typedef struct {
                                                // itself always resolves to a single "current tempo"
                                                // slot regardless of which Program's arp is asking.
     bool          arp_tempo_smoothed_initialized;
+    float         lfo_tempo_smoothed;        // chases compute_current_tempo_bpm()'s live result,
+                                               // same shape and reasoning as arp_tempo_smoothed
+                                               // just above -- see render_audio_block's own
+                                               // comment on it. One shared value, not per-Program,
+                                               // for the same reason arp_tempo_smoothed is.
+    bool          lfo_tempo_smoothed_initialized;
 } HdsEngineState;
 
 // The standalone app's own single instance -- same storage duration (process lifetime) and
@@ -6903,6 +6975,50 @@ static inline int lfo_phase_target_index(int target) {
     return -1;
 }
 
+// LFO Tempo Sync divisions -- how many beats (quarter notes) one full LFO cycle takes at each
+// selectable division. Ordered by note NAME (2 Bars / 2 Bars Dotted / 2 Bars Triplet, then 1 Bar
+// / ../.., down to 1/64 / ../..), matching the sync-rate menu convention most DAWs/synths already
+// use, rather than sorted strictly by the resulting speed (a dotted note and the next triplet
+// down can interleave in raw speed terms -- irrelevant to how a musician looks this up by name).
+// A straight note's own length in beats is halved at each step (2 bars = 8 beats down to 1/64 =
+// 1/16 beat); dotted = 1.5x that length, triplet = 2/3 of it -- the standard definitions.
+// PackLfoParams.tempo_sync_division is 0 = Free (rate_hz used directly, today's only behavior),
+// 1..LFO_SYNC_DIVISION_COUNT = a 1-based index into this table -- see resolve_lfo_rate_hz().
+#define LFO_SYNC_DIVISION_COUNT 24
+static const float LFO_SYNC_BEATS_PER_CYCLE[LFO_SYNC_DIVISION_COUNT] = {
+    8.0f,      12.0f,     5.333333f,  // 2 Bars, 2 Bars Dotted, 2 Bars Triplet
+    4.0f,      6.0f,      2.666667f,  // 1 Bar,  1 Bar Dotted,  1 Bar Triplet
+    2.0f,      3.0f,      1.333333f,  // 1/2,    1/2 Dotted,    1/2 Triplet
+    1.0f,      1.5f,      0.666667f,  // 1/4,    1/4 Dotted,    1/4 Triplet
+    0.5f,      0.75f,     0.333333f,  // 1/8,    1/8 Dotted,    1/8 Triplet
+    0.25f,     0.375f,    0.166667f,  // 1/16,   1/16 Dotted,   1/16 Triplet
+    0.125f,    0.1875f,   0.083333f,  // 1/32,   1/32 Dotted,   1/32 Triplet
+    0.0625f,   0.09375f,  0.041667f,  // 1/64,   1/64 Dotted,   1/64 Triplet
+};
+
+// Resolves one LFO's effective rate in Hz for this block/sample. Free mode (tempo_sync_division
+// <= 0) reproduces the exact pre-existing formula (rate_hz + a mod-matrix rate offset, clamped to
+// [0.1, 200] -- the same clamp already applied unconditionally before this helper existed, kept
+// identical so it still bounds a runaway Synced rate too). Synced mode instead derives Hz from
+// tempo_bpm_smoothed (the same block-granularity smoothed tempo poll_arpeggiator's own
+// arp_tempo_smoothed already uses, to avoid a hard discontinuity in an LFO's own cycle rate on a
+// fast Tempo-knob move) and the selected note division. rate_mod_state is the raw, un-multiplied
+// one-sample-delayed mod-matrix value (lfo_rate_mod_state[p][l] at the Global call site,
+// compute_per_key_lfo_output's own rate_mod parameter at the Per-Key one) -- the existing *20.0f
+// scale is applied here, once, rather than duplicated at each of this function's two call sites.
+static float resolve_lfo_rate_hz(const PackLfoParams *lp, float rate_mod_state, float tempo_bpm_smoothed) {
+    int sync_idx = (int)lp->tempo_sync_division;
+    float base_hz;
+    if (sync_idx <= 0) {
+        base_hz = lp->rate_hz;
+    } else {
+        int div_idx = sync_idx - 1;
+        if (div_idx >= LFO_SYNC_DIVISION_COUNT) div_idx = LFO_SYNC_DIVISION_COUNT - 1;
+        base_hz = tempo_bpm_smoothed / (60.0f * LFO_SYNC_BEATS_PER_CYCLE[div_idx]);
+    }
+    return fmaxf(0.1f, fminf(200.0f, base_hz + rate_mod_state * 20.0f));
+}
+
 // Per-Key LFO (see PackLfoParams.per_key_mode): computes one sample of ONE LFO for ONE voice,
 // using that voice's own phase/decimation state (voice->lfo_phase/lfo_decim_*) instead of the
 // Program-shared global_lfo_phases/lfo_out this same math normally reads/writes -- see
@@ -6918,15 +7034,17 @@ static inline int lfo_phase_target_index(int target) {
 // well be a Global-mode LFO with no per-voice identity of its own to begin with).
 static float compute_per_key_lfo_output(SynthVoice *voice, const PackLfoParams *lp, int lfo_idx,
                                           float rate_mod, float depth_mod, float phase_mod,
-                                          const MidiLiveState *midi_live) {
+                                          const MidiLiveState *midi_live, float tempo_bpm_smoothed) {
     int wave_type = (int)lp->wave_type;
     if (wave_type == 4) return 0.0f; // Off
     float effective_mod_depth = fmaxf(0.0f, fminf(1.0f, lp->mod_depth + depth_mod));
     // Keyboard tracking: +-100 = a full octave-per-octave-of-keyboard multiplier, centered on
-    // note 60 (middle C). Velocity tracking: linear, centered on velocity 64 ("normal").
+    // note 60 (middle C). Velocity tracking: linear, centered on velocity 64 ("normal"). Applied
+    // on top of resolve_lfo_rate_hz's own result -- key/vel tracking scales whatever base rate
+    // resolves, Free Hz or Tempo Synced alike.
     float key_mult = powf(2.0f, ((float)(voice->midi_note - 60) / 12.0f) * (lp->key_track / 100.0f));
     float vel_mult = 1.0f + (lp->vel_track / 100.0f) * ((float)(voice->midi_velocity - 64) / 63.0f);
-    float effective_rate_hz = fmaxf(0.1f, fminf(200.0f, (lp->rate_hz + rate_mod * 20.0f) * key_mult * vel_mult));
+    float effective_rate_hz = resolve_lfo_rate_hz(lp, rate_mod, tempo_bpm_smoothed) * key_mult * vel_mult;
 
     if (voice->lfo_decim_counter[lfo_idx] == 0) {
         voice->lfo_decim_last_value[lfo_idx] = voice->lfo_decim_target_value[lfo_idx];
@@ -6946,7 +7064,7 @@ static float compute_per_key_lfo_output(SynthVoice *voice, const PackLfoParams *
     return out;
 }
 
-static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer) {
+static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm) {
     float peak = 0.0f;
     // Combi mode: how many of the 8 Program slots are actually "live" this block -- 1 (just
     // program 0) outside Combi mode, all 8 inside it. Every per-program precompute below loops
@@ -7098,6 +7216,21 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
     int voice_limit = effective_voice_limit(knobs);
     int block_size = effective_block_size(knobs);
 
+    // LFO Tempo Sync: chases current_tempo_bpm (already resolved once per block by the caller,
+    // same compute_current_tempo_bpm() the arpeggiator uses) over the exact same ~120ms
+    // block-granularity time constant poll_arpeggiator's own arp_tempo_smoothed already uses --
+    // so a fast Tempo-knob move can't slam a Synced LFO's cycle rate into a discontinuity any
+    // more than it can the arp's step clock. Snaps straight to the current tempo on the very
+    // first call, same "don't fade in at startup" reasoning as master_volume_smoothed above.
+    float *lfo_tempo_smoothed = &engine->lfo_tempo_smoothed;
+    if (!engine->lfo_tempo_smoothed_initialized) {
+        *lfo_tempo_smoothed = current_tempo_bpm;
+        engine->lfo_tempo_smoothed_initialized = true;
+    } else {
+        const float lfo_tempo_chase_rate = 1.0f - expf(-(float)block_size / (SAMPLE_RATE * 0.120f));
+        *lfo_tempo_smoothed += (current_tempo_bpm - *lfo_tempo_smoothed) * lfo_tempo_chase_rate;
+    }
+
     // Portamento glide coefficient, per voice: depends on that voice's OWN Program's
     // portamento_time_ms (a knob, block-invariant) and voices[v].glide_time_multiplier (per-voice,
     // but only rerolled at a glide event in handle_note_on/off -- called once per block from
@@ -7185,7 +7318,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             // its whole 0.1-200Hz dial range); Depth mod adds directly (mod_depth is already a
             // plain 0-1 fraction, same convention mod_source_cc's multiplicative scale uses).
             // Both stay independent of and coexist with mod_source_cc's own CC/aftertouch scale.
-            float effective_rate_hz = fmaxf(0.1f, fminf(200.0f, knobs->programs[p].lfo[l].rate_hz + lfo_rate_mod_state[p][l] * 20.0f));
+            float effective_rate_hz = resolve_lfo_rate_hz(&knobs->programs[p].lfo[l], lfo_rate_mod_state[p][l], *lfo_tempo_smoothed);
             float effective_mod_depth = fmaxf(0.0f, fminf(1.0f, knobs->programs[p].lfo[l].mod_depth + lfo_depth_mod_state[p][l]));
 
             if (l < 2) {
@@ -7341,7 +7474,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                 // Program reads -- the whole point of Per-Key mode (overlapping notes each run
                 // their own unsynced cycle, and Rate can track this voice's own key/velocity).
                 float val = (prog->lfo[l].per_key_mode != 0.0f)
-                    ? compute_per_key_lfo_output(&voices[v], &prog->lfo[l], l, lfo_rate_mod_state[pidx][l], lfo_depth_mod_state[pidx][l], lfo_phase_mod_state[pidx][l], midi_live)
+                    ? compute_per_key_lfo_output(&voices[v], &prog->lfo[l], l, lfo_rate_mod_state[pidx][l], lfo_depth_mod_state[pidx][l], lfo_phase_mod_state[pidx][l], midi_live, *lfo_tempo_smoothed)
                     : lfo_out[pidx][l];
                 // PERF: a real switch (not a flat if-chain) so the compiler can build a jump
                 // table -- O(1) dispatch per routed target instead of a linear scan through every
@@ -9014,7 +9147,7 @@ int main(int argc, char **argv) {
         static float buffer[BUFFER_SIZE * OUTPUT_MAX_CHANNELS];
         struct timespec render_t0, render_t1;
         clock_gettime(CLOCK_MONOTONIC, &render_t0);
-        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer);
+        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer, current_tempo_bpm);
         clock_gettime(CLOCK_MONOTONIC, &render_t1);
         double render_ms = (render_t1.tv_sec - render_t0.tv_sec) * 1000.0 + (render_t1.tv_nsec - render_t0.tv_nsec) / 1e6;
         double budget_ms = (block_size / (double)SAMPLE_RATE) * 1000.0;

@@ -613,7 +613,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         // instance's render clobber another's mid-flight, a real cross-instance data race this
         // multi-instance pass exists to eliminate, not reintroduce.
         float chunk_buffer[BUFFER_SIZE * 2];
-        float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer);
+        float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer, current_tempo_bpm);
         if (peak > block_peak) block_peak = peak;
 
         if (out) {

@@ -623,6 +623,23 @@ MAX_ROUND_ROBIN_GROUPS = 256
 OSC_SHAPE_NAMES = ["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample", "Off"]
 # LFO count: must match LFO_COUNT in backend.c exactly.
 LFO_COUNT = 16
+# LFO Tempo Sync divisions -- index 0 ("Free") means "use the Rate dial's own Hz value", matching
+# PackLfoParams.tempo_sync_division == 0 exactly; indices 1-24 are 1-based, matching backend.c's
+# own LFO_SYNC_BEATS_PER_CYCLE table order exactly (grouped by note name -- 2 Bars/2 Bars Dotted/
+# 2 Bars Triplet, then 1 Bar/../.., down to 1/64/../.. -- not sorted strictly by resulting speed;
+# see that table's own comment for why). Combo currentIndex() IS the wire value sent directly --
+# no separate lookup/offset needed on either side.
+LFO_SYNC_DIVISION_LABELS = [
+    "Free",
+    "2 Bars", "2 Bars D", "2 Bars T",
+    "1 Bar", "1 Bar D", "1 Bar T",
+    "1/2", "1/2 D", "1/2 T",
+    "1/4", "1/4 D", "1/4 T",
+    "1/8", "1/8 D", "1/8 T",
+    "1/16", "1/16 D", "1/16 T",
+    "1/32", "1/32 D", "1/32 T",
+    "1/64", "1/64 D", "1/64 T",
+]
 # Combi/Sequencer lane scaffolding: must match SEQ_LANE_COUNT/AUDIO_LANE_RESOURCE_COUNT in
 # backend.c exactly. COMBI_PROGRAM_COUNT itself is defined earlier now (ahead of SOURCE_NAMES/
 # SOURCE_COUNT, which are built directly on top of it) -- see that definition's own comment.
@@ -3744,6 +3761,10 @@ class SynthGui(QWidget):
 
         self.lfo_combos, self.lfo_dials, self.lfo_readouts = [], [], []
         self.lfo_sync_combos, self.lfo_dest_combos, self.lfo_depth_dials, self.lfo_visualizers = [], [], [], []
+        # Tempo Sync -- a SEPARATE concept from lfo_sync_combos above (which is key_sync, a
+        # note-on phase-reset toggle): this instead decides whether Rate is a free Hz value or a
+        # note-division of the current tempo. See LFO_SYNC_DIVISION_LABELS' own comment.
+        self.lfo_tempo_sync_combos = []
         self.lfo_per_key_checks, self.lfo_key_track_dials, self.lfo_vel_track_dials, self.lfo_key_track_boxes = [], [], [], []
         self.lfo_phase_dials = []
         # Modulation Source (right-click on an LFO's Depth pot): -1.0 = None, 0.0-127.0 = that
@@ -3835,6 +3856,19 @@ class SynthGui(QWidget):
             lfo_row.addWidget(readout)
             self.lfo_dials.append(dial)
             self.lfo_readouts.append(readout)
+
+            # Tempo Sync: "Free" (index 0, default) means Rate's own Hz dial above sets this
+            # LFO's speed, exactly as before this feature existed; any other selection instead
+            # locks the rate to that note division of the current tempo, and the Rate dial (still
+            # transmitted, just ignored by the backend while synced) is grayed out here so it
+            # doesn't look like it's doing something it isn't.
+            sync_div_combo = QComboBox()
+            sync_div_combo.addItems(LFO_SYNC_DIVISION_LABELS)
+            sync_div_combo.setStyleSheet("font-size: 10px;")
+            sync_div_combo.setToolTip("Tempo Sync: locks this LFO's rate to a note division of the current tempo instead of the Rate dial's own Hz value")
+            sync_div_combo.currentIndexChanged.connect(lambda idx, d=dial: d.setEnabled(idx == 0))
+            lfo_row.addWidget(sync_div_combo)
+            self.lfo_tempo_sync_combos.append(sync_div_combo)
 
             dp_dial = PotentiometerKnob(f"LFO {x} Dp", self)
             dp_dial.setRange(0, 100)
@@ -4032,6 +4066,9 @@ class SynthGui(QWidget):
         # FXSlotParams in backend.c. Mirrors fx_type_combos in every way that matters for
         # snapshot/restore/swap (a slot's source assignment moves with it on reorder).
         self.fx_source_combos = []
+        # Chain To Next -- see FXSlotParams.chain_to_next in backend.c and the button's own
+        # tooltip/comment at its construction site below.
+        self.fx_chain_to_next_buttons = []
         # Per-slot lists of the 8 generic param widgets, so _apply_fx_slot_type can relabel,
         # re-range/re-populate, and show/hide them once a slot's Type is known. Each param
         # position carries BOTH a knob and a combo (only one shown at a time) so a discrete
@@ -4107,6 +4144,28 @@ class SynthGui(QWidget):
             bypass_btn.setToolTip("Bypass this slot (keeps its state alive -- e.g. a delay's tail -- unlike switching Type to Off)")
             slot_lay.addWidget(bypass_btn)
             self.fx_bypass_buttons.append(bypass_btn)
+
+            # Chain To Next: only meaningful when this slot's SOURCE is running in Parallel mode
+            # (see the per-source Series/Parallel toggles below) -- inert (harmless, no effect) in
+            # Series mode, where every slot is already chained unconditionally. When on, the NEXT
+            # slot belonging to the same source is fed THIS slot's own output instead of starting
+            # a fresh parallel branch, letting several slots run in series as one branch alongside
+            # a source's other parallel slots/branches -- e.g. two independent 3-slot serial
+            # chains summed together. No "next slot" exists on the very last slot, so its own
+            # button is disabled there (matching the Down-reorder button's own boundary
+            # convention just below).
+            chain_btn = QPushButton("→")
+            chain_btn.setCheckable(True)
+            chain_btn.setFixedSize(18, 22)
+            chain_btn.setStyleSheet("QPushButton { font-size: 10px; } QPushButton:checked { background-color: #2e8b57; color: white; }")
+            chain_btn.setToolTip(
+                "Chain this slot's output into the next slot (same source), continuing this as one\n"
+                "series sub-chain instead of a separate parallel branch. Only has an effect while\n"
+                "this slot's source is set to Parallel routing -- see the Routing buttons below."
+            )
+            chain_btn.setEnabled(slot_idx < FX_SLOT_COUNT - 1)
+            slot_lay.addWidget(chain_btn)
+            self.fx_chain_to_next_buttons.append(chain_btn)
 
             # Reorder: these move the slot's whole configuration (type/params/mix/bypass) to the
             # neighboring position -- the row widgets themselves never move, only the values they
@@ -4685,7 +4744,8 @@ class SynthGui(QWidget):
     def _fx_slot_snapshot(self, slot_idx):
         """Captures everything that makes up one FX slot's configuration -- type, all 8 params
         (as whichever representation, dial value or combo index, that type actually uses), mix,
-        and bypass -- so it can be moved wholesale to another slot position by _swap_fx_slots."""
+        bypass, and chain-to-next -- so it can be moved wholesale to another slot position by
+        _swap_fx_slots."""
         type_idx = self.fx_type_combos[slot_idx].currentIndex()
         entry = FX_TYPE_METADATA[type_idx] if 0 <= type_idx < len(FX_TYPE_METADATA) else FX_TYPE_METADATA[0]
         params_meta = entry["params"]
@@ -4702,6 +4762,7 @@ class SynthGui(QWidget):
             "params": params,
             "mix": self.fx_mix_dials[slot_idx].value(),
             "bypass": self.fx_bypass_buttons[slot_idx].isChecked(),
+            "chain_to_next": self.fx_chain_to_next_buttons[slot_idx].isChecked(),
         }
 
     def _fx_slot_restore(self, slot_idx, snapshot):
@@ -4733,13 +4794,20 @@ class SynthGui(QWidget):
         self.fx_bypass_buttons[slot_idx].blockSignals(True)
         self.fx_bypass_buttons[slot_idx].setChecked(snapshot["bypass"])
         self.fx_bypass_buttons[slot_idx].blockSignals(False)
+        self.fx_chain_to_next_buttons[slot_idx].blockSignals(True)
+        self.fx_chain_to_next_buttons[slot_idx].setChecked(snapshot["chain_to_next"])
+        self.fx_chain_to_next_buttons[slot_idx].blockSignals(False)
 
     def _swap_fx_slots(self, a, b):
         """Moves slot a's whole configuration to slot b's position and vice versa -- the row
         widgets stay put (so nothing about their signal wiring changes), only the values they
         hold move. Series routing processes slots strictly by array position, so this alone is
         what makes reordering actually change processing order once retransmitted; Parallel
-        routing sums all slots so order is a no-op for it either way."""
+        routing sums all slots so order is a no-op for it either way -- chain_to_next moving with
+        its slot is what lets a chained group stay grouped/coherent across a reorder too. Note
+        fx_chain_to_next_buttons[slot_idx]'s own ENABLED state (disabled on the very last slot) is
+        NOT part of the swap -- it's a fixed property of the row's physical POSITION (no "next
+        slot" exists there, ever), not of whatever content currently occupies that position."""
         if not (0 <= a < FX_SLOT_COUNT and 0 <= b < FX_SLOT_COUNT):
             return
         snap_a = self._fx_slot_snapshot(a)
@@ -5278,6 +5346,15 @@ class SynthGui(QWidget):
                 self.lfo_dials[idx].setValue(int(round(fields[f"/hds/lfo/{idx}/rate"] * 10.0)))
                 self.lfo_dials[idx].blockSignals(False)
                 self.lfo_readouts[idx].setText(f"{fields[f'/hds/lfo/{idx}/rate']:.1f} Hz")
+            if f"/hds/lfo/{idx}/tempo_sync" in fields:
+                sync_idx = int(round(fields[f"/hds/lfo/{idx}/tempo_sync"]))
+                sync_idx = max(0, min(len(LFO_SYNC_DIVISION_LABELS) - 1, sync_idx))
+                self.lfo_tempo_sync_combos[idx].blockSignals(True)
+                self.lfo_tempo_sync_combos[idx].setCurrentIndex(sync_idx)
+                self.lfo_tempo_sync_combos[idx].blockSignals(False)
+                self.lfo_dials[idx].setEnabled(sync_idx == 0)
+                if sync_idx != 0:
+                    self.lfo_readouts[idx].setText(LFO_SYNC_DIVISION_LABELS[sync_idx])
             if f"/hds/lfo/{idx}/depth" in fields:
                 self.lfo_depth_dials[idx].blockSignals(True)
                 self.lfo_depth_dials[idx].setValue(int(round(fields[f"/hds/lfo/{idx}/depth"] * 100.0)))
@@ -5360,6 +5437,7 @@ class SynthGui(QWidget):
                 "params": params,
                 "mix": int(round(fields.get(f"/hds/fx/{slot_idx}/mix", self.fx_mix_dials[slot_idx].value()))),
                 "bypass": fields.get(f"/hds/fx/{slot_idx}/bypass", 0.0) != 0.0,
+                "chain_to_next": fields.get(f"/hds/fx/{slot_idx}/chain_to_next", 0.0) != 0.0,
             }
             self._fx_slot_restore(slot_idx, snapshot)
 
@@ -6083,10 +6161,13 @@ class SynthGui(QWidget):
         add_f("/hds/seq/transport/seek_fwd", self.seq_transport_seek_fwd_trigger)
         add_f("/hds/seq/transport/metronome", 1.0 if self.seq_btn_metronome.isChecked() else 0.0)
 
-        # LFOs (incl. phase offset + mod source CC)
+        # LFOs (incl. phase offset + mod source CC + Tempo Sync)
         for idx in range(LFO_COUNT):
             lfo_hz = float(self.lfo_dials[idx].value()) / 10.0
-            self.lfo_readouts[idx].setText(f"{lfo_hz:.1f} Hz")
+            sync_div_idx = self.lfo_tempo_sync_combos[idx].currentIndex()
+            # Readout shows the actual Hz value while Free, or the division label while Synced --
+            # showing "4.5 Hz" for a rate the backend is actually ignoring would be misleading.
+            self.lfo_readouts[idx].setText(f"{lfo_hz:.1f} Hz" if sync_div_idx == 0 else LFO_SYNC_DIVISION_LABELS[sync_div_idx])
             lfo_dp = float(self.lfo_depth_dials[idx].value()) / 100.0
             add_f(f"/hds/lfo/{idx}/wave", self.lfo_combos[idx].currentIndex())
             add_f(f"/hds/lfo/{idx}/rate", lfo_hz)
@@ -6098,6 +6179,7 @@ class SynthGui(QWidget):
             add_f(f"/hds/lfo/{idx}/per_key", 1.0 if self.lfo_per_key_checks[idx].isChecked() else 0.0)
             add_f(f"/hds/lfo/{idx}/key_track", self.lfo_key_track_dials[idx].value())
             add_f(f"/hds/lfo/{idx}/vel_track", self.lfo_vel_track_dials[idx].value())
+            add_f(f"/hds/lfo/{idx}/tempo_sync", sync_div_idx)
 
         # 6 custom EG intensity multipliers
         for idx in range(6):
@@ -6205,6 +6287,7 @@ class SynthGui(QWidget):
                 add_f(f"/hds/fx/{slot_idx}/param/{p_idx}", value)
             add_f(f"/hds/fx/{slot_idx}/mix", self.fx_mix_dials[slot_idx].value())
             add_f(f"/hds/fx/{slot_idx}/bypass", 1.0 if self.fx_bypass_buttons[slot_idx].isChecked() else 0.0)
+            add_f(f"/hds/fx/{slot_idx}/chain_to_next", 1.0 if self.fx_chain_to_next_buttons[slot_idx].isChecked() else 0.0)
 
         # FX Bus routing: 0 = Series, 1 = Parallel -- now per-source (see SOURCE_COUNT).
         for src in range(SOURCE_COUNT):
@@ -6510,6 +6593,7 @@ def runtime_connect_and_bind(gui):
         gui.lfo_depth_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.lfo_phase_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.lfo_sync_combos[idx].currentIndexChanged.connect(gui.transmit_knob_packet)
+        gui.lfo_tempo_sync_combos[idx].currentIndexChanged.connect(gui.transmit_knob_packet)
         gui.lfo_per_key_checks[idx].toggled.connect(gui.transmit_knob_packet)
         gui.lfo_key_track_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.lfo_vel_track_dials[idx].valueChanged.connect(gui.transmit_knob_packet)
@@ -6531,6 +6615,7 @@ def runtime_connect_and_bind(gui):
             p_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
         gui.fx_mix_dials[slot_idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.fx_bypass_buttons[slot_idx].toggled.connect(gui.transmit_knob_packet)
+        gui.fx_chain_to_next_buttons[slot_idx].toggled.connect(gui.transmit_knob_packet)
     for btn in gui.fx_source_routing_btns:
         btn.toggled.connect(gui.transmit_knob_packet)
 
