@@ -1054,3 +1054,15 @@ Port numbers to use for less common cases:
   (VU meter, tempo, recording state); knob control alone could still reach
   a remote plugin instance via `--osc-host`, but its status replies
   wouldn't find their way back.
+
+Connecting a fresh `frontend.py` to an already-configured instance (a DAW's
+restored patch, or simply a second GUI pointed at a different instance's
+port pair) now correctly pulls and displays that instance's real
+Performance Mode and every Sequencer/Combi lane setting, not just its
+oscillator/filter/EG knobs -- previously, any of these Sequencer/Combi
+fields the GUI didn't already have loaded would get silently blasted back
+to that fresh GUI's own defaults the instant it connected (see
+`_apply_seq_and_combi_fields()` in `frontend.py`), which made editing an
+existing preset through a second address effectively impossible. Fixed:
+that pull is now complete for everything `transmit_knob_packet()` can
+actually overwrite.

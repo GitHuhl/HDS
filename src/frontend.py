@@ -6009,7 +6009,8 @@ class SynthGui(QWidget):
     def _apply_full_state_fields(self, fields):
         """Applies a /hds/request_state reply (see listen_for_status_frames()'s sentinel
         handling) to this GUI's own widgets, so connecting to an already-configured backend
-        instance (e.g. a DAW-hosted CLAP instance with a restored patch) pulls and displays its
+        instance (e.g. a DAW-hosted CLAP instance with a restored patch, or another running
+        frontend.py pointed at a different CLAP instance's own port pair) pulls and displays its
         real current state instead of overwriting it with GUI defaults -- see the boot-time call
         site in runtime_connect_and_bind() for the connect-time flow this serves.
 
@@ -6022,14 +6023,27 @@ class SynthGui(QWidget):
         call, so its trailing transmit_knob_packet() call round-trips the correct values along
         with everything else.
 
-        Known, deliberate gap (not silently dropped): Sequencer/Combi-lane fields
-        (/hds/seq/..., /hds/performance_mode) and the rig-level fields Program scope also excludes
-        (/hds/device/, /hds/record/, /hds/routing/, /hds/ext_in/, /hds/audio/) are not applied by
-        this pass -- the first because this GUI has no reverse-mapping for the Sequencer/Combi
-        lane widgets yet, the second because they're either functionally inert for a CLAP instance
-        (no audio-device I/O at all) or not landmines the way knob state is (transmit_knob_packet()
-        doesn't re-blast them, so an unsynced GUI default there is stale-but-harmless, not a
-        clobber risk)."""
+        FIXED: performance_mode and every Sequencer/Combi-lane field transmit_knob_packet()
+        unconditionally re-sends (see _apply_seq_and_combi_fields()'s own comment) used to be
+        skipped here entirely -- meaning that same trailing transmit_knob_packet() call
+        immediately blasted this freshly-constructed GUI's own DEFAULT lane/mode state back over
+        the wire the instant you connected, silently wiping out whatever Sequencer lanes or Combi
+        setup the instance actually had. This is exactly what made editing an existing preset
+        through a second address (a DAW's restored patch, or another frontend.py instance)
+        "virtually impossible" -- the corruption happened on connect, before you ever touched a
+        knob. _apply_seq_and_combi_fields() closes that gap, so the trailing transmit is now a
+        true no-op round-trip for these fields too, not a clobber.
+
+        Remaining, genuinely-fine-to-skip gap: Combi lanes' own PER-PROGRAM content (e.g.
+        /hds/combi/{i}/vco1/shape) and the rig-level fields Program scope also excludes
+        (/hds/device/, /hds/record/, /hds/routing/, /hds/ext_in/, /hds/audio/). The first is safe
+        to skip because transmit_knob_packet() never sends those addresses at all (see
+        _apply_program_fields_to_combi_lane's own comment) -- there is no stale GUI default that
+        could ever overwrite them, only a cosmetic "this GUI has no live per-lane oscillator
+        editing UI" gap that already existed by design. The second is skipped because those fields
+        are either functionally inert for a CLAP instance (no audio-device I/O at all) or not
+        landmines the way knob state is, for the same "transmit_knob_packet() doesn't re-blast
+        them" reason."""
         if "/hds/master_volume" in fields:
             self.master_vol.blockSignals(True)
             self.master_vol.setValue(_audio_vol_untaper(fields["/hds/master_volume"]))
@@ -6038,7 +6052,140 @@ class SynthGui(QWidget):
             self.transpose_dial.blockSignals(True)
             self.transpose_dial.setValue(int(round(fields["/hds/transpose_semitones"])))
             self.transpose_dial.blockSignals(False)
+        self._apply_seq_and_combi_fields(fields)
         self._apply_program_fields(fields)
+
+    def _apply_seq_and_combi_fields(self, fields):
+        """Restores performance_mode plus every field transmit_knob_packet() sends
+        UNCONDITIONALLY regardless of mode: all 32 Sequencer lanes' own mixer-strip fields (lane
+        type/volume/pan/MIDI channel/mode/mute/rec/overdub/audio path+offset -- see that method's
+        own "always sent, unconditionally, regardless of Performance Mode" comment), each Combi
+        lane's own session-level fields (MIDI channel, Key/Velocity zone, Transpose -- and, since
+        Combi mode mirrors its own fader/pan onto the SAME /hds/seq/{i}/volume|pan addresses,
+        those too), the Sequencer transport's own trigger counters (resynced, not re-fired -- see
+        below), and the metronome/quantize/sync-source toggles. Called from
+        _apply_full_state_fields() BEFORE _apply_program_fields()'s own trailing
+        transmit_knob_packet(), so that transmit echoes back the ACTUAL current state instead of
+        this GUI's freshly-constructed defaults -- see _apply_full_state_fields()'s own comment on
+        why an unrestored field here used to mean instant, silent corruption on connect."""
+        if "/hds/performance_mode" in fields:
+            mode = int(round(fields["/hds/performance_mode"]))
+            radios = (self.osc_prog_radio, self.osc_combi_radio, self.osc_sequencer_radio)
+            for radio in radios:
+                radio.blockSignals(True)
+            self.osc_prog_radio.setChecked(mode == 0)
+            self.osc_combi_radio.setChecked(mode == 1)
+            self.osc_sequencer_radio.setChecked(mode == 2)
+            for radio in radios:
+                radio.blockSignals(False)
+            # Re-apply the visual side effects blockSignals skipped (same "re-emit manually"
+            # idiom _apply_program_fields uses for its own combo-driven show/hide widgets).
+            self.osc_prog_scroll.setVisible(mode == 0)
+            self.osc_combi_widget.setVisible(mode == 1)
+            if mode == 2:
+                self.tab_widget.setCurrentWidget(self.tab_sequencer)
+
+        for i, (_row, fader, pan_dial, type_combo, mode_combo) in enumerate(self.seq_lane_rows):
+            prefix = f"/hds/seq/{i}/"
+            if f"{prefix}lane_type" in fields:
+                type_combo.blockSignals(True); type_combo.setCurrentIndex(int(round(fields[f"{prefix}lane_type"]))); type_combo.blockSignals(False)
+            if f"{prefix}volume" in fields:
+                fader.blockSignals(True); fader.setValue(int(round(fields[f"{prefix}volume"]))); fader.blockSignals(False)
+            if f"{prefix}pan" in fields:
+                pan_dial.blockSignals(True); pan_dial.setValue(int(round(fields[f"{prefix}pan"] * 100.0))); pan_dial.blockSignals(False)
+            if f"{prefix}midi_channel" in fields:
+                combo = self.seq_lane_midi_channel_combos[i]
+                combo.blockSignals(True); combo.setCurrentIndex(int(round(fields[f"{prefix}midi_channel"]))); combo.blockSignals(False)
+            if f"{prefix}mode" in fields:
+                mode_combo.blockSignals(True); mode_combo.setCurrentIndex(int(round(fields[f"{prefix}mode"]))); mode_combo.blockSignals(False)
+            if f"{prefix}mute" in fields:
+                btn = self.seq_lane_mute_buttons[i]
+                btn.blockSignals(True); btn.setChecked(fields[f"{prefix}mute"] != 0.0); btn.blockSignals(False)
+            if f"{prefix}rec_armed" in fields:
+                btn = self.seq_lane_rec_buttons[i]
+                btn.blockSignals(True); btn.setChecked(fields[f"{prefix}rec_armed"] != 0.0); btn.blockSignals(False)
+            if f"{prefix}rec_overdub" in fields:
+                combo = self.seq_lane_overdub_combos[i]
+                combo.blockSignals(True); combo.setCurrentIndex(int(round(fields[f"{prefix}rec_overdub"]))); combo.blockSignals(False)
+            audio_widgets = self.seq_lane_audio_widgets[i]
+            if f"{prefix}audio_path" in fields:
+                path = fields[f"{prefix}audio_path"] or ""
+                audio_widgets["path"] = path
+                audio_widgets["status_label"].setText(os.path.basename(path) if path else "(no file)")
+            if f"{prefix}audio_offset_sec" in fields:
+                dial = audio_widgets["offset_dial"]
+                dial.blockSignals(True); dial.setValue(int(round(float(fields[f"{prefix}audio_offset_sec"]) * 10.0))); dial.blockSignals(False)
+            if f"{prefix}audio_preview_trigger" in fields:
+                audio_widgets["preview_trigger"] = fields[f"{prefix}audio_preview_trigger"]
+            # Re-sync each lane's MIDI/Audio box visibility now that Type is actually restored --
+            # the same show/hide logic _enforce_seq_lane_type_cap applies on a live edit, minus
+            # its audio-lane-count cap check (a live-editing safety guard, not needed here: the
+            # backend's own state is already valid by construction).
+            new_index = type_combo.currentIndex()
+            self.seq_lane_audio_widgets[i]["box"].setVisible(new_index == 1)
+            self.seq_lane_midi_import_widgets[i]["box"].setVisible(new_index == 0)
+            self.seq_lane_midi_channel_combos[i].setVisible(new_index == 0)
+
+        # Combi lanes: their own session-level fields, plus their fader/pan mirror of the same
+        # /hds/seq/{i}/volume|pan addresses just restored above (see this method's own comment).
+        for i, (_row, fader, pan_dial, _type_combo, _mode_combo) in enumerate(self.combi_lane_rows):
+            if f"/hds/seq/{i}/volume" in fields:
+                fader.blockSignals(True); fader.setValue(int(round(fields[f"/hds/seq/{i}/volume"]))); fader.blockSignals(False)
+            if f"/hds/seq/{i}/pan" in fields:
+                pan_dial.blockSignals(True); pan_dial.setValue(int(round(fields[f"/hds/seq/{i}/pan"] * 100.0))); pan_dial.blockSignals(False)
+        for i, combo in enumerate(self.combi_lane_midi_channel_combos):
+            addr = f"/hds/combi/{i}/midi_channel"
+            if addr in fields:
+                combo.blockSignals(True); combo.setCurrentIndex(int(round(fields[addr]))); combo.blockSignals(False)
+        for i in range(COMBI_PROGRAM_COUNT):
+            for suffix, spins in (("key_lo", self.combi_lane_key_lo_spins), ("key_hi", self.combi_lane_key_hi_spins),
+                                   ("vel_lo", self.combi_lane_vel_lo_spins), ("vel_hi", self.combi_lane_vel_hi_spins),
+                                   ("transpose", self.combi_lane_transpose_spins)):
+                addr = f"/hds/combi/{i}/{suffix}"
+                if addr in fields:
+                    spins[i].blockSignals(True); spins[i].setValue(int(round(fields[addr]))); spins[i].blockSignals(False)
+
+        # Sequencer transport trigger counters -- resynced (not re-fired: these are plain instance
+        # attributes, not buttons, so there's no click to simulate), so a later real button press
+        # is compared against the ACTUAL last-seen value instead of a stale local 0 that could
+        # either spuriously re-trigger an edge the backend already saw, or fail to trigger one it
+        # hasn't.
+        trigger_attrs = {
+            "/hds/seq/transport/play": "seq_transport_play_trigger",
+            "/hds/seq/transport/pause": "seq_transport_pause_trigger",
+            "/hds/seq/transport/stop": "seq_transport_stop_trigger",
+            "/hds/seq/transport/seek_start": "seq_transport_seek_start_trigger",
+            "/hds/seq/transport/seek_back": "seq_transport_seek_back_trigger",
+            "/hds/seq/transport/seek_fwd": "seq_transport_seek_fwd_trigger",
+            "/hds/seq/transport/seek_to_target_sec": "seq_transport_seek_to_target_sec",
+            "/hds/seq/transport/seek_to": "seq_transport_seek_to_trigger",
+        }
+        for addr, attr in trigger_attrs.items():
+            if addr in fields:
+                setattr(self, attr, fields[addr])
+
+        if "/hds/seq/transport/metronome" in fields:
+            self.seq_btn_metronome.blockSignals(True)
+            self.seq_btn_metronome.setChecked(fields["/hds/seq/transport/metronome"] != 0.0)
+            self.seq_btn_metronome.blockSignals(False)
+        if "/hds/seq/quantize/enable" in fields:
+            self.seq_btn_quantize.blockSignals(True)
+            self.seq_btn_quantize.setChecked(fields["/hds/seq/quantize/enable"] != 0.0)
+            self.seq_btn_quantize.blockSignals(False)
+        if "/hds/seq/quantize/resolution" in fields:
+            try:
+                idx = SEQ_QUANTIZE_RESOLUTIONS.index(int(round(fields["/hds/seq/quantize/resolution"])))
+            except ValueError:
+                idx = None
+            if idx is not None:
+                self.seq_quantize_resolution_combo.blockSignals(True)
+                self.seq_quantize_resolution_combo.setCurrentIndex(idx)
+                self.seq_quantize_resolution_combo.blockSignals(False)
+        if "/hds/seq/sync_source" in fields:
+            self.seq_sync_source_combo.blockSignals(True)
+            self.seq_sync_source_combo.setCurrentIndex(int(round(fields["/hds/seq/sync_source"])))
+            self.seq_sync_source_combo.blockSignals(False)
+            self._update_seq_sync_lock_label()
 
     def _apply_program_fields(self, fields):
         """Save/Load's Load handler's field-application step -- the mirror image of
