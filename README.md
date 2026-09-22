@@ -902,3 +902,51 @@ its standalone mock mode if not. Multiple simultaneous controllers (e.g.
 work independently but don't mirror each other's state live -- that would
 need each controller to also listen for every other controller's writes,
 which none of them currently do.
+
+#### Using the frontend GUI with the CLAP plugin
+
+`hds.clap`, once loaded into a host, has no visible UI of its own -- it
+embeds an OSC control server (see "CLAP: multi-out audio ports"/"CLAP:
+params extension" above), the same protocol the standalone app speaks, just
+on different ports so it never collides with a `synth_engine` you might
+also have running. `frontend.py` is the recommended way to actually see
+and drive it: point it at the plugin instance's ports instead of the
+standalone app's defaults --
+
+```sh
+python3 src/frontend.py --osc-listen-port 9010 --osc-reply-port 9011
+```
+
+That's it for the common case (one host, one instance, running on the same
+machine as the GUI) -- `--osc-host` stays at its `127.0.0.1` default since
+the plugin runs in the same host process on the same machine.
+
+Port numbers to use for less common cases:
+
+- **More than one instance in the same host** (e.g. HDS on several
+  tracks): each instance claims the next free pair 2 ports up from the
+  last -- instance 1 gets 9010/9011, instance 2 gets 9012/9013, instance 3
+  gets 9014/9015, and so on (`CLAP_OSC_LISTEN_PORT_BASE`/
+  `CLAP_OSC_REPLY_PORT_BASE` in `clap_plugin.c`). There's no way to choose
+  which instance gets which pair -- it's whichever port each one manages to
+  bind first, in whatever order the host activates them -- so if you have
+  more than one instance loaded, check which pair a given one actually got
+  rather than assuming. Each bound pair is logged to the host's own log/
+  console (look for a line like `[hds-clap] OSC listening on UDP port
+  9012, status replies to 127.0.0.1:9013`, either on the host's stderr or,
+  for hosts that surface it, via the CLAP `log` extension), and run one
+  `frontend.py --osc-listen-port <N> --osc-reply-port <N+1>` per instance
+  you want a GUI open for.
+- **A `synth_engine` instance already running on 9000/9001 at the same
+  time**: no conflict -- the plugin's 9010+ range never overlaps the
+  standalone app's 9000/9001, so both can be driven from separate
+  `frontend.py` processes simultaneously.
+- **The host is on a different machine than the GUI** (e.g. a headless DAW
+  render box): same as the standalone cross-machine case above, but there's
+  no `--osc-reply-host`-equivalent flag on the plugin side to point status
+  replies back at a remote frontend -- the plugin always replies to
+  `127.0.0.1` (`CLAP_OSC_REPLY_HOST` in `clap_plugin.c`). Run `frontend.py`
+  on the same machine as the host for now if you need live status feedback
+  (VU meter, tempo, recording state); knob control alone could still reach
+  a remote plugin instance via `--osc-host`, but its status replies
+  wouldn't find their way back.
