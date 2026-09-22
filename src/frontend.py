@@ -6047,6 +6047,24 @@ class SynthGui(QWidget):
         knob. _apply_seq_and_combi_fields() closes that gap, so the trailing transmit is now a
         true no-op round-trip for these fields too, not a clobber.
 
+        FIXED (second pass): an address-by-address audit of every OSC address
+        transmit_knob_packet() ever sends against everything the apply-functions below actually
+        restore turned up the SAME bug class in three more places transmit_knob_packet() sends
+        unconditionally: each FX slot's own source routing (/hds/fx/{i}/source) and each source's
+        own Series/Parallel FX routing mode (/hds/fx_routing/{i}/mode) -- both deliberately
+        excluded from _apply_program_fields_fx()'s own Program-Load behavior (correctly -- a
+        Program shouldn't dictate session routing), but with nothing else restoring them for the
+        reconnect case either, so reconnecting silently reset any ext-in FX routing back to
+        Program/Series. _apply_fx_routing_fields() closes that gap the same way
+        _apply_seq_and_combi_fields() closed the Sequencer/Combi one. Programmable tempo markers
+        (/hds/tempo/marker_count, /hds/tempo/marker/{i}/time|bpm, e.g. from importing a Standard
+        MIDI File) and microtuning (/hds/tuning/enable|reference_note|reference_freq) were a
+        different shape of the same bug: genuinely Program-scoped (not excluded), so they SHOULD
+        already have been restored by _apply_program_fields() for both Program Load and reconnect
+        alike -- but nothing there ever applied them either, so BOTH use cases silently dropped an
+        imported tempo map or an active tuning scale. Now restored directly in
+        _apply_program_fields() itself, benefiting Program Load too, not just reconnect.
+
         Remaining, genuinely-fine-to-skip gap: Combi lanes' own PER-PROGRAM content (e.g.
         /hds/combi/{i}/vco1/shape) and the rig-level fields Program scope also excludes
         (/hds/device/, /hds/record/, /hds/routing/, /hds/ext_in/, /hds/audio/). The first is safe
@@ -6066,7 +6084,27 @@ class SynthGui(QWidget):
             self.transpose_dial.setValue(int(round(fields["/hds/transpose_semitones"])))
             self.transpose_dial.blockSignals(False)
         self._apply_seq_and_combi_fields(fields)
+        self._apply_fx_routing_fields(fields)
         self._apply_program_fields(fields)
+
+    def _apply_fx_routing_fields(self, fields):
+        """Restores each FX slot's own source assignment and each source's own Series/Parallel
+        routing mode -- both sent unconditionally by transmit_knob_packet() but deliberately
+        excluded from _apply_program_fields_fx()'s Program-Load behavior (session routing, not
+        patch content -- see _is_program_scope_address()'s own comment on the one exception,
+        /hds/fx_routing/0/mode). Nothing else restores these for the reconnect case, so without
+        this they silently reset to Program/Series on every reconnect -- see
+        _apply_full_state_fields()'s own comment."""
+        for slot_idx in range(FX_SLOT_COUNT):
+            addr = f"/hds/fx/{slot_idx}/source"
+            if addr in fields:
+                combo = self.fx_source_combos[slot_idx]
+                combo.blockSignals(True); combo.setCurrentIndex(int(round(fields[addr]))); combo.blockSignals(False)
+        for src in range(SOURCE_COUNT):
+            addr = f"/hds/fx_routing/{src}/mode"
+            if addr in fields:
+                btn = self.fx_source_routing_btns[src]
+                btn.blockSignals(True); btn.setChecked(fields[addr] != 0.0); btn.blockSignals(False)
 
     def _apply_seq_and_combi_fields(self, fields):
         """Restores performance_mode plus every field transmit_knob_packet() sends
@@ -6344,6 +6382,37 @@ class SynthGui(QWidget):
         for combo in (self.vco1_combo, self.vco2_combo, self.vco3_combo, self.vco4_combo,
                       *self.filter_type_combos, self.filter_chain_mode_combo):
             combo.currentIndexChanged.emit(combo.currentIndex())
+
+        # FIXED: tempo markers (e.g. from importing a Standard MIDI File) and microtuning are
+        # genuinely Program-scoped (see _is_program_scope_address -- neither is excluded), so a
+        # saved Program's own file already includes them, and a reconnect's full state dump
+        # already carries them too -- but nothing here ever applied either back onto this GUI's
+        # own state. Left unfixed, EVERY call site of this function (Program Load, and the
+        # reconnect path via _apply_full_state_fields) silently dropped an imported tempo map back
+        # to flat/zero and any active tuning scale back to standard 12-TET -- then this method's
+        # own trailing transmit_knob_packet() below re-sent that emptied-out state, permanently
+        # erasing the real values rather than just failing to display them.
+        if "/hds/tempo/marker_count" in fields:
+            count = max(0, min(TEMPO_MARKER_MAX, int(round(fields["/hds/tempo/marker_count"]))))
+            markers = []
+            for i in range(count):
+                t = fields.get(f"/hds/tempo/marker/{i}/time")
+                bpm = fields.get(f"/hds/tempo/marker/{i}/bpm")
+                if t is not None and bpm is not None:
+                    markers.append((float(t), float(bpm)))
+            self._imported_tempo_markers = markers
+        if "/hds/tuning/enable" in fields:
+            self.tuning_enable_check.blockSignals(True)
+            self.tuning_enable_check.setChecked(fields["/hds/tuning/enable"] != 0.0)
+            self.tuning_enable_check.blockSignals(False)
+        if "/hds/tuning/reference_note" in fields:
+            self.tuning_ref_note_spin.blockSignals(True)
+            self.tuning_ref_note_spin.setValue(int(round(fields["/hds/tuning/reference_note"])))
+            self.tuning_ref_note_spin.blockSignals(False)
+        if "/hds/tuning/reference_freq" in fields:
+            self.tuning_ref_freq_spin.blockSignals(True)
+            self.tuning_ref_freq_spin.setValue(float(fields["/hds/tuning/reference_freq"]))
+            self.tuning_ref_freq_spin.blockSignals(False)
 
         self.transmit_knob_packet()
 

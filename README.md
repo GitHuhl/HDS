@@ -1094,3 +1094,28 @@ active LPF rather than Off like every other slot -- both now match
 to match (Off/Off/Off), so a fresh, never-configured instance's actual
 starting patch is now silence-free on Oscillators 2-3 and filter-free,
 not just the frontend's own pre-connection appearance.
+
+A second pass found the same bug class in three more places: an
+address-by-address audit of every OSC address `transmit_knob_packet()`
+ever sends against everything the `_apply_*` functions actually restore
+(rather than reasoning about it one report at a time) turned up each FX
+slot's own source routing (`/hds/fx/{i}/source`) and each source's own
+Series/Parallel FX routing mode (`/hds/fx_routing/{i}/mode`) -- both
+deliberately excluded from Program Load's own restore behavior (correctly
+-- a Program shouldn't dictate session routing), but with nothing else
+restoring them for the reconnect case either, so reconnecting silently
+reset any ext-in FX routing back to Program/Series. Fixed by a new
+`_apply_fx_routing_fields()`, called from `_apply_full_state_fields()`
+alongside the existing Sequencer/Combi restore. Programmable tempo markers
+(`/hds/tempo/marker_count`, `/hds/tempo/marker/{i}/time|bpm` -- e.g. from
+importing a Standard MIDI File) and microtuning
+(`/hds/tuning/enable|reference_note|reference_freq`) were a different
+shape of the same bug: genuinely Program-scoped, so they should already
+have been restored by `_apply_program_fields()` for both Program Load and
+reconnect alike -- but nothing there ever applied them either, so both use
+cases silently dropped an imported tempo map or an active tuning scale
+back to flat/12-TET, and that function's own trailing
+`transmit_knob_packet()` then re-sent the emptied-out state, permanently
+erasing the real values rather than just failing to display them. Fixed
+by restoring both directly inside `_apply_program_fields()`, which fixes
+Program Load too, not just reconnect.
