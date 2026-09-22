@@ -5067,7 +5067,7 @@ static int request_state_handler(const char *path, const char *types, lo_arg **a
 
 // FIXED: Restored 'init_default_controls' macro mapping setup routine missing from compilation stack
 static void init_default_controls(SynthSharedControls *knobs) {
-    knobs->programs[0].is_polyphonic = 1.0f; knobs->programs[0].vco1_shape = 0.0f; knobs->programs[0].vco2_shape = 3.0f;
+    knobs->programs[0].is_polyphonic = 1.0f; knobs->programs[0].vco1_shape = 0.0f; knobs->programs[0].vco2_shape = (float)WAVE_OFF;
     knobs->programs[0].fm_intensity = 0.0f; knobs->programs[0].vco1_vol = 0.8f; knobs->programs[0].vco2_vol = 0.5f;
     knobs->programs[0].portamento_time_ms = 150.0f; knobs->master_volume = 0.50f;
     knobs->transpose_semitones = 0.0f; // centered, no transposition
@@ -5076,12 +5076,13 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->tuning_reference_freq = 261.6256f; // Middle C's own standard 12-TET frequency
     knobs->programs[0].vco1_pan = 0.0f; knobs->programs[0].vco2_pan = 0.0f;
     knobs->programs[0].vco1_fine_tune = 0.0f; knobs->programs[0].vco2_pitch_offset = 0.0f; knobs->programs[0].vco2_fine_tune = 0.0f;
-    // Filters: 5 flat slots, Series by default. Filter 0 reproduces today's exact single-LPF
-    // default (800Hz, Q20, 2-pole); filters 1-4 default Off, matching today's inert
-    // Filter B/Multi units -- see the filter section simplification's own comments.
+    // Filters: 5 flat slots, Series by default, every slot Off -- a fresh patch pays no filter
+    // cost at all until a player actually reaches for one (same "Off is a true bypass" posture
+    // as the post-filter EQ bands below). Filter 0's cutoff/res still default to a sensible
+    // 800Hz/Q20 starting point for whenever it IS switched on, just not engaged automatically.
     knobs->programs[0].filter_chain_mode = 0.0f; // Series
     knobs->programs[0].filters[0].cutoff = 800.0f; knobs->programs[0].filters[0].res_q = 20.0f;
-    knobs->programs[0].filters[0].slope_poles = 0.0f; knobs->programs[0].filters[0].filter_type = 1.0f; // LPF
+    knobs->programs[0].filters[0].slope_poles = 0.0f; knobs->programs[0].filters[0].filter_type = 0.0f; // Off -- every filter slot off by default
     knobs->programs[0].filters[0].key_track = 0.0f; knobs->programs[0].filters[0].cutoff_mod_source_cc = -1.0f;
     for (int f = 1; f < 5; f++) {
         knobs->programs[0].filters[f].cutoff = 2000.0f; knobs->programs[0].filters[f].res_q = 20.0f;
@@ -5117,7 +5118,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
 
     knobs->programs[0].vco1_pulse_width = 50.0f; knobs->programs[0].vco2_pulse_width = 50.0f;
     knobs->programs[0].vco3_vol = 0.0f; knobs->programs[0].vco3_pan = 0.0f; knobs->programs[0].vco3_mute = 0.0f; knobs->programs[0].vco3_pulse_width = 0.0f;
-    knobs->programs[0].vco3_shape = (float)WAVE_NOISE; knobs->programs[0].vco3_fine_tune = 0.0f; knobs->programs[0].vco3_pitch_offset = 0.0f;
+    knobs->programs[0].vco3_shape = (float)WAVE_OFF; knobs->programs[0].vco3_fine_tune = 0.0f; knobs->programs[0].vco3_pitch_offset = 0.0f;
     knobs->programs[0].vco3_phase_offset = 0.0f; knobs->programs[0].vco3_unison_saw_detune = 25.0f; knobs->programs[0].vco3_unison_saw_width = 50.0f;
     knobs->programs[0].vco4_vol = 0.0f; knobs->programs[0].vco4_pan = 0.0f; knobs->programs[0].vco4_mute = 0.0f; knobs->programs[0].vco4_pulse_width = 50.0f;
     knobs->programs[0].vco4_shape = (float)WAVE_OFF; knobs->programs[0].vco4_fine_tune = 0.0f; knobs->programs[0].vco4_pitch_offset = 0.0f;

@@ -1066,3 +1066,31 @@ to that fresh GUI's own defaults the instant it connected (see
 existing preset through a second address effectively impossible. Fixed:
 that pull is now complete for everything `transmit_knob_packet()` can
 actually overwrite.
+
+That pull itself also used to be fragile: `frontend.py` requests the
+instance's current state exactly once, at its own startup. If that request
+went out before the plugin's embedded OSC server was even listening yet
+(a completely normal ordering when launching a GUI before the DAW has
+actually loaded/activated the instance it's meant to control -- exactly
+the situation running several instances tends to produce), the request was
+simply lost with no retry, leaving that GUI stuck showing its own
+construction-time defaults indefinitely, indistinguishable from the state
+pull itself being broken. Fixed: `frontend.py` now re-requests the current
+state every time it notices the backend transition from unreachable to
+reachable (`listen_for_status_frames()`'s own mock-mode tracking), not
+just once at boot -- so the pull happens whenever the instance actually
+becomes available, in whatever order things were launched, and self-heals
+if the backend later restarts.
+
+Also fixed alongside this: a handful of GUI sliders (`master_vol`,
+`vco1_vol`, `vco2_vol`) only ever recorded their intended default as a
+double-click-reset target, never actually applying it at construction --
+so a disconnected/mock-mode GUI, or the brief window before a real
+backend's state pull completes, showed silence (slider position 0) rather
+than the intended audible level. Oscillator 2 and 3 also defaulted to an
+audible shape (Sine/Noise) rather than Off, and Filter 1 defaulted to an
+active LPF rather than Off like every other slot -- both now match
+`init_default_controls()`'s own backend-side defaults, which were changed
+to match (Off/Off/Off), so a fresh, never-configured instance's actual
+starting patch is now silence-free on Oscillators 2-3 and filter-free,
+not just the frontend's own pre-connection appearance.

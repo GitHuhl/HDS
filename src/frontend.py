@@ -2731,6 +2731,12 @@ class SynthGui(QWidget):
         # so this double-click-reset target is recomputed to still land on that exact same gain.
         self.master_vol = ResetSlider(Qt.Orientation.Vertical, 79, self)
         self.master_vol.setRange(0, 100); self.master_vol.setMinimumHeight(150)
+        # FIXED: ResetSlider's own constructor only remembers 79 as the double-click-reset
+        # target -- it never actually sets the slider there, so this used to sit at QSlider's own
+        # default (0, i.e. silence/-inf through the audio taper) until something else touched it
+        # or a backend connection's state pull overwrote it. Explicit .setValue() so a freshly
+        # launched (or still-disconnected/mock-mode) GUI shows a real, audible level immediately.
+        self.master_vol.setValue(79)
         vol_box.addWidget(self.master_vol, alignment=Qt.AlignmentFlag.AlignCenter); meters_strip.addLayout(vol_box)
         master_strip_lay.addLayout(meters_strip)
 
@@ -2932,6 +2938,10 @@ class SynthGui(QWidget):
         self.vco1_vol = ResetSlider(Qt.Orientation.Vertical, 93)
         self.vco1_vol.setRange(0, 100)
         self.vco1_vol.setFixedHeight(80)
+        # FIXED: same missing-setValue bug as master_vol above -- 93 was only ever the
+        # double-click-reset target, never actually applied, so this sat at silence/-inf until
+        # something else set it.
+        self.vco1_vol.setValue(93)
         v1_vol_layout.addWidget(self.vco1_vol, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.vco1_mute = QPushButton("M")
@@ -2958,7 +2968,7 @@ class SynthGui(QWidget):
 
         self.vco2_combo = QComboBox()
         self.vco2_combo.addItems(OSC_SHAPE_NAMES)
-        self.vco2_combo.setCurrentIndex(3)
+        self.vco2_combo.setCurrentIndex(8)  # Off -- matches backend.c's own init_default_controls()
         v2_strip.addWidget(self.vco2_combo)
 
         # Dual-duty Pulse Width (Shape=Pulse) / Tilt (Shape=Noise) knob -- see Osc 1's own
@@ -3077,6 +3087,8 @@ class SynthGui(QWidget):
         self.vco2_vol = ResetSlider(Qt.Orientation.Vertical, 79)
         self.vco2_vol.setRange(0, 100)
         self.vco2_vol.setFixedHeight(80)
+        # FIXED: same missing-setValue bug as vco1_vol/master_vol above.
+        self.vco2_vol.setValue(79)
         v2_vol_layout.addWidget(self.vco2_vol, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.vco2_mute = QPushButton("M")
@@ -3105,7 +3117,7 @@ class SynthGui(QWidget):
 
         self.vco3_combo = QComboBox()
         self.vco3_combo.addItems(OSC_SHAPE_NAMES)
-        self.vco3_combo.setCurrentIndex(5)  # Noise, matching the old dedicated Noise oscillator's default
+        self.vco3_combo.setCurrentIndex(8)  # Off -- matches backend.c's own init_default_controls()
         v3_strip.addWidget(self.vco3_combo)
 
         # Dual-duty Pulse Width (Shape=Pulse) / Tilt (Shape=Noise) knob -- one physical knob/wire
@@ -4130,7 +4142,8 @@ class SynthGui(QWidget):
             self.filter_slope_combos.append(v_slope)
 
             v_type = QComboBox(); v_type.addItems(["Off", "LPF", "HPF", "BPF", "Notch"])
-            v_type.setCurrentIndex(1 if i == 0 else 0)  # Filter 1 defaults to an active LPF, rest Off
+            # Every filter slot defaults to Off, matching backend.c's own init_default_controls()
+            # -- a fresh patch pays no filter cost until a player actually reaches for one.
             self.filter_type_combos.append(v_type)
 
             lay.addWidget(QLabel("Freq:")); lay.addWidget(c_dial)
@@ -7130,7 +7143,23 @@ class SynthGui(QWidget):
             self._last_status_time = time.monotonic()
         # Liveness: UDP has no connect-time signal, so "is the backend there" is inferred from
         # whether status has arrived recently (a few missed vu_timer ticks' worth of silence).
+        was_mock = self.mock_mode
         self.mock_mode = (self._last_status_time == 0.0) or (time.monotonic() - self._last_status_time > OSC_STATUS_TIMEOUT_S)
+        # FIXED: runtime_connect_and_bind()'s own /hds/request_state is sent exactly once, at
+        # this frontend's own startup -- if that datagram went out before the backend's OSC
+        # server even existed yet (e.g. this frontend was launched before the DAW actually
+        # loaded/activated the CLAP instance it's pointed at, a completely normal ordering when
+        # juggling several instances on different ports), it's simply gone, with no retry, and
+        # this GUI is stuck showing its own construction-time defaults forever -- indistinguishable
+        # from "the restore is broken" even though _apply_full_state_fields() itself is fine.
+        # Re-requesting on every mock-mode -> live transition (not just once at boot) closes that
+        # gap: the moment this frontend notices the backend is ACTUALLY there (via its own
+        # per-block status broadcast, which needs no request at all), it pulls the real state --
+        # regardless of launch order, and self-healing if the backend later restarts/reconnects.
+        if was_mock and not self.mock_mode and self.osc_client is not None:
+            request_msg = OscMessageBuilder(address="/hds/request_state")
+            try: self.osc_client.send(request_msg.build())
+            except OSError: pass
     def transmit_knob_packet(self):
         """Sends every knob's current value as one OSC bundle (one UDP datagram) to the backend --
         the OSC replacement for the old struct.pack'd binary_packet. Every value-computation line
