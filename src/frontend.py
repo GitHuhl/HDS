@@ -1599,6 +1599,10 @@ class SamplerMappingGrid(QWidget):
         self.black_key_offsets = {1, 3, 6, 8, 10}
         self.sample_zones = []
         self._next_zone_id = 1  # ever-incrementing, never reused/recycled -- see SampleZone.zone_id
+        # Which oscillator (0-3) the grid currently displays/edits -- see visible_zones(). The
+        # catalog itself (self.sample_zones) stays one flat, session-wide list shared across all
+        # 4 oscillators (matching backend.c's own catalog shape); this is purely a view filter.
+        self.selected_osc = 0
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -1632,6 +1636,13 @@ class SamplerMappingGrid(QWidget):
         elx, ew = self.key_geometries[zone.max_note]
         return QRectF(float(lx), float(self.get_y_for_velocity(zone.max_velocity)), float((elx + ew) - lx), float(self.get_y_for_velocity(zone.min_velocity) - self.get_y_for_velocity(zone.max_velocity)))
 
+    def visible_zones(self):
+        """Zones belonging to the currently-selected oscillator -- every interaction/rendering
+        method below iterates this instead of the full self.sample_zones list, so a zone on a
+        different oscillator is neither visible, clickable, nor reachable by a marquee/Delete
+        while that oscillator isn't selected."""
+        return [z for z in self.sample_zones if z.assigned_osc == self.selected_osc]
+
     def get_marquee_rect(self): return QRectF(QPointF(self.drag_start_pos), QPointF(self.marquee_current_pos)).normalized()
     def dragEnterEvent(self, e): e.acceptProposedAction() if e.mimeData().hasUrls() else None
     def dragMoveEvent(self, e): e.acceptProposedAction() if e.mimeData().hasUrls() else None
@@ -1643,6 +1654,7 @@ class SamplerMappingGrid(QWidget):
         zone_id = self._next_zone_id
         self._next_zone_id += 1
         zone = SampleZone(file_path, note_number, zone_id)
+        zone.assigned_osc = self.selected_osc
         self.sample_zones.append(zone)
         if self.parent_window:
             self.parent_window.set_mapping_status(None)
@@ -1679,7 +1691,7 @@ class SamplerMappingGrid(QWidget):
         if event.button() != Qt.MouseButton.LeftButton: return
         self.setFocus()
         pos = event.position().toPoint()
-        for zone in reversed(self.sample_zones):
+        for zone in reversed(self.visible_zones()):
             rect = self.get_zone_rect(zone)
             if rect.contains(QPointF(pos)):
                 self.active_zone, self.drag_start_pos = zone, pos
@@ -1711,7 +1723,7 @@ class SamplerMappingGrid(QWidget):
         pos = event.position().toPoint()
         if self.drag_mode is None:
             c_set = False
-            for zone in self.sample_zones:
+            for zone in self.visible_zones():
                 rect = self.get_zone_rect(zone)
                 if rect.contains(QPointF(pos)):
                     margin = 6
@@ -1727,7 +1739,10 @@ class SamplerMappingGrid(QWidget):
         if self.drag_mode == "marquee":
             self.marquee_current_pos = pos
             m_rect = self.get_marquee_rect()
-            for zone in self.sample_zones: zone.is_selected = m_rect.intersects(self.get_zone_rect(zone))
+            # Gated to the visible oscillator's own zones only -- a marquee drawn while viewing
+            # osc 1 must never reach into osc 2-4's zones (which aren't even drawn), or Delete
+            # could remove zones the user never saw get selected.
+            for zone in self.visible_zones(): zone.is_selected = m_rect.intersects(self.get_zone_rect(zone))
             self.update()
             return
         current_note, start_click_note = self.get_note_at_x(pos.x()), self.get_note_at_x(self.drag_start_pos.x())
@@ -1773,8 +1788,9 @@ class SamplerMappingGrid(QWidget):
         # identical rects would fully hide all but the topmost. Cascade each group's members by a
         # few pixels so every one stays visible and individually clickable -- purely a drawing
         # offset; hit-testing/dragging (get_zone_rect) always use the real, un-cascaded rect.
+        visible = self.visible_zones()
         group_members = {}
-        for zone in self.sample_zones:
+        for zone in visible:
             if zone.round_robin_group > 0:
                 group_members.setdefault(zone.round_robin_group, []).append(zone)
         cascade_offset = {}
@@ -1783,7 +1799,7 @@ class SamplerMappingGrid(QWidget):
                 for idx, zone in enumerate(sorted(members, key=lambda z: z.zone_id)):
                     cascade_offset[id(zone)] = idx * 9
 
-        for zone in self.sample_zones:
+        for zone in visible:
             rect = self.get_zone_rect(zone)
             if rect.isValid():
                 offset = cascade_offset.get(id(zone), 0)
@@ -4730,6 +4746,27 @@ class SynthGui(QWidget):
         mapping_outer_lay.addWidget(mapping_header)
 
         mapping_top_bar = QHBoxLayout()
+        mapping_top_bar.addWidget(QLabel("Oscillator:"))
+        self.mapping_osc_combo = QComboBox()
+        self.mapping_osc_combo.addItems(["Osc 1", "Osc 2", "Osc 3", "Osc 4"])
+        self.mapping_osc_combo.setToolTip(
+            "Which oscillator's own sample zones this grid shows/edits -- each of the 4 "
+            "oscillators has its own independent zone set (see backend.c's SampleSlot."
+            "assigned_osc), so a multisample patch can spread across more than one."
+        )
+        self.mapping_osc_combo.currentIndexChanged.connect(self._on_mapping_osc_changed)
+        mapping_top_bar.addWidget(self.mapping_osc_combo)
+
+        self.mapping_sfz_readout = QLabel("SFZ: (none loaded)")
+        self.mapping_sfz_readout.setStyleSheet("font-size: 10px; color: #888;")
+        self.mapping_sfz_readout.setToolTip(
+            "Only reflects an SFZ this frontend itself loaded (Import SFZ… or a Program load) "
+            "onto the selected oscillator -- a backend-native load (the --sfz-vcoN startup flags, "
+            "or an /hds/zone/load_sfz message from elsewhere) has no way to report its path back "
+            "here, and won't update this readout."
+        )
+        mapping_top_bar.addWidget(self.mapping_sfz_readout)
+
         mapping_top_bar.addWidget(QLabel("Root Key (selected zone):"))
         self.root_key_box = QComboBox()
         self.root_key_box.setFixedWidth(190)
@@ -4771,7 +4808,10 @@ class SynthGui(QWidget):
         self.zone_inspector = ZoneInspectorPanel(parent_window=self)
         mapping_outer_lay.addWidget(self.zone_inspector, stretch=0)
 
-        self.set_mapping_status(None)
+        # Which .sfz path (if any) this frontend itself most recently loaded onto each oscillator
+        # -- see mapping_sfz_readout's own tooltip for the limits of what this can reflect.
+        self.mapping_loaded_sfz_path = [None, None, None, None]
+        self._on_mapping_osc_changed(0)
 
         # ----------------------------------------------------
         # ASSEMBLE AND ANCHOR TOUCH DECK TO ROOT LAYOUT
@@ -5010,7 +5050,10 @@ class SynthGui(QWidget):
         zones, warnings = _build_zones_from_sfz(path, self.mapping_grid._next_zone_id)
         if zones:
             self.mapping_grid._next_zone_id += len(zones)
+            for z in zones: z.assigned_osc = self.mapping_grid.selected_osc
             self.mapping_grid.sample_zones.extend(zones)
+            self.mapping_loaded_sfz_path[self.mapping_grid.selected_osc] = path
+            self.mapping_sfz_readout.setText(f"SFZ: {os.path.basename(path)}")
             self.mapping_grid.update()
             self.transmit_zone_upsert(zones)
         filename = os.path.basename(path)
@@ -5721,14 +5764,27 @@ class SynthGui(QWidget):
             self._load_program_from_path(path)
 
     def set_mapping_status(self, message, error=False):
-        """Status line under the Mapping tab's top bar -- shows the live zone count by default
-        (no ceiling to report against -- the catalog has no product-facing cap)."""
+        """Status line under the Mapping tab's top bar -- shows the live zone count (for the
+        CURRENTLY SELECTED oscillator only, since that's what's actually visible/editable in the
+        grid right now) by default -- no ceiling to report against, the catalog has no
+        product-facing cap."""
         if message is None:
-            n = len(self.mapping_grid.sample_zones)
-            message = f"Sample Bank: {n} zone{'s' if n != 1 else ''}"
+            n = len(self.mapping_grid.visible_zones())
+            message = f"Sample Bank (Osc {self.mapping_grid.selected_osc + 1}): {n} zone{'s' if n != 1 else ''}"
             error = False
         self.mapping_status_label.setText(message)
         self.mapping_status_label.setStyleSheet(f"font-size: 10px; color: {'#ff5555' if error else '#888'};")
+
+    def _on_mapping_osc_changed(self, index):
+        """Switches the Mapping tab's grid to show/edit a different oscillator's own zone set --
+        updates the grid's selected_osc (triggering a repaint via visible_zones()), the SFZ-path
+        readout, and the zone-count status line."""
+        osc = max(0, min(3, index))
+        self.mapping_grid.selected_osc = osc
+        self.mapping_grid.update()
+        path = self.mapping_loaded_sfz_path[osc]
+        self.mapping_sfz_readout.setText(f"SFZ: {os.path.basename(path)}" if path else "SFZ: (none loaded)")
+        self.set_mapping_status(None)
 
     def synchronize_root_key_dropdown(self, zone):
         """Keeps the Mapping tab's Root Key combo showing whichever selected zone's key center
