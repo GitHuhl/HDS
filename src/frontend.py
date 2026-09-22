@@ -5294,11 +5294,21 @@ class SynthGui(QWidget):
         try:
             os.makedirs(prog_dir, exist_ok=True)
             data = {"format_version": 1, "name": name, "category": category, "fields": fields}
-            if self.mapping_grid.sample_zones:
-                sfz_filename = f"{name}.sfz"
+            # Per-oscillator SFZ export: only the oscillators that actually have zones get their
+            # own file (<name>_vco{N}.sfz), recorded as a {"<osc_index>": "<filename>"} map --
+            # replaces the old single shared file, which couldn't tell which oscillator a zone
+            # belonged to. See _load_program_from_path()'s load-side mirror of this map.
+            sfz_map = {}
+            for osc in range(4):
+                osc_zones = [z for z in self.mapping_grid.sample_zones if z.assigned_osc == osc]
+                if not osc_zones:
+                    continue
+                sfz_filename = f"{name}_vco{osc + 1}.sfz"
                 with open(os.path.join(prog_dir, sfz_filename), "w") as f:
-                    f.write(_build_sfz_from_zones(self.mapping_grid.sample_zones))
-                data["sfz_file"] = sfz_filename
+                    f.write(_build_sfz_from_zones(osc_zones))
+                sfz_map[str(osc)] = sfz_filename
+            if sfz_map:
+                data["sfz_file"] = sfz_map
             with open(os.path.join(prog_dir, f"{name}.hdsprog"), "w") as f:
                 json.dump(data, f, indent=2)
         except OSError as e:
@@ -5705,13 +5715,15 @@ class SynthGui(QWidget):
         _edit_combi_lane_in_program_mode), and each Combi lane's own Program picker (lane_idx
         0-7): apply every included field via _apply_program_fields_to_combi_lane(), and -- only
         when loading into Single Program mode's own slot (lane_idx is None) -- if the file
-        references a colocated .sfz, REPLACE (not merge with) the current Sample Bank -- a real,
-        deliberate behavior difference from the SFZ importer's own additive-only posture, because
-        loading a *Program* means "this Program's own samples," not "add these on top of whatever
-        was already loaded." The Sample Bank is a single session-wide catalog with no
-        per-Program partitioning (see the Mapping tab's own zone-catalog design), so this pass
-        deliberately does not attempt to load a Combi lane's own colocated .sfz -- a documented
-        scope boundary, not an oversight."""
+        references any colocated per-oscillator .sfz files, REPLACE (not merge with) only the
+        REFERENCED oscillators' own zones -- a real, deliberate behavior difference from the SFZ
+        importer's own additive-only posture, because loading a *Program* means "this Program's
+        own samples for the oscillators it actually uses," not "add these on top of whatever was
+        already loaded" or "wipe every oscillator regardless of what this Program touches." An
+        oscillator this Program's sfz_file map doesn't mention is left completely untouched. The
+        Sample Bank is a single session-wide catalog with no per-Program partitioning (see the
+        Mapping tab's own zone-catalog design), so this pass deliberately does not attempt to load
+        a Combi lane's own colocated .sfz -- a documented scope boundary, not an oversight."""
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -5723,23 +5735,44 @@ class SynthGui(QWidget):
             return
 
         sfz_file = data.get("sfz_file")
-        if sfz_file:
-            sfz_path = os.path.join(os.path.dirname(path), sfz_file)
-            if self.mapping_grid.sample_zones:
-                old_ids = [z.zone_id for z in self.mapping_grid.sample_zones]
-                self.transmit_zone_remove(old_ids)
-                self.mapping_grid.sample_zones.clear()
-                self.mapping_grid.update()
-            if os.path.isfile(sfz_path):
-                zones, warnings = _build_zones_from_sfz(sfz_path, self.mapping_grid._next_zone_id)
-                if zones:
-                    self.mapping_grid._next_zone_id += len(zones)
-                    self.mapping_grid.sample_zones.extend(zones)
-                    self.mapping_grid.update()
-                    self.transmit_zone_upsert(zones)
-                if warnings:
-                    QMessageBox.warning(self, "Load Program", f"Loaded '{data.get('name', '')}' with some sample issues:\n\n" + "\n".join(f"- {w}" for w in warnings))
-            self.set_mapping_status(None)
+        # Backward-compat: an old save's sfz_file was a bare filename (one shared file, no
+        # oscillator tagging at all) -- treated as "every zone in it was Osc 1" (index "0"), the
+        # same convention _build_zones_from_sfz()'s own default assigned_osc=0 already implies.
+        if isinstance(sfz_file, str):
+            sfz_map = {"0": sfz_file}
+        elif isinstance(sfz_file, dict):
+            sfz_map = sfz_file
+        else:
+            sfz_map = {}
+
+        if sfz_map:
+            prog_dir = os.path.dirname(path)
+            all_warnings = []
+            for osc_str, sfz_filename in sfz_map.items():
+                try:
+                    osc = max(0, min(3, int(osc_str)))
+                except (TypeError, ValueError):
+                    continue
+                sfz_path = os.path.join(prog_dir, sfz_filename)
+                old_ids = [z.zone_id for z in self.mapping_grid.sample_zones if z.assigned_osc == osc]
+                if old_ids:
+                    self.transmit_zone_remove(old_ids)
+                    self.mapping_grid.sample_zones = [z for z in self.mapping_grid.sample_zones if z.assigned_osc != osc]
+                if os.path.isfile(sfz_path):
+                    zones, warnings = _build_zones_from_sfz(sfz_path, self.mapping_grid._next_zone_id)
+                    if zones:
+                        self.mapping_grid._next_zone_id += len(zones)
+                        for z in zones: z.assigned_osc = osc
+                        self.mapping_grid.sample_zones.extend(zones)
+                        self.transmit_zone_upsert(zones)
+                    self.mapping_loaded_sfz_path[osc] = sfz_path
+                    all_warnings.extend(warnings)
+                else:
+                    all_warnings.append(f"{sfz_filename} (Osc {osc + 1}): file not found")
+            self.mapping_grid.update()
+            self._on_mapping_osc_changed(self.mapping_grid.selected_osc)  # refresh readout/status
+            if all_warnings:
+                QMessageBox.warning(self, "Load Program", f"Loaded '{data.get('name', '')}' with some sample issues:\n\n" + "\n".join(f"- {w}" for w in all_warnings))
 
         self.program_name_field.setText(data.get("name", os.path.splitext(os.path.basename(path))[0]))
         self._current_program_category = data.get("category", "")
