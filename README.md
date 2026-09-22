@@ -701,6 +701,19 @@ state from that point on (round-trips through Save/Load Song's own
 `song.json`, not a live backend knob), the same way Sequencer lane
 config already is.
 
+**Per-lane "Load MIDI..."** (each Program/MIDI lane's own strip on the
+Sequencer tab, next to its Mute/Rec/Overdub controls): imports a single
+`.mid`/`.midi` file straight into THAT one lane only, replacing whatever
+it currently holds (`hds_song_import_smf_track()` in backend.c) -- for
+when you just want to drop one part onto one lane rather than replace
+the whole song. Every other lane, and the tempo map/Markers list, are
+completely untouched; if the file happens to have more than one
+note-carrying track, they're all merged together by time into that one
+lane rather than silently dropping the extras. Shares its file-parsing
+internals with the whole-song importer above (same header validation,
+same running-status/meta/sysex handling, same "no partial application"
+posture) -- they differ only in what each one does with what it finds.
+
 Fixed alongside this: the Tempo knob/tempo-map's own elapsed-time axis
 used to be the engine's running uptime, a dormant bug that never mattered
 while the tempo map was always empty (nothing populated it before this).

@@ -105,6 +105,8 @@ typedef struct {
     // "/hds/song/import_smf" support -- see HdsSmfImportContext's own comment in backend.c. Same
     // "needs this instance's own osc_reply_addr" reason as state_request_ctx just above.
     HdsSmfImportContext smf_import_ctx;
+    // "/hds/song/import_smf_track" support (per-lane "Load MIDI...") -- same reason.
+    HdsSmfTrackImportContext smf_import_track_ctx;
 } HdsClapPlugin;
 
 // ---------------------------------------------------------------------------------------------
@@ -692,6 +694,9 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         p->smf_import_ctx.knobs = &p->knobs;
         p->smf_import_ctx.reply_addr = p->osc_reply_addr;
         lo_server_add_method(p->osc_server, "/hds/song/import_smf", "sf", song_import_smf_handler, &p->smf_import_ctx);
+        p->smf_import_track_ctx.engine = &p->engine;
+        p->smf_import_track_ctx.reply_addr = p->osc_reply_addr;
+        lo_server_add_method(p->osc_server, "/hds/song/import_smf_track", "sf", song_import_smf_track_handler, &p->smf_import_track_ctx);
         p->osc_ready = true;
         fprintf(stderr, "[hds-clap] OSC listening on UDP port %d, status replies to %s:%d\n", p->osc_listen_port, CLAP_OSC_REPLY_HOST, p->osc_reply_port);
         if (p->host && p->host->get_extension) {

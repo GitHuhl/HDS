@@ -3528,6 +3528,36 @@ class SynthGui(QWidget):
             )
             return mute_btn, rec_btn, overdub_combo
 
+        # "Load MIDI..." controls for one Sequencer lane (Program/MIDI lanes only -- the
+        # complement of _build_seq_audio_controls just below, same "visible only for this lane's
+        # current Type" idiom, see _enforce_seq_lane_type_cap). Imports a single .mid/.midi file's
+        # notes straight into THIS lane, replacing whatever it currently holds -- distinct from
+        # the Sequencer tab's own whole-song Import MIDI (_pick_and_import_midi()), which
+        # repopulates every lane at once and can also apply the file's tempo map. This is scoped
+        # to exactly one lane and never touches tempo or the Markers list at all -- see
+        # hds_song_import_smf_track()'s own comment in backend.c.
+        def _build_seq_midi_controls(idx):
+            box = QWidget()
+            box_lay = QVBoxLayout(box); box_lay.setContentsMargins(0, 0, 0, 0); box_lay.setSpacing(2)
+            load_btn = QPushButton("Load MIDI…")
+            load_btn.setStyleSheet("font-size: 9px;")
+            load_btn.setToolTip(
+                "Imports a single .mid/.midi file's note events straight into this lane, "
+                "replacing whatever it currently holds. Every note-carrying track in the file is "
+                "merged together (most such files only have one) -- this lane's own tempo/"
+                "markers are untouched; use this tab's whole-song Import MIDI for that instead."
+            )
+            load_btn.clicked.connect(lambda: self._pick_and_import_midi_track(idx))
+            box_lay.addWidget(load_btn)
+            status_lbl = QLabel("(no file)")
+            status_lbl.setStyleSheet("font-size: 8px; color: #888;")
+            status_lbl.setWordWrap(True)
+            status_lbl.setFixedWidth(66)
+            box_lay.addWidget(status_lbl)
+            _retain_hidden(box)
+            box.setVisible(True)  # Program/MIDI (type index 0) is every lane's own default type
+            return {"box": box, "status_label": status_lbl}
+
         # "Load Audio" controls for one Sequencer lane (Sequencer only -- Combi has no audio-lane
         # concept at all). Built separately from _build_seq_lane_row and appended onto the strip's
         # own layout afterward, same idiom Combi's per-lane Program-picker combo already uses --
@@ -3941,6 +3971,9 @@ class SynthGui(QWidget):
         # onto the strip afterward, same idiom _build_seq_audio_controls already uses, to keep
         # _build_seq_lane_row's own return shape unchanged.
         self.seq_lane_midi_channel_combos = []  # 32 x QComboBox
+        # Per-lane "Load MIDI..." (Program/MIDI lanes only) -- see _build_seq_midi_controls' own
+        # comment. Parallel to seq_lane_audio_widgets, same "list of dicts, one per lane" shape.
+        self.seq_lane_midi_import_widgets = []  # 32 x dict, see _build_seq_midi_controls
         for i in range(SEQ_LANE_COUNT):
             lane = _build_seq_lane_row(i, show_seq_controls=True)
             mute_btn, rec_btn, overdub_combo = _build_seq_lane_rec_mute_controls(i)
@@ -3950,6 +3983,9 @@ class SynthGui(QWidget):
             self.seq_lane_mute_buttons.append(mute_btn)
             self.seq_lane_rec_buttons.append(rec_btn)
             self.seq_lane_overdub_combos.append(overdub_combo)
+            midi_import_widgets = _build_seq_midi_controls(i)
+            lane[0].layout().addWidget(midi_import_widgets["box"])
+            self.seq_lane_midi_import_widgets.append(midi_import_widgets)
             audio_widgets = _build_seq_audio_controls(i)
             lane[0].layout().addWidget(audio_widgets["box"])
             self.seq_lane_audio_widgets.append(audio_widgets)
@@ -3971,7 +4007,7 @@ class SynthGui(QWidget):
         seq_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         seq_mixer_row = QHBoxLayout(); seq_mixer_row.setSpacing(4)
-        seq_mixer_row.addWidget(_build_lane_legend(["#", "Level", "Pan", "Type", "Mode", "Mute/Rec", "Audio"]))
+        seq_mixer_row.addWidget(_build_lane_legend(["#", "Level", "Pan", "Type", "Mode", "Mute/Rec", "MIDI", "Audio"]))
         seq_mixer_row.addWidget(seq_scroll, stretch=1)
         seq_outer_lay.addLayout(seq_mixer_row, 1)
 
@@ -3999,6 +4035,7 @@ class SynthGui(QWidget):
                     self.seq_status_label.setText(f"Lane {idx + 1}: already {AUDIO_LANE_RESOURCE_COUNT} Audio lanes active -- reverted")
                     new_index = 0
             self.seq_lane_audio_widgets[idx]["box"].setVisible(new_index == 1)
+            self.seq_lane_midi_import_widgets[idx]["box"].setVisible(new_index == 0)
             self.seq_lane_midi_channel_combos[idx].setVisible(new_index == 0)
         for i, lane in enumerate(self.seq_lane_rows):
             lane[3].currentIndexChanged.connect(lambda new_index, idx=i: _enforce_seq_lane_type_cap(idx, new_index))
@@ -5739,6 +5776,42 @@ class SynthGui(QWidget):
         self.smf_import_status_label.setText(status)
         self.transmit_knob_packet()
 
+    def _pick_and_import_midi_track(self, idx):
+        """Per-lane 'Load MIDI...' button (Program/MIDI lanes only, see
+        _build_seq_midi_controls()): imports a single .mid/.midi file's note events directly into
+        lane `idx`, replacing whatever it currently holds. Unlike the Sequencer tab's whole-song
+        Import MIDI (_pick_and_import_midi()), this touches ONLY this one lane and never the
+        tempo map or Markers list -- see hds_song_import_smf_track()'s own comment in backend.c."""
+        path, _ = QFileDialog.getOpenFileName(self, "Load MIDI", "", "Standard MIDI Files (*.mid *.midi)")
+        if not path:
+            return
+        self.seq_lane_midi_import_widgets[idx]["status_label"].setText(f"Loading {os.path.basename(path)}…")
+        msg = OscMessageBuilder(address="/hds/song/import_smf_track")
+        msg.add_arg(path, "s")
+        msg.add_arg(float(idx), "f")
+        try: self.osc_client.send(msg.build())
+        except OSError: pass
+
+    def _apply_smf_track_import_result(self, fields):
+        """Applies one /hds/song/import_smf_track reply (see listen_for_status_frames()'s
+        /hds/status/smf_import_track/ handling): updates that specific lane's own status label --
+        the only per-lane, per-import UI feedback this needs, since the recorded note data itself
+        stays backend-only, exactly like a normal live Rec take."""
+        lane = int(fields.get("lane", -1))
+        if not (0 <= lane < SEQ_LANE_COUNT):
+            return
+        status_label = self.seq_lane_midi_import_widgets[lane]["status_label"]
+        if fields.get("ok", 0.0) == 0.0:
+            error = fields.get("error", "")
+            status_label.setText(f"Failed: {error}" if error else "Failed")
+            return
+        note_count = int(fields.get("note_count", 0))
+        tracks_with_notes = int(fields.get("tracks_with_notes", 0))
+        text = f"{note_count} note(s)"
+        if tracks_with_notes > 1:
+            text += f" ({tracks_with_notes} tracks merged)"
+        status_label.setText(text)
+
     def _update_seq_sync_lock_label(self, _index=None):
         """Reflects /hds/status/midi_clock_locked next to the Sequencer tab's Sync combo -- blank
         when Internal (nothing to lock onto), Locked/Waiting when External, so a missing or
@@ -6764,6 +6837,7 @@ class SynthGui(QWidget):
             values = {}
             seq_audio_updates = {}  # lane_index -> {"state": ..., "frames"?: ..., "channels"?: ..., "sample_rate"?: ...}
             smf_import_fields = {}  # field name (with any "marker/N/..." or "tempo_marker/N/..." prefix kept) -> value
+            smf_import_track_fields = {}  # field name -> value, see /hds/status/smf_import_track/ handling below
             for timed_msg in packet.messages:
                 msg = timed_msg.message
                 if msg.address in self._STATUS_ADDRESSES and msg.params:
@@ -6774,6 +6848,11 @@ class SynthGui(QWidget):
                     # /hds/request_state dump there's no sentinel to wait for: everything this
                     # import produced arrives in this one packet, applied once the loop below ends.
                     smf_import_fields[msg.address[len("/hds/status/smf_import/"):]] = msg.params[0]
+                elif msg.address.startswith("/hds/status/smf_import_track/") and msg.params:
+                    # One-shot reply to /hds/song/import_smf_track (per-lane "Load MIDI..." --
+                    # see song_import_smf_track_handler() in backend.c). Same single-bundle, no-
+                    # sentinel shape as smf_import_fields just above, just scoped to one lane.
+                    smf_import_track_fields[msg.address[len("/hds/status/smf_import_track/"):]] = msg.params[0]
                 elif msg.address.startswith("/hds/status/seq_audio/") and msg.params:
                     # /hds/status/seq_audio/<lane>/<field> -- a variable-length, mostly-empty set
                     # (see send_seq_audio_status() in backend.c), so unlike the fixed-shape
@@ -6813,6 +6892,8 @@ class SynthGui(QWidget):
                 self._apply_seq_audio_status(seq_audio_updates)
             if smf_import_fields:
                 self._apply_smf_import_result(smf_import_fields)
+            if smf_import_track_fields:
+                self._apply_smf_track_import_result(smf_import_track_fields)
             if "/hds/status/peak" in values:
                 self.vu_meter.setValue(int(max(0, min(100, values["/hds/status/peak"] * 100.0))))
             if all(a in values for a in self._STATUS_ADDRESSES[1:5]):
