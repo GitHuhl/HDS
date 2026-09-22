@@ -671,6 +671,44 @@ echoed back to the host as an output parameter-change event
 (`hds_clap_push_changed_params()`), so the host's own automation lane/UI
 stays in sync regardless of which side changed it.
 
+**Standard MIDI File import** (Sequencer tab's "Import MIDI / Song
+Markers" box): reads a real `.mid`/`.midi` file -- Type 0 or Type 1, e.g.
+exported from Reaper or any other DAW -- via a genuine SMF parser
+(`hds_song_import_smf()` in backend.c, not the small internal round-trip
+format `hds_song_save_midi`/`load_midi` above use for HDS's own Save/Load
+Song). Each note-carrying track becomes one Sequencer lane, up to
+`SEQ_LANE_COUNT` (32); every lane is cleared first (a real Load, not a
+merge). Handles running status and every standard meta/sysex event
+correctly by skipping unrecognized ones via their own length prefix, and
+scans every track for the file's Tempo (`0xFF 0x51`) and Marker
+(`0xFF 0x06`) meta-events rather than assuming Track 0 only, so a Type 0
+file (tempo/markers/notes all interleaved on one track) works the same
+way. "No partial application": any structural corruption in the file
+aborts before touching a single lane or knob; a capacity overflow (more
+tracks/tempo changes/markers than this engine reserves room for) is not
+such a failure -- it's reported on stderr and the rest of the file still
+imports. Note timing always uses the file's own tempo map to convert
+ticks to real seconds -- that's simply what correct playback requires --
+independent of the "Import tempo" checkbox, which controls only whether
+the file's tempo map is *also* applied to Single Program mode's own
+Tempo knob/tempo-map (so the Arp, LFO Tempo Sync, metronome, and Quantize
+grid follow it too). The file's own text markers always populate the
+Markers list regardless of that checkbox; double-clicking one seeks the
+Sequencer playhead straight there (`/hds/seq/transport/seek_to_target_sec`
++ `seek_to`, a new arbitrary-position seek trigger alongside the existing
+seek-to-start/back/forward-one-measure ones). Markers are frontend-owned
+state from that point on (round-trips through Save/Load Song's own
+`song.json`, not a live backend knob), the same way Sequencer lane
+config already is.
+
+Fixed alongside this: the Tempo knob/tempo-map's own elapsed-time axis
+used to be the engine's running uptime, a dormant bug that never mattered
+while the tempo map was always empty (nothing populated it before this).
+An imported song's tempo map is inherently relative to *song position*,
+not how long the process has been running, so it now interpolates
+against the Sequencer's own playhead instead -- matching what the
+arpeggiator was already independently doing for the same reason.
+
 ## Build & run
 
 Requires ALSA dev headers (`libasound2-dev` on Debian/Ubuntu) and liblo dev

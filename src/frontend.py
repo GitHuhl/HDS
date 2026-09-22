@@ -19,7 +19,8 @@ from pythonosc.osc_packet import OscPacket, ParseError as OscParseError
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
                              QSlider, QPushButton, QProgressBar, QSpinBox, QDoubleSpinBox, QLineEdit, QCheckBox,
-                             QScrollArea, QMenu, QInputDialog, QFileDialog, QGridLayout, QMessageBox)
+                             QScrollArea, QMenu, QInputDialog, QFileDialog, QGridLayout, QMessageBox,
+                             QListWidget, QListWidgetItem)
 from PySide6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor, QAction, QFont
 from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, Signal
 
@@ -2332,6 +2333,21 @@ class SynthGui(QWidget):
         # Song save/load: one subfolder per song (~/HDS_Songs/<name>/song.json + song_midi.dat +
         # audio/lane_<i>.wav) -- see _pick_and_save_song()'s own docstring.
         self.songs_folder = os.path.expanduser("~/HDS_Songs")
+        # Song Markers (Sequencer tab): (time_sec, label) pairs, either typed in by hand or
+        # populated by importing a Standard MIDI File's own text markers (0xFF 0x06 -- see
+        # _pick_and_import_midi()/backend.c's hds_song_import_smf()). Frontend-authoritative, same
+        # as seq_lane_rows' own widget state -- the backend only ever REPORTS markers back once,
+        # right after an import; from then on this list (and song.json, via Song save/load) is
+        # the source of truth, not a live backend knob.
+        self.song_markers = []  # list of (time_sec: float, label: str), kept sorted by time
+        # Imported tempo map cache: transmit_knob_packet() must resend these EXACT values on every
+        # call (it blasts the whole live-knob state on any change) or the next unrelated knob
+        # tweak would silently wipe an imported tempo map back to flat/zero -- see that method's
+        # own comment on this block, and song_import_smf_handler()'s reply in backend.c which
+        # populates this list right after a successful tempo import.
+        self._imported_tempo_markers = []  # list of (time_sec: float, bpm: float), <= TEMPO_MARKER_MAX
+        self.seq_transport_seek_to_target_sec = 0.0
+        self.seq_transport_seek_to_trigger = 0
         # The currently-loaded Program's category (schema field alongside "fields"/"name" --
         # pure metadata, never applied to any OSC address), so re-saving after a Load defaults
         # to the category it was already filed under instead of forgetting it every time.
@@ -3870,6 +3886,39 @@ class SynthGui(QWidget):
         self.seq_status_label = QLabel("")
         self.seq_status_label.setStyleSheet("color: #c0392b; font-style: italic;")
         seq_outer_lay.addWidget(self.seq_status_label)
+
+        # MIDI import (Standard MIDI File, e.g. exported from Reaper) + the Markers list it (or a
+        # hand-typed marker) populates -- see _pick_and_import_midi()/hds_song_import_smf() in
+        # backend.c. A real .mid/.midi reader, distinct from Save/Load Song's own small internal
+        # round-trip format above (which can't read a file from another program at all).
+        import_box = QGroupBox("Import MIDI / Song Markers")
+        import_lay = QHBoxLayout(import_box)
+        self.btn_import_midi = QPushButton("Import MIDI (.mid)…")
+        self.btn_import_midi.setToolTip(
+            "Reads a Standard MIDI File (Type 0 or 1): each note-carrying track becomes one "
+            "Sequencer lane, and the file's own text markers appear in the list to the right."
+        )
+        import_lay.addWidget(self.btn_import_midi)
+        self.smf_import_tempo_check = QCheckBox("Import tempo")
+        self.smf_import_tempo_check.setChecked(True)
+        self.smf_import_tempo_check.setToolTip(
+            "Also apply the file's own tempo map to the Tempo knob/tempo-map (so the Arp, LFO "
+            "Tempo Sync, metronome, and Quantize grid follow it too). Note timing itself always "
+            "uses the file's own tempo regardless of this -- this only controls whether HDS's "
+            "live tempo follows along as well."
+        )
+        import_lay.addWidget(self.smf_import_tempo_check)
+        self.smf_import_status_label = QLabel("")
+        self.smf_import_status_label.setStyleSheet("font-style: italic; color: #888;")
+        import_lay.addWidget(self.smf_import_status_label)
+        import_lay.addStretch()
+        self.marker_list_widget = QListWidget()
+        self.marker_list_widget.setFixedHeight(70)
+        self.marker_list_widget.setToolTip("Double-click a marker to jump the Sequencer playhead there.")
+        self.marker_list_widget.itemDoubleClicked.connect(self._jump_to_marker)
+        import_lay.addWidget(self.marker_list_widget, 1)
+        self.btn_import_midi.clicked.connect(self._pick_and_import_midi)
+        seq_outer_lay.addWidget(import_box)
 
         seq_strips_widget = QWidget()
         seq_strips_lay = QHBoxLayout(seq_strips_widget)
@@ -5522,7 +5571,11 @@ class SynthGui(QWidget):
                 "audio_path": rel_audio_path,
                 "audio_offset_sec": audio_widgets["offset_dial"].value() / 10.0,
             })
-        data = {"format_version": 1, "name": name, "lanes": lanes}
+        # Song Markers -- see self.song_markers' own comment. format_version bumped to 2 since an
+        # older (version-1) song.json simply has no "markers" key at all; _pick_and_load_song()
+        # reads it with .get("markers", []), so loading an older file just starts with none.
+        markers = [{"time": t, "label": lbl} for (t, lbl) in self.song_markers]
+        data = {"format_version": 2, "name": name, "lanes": lanes, "markers": markers}
         try:
             with open(os.path.join(song_dir, "song.json"), "w") as f:
                 json.dump(data, f, indent=2)
@@ -5585,6 +5638,13 @@ class SynthGui(QWidget):
             offset_dial = audio_widgets["offset_dial"]
             offset_dial.blockSignals(True); offset_dial.setValue(int(round(float(lane.get("audio_offset_sec", 0.0)) * 10.0))); offset_dial.blockSignals(False)
 
+        # Song Markers -- absent entirely in a pre-version-2 song.json, hence .get() with a
+        # default rather than a hard requirement.
+        self.song_markers = sorted(
+            (float(m.get("time", 0.0)), str(m.get("label", ""))) for m in data.get("markers", [])
+        )
+        self._rebuild_marker_list_widget()
+
         self.transmit_knob_packet()
 
         midi_path = os.path.join(folder, "song_midi.dat")
@@ -5593,6 +5653,91 @@ class SynthGui(QWidget):
             msg.add_arg(midi_path, "s")
             try: self.osc_client.send(msg.build())
             except OSError: pass
+
+    def _rebuild_marker_list_widget(self):
+        """Repopulates the Sequencer tab's Markers list from self.song_markers (the frontend's own
+        authoritative copy -- see its own comment), sorted by time. Called after an SMF import, a
+        Song load, or any hand-edit of the list."""
+        self.marker_list_widget.clear()
+        for t, label in self.song_markers:
+            minutes, seconds = divmod(max(0.0, t), 60.0)
+            item = QListWidgetItem(f"{int(minutes):02d}:{seconds:04.1f}   {label}")
+            item.setData(Qt.ItemDataRole.UserRole, t)
+            self.marker_list_widget.addItem(item)
+
+    def _jump_to_marker(self, item):
+        """Double-click handler for the Markers list: seeks the Sequencer playhead straight to
+        that marker's position via the backend's seek-to-arbitrary-position transport trigger
+        (poll_transport_triggers() in backend.c) -- works in every transport state, same as the
+        other seek buttons."""
+        target_sec = item.data(Qt.ItemDataRole.UserRole)
+        if target_sec is None:
+            return
+        self.seq_transport_seek_to_target_sec = float(target_sec)
+        self.seq_transport_seek_to_trigger += 1
+        self.transmit_knob_packet()
+
+    def _pick_and_import_midi(self):
+        """Imports a real Standard MIDI File (Type 0 or 1) -- e.g. exported from Reaper -- via
+        /hds/song/import_smf (path, import_tempo). Backend-native parsing (hds_song_import_smf()
+        in backend.c), same "OSC carries a path, the backend does the file I/O" shape as Load
+        Scale/Song's own MIDI load -- but unlike those, this DOES get a real reply (see
+        listen_for_status_frames()'s /hds/status/smf_import/ handling and
+        _apply_smf_import_result()), since the result (which lanes got populated, what markers/
+        tempo were found) is new information this GUI has no other way to learn."""
+        path, _ = QFileDialog.getOpenFileName(self, "Import MIDI", "", "Standard MIDI Files (*.mid *.midi)")
+        if not path:
+            return
+        self.smf_import_status_label.setText(f"Importing {os.path.basename(path)}…")
+        msg = OscMessageBuilder(address="/hds/song/import_smf")
+        msg.add_arg(path, "s")
+        msg.add_arg(1.0 if self.smf_import_tempo_check.isChecked() else 0.0, "f")
+        try: self.osc_client.send(msg.build())
+        except OSError: pass
+
+    def _apply_smf_import_result(self, fields):
+        """Applies one /hds/song/import_smf reply (see listen_for_status_frames()'s
+        /hds/status/smf_import/ handling): updates the status label, rebuilds the Markers list
+        from whatever markers the file had, and -- if tempo import was requested -- syncs the
+        Tempo dial to the file's own tempo_bpm and, if it had more than one tempo change, caches
+        the returned tempo-map values so transmit_knob_packet() can keep echoing them back on
+        every future send (see self._imported_tempo_markers' own comment -- without this cache,
+        the very next unrelated knob tweak would silently wipe the just-imported tempo map)."""
+        ok = fields.get("ok", 0.0) != 0.0
+        error = fields.get("error", "")
+        lanes_used = int(fields.get("lanes_used", 0))
+        tempo_applied = fields.get("tempo_applied", 0.0) != 0.0
+        if not ok:
+            self.smf_import_status_label.setText(f"Import failed: {error}" if error else "Import failed")
+            return
+        marker_count = int(fields.get("marker_count", 0))
+        self.song_markers = []
+        for i in range(marker_count):
+            t = fields.get(f"marker/{i}/time")
+            label = fields.get(f"marker/{i}/label")
+            if t is not None and label is not None:
+                self.song_markers.append((float(t), str(label)))
+        self._rebuild_marker_list_widget()
+
+        if tempo_applied:
+            tempo_marker_count = int(fields.get("tempo_marker_count", 0))
+            if tempo_marker_count > 0:
+                self._imported_tempo_markers = []
+                for i in range(tempo_marker_count):
+                    t = fields.get(f"tempo_marker/{i}/time")
+                    bpm = fields.get(f"tempo_marker/{i}/bpm")
+                    if t is not None and bpm is not None:
+                        self._imported_tempo_markers.append((float(t), float(bpm)))
+            else:
+                self._imported_tempo_markers = []
+            if "tempo_bpm" in fields:
+                self.tempo_dial.setValue(int(round(fields["tempo_bpm"])))
+
+        status = f"Imported {lanes_used} lane(s), {marker_count} marker(s)"
+        if tempo_applied:
+            status += ", tempo applied"
+        self.smf_import_status_label.setText(status)
+        self.transmit_knob_packet()
 
     def _update_seq_sync_lock_label(self, _index=None):
         """Reflects /hds/status/midi_clock_locked next to the Sequencer tab's Sync combo -- blank
@@ -6618,10 +6763,17 @@ class SynthGui(QWidget):
             got_any = True
             values = {}
             seq_audio_updates = {}  # lane_index -> {"state": ..., "frames"?: ..., "channels"?: ..., "sample_rate"?: ...}
+            smf_import_fields = {}  # field name (with any "marker/N/..." or "tempo_marker/N/..." prefix kept) -> value
             for timed_msg in packet.messages:
                 msg = timed_msg.message
                 if msg.address in self._STATUS_ADDRESSES and msg.params:
                     values[msg.address] = msg.params[0]
+                elif msg.address.startswith("/hds/status/smf_import/") and msg.params:
+                    # One-shot reply to /hds/song/import_smf (see song_import_smf_handler() in
+                    # backend.c) -- sent as a single small bundle, so unlike the chunked
+                    # /hds/request_state dump there's no sentinel to wait for: everything this
+                    # import produced arrives in this one packet, applied once the loop below ends.
+                    smf_import_fields[msg.address[len("/hds/status/smf_import/"):]] = msg.params[0]
                 elif msg.address.startswith("/hds/status/seq_audio/") and msg.params:
                     # /hds/status/seq_audio/<lane>/<field> -- a variable-length, mostly-empty set
                     # (see send_seq_audio_status() in backend.c), so unlike the fixed-shape
@@ -6659,6 +6811,8 @@ class SynthGui(QWidget):
                     self._state_dump_buffer[msg.address] = msg.params[0]
             if seq_audio_updates:
                 self._apply_seq_audio_status(seq_audio_updates)
+            if smf_import_fields:
+                self._apply_smf_import_result(smf_import_fields)
             if "/hds/status/peak" in values:
                 self.vu_meter.setValue(int(max(0, min(100, values["/hds/status/peak"] * 100.0))))
             if all(a in values for a in self._STATUS_ADDRESSES[1:5]):
@@ -6898,6 +7052,8 @@ class SynthGui(QWidget):
         add_f("/hds/seq/transport/seek_start", self.seq_transport_seek_start_trigger)
         add_f("/hds/seq/transport/seek_back", self.seq_transport_seek_back_trigger)
         add_f("/hds/seq/transport/seek_fwd", self.seq_transport_seek_fwd_trigger)
+        add_f("/hds/seq/transport/seek_to_target_sec", self.seq_transport_seek_to_target_sec)
+        add_f("/hds/seq/transport/seek_to", self.seq_transport_seek_to_trigger)
         add_f("/hds/seq/transport/metronome", 1.0 if self.seq_btn_metronome.isChecked() else 0.0)
         add_f("/hds/seq/quantize/enable", 1.0 if self.seq_btn_quantize.isChecked() else 0.0)
         add_f("/hds/seq/quantize/resolution", float(SEQ_QUANTIZE_RESOLUTIONS[self.seq_quantize_resolution_combo.currentIndex()]))
@@ -7072,18 +7228,26 @@ class SynthGui(QWidget):
 
         # Tempo: the Tempo knob (tempo_bpm) plus a programmable tempo-map system in the backend --
         # tempo_marker_count + up to TEMPO_MARKER_MAX (time, bpm) marker pairs, interpolated
-        # between (see compute_current_tempo_bpm() in backend.c). No marker editor UI exists yet,
-        # so marker_count is always 0 and the arrays always zero -- reserved for a future editor.
+        # between (see compute_current_tempo_bpm() in backend.c). There's still no marker EDITOR
+        # UI, but importing a Standard MIDI File (_pick_and_import_midi()) can now populate a real
+        # map -- self._imported_tempo_markers caches whatever song_import_smf_handler() last
+        # reported, and MUST be resent as-is on every call here (this method blasts the whole live
+        # state on any change at all), or the very next unrelated knob tweak would silently wipe
+        # the just-imported map back to flat/zero. Manually clearing it back to "no map" isn't
+        # exposed anywhere yet -- re-importing (or restarting the GUI) is the only way, matching
+        # the same gap Load Scale's own tuning table has.
         add_f("/hds/tempo/bpm", self.tempo_dial.value())
         add_f("/hds/arp/enabled", 1.0 if self.arp_enabled_btn.isChecked() else 0.0)
         add_f("/hds/arp/style", self.arp_style_combo.currentIndex())
         add_f("/hds/arp/velocity", float(self.arp_velocity_dial.value()))
         add_f("/hds/arp/gate_pct", float(self.arp_gate_dial.value()))
-        add_f("/hds/tempo/marker_count", 0.0)
+        add_f("/hds/tempo/marker_count", float(len(self._imported_tempo_markers)))
         for idx in range(TEMPO_MARKER_MAX):
-            add_f(f"/hds/tempo/marker/{idx}/time", 0.0)
+            t = self._imported_tempo_markers[idx][0] if idx < len(self._imported_tempo_markers) else 0.0
+            add_f(f"/hds/tempo/marker/{idx}/time", t)
         for idx in range(TEMPO_MARKER_MAX):
-            add_f(f"/hds/tempo/marker/{idx}/bpm", 0.0)
+            bpm = self._imported_tempo_markers[idx][1] if idx < len(self._imported_tempo_markers) else 0.0
+            add_f(f"/hds/tempo/marker/{idx}/bpm", bpm)
 
         # Sample Bank: NOT part of this bundle -- the Mapping tab's zone catalog travels over its
         # own dedicated OSC addresses instead (see transmit_zone_upsert()/transmit_zone_remove()),

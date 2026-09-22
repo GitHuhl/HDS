@@ -91,7 +91,6 @@ typedef struct {
     // known to exist (clap_factory_create_plugin sets every entry to that param's default_value).
     double clap_param_shadow[64]; // >= HDS_CLAP_PARAM_COUNT; a plain fixed size since the table is a compile-time constant and this is just a shadow cache, not wire-visible
 
-    uint64_t total_frames_rendered;
     int vu_decimator;
 
     lo_server osc_server;
@@ -103,6 +102,9 @@ typedef struct {
     // a frontend that just connected to THIS instance's OSC port pull its current live state
     // instead of blindly pushing GUI defaults over a DAW-restored patch.
     HdsStateRequestContext state_request_ctx;
+    // "/hds/song/import_smf" support -- see HdsSmfImportContext's own comment in backend.c. Same
+    // "needs this instance's own osc_reply_addr" reason as state_request_ctx just above.
+    HdsSmfImportContext smf_import_ctx;
 } HdsClapPlugin;
 
 // ---------------------------------------------------------------------------------------------
@@ -686,6 +688,10 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         p->state_request_ctx.knobs = &p->knobs;
         p->state_request_ctx.reply_addr = p->osc_reply_addr;
         lo_server_add_method(p->osc_server, "/hds/request_state", "", request_state_handler, &p->state_request_ctx);
+        p->smf_import_ctx.engine = &p->engine;
+        p->smf_import_ctx.knobs = &p->knobs;
+        p->smf_import_ctx.reply_addr = p->osc_reply_addr;
+        lo_server_add_method(p->osc_server, "/hds/song/import_smf", "sf", song_import_smf_handler, &p->smf_import_ctx);
         p->osc_ready = true;
         fprintf(stderr, "[hds-clap] OSC listening on UDP port %d, status replies to %s:%d\n", p->osc_listen_port, CLAP_OSC_REPLY_HOST, p->osc_reply_port);
         if (p->host && p->host->get_extension) {
@@ -714,7 +720,6 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         fprintf(stderr, "[hds-clap] failed to start sample disk streaming thread -- WAVE_SAMPLE playback unavailable this session\n");
     }
 
-    p->total_frames_rendered = 0;
     p->vu_decimator = 0;
     return true;
 }
@@ -795,8 +800,10 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
     // app, not just a stripped-down MIDI-only mode.
     poll_seq_audio_load_requests(&p->streams_state, &p->knobs);
     poll_seq_audio_preview_triggers(&p->streams_state, &p->knobs);
-    double engine_elapsed_seconds = (double)p->total_frames_rendered / (double)SAMPLE_RATE;
-    float current_tempo_bpm = compute_current_tempo_bpm(&p->knobs, engine_elapsed_seconds);
+    // Resolved against the Sequencer's own playhead position, not this instance's uptime -- see
+    // backend.c main()'s own identical fix and comment (a song's tempo map is relative to song
+    // position, not to how long this plugin instance has been running).
+    float current_tempo_bpm = compute_current_tempo_bpm(&p->knobs, p->engine.transport_playhead_sec);
     // Host tempo sync (SynthSharedControls.seq_sync_source == 1, "External"): a CLAP host already
     // hands its own tempo directly via process->transport -- no raw MIDI Clock bytes to parse at
     // all here, unlike the standalone app's ALSA-sequencer path (see
@@ -932,7 +939,6 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
             }
         }
 
-        p->total_frames_rendered += (uint64_t)block_size;
         frames_done += (uint32_t)block_size;
     }
 

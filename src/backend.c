@@ -1010,14 +1010,21 @@ typedef struct {
     float seq_transport_stop_trigger;
     // Seek: same edge-triggered-counter idiom as Play/Pause/Stop above. seek_start jumps the
     // playhead to 0:00 ("very beginning" reset); seek_back/seek_fwd move it by one whole measure
-    // (4 beats at the engine's current tempo -- see poll_transport_triggers' own comment on why
-    // "current" rather than "at the target position": this engine's tempo-map system interpolates
-    // against uptime, not a seekable playhead, an existing limitation this reuses rather than
-    // solves). All three work in every transport state (Stopped/Paused/Playing), repositioning
-    // every lane's own playback position to match, not just the display.
+    // (4 beats at the engine's current tempo). All three work in every transport state (Stopped/
+    // Paused/Playing), repositioning every lane's own playback position to match, not just the
+    // display.
     float seq_transport_seek_start_trigger;
     float seq_transport_seek_back_trigger;
     float seq_transport_seek_fwd_trigger;
+    // Seek-to-arbitrary-position: jumps straight to seq_transport_seek_to_target_sec (seconds from
+    // the top) instead of a relative one-measure step -- what "jump to marker" (Sequencer tab's
+    // Markers list, populated by an imported Standard MIDI File's own text markers, or added by
+    // hand) actually sends. Same edge-triggered-counter idiom as every other transport trigger
+    // here: the frontend sets the target field, then increments the trigger to fire the jump, so a
+    // second click on the SAME marker (same target_sec) still fires (the counter changed even
+    // though the target didn't).
+    float seq_transport_seek_to_target_sec;
+    float seq_transport_seek_to_trigger;
 
     // Quantize: rounds a Rec-armed lane's recorded note-ON timestamps to the nearest grid line at
     // the engine's current tempo, so a slightly-early/late live take still lines up rhythmically
@@ -4116,6 +4123,8 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/seq/transport/seek_start", seq_transport_seek_start_trigger),
     OSC_SCALAR("/hds/seq/transport/seek_back", seq_transport_seek_back_trigger),
     OSC_SCALAR("/hds/seq/transport/seek_fwd", seq_transport_seek_fwd_trigger),
+    OSC_SCALAR("/hds/seq/transport/seek_to_target_sec", seq_transport_seek_to_target_sec),
+    OSC_SCALAR("/hds/seq/transport/seek_to", seq_transport_seek_to_trigger),
     OSC_SCALAR("/hds/seq/transport/metronome", metronome_enable),
     OSC_SCALAR("/hds/seq/quantize/enable", seq_quantize_enable),
     OSC_SCALAR("/hds/seq/quantize/resolution", seq_quantize_resolution),
@@ -4474,6 +4483,8 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->seq_transport_seek_start_trigger = 0.0f;
     knobs->seq_transport_seek_back_trigger = 0.0f;
     knobs->seq_transport_seek_fwd_trigger = 0.0f;
+    knobs->seq_transport_seek_to_target_sec = 0.0f;
+    knobs->seq_transport_seek_to_trigger = 0.0f;
     knobs->seq_quantize_enable = 0.0f;
     knobs->seq_quantize_resolution = 4.0f; // sixteenth notes
     knobs->seq_sync_source = 0.0f; // Internal
@@ -7232,6 +7243,7 @@ typedef struct {
     double        transport_playhead_sec;
     float         transport_last_play_trigger, transport_last_pause_trigger, transport_last_stop_trigger;
     float         transport_last_seek_start_trigger, transport_last_seek_back_trigger, transport_last_seek_fwd_trigger;
+    float         transport_last_seek_to_trigger;
 
     // --- External MIDI Clock sync (see SynthSharedControls.seq_sync_source) ---
     bool   midi_clock_valid;                  // true once enough consecutive ticks have arrived to trust midi_clock_bpm
@@ -7545,6 +7557,13 @@ static void poll_transport_triggers(HdsStreamsState *streams, HdsEngineState *en
         engine->transport_playhead_sec += (double)measure_sec;
         seeked = true;
     }
+    // Seek-to-arbitrary-position ("jump to marker" -- see SynthSharedControls' own comment):
+    // jumps straight to the requested absolute position rather than a relative one-measure step.
+    if (knobs->seq_transport_seek_to_trigger != engine->transport_last_seek_to_trigger) {
+        engine->transport_last_seek_to_trigger = knobs->seq_transport_seek_to_trigger;
+        engine->transport_playhead_sec = fmax(0.0, (double)knobs->seq_transport_seek_to_target_sec);
+        seeked = true;
+    }
     if (seeked) {
         transport_reposition_lanes(streams, engine, knobs);
         // Resync the metronome's own schedule to the NEW playhead position -- without this, a
@@ -7809,6 +7828,378 @@ static int song_load_midi_handler(const char *path, const char *types, lo_arg **
     if (!hds_song_load_midi(engine, file_path)) {
         fprintf(stderr, "[song] failed to load MIDI data from '%s' (missing, unreadable, or wrong format/version)\n", file_path);
     }
+    return 0;
+}
+
+// --- Standard MIDI File (.mid) import: a REAL SMF Type 0/1 reader (e.g. for a file exported from
+// a DAW like Reaper) -- distinct from hds_song_save_midi/load_midi just above, which is this
+// engine's OWN small internal round-trip format, not a real SMF parser. Populates Sequencer
+// lanes from each note-carrying track, and always reports the file's own text markers (0xFF 0x06)
+// back to the caller for the Sequencer tab's Markers list ("jump to marker") regardless of
+// whether the caller also asked to import the file's tempo map.
+//
+// Ticks are shared across every track in one SMF file (each track advances the same underlying
+// clock via its own independent delta-times), and Set Tempo (0xFF 0x51)/Marker (0xFF 0x06)
+// meta-events conventionally live on a Type 1 file's own Track 0 -- but this scans EVERY track
+// for them rather than assuming that, so a Type 0 file (tempo, markers, and notes all
+// interleaved on one single track) is handled by the exact same code path with no special case.
+#define HDS_SMF_MARKER_MAX 64
+#define HDS_SMF_MARKER_LABEL_LEN 64
+#define HDS_SMF_TEMPO_EVENT_MAX 256
+// Generous ceiling on a plausible plain MIDI file -- rejects anything wildly oversized outright
+// rather than fread()ing an arbitrarily large file into memory (a real SMF export, even a long,
+// busy multi-track song, is almost always well under 1MB).
+#define HDS_SMF_FILE_SIZE_MAX (16 * 1024 * 1024)
+
+typedef struct { long tick; uint32_t usec_per_qn; } HdsSmfTempoEvent;
+typedef struct { long tick; char label[HDS_SMF_MARKER_LABEL_LEN]; } HdsSmfMarkerEvent;
+typedef struct { long tick; unsigned char type; unsigned char note; unsigned char velocity; } HdsSmfNoteEvent; // type: 0 = note_on, 1 = note_off -- pre-conversion twin of SeqMidiEvent, tick instead of time_sec
+
+typedef struct {
+    bool ok;
+    char error[128]; // empty on success
+    int lanes_used;
+    bool tempo_applied;
+    int marker_count;
+    float marker_time[HDS_SMF_MARKER_MAX];
+    char marker_label[HDS_SMF_MARKER_MAX][HDS_SMF_MARKER_LABEL_LEN];
+} HdsSmfImportResult;
+
+static bool hds_smf_read_u16be(const uint8_t *buf, size_t len, size_t *pos, uint16_t *out) {
+    if (*pos + 2 > len) return false;
+    *out = (uint16_t)(((uint16_t)buf[*pos] << 8) | buf[*pos + 1]);
+    *pos += 2;
+    return true;
+}
+static bool hds_smf_read_u32be(const uint8_t *buf, size_t len, size_t *pos, uint32_t *out) {
+    if (*pos + 4 > len) return false;
+    *out = ((uint32_t)buf[*pos] << 24) | ((uint32_t)buf[*pos + 1] << 16) | ((uint32_t)buf[*pos + 2] << 8) | (uint32_t)buf[*pos + 3];
+    *pos += 4;
+    return true;
+}
+// A Variable-Length Quantity: 7 payload bits per byte, MSB set on every byte but the last. Used
+// for both delta-times and meta-event lengths. Real SMF values never need more than 4 continuation
+// bytes (28 bits) -- more than that is corrupt input, not a value this format can express.
+static bool hds_smf_read_vlq(const uint8_t *buf, size_t len, size_t *pos, uint32_t *out) {
+    uint32_t value = 0;
+    for (int i = 0; i < 4; i++) {
+        if (*pos >= len) return false;
+        uint8_t b = buf[*pos]; (*pos)++;
+        value = (value << 7) | (uint32_t)(b & 0x7F);
+        if (!(b & 0x80)) { *out = value; return true; }
+    }
+    return false;
+}
+
+// Parses one MTrk chunk's raw event bytes (delta-time + event, repeated until the chunk ends).
+// Returns false only for genuine STRUCTURAL corruption (a truncated VLQ, or an event that runs
+// off the end of the chunk) -- "no partial application" all the way up to hds_song_import_smf's
+// own caller, same posture as hds_song_load_midi/hds_tuning_load_scl elsewhere in this file. A
+// recognized-but-full capacity (more tempo/marker/note events than this engine reserves room for)
+// is NOT such a failure -- it's silently capped, with a diagnostic, exactly like every other
+// fixed-capacity import here (see hds_tuning_load_scl's HDS_TUNING_MAX_DEGREES, or
+// seq_record_midi_event's own SEQ_MIDI_EVENT_CAPACITY cap). note_cap == 0 means "don't collect
+// notes for this track at all" (this file already has SEQ_LANE_COUNT note tracks) -- silent,
+// since the caller already reports that once per file, not once per dropped note.
+static bool hds_smf_parse_track(const uint8_t *data, size_t len,
+                                 HdsSmfTempoEvent *tempo_events, int *tempo_count, int tempo_cap,
+                                 HdsSmfMarkerEvent *markers, int *marker_count, int marker_cap,
+                                 HdsSmfNoteEvent *notes, int *note_count, int note_cap) {
+    size_t pos = 0;
+    long abs_tick = 0;
+    uint8_t running_status = 0;
+    while (pos < len) {
+        uint32_t delta;
+        if (!hds_smf_read_vlq(data, len, &pos, &delta)) return false;
+        abs_tick += (long)delta;
+        if (pos >= len) return false; // a delta-time with no event following it -- truncated
+        uint8_t status_byte = data[pos];
+        if (status_byte == 0xFF) {
+            pos++;
+            if (pos >= len) return false;
+            uint8_t meta_type = data[pos]; pos++;
+            uint32_t meta_len;
+            if (!hds_smf_read_vlq(data, len, &pos, &meta_len)) return false;
+            if (meta_len > len - pos) return false;
+            if (meta_type == 0x51) { // Set Tempo: always exactly 3 bytes, microseconds per quarter note, big-endian
+                if (meta_len != 3) return false;
+                uint32_t usec = ((uint32_t)data[pos] << 16) | ((uint32_t)data[pos + 1] << 8) | (uint32_t)data[pos + 2];
+                if (*tempo_count < tempo_cap) { tempo_events[*tempo_count] = (HdsSmfTempoEvent){ abs_tick, usec }; (*tempo_count)++; }
+                else fprintf(stderr, "[smf] more than %d tempo changes in this file -- dropping the rest\n", tempo_cap);
+            } else if (meta_type == 0x06) { // Marker: an ASCII label, exactly meta_len bytes, not NUL-terminated in the file
+                if (*marker_count < marker_cap) {
+                    size_t copy_len = meta_len < (uint32_t)(HDS_SMF_MARKER_LABEL_LEN - 1) ? meta_len : (uint32_t)(HDS_SMF_MARKER_LABEL_LEN - 1);
+                    HdsSmfMarkerEvent *me = &markers[*marker_count];
+                    memcpy(me->label, &data[pos], copy_len);
+                    me->label[copy_len] = '\0';
+                    me->tick = abs_tick;
+                    (*marker_count)++;
+                } else fprintf(stderr, "[smf] more than %d markers in this file -- dropping the rest\n", marker_cap);
+            }
+            // Every other meta type (Track Name, End of Track, Time/Key Signature, Sequencer-
+            // Specific, ...) is simply skipped by its own length prefix -- a real SMF reader must
+            // tolerate any meta type it doesn't specifically use, not just the two above.
+            pos += meta_len;
+        } else if (status_byte == 0xF0 || status_byte == 0xF7) { // Sysex -- skip by its own length prefix
+            pos++;
+            uint32_t sysex_len;
+            if (!hds_smf_read_vlq(data, len, &pos, &sysex_len)) return false;
+            if (sysex_len > len - pos) return false;
+            pos += sysex_len;
+        } else {
+            // A channel voice/mode message, possibly via running status: a status byte < 0x80 is
+            // NOT a fresh status -- it's the first DATA byte of an event reusing whichever real
+            // status byte came before it (a standard MIDI file-size optimization for runs of the
+            // same message type, e.g. a whole chord's worth of Note On events).
+            uint8_t status;
+            if (status_byte & 0x80) { status = status_byte; running_status = status_byte; pos++; }
+            else { status = running_status; if (status == 0) return false; } // no running status yet to fall back on -- corrupt
+            uint8_t hi = status & 0xF0;
+            int data_bytes = (hi == 0xC0 || hi == 0xD0) ? 1 : 2; // Program Change/Channel Pressure: 1 data byte; everything else here: 2
+            if ((size_t)data_bytes > len - pos) return false;
+            uint8_t d1 = data[pos];
+            uint8_t d2 = (data_bytes == 2) ? data[pos + 1] : 0;
+            pos += (size_t)data_bytes;
+            if (hi == 0x80 || hi == 0x90) { // Note Off / Note On
+                bool is_on = (hi == 0x90 && d2 > 0); // velocity-0 Note On counts as Note Off, matching this engine's own live MIDI decode convention
+                if (*note_count < note_cap) { notes[*note_count] = (HdsSmfNoteEvent){ abs_tick, is_on ? (unsigned char)0 : (unsigned char)1, d1, d2 }; (*note_count)++; }
+                else if (note_cap > 0) fprintf(stderr, "[smf] more than %d note events on one track -- dropping the rest\n", note_cap);
+            }
+            // Every other channel message (CC, Program Change, Pitch Bend, Aftertouch) is simply
+            // ignored for import purposes -- matches seq_record_midi_event's own scope (this
+            // engine's recorded Sequencer lanes only ever hold note-on/off events).
+        }
+    }
+    return true;
+}
+
+static int hds_smf_tempo_event_cmp(const void *a, const void *b) {
+    long ta = ((const HdsSmfTempoEvent *)a)->tick, tb = ((const HdsSmfTempoEvent *)b)->tick;
+    return (ta > tb) - (ta < tb);
+}
+
+// Converts an absolute tick position into real seconds by walking the (already tick-sorted)
+// tempo map and accumulating elapsed time segment by segment. Before the first explicit Set Tempo
+// event, the MIDI spec's own default applies: 500000 usec/quarter note = 120 BPM.
+static double hds_smf_ticks_to_seconds(long target_tick, const HdsSmfTempoEvent *tempo_events, int tempo_count, int ticks_per_quarter) {
+    double seconds = 0.0;
+    long prev_tick = 0;
+    uint32_t usec_per_qn = 500000;
+    for (int i = 0; i < tempo_count && tempo_events[i].tick <= target_tick; i++) {
+        seconds += (double)(tempo_events[i].tick - prev_tick) * (double)usec_per_qn / 1e6 / (double)ticks_per_quarter;
+        usec_per_qn = tempo_events[i].usec_per_qn;
+        prev_tick = tempo_events[i].tick;
+    }
+    seconds += (double)(target_tick - prev_tick) * (double)usec_per_qn / 1e6 / (double)ticks_per_quarter;
+    return seconds;
+}
+
+// Imports file_path into engine->seq_midi[]/knobs, per this section's own header comment.
+// import_tempo controls ONLY whether the file's Set Tempo events also get applied to Single
+// Program mode's own tempo-map knobs (programs[SINGLE_PROGRAM_SLOT].tempo_marker_*) -- note
+// timing itself always uses the file's own tempo map to convert ticks to seconds regardless of
+// this flag, since that's simply what correct playback of the file requires.
+static bool hds_song_import_smf(HdsEngineState *engine, SynthSharedControls *knobs, const char *file_path, bool import_tempo, HdsSmfImportResult *result) {
+    *result = (HdsSmfImportResult){0};
+    FILE *f = fopen(file_path, "rb");
+    if (!f) { snprintf(result->error, sizeof(result->error), "could not open file"); return false; }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize < 14 || fsize > HDS_SMF_FILE_SIZE_MAX) {
+        fclose(f);
+        snprintf(result->error, sizeof(result->error), "not a plausible Standard MIDI File (size)");
+        return false;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)fsize);
+    if (!buf) { fclose(f); snprintf(result->error, sizeof(result->error), "out of memory"); return false; }
+    size_t read_bytes = fread(buf, 1, (size_t)fsize, f);
+    fclose(f);
+    if (read_bytes != (size_t)fsize) { free(buf); snprintf(result->error, sizeof(result->error), "short read"); return false; }
+
+    if (memcmp(buf, "MThd", 4) != 0) { free(buf); snprintf(result->error, sizeof(result->error), "missing MThd header"); return false; }
+    size_t pos = 4;
+    uint32_t header_len; hds_smf_read_u32be(buf, (size_t)fsize, &pos, &header_len);
+    if (header_len != 6) { free(buf); snprintf(result->error, sizeof(result->error), "unexpected MThd length"); return false; }
+    uint16_t format, ntrks, division;
+    hds_smf_read_u16be(buf, (size_t)fsize, &pos, &format);
+    hds_smf_read_u16be(buf, (size_t)fsize, &pos, &ntrks);
+    hds_smf_read_u16be(buf, (size_t)fsize, &pos, &division);
+    if (format == 2) { free(buf); snprintf(result->error, sizeof(result->error), "Type 2 (independent unsynced tracks) has no single timeline -- not supported"); return false; }
+    if (division & 0x8000) { free(buf); snprintf(result->error, sizeof(result->error), "SMPTE timecode division is not supported (only ticks-per-quarter-note files)"); return false; }
+    int ticks_per_quarter = (int)division;
+    if (ticks_per_quarter <= 0) { free(buf); snprintf(result->error, sizeof(result->error), "invalid ticks-per-quarter-note division"); return false; }
+
+    static HdsSmfTempoEvent tempo_events[HDS_SMF_TEMPO_EVENT_MAX];
+    int tempo_count = 0;
+    static HdsSmfMarkerEvent marker_events[HDS_SMF_MARKER_MAX];
+    int marker_count = 0;
+    // Per-track note staging -- static, far too large for the stack (mirrors hds_song_load_midi's
+    // own identical reasoning for its "loaded[]" staging array).
+    static HdsSmfNoteEvent note_stage[SEQ_LANE_COUNT][SEQ_MIDI_EVENT_CAPACITY];
+    static int note_stage_count[SEQ_LANE_COUNT];
+    int lanes_used = 0;
+    memset(note_stage_count, 0, sizeof(note_stage_count));
+
+    for (int t = 0; t < (int)ntrks; t++) {
+        if (pos + 8 > (size_t)fsize || memcmp(&buf[pos], "MTrk", 4) != 0) {
+            free(buf);
+            snprintf(result->error, sizeof(result->error), "missing MTrk header for track %d", t);
+            return false;
+        }
+        pos += 4;
+        uint32_t track_len; hds_smf_read_u32be(buf, (size_t)fsize, &pos, &track_len);
+        if (track_len > (size_t)fsize - pos) {
+            free(buf);
+            snprintf(result->error, sizeof(result->error), "track %d runs past end of file", t);
+            return false;
+        }
+        int this_track_note_count = 0;
+        HdsSmfNoteEvent *dest_notes = (lanes_used < SEQ_LANE_COUNT) ? note_stage[lanes_used] : NULL;
+        int dest_cap = (dest_notes != NULL) ? SEQ_MIDI_EVENT_CAPACITY : 0;
+        bool track_ok = hds_smf_parse_track(&buf[pos], track_len,
+                                             tempo_events, &tempo_count, HDS_SMF_TEMPO_EVENT_MAX,
+                                             marker_events, &marker_count, HDS_SMF_MARKER_MAX,
+                                             dest_notes, &this_track_note_count, dest_cap);
+        if (!track_ok) {
+            free(buf);
+            snprintf(result->error, sizeof(result->error), "corrupt event data in track %d", t);
+            return false;
+        }
+        if (this_track_note_count > 0) {
+            if (lanes_used < SEQ_LANE_COUNT) {
+                note_stage_count[lanes_used] = this_track_note_count;
+                lanes_used++;
+            } else {
+                fprintf(stderr, "[smf] more than %d note-carrying tracks in this file -- dropping track %d entirely\n", SEQ_LANE_COUNT, t);
+            }
+        }
+        pos += track_len;
+    }
+    free(buf);
+
+    qsort(tempo_events, (size_t)tempo_count, sizeof(HdsSmfTempoEvent), hds_smf_tempo_event_cmp);
+
+    // Everything parsed cleanly -- commit. Clears every lane first (a real Load, not a merge --
+    // same "no stale leftovers" posture as hds_song_load_midi), then refills however many the
+    // file actually used.
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) { engine->seq_midi[l].event_count = 0; engine->seq_midi[l].playback_cursor = 0; }
+    for (int l = 0; l < lanes_used; l++) {
+        int n = note_stage_count[l];
+        engine->seq_midi[l].event_count = n;
+        for (int e = 0; e < n; e++) {
+            engine->seq_midi[l].events[e] = (SeqMidiEvent){
+                (float)hds_smf_ticks_to_seconds(note_stage[l][e].tick, tempo_events, tempo_count, ticks_per_quarter),
+                note_stage[l][e].type, note_stage[l][e].note, note_stage[l][e].velocity
+            };
+        }
+    }
+
+    if (import_tempo) {
+        ProgramState *prog = &knobs->programs[SINGLE_PROGRAM_SLOT];
+        if (tempo_count <= 1) {
+            // The common case, a file with one flat, unchanging tempo: no map needed at all --
+            // matches compute_current_tempo_bpm()'s own "no markers" fast path.
+            prog->tempo_bpm = (tempo_count == 1) ? (60000000.0f / (float)tempo_events[0].usec_per_qn) : 120.0f;
+            prog->tempo_marker_count = 0.0f;
+        } else {
+            int n = tempo_count < TEMPO_MARKER_MAX ? tempo_count : TEMPO_MARKER_MAX;
+            if (tempo_count > TEMPO_MARKER_MAX) {
+                fprintf(stderr, "[smf] file has %d tempo changes, more than this engine's %d-slot tempo map holds -- keeping the first %d\n", tempo_count, TEMPO_MARKER_MAX, TEMPO_MARKER_MAX);
+            }
+            for (int i = 0; i < n; i++) {
+                prog->tempo_marker_time[i] = (float)hds_smf_ticks_to_seconds(tempo_events[i].tick, tempo_events, tempo_count, ticks_per_quarter);
+                prog->tempo_marker_bpm[i] = 60000000.0f / (float)tempo_events[i].usec_per_qn;
+            }
+            prog->tempo_marker_count = (float)n;
+        }
+    }
+
+    int n_markers = marker_count < HDS_SMF_MARKER_MAX ? marker_count : HDS_SMF_MARKER_MAX;
+    for (int i = 0; i < n_markers; i++) {
+        result->marker_time[i] = (float)hds_smf_ticks_to_seconds(marker_events[i].tick, tempo_events, tempo_count, ticks_per_quarter);
+        snprintf(result->marker_label[i], HDS_SMF_MARKER_LABEL_LEN, "%s", marker_events[i].label);
+    }
+    // Sort markers by time -- almost always already in order (collected in increasing-tick order
+    // per track, and markers conventionally live on just one track), but a stable guarantee costs
+    // nothing here (marker_count is capped small) and the Sequencer tab's Markers list shouldn't
+    // have to re-sort what should already read as a timeline. Plain insertion sort (small N).
+    for (int i = 1; i < n_markers; i++) {
+        float t = result->marker_time[i];
+        char lbl[HDS_SMF_MARKER_LABEL_LEN]; snprintf(lbl, sizeof(lbl), "%s", result->marker_label[i]);
+        int j = i - 1;
+        while (j >= 0 && result->marker_time[j] > t) {
+            result->marker_time[j + 1] = result->marker_time[j];
+            memcpy(result->marker_label[j + 1], result->marker_label[j], HDS_SMF_MARKER_LABEL_LEN);
+            j--;
+        }
+        result->marker_time[j + 1] = t;
+        snprintf(result->marker_label[j + 1], HDS_SMF_MARKER_LABEL_LEN, "%s", lbl);
+    }
+
+    result->ok = true;
+    result->lanes_used = lanes_used;
+    result->tempo_applied = import_tempo;
+    result->marker_count = n_markers;
+    return true;
+}
+
+typedef struct {
+    HdsEngineState *engine;
+    SynthSharedControls *knobs;
+    lo_address reply_addr;
+} HdsSmfImportContext;
+
+// Fired once, synchronously, right from this handler (same "rare, discrete, user-initiated
+// action" posture as hds_song_save_midi/load_midi -- see that section's own REALTIME NOTE): parses
+// the file, applies it, and immediately reports the result back to reply_addr as one small bundle
+// -- there's no periodic per-block status poll for this the way send_seq_audio_status has, since
+// an import is a one-shot event, not ongoing state.
+static int song_import_smf_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)msg;
+    HdsSmfImportContext *ctx = (HdsSmfImportContext *)user_data;
+    if (argc != 2) return 0;
+    const char *file_path = (const char *)&argv[0]->s;
+    bool import_tempo = argv[1]->f != 0.0f;
+    HdsSmfImportResult result;
+    if (!hds_song_import_smf(ctx->engine, ctx->knobs, file_path, import_tempo, &result)) {
+        fprintf(stderr, "[smf] import of '%s' failed: %s\n", file_path, result.error);
+    }
+    if (!ctx->reply_addr) return 0;
+    lo_bundle b = lo_bundle_new(LO_TT_IMMEDIATE);
+    lo_message m;
+    m = lo_message_new(); lo_message_add_float(m, result.ok ? 1.0f : 0.0f); lo_bundle_add_message(b, "/hds/status/smf_import/ok", m);
+    m = lo_message_new(); lo_message_add_string(m, result.error); lo_bundle_add_message(b, "/hds/status/smf_import/error", m);
+    m = lo_message_new(); lo_message_add_float(m, (float)result.lanes_used); lo_bundle_add_message(b, "/hds/status/smf_import/lanes_used", m);
+    m = lo_message_new(); lo_message_add_float(m, result.tempo_applied ? 1.0f : 0.0f); lo_bundle_add_message(b, "/hds/status/smf_import/tempo_applied", m);
+    m = lo_message_new(); lo_message_add_float(m, (float)result.marker_count); lo_bundle_add_message(b, "/hds/status/smf_import/marker_count", m);
+    for (int i = 0; i < result.marker_count; i++) {
+        char addr[64];
+        snprintf(addr, sizeof(addr), "/hds/status/smf_import/marker/%d/time", i);
+        m = lo_message_new(); lo_message_add_float(m, result.marker_time[i]); lo_bundle_add_message(b, addr, m);
+        snprintf(addr, sizeof(addr), "/hds/status/smf_import/marker/%d/label", i);
+        m = lo_message_new(); lo_message_add_string(m, result.marker_label[i]); lo_bundle_add_message(b, addr, m);
+    }
+    // Tempo map values, if applied -- so the frontend can cache them and keep echoing them back
+    // on every future transmit_knob_packet() call (which resends every knob's CURRENT value on
+    // any change, tempo markers included -- without its own cached copy, the very next unrelated
+    // knob tweak would blast the just-imported tempo map back to flat/zero; see frontend.py's own
+    // transmit_knob_packet() comment on this exact block).
+    if (result.tempo_applied) {
+        const ProgramState *prog = &ctx->knobs->programs[SINGLE_PROGRAM_SLOT];
+        int n = (int)prog->tempo_marker_count;
+        m = lo_message_new(); lo_message_add_float(m, prog->tempo_bpm); lo_bundle_add_message(b, "/hds/status/smf_import/tempo_bpm", m);
+        m = lo_message_new(); lo_message_add_float(m, (float)n); lo_bundle_add_message(b, "/hds/status/smf_import/tempo_marker_count", m);
+        for (int i = 0; i < n; i++) {
+            char addr[64];
+            snprintf(addr, sizeof(addr), "/hds/status/smf_import/tempo_marker/%d/time", i);
+            m = lo_message_new(); lo_message_add_float(m, prog->tempo_marker_time[i]); lo_bundle_add_message(b, addr, m);
+            snprintf(addr, sizeof(addr), "/hds/status/smf_import/tempo_marker/%d/bpm", i);
+            m = lo_message_new(); lo_message_add_float(m, prog->tempo_marker_bpm[i]); lo_bundle_add_message(b, addr, m);
+        }
+    }
+    lo_send_bundle(ctx->reply_addr, b);
+    lo_bundle_free_recursive(b);
     return 0;
 }
 
@@ -10883,6 +11274,11 @@ int main(int argc, char **argv) {
     HdsStateRequestContext state_request_ctx = { &active_knobs, osc_reply_addr };
     lo_server_add_method(osc_server, "/hds/request_state", "", request_state_handler, &state_request_ctx);
 
+    // "/hds/song/import_smf" -- same reason as request_state above: needs osc_reply_addr to
+    // report the import's result (lanes used, markers found, tempo applied) back to the frontend.
+    HdsSmfImportContext smf_import_ctx = { &g_engine, &active_knobs, osc_reply_addr };
+    lo_server_add_method(osc_server, "/hds/song/import_smf", "sf", song_import_smf_handler, &smf_import_ctx);
+
     // --sfz-vcoN startup loading: right here, after the OSC methods are registered (so a
     // subsequent /hds/zone/load_sfz can still layer on top live) but before open_pcm_stream()
     // opens the real-time audio device -- hds_load_sfz_for_osc() only does text parsing + path/
@@ -10987,10 +11383,6 @@ int main(int argc, char **argv) {
     SynthVoice voices[MAX_VOICES]; for (int i = 0; i < MAX_VOICES; i++) init_voice(&voices[i]);
     MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1]; for (int mp = 0; mp <= COMBI_PROGRAM_COUNT; mp++) mono_stacks[mp] = (MonoNoteStack){0}; // index COMBI_PROGRAM_COUNT = SINGLE_PROGRAM_SLOT
 
-    // Engine "uptime" in samples, purely for the Tempo system's elapsed-time axis (see
-    // compute_current_tempo_bpm()) -- there's no other transport/song-position concept here.
-    uint64_t total_frames_rendered = 0;
-
     while (g_synth_running) {
         // Drain every pending OSC datagram this block -- generic_osc_handler/zone_upsert_handler/
         // zone_remove_handler write directly into active_knobs/g_sample_slots as each message is
@@ -11000,14 +11392,19 @@ int main(int argc, char **argv) {
         poll_seq_audio_preview_triggers(&g_streams_state, &active_knobs); // starts one-shot playback if a lane's Preview button was clicked
 
         // Programmable tempo: resolved once per block from the Tempo knob/tempo-map (see
-        // compute_current_tempo_bpm()) against this engine's own running uptime. Computed here,
-        // before poll_transport_triggers, so the new Seek Back/Forward-one-measure triggers can
-        // use it too (a measure = 4 beats at whatever tempo is "current" right now -- this
-        // engine's tempo-map system interpolates against uptime, not a seekable playhead, an
-        // existing limitation this reuses rather than solves). Otherwise reported back to the GUI
-        // (EngineStatus.tempo_bpm_live) purely so the Tempo knob visibly does something
-        // end-to-end even before a tempo-synced feature exists to actually use it.
-        double engine_elapsed_seconds = (double)total_frames_rendered / (double)SAMPLE_RATE;
+        // compute_current_tempo_bpm()) against the Sequencer's own playhead position
+        // (g_transport_playhead_sec), matching poll_arpeggiator()'s own independent resolution of
+        // the same thing. FIXED: this used to interpolate against the engine's running uptime
+        // instead -- harmless as long as tempo_marker_count was always 0 (the only case that ever
+        // existed before a real tempo MAP could be populated, e.g. by importing a Standard MIDI
+        // File's own tempo track -- see hds_song_import_smf()), but wrong the moment it isn't: a
+        // song's tempo map is inherently relative to SONG position, not to how long this process
+        // happens to have been running. Keyed to uptime, the map would read a different tempo
+        // every time depending purely on when Play was pressed relative to launch, and permanently
+        // drift out of step with the actual performance on every Stop/Play restart or Seek (the
+        // playhead resets/jumps; uptime doesn't). Computed here, before poll_transport_triggers,
+        // so the Seek Back/Forward-one-measure triggers can use it too (a measure = 4 beats at
+        // whatever tempo is "current" right now).
         // External MIDI Clock sync (see SynthSharedControls.seq_sync_source): substitutes the
         // clock-derived BPM for the Tempo knob/tempo-map's own result at this single resolution
         // point -- every downstream consumer (Arp, LFO Tempo Sync, Quantize, the metronome, the
@@ -11017,7 +11414,7 @@ int main(int argc, char **argv) {
         // external source degrades to the Tempo knob rather than freezing at a stale BPM).
         bool use_external_clock = (active_knobs.seq_sync_source != 0.0f) && g_engine.midi_clock_valid
             && (hds_monotonic_seconds() - g_engine.midi_clock_last_tick_sec) < HDS_MIDI_CLOCK_TIMEOUT_SEC;
-        float current_tempo_bpm = use_external_clock ? g_engine.midi_clock_bpm : compute_current_tempo_bpm(&active_knobs, engine_elapsed_seconds);
+        float current_tempo_bpm = use_external_clock ? g_engine.midi_clock_bpm : compute_current_tempo_bpm(&active_knobs, g_transport_playhead_sec);
 
         poll_transport_triggers(&g_streams_state, &g_engine, &active_knobs, current_tempo_bpm); // Play/Pause/Stop/Seek -- starts/freezes/resets/repositions the real Sequencer playhead
         poll_metronome(&g_engine, &active_knobs, current_tempo_bpm); // schedules the next click, if engaged and PLAYING
@@ -11223,7 +11620,6 @@ int main(int argc, char **argv) {
             vu_decimator = 0;
         }
         write_audio_block(pcm_handle, buffer, detected_output_channels, block_size, active_voices_count, render_ms);
-        total_frames_rendered += (uint64_t)block_size;
     }
     // Flush/finalize a still-running take on shutdown: signal the writer thread to stop (if a
     // recording was active) and to exit, then join it so its final fclose actually happens
