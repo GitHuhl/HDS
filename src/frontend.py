@@ -768,6 +768,10 @@ FX_TYPE_METADATA = [
         {"label": "Gate", "range": (0, 100), "default": 0},
         {"label": "Output", "range": (0, 100), "default": 50},
     ]},
+    # Genuinely parameterless -- matches the original plugin's own kNumParameters == 0 (see
+    # FX_TYPE_GUITARCONDITIONER's own comment in backend.c). Only the slot's generic Mix/Bypass
+    # apply; every P1-P10 dial stays hidden, same as "Off".
+    {"name": "GuitarConditioner", "params": []},
 ]
 
 # Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --

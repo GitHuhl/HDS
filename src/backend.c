@@ -438,6 +438,18 @@ typedef struct {
 // param[6] HSpeakr, param[7] LSpeakr, param[8] Gate (threshold), param[9] Output (makeup gain) --
 // the original's own A-J order, unchanged.
 #define FX_TYPE_POINTYGUITAR 7
+// Ported from Airwindows GuitarConditioner (MIT license). A parameterless (no knobs at all, same
+// as the original -- kNumParameters == 0) treble/bass conditioner: the signal is split into a
+// treble path and a bass path, each run through its own dynamically-adaptive one-pole highpass
+// (the pole coefficient itself depends on the CURRENT sample's own level -- "offset" below --
+// rather than being fixed, a signal-dependent filter rather than a plain static one), then each
+// path's sample-to-sample delta is slew-limited (clamped to a fixed max step) before the two
+// paths are summed back together. Both the treble and bass highpasses alternate between two
+// independent one-pole memories every other sample (`fpFlip`) -- ported as-is; this is the
+// original's own technique, not something this port added. No Mix-equivalent knob to drop or
+// keep here -- there's simply nothing to expose, the slot's generic Mix/Bypass are the only
+// controls this effect has.
+#define FX_TYPE_GUITARCONDITIONER 8
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -3129,6 +3141,128 @@ static void run_fx_pointyguitar(FXSlotEngine *engine, const FXSlotParams *params
     *r = inputSampleR;
 }
 
+// --- FX_TYPE_GUITARCONDITIONER: ported from Airwindows GuitarConditioner (MIT license) --- see
+// this effect's own FX_TYPE_GUITARCONDITIONER comment above for the full algorithm summary.
+// Genuinely parameterless -- `params` is unused, matching the original's own kNumParameters == 0.
+typedef struct {
+    bool fp_flip;
+    float last_sample_tl, last_sample_bl;
+    float iir_sample_tal, iir_sample_tbl, iir_sample_bal, iir_sample_bbl;
+    float last_sample_tr, last_sample_br;
+    float iir_sample_tar, iir_sample_tbr, iir_sample_bar, iir_sample_bbr;
+    uint32_t fpdL, fpdR;
+} FxGuitarConditionerState;
+
+static void run_fx_guitarconditioner(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    (void)params; // no params -- see this effect's own FX_TYPE_GUITARCONDITIONER comment above
+    FxGuitarConditionerState *st = (FxGuitarConditionerState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxGuitarConditionerState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+        st->fp_flip = true; // matches the original's own constructor default
+        st->fpdL = (uint32_t)rand(); while (st->fpdL < 16386) st->fpdL = (uint32_t)rand();
+        st->fpdR = (uint32_t)rand(); while (st->fpdR < 16386) st->fpdR = (uint32_t)rand();
+    }
+
+    float overallscale = (float)SAMPLE_RATE / 44100.0f;
+    float iirTreble = 0.287496f / overallscale; // tight is -1
+    float iirBass = 0.085184f / overallscale;   // tight is 1
+    iirTreble += iirTreble;
+    iirBass += iirBass; // simple double when tight is -1 or 1
+    const float tightBass = 0.6666666666f;
+    const float tightTreble = -0.3333333333f;
+    float threshTreble = 0.0081f / overallscale;
+    float threshBass = 0.0256f / overallscale;
+
+    float inputSampleL = *l, inputSampleR = *r;
+    if (fabsf(inputSampleL) < 1.18e-23f) inputSampleL = (float)st->fpdL * 1.18e-17f;
+    if (fabsf(inputSampleR) < 1.18e-23f) inputSampleR = (float)st->fpdR * 1.18e-17f;
+
+    float trebleL = inputSampleL, bassL = inputSampleL;
+    float trebleR = inputSampleR, bassR = inputSampleR;
+    trebleL += trebleL; // +3dB on treble as the highpass is higher
+    trebleR += trebleR;
+
+    float offset = (1.0f + tightTreble) + ((1.0f - fabsf(trebleL)) * tightTreble); // treble HP
+    offset = fmaxf(0.0f, fminf(1.0f, offset));
+    if (st->fp_flip) {
+        st->iir_sample_tal = (st->iir_sample_tal * (1.0f - (offset * iirTreble))) + (trebleL * (offset * iirTreble));
+        trebleL -= st->iir_sample_tal;
+    } else {
+        st->iir_sample_tbl = (st->iir_sample_tbl * (1.0f - (offset * iirTreble))) + (trebleL * (offset * iirTreble));
+        trebleL -= st->iir_sample_tbl;
+    } // done trebleL HP
+
+    offset = (1.0f + tightTreble) + ((1.0f - fabsf(trebleR)) * tightTreble); // treble HP
+    offset = fmaxf(0.0f, fminf(1.0f, offset));
+    if (st->fp_flip) {
+        st->iir_sample_tar = (st->iir_sample_tar * (1.0f - (offset * iirTreble))) + (trebleR * (offset * iirTreble));
+        trebleR -= st->iir_sample_tar;
+    } else {
+        st->iir_sample_tbr = (st->iir_sample_tbr * (1.0f - (offset * iirTreble))) + (trebleR * (offset * iirTreble));
+        trebleR -= st->iir_sample_tbr;
+    } // done trebleR HP
+
+    offset = (1.0f - tightBass) + (fabsf(bassL) * tightBass); // bass HP
+    offset = fmaxf(0.0f, fminf(1.0f, offset));
+    if (st->fp_flip) {
+        st->iir_sample_bal = (st->iir_sample_bal * (1.0f - (offset * iirBass))) + (bassL * (offset * iirBass));
+        bassL -= st->iir_sample_bal;
+    } else {
+        st->iir_sample_bbl = (st->iir_sample_bbl * (1.0f - (offset * iirBass))) + (bassL * (offset * iirBass));
+        bassL -= st->iir_sample_bbl;
+    } // done bassL HP
+
+    offset = (1.0f - tightBass) + (fabsf(bassR) * tightBass); // bass HP
+    offset = fmaxf(0.0f, fminf(1.0f, offset));
+    if (st->fp_flip) {
+        st->iir_sample_bar = (st->iir_sample_bar * (1.0f - (offset * iirBass))) + (bassR * (offset * iirBass));
+        bassR -= st->iir_sample_bar;
+    } else {
+        st->iir_sample_bbr = (st->iir_sample_bbr * (1.0f - (offset * iirBass))) + (bassR * (offset * iirBass));
+        bassR -= st->iir_sample_bbr;
+    } // done bassR HP
+
+    // Slew-limit each band's sample-to-sample delta (a hard cap on how fast it can move) --
+    // ported directly, using each band's own value straight (the original round-trips it through
+    // a same-value local first; behaviorally identical, just fewer temporaries).
+    float clamp = trebleL - st->last_sample_tl;
+    if (clamp > threshTreble) trebleL = st->last_sample_tl + threshTreble;
+    if (-clamp > threshTreble) trebleL = st->last_sample_tl - threshTreble;
+    st->last_sample_tl = trebleL; // trebleL slew
+
+    clamp = trebleR - st->last_sample_tr;
+    if (clamp > threshTreble) trebleR = st->last_sample_tr + threshTreble;
+    if (-clamp > threshTreble) trebleR = st->last_sample_tr - threshTreble;
+    st->last_sample_tr = trebleR; // trebleR slew
+
+    clamp = bassL - st->last_sample_bl;
+    if (clamp > threshBass) bassL = st->last_sample_bl + threshBass;
+    if (-clamp > threshBass) bassL = st->last_sample_bl - threshBass;
+    st->last_sample_bl = bassL; // bassL slew
+
+    clamp = bassR - st->last_sample_br;
+    if (clamp > threshBass) bassR = st->last_sample_br + threshBass;
+    if (-clamp > threshBass) bassR = st->last_sample_br - threshBass;
+    st->last_sample_br = bassR; // bassR slew
+
+    inputSampleL = trebleL + bassL; // final merge
+    inputSampleR = trebleR + bassR; // final merge
+    st->fp_flip = !st->fp_flip;
+
+    int expon;
+    frexpf(inputSampleL, &expon);
+    st->fpdL ^= st->fpdL << 13; st->fpdL ^= st->fpdL >> 17; st->fpdL ^= st->fpdL << 5;
+    inputSampleL += (((float)st->fpdL - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+    frexpf(inputSampleR, &expon);
+    st->fpdR ^= st->fpdR << 13; st->fpdR ^= st->fpdR >> 17; st->fpdR ^= st->fpdR << 5;
+    inputSampleR += (((float)st->fpdR - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+
+    *l = inputSampleL;
+    *r = inputSampleR;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -3238,6 +3372,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                 case FX_TYPE_STEREODOUBLER: run_fx_stereodoubler(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_TAPEDELAY2: run_fx_tapedelay2(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_POINTYGUITAR: run_fx_pointyguitar(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_GUITARCONDITIONER: run_fx_guitarconditioner(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through
