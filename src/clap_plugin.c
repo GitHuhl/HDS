@@ -165,7 +165,7 @@ static const clap_plugin_note_ports_t k_note_ports_ext = {
 //   HDS1                                 -- version line, first
 //   K <address> <float>                  -- one per concrete OSC_KIND_FLOAT address
 //   T <address> <string>                 -- one per concrete OSC_KIND_STRING address
-//   Z <zone_id> <17 ints/floats> <path>  -- one per loaded Sample Bank zone, ZoneRecordWire's
+//   Z <zone_id> <18 ints/floats> <path>  -- one per loaded Sample Bank zone, ZoneRecordWire's
 //                                           own field order (see apply_zone_upsert)
 // ---------------------------------------------------------------------------------------------
 
@@ -230,12 +230,12 @@ static bool clap_state_save(const clap_plugin_t *plugin, const clap_ostream_t *s
         float loop_start_frac = (slot->total_frames > 1) ? (float)slot->loop_start / (float)(slot->total_frames - 1) : 0.0f;
         float loop_end_frac   = (slot->total_frames > 1) ? (float)slot->loop_end   / (float)(slot->total_frames - 1) : 0.0f;
         float end_frac = (slot->total_frames > 0) ? (float)slot->playback_end_frame / (float)slot->total_frames : 1.0f;
-        state_buf_appendf(&b, "Z %d %d %d %d %d %d %d %.9g %.9g %d %d %.9g %.9g %.9g %.9g %d %d %.9g %s\n",
+        state_buf_appendf(&b, "Z %d %d %d %d %d %d %d %.9g %.9g %d %d %.9g %.9g %.9g %.9g %d %d %.9g %d %s\n",
             slot->zone_id, slot->root_note, slot->min_note, slot->max_note, slot->min_velocity, slot->max_velocity,
             slot->unpitched ? 1 : 0, (double)loop_start_frac, (double)loop_end_frac, slot->loop_enabled ? 1 : 0,
             slot->round_robin_group, (double)slot->tune_cents, (double)slot->gain_db, (double)slot->pan,
             (double)slot->start_offset_frac, slot->reverse ? 1 : 0, slot->loop_release_exit ? 1 : 0, (double)end_frac,
-            slot->file_path);
+            slot->assigned_osc, slot->file_path);
     }
 
     bool ok = true;
@@ -305,13 +305,15 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
             ZoneRecordWire rec;
             int unpitched_i, loop_enabled_i, reverse_i, loop_release_exit_i;
             int root_note, min_note, max_note, min_velocity, max_velocity, round_robin_group;
+            int assigned_osc;
             double loop_start, loop_end, tune_cents, gain_db, pan, start_offset_frac, end_frac;
             char path[SAMPLE_PATH_LEN];
-            int n = sscanf(cursor + 2, "%d %d %d %d %d %d %d %lf %lf %d %d %lf %lf %lf %lf %d %d %lf %[^\n]",
+            int n = sscanf(cursor + 2, "%d %d %d %d %d %d %d %lf %lf %d %d %lf %lf %lf %lf %d %d %lf %d %[^\n]",
                 &rec.zone_id, &root_note, &min_note, &max_note, &min_velocity, &max_velocity,
                 &unpitched_i, &loop_start, &loop_end, &loop_enabled_i, &round_robin_group,
-                &tune_cents, &gain_db, &pan, &start_offset_frac, &reverse_i, &loop_release_exit_i, &end_frac, path);
-            if (n == 19) {
+                &tune_cents, &gain_db, &pan, &start_offset_frac, &reverse_i, &loop_release_exit_i, &end_frac,
+                &assigned_osc, path);
+            if (n == 20) {
                 rec.root_note = (float)root_note; rec.min_note = (float)min_note; rec.max_note = (float)max_note;
                 rec.min_velocity = (float)min_velocity; rec.max_velocity = (float)max_velocity;
                 rec.unpitched = unpitched_i ? 1.0f : 0.0f;
@@ -323,6 +325,7 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
                 rec.reverse = reverse_i ? 1.0f : 0.0f;
                 rec.loop_release_exit = loop_release_exit_i ? 1.0f : 0.0f;
                 rec.end_frac = (float)end_frac;
+                rec.assigned_osc = (float)assigned_osc;
                 snprintf(rec.path, sizeof(rec.path), "%s", path);
                 apply_zone_upsert(&p->sample_engine, &rec); // brand-new zone -> queued via enqueue_pending_sample_load, picked up by this instance's own drain_pending_sample_loads() poll in process()
                 applied_zones++;
@@ -411,8 +414,9 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         }
     }
     if (p->osc_server) {
-        lo_server_add_method(p->osc_server, "/hds/zone/upsert", "ifffffffffffffffffs", zone_upsert_handler, &p->sample_engine);
+        lo_server_add_method(p->osc_server, "/hds/zone/upsert", "i" "ffffffffffffffffff" "s", zone_upsert_handler, &p->sample_engine);
         lo_server_add_method(p->osc_server, "/hds/zone/remove", "i", zone_remove_handler, &p->sample_engine);
+        lo_server_add_method(p->osc_server, "/hds/zone/load_sfz", "is", zone_load_sfz_handler, &p->sample_engine);
         lo_server_add_method(p->osc_server, NULL, NULL, generic_osc_handler, &p->knobs);
         char reply_port_str[16]; snprintf(reply_port_str, sizeof(reply_port_str), "%d", p->osc_reply_port);
         p->osc_reply_addr = lo_address_new(CLAP_OSC_REPLY_HOST, reply_port_str);

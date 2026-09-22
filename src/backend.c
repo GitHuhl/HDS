@@ -22,6 +22,10 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
+#include <dirent.h> // native SFZ parser's case-insensitive sample-path fallback (sfz_resolve_sample_path)
+#include <limits.h> // PATH_MAX, for the same parser's #include cycle-guard/path buffers
+#include <ctype.h>  // isalpha/isalnum/isspace, for the same parser's hand-written tokenizer
+#include <strings.h> // strcasecmp -- SFZ opcode names are conventionally lowercase, matched case-insensitively here for robustness
 // WavPack recording is disabled for now (commented out via this single guard, not deleted --
 // flip to 1, re-add -lwavpack to the Makefile's LDLIBS, and re-enable the frontend.py format
 // radio button to bring it back). See WavPackRecorder further down for the real implementation
@@ -4394,8 +4398,16 @@ typedef struct {
     int min_velocity, max_velocity;
     bool unpitched; // playback rate forced to 1.0 regardless of note -- see render_sample_osc
     int round_robin_group; // 0 = independent zone; >0 = cycles with every other loaded, currently
-                            // zone-matching slot sharing this same group id -- see
+                            // zone-matching slot sharing this same group id (scoped per-oscillator
+                            // -- see round_robin_hit_count's own comment) -- see
                             // find_matching_sample_slot()/g_round_robin_hit_count[].
+    int assigned_osc; // 0-3 (vco1..vco4) -- which oscillator this zone belongs to. Set once at
+                       // creation (a frontend upsert, a CLI --sfz-vcoN flag, or an
+                       // /hds/zone/load_sfz message) and never changed by an in-place
+                       // metadata-only upsert (same posture as zone_id, just below). See
+                       // find_matching_sample_slot()'s oscillator filter -- every WAVE_SAMPLE
+                       // oscillator used to share one unpartitioned note/velocity-keyed catalog;
+                       // this is what actually splits it into 4 independent ones.
     int zone_id;  // stable identity assigned by the frontend, used to reconcile ZONE_OP_UPSERT/
                   // ZONE_OP_REMOVE messages against this array -- see the OSC zone handlers.
     bool active;  // false = a tombstoned (removed) array position, permanently skipped; distinct
@@ -4620,6 +4632,470 @@ static bool load_sample_slot(HdsSampleEngine *se, int index, const char *path, i
     slot->active = true;
     fprintf(stderr, "[sample] loaded slot %d: '%s' (%u frames, root note %d)\n", index, path, total_frames, root_note);
     return true;
+}
+
+// Header-only counterpart to load_sample_slot()'s own RIFF chunk walk (same chunk-skip shape,
+// stopping right after reading data_size, with none of the pre-roll PCM decode that follows) --
+// the C-side SFZ parser's own equivalent of frontend.py's _wav_total_frames, needed to convert
+// loop_start=/loop_end=/offset=/end= (given in the SFZ file as absolute sample frames) into the
+// 0-1 fractions ZoneRecordWire actually carries. Deliberately a small, independent duplicate of
+// load_sample_slot()'s chunk-walk rather than a shared sub-helper both call -- load_sample_slot()
+// is a heavily-exercised, already-correct hot path; this keeps that function untouched.
+static bool read_wav_frame_count(const char *path, unsigned int *out_total_frames) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char chunk_id[4];
+    fseek(f, 12, SEEK_SET);
+    SAMPLE_CHECK_READ(chunk_id, 1, 4, f);
+    while (strncmp(chunk_id, "fmt ", 4) != 0) {
+        unsigned int chunk_size;
+        SAMPLE_CHECK_READ(&chunk_size, 4, 1, f);
+        fseek(f, chunk_size, SEEK_CUR);
+        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return false; }
+    }
+    unsigned int subchunk1_size; unsigned short audio_format, num_channels;
+    unsigned int sample_rate, byte_rate; unsigned short block_align, bits_per_sample;
+    SAMPLE_CHECK_READ(&subchunk1_size, 4, 1, f);
+    SAMPLE_CHECK_READ(&audio_format, 2, 1, f);
+    SAMPLE_CHECK_READ(&num_channels, 2, 1, f);
+    SAMPLE_CHECK_READ(&sample_rate, 4, 1, f);
+    SAMPLE_CHECK_READ(&byte_rate, 4, 1, f);
+    SAMPLE_CHECK_READ(&block_align, 2, 1, f);
+    SAMPLE_CHECK_READ(&bits_per_sample, 2, 1, f);
+    (void)audio_format; (void)sample_rate; (void)byte_rate; (void)block_align;
+    if (subchunk1_size > 16) fseek(f, subchunk1_size - 16, SEEK_CUR);
+    SAMPLE_CHECK_READ(chunk_id, 1, 4, f);
+    while (strncmp(chunk_id, "data", 4) != 0) {
+        unsigned int chunk_size;
+        SAMPLE_CHECK_READ(&chunk_size, 4, 1, f);
+        fseek(f, chunk_size, SEEK_CUR);
+        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return false; }
+    }
+    unsigned int data_size;
+    SAMPLE_CHECK_READ(&data_size, 4, 1, f);
+    fclose(f);
+    int bytes_per_sample = bits_per_sample / 8;
+    if (num_channels == 0 || bytes_per_sample == 0) return false;
+    *out_total_frames = data_size / (unsigned int)(num_channels * bytes_per_sample);
+    return true;
+}
+
+// ============================================================================
+// Native SFZ file parser -- lets the backend load a multisample instrument directly from a local
+// .sfz file, without any frontend ever having been connected (see the CLI --sfz-vcoN flags and
+// the /hds/zone/load_sfz OSC method, both further down, which are the two things that actually
+// call sfz_parse_file()/hds_load_sfz_for_osc()). Mirrors frontend.py's own _parse_sfz()/
+// _build_zones_from_sfz() opcode table and inheritance rules exactly (see each function's own
+// comment for the specific correspondence) so the two loading paths -- a frontend's rich,
+// warning-reporting Python import, and this backend-native path -- produce equivalent zones.
+// #define/$variable macros are NOT supported here either, matching the Python parser's own
+// documented limitation: a region using one is skipped (its sample= fails to resolve), never
+// crashed on or silently mis-mapped.
+// ============================================================================
+
+// One <region>'s recognized opcodes, built the same way the Python importer's per-region dict is
+// (SFZ inheritance: a region starts as a copy of its enclosing <group>/<global> and each opcode
+// line overwrites its own field, last-value-wins). A bounded struct-of-optional-fields instead of
+// a generic string map, since HDS's supported opcode set is fixed and small. Text-valued fields
+// are used wherever the raw string needs deferred numeric interpretation (lokey/hikey/
+// pitch_keycenter as note-name-or-int; loop_start/loop_end/offset/end as frame counts, which need
+// total_frames -- only known once sample= resolves -- before they can become a 0-1 fraction).
+#define SFZ_TEXT_FIELD_LEN 32
+typedef struct {
+    bool has_sample;              char sample[SAMPLE_PATH_LEN];
+    bool has_key;                  char key[SFZ_TEXT_FIELD_LEN];
+    bool has_lokey;                char lokey[SFZ_TEXT_FIELD_LEN];
+    bool has_hikey;                char hikey[SFZ_TEXT_FIELD_LEN];
+    bool has_pitch_keycenter;      char pitch_keycenter[SFZ_TEXT_FIELD_LEN];
+    bool has_pitch_keytrack;       float pitch_keytrack;
+    bool has_lovel;                int lovel;
+    bool has_hivel;                int hivel;
+    bool has_loop_mode;            char loop_mode[24];
+    bool has_loop_start;           char loop_start[SFZ_TEXT_FIELD_LEN];
+    bool has_loop_end;             char loop_end[SFZ_TEXT_FIELD_LEN];
+    bool has_offset;               char offset[SFZ_TEXT_FIELD_LEN];
+    bool has_end;                  char end[SFZ_TEXT_FIELD_LEN];
+    bool has_tune;                 float tune;
+    bool has_pitch;                float pitch;
+    bool has_volume;               float volume;
+    bool has_pan;                  float pan;
+    bool has_direction;            char direction[16];
+    bool has_group;                char group[SFZ_TEXT_FIELD_LEN];
+    bool has_seq_length;           // presence only, matches "group= AND seq_length=" round-robin gate
+} SfzRegion;
+
+#define SFZ_MAX_REGIONS_PER_FILE 65536
+// File-scope static scratch buffer (used by hds_load_sfz_for_osc(), further down, as the
+// out_regions argument to sfz_parse_file()) rather than a stack array or per-call malloc -- reused
+// across calls, not reentrant/thread-safe, which is correct because every caller (the CLI
+// --sfz-vcoN flags at startup, and /hds/zone/load_sfz's handler) runs on the same single thread
+// that already owns g_sample_slot_state/g_pending_load_state (main()'s own OSC-poll/audio
+// thread) -- same "audio-thread-only, no cross-thread sync needed" posture those already have.
+static SfzRegion g_sfz_parse_scratch[SFZ_MAX_REGIONS_PER_FILE];
+
+// Mirrors _sfz_note_to_number(): bare MIDI int, or a note name like "C4"/"F#3"/"Ab-1" (C4=60,
+// 's' accepted as an alternate sharp spelling same as the Python side). Returns -1 (the C
+// equivalent of Python's None here) on unparseable/out-of-range input.
+static int sfz_note_to_number(const char *value) {
+    if (!value || !*value) return -1;
+    // Bare integer (allowing a leading '-' for the theoretical negative case, though notes are
+    // always 0-127 in practice).
+    char *endptr = NULL;
+    long as_int = strtol(value, &endptr, 10);
+    if (endptr && *endptr == '\0' && endptr != value) {
+        if (as_int < 0 || as_int > 127) return -1;
+        return (int)as_int;
+    }
+    // Note name: letter (a-g/A-G), optional accidental (#, s, S, b, B), signed octave integer.
+    const char *p = value;
+    if (!isalpha((unsigned char)*p)) return -1;
+    char letter = (char)tolower((unsigned char)*p); p++;
+    static const int PITCH_CLASS[7] = {9, 11, 0, 2, 4, 5, 7}; // a,b,c,d,e,f,g
+    if (letter < 'a' || letter > 'g') return -1;
+    int pitch_class = PITCH_CLASS[letter - 'a'];
+    if (*p == '#' || *p == 's' || *p == 'S') { pitch_class += 1; p++; }
+    else if (*p == 'b' || *p == 'B') { pitch_class -= 1; p++; }
+    if (!*p) return -1;
+    endptr = NULL;
+    long octave = strtol(p, &endptr, 10);
+    if (!endptr || *endptr != '\0' || endptr == p) return -1;
+    long note = (octave + 1) * 12 + pitch_class;
+    if (note < 0 || note > 127) return -1;
+    return (int)note;
+}
+
+// Mirrors _sfz_frame_to_frac(): an absolute frame-count string + total_frames -> a 0-1 fraction.
+// Returns false (out_frac left untouched) if frame_str isn't a valid number.
+static bool sfz_frame_to_frac(const char *frame_str, unsigned int total_frames, float *out_frac) {
+    if (!frame_str || !*frame_str || total_frames <= 1) return false;
+    char *endptr = NULL;
+    double frame = strtod(frame_str, &endptr);
+    if (!endptr || endptr == frame_str) return false;
+    double frac = frame / (double)(total_frames - 1);
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+    *out_frac = (float)frac;
+    return true;
+}
+
+// Mirrors _resolve_sfz_sample_path(): backslashes normalized to '/' first (Windows-authored
+// libraries), then tried in order: (1) as-is if absolute and it exists; (2) joined with
+// default_path (the <control> header's own default_path=, itself already resolved against
+// sfz_dir by the caller); (3) joined with sfz_dir; (4) a case-insensitive filename match via
+// opendir()/readdir() within whichever of (2)/(3) resolved to a real, existing directory.
+// Bounded "dir/name" join with an explicit precision on each "%s", for the same
+// -Wformat-truncation reason sfz_set_text_field exists -- dir can come from a PATH_MAX-sized
+// directory buffer several frames up (sfz_parse_file_recursive's sfz_dir), but the destination is
+// the SAMPLE_PATH_LEN(256) bound every actual sample path in this file already lives within; a
+// join that would overflow simply truncates, and the resulting fopen() attempt then just fails
+// like any other unresolvable candidate path (skip, don't crash).
+static void sfz_join_path(char *dst, size_t dst_len, const char *dir, const char *name) {
+    int half = (int)(dst_len / 2) - 1;
+    if (half < 1) half = 1;
+    snprintf(dst, dst_len, "%.*s/%.*s", half, dir, half, name);
+}
+
+static bool sfz_resolve_sample_path(const char *sample_value, const char *sfz_dir, const char *default_path, char *out_resolved, size_t out_len) {
+    char normalized[SAMPLE_PATH_LEN];
+    snprintf(normalized, sizeof(normalized), "%s", sample_value);
+    for (char *c = normalized; *c; c++) if (*c == '\\') *c = '/';
+
+    if (normalized[0] == '/') {
+        FILE *f = fopen(normalized, "rb");
+        if (f) { fclose(f); snprintf(out_resolved, out_len, "%s", normalized); return true; }
+    }
+
+    const char *candidate_dirs[2]; int candidate_dir_count = 0;
+    if (default_path && default_path[0]) candidate_dirs[candidate_dir_count++] = default_path;
+    candidate_dirs[candidate_dir_count++] = sfz_dir;
+
+    for (int d = 0; d < candidate_dir_count; d++) {
+        char joined[SAMPLE_PATH_LEN];
+        sfz_join_path(joined, sizeof(joined), candidate_dirs[d], normalized);
+        FILE *f = fopen(joined, "rb");
+        if (f) { fclose(f); snprintf(out_resolved, out_len, "%s", joined); return true; }
+    }
+
+    // Case-insensitive filename fallback: only the basename needs matching (a sample= value with
+    // its own subdirectory prefix that merely differs in case is rare enough not to be worth
+    // walking -- same practical scope the Python importer's own fallback covers).
+    const char *base = strrchr(normalized, '/');
+    base = base ? base + 1 : normalized;
+    for (int d = 0; d < candidate_dir_count; d++) {
+        DIR *dir = opendir(candidate_dirs[d]);
+        if (!dir) continue;
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcasecmp(entry->d_name, base) == 0) {
+                char joined[SAMPLE_PATH_LEN];
+                sfz_join_path(joined, sizeof(joined), candidate_dirs[d], entry->d_name);
+                FILE *f = fopen(joined, "rb");
+                if (f) { fclose(f); closedir(dir); snprintf(out_resolved, out_len, "%s", joined); return true; }
+            }
+        }
+        closedir(dir);
+    }
+    return false;
+}
+
+// Finds the next SFZ token (a "<name>" header or a "name=" opcode key) at or after `pos`, mirroring
+// _SFZ_TOKEN_RE's own "<(\w+)>|([a-zA-Z_][a-zA-Z0-9_]*)=" alternation -- a header always starts
+// with a literal '<', an opcode key always starts with a letter/underscore, so there's no ambiguity
+// in which pattern to try at a given scan position. Returns the token's own start position (its
+// end position is written to *out_token_end), or SFZ_TOKEN_NOT_FOUND if nothing matched before len.
+#define SFZ_TOKEN_NOT_FOUND (-1)
+static long sfz_find_next_token(const char *text, size_t pos, size_t len, size_t *out_token_end, bool *out_is_header, char *out_name, size_t out_name_cap) {
+    for (size_t i = pos; i < len; i++) {
+        if (text[i] == '<') {
+            size_t j = i + 1, n = 0;
+            while (j < len && (isalnum((unsigned char)text[j]) || text[j] == '_')) { if (n + 1 < out_name_cap) out_name[n++] = text[j]; j++; }
+            if (n > 0 && j < len && text[j] == '>') {
+                out_name[n] = '\0';
+                *out_is_header = true;
+                *out_token_end = j + 1;
+                return (long)i;
+            }
+            continue;
+        }
+        if (isalpha((unsigned char)text[i]) || text[i] == '_') {
+            size_t j = i, n = 0;
+            while (j < len && (isalnum((unsigned char)text[j]) || text[j] == '_')) { if (n + 1 < out_name_cap) out_name[n++] = text[j]; j++; }
+            if (n > 0 && j < len && text[j] == '=') {
+                out_name[n] = '\0';
+                *out_is_header = false;
+                *out_token_end = j + 1;
+                return (long)i;
+            }
+            // Not immediately followed by '=' -- not an opcode token; resume scanning right after
+            // this identifier run (not i+1) to avoid re-testing every character inside it.
+            i = j - 1;
+            continue;
+        }
+    }
+    return SFZ_TOKEN_NOT_FOUND;
+}
+
+// Bounded copy into a fixed-size SfzRegion text field, with an explicit precision on the "%s" so
+// -Wformat-truncation can prove the write can never overflow regardless of value's actual length
+// -- value always comes from a much larger scratch buffer (see sfz_tokenize_and_apply's own
+// value[SAMPLE_PATH_LEN]), which is what triggers the warning on a plain "%s" here. Truncation
+// itself is harmless for every field this is used on (note names/loop-mode keywords/group ids are
+// always short in real SFZ files).
+static void sfz_set_text_field(char *dst, size_t dst_len, const char *value) {
+    snprintf(dst, dst_len, "%.*s", (int)(dst_len - 1), value);
+}
+
+// Applies one opcode (already-trimmed key/value strings) onto a region-shaped accumulator --
+// shared by every header level (<global>/<group>/<region>/<control>/anything-else-thrown-away).
+static void sfz_apply_opcode(SfzRegion *r, const char *key, const char *value) {
+    if (strcasecmp(key, "sample") == 0) { r->has_sample = true; sfz_set_text_field(r->sample, sizeof(r->sample), value); }
+    else if (strcasecmp(key, "key") == 0) { r->has_key = true; sfz_set_text_field(r->key, sizeof(r->key), value); }
+    else if (strcasecmp(key, "lokey") == 0) { r->has_lokey = true; sfz_set_text_field(r->lokey, sizeof(r->lokey), value); }
+    else if (strcasecmp(key, "hikey") == 0) { r->has_hikey = true; sfz_set_text_field(r->hikey, sizeof(r->hikey), value); }
+    else if (strcasecmp(key, "pitch_keycenter") == 0) { r->has_pitch_keycenter = true; sfz_set_text_field(r->pitch_keycenter, sizeof(r->pitch_keycenter), value); }
+    else if (strcasecmp(key, "pitch_keytrack") == 0) { r->has_pitch_keytrack = true; r->pitch_keytrack = (float)atof(value); }
+    else if (strcasecmp(key, "lovel") == 0) { r->has_lovel = true; r->lovel = atoi(value); }
+    else if (strcasecmp(key, "hivel") == 0) { r->has_hivel = true; r->hivel = atoi(value); }
+    else if (strcasecmp(key, "loop_mode") == 0) { r->has_loop_mode = true; sfz_set_text_field(r->loop_mode, sizeof(r->loop_mode), value); }
+    else if (strcasecmp(key, "loop_start") == 0) { r->has_loop_start = true; sfz_set_text_field(r->loop_start, sizeof(r->loop_start), value); }
+    else if (strcasecmp(key, "loop_end") == 0) { r->has_loop_end = true; sfz_set_text_field(r->loop_end, sizeof(r->loop_end), value); }
+    else if (strcasecmp(key, "offset") == 0) { r->has_offset = true; sfz_set_text_field(r->offset, sizeof(r->offset), value); }
+    else if (strcasecmp(key, "end") == 0) { r->has_end = true; sfz_set_text_field(r->end, sizeof(r->end), value); }
+    else if (strcasecmp(key, "tune") == 0 || strcasecmp(key, "pitch") == 0) {
+        // "pitch=" is the fallback spelling for "tune=" -- both write the same field (matches
+        // _build_zones_from_sfz's own "tune= (fallback pitch=)" note).
+        r->has_tune = true; r->tune = (float)atof(value);
+    }
+    else if (strcasecmp(key, "volume") == 0) { r->has_volume = true; r->volume = (float)atof(value); }
+    else if (strcasecmp(key, "pan") == 0) { r->has_pan = true; r->pan = (float)atof(value); }
+    else if (strcasecmp(key, "direction") == 0) { r->has_direction = true; sfz_set_text_field(r->direction, sizeof(r->direction), value); }
+    else if (strcasecmp(key, "group") == 0) { r->has_group = true; sfz_set_text_field(r->group, sizeof(r->group), value); }
+    else if (strcasecmp(key, "seq_length") == 0) { r->has_seq_length = true; }
+    // Any other opcode (ADSR, filter, curve, etc.) is silently ignored -- out of scope for HDS's
+    // own zone model, same posture _build_zones_from_sfz's own opcode table already has.
+}
+
+// Tokenizes one already-comment-stripped, #include-blanked text buffer into <global>/<group>/
+// <master>/<region>/<control> opcode sets, applying inheritance exactly like _parse_sfz's own
+// current_dict swap: <global> resets the global accumulator; <group>/<master> both copy from the
+// current global accumulator into a fresh group accumulator; <region> copies from the current
+// group accumulator into a fresh region, appended to out_regions once the NEXT header (or EOF) is
+// reached; <control> opcodes go into a separate accumulator (only default_path= is used, resolved
+// against base_dir); any other header (<curve>, <effect>, ...) tokenizes into a throwaway
+// accumulator and is otherwise ignored.
+static void sfz_tokenize_and_apply(const char *text, const char *base_dir, SfzRegion *out_regions, int max_regions, int *io_region_count, char *out_default_path, size_t out_default_path_len) {
+    size_t len = strlen(text);
+    SfzRegion global_opcodes; memset(&global_opcodes, 0, sizeof(global_opcodes));
+    SfzRegion group_opcodes; memset(&group_opcodes, 0, sizeof(group_opcodes));
+    SfzRegion control_opcodes; memset(&control_opcodes, 0, sizeof(control_opcodes));
+    SfzRegion throwaway; memset(&throwaway, 0, sizeof(throwaway));
+    SfzRegion current_region; memset(&current_region, 0, sizeof(current_region));
+    bool region_open = false;
+    SfzRegion *active = &throwaway; // where opcodes seen before ANY header go -- discarded, matches SFZ having no meaning for stray top-level opcodes
+
+    size_t pos = 0;
+    for (;;) {
+        size_t token_end; bool is_header; char name[64];
+        long token_start = sfz_find_next_token(text, pos, len, &token_end, &is_header, name, sizeof(name));
+
+        if (is_header || token_start == SFZ_TOKEN_NOT_FOUND) {
+            // Close out whatever region was open before switching context (a new header, or EOF).
+            if (region_open && *io_region_count < max_regions) {
+                out_regions[(*io_region_count)++] = current_region;
+                region_open = false;
+            }
+        }
+        if (token_start == SFZ_TOKEN_NOT_FOUND) break;
+
+        if (is_header) {
+            if (strcasecmp(name, "global") == 0) {
+                memset(&global_opcodes, 0, sizeof(global_opcodes));
+                active = &global_opcodes;
+            } else if (strcasecmp(name, "group") == 0 || strcasecmp(name, "master") == 0) {
+                group_opcodes = global_opcodes;
+                active = &group_opcodes;
+            } else if (strcasecmp(name, "region") == 0) {
+                current_region = group_opcodes;
+                region_open = true;
+                active = &current_region;
+            } else if (strcasecmp(name, "control") == 0) {
+                memset(&control_opcodes, 0, sizeof(control_opcodes));
+                active = &control_opcodes;
+            } else {
+                memset(&throwaway, 0, sizeof(throwaway));
+                active = &throwaway;
+            }
+            pos = token_end;
+            continue;
+        }
+
+        // Opcode token: name[0..) is the key, token_end is right after '='. The value runs until
+        // the NEXT token's own start (or EOF), trimmed of surrounding whitespace.
+        size_t value_start = token_end;
+        size_t next_end; bool next_is_header; char next_name[64];
+        long next_start = sfz_find_next_token(text, token_end, len, &next_end, &next_is_header, next_name, sizeof(next_name));
+        size_t value_end = (next_start == SFZ_TOKEN_NOT_FOUND) ? len : (size_t)next_start;
+        while (value_start < value_end && isspace((unsigned char)text[value_start])) value_start++;
+        size_t trimmed_end = value_end;
+        while (trimmed_end > value_start && isspace((unsigned char)text[trimmed_end - 1])) trimmed_end--;
+        char value[SAMPLE_PATH_LEN];
+        size_t vlen = trimmed_end - value_start; if (vlen >= sizeof(value)) vlen = sizeof(value) - 1;
+        memcpy(value, text + value_start, vlen); value[vlen] = '\0';
+
+        if (active == &control_opcodes) {
+            if (strcasecmp(name, "default_path") == 0) {
+                char normalized[SAMPLE_PATH_LEN]; snprintf(normalized, sizeof(normalized), "%s", value);
+                for (char *c = normalized; *c; c++) if (*c == '\\') *c = '/';
+                if (normalized[0] == '/') snprintf(out_default_path, out_default_path_len, "%s", normalized);
+                else sfz_join_path(out_default_path, out_default_path_len, base_dir, normalized);
+            }
+        } else {
+            sfz_apply_opcode(active, name, value);
+            if (strcasecmp(name, "sample") == 0) {
+                // Resolved EAGERLY, right here, using THIS file's own base_dir/default_path --
+                // not deferred to the caller -- because a region's sample= is usually set at
+                // <group>/<global> level and inherited by many regions via the struct-copy
+                // above; resolving once here (and inheriting the already-resolved absolute path)
+                // is both correct for multi-file libraries (each #include'd file's own regions
+                // resolve against ITS OWN directory, not the top-level file's) and cheaper than
+                // re-resolving per region. Left as the raw, unresolved value if resolution fails
+                // -- that zone's own load simply fails later (logged, slot deactivated), the same
+                // "skip, don't crash" outcome the Python importer's own warning-and-skip gives.
+                char resolved[SAMPLE_PATH_LEN];
+                if (sfz_resolve_sample_path(value, base_dir, out_default_path[0] ? out_default_path : NULL, resolved, sizeof(resolved))) {
+                    snprintf(active->sample, sizeof(active->sample), "%s", resolved);
+                }
+            }
+        }
+        pos = token_end; // resume scanning right after '=' -- the value text itself is skipped
+                          // over naturally since the next token search always starts past it
+    }
+}
+
+// Reads `path`, strips "//" comments and blanks "#include \"...\"" lines (mirrors _parse_sfz's
+// own two-pass shape: strip/tokenize first, separately re-scan the raw text for #include lines
+// and recurse into each). Cycle guard: `visited_realpaths` is a caller-owned array of
+// realpath()-resolved strings; this file is skipped (no new regions) if already present, mirroring
+// _parse_sfz's own `_visited` set exactly. `io_region_count` is threaded through every recursive
+// call (not a global) so regions from every #include'd file land in the SAME out_regions array,
+// continuing to append rather than each recursion starting its own separate count.
+static void sfz_parse_file_recursive(const char *path, SfzRegion *out_regions, int max_regions, int *io_region_count, char *out_default_path, size_t out_default_path_len, char (*visited_realpaths)[PATH_MAX], int *visited_count, int max_visited) {
+    char resolved[PATH_MAX];
+    if (!realpath(path, resolved)) { fprintf(stderr, "[sfz] failed to resolve '%s'\n", path); return; }
+    for (int i = 0; i < *visited_count; i++) if (strcmp(visited_realpaths[i], resolved) == 0) return; // cycle
+    if (*visited_count >= max_visited) return;
+    strcpy(visited_realpaths[*visited_count], resolved);
+    (*visited_count)++;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[sfz] failed to open '%s': %s\n", path, strerror(errno)); return; }
+    fseek(f, 0, SEEK_END); long fsize = ftell(f); fseek(f, 0, SEEK_SET);
+    if (fsize < 0) { fclose(f); return; }
+    char *buf = (char *)malloc((size_t)fsize + 1);
+    if (!buf) { fclose(f); return; }
+    size_t read_n = fread(buf, 1, (size_t)fsize, f);
+    fclose(f);
+    buf[read_n] = '\0';
+
+    char sfz_dir[PATH_MAX];
+    snprintf(sfz_dir, sizeof(sfz_dir), "%s", resolved);
+    char *last_slash = strrchr(sfz_dir, '/');
+    if (last_slash) *last_slash = '\0'; else snprintf(sfz_dir, sizeof(sfz_dir), ".");
+
+    // Strip "//" comments (blank to end of line) and collect+blank "#include \"...\"" lines, in
+    // one forward pass over the mutable buffer.
+    #define SFZ_MAX_INCLUDES_PER_FILE 64
+    char include_paths[SFZ_MAX_INCLUDES_PER_FILE][SAMPLE_PATH_LEN];
+    int include_count = 0;
+    for (size_t i = 0; i < read_n; i++) {
+        if (buf[i] == '/' && i + 1 < read_n && buf[i + 1] == '/') {
+            while (i < read_n && buf[i] != '\n') buf[i++] = ' ';
+        } else if (buf[i] == '#' && strncmp(buf + i, "#include", 8) == 0) {
+            size_t j = i + 8;
+            while (j < read_n && isspace((unsigned char)buf[j])) j++;
+            if (j < read_n && buf[j] == '"') {
+                size_t start = j + 1, k = start;
+                while (k < read_n && buf[k] != '"' && buf[k] != '\n') k++;
+                if (k < read_n && buf[k] == '"' && include_count < SFZ_MAX_INCLUDES_PER_FILE) {
+                    size_t plen = k - start; if (plen >= SAMPLE_PATH_LEN) plen = SAMPLE_PATH_LEN - 1;
+                    memcpy(include_paths[include_count], buf + start, plen);
+                    include_paths[include_count][plen] = '\0';
+                    include_count++;
+                    for (size_t z = i; z <= k && z < read_n; z++) buf[z] = ' '; // blank the whole directive
+                    i = k;
+                }
+            }
+        }
+    }
+
+    sfz_tokenize_and_apply(buf, sfz_dir, out_regions, max_regions, io_region_count, out_default_path, out_default_path_len);
+    free(buf);
+
+    for (int inc = 0; inc < include_count; inc++) {
+        char inc_path[SAMPLE_PATH_LEN];
+        if (include_paths[inc][0] == '/') sfz_set_text_field(inc_path, sizeof(inc_path), include_paths[inc]);
+        else sfz_join_path(inc_path, sizeof(inc_path), sfz_dir, include_paths[inc]);
+        char inc_default_path[SAMPLE_PATH_LEN]; inc_default_path[0] = '\0';
+        sfz_parse_file_recursive(inc_path, out_regions, max_regions, io_region_count, inc_default_path, sizeof(inc_default_path), visited_realpaths, visited_count, max_visited);
+        // A sub-file's own default_path= (if any) only applies to ITS OWN regions -- already
+        // baked into them via the recursive call above, which passes sfz_dir derived from
+        // inc_path's own directory. The outer file's out_default_path is left as whatever the
+        // outer file's own <control> block set (or empty), matching real SFZ scoping.
+    }
+}
+
+// Public entry point: owns/frees the visited-path cycle-guard list itself. Returns the number of
+// regions parsed into out_regions (0 on total failure, e.g. the file doesn't open).
+static int sfz_parse_file(const char *path, SfzRegion *out_regions, int max_regions, char *out_default_path, size_t out_default_path_len) {
+    out_default_path[0] = '\0';
+    int region_count = 0;
+    #define SFZ_MAX_VISITED_FILES 256
+    char (*visited)[PATH_MAX] = (char (*)[PATH_MAX])malloc((size_t)SFZ_MAX_VISITED_FILES * PATH_MAX);
+    if (!visited) return 0;
+    int visited_count = 0;
+    sfz_parse_file_recursive(path, out_regions, max_regions, &region_count, out_default_path, out_default_path_len, visited, &visited_count, SFZ_MAX_VISITED_FILES);
+    free(visited);
+    return region_count;
 }
 
 // A fixed pool of "currently streaming from disk" slots (see MAX_SAMPLE_STREAMS's comment on
@@ -5304,7 +5780,7 @@ static void *sample_disk_thread_main(void *arg) {
 // header, size a body buffer from its claimed count, accumulate the body) needed to. That whole
 // framing layer is gone: liblo already delivers each UDP datagram as one complete, self-contained
 // message, so there is no partial-message state to track between polls.
-//   "/hds/zone/upsert" (types "ifffffffffffffffffs") -- add-or-update one zone by zone_id (on
+//   "/hds/zone/upsert" (types "i" + "f"*18 + "s") -- add-or-update one zone by zone_id (on
 //     fresh connect the frontend sends one upsert per zone in its current list, since this
 //     side's catalog starts empty).
 //   "/hds/zone/remove" (types "i") -- delete one zone by zone_id.
@@ -5323,6 +5799,9 @@ typedef struct {
     // Full SFZ loop_sustain/end= support (appended, 2 more floats -- 17 total): see
     // SampleSlot.loop_release_exit/playback_end_frame's own comment.
     float loop_release_exit, end_frac;
+    // Which oscillator (0-3) this zone belongs to -- appended (18th float), never renumbering the
+    // 17 above, matching this file's own established convention. See SampleSlot.assigned_osc.
+    float assigned_osc;
     char path[SAMPLE_PATH_LEN];
 } ZoneRecordWire;
 
@@ -5343,6 +5822,7 @@ typedef struct {
     bool reverse;
     bool loop_release_exit;
     float end_frac;
+    int assigned_osc; // 0-3 -- see SampleSlot.assigned_osc
 } PendingSampleLoad;
 #define PENDING_SAMPLE_LOAD_CAPACITY 4096
 // How many queued sample loads (each a bounded, one-file blocking file-open+pre-roll-decode) the
@@ -5359,7 +5839,11 @@ typedef struct {
 typedef struct HdsPendingLoadState {
     PendingSampleLoad pending_loads[PENDING_SAMPLE_LOAD_CAPACITY];
     int          pending_load_head, pending_load_tail, pending_load_count;
-    unsigned int round_robin_hit_count[MAX_ROUND_ROBIN_GROUPS + 1];
+    // [assigned_osc][group_idx] -- scoped per-oscillator so two unrelated zone sets on different
+    // oscillators that happen to both use round_robin_group=1 cycle independently instead of
+    // sharing one counter. Index 0 of the inner dimension is unused (group 0 = "not grouped"),
+    // same convention as before this gained the outer oscillator dimension.
+    unsigned int round_robin_hit_count[4][MAX_ROUND_ROBIN_GROUPS + 1];
 } HdsPendingLoadState;
 static HdsPendingLoadState g_pending_load_state;
 #define g_pending_loads g_pending_load_state.pending_loads
@@ -5373,6 +5857,15 @@ static HdsPendingLoadState g_pending_load_state;
 // can take it as a parameter; the instance is only declared here, now that all three tiers'
 // globals it points at actually exist.
 static HdsSampleEngine g_sample_engine = { &g_sample_slot_state, &g_streams_state, &g_pending_load_state };
+
+// Clamps a wire-carried oscillator index (a plain float, like every other OSC-carried enum in
+// this file) into the valid 0-3 range -- shared by every site that reads ZoneRecordWire.assigned_osc.
+static inline int clamp_assigned_osc(float raw) {
+    int v = (int)raw;
+    if (v < 0) return 0;
+    if (v > 3) return 3;
+    return v;
+}
 
 static void enqueue_pending_sample_load(HdsSampleEngine *se, int slot_index, const ZoneRecordWire *rec) {
     if (se->pending->pending_load_count >= PENDING_SAMPLE_LOAD_CAPACITY) {
@@ -5395,6 +5888,7 @@ static void enqueue_pending_sample_load(HdsSampleEngine *se, int slot_index, con
     p->reverse = rec->reverse != 0.0f;
     p->loop_release_exit = rec->loop_release_exit != 0.0f;
     p->end_frac = rec->end_frac;
+    p->assigned_osc = clamp_assigned_osc(rec->assigned_osc);
     se->pending->pending_load_tail = (se->pending->pending_load_tail + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
     se->pending->pending_load_count++;
 }
@@ -5459,6 +5953,7 @@ static void drain_pending_sample_loads(HdsSampleEngine *se) {
             slot->min_velocity = p->min_velocity; slot->max_velocity = p->max_velocity;
             slot->unpitched = p->unpitched;
             slot->round_robin_group = p->round_robin_group;
+            slot->assigned_osc = p->assigned_osc;
             slot->loop_enabled = p->loop_enabled;
             apply_loop_points(slot, p->loop_start_frac, p->loop_end_frac);
             slot->tune_cents = p->tune_cents; slot->gain_db = p->gain_db; slot->pan = p->pan;
@@ -5511,6 +6006,7 @@ static void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     slot->min_velocity = (int)rec->min_velocity; slot->max_velocity = (int)rec->max_velocity;
     slot->unpitched = rec->unpitched != 0.0f;
     slot->round_robin_group = (int)rec->round_robin_group;
+    slot->assigned_osc = clamp_assigned_osc(rec->assigned_osc);
     slot->loop_enabled = rec->loop_enabled != 0.0f;
     apply_loop_points(slot, rec->loop_start, rec->loop_end);
     slot->tune_cents = rec->tune_cents; slot->gain_db = rec->gain_db; slot->pan = rec->pan;
@@ -5532,20 +6028,20 @@ static void apply_zone_remove(HdsSampleEngine *se, int32_t zone_id) {
     }
 }
 
-// "/hds/zone/upsert" i + 17 f's + s -- zone_id + 17 floats in ZoneRecordWire's own field order
+// "/hds/zone/upsert" i + 18 f's + s -- zone_id + 18 floats in ZoneRecordWire's own field order
 // (root_note, min_note, max_note, min_velocity, max_velocity, unpitched, loop_start, loop_end,
 // loop_enabled, round_robin_group, tune_cents, gain_db, pan, start_offset_frac, reverse,
-// loop_release_exit, end_frac) + path. liblo only dispatches here when the incoming type string
-// matches exactly, so argc/types are already guaranteed correct -- no manual validation needed,
-// unlike generic_osc_handler's table.
+// loop_release_exit, end_frac, assigned_osc) + path. liblo only dispatches here when the incoming
+// type string matches exactly, so argc/types are already guaranteed correct -- no manual
+// validation needed, unlike generic_osc_handler's table.
 static int zone_upsert_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argc; (void)msg;
     HdsSampleEngine *se = (HdsSampleEngine *)user_data;
     ZoneRecordWire rec;
     rec.zone_id = argv[0]->i;
-    float *f = &rec.root_note; // root_note..end_frac are 17 consecutive floats
-    for (int i = 0; i < 17; i++) f[i] = argv[1 + i]->f;
-    snprintf(rec.path, SAMPLE_PATH_LEN, "%s", (const char *)&argv[18]->s);
+    float *f = &rec.root_note; // root_note..assigned_osc are 18 consecutive floats
+    for (int i = 0; i < 18; i++) f[i] = argv[1 + i]->f;
+    snprintf(rec.path, SAMPLE_PATH_LEN, "%s", (const char *)&argv[19]->s);
     apply_zone_upsert(se, &rec);
     return 0;
 }
@@ -5554,6 +6050,135 @@ static int zone_remove_handler(const char *path, const char *types, lo_arg **arg
     (void)path; (void)types; (void)argc; (void)msg;
     HdsSampleEngine *se = (HdsSampleEngine *)user_data;
     apply_zone_remove(se, argv[0]->i);
+    return 0;
+}
+
+// Backend-native SFZ loading -- lets a whole multisample instrument be loaded directly from a
+// local .sfz file, for one oscillator (0-3), without any frontend ever deriving/pushing zone
+// data itself. The shared core both the CLI --sfz-vcoN startup flags and the /hds/zone/load_sfz
+// OSC method call (see main() and zone_load_sfz_handler, further down) -- they differ only in
+// WHEN/HOW this gets triggered, not in what it does once triggered. Reuses apply_zone_upsert()
+// (the exact same function an OSC-driven zone upsert already calls) for every parsed region, so
+// DFD streaming/pre-roll setup happens through the identical, already-proven throttled-load path
+// either way -- one code path, not two to keep in sync.
+static int32_t g_next_native_zone_id = -1; // decrements per native-loaded zone; frontend-assigned
+    // zone_ids are always >= 1 (SamplerMappingGrid._next_zone_id only ever increments from 1), so
+    // this negative space can never collide with one.
+
+static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, const char *sfz_path) {
+    if (osc_index < 0 || osc_index > 3) return 0;
+
+    // Always "replace this oscillator's zone set" -- a no-op at empty-catalog startup time, the
+    // real live-reload behavior for /hds/zone/load_sfz. Collect ids first (a plain forward scan
+    // while tombstoning in place is safe here too, same as apply_zone_remove's own loop, but
+    // collecting first keeps this obviously correct regardless of how apply_zone_remove's own
+    // loop shape might change later).
+    for (int s = 0; s < se->slots->sample_slot_count; s++) {
+        SampleSlot *slot = &se->slots->sample_slots[s];
+        if (slot->active && slot->assigned_osc == osc_index) apply_zone_remove(se, slot->zone_id);
+    }
+
+    char default_path[SAMPLE_PATH_LEN];
+    int region_count = sfz_parse_file(sfz_path, g_sfz_parse_scratch, SFZ_MAX_REGIONS_PER_FILE, default_path, sizeof(default_path));
+    if (region_count == 0) {
+        fprintf(stderr, "[sfz] '%s': no regions parsed (osc %d)\n", sfz_path, osc_index + 1);
+        return 0;
+    }
+
+    // group=+seq_length= round-robin compaction, local to this one load -- mirrors the Python
+    // importer's own per-file round_robin_ids dict: each distinct qualifying group= value seen in
+    // THIS file gets its own small sequential id (1, 2, 3, ...), since SFZ's own group numbers can
+    // collide across unrelated articulations/files.
+    #define SFZ_MAX_SEEN_GROUPS 64
+    char seen_group_names[SFZ_MAX_SEEN_GROUPS][SFZ_TEXT_FIELD_LEN];
+    int seen_group_ids[SFZ_MAX_SEEN_GROUPS];
+    int seen_group_count = 0;
+
+    int queued = 0;
+    for (int i = 0; i < region_count; i++) {
+        SfzRegion *r = &g_sfz_parse_scratch[i];
+        if (!r->has_sample || !r->sample[0]) continue; // no sample= at all -- nothing to play
+
+        const char *lokey_str = r->has_lokey ? r->lokey : (r->has_key ? r->key : NULL);
+        const char *hikey_str = r->has_hikey ? r->hikey : (r->has_key ? r->key : NULL);
+        int lokey = lokey_str ? sfz_note_to_number(lokey_str) : 0; if (lokey < 0) lokey = 0;
+        int hikey = hikey_str ? sfz_note_to_number(hikey_str) : 127; if (hikey < 0) hikey = 127;
+
+        bool is_drum = r->has_pitch_keytrack && r->pitch_keytrack == 0.0f;
+        int key_center = lokey;
+        if (!is_drum) {
+            const char *keycenter_str = r->has_pitch_keycenter ? r->pitch_keycenter : lokey_str;
+            if (keycenter_str) { int kc = sfz_note_to_number(keycenter_str); if (kc >= 0) key_center = kc; }
+        }
+
+        int min_vel = r->has_lovel ? r->lovel : 0; if (min_vel < 0) min_vel = 0; if (min_vel > 127) min_vel = 127;
+        int max_vel = r->has_hivel ? r->hivel : 127; if (max_vel < 0) max_vel = 0; if (max_vel > 127) max_vel = 127;
+
+        bool loop_enabled = false, loop_release_exit = false;
+        if (r->has_loop_mode) {
+            if (strcasecmp(r->loop_mode, "loop_sustain") == 0) { loop_enabled = true; loop_release_exit = true; }
+            else if (strcasecmp(r->loop_mode, "loop_continuous") == 0) { loop_enabled = true; }
+            // "no_loop"/"one_shot"/anything else: loop_enabled stays false.
+        }
+
+        unsigned int total_frames = 0;
+        read_wav_frame_count(r->sample, &total_frames); // best-effort -- 0 leaves every frac below at its safe default
+
+        float loop_start_frac = 0.0f, loop_end_frac = 1.0f, offset_frac = 0.0f, end_frac = 1.0f;
+        if (r->has_loop_start) sfz_frame_to_frac(r->loop_start, total_frames, &loop_start_frac);
+        if (r->has_loop_end) sfz_frame_to_frac(r->loop_end, total_frames, &loop_end_frac);
+        if (r->has_offset) sfz_frame_to_frac(r->offset, total_frames, &offset_frac);
+        if (r->has_end) sfz_frame_to_frac(r->end, total_frames, &end_frac);
+
+        int round_robin_group = 0;
+        if (r->has_group && r->has_seq_length) {
+            int found = -1;
+            for (int g = 0; g < seen_group_count; g++) if (strcmp(seen_group_names[g], r->group) == 0) { found = g; break; }
+            if (found < 0 && seen_group_count < SFZ_MAX_SEEN_GROUPS) {
+                found = seen_group_count;
+                snprintf(seen_group_names[found], sizeof(seen_group_names[found]), "%s", r->group);
+                seen_group_ids[found] = seen_group_count + 1;
+                seen_group_count++;
+            }
+            if (found >= 0) round_robin_group = seen_group_ids[found];
+        }
+
+        ZoneRecordWire rec;
+        rec.zone_id = g_next_native_zone_id--;
+        rec.root_note = is_drum ? 60.0f : (float)key_center;
+        rec.min_note = (float)lokey; rec.max_note = (float)hikey;
+        rec.min_velocity = (float)min_vel; rec.max_velocity = (float)max_vel;
+        rec.unpitched = is_drum ? 1.0f : 0.0f;
+        rec.loop_start = loop_start_frac; rec.loop_end = loop_end_frac;
+        rec.loop_enabled = loop_enabled ? 1.0f : 0.0f;
+        rec.round_robin_group = (float)round_robin_group;
+        rec.tune_cents = r->has_tune ? r->tune : 0.0f;
+        rec.gain_db = r->has_volume ? r->volume : 0.0f;
+        rec.pan = (r->has_pan ? r->pan : 0.0f) / 100.0f;
+        rec.start_offset_frac = offset_frac;
+        rec.reverse = (r->has_direction && strcasecmp(r->direction, "reverse") == 0) ? 1.0f : 0.0f;
+        rec.loop_release_exit = loop_release_exit ? 1.0f : 0.0f;
+        rec.end_frac = end_frac;
+        rec.assigned_osc = (float)osc_index;
+        snprintf(rec.path, SAMPLE_PATH_LEN, "%s", r->sample);
+
+        apply_zone_upsert(se, &rec);
+        queued++;
+    }
+    return queued;
+}
+
+// "/hds/zone/load_sfz" i s -- oscillator index (0-3) + a path, valid on the BACKEND's own
+// filesystem (never a payload the frontend decoded itself -- see this pass's own design
+// rationale: a backend on another system has its samples with it locally, so only a path needs
+// to cross the wire). Reuses the exact same hds_load_sfz_for_osc() the CLI --sfz-vcoN flags call.
+static int zone_load_sfz_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)argc; (void)msg;
+    HdsSampleEngine *se = (HdsSampleEngine *)user_data;
+    int osc_index = argv[0]->i;
+    const char *sfz_path = (const char *)&argv[1]->s;
+    int n = hds_load_sfz_for_osc(se, osc_index, sfz_path);
+    fprintf(stderr, "[sfz] /hds/zone/load_sfz osc=%d '%s': %d zone(s) queued\n", osc_index + 1, sfz_path, n);
     return 0;
 }
 
@@ -5579,13 +6204,14 @@ static int zone_remove_handler(const char *path, const char *types, lo_arg **arg
 // here because g_sample_slots is strictly append-only (see its own comment) -- array index order
 // and zone_id creation order are the same thing. That invariant would need revisiting if slot
 // reuse/compaction is ever added later.
-static int find_matching_sample_slot(HdsSampleEngine *se, int note, int velocity) {
+static int find_matching_sample_slot(HdsSampleEngine *se, int assigned_osc, int note, int velocity) {
     long best_area = -1; // -1 sentinel: "no candidate yet", distinct from a real zero-area zone
     int first_best_idx = -1;
     int tie_count = 0;
     for (int i = 0; i < se->slots->sample_slot_count; i++) {
         SampleSlot *slot = &se->slots->sample_slots[i];
         if (!slot->active || !slot->loaded) continue;
+        if (slot->assigned_osc != assigned_osc) continue;
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
         long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
@@ -5602,6 +6228,7 @@ static int find_matching_sample_slot(HdsSampleEngine *se, int note, int velocity
     for (int i = 0; i < se->slots->sample_slot_count; i++) {
         SampleSlot *slot = &se->slots->sample_slots[i];
         if (!slot->active || !slot->loaded) continue;
+        if (slot->assigned_osc != assigned_osc) continue;
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
         long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
@@ -5611,12 +6238,13 @@ static int find_matching_sample_slot(HdsSampleEngine *se, int note, int velocity
 
     int group_idx = group;
     if (group_idx < 1) group_idx = 1; else if (group_idx > MAX_ROUND_ROBIN_GROUPS) group_idx = MAX_ROUND_ROBIN_GROUPS;
-    unsigned int hit = se->pending->round_robin_hit_count[group_idx]++;
+    unsigned int hit = se->pending->round_robin_hit_count[assigned_osc][group_idx]++;
     unsigned int target_ordinal = hit % (unsigned int)member_count;
     unsigned int ordinal = 0;
     for (int i = 0; i < se->slots->sample_slot_count; i++) {
         SampleSlot *slot = &se->slots->sample_slots[i];
         if (!slot->active || !slot->loaded) continue;
+        if (slot->assigned_osc != assigned_osc) continue;
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
         long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
@@ -5633,9 +6261,9 @@ static int find_matching_sample_slot(HdsSampleEngine *se, int note, int velocity
 // find_matching_sample_slot finds a zone covering this note+velocity. Leaves *stream_idx at -1
 // (silent) if nothing matches or the stream pool is exhausted, rather than failing the whole
 // note-on.
-static void start_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr, bool *preroll, int note, int velocity) {
+static void start_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr, bool *preroll, int assigned_osc, int note, int velocity) {
     if (*stream_idx >= 0) { release_sample_stream(se, *stream_idx); *stream_idx = -1; }
-    int slot_idx = find_matching_sample_slot(se, note, velocity);
+    int slot_idx = find_matching_sample_slot(se, assigned_osc, note, velocity);
     unsigned int start_frame = 0;
     if (slot_idx >= 0) {
         SampleSlot *slot = &se->slots->sample_slots[slot_idx];
@@ -6076,25 +6704,25 @@ static void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthShared
         // and release any stream a stolen/retriggered voice was still holding from a previous
         // note even if this new note doesn't need one -- see start_sample_osc()'s comment.
         if ((WaveType)((int)prog->vco1_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, note, velocity);
+            start_sample_osc(se, &voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, 0, note, velocity);
         } else if (voices[slot].vco1_sample_stream >= 0) {
             release_sample_stream(se, voices[slot].vco1_sample_stream);
             voices[slot].vco1_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco2_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, note, velocity);
+            start_sample_osc(se, &voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, 1, note, velocity);
         } else if (voices[slot].vco2_sample_stream >= 0) {
             release_sample_stream(se, voices[slot].vco2_sample_stream);
             voices[slot].vco2_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco3_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, note, velocity);
+            start_sample_osc(se, &voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, 2, note, velocity);
         } else if (voices[slot].vco3_sample_stream >= 0) {
             release_sample_stream(se, voices[slot].vco3_sample_stream);
             voices[slot].vco3_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco4_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, note, velocity);
+            start_sample_osc(se, &voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, 3, note, velocity);
         } else if (voices[slot].vco4_sample_stream >= 0) {
             release_sample_stream(se, voices[slot].vco4_sample_stream);
             voices[slot].vco4_sample_stream = -1;
@@ -9075,12 +9703,21 @@ int main(int argc, char **argv) {
     // here (e.g. `--output-device hw:1,0` or `--output-device plughw:1,0`).
     const char *cli_output_device = NULL;
     const char *cli_input_device = NULL;
+    // --sfz-vco1 <path> .. --sfz-vco4 <path>: load a multisample instrument onto that oscillator
+    // at startup, directly from the backend's own local filesystem -- no frontend needs to ever
+    // connect for this synth to have playable sample content (see hds_load_sfz_for_osc() above
+    // for the shared loading core this and /hds/zone/load_sfz both call).
+    const char *cli_sfz_path[4] = { NULL, NULL, NULL, NULL };
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--osc-listen-port") == 0 && i + 1 < argc) osc_listen_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--osc-reply-host") == 0 && i + 1 < argc) osc_reply_host = argv[++i];
         else if (strcmp(argv[i], "--osc-reply-port") == 0 && i + 1 < argc) osc_reply_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--output-device") == 0 && i + 1 < argc) cli_output_device = argv[++i];
         else if (strcmp(argv[i], "--input-device") == 0 && i + 1 < argc) cli_input_device = argv[++i];
+        else if (strcmp(argv[i], "--sfz-vco1") == 0 && i + 1 < argc) cli_sfz_path[0] = argv[++i];
+        else if (strcmp(argv[i], "--sfz-vco2") == 0 && i + 1 < argc) cli_sfz_path[1] = argv[++i];
+        else if (strcmp(argv[i], "--sfz-vco3") == 0 && i + 1 < argc) cli_sfz_path[2] = argv[++i];
+        else if (strcmp(argv[i], "--sfz-vco4") == 0 && i + 1 < argc) cli_sfz_path[3] = argv[++i];
     }
 
     SynthSharedControls active_knobs; init_default_controls(&active_knobs);
@@ -9097,8 +9734,9 @@ int main(int argc, char **argv) {
     char osc_listen_port_str[16]; snprintf(osc_listen_port_str, sizeof(osc_listen_port_str), "%d", osc_listen_port);
     lo_server osc_server = lo_server_new_with_proto(osc_listen_port_str, LO_UDP, osc_error_handler);
     if (!osc_server) { fprintf(stderr, "Cannot continue without an OSC listen socket on port %d.\n", osc_listen_port); return 1; }
-    lo_server_add_method(osc_server, "/hds/zone/upsert", "ifffffffffffffffffs", zone_upsert_handler, &g_sample_engine);
+    lo_server_add_method(osc_server, "/hds/zone/upsert", "i" "ffffffffffffffffff" "s", zone_upsert_handler, &g_sample_engine);
     lo_server_add_method(osc_server, "/hds/zone/remove", "i", zone_remove_handler, &g_sample_engine);
+    lo_server_add_method(osc_server, "/hds/zone/load_sfz", "is", zone_load_sfz_handler, &g_sample_engine);
     lo_server_add_method(osc_server, NULL, NULL, generic_osc_handler, &active_knobs);
 
     char osc_reply_port_str[16]; snprintf(osc_reply_port_str, sizeof(osc_reply_port_str), "%d", osc_reply_port);
@@ -9111,6 +9749,20 @@ int main(int argc, char **argv) {
     // osc_server itself does.
     HdsStateRequestContext state_request_ctx = { &active_knobs, osc_reply_addr };
     lo_server_add_method(osc_server, "/hds/request_state", "", request_state_handler, &state_request_ctx);
+
+    // --sfz-vcoN startup loading: right here, after the OSC methods are registered (so a
+    // subsequent /hds/zone/load_sfz can still layer on top live) but before open_pcm_stream()
+    // opens the real-time audio device -- hds_load_sfz_for_osc() only does text parsing + path/
+    // stat() resolution + one header-only WAV read per region (no PCM decode, which stays
+    // throttled through drain_pending_sample_loads() at SAMPLE_LOADS_PER_BLOCK per block, same as
+    // any other zone load), so even a large multisample library enqueues fast and never risks
+    // blocking a thread that has real-time constraints. A bad/missing path logs and continues
+    // starting -- never fatal, matching load_sample_slot()'s own established failure posture.
+    for (int i = 0; i < 4; i++) {
+        if (!cli_sfz_path[i]) continue;
+        int n = hds_load_sfz_for_osc(&g_sample_engine, i, cli_sfz_path[i]);
+        fprintf(stderr, "[sfz] --sfz-vco%d '%s': %d zone(s) queued\n", i + 1, cli_sfz_path[i], n);
+    }
 
     // Output: opened with however many channels query_output_device_channel_count() detects --
     // see the multi-source routing model's output-pair grid (SynthSharedControls.source_routing)

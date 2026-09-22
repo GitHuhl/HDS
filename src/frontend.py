@@ -1563,6 +1563,10 @@ class SampleZone:
         # SampleSlot.loop_release_exit/playback_end_frame for how these are actually applied.
         self.loop_release_exit = False
         self.end_frac = 1.0
+        # Which oscillator (0-3) this zone belongs to -- see backend.c's SampleSlot.assigned_osc.
+        # Set at creation time (drag-drop tags it with the Mapping tab's currently-selected
+        # oscillator; SFZ import tags every zone it creates the same way) and otherwise left alone.
+        self.assigned_osc = 0
 
 class MidiKeyButton(QPushButton):
     """A single piano key on the Mapping tab's reference keyboard -- visual only (no MIDI is
@@ -6577,11 +6581,11 @@ class SynthGui(QWidget):
     # backend.c). Each OSC message carries exactly ONE zone -- a Mapping tab edit touching several
     # zones just sends several messages back to back, unlike the old wire-framed socket's
     # one-message-covers-many-zones batching.
-    # zone_id (i) + 17 floats (root_note, min_note, max_note, min_velocity, max_velocity,
+    # zone_id (i) + 18 floats (root_note, min_note, max_note, min_velocity, max_velocity,
     # unpitched, loop_start, loop_end, loop_enabled, round_robin_group, tune_cents, gain_db, pan,
-    # start_offset_frac, reverse, loop_release_exit, end_frac) + path (s) -- must match
-    # ZoneRecordWire's field order in backend.c exactly.
-    _ZONE_UPSERT_TYPES = "i" + "f" * 17 + "s"
+    # start_offset_frac, reverse, loop_release_exit, end_frac, assigned_osc) + path (s) -- must
+    # match ZoneRecordWire's field order in backend.c exactly.
+    _ZONE_UPSERT_TYPES = "i" + "f" * 18 + "s"
 
     def _zone_to_osc_args(self, zone):
         is_drum = (zone.key_center == -1)
@@ -6599,6 +6603,7 @@ class SynthGui(QWidget):
             float(zone.tune_cents), float(zone.gain_db), float(zone.pan) / 100.0,
             float(zone.start_offset), 1.0 if zone.reverse else 0.0,
             1.0 if zone.loop_release_exit else 0.0, float(zone.end_frac),
+            float(zone.assigned_osc),
             zone.file_path,
         )
 
