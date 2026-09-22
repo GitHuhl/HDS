@@ -1,5 +1,6 @@
 import sys
 import os
+import shutil
 import socket
 import struct
 import math
@@ -587,6 +588,10 @@ FX_SLOT_PARAM_COUNT = 8
 # Combi mode: up to COMBI_PROGRAM_COUNT independently-synthesizing Programs sharing one voice
 # pool -- must match COMBI_PROGRAM_COUNT in backend.c exactly. Defined here, ahead of
 # SOURCE_NAMES/SOURCE_COUNT below, since the bus/source model is built directly on top of it.
+# Sequencer record-quantize grid resolutions, as "divisions per beat" -- must match
+# seq_quantize_resolution's own convention in backend.c exactly (a plain divisor, not a musical-
+# fraction enum). Index into this list is the Resolution combo's currentIndex().
+SEQ_QUANTIZE_RESOLUTIONS = [1, 2, 3, 4, 6, 8]
 COMBI_PROGRAM_COUNT = 8
 # Multi-source/multi-output audio routing: must match EXT_IN_PAIR_COUNT/SOURCE_COUNT/
 # OUTPUT_PAIR_MAX in backend.c exactly. BREAKING CHANGE (real Combi mode): source ids 0-7 are
@@ -2318,6 +2323,12 @@ class SynthGui(QWidget):
         # Program save/load: one subfolder per Program (~/HDS_Programs/<name>/<name>.hdsprog
         # [+ <name>.sfz]) -- mirrors the existing ~/HDS_Recordings convention (self.record_folder).
         self.programs_folder = os.path.expanduser("~/HDS_Programs")
+        # Combi save/load: one subfolder per Combi (~/HDS_Combis/<name>/<name>.hdscombi), same
+        # convention as programs_folder above -- see _pick_and_save_combi()'s own docstring.
+        self.combis_folder = os.path.expanduser("~/HDS_Combis")
+        # Song save/load: one subfolder per song (~/HDS_Songs/<name>/song.json + song_midi.dat +
+        # audio/lane_<i>.wav) -- see _pick_and_save_song()'s own docstring.
+        self.songs_folder = os.path.expanduser("~/HDS_Songs")
         # The currently-loaded Program's category (schema field alongside "fields"/"name" --
         # pure metadata, never applied to any OSC address), so re-saving after a Load defaults
         # to the category it was already filed under instead of forgetting it every time.
@@ -3529,6 +3540,19 @@ class SynthGui(QWidget):
         combi_note.setWordWrap(True)
         combi_note.setStyleSheet("color: #777; font-style: italic;")
         combi_lay.addWidget(combi_note)
+        # Combi Save/Load: a .hdscombi file references each lane's constituent Program BY NAME
+        # (not by embedding its full ~1150-field parameter set), the same "reference, don't
+        # duplicate" relationship the lane picker below already has to ~/HDS_Programs -- see
+        # _pick_and_save_combi()/_pick_and_load_combi()'s own docstrings.
+        combi_save_load_row = QHBoxLayout()
+        self.btn_save_combi = QPushButton("Save Combi")
+        self.btn_load_combi = QPushButton("Load Combi")
+        combi_save_load_row.addWidget(self.btn_save_combi)
+        combi_save_load_row.addWidget(self.btn_load_combi)
+        combi_save_load_row.addStretch()
+        combi_lay.addLayout(combi_save_load_row)
+        self.btn_save_combi.clicked.connect(self._pick_and_save_combi)
+        self.btn_load_combi.clicked.connect(self._pick_and_load_combi)
         # Per-lane "pick a saved Program" dropdown -- loads that .hdsprog's fields onto this
         # lane's own /hds/combi/{lane}/... address set (programs[lane] in backend.c). Every lane
         # (0-7) is its own fully independent ProgramState, completely separate from Single
@@ -3554,6 +3578,11 @@ class SynthGui(QWidget):
         # reproducing today's exact unconditional dispatch.
         self.combi_lane_key_lo_spins, self.combi_lane_key_hi_spins = [], []
         self.combi_lane_vel_lo_spins, self.combi_lane_vel_hi_spins = [], []
+        # Per-lane Transpose (octave layering): -48..+48 semitones, session-level (see backend.c's
+        # combi_lane_transpose comment) -- lets the same or different Programs be stacked at
+        # different octaves for a thicker layered sound. A plain QSpinBox, same "st"-suffixed
+        # up/down-arrow incrementer convention as vco2/3/4's own Pitch Offset spinboxes.
+        self.combi_lane_transpose_spins = []
         combi_strips_widget = QWidget()
         combi_strips_lay = QHBoxLayout(combi_strips_widget)
         combi_strips_lay.setContentsMargins(0, 0, 0, 0); combi_strips_lay.setSpacing(3)
@@ -3630,6 +3659,22 @@ class SynthGui(QWidget):
             self.combi_lane_vel_lo_spins.append(vel_lo_spin)
             self.combi_lane_vel_hi_spins.append(vel_hi_spin)
 
+            transpose_spin = QSpinBox()
+            transpose_spin.setRange(-48, 48)
+            transpose_spin.setValue(0)
+            transpose_spin.setSuffix(" st")
+            transpose_spin.setFixedWidth(56)
+            transpose_spin.setStyleSheet("font-size: 9px;")
+            transpose_spin.setToolTip(
+                "Octave/semitone transpose for THIS lane only (-48..+48 semitones) -- lets the "
+                "same or different Programs be stacked at different octaves (octave layering)."
+            )
+            transpose_row = QHBoxLayout(); transpose_row.setSpacing(1)
+            transpose_row.addWidget(QLabel("Transpose:"))
+            transpose_row.addWidget(transpose_spin)
+            lane[0].layout().addLayout(transpose_row)
+            self.combi_lane_transpose_spins.append(transpose_spin)
+
             combi_strips_lay.addWidget(lane[0])
             self.combi_lane_rows.append(lane)
         combi_strips_lay.addStretch()
@@ -3699,6 +3744,23 @@ class SynthGui(QWidget):
         self.seq_btn_metronome.setCheckable(True)
         self.seq_btn_metronome.setToolTip("Click on each beat while playing (400Hz, 8ms square wave)")
         transport_lay.addWidget(self.seq_btn_metronome)
+        # Quantize: snaps a Rec-armed lane's recorded note-ON timestamps to the nearest grid line
+        # at the current tempo (note lengths are left as-played -- see backend.c's
+        # seq_quantize_enable comment). Off by default, same "opt-in, doesn't change existing
+        # behavior" posture as Metronome above.
+        self.seq_btn_quantize = QPushButton("Quantize")
+        self.seq_btn_quantize.setCheckable(True)
+        self.seq_btn_quantize.setToolTip(
+            "Snap recorded note-ON timestamps to the nearest grid line at the current tempo "
+            "(note lengths are left exactly as played)."
+        )
+        transport_lay.addWidget(self.seq_btn_quantize)
+        self.seq_quantize_resolution_combo = QComboBox()
+        self.seq_quantize_resolution_combo.addItems(["1/4", "1/8", "1/8 Triplet", "1/16", "1/16 Triplet", "1/32"])
+        self.seq_quantize_resolution_combo.setCurrentIndex(3)  # 1/16 -- matches backend's own default (seq_quantize_resolution=4)
+        self.seq_quantize_resolution_combo.setToolTip("Quantize grid resolution")
+        transport_lay.addWidget(QLabel("Resolution:"))
+        transport_lay.addWidget(self.seq_quantize_resolution_combo)
         # Real, edge-triggered counters -- same idiom as each Sequencer audio lane's own Preview
         # button (_preview_seq_audio/preview_trigger): the backend's poll_transport_triggers
         # detects a change in the value since last block, so each click just increments and
@@ -3720,6 +3782,8 @@ class SynthGui(QWidget):
         self.seq_btn_seek_back.clicked.connect(self._seq_transport_seek_back)
         self.seq_btn_seek_fwd.clicked.connect(self._seq_transport_seek_fwd)
         self.seq_btn_metronome.toggled.connect(self.transmit_knob_packet)
+        self.seq_btn_quantize.toggled.connect(self.transmit_knob_packet)
+        self.seq_quantize_resolution_combo.currentIndexChanged.connect(self.transmit_knob_packet)
         transport_lay.addSpacing(16)
         self.seq_transport_state_label = QLabel("STOPPED")
         self.seq_transport_state_label.setStyleSheet("font-weight: bold;")
@@ -3732,6 +3796,14 @@ class SynthGui(QWidget):
         self.seq_bars_beats_label.setStyleSheet("font-family: monospace; font-size: 14px;")
         transport_lay.addWidget(QLabel("Bars\u200a:\u200aBeats:")); transport_lay.addWidget(self.seq_bars_beats_label)
         transport_lay.addStretch()
+        # Song save/load: a self-contained folder (config + recorded MIDI + copied-in audio) you
+        # can come back to and keep working on later -- see _pick_and_save_song()'s own docstring.
+        self.btn_save_song = QPushButton("Save Song")
+        self.btn_load_song = QPushButton("Load Song")
+        transport_lay.addWidget(self.btn_save_song)
+        transport_lay.addWidget(self.btn_load_song)
+        self.btn_save_song.clicked.connect(self._pick_and_save_song)
+        self.btn_load_song.clicked.connect(self._pick_and_load_song)
         seq_outer_lay.addWidget(transport_box)
 
         self.seq_status_label = QLabel("")
@@ -3879,6 +3951,48 @@ class SynthGui(QWidget):
             lay.addWidget(QLabel("Type:")); lay.addWidget(v_type)
             box.setLayout(lay)
             filters_column.addWidget(box)
+
+        # --- Post-filter 3-band EQ (Low Shelf / Mid Peak / High Shelf) -- see backend.c's
+        # EqBandParams/ProgramState.eq_bands comment. Applied once per Program per sample, right
+        # after the 5-slot filter chain above, before FX/routing. Shelf bands (Low/High) have no
+        # Q control -- backend.c fixes their shelf slope at S=1, matching a typical hardware
+        # channel-strip EQ rather than a fully general parametric-shelf design; only the Mid Peak
+        # band exposes Q.
+        eq_box = QGroupBox("3-Band EQ (post-filter)")
+        eq_lay = QHBoxLayout(); eq_lay.setSpacing(4); eq_lay.setContentsMargins(4, 4, 4, 4)
+        self.eq_freq_dials, self.eq_gain_dials, self.eq_q_dials = [], [], []
+        eq_band_names = ["Low Shelf", "Mid Peak", "High Shelf"]
+        eq_freq_defaults = [100, 1000, 5000]
+        for b in range(3):
+            band_box = QGroupBox(eq_band_names[b])
+            band_lay = QHBoxLayout(); band_lay.setSpacing(4); band_lay.setContentsMargins(4, 4, 4, 4)
+
+            f_dial = PotentiometerKnob(f"{eq_band_names[b]} Freq", self)
+            f_dial.setRange(20, 20000); f_dial.setValue(eq_freq_defaults[b])
+            f_dial.value_formatter = lambda v: f"{v} Hz"
+            self.eq_freq_dials.append(f_dial)
+
+            g_dial = PotentiometerKnob(f"{eq_band_names[b]} Gain", self)
+            g_dial.setRange(-18, 18); g_dial.setValue(0)
+            g_dial.value_formatter = lambda v: f"{v:+d} dB"
+            self.eq_gain_dials.append(g_dial)
+
+            band_lay.addWidget(QLabel("Freq:")); band_lay.addWidget(f_dial)
+            band_lay.addWidget(QLabel("Gain:")); band_lay.addWidget(g_dial)
+
+            if b == 1:  # Mid Peak only
+                q_dial = PotentiometerKnob("Mid Q", self)
+                q_dial.setRange(1, 100); q_dial.setValue(7)  # /10.0 at transmit time -> Q 0.1-10.0, default ~0.7
+                q_dial.value_formatter = lambda v: f"{v / 10.0:.1f}"
+                band_lay.addWidget(QLabel("Q:")); band_lay.addWidget(q_dial)
+                self.eq_q_dials.append(q_dial)
+            else:
+                self.eq_q_dials.append(None)
+
+            band_box.setLayout(band_lay)
+            eq_lay.addWidget(band_box)
+        eq_box.setLayout(eq_lay)
+        filters_column.addWidget(eq_box)
 
         filters_column.addStretch()
         filters_outer_lay.addLayout(filters_column)
@@ -4401,9 +4515,17 @@ class SynthGui(QWidget):
             hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.routing_grid.addWidget(hdr, 0, 3 + p)
             self.routing_output_col_headers.append(hdr)
+        # One more column after the output-pair checkboxes: a per-Ext-In-pair VU meter (there's
+        # plenty of spare horizontal space in each row already). Only ext-in pairs are real audio
+        # INPUTS this tab has anything to meter -- Programs/Combi Mix are synth-generated, not
+        # captured, and already have their own VU meter on the Output strip. Metering itself is
+        # only ever computed backend-side while this tab is actually on-screen (see
+        # gui_routing_tab_visible/_on_main_tab_changed) -- a true no-op the rest of the time.
+        self.routing_grid.addWidget(QLabel("<b>VU</b>"), 0, 3 + OUTPUT_PAIR_MAX)
 
         self.routing_ext_in_enable_cbs = []
         self.routing_ext_in_gain_dials = []
+        self.routing_ext_in_vu_meters = []
         self.routing_output_pair_cbs = []  # [source_idx][pair_idx] -> QCheckBox
         for src in range(SOURCE_COUNT):
             row = src + 1
@@ -4415,6 +4537,7 @@ class SynthGui(QWidget):
                 # output routing is configured on this tab.
                 self.routing_ext_in_enable_cbs.append(None)
                 self.routing_ext_in_gain_dials.append(None)
+                self.routing_ext_in_vu_meters.append(None)
             else:
                 enable_cb = QCheckBox()
                 self.routing_grid.addWidget(enable_cb, row, 1)
@@ -4428,6 +4551,16 @@ class SynthGui(QWidget):
                 gain_dial.value_formatter = lambda v: "-inf dB" if v <= 0 else f"{v}%"
                 self.routing_grid.addWidget(gain_dial, row, 2)
                 self.routing_ext_in_gain_dials.append(gain_dial)
+
+                vu_meter = QProgressBar()
+                vu_meter.setRange(0, 100); vu_meter.setValue(0); vu_meter.setTextVisible(False)
+                vu_meter.setFixedSize(70, 14)
+                vu_meter.setStyleSheet("""
+                    QProgressBar { border: 1px solid #444; background: #222; }
+                    QProgressBar::chunk { background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0f0, stop:0.7 #ff0, stop:1 #f00); }
+                """)
+                self.routing_grid.addWidget(vu_meter, row, 3 + OUTPUT_PAIR_MAX)
+                self.routing_ext_in_vu_meters.append(vu_meter)
 
             pair_cbs = []
             for p in range(OUTPUT_PAIR_MAX):
@@ -5150,6 +5283,94 @@ class SynthGui(QWidget):
         self.osc_prog_radio.setChecked(True)  # jump into Single Program mode so it's audible/editable
         self.tab_widget.setCurrentWidget(self.tab_play)
 
+    def _pick_and_save_combi(self):
+        """Saves the current Combi to ~/HDS_Combis/<name>/<name>.hdscombi. Deliberately references
+        each lane's constituent Program BY NAME (self.combi_lane_program_choice[i], the same
+        bookkeeping the lane picker itself already maintains) rather than embedding that Program's
+        full ~1150-field parameter set -- exactly the "reference, don't duplicate" relationship
+        the picker already has to ~/HDS_Programs, so a Combi file stays a few hundred bytes
+        instead of megabytes, and always reflects whatever that Program currently is (re-saving
+        the Program updates every Combi that references it, with nothing to keep in sync by
+        hand). Also captures each lane's own session-level routing (MIDI channel, Key/Velocity
+        zone, Transpose, fader/pan) -- see _pick_and_load_combi() for the load-side mirror."""
+        name, ok = QInputDialog.getText(self, "Save Combi", "Combi name:", QLineEdit.EchoMode.Normal, "My Combi")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        lanes = []
+        for i in range(COMBI_PROGRAM_COUNT):
+            _strip, fader, pan_dial, _type_combo, _mode_combo = self.combi_lane_rows[i]
+            lanes.append({
+                "program": self.combi_lane_program_choice[i],
+                "midi_channel": self.combi_lane_midi_channel_combos[i].currentIndex(),
+                "key_lo": self.combi_lane_key_lo_spins[i].value(),
+                "key_hi": self.combi_lane_key_hi_spins[i].value(),
+                "vel_lo": self.combi_lane_vel_lo_spins[i].value(),
+                "vel_hi": self.combi_lane_vel_hi_spins[i].value(),
+                "transpose": self.combi_lane_transpose_spins[i].value(),
+                "volume": fader.value(),
+                "pan": pan_dial.value(),
+            })
+        data = {"format_version": 1, "name": name, "lanes": lanes}
+        combi_dir = os.path.join(self.combis_folder, name)
+        try:
+            os.makedirs(combi_dir, exist_ok=True)
+            with open(os.path.join(combi_dir, f"{name}.hdscombi"), "w") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            QMessageBox.warning(self, "Save Combi", f"Could not save '{name}':\n{e}")
+
+    def _pick_and_load_combi(self):
+        """Loads a .hdscombi saved by _pick_and_save_combi(): for each lane with a referenced
+        Program, loads that Program's CURRENT .hdsprog onto the lane (via the same
+        _load_program_from_path(..., lane_idx=i) the picker itself uses -- a Program renamed or
+        re-saved since this Combi was captured is picked up as-is, not frozen at save time), then
+        restores that lane's own session-level routing. A referenced Program that no longer exists
+        on disk is reported once at the end rather than aborting the whole load, so the rest of the
+        Combi still comes in."""
+        os.makedirs(self.combis_folder, exist_ok=True)
+        path, _ = QFileDialog.getOpenFileName(self, "Load Combi", self.combis_folder, "HDS Combis (*.hdscombi)")
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            QMessageBox.warning(self, "Load Combi", f"Could not read '{path}':\n{e}")
+            return
+        lanes = data.get("lanes", [])
+        missing = []
+        for i in range(COMBI_PROGRAM_COUNT):
+            lane = lanes[i] if i < len(lanes) else {}
+            prog_name = lane.get("program")
+            if prog_name:
+                prog_path = os.path.join(self.programs_folder, prog_name, f"{prog_name}.hdsprog")
+                if os.path.isfile(prog_path):
+                    self._load_program_from_path(prog_path, lane_idx=i)
+                    self.combi_lane_program_choice[i] = prog_name
+                else:
+                    missing.append(prog_name)
+                    self.combi_lane_program_choice[i] = None
+            else:
+                self.combi_lane_program_choice[i] = None
+
+            channel_combo = self.combi_lane_midi_channel_combos[i]
+            channel_combo.blockSignals(True); channel_combo.setCurrentIndex(int(lane.get("midi_channel", 0))); channel_combo.blockSignals(False)
+            for spin, key, default in (
+                (self.combi_lane_key_lo_spins[i], "key_lo", 0), (self.combi_lane_key_hi_spins[i], "key_hi", 127),
+                (self.combi_lane_vel_lo_spins[i], "vel_lo", 1), (self.combi_lane_vel_hi_spins[i], "vel_hi", 127),
+                (self.combi_lane_transpose_spins[i], "transpose", 0),
+            ):
+                spin.blockSignals(True); spin.setValue(int(lane.get(key, default))); spin.blockSignals(False)
+            _strip, fader, pan_dial, _type_combo, _mode_combo = self.combi_lane_rows[i]
+            fader.blockSignals(True); fader.setValue(int(lane.get("volume", 80))); fader.blockSignals(False)
+            pan_dial.blockSignals(True); pan_dial.setValue(int(lane.get("pan", 0))); pan_dial.blockSignals(False)
+
+        self._refresh_combi_program_combos()
+        self.transmit_knob_packet()
+        if missing:
+            QMessageBox.warning(self, "Load Combi", "Some referenced Programs were not found:\n" + "\n".join(missing))
+
     def _pick_seq_audio_file(self, lane_idx):
         """'Load Audio' button handler for one Sequencer lane. Sends the chosen path over OSC
         (/hds/seq/<lane>/audio_path); the backend actually reads the WAV into RAM on a background
@@ -5175,6 +5396,126 @@ class SynthGui(QWidget):
         widgets = self.seq_lane_audio_widgets[lane_idx]
         widgets["preview_trigger"] = widgets.get("preview_trigger", 0) + 1
         self.transmit_knob_packet()
+
+    def _pick_and_save_song(self):
+        """Saves the Sequencer's current state to ~/HDS_Songs/<name>/ -- each of the 32 lanes' own
+        config (type, level/pan, MIDI channel, mute/rec/overdub, an Audio lane's own offset) plus,
+        for a Program/MIDI lane, its actual RECORDED PERFORMANCE (SeqMidiLane.events[] in
+        backend.c) -- pure runtime state, never an OSC-addressable knob the way a plain fader
+        value is, so the backend dumps it directly to a compact binary file
+        (/hds/song/save_midi) rather than this function trying to read it back one event at a
+        time over OSC. An Audio lane's referenced WAV is COPIED into the song folder
+        (audio/lane_<i>.wav) so the song stays loadable even if the original file is later moved
+        or renamed -- a "song folder" is meant to be one complete, self-contained unit you can
+        archive or move as a whole."""
+        name, ok = QInputDialog.getText(self, "Save Song", "Song name:", QLineEdit.EchoMode.Normal, "My Song")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        song_dir = os.path.join(self.songs_folder, name)
+        audio_dir = os.path.join(song_dir, "audio")
+        try:
+            os.makedirs(audio_dir, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(self, "Save Song", f"Could not create '{song_dir}':\n{e}")
+            return
+
+        lanes = []
+        for i in range(SEQ_LANE_COUNT):
+            _strip, fader, pan_dial, type_combo, mode_combo = self.seq_lane_rows[i]
+            audio_widgets = self.seq_lane_audio_widgets[i]
+            src_path = audio_widgets.get("path", "") or ""
+            rel_audio_path = ""
+            if src_path and os.path.isfile(src_path):
+                rel_audio_path = f"audio/lane_{i}.wav"
+                try:
+                    shutil.copyfile(src_path, os.path.join(song_dir, rel_audio_path))
+                except OSError as e:
+                    QMessageBox.warning(self, "Save Song", f"Could not copy audio for lane {i + 1}:\n{e}")
+                    rel_audio_path = ""
+            lanes.append({
+                "lane_type": type_combo.currentIndex(),
+                "mode": mode_combo.currentIndex(),
+                "volume": fader.value(),
+                "pan": pan_dial.value(),
+                "midi_channel": self.seq_lane_midi_channel_combos[i].currentIndex(),
+                "mute": 1 if self.seq_lane_mute_buttons[i].isChecked() else 0,
+                "rec_armed": 1 if self.seq_lane_rec_buttons[i].isChecked() else 0,
+                "rec_overdub": self.seq_lane_overdub_combos[i].currentIndex(),
+                "audio_path": rel_audio_path,
+                "audio_offset_sec": audio_widgets["offset_dial"].value() / 10.0,
+            })
+        data = {"format_version": 1, "name": name, "lanes": lanes}
+        try:
+            with open(os.path.join(song_dir, "song.json"), "w") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            QMessageBox.warning(self, "Save Song", f"Could not write song.json for '{name}':\n{e}")
+            return
+
+        # Recorded MIDI performance data -- backend-native, see this method's own docstring.
+        midi_path = os.path.join(song_dir, "song_midi.dat")
+        msg = OscMessageBuilder(address="/hds/song/save_midi")
+        msg.add_arg(midi_path, "s")
+        try: self.osc_client.send(msg.build())
+        except OSError: pass
+
+    def _pick_and_load_song(self):
+        """Loads a song saved by _pick_and_save_song(): restores every lane's own config from
+        song.json straight onto the same widgets transmit_knob_packet() itself already reads
+        (one normal transmit_knob_packet() call at the end pushes it all to the backend -- these
+        are all regular /hds/seq/... knobs already, nothing special needed there), points each
+        Audio lane at its own copy inside the song folder, and asks the backend to load the
+        recorded MIDI performance data back into memory via /hds/song/load_midi."""
+        folder = QFileDialog.getExistingDirectory(self, "Load Song", self.songs_folder)
+        if not folder:
+            return
+        manifest_path = os.path.join(folder, "song.json")
+        try:
+            with open(manifest_path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            QMessageBox.warning(self, "Load Song", f"Could not read '{manifest_path}':\n{e}")
+            return
+
+        lanes = data.get("lanes", [])
+        for i in range(SEQ_LANE_COUNT):
+            lane = lanes[i] if i < len(lanes) else {}
+            _strip, fader, pan_dial, type_combo, mode_combo = self.seq_lane_rows[i]
+            type_combo.blockSignals(True); type_combo.setCurrentIndex(int(lane.get("lane_type", 0))); type_combo.blockSignals(False)
+            mode_combo.blockSignals(True); mode_combo.setCurrentIndex(int(lane.get("mode", 0))); mode_combo.blockSignals(False)
+            fader.blockSignals(True); fader.setValue(int(lane.get("volume", 80))); fader.blockSignals(False)
+            pan_dial.blockSignals(True); pan_dial.setValue(int(lane.get("pan", 0))); pan_dial.blockSignals(False)
+            channel_combo = self.seq_lane_midi_channel_combos[i]
+            channel_combo.blockSignals(True); channel_combo.setCurrentIndex(int(lane.get("midi_channel", 0))); channel_combo.blockSignals(False)
+            mute_btn = self.seq_lane_mute_buttons[i]
+            mute_btn.blockSignals(True); mute_btn.setChecked(bool(lane.get("mute", 0))); mute_btn.blockSignals(False)
+            rec_btn = self.seq_lane_rec_buttons[i]
+            rec_btn.blockSignals(True); rec_btn.setChecked(bool(lane.get("rec_armed", 0))); rec_btn.blockSignals(False)
+            overdub_combo = self.seq_lane_overdub_combos[i]
+            overdub_combo.blockSignals(True); overdub_combo.setCurrentIndex(int(lane.get("rec_overdub", 0))); overdub_combo.blockSignals(False)
+
+            audio_widgets = self.seq_lane_audio_widgets[i]
+            rel_audio_path = lane.get("audio_path", "") or ""
+            if rel_audio_path:
+                abs_path = os.path.join(folder, rel_audio_path)
+                audio_widgets["path"] = abs_path if os.path.isfile(abs_path) else ""
+                audio_widgets["status_label"].setText(os.path.basename(abs_path) if audio_widgets["path"] else "(missing file)")
+            else:
+                audio_widgets["path"] = ""
+                audio_widgets["status_label"].setText("(no file)")
+            audio_widgets["offset_widget"].setVisible(False)
+            offset_dial = audio_widgets["offset_dial"]
+            offset_dial.blockSignals(True); offset_dial.setValue(int(round(float(lane.get("audio_offset_sec", 0.0)) * 10.0))); offset_dial.blockSignals(False)
+
+        self.transmit_knob_packet()
+
+        midi_path = os.path.join(folder, "song_midi.dat")
+        if os.path.isfile(midi_path):
+            msg = OscMessageBuilder(address="/hds/song/load_midi")
+            msg.add_arg(midi_path, "s")
+            try: self.osc_client.send(msg.build())
+            except OSError: pass
 
     def _seq_transport_play(self):
         """Play button: edge-triggered counter, same idiom as _preview_seq_audio -- the backend's
@@ -5402,6 +5743,7 @@ class SynthGui(QWidget):
         # transmit_knob_packet() itself uses, applied in reverse. (Oscillator scalars are handled
         # directly below, alongside the rest of this function's plain single-field restores.)
         self._apply_program_fields_filters(fields)
+        self._apply_program_fields_eq(fields)
         self._apply_program_fields_egs(fields)
         self._apply_program_fields_lfos(fields)
         self._apply_program_fields_fx(fields)
@@ -5523,6 +5865,20 @@ class SynthGui(QWidget):
             cc_source_addr = f"/hds/filter/{i}/cc_source"
             if cc_source_addr in fields:
                 self.filter_cutoff_mod_source_cc[i] = fields[cc_source_addr]
+
+    def _apply_program_fields_eq(self, fields):
+        """Mirrors transmit_knob_packet()'s own 3-band EQ section in reverse -- see backend.c's
+        EqBandParams/ProgramState.eq_bands comment. eq_q_dials[0]/[2] are None (shelf bands have
+        no Q control), so the Q restore is skipped for those two bands."""
+        def sd(addr, dial, scale=1.0):
+            if addr in fields:
+                dial.blockSignals(True); dial.setValue(int(round(fields[addr] * scale))); dial.blockSignals(False)
+
+        for b in range(3):
+            sd(f"/hds/eq/{b}/freq", self.eq_freq_dials[b])
+            sd(f"/hds/eq/{b}/gain", self.eq_gain_dials[b])
+            if self.eq_q_dials[b] is not None:
+                sd(f"/hds/eq/{b}/q", self.eq_q_dials[b], scale=10.0)
 
     def _apply_program_fields_egs(self, fields):
         """Mirrors transmit_knob_packet()'s EG-params loop, reusing each EG panel's own existing
@@ -6188,6 +6544,18 @@ class SynthGui(QWidget):
                     except (IndexError, ValueError):
                         continue
                     seq_audio_updates.setdefault(lane_idx, {})[field] = msg.params[0]
+                elif msg.address.startswith("/hds/status/ext_in_peak/") and msg.params:
+                    # /hds/status/ext_in_peak/<pair> -- Routing tab's per-Ext-In VU meters (see
+                    # gui_routing_tab_visible/_on_main_tab_changed); only ever non-zero while this
+                    # tab is actually on-screen. Applied directly (not buffered) since there's
+                    # nothing to reconcile against -- each message is already the latest value.
+                    try:
+                        pair = int(msg.address.rsplit("/", 1)[1])
+                    except ValueError:
+                        continue
+                    src = COMBI_PROGRAM_COUNT + 1 + pair
+                    if 0 <= src < len(self.routing_ext_in_vu_meters) and self.routing_ext_in_vu_meters[src] is not None:
+                        self.routing_ext_in_vu_meters[src].setValue(int(max(0, min(100, msg.params[0] * 100.0))))
                 elif msg.address == "/hds/status/state_dump_complete":
                     # Sentinel closing out a /hds/request_state reply -- see
                     # send_full_state_dump() in backend.c. Apply everything buffered so far, then
@@ -6363,6 +6731,15 @@ class SynthGui(QWidget):
             add_f(f"/hds/filter/{i}/key_track", self.filter_key_track[i])
             add_f(f"/hds/filter/{i}/cc_source", self.filter_cutoff_mod_source_cc[i])
 
+        # --- Post-filter 3-band EQ (Low Shelf / Mid Peak / High Shelf) -- see backend.c's
+        # EqBandParams/ProgramState.eq_bands comment. Q is only meaningful for the Mid Peak band
+        # (index 1); eq_q_dials[0]/[2] are None for the two Shelf bands.
+        for b in range(3):
+            add_f(f"/hds/eq/{b}/freq", self.eq_freq_dials[b].value())
+            add_f(f"/hds/eq/{b}/gain", self.eq_gain_dials[b].value())
+            if self.eq_q_dials[b] is not None:
+                add_f(f"/hds/eq/{b}/q", self.eq_q_dials[b].value() / 10.0)
+
         # --- Combi/Sequencer scaffolding (see backend.c's SEQ_LANE_COUNT comment) ---
         if self.osc_combi_radio.isChecked():
             perf_mode = 1
@@ -6416,6 +6793,7 @@ class SynthGui(QWidget):
             add_f(f"/hds/combi/{i}/key_hi", self.combi_lane_key_hi_spins[i].value())
             add_f(f"/hds/combi/{i}/vel_lo", self.combi_lane_vel_lo_spins[i].value())
             add_f(f"/hds/combi/{i}/vel_hi", self.combi_lane_vel_hi_spins[i].value())
+            add_f(f"/hds/combi/{i}/transpose", self.combi_lane_transpose_spins[i].value())
 
         # Sequencer transport -- edge-triggered counters, same idiom as each audio lane's own
         # Preview trigger (see poll_transport_triggers in backend.c).
@@ -6426,6 +6804,8 @@ class SynthGui(QWidget):
         add_f("/hds/seq/transport/seek_back", self.seq_transport_seek_back_trigger)
         add_f("/hds/seq/transport/seek_fwd", self.seq_transport_seek_fwd_trigger)
         add_f("/hds/seq/transport/metronome", 1.0 if self.seq_btn_metronome.isChecked() else 0.0)
+        add_f("/hds/seq/quantize/enable", 1.0 if self.seq_btn_quantize.isChecked() else 0.0)
+        add_f("/hds/seq/quantize/resolution", float(SEQ_QUANTIZE_RESOLUTIONS[self.seq_quantize_resolution_combo.currentIndex()]))
 
         # LFOs (incl. phase offset + mod source CC + Tempo Sync)
         for idx in range(LFO_COUNT):
@@ -6696,6 +7076,20 @@ class SynthGui(QWidget):
             zone.file_path,
         )
 
+    def _on_main_tab_changed(self, index):
+        """Gates the Routing tab's per-ext-in VU meters (see backend.c's gui_routing_tab_visible
+        comment) so that metering cost is only ever paid while a player is actually looking at
+        this tab, not for the life of the process. Sent as its own one-off message (not folded
+        into the next transmit_knob_packet) so switching tabs takes effect immediately rather than
+        waiting on the next incidental knob change."""
+        if self.osc_client is None:
+            return
+        visible = (self.tab_widget.widget(index) is self.tab_routing)
+        msg = OscMessageBuilder(address="/hds/gui/routing_tab_visible")
+        msg.add_arg(1.0 if visible else 0.0, "f")
+        try: self.osc_client.send(msg.build())
+        except OSError: pass
+
     def transmit_zone_upsert(self, zones):
         """Sends one "/hds/zone/upsert" OSC message per given zone (never the whole catalog) --
         called from every Mapping tab edit site: drop, drag/resize, delete's sibling add,
@@ -6826,6 +7220,9 @@ def runtime_connect_and_bind(gui):
         combo.currentIndexChanged.connect(gui.transmit_knob_packet)
     for combo in gui.filter_type_combos:
         combo.currentIndexChanged.connect(gui.transmit_knob_packet)
+    # Post-filter 3-band EQ: eq_q_dials[0]/[2] are None (shelf bands have no Q control).
+    for dial in gui.eq_freq_dials + gui.eq_gain_dials + [d for d in gui.eq_q_dials if d is not None]:
+        dial.valueChanged.connect(gui.transmit_knob_packet)
 
     # Combi/Sequencer lane scaffolding: fader/pan (both views) + type/seq-mode combos
     # (Sequencer view only -- Combi's rows have None in those two tuple slots).
@@ -6845,7 +7242,8 @@ def runtime_connect_and_bind(gui):
     for channel_combo in gui.combi_lane_midi_channel_combos:
         channel_combo.currentIndexChanged.connect(gui.transmit_knob_packet)
     for spin_list in (gui.combi_lane_key_lo_spins, gui.combi_lane_key_hi_spins,
-                      gui.combi_lane_vel_lo_spins, gui.combi_lane_vel_hi_spins):
+                      gui.combi_lane_vel_lo_spins, gui.combi_lane_vel_hi_spins,
+                      gui.combi_lane_transpose_spins):
         for spin in spin_list:
             spin.valueChanged.connect(gui.transmit_knob_packet)
     for mute_btn, rec_btn, overdub_combo in zip(gui.seq_lane_mute_buttons, gui.seq_lane_rec_buttons, gui.seq_lane_overdub_combos):
@@ -6925,6 +7323,12 @@ def runtime_connect_and_bind(gui):
     for src in range(SOURCE_COUNT):
         for p in range(OUTPUT_PAIR_MAX):
             gui.routing_output_pair_cbs[src][p].toggled.connect(gui.transmit_knob_packet)
+
+    # Routing tab's per-Ext-In VU meters are only ever metered backend-side while this tab is
+    # actually on-screen (see gui_routing_tab_visible) -- tell it whenever the visible tab changes,
+    # and once now for whatever tab happens to be showing at startup.
+    gui.tab_widget.currentChanged.connect(gui._on_main_tab_changed)
+    gui._on_main_tab_changed(gui.tab_widget.currentIndex())
 
     # Audio device selection
     gui.output_device_combo.currentTextChanged.connect(gui.transmit_knob_packet)

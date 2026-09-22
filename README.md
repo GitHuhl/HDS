@@ -537,6 +537,76 @@ entry in `FX_TYPE_METADATA` (`frontend.py`) giving its real param count,
 labels, and ranges — the frontend uses that to relabel/show only the
 knobs a given effect actually uses instead of 8 generic "P1..P8" dials.
 
+**3-band EQ** (`Filters` tab, post-filter): each Program gets its own Low
+Shelf / Mid Peak / High Shelf EQ (`ProgramState.eq_bands[3]` in
+`backend.c`), applied once per Program per sample right after the 5-slot
+filter chain and before FX/output routing (`apply_program_eq()` in
+`render_audio_block()`) -- RBJ Audio-EQ-Cookbook biquads, ±18dB per band,
+with Q exposed only on the Mid Peak band (the two Shelf bands use a fixed,
+musical shelf slope). A flat (0dB) band is a true zero-cost bypass, so an
+unused EQ costs nothing.
+
+**Sequencer record-quantize** (`Sequencer` tab, Transport panel): a
+Quantize toggle + Resolution dropdown (1/4 down to 1/32, including
+triplets) snaps a Rec-armed lane's recorded note-ON timestamps to the
+nearest grid line at the engine's current tempo (`seq_record_midi_event()`
+in `backend.c`) -- note-OFF timestamps, and therefore note length, are
+deliberately left exactly as played.
+
+**Combi per-lane Transpose** (Combi view, Play tab): each of the 8 Combi
+lanes gets its own ±48-semitone Transpose spinbox
+(`combi_lane_transpose[COMBI_PROGRAM_COUNT]` in `backend.c`), composed as
+just another additive-cents term alongside pitch bend/fine tune/pitch
+offset -- lets the same or different Programs be stacked at different
+octaves ("octave layering") without touching either Program's own patch
+content. Session-level, like the lane's MIDI channel/Key/Velocity zone --
+not saved as part of a `.hdsprog` Program file.
+
+**Combi save/load** (`Save Combi` / `Load Combi` buttons, Combi view): a
+`.hdscombi` file (`~/HDS_Combis/<name>/<name>.hdscombi`, plain JSON)
+captures all 8 lanes' session-level setup (which Program is picked, MIDI
+channel, Key/Velocity zone, Transpose, fader/pan) but deliberately
+**references each lane's Program by name** rather than embedding its full
+~1150-field parameter set -- the same relationship the Combi lane picker
+itself already has to `~/HDS_Programs/`, so a Combi file stays a few
+hundred bytes, and re-saving a referenced Program updates every Combi that
+uses it with nothing to keep in sync by hand. Entirely frontend-side
+(`_pick_and_save_combi()`/`_pick_and_load_combi()` in `frontend.py`),
+mirroring Program save/load's own existing JSON convention.
+
+**Song save/load** (`Save Song` / `Load Song` buttons, Sequencer tab): a
+song folder (`~/HDS_Songs/<name>/`) is a complete, self-contained snapshot
+of the Sequencer's 32 lanes -- each lane's own config (type, level/pan,
+MIDI channel, mute/rec/overdub, an Audio lane's own offset) round-trips
+through the same `/hds/seq/...` OSC knobs everything else already uses
+(`song.json`, plain JSON, written/read entirely by `frontend.py`), and an
+Audio lane's referenced WAV is **copied into** the folder
+(`audio/lane_<N>.wav`) so the song stays loadable even if the original
+file is later moved or deleted. A Program/MIDI lane's actual **recorded
+performance** (`SeqMidiLane.events[]` in `backend.c`) is pure runtime
+state with no OSC-addressable "current value" the way a knob has one, and
+is too large to safely fit in a UDP OSC bundle in the worst case -- so it's
+saved/loaded backend-natively instead: the frontend sends just a file path
+over OSC (`/hds/song/save_midi` / `/hds/song/load_midi`), and the backend
+does the actual file I/O directly (`hds_song_save_midi()`/
+`hds_song_load_midi()` in `backend.c`), the same "OSC carries a path
+string, the backend does the file work" shape `--sfz-vcoN`/
+`/hds/zone/load_sfz` already use for SFZ loading, applied here to a small
+custom binary dump instead. This intentionally runs synchronously on the
+Save/Load button press rather than through a dedicated background thread
+(unlike continuous WAV recording/sample streaming) -- a rare, discrete,
+user-initiated action, and even a fully-packed worst case (32 lanes x 8192
+events) is only a couple of megabytes.
+
+**Routing tab VU meters**: each of the 8 External Input pairs gets its own
+small VU meter on the `Routing` tab, filling the row's spare horizontal
+space next to the output-pair checkboxes. Metering is computed
+backend-side only while the Routing tab is actually the visible tab
+(`gui_routing_tab_visible` in `backend.c`, set by the frontend on every
+`QTabWidget.currentChanged` -- see `_on_main_tab_changed()` in
+`frontend.py`) -- a true no-op the rest of the time, not just "computed
+but ignored."
+
 ## Build & run
 
 Requires ALSA dev headers (`libasound2-dev` on Debian/Ubuntu) and liblo dev

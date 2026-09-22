@@ -554,7 +554,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
                 int velocity_127 = (int)(vel * 127.0 + 0.5);
                 dispatch_midi_event(&p->engine, &p->sample_engine, hdr->type == CLAP_EVENT_NOTE_ON ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF,
                                      (int)ev->channel + 1, (int)ev->key, velocity_127,
-                                     p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
+                                     p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live, current_tempo_bpm);
             } else if (hdr->type == CLAP_EVENT_MIDI) {
                 const clap_event_midi_t *ev = (const clap_event_midi_t *)hdr;
                 unsigned char status = ev->data[0] & 0xF0;
@@ -564,17 +564,17 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
                 if (status == 0x90 || status == 0x80) {
                     bool is_note_on = (status == 0x90 && ev->data[2] > 0);
                     dispatch_midi_event(&p->engine, &p->sample_engine, is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, ev->data[1], ev->data[2],
-                                         p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
+                                         p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live, current_tempo_bpm);
                 } else if (status == 0xB0) {
                     dispatch_midi_event(&p->engine, &p->sample_engine, HDS_MIDI_CC, midi_channel_1_16, ev->data[1], ev->data[2],
-                                         p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
+                                         p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live, current_tempo_bpm);
                 } else if (status == 0xE0) {
                     int bend14 = (int)ev->data[1] | ((int)ev->data[2] << 7);
                     dispatch_midi_event(&p->engine, &p->sample_engine, HDS_MIDI_PITCH_BEND, midi_channel_1_16, 0, bend14 - 8192,
-                                         p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
+                                         p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live, current_tempo_bpm);
                 } else if (status == 0xD0) {
                     dispatch_midi_event(&p->engine, &p->sample_engine, HDS_MIDI_CHANNEL_PRESSURE, midi_channel_1_16, 0, ev->data[1],
-                                         p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live);
+                                         p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live, current_tempo_bpm);
                 }
             }
         }
@@ -617,7 +617,11 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         // instance's render clobber another's mid-flight, a real cross-instance data race this
         // multi-instance pass exists to eliminate, not reintroduce.
         float chunk_buffer[BUFFER_SIZE * 2];
-        float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer, current_tempo_bpm);
+        // No Routing tab exists for a CLAP plugin instance's own OSC control surface to report
+        // visibility for (see gui_routing_tab_visible's own comment) -- ext_in_peak_scratch is
+        // therefore always all-zero (gui_routing_tab_visible defaults to 0) and simply discarded.
+        float ext_in_peak_scratch[EXT_IN_PAIR_COUNT];
+        float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer, current_tempo_bpm, ext_in_peak_scratch);
         if (peak > block_peak) block_peak = peak;
 
         if (out) {

@@ -280,6 +280,18 @@ typedef struct {
     float cutoff_mod_source_cc;
 } FilterParams;
 
+// One band of a Program's post-filter 3-band EQ (see ProgramState.eq_bands[3] and
+// run_eq_band()/render_audio_block's EQ dispatch for the DSP). Band 0 = Low Shelf, band 1 = Mid
+// Peak, band 2 = High Shelf -- a standard channel-strip topology, RBJ Audio-EQ-Cookbook biquad
+// forms (shelf bands ignore `q`, using a fixed shelf slope instead -- see run_eq_band()). All
+// gain in dB, +-18dB range (generous for tone-shaping without inviting a full mixing-console's
+// worth of gain-staging risk); freq in Hz.
+typedef struct {
+    float freq;
+    float gain_db;
+    float q; // Mid Peak only; ignored for the two Shelf bands
+} EqBandParams;
+
 // One lane in the Combi/Sequencer 32-lane pool (see SEQ_LANE_COUNT's own comment above). Purely
 // a mixer-strip + assignment data model this pass -- nothing in render_audio_block reads any of
 // these fields yet. Combi mode shows only lanes 0-15 (implicitly Program/MIDI, never Audio) with
@@ -606,6 +618,14 @@ typedef struct {
                               // divisor that averages however many slots are actually active).
     FilterParams filters[5];
 
+    // Post-filter 3-band EQ (Low Shelf / Mid Peak / High Shelf) -- see EqBandParams' own comment.
+    // Deliberately placed after the filter chain in the signal path (render_audio_block applies it
+    // to each Program's own fully-mixed/filtered bus, once per sample, not per voice -- see the
+    // "Multi-source bus dispatch" section) rather than per-voice like the filters above: an EQ is
+    // cheap tone-shaping on an already-summed signal, not a per-voice resonant effect, so doing it
+    // once per Program per sample (not once per voice per sample) is both correct and far cheaper.
+    EqBandParams eq_bands[3];
+
     // Active LFO Mapping Items (LFO_COUNT=16 LFOs * 7 Properties, incl. phase offset + mod source CC)
     PackLfoParams lfo[LFO_COUNT];
 
@@ -848,6 +868,13 @@ typedef struct {
     float ext_in_enable[EXT_IN_PAIR_COUNT];
     float ext_in_gain[EXT_IN_PAIR_COUNT];
 
+    // Routing tab visibility (sent by the frontend on every QTabWidget.currentChanged, see
+    // frontend.py's own comment) -- gates render_audio_block's per-ext-in-pair peak metering
+    // (see ext_in_peak_out) so that cost is only ever paid while a player is actually looking at
+    // the Routing tab's meters, not on every block for the life of the process. Session-level,
+    // not Program-scoped -- a GUI-visibility flag, not a patch or even a rig property.
+    float gui_routing_tab_visible; // 0/1
+
     // FX Bus: FX_SLOT_COUNT slots, each assigned to one source (fx[].fx_source -- see
     // SOURCE_COUNT's own comment for the full source enumeration: Combi Programs, the Combi Mix
     // bus, and ext-in pairs) rather than implicitly processing one shared mix -- see
@@ -968,6 +995,21 @@ typedef struct {
     float seq_transport_seek_back_trigger;
     float seq_transport_seek_fwd_trigger;
 
+    // Quantize: rounds a Rec-armed lane's recorded note-ON timestamps to the nearest grid line at
+    // the engine's current tempo, so a slightly-early/late live take still lines up rhythmically
+    // on playback -- the same idea as a DAW's/hardware sequencer's record-quantize. Note-OFF
+    // timestamps are deliberately left as-played (only a note's START snaps to the grid) so note
+    // durations still reflect how long the key was actually held, rather than every note
+    // quantizing to identical grid-aligned lengths. Applied in seq_record_midi_event(), which
+    // already has this block's current_tempo_bpm threaded in from main(). seq_quantize_resolution
+    // is "grid divisions per beat" (a quarter note = 1 beat, matching every other tempo-based calc
+    // in this file, e.g. poll_metronome's beat_sec) -- 1=quarter, 2=eighth, 3=eighth triplet,
+    // 4=sixteenth, 6=sixteenth triplet, 8=32nd -- a plain divisor rather than a musical-fraction
+    // enum, so the GUI's resolution dropdown can offer exactly these values with no shared
+    // note-name vocabulary needed between frontend and backend.
+    float seq_quantize_enable;      // 0/1
+    float seq_quantize_resolution;  // grid divisions per beat, see above (default 4 = sixteenth notes)
+
     // Metronome: a plain on/off toggle (not a trigger -- this is a sustained state, unlike the
     // edge-triggered transport buttons above), engaging a cheap, hardcoded 400Hz/8ms square-wave
     // click on each beat while the transport is PLAYING. See poll_metronome()/the click-render
@@ -998,6 +1040,17 @@ typedef struct {
     float combi_lane_key_hi[COMBI_PROGRAM_COUNT];
     float combi_lane_vel_lo[COMBI_PROGRAM_COUNT];
     float combi_lane_vel_hi[COMBI_PROGRAM_COUNT];
+
+    // Combi mode: per-lane transpose, in semitones (-48..48, centered at 0) -- lets the same or
+    // different Programs be stacked at different octaves for a thicker layered sound ("octave
+    // layering"). Session-level, same placement rationale as combi_lane_midi_channel/key_lo above
+    // (a property of THIS Combi performance setup, not of any one patch) -- deliberately NOT
+    // inside ProgramState, so re-picking a different Program into a lane never disturbs whatever
+    // octave that lane was set to play at. Applied as an additive cents offset alongside the
+    // global transpose_semitones knob (see mod_vco{1-4}_pitch in render_audio_block) -- the two
+    // compose cleanly since both are just more terms in the same additive-cents accumulator pitch
+    // bend and pitch_offset already use.
+    float combi_lane_transpose[COMBI_PROGRAM_COUNT];
 
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
     // "hw:1,0"), always null-terminated. main() compares these against whichever device name
@@ -1406,6 +1459,76 @@ static float run_svf_filter(float input, float cutoff_hz, float res_q, int filte
 static float run_svf_filter_p(float input, const FilterParams *p, float cutoff_mod, float res_mod, float low_state[2], float band_state[2]) {
     return run_svf_filter(input, p->cutoff + cutoff_mod, p->res_q + res_mod, (int)p->filter_type, (int)p->slope_poles, low_state, band_state);
 }
+
+// --- Post-filter 3-band EQ (see EqBandParams/ProgramState.eq_bands) ---
+// RBJ Audio-EQ-Cookbook biquad coefficients, Direct Form II Transposed (2 state variables: y =
+// b0*x + z1; z1' = b1*x - a1*y + z2; z2' = b2*x - a2*y -- the standard, numerically robust
+// implementation for a musical shelf/peak EQ band). Every coefficient here is already normalized
+// by the cookbook's own a0 (a0 == 1 implicitly), so run_eq_biquad() never needs it.
+typedef struct { float b0, b1, b2, a1, a2; } EqBiquadCoeffs;
+
+// band_index: 0 = Low Shelf, 1 = Mid Peak, 2 = High Shelf (see EqBandParams' own comment). Shelf
+// slope is fixed at S=1 (a gentle, musical shelf -- the cookbook's own suggested default): this
+// engine exposes freq/gain per shelf band, not a separate slope control, matching a typical
+// hardware channel-strip EQ rather than a fully general parametric-shelf design. gain_db==0 is a
+// true identity filter algebraically (b0=a0/b1=a1/b2=a2 before normalizing falls out of the same
+// formulas at A=1), but skipped here anyway as a cheap, explicit bypass -- no trig needed at all
+// for a band a player has left flat.
+static EqBiquadCoeffs compute_eq_band_coeffs(const EqBandParams *band, int band_index) {
+    EqBiquadCoeffs c = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f }; // transparent passthrough
+    float gain_db = fmaxf(-18.0f, fminf(18.0f, band->gain_db));
+    if (gain_db == 0.0f) return c;
+    float freq_hz = fmaxf(20.0f, fminf(20000.0f, band->freq));
+    float A = powf(10.0f, gain_db / 40.0f);
+    float w0 = 2.0f * (float)M_PI * freq_hz / (float)SAMPLE_RATE;
+    float cos_w0 = cosf(w0), sin_w0 = sinf(w0);
+    float b0, b1, b2, a0, a1, a2;
+    if (band_index == 1) {
+        float q = fmaxf(0.1f, fminf(10.0f, band->q));
+        float alpha = sin_w0 / (2.0f * q);
+        b0 = 1.0f + alpha * A;   b1 = -2.0f * cos_w0;   b2 = 1.0f - alpha * A;
+        a0 = 1.0f + alpha / A;   a1 = -2.0f * cos_w0;   a2 = 1.0f - alpha / A;
+    } else {
+        const float S = 1.0f; // shelf slope, see this function's own comment
+        float alpha = sin_w0 / 2.0f * sqrtf((A + 1.0f / A) * (1.0f / S - 1.0f) + 2.0f);
+        float sqrtA2alpha = 2.0f * sqrtf(A) * alpha;
+        if (band_index == 0) { // Low Shelf
+            b0 =        A * ((A + 1.0f) - (A - 1.0f) * cos_w0 + sqrtA2alpha);
+            b1 =  2.0f * A * ((A - 1.0f) - (A + 1.0f) * cos_w0);
+            b2 =        A * ((A + 1.0f) - (A - 1.0f) * cos_w0 - sqrtA2alpha);
+            a0 =             (A + 1.0f) + (A - 1.0f) * cos_w0 + sqrtA2alpha;
+            a1 =       -2.0f * ((A - 1.0f) + (A + 1.0f) * cos_w0);
+            a2 =             (A + 1.0f) + (A - 1.0f) * cos_w0 - sqrtA2alpha;
+        } else { // High Shelf (band_index == 2)
+            b0 =        A * ((A + 1.0f) + (A - 1.0f) * cos_w0 + sqrtA2alpha);
+            b1 = -2.0f * A * ((A - 1.0f) + (A + 1.0f) * cos_w0);
+            b2 =        A * ((A + 1.0f) + (A - 1.0f) * cos_w0 - sqrtA2alpha);
+            a0 =             (A + 1.0f) - (A - 1.0f) * cos_w0 + sqrtA2alpha;
+            a1 =        2.0f * ((A - 1.0f) - (A + 1.0f) * cos_w0);
+            a2 =             (A + 1.0f) - (A - 1.0f) * cos_w0 - sqrtA2alpha;
+        }
+    }
+    float inv_a0 = 1.0f / a0;
+    c.b0 = b0 * inv_a0; c.b1 = b1 * inv_a0; c.b2 = b2 * inv_a0;
+    c.a1 = a1 * inv_a0; c.a2 = a2 * inv_a0;
+    return c;
+}
+
+static inline float run_eq_biquad(float input, const EqBiquadCoeffs *c, float *z1, float *z2) {
+    float y = c->b0 * input + *z1;
+    float new_z1 = c->b1 * input - c->a1 * y + *z2;
+    float new_z2 = c->b2 * input - c->a2 * y;
+    // Same defense-in-depth hard state clamp as run_svf_filter's own low_state/band_state -- see
+    // its comment for the rationale (a held note running this recursively for minutes should
+    // degrade to a recoverable clip, never a permanent NaN/Inf lockup, however unlikely).
+    *z1 = fmaxf(-1.0e6f, fminf(1.0e6f, new_z1));
+    *z2 = fmaxf(-1.0e6f, fminf(1.0e6f, new_z2));
+    return y;
+}
+
+// apply_program_eq() (cascades all 3 bands over one Program's bus) lives further down, right
+// before render_audio_block -- it needs HdsEngineState, which isn't a complete type yet at this
+// point in the file (see HdsEngineState's own comment on why it's declared so late).
 
 // Persistent per-slot engine state for the FX bus -- deliberately kept OUT of the wire struct
 // (SynthSharedControls only carries each slot's user-facing params). `state` is an opaque
@@ -3111,6 +3234,36 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSUBARRAY_AT("/hds/combi/6/filter/%d/cc_source", filters, FilterParams, cutoff_mod_source_cc, 5, 6),
     OSC_PSUBARRAY_AT("/hds/combi/7/filter/%d/cc_source", filters, FilterParams, cutoff_mod_source_cc, 5, 7),
 
+    // --- Post-filter 3-band EQ (eq_bands[3], EqBandParams -- 0=Low Shelf, 1=Mid Peak, 2=High
+    // Shelf, see EqBandParams' own comment) ---
+    OSC_PSUBARRAY("/hds/eq/%d/freq", eq_bands, EqBandParams, freq, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/eq/%d/freq", eq_bands, EqBandParams, freq, 3, 0),
+    OSC_PSUBARRAY_AT("/hds/combi/1/eq/%d/freq", eq_bands, EqBandParams, freq, 3, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/eq/%d/freq", eq_bands, EqBandParams, freq, 3, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/eq/%d/freq", eq_bands, EqBandParams, freq, 3, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/eq/%d/freq", eq_bands, EqBandParams, freq, 3, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/eq/%d/freq", eq_bands, EqBandParams, freq, 3, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/eq/%d/freq", eq_bands, EqBandParams, freq, 3, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/eq/%d/freq", eq_bands, EqBandParams, freq, 3, 7),
+    OSC_PSUBARRAY("/hds/eq/%d/gain", eq_bands, EqBandParams, gain_db, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/eq/%d/gain", eq_bands, EqBandParams, gain_db, 3, 0),
+    OSC_PSUBARRAY_AT("/hds/combi/1/eq/%d/gain", eq_bands, EqBandParams, gain_db, 3, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/eq/%d/gain", eq_bands, EqBandParams, gain_db, 3, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/eq/%d/gain", eq_bands, EqBandParams, gain_db, 3, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/eq/%d/gain", eq_bands, EqBandParams, gain_db, 3, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/eq/%d/gain", eq_bands, EqBandParams, gain_db, 3, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/eq/%d/gain", eq_bands, EqBandParams, gain_db, 3, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/eq/%d/gain", eq_bands, EqBandParams, gain_db, 3, 7),
+    OSC_PSUBARRAY("/hds/eq/%d/q", eq_bands, EqBandParams, q, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/0/eq/%d/q", eq_bands, EqBandParams, q, 3, 0),
+    OSC_PSUBARRAY_AT("/hds/combi/1/eq/%d/q", eq_bands, EqBandParams, q, 3, 1),
+    OSC_PSUBARRAY_AT("/hds/combi/2/eq/%d/q", eq_bands, EqBandParams, q, 3, 2),
+    OSC_PSUBARRAY_AT("/hds/combi/3/eq/%d/q", eq_bands, EqBandParams, q, 3, 3),
+    OSC_PSUBARRAY_AT("/hds/combi/4/eq/%d/q", eq_bands, EqBandParams, q, 3, 4),
+    OSC_PSUBARRAY_AT("/hds/combi/5/eq/%d/q", eq_bands, EqBandParams, q, 3, 5),
+    OSC_PSUBARRAY_AT("/hds/combi/6/eq/%d/q", eq_bands, EqBandParams, q, 3, 6),
+    OSC_PSUBARRAY_AT("/hds/combi/7/eq/%d/q", eq_bands, EqBandParams, q, 3, 7),
+
     // --- LFOs (lfo[LFO_COUNT], PackLfoParams) ---
     OSC_PSUBARRAY("/hds/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT),
     OSC_PSUBARRAY_AT("/hds/combi/0/lfo/%d/wave", lfo, PackLfoParams, wave_type, LFO_COUNT, 0),
@@ -3521,6 +3674,7 @@ static const OscParamEntry OSC_PARAMS[] = {
 
     OSC_ARRAY("/hds/ext_in/%d/enable", ext_in_enable, EXT_IN_PAIR_COUNT),
     OSC_ARRAY("/hds/ext_in/%d/gain", ext_in_gain, EXT_IN_PAIR_COUNT),
+    OSC_SCALAR("/hds/gui/routing_tab_visible", gui_routing_tab_visible),
 
     // --- FX Bus (fx[FX_SLOT_COUNT], FXSlotParams) ---
     OSC_SUBARRAY("/hds/fx/%d/type", fx, FXSlotParams, fx_type, FX_SLOT_COUNT),
@@ -3936,12 +4090,15 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/seq/transport/seek_back", seq_transport_seek_back_trigger),
     OSC_SCALAR("/hds/seq/transport/seek_fwd", seq_transport_seek_fwd_trigger),
     OSC_SCALAR("/hds/seq/transport/metronome", metronome_enable),
+    OSC_SCALAR("/hds/seq/quantize/enable", seq_quantize_enable),
+    OSC_SCALAR("/hds/seq/quantize/resolution", seq_quantize_resolution),
 
     OSC_ARRAY("/hds/combi/%d/midi_channel", combi_lane_midi_channel, COMBI_PROGRAM_COUNT),
     OSC_ARRAY("/hds/combi/%d/key_lo", combi_lane_key_lo, COMBI_PROGRAM_COUNT),
     OSC_ARRAY("/hds/combi/%d/key_hi", combi_lane_key_hi, COMBI_PROGRAM_COUNT),
     OSC_ARRAY("/hds/combi/%d/vel_lo", combi_lane_vel_lo, COMBI_PROGRAM_COUNT),
     OSC_ARRAY("/hds/combi/%d/vel_hi", combi_lane_vel_hi, COMBI_PROGRAM_COUNT),
+    OSC_ARRAY("/hds/combi/%d/transpose", combi_lane_transpose, COMBI_PROGRAM_COUNT),
 
     OSC_STRING("/hds/device/output", output_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/input", input_device, AUDIO_DEVICE_NAME_LEN),
@@ -4155,6 +4312,13 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->programs[0].filters[f].slope_poles = 0.0f; knobs->programs[0].filters[f].filter_type = 0.0f; // Off
         knobs->programs[0].filters[f].key_track = 0.0f; knobs->programs[0].filters[f].cutoff_mod_source_cc = -1.0f;
     }
+    // Post-filter 3-band EQ: flat (0dB) by default on every band -- see compute_eq_band_coeffs'
+    // own "gain_db==0 is a true bypass" comment, so a fresh patch pays no EQ cost at all until a
+    // player actually reaches for it. Freq defaults are just sensible starting points for each
+    // band's own useful range (Low Shelf/Mid Peak/High Shelf).
+    knobs->programs[0].eq_bands[0].freq = 100.0f;  knobs->programs[0].eq_bands[0].gain_db = 0.0f; knobs->programs[0].eq_bands[0].q = 0.707f;
+    knobs->programs[0].eq_bands[1].freq = 1000.0f; knobs->programs[0].eq_bands[1].gain_db = 0.0f; knobs->programs[0].eq_bands[1].q = 0.707f;
+    knobs->programs[0].eq_bands[2].freq = 5000.0f; knobs->programs[0].eq_bands[2].gain_db = 0.0f; knobs->programs[0].eq_bands[2].q = 0.707f;
     for(int l=0; l<LFO_COUNT; l++) { knobs->programs[0].lfo[l].wave_type = 0.0f; knobs->programs[0].lfo[l].rate_hz = 5.0f; knobs->programs[0].lfo[l].mod_depth = 0.0f; knobs->programs[0].lfo[l].key_sync = 1.0f; knobs->programs[0].lfo[l].dest_target = 0.0f; knobs->programs[0].lfo[l].phase_offset = 0.0f; knobs->programs[0].lfo[l].mod_source_cc = -1.0f; knobs->programs[0].lfo[l].per_key_mode = 0.0f; knobs->programs[0].lfo[l].key_track = 0.0f; knobs->programs[0].lfo[l].vel_track = 0.0f; knobs->programs[0].lfo[l].tempo_sync_division = 0.0f; knobs->programs[0].lfo[l].curve_drive = 0.0f; }
     for(int e=0; e<ENV_COUNT; e++) { knobs->programs[0].eg[e].d = 0.0f; knobs->programs[0].eg[e].h = 0.0f; knobs->programs[0].eg[e].a = 10.0f; knobs->programs[0].eg[e].dec = 150.0f; knobs->programs[0].eg[e].s = 80.0f; knobs->programs[0].eg[e].r = 300.0f; knobs->programs[0].eg[e].al = 0.0f; knobs->programs[0].eg[e].pk = 100.0f; knobs->programs[0].eg_mode[e] = 0.0f; }
     for(int i=0; i<ASSIGNABLE_EG_COUNT; i++) { knobs->programs[0].eg_intensity[i] = 1.0f; knobs->programs[0].eg_dest_target[i] = 0.0f; }
@@ -4216,6 +4380,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     // frontend's own dial -- which also always inits to 0 -- has sent its first packet). The
     // user always has to bring this up manually.
     for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) { knobs->ext_in_enable[p] = 0.0f; knobs->ext_in_gain[p] = 0.0f; }
+    knobs->gui_routing_tab_visible = 0.0f;
     for (int f = 0; f < FX_SLOT_COUNT; f++) {
         knobs->fx[f].fx_type = FX_TYPE_OFF;
         for (int p = 0; p < FX_SLOT_PARAM_COUNT; p++) knobs->fx[f].param[p] = 0.0f;
@@ -4278,11 +4443,14 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->seq_transport_seek_start_trigger = 0.0f;
     knobs->seq_transport_seek_back_trigger = 0.0f;
     knobs->seq_transport_seek_fwd_trigger = 0.0f;
+    knobs->seq_quantize_enable = 0.0f;
+    knobs->seq_quantize_resolution = 4.0f; // sixteenth notes
     knobs->metronome_enable = 0.0f;
     for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
         knobs->combi_lane_midi_channel[p] = 0.0f; // Omni
         knobs->combi_lane_key_lo[p] = 0.0f; knobs->combi_lane_key_hi[p] = 127.0f; // full range
         knobs->combi_lane_vel_lo[p] = 1.0f; knobs->combi_lane_vel_hi[p] = 127.0f; // full range
+        knobs->combi_lane_transpose[p] = 0.0f; // centered, no transposition
     }
     snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "default");
     snprintf(knobs->input_device, AUDIO_DEVICE_NAME_LEN, "default");
@@ -6936,6 +7104,14 @@ typedef struct {
     float         lfo_decim_last_value[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
     float         lfo_decim_target_value[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
     float         mono_noise_tilt_lp[COMBI_PROGRAM_COUNT + 1][4];
+    // Post-filter 3-band EQ biquad state (Direct Form I z^-1/z^-2 delay elements) -- one pair per
+    // Program slot per band per channel (0=L, 1=R), mirroring mono_noise_tilt_lp's own per-Program
+    // placement just above. DSP STATE, not a knob value, so it lives here on HdsEngineState rather
+    // than on ProgramState/SynthSharedControls -- same reasoning as filters[]'s own per-voice
+    // f_low/f_band state (SynthVoice), just per-Program instead of per-voice since the EQ runs
+    // once per Program per sample, not once per voice (see EqBandParams' own comment).
+    float         eq_z1[COMBI_PROGRAM_COUNT + 1][3][2];
+    float         eq_z2[COMBI_PROGRAM_COUNT + 1][3][2];
     FXSlotEngine  fx_engine[FX_SLOT_COUNT];
     bool          fx_engine_initialized;
     float         limiter_gain[OUTPUT_PAIR_MAX];
@@ -7221,7 +7397,7 @@ static void advance_transport_playhead(HdsEngineState *engine, int block_size) {
 // midi_channel_1_16 is the incoming event's own MIDI channel, already converted from ALSA's
 // 0-indexed data.note.channel to this file's 1-16 convention (matching SeqLaneState.midi_channel)
 // by the caller.
-static void seq_record_midi_event(HdsEngineState *engine, const SynthSharedControls *knobs, unsigned char type, unsigned char note, unsigned char velocity, int midi_channel_1_16) {
+static void seq_record_midi_event(HdsEngineState *engine, const SynthSharedControls *knobs, unsigned char type, unsigned char note, unsigned char velocity, int midi_channel_1_16, float current_tempo_bpm) {
     if (engine->transport_state != TRANSPORT_PLAYING) return;
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         if (knobs->seq_lanes[l].lane_type != 0.0f) continue; // Audio lanes don't record MIDI
@@ -7238,6 +7414,14 @@ static void seq_record_midi_event(HdsEngineState *engine, const SynthSharedContr
         // mid-take already made engine->transport_playhead_sec non-monotonic relative to a blind
         // append, which would have stored that event out of order.)
         float t = (float)engine->transport_playhead_sec;
+        // Quantize: note-ON only (see SynthSharedControls.seq_quantize_enable's own comment for
+        // why note-OFF is deliberately left untouched), snapped to the nearest grid line at
+        // whichever divisions-per-beat the Sequencer page's Resolution control is set to.
+        if (type == 0 && knobs->seq_quantize_enable != 0.0f) {
+            float beat_sec = 60.0f / fmaxf(1.0f, current_tempo_bpm);
+            float grid_sec = beat_sec / fmaxf(1.0f, knobs->seq_quantize_resolution);
+            t = roundf(t / grid_sec) * grid_sec;
+        }
         int idx = ml->event_count;
         while (idx > 0 && ml->events[idx - 1].time_sec > t) idx--;
         for (int j = ml->event_count; j > idx; j--) ml->events[j] = ml->events[j - 1];
@@ -7280,6 +7464,136 @@ static void seq_playback_midi_events(HdsEngineState *engine, HdsSampleEngine *se
             ml->playback_cursor++;
         }
     }
+}
+
+// --- Song save/load: recorded Sequencer MIDI data (SeqMidiLane.events[]) ---
+//
+// Everything else a "song" needs (each lane's own type/volume/pan/midi_channel/mute/rec state,
+// and an Audio lane's own audio_path/offset) already lives on SynthSharedControls, addressed by
+// the existing /hds/seq/%d/... OSC entries -- the frontend saves/restores all of that itself the
+// exact same way it already saves/restores a Program's fields, no new backend involvement needed.
+// The ONE piece that can't work that way is a Rec-armed lane's actual recorded performance
+// (SeqMidiLane.events[], up to SEQ_MIDI_EVENT_CAPACITY=8192 per lane): pure runtime state, never
+// exposed as an OSC-addressable knob at all (there's no single "current value" to read/write one
+// at a time the way a fader position is), and too large to safely shuttle over a UDP OSC bundle in
+// the worst case (32 fully-packed lanes would be several times over a single UDP datagram's
+// realistic safe size). Backend-native file I/O instead -- the same "OSC carries just a path
+// string, the backend does the actual file work" shape as --sfz-vcoN/zone_load_sfz_handler's SFZ
+// loading, applied here to this engine's own small binary dump instead of a third-party format.
+//
+// REALTIME NOTE: unlike WAV recording/sample streaming (continuous for a take's whole duration,
+// so routed through a dedicated writer/loader thread specifically to keep file I/O off the audio
+// thread), this runs synchronously on a Save/Load button click -- a rare, discrete, user-initiated
+// action, not something that happens while notes are actively being processed. A worst-case
+// fully-packed take (32 lanes x 8192 events, 8 bytes/event) is still only ~2MB, a few
+// milliseconds of disk I/O even on a slow card -- an explicitly accepted tradeoff against building
+// a whole second dedicated-thread pipeline for something this infrequent, not an oversight.
+#define HDS_SONG_MIDI_MAGIC 0x48445351u // "HDSQ" as a little-endian u32
+#define HDS_SONG_MIDI_VERSION 1u
+
+static void hds_song_write_u32(FILE *f, uint32_t v) {
+    uint8_t b[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
+    fwrite(b, 1, 4, f);
+}
+static uint32_t hds_song_read_u32(FILE *f) {
+    uint8_t b[4] = {0};
+    if (fread(b, 1, 4, f) != 4) return 0;
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+static void hds_song_write_f32(FILE *f, float v) {
+    uint32_t bits; memcpy(&bits, &v, sizeof(bits));
+    hds_song_write_u32(f, bits);
+}
+static float hds_song_read_f32(FILE *f) {
+    uint32_t bits = hds_song_read_u32(f);
+    float v; memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+// Writes every lane's recorded MIDI events to file_path (created/overwritten). Format: magic (u32)
+// + version (u32) + lane count (u32), then per lane: event_count (u32) followed by that many
+// (time_sec:f32, type:u8, note:u8, velocity:u8) records -- explicit byte-level fields throughout
+// (not a raw struct dump), so the file is portable across this project's own x86_64/aarch64
+// targets regardless of either platform's struct padding/alignment rules.
+static bool hds_song_save_midi(const HdsEngineState *engine, const char *file_path) {
+    FILE *f = fopen(file_path, "wb");
+    if (!f) return false;
+    hds_song_write_u32(f, HDS_SONG_MIDI_MAGIC);
+    hds_song_write_u32(f, HDS_SONG_MIDI_VERSION);
+    hds_song_write_u32(f, (uint32_t)SEQ_LANE_COUNT);
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        const SeqMidiLane *ml = &engine->seq_midi[l];
+        hds_song_write_u32(f, (uint32_t)ml->event_count);
+        for (int e = 0; e < ml->event_count; e++) {
+            hds_song_write_f32(f, ml->events[e].time_sec);
+            uint8_t rec[3] = { ml->events[e].type, ml->events[e].note, ml->events[e].velocity };
+            fwrite(rec, 1, 3, f);
+        }
+    }
+    bool ok = (ferror(f) == 0);
+    fclose(f);
+    return ok;
+}
+
+// Reads back a file written by hds_song_save_midi(), replacing every lane's current recorded
+// events entirely (a real Load, not a merge) and resetting playback_cursor to 0 so Play starts
+// from the top of whatever was just loaded. A truncated/corrupt/version-mismatched file is
+// rejected wholesale, with NOTHING applied -- silently applying half a load would leave some
+// lanes holding a stale previous take and others the new one, worse than just refusing outright.
+static bool hds_song_load_midi(HdsEngineState *engine, const char *file_path) {
+    FILE *f = fopen(file_path, "rb");
+    if (!f) return false;
+    uint32_t magic = hds_song_read_u32(f);
+    uint32_t version = hds_song_read_u32(f);
+    uint32_t lane_count = hds_song_read_u32(f);
+    if (magic != HDS_SONG_MIDI_MAGIC || version != HDS_SONG_MIDI_VERSION || lane_count != (uint32_t)SEQ_LANE_COUNT || ferror(f)) {
+        fclose(f);
+        return false;
+    }
+    // Too large for main()'s stack (~2MB worst case, same reasoning as capture_buffer/RecordRing
+    // elsewhere in this file) -- static is safe here since this is only ever reached synchronously
+    // from the single OSC-dispatch thread, one call at a time (see this section's own REALTIME
+    // NOTE), never concurrently.
+    static SeqMidiLane loaded[SEQ_LANE_COUNT];
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        uint32_t count = hds_song_read_u32(f);
+        if (count > (uint32_t)SEQ_MIDI_EVENT_CAPACITY || ferror(f)) { fclose(f); return false; }
+        loaded[l].event_count = (int)count;
+        loaded[l].playback_cursor = 0;
+        for (uint32_t e = 0; e < count; e++) {
+            float t = hds_song_read_f32(f);
+            uint8_t rec[3] = {0};
+            if (fread(rec, 1, 3, f) != 3) { fclose(f); return false; }
+            loaded[l].events[e] = (SeqMidiEvent){ t, rec[0], rec[1], rec[2] };
+        }
+    }
+    fclose(f);
+    // Only commit into the real engine state once the whole file has parsed cleanly -- see this
+    // function's own "nothing applied on failure" comment.
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) engine->seq_midi[l] = loaded[l];
+    return true;
+}
+
+static int song_save_midi_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)msg;
+    HdsEngineState *engine = (HdsEngineState *)user_data;
+    if (argc != 1) return 0;
+    const char *file_path = (const char *)&argv[0]->s;
+    if (!hds_song_save_midi(engine, file_path)) {
+        fprintf(stderr, "[song] failed to save MIDI data to '%s'\n", file_path);
+    }
+    return 0;
+}
+
+static int song_load_midi_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)msg;
+    HdsEngineState *engine = (HdsEngineState *)user_data;
+    if (argc != 1) return 0;
+    const char *file_path = (const char *)&argv[0]->s;
+    if (!hds_song_load_midi(engine, file_path)) {
+        fprintf(stderr, "[song] failed to load MIDI data from '%s' (missing, unreadable, or wrong format/version)\n", file_path);
+    }
+    return 0;
 }
 
 // How many arp steps occur per quarter-note beat, indexed by ProgramState.arp_rate. Deliberately
@@ -7531,7 +7845,7 @@ static void arp_note_off(HdsEngineState *engine, const ProgramState *prog, int t
 static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, HdsMidiEventType type, int midi_channel_1_16, int data1, int value,
                                  SynthVoice voices[], SynthSharedControls *knobs,
                                  float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT],
-                                 MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], MidiLiveState *midi_live) {
+                                 MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], MidiLiveState *midi_live, float current_tempo_bpm) {
     if (type == HDS_MIDI_NOTE_ON || type == HDS_MIDI_NOTE_OFF) {
         int note = data1;
         bool is_note_on = (type == HDS_MIDI_NOTE_ON);
@@ -7594,8 +7908,8 @@ static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, Hds
         // Arp subsequently generates from it. Making Sequencer-recorded/played-back events
         // themselves feed an Arp (via seq_playback_midi_events' own separate call site) is a
         // further extension not attempted here.
-        if (is_note_on) seq_record_midi_event(engine, knobs, 0, (unsigned char)note, (unsigned char)value, midi_channel_1_16);
-        else seq_record_midi_event(engine, knobs, 1, (unsigned char)note, 0, midi_channel_1_16);
+        if (is_note_on) seq_record_midi_event(engine, knobs, 0, (unsigned char)note, (unsigned char)value, midi_channel_1_16, current_tempo_bpm);
+        else seq_record_midi_event(engine, knobs, 1, (unsigned char)note, 0, midi_channel_1_16, current_tempo_bpm);
     } else if (type == HDS_MIDI_CC) {
         int cc_num = data1;
         if (cc_num >= 0 && cc_num < 128) midi_live->cc[cc_num] = fmaxf(0.0f, fminf(1.0f, value / 127.0f));
@@ -7729,7 +8043,7 @@ static void midi_autoconnect_scan(snd_seq_t *seq, int our_port, const char *midi
 // our port to the ALSA announce port at startup (see main()'s comment on that subscription). The
 // actual musical response to each decoded event is dispatch_midi_event() above -- this function's
 // own job is purely "decode an ALSA sequencer event."
-static void process_midi_input(HdsEngineState *engine, HdsSampleEngine *se, snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live) {
+static void process_midi_input(HdsEngineState *engine, HdsSampleEngine *se, snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live, float current_tempo_bpm) {
     snd_seq_event_t *ev = NULL;
     while (snd_seq_event_input_pending(seq_handle, 1) > 0) {
         snd_seq_event_input(seq_handle, &ev); if (ev == NULL) continue;
@@ -7739,14 +8053,14 @@ static void process_midi_input(HdsEngineState *engine, HdsSampleEngine *se, snd_
             // for every call site inside dispatch_midi_event.
             int midi_channel_1_16 = (int)ev->data.note.channel + 1;
             bool is_note_on = (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0);
-            dispatch_midi_event(engine, se, is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, ev->data.note.note, ev->data.note.velocity, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, is_note_on ? HDS_MIDI_NOTE_ON : HDS_MIDI_NOTE_OFF, midi_channel_1_16, ev->data.note.note, ev->data.note.velocity, voices, knobs, global_lfo_phases, mono_stacks, midi_live, current_tempo_bpm);
         } else if (ev->type == SND_SEQ_EVENT_CONTROLLER) {
-            dispatch_midi_event(engine, se, HDS_MIDI_CC, (int)ev->data.control.channel + 1, ev->data.control.param, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, HDS_MIDI_CC, (int)ev->data.control.channel + 1, ev->data.control.param, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live, current_tempo_bpm);
         } else if (ev->type == SND_SEQ_EVENT_PITCHBEND) {
             // ALSA's own sequencer convention: value is already signed, -8192..8191, 0 = centered.
-            dispatch_midi_event(engine, se, HDS_MIDI_PITCH_BEND, (int)ev->data.control.channel + 1, 0, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, HDS_MIDI_PITCH_BEND, (int)ev->data.control.channel + 1, 0, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live, current_tempo_bpm);
         } else if (ev->type == SND_SEQ_EVENT_CHANPRESS) {
-            dispatch_midi_event(engine, se, HDS_MIDI_CHANNEL_PRESSURE, (int)ev->data.control.channel + 1, 0, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live);
+            dispatch_midi_event(engine, se, HDS_MIDI_CHANNEL_PRESSURE, (int)ev->data.control.channel + 1, 0, ev->data.control.value, voices, knobs, global_lfo_phases, mono_stacks, midi_live, current_tempo_bpm);
         } else if (ev->type == SND_SEQ_EVENT_PORT_START) {
             // A new ALSA sequencer client/port just appeared -- e.g. a USB MIDI keyboard was
             // just plugged in. Auto-connect immediately if it matches the current selection
@@ -7876,8 +8190,23 @@ static float compute_per_key_lfo_output(SynthVoice *voice, const PackLfoParams *
     return out;
 }
 
-static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm) {
+// Cascades all 3 EQ bands (Low Shelf -> Mid Peak -> High Shelf) over both channels of one
+// Program's already-mixed/filtered bus -- see render_audio_block's "Multi-source bus dispatch"
+// section for the one call site (right after each Program's bus_l/bus_r is computed, before FX).
+static void apply_program_eq(HdsEngineState *engine, int p, const EqBiquadCoeffs coeffs[3], float *l, float *r) {
+    for (int b = 0; b < 3; b++) {
+        *l = run_eq_biquad(*l, &coeffs[b], &engine->eq_z1[p][b][0], &engine->eq_z2[p][b][0]);
+        *r = run_eq_biquad(*r, &coeffs[b], &engine->eq_z1[p][b][1], &engine->eq_z2[p][b][1]);
+    }
+}
+
+static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm, float ext_in_peak_out[EXT_IN_PAIR_COUNT]) {
     float peak = 0.0f;
+    // Routing tab's per-ext-in-pair VU meters (see gui_routing_tab_visible's own comment): a true
+    // no-op -- not just "computed but ignored" -- whenever the Routing tab isn't on-screen, so
+    // this costs nothing for the life of the process unless a player is actually looking at it.
+    for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) ext_in_peak_out[p] = 0.0f;
+    bool meter_ext_in = (knobs->gui_routing_tab_visible != 0.0f);
     // Combi mode: how many of the 8 Program slots are actually "live" this block -- 1 (just
     // program 0) outside Combi mode, all 8 inside it. Every per-program precompute below loops
     // over this many slots, NOT over which voices happen to be currently sounding -- LFOs must
@@ -7932,6 +8261,15 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         pb_bend_cents[p] = (midi_live->pitch_bend >= 0.0f)
             ? midi_live->pitch_bend * knobs->programs[p].pb_range_up * 100.0f
             : midi_live->pitch_bend * knobs->programs[p].pb_range_down * 100.0f;
+    }
+
+    // Post-filter 3-band EQ coefficients (see EqBandParams/compute_eq_band_coeffs): the 3 knobs
+    // per band are constant for the whole block (no mod-matrix destination targets them), so
+    // computing each Program's biquad coefficients once here -- not once per sample -- is both
+    // correct and far cheaper than redoing the trig 3 bands x up to 9 Programs x every sample.
+    EqBiquadCoeffs eq_coeffs[COMBI_PROGRAM_COUNT + 1][3];
+    for (int p = 0; p <= COMBI_PROGRAM_COUNT; p++) {
+        for (int b = 0; b < 3; b++) eq_coeffs[p][b] = compute_eq_band_coeffs(&knobs->programs[p].eq_bands[b], b);
     }
 
     // One-sample-delayed feedback state for LFO Phase modulation: holds each LFO's phase-shift
@@ -8243,10 +8581,16 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             // so it retunes already-held notes live without disturbing Key Track/note-off
             // matching (both of which read midi_note directly).
             float transpose_cents = knobs->transpose_semitones * 100.0f;
-            float mod_vco1_pitch = prog->vco1_fine_tune + prog->vco1_pitch + pb_bend_cents[pidx] + transpose_cents;
-            float mod_vco2_pitch = prog->vco2_fine_tune + (prog->vco2_pitch_offset * 100.0f) + prog->vco2_pitch + pb_bend_cents[pidx] + transpose_cents;
-            float mod_vco3_pitch = prog->vco3_fine_tune + (prog->vco3_pitch_offset * 100.0f) + prog->vco3_pitch + pb_bend_cents[pidx] + transpose_cents;
-            float mod_vco4_pitch = prog->vco4_fine_tune + (prog->vco4_pitch_offset * 100.0f) + prog->vco4_pitch + pb_bend_cents[pidx] + transpose_cents;
+            // Combi per-lane transpose (octave layering): an additional additive-cents term,
+            // exactly like transpose_cents above, but per-Combi-lane instead of global -- see
+            // SynthSharedControls.combi_lane_transpose's own comment. Only meaningful for the 8
+            // real Combi lanes (pidx 0-7); SINGLE_PROGRAM_SLOT (pidx==COMBI_PROGRAM_COUNT) has no
+            // lane to look up, so it contributes nothing there, same as today.
+            float combi_transpose_cents = (pidx < COMBI_PROGRAM_COUNT) ? knobs->combi_lane_transpose[pidx] * 100.0f : 0.0f;
+            float mod_vco1_pitch = prog->vco1_fine_tune + prog->vco1_pitch + pb_bend_cents[pidx] + transpose_cents + combi_transpose_cents;
+            float mod_vco2_pitch = prog->vco2_fine_tune + (prog->vco2_pitch_offset * 100.0f) + prog->vco2_pitch + pb_bend_cents[pidx] + transpose_cents + combi_transpose_cents;
+            float mod_vco3_pitch = prog->vco3_fine_tune + (prog->vco3_pitch_offset * 100.0f) + prog->vco3_pitch + pb_bend_cents[pidx] + transpose_cents + combi_transpose_cents;
+            float mod_vco4_pitch = prog->vco4_fine_tune + (prog->vco4_pitch_offset * 100.0f) + prog->vco4_pitch + pb_bend_cents[pidx] + transpose_cents + combi_transpose_cents;
             float mod_vco1_amp = 0.0f, mod_vco2_amp = 0.0f, fm_mod = 0.0f, mix_bal = 0.0f;
             // Filter cutoff/resonance mod destinations -- one flat slot per filter (0-4), targets
             // 90-99 (see the frontend's matrix_shared_routes comment). Key Track and ext-MIDI CC/
@@ -8864,6 +9208,11 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
             bus_l[p] = mixed_l[p] * (*master_volume_smoothed) * combi_lane_gain_l[p];
             bus_r[p] = mixed_r[p] * (*master_volume_smoothed) * combi_lane_gain_r[p];
+            // Post-filter, pre-FX 3-band EQ -- see EqBandParams/apply_program_eq's own comment.
+            // Gain-order-independent (both master_volume/combi_lane_gain above and this EQ are
+            // linear), so applying it here vs. before the *master_volume_smoothed scaling is
+            // equivalent -- done here since bus_l/bus_r are what's actually already in hand.
+            apply_program_eq(engine, p, eq_coeffs[p], &bus_l[p], &bus_r[p]);
             combi_mix_l += bus_l[p];
             combi_mix_r += bus_r[p];
         }
@@ -8875,6 +9224,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         if (!combi_mode_active) {
             bus_l[0] = mixed_l[SINGLE_PROGRAM_SLOT] * (*master_volume_smoothed);
             bus_r[0] = mixed_r[SINGLE_PROGRAM_SLOT] * (*master_volume_smoothed);
+            apply_program_eq(engine, SINGLE_PROGRAM_SLOT, eq_coeffs[SINGLE_PROGRAM_SLOT], &bus_l[0], &bus_r[0]);
             combi_mix_l = bus_l[0];
             combi_mix_r = bus_r[0];
         }
@@ -8895,6 +9245,10 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                 float r = (2 * p + 1 < ext_in_channels) ? ext_in_buffer[i * ext_in_channels + 2 * p + 1] : l;
                 bus_l[src] = l * knobs->ext_in_gain[p];
                 bus_r[src] = r * knobs->ext_in_gain[p];
+                if (meter_ext_in) {
+                    float pair_peak = fmaxf(fabsf(bus_l[src]), fabsf(bus_r[src]));
+                    if (pair_peak > ext_in_peak_out[p]) ext_in_peak_out[p] = pair_peak;
+                }
             }
         }
 
@@ -10104,6 +10458,11 @@ typedef struct {
     // recorder's own unrelated recording-duration counter.
     float seq_elapsed_seconds;
     float seq_transport_state; // 0 = stopped, 1 = playing, 2 = paused -- see TransportState
+    // Routing tab's per-ext-in-pair VU meters -- only ever non-zero while gui_routing_tab_visible
+    // is set (see render_audio_block's own ext_in_peak_out comment); zero the rest of the time,
+    // same "computed and sent every status tick regardless, just usually zero" shape as peak
+    // itself rather than a separate conditional message.
+    float ext_in_peak[EXT_IN_PAIR_COUNT];
 } EngineStatus;
 
 // Sends the GUI-status snapshot as one OSC bundle (one UDP datagram, 8 messages) to the reply
@@ -10123,6 +10482,11 @@ static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
     m = lo_message_new(); lo_message_add_float(m, status->tempo_bpm_live); lo_bundle_add_message(b, "/hds/status/tempo_bpm_live", m);
     m = lo_message_new(); lo_message_add_float(m, status->seq_elapsed_seconds); lo_bundle_add_message(b, "/hds/status/seq_elapsed_seconds", m);
     m = lo_message_new(); lo_message_add_float(m, status->seq_transport_state); lo_bundle_add_message(b, "/hds/status/seq_transport_state", m);
+    for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) {
+        char addr[40];
+        snprintf(addr, sizeof(addr), "/hds/status/ext_in_peak/%d", p);
+        m = lo_message_new(); lo_message_add_float(m, status->ext_in_peak[p]); lo_bundle_add_message(b, addr, m);
+    }
     lo_send_bundle(reply_addr, b);
     lo_bundle_free_recursive(b); // frees the bundle AND every message added to it
 }
@@ -10237,6 +10601,8 @@ int main(int argc, char **argv) {
     lo_server_add_method(osc_server, "/hds/zone/upsert", "i" "ffffffffffffffffff" "s", zone_upsert_handler, &g_sample_engine);
     lo_server_add_method(osc_server, "/hds/zone/remove", "i", zone_remove_handler, &g_sample_engine);
     lo_server_add_method(osc_server, "/hds/zone/load_sfz", "is", zone_load_sfz_handler, &g_sample_engine);
+    lo_server_add_method(osc_server, "/hds/song/save_midi", "s", song_save_midi_handler, &g_engine);
+    lo_server_add_method(osc_server, "/hds/song/load_midi", "s", song_load_midi_handler, &g_engine);
     lo_server_add_method(osc_server, NULL, NULL, generic_osc_handler, &active_knobs);
 
     char osc_reply_port_str[16]; snprintf(osc_reply_port_str, sizeof(osc_reply_port_str), "%d", osc_reply_port);
@@ -10436,7 +10802,7 @@ int main(int argc, char **argv) {
         // block (see its #define for the real-time trade-off this bounds).
         drain_pending_sample_loads(&g_sample_engine);
 
-        process_midi_input(&g_engine, &g_sample_engine, seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live);
+        process_midi_input(&g_engine, &g_sample_engine, seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live, current_tempo_bpm);
         seq_playback_midi_events(&g_engine, &g_sample_engine, voices, &active_knobs, global_lfo_phases, &mono_stacks[SINGLE_PROGRAM_SLOT], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets SINGLE_PROGRAM_SLOT)
 
         // block_size/voice_limit are computed fresh every iteration since both are live,
@@ -10478,7 +10844,8 @@ int main(int argc, char **argv) {
         static float buffer[BUFFER_SIZE * OUTPUT_MAX_CHANNELS];
         struct timespec render_t0, render_t1;
         clock_gettime(CLOCK_MONOTONIC, &render_t0);
-        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer, current_tempo_bpm);
+        float ext_in_peak[EXT_IN_PAIR_COUNT];
+        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer, current_tempo_bpm, ext_in_peak);
         clock_gettime(CLOCK_MONOTONIC, &render_t1);
         double render_ms = (render_t1.tv_sec - render_t0.tv_sec) * 1000.0 + (render_t1.tv_nsec - render_t0.tv_nsec) / 1e6;
         double budget_ms = (block_size / (double)SAMPLE_RATE) * 1000.0;
@@ -10573,6 +10940,7 @@ int main(int argc, char **argv) {
                 .seq_elapsed_seconds = (float)g_transport_playhead_sec,
                 .seq_transport_state = (float)g_transport_state,
             };
+            for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) status.ext_in_peak[p] = ext_in_peak[p];
             send_osc_status(osc_reply_addr, &status);
             send_seq_audio_status(&g_streams_state, osc_reply_addr);
             vu_decimator = 0;
