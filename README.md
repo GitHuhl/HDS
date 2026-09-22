@@ -1161,6 +1161,39 @@ failure -- an immediate post-connect knob touch, with zero artificial
 delay -- both before this fix (a full default-laden packet went out) and
 after (nothing goes out until the real state has actually landed).
 
+### `/hds/request_state` never actually worked -- not a race, dead on arrival every time
+
+Every fix above (the Sequencer/Combi/FX-routing/tempo/tuning restore gaps,
+then the reconnect-race guard) was real and independently verified, but
+none of them mattered in practice: the state-pull mechanism they all
+depend on -- a frontend sending `/hds/request_state` and the backend
+replying with its live values -- never actually ran, in either the CLAP
+plugin or the standalone engine, from the moment it was first added.
+Root-caused by writing a minimal liblo C harness that reproduces the
+exact method-registration pattern both `backend.c` and `clap_plugin.c`
+used: `generic_osc_handler` -- a real catch-all registered with a NULL
+path and NULL types, matching literally every incoming address -- was
+registered BEFORE `/hds/request_state`'s own specific handler. liblo
+tries a message's matching methods in REGISTRATION ORDER and stops at
+the first one that returns 0 ("fully handled") -- it does not prefer a
+more specific path match over a less specific one registered earlier.
+So every `/hds/request_state` message matched the catch-all first, which
+(correctly, from its own narrow perspective) treats an address absent
+from `osc_dispatch_table` as "unrecognized," logs it, and returns 0 --
+permanently preventing liblo from ever trying the real handler. Verified
+both ways with the same harness: the catch-all registered first silently
+swallows the message (the specific handler's own log line never prints);
+registering the specific handler first lets it fire correctly, with the
+catch-all still available afterward for the ~1150 plain knob addresses
+that have no handler of their own. The exact same registration-order bug
+also silently killed `/hds/song/import_smf` and `/hds/song/import_smf_track`
+(Standard MIDI File import's own OSC replies) in both files. Fixed by
+moving each file's single `generic_osc_handler` registration to be the
+LAST `lo_server_add_method()` call, after every specific-path handler,
+in both `backend.c` and `clap_plugin.c` -- this was never a race, never
+host-dependent, and never worked once before this fix, exactly as
+reported.
+
 ### Window was forced obnoxiously wide, LFO tab's knobs strayed from their labels
 
 Measuring `SynthGui`'s own minimum size hint traced this to the Sequencer

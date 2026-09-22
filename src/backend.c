@@ -12142,7 +12142,22 @@ int main(int argc, char **argv) {
     lo_server_add_method(osc_server, "/hds/song/save_midi", "s", song_save_midi_handler, &g_engine);
     lo_server_add_method(osc_server, "/hds/song/load_midi", "s", song_load_midi_handler, &g_engine);
     lo_server_add_method(osc_server, "/hds/tuning/load_scl", "s", tuning_load_scl_handler, NULL);
-    lo_server_add_method(osc_server, NULL, NULL, generic_osc_handler, &active_knobs);
+    // generic_osc_handler (registered below, once every specific-path method above AND below is
+    // registered) is a real catch-all: NULL path, NULL types, matching literally everything. Bug
+    // fix: liblo tries a message's matching methods in REGISTRATION ORDER and stops at the first
+    // one that returns 0 ("fully handled") -- it does NOT prefer a more specific path match over
+    // a less specific one registered earlier. This catch-all used to be registered HERE, before
+    // /hds/request_state and the two /hds/song/import_smf* handlers below -- meaning every single
+    // message to any of those three addresses matched THIS handler first, which (correctly, from
+    // its own perspective) treats an address absent from osc_dispatch_table as "unrecognized,"
+    // logs it, and returns 0 -- permanently preventing liblo from EVER trying the real, specific
+    // handler for that address. /hds/request_state -- the entire "pull this instance's live state
+    // on connect" mechanism a DAW-restored CLAP patch depends on -- was silently, deterministically
+    // dead code from the moment it was added: not a race, not host-dependent, never worked once.
+    // Registering this catch-all LAST (after every specific method, including the three below)
+    // fixes it: liblo now reaches the specific handler for any of those exact addresses first,
+    // and only truly falls through to this catch-all for the ~1150 plain knob addresses that have
+    // no specific method of their own -- exactly its original intent.
 
     char osc_reply_port_str[16]; snprintf(osc_reply_port_str, sizeof(osc_reply_port_str), "%d", osc_reply_port);
     lo_address osc_reply_addr = lo_address_new(osc_reply_host, osc_reply_port_str);
@@ -12164,6 +12179,10 @@ int main(int argc, char **argv) {
     // needs-osc_reply_addr reason as the two contexts just above.
     HdsSmfTrackImportContext smf_import_track_ctx = { &g_engine, osc_reply_addr };
     lo_server_add_method(osc_server, "/hds/song/import_smf_track", "sf", song_import_smf_track_handler, &smf_import_track_ctx);
+
+    // The real catch-all, registered LAST -- see its own comment above (right after the
+    // /hds/tuning/load_scl registration) for why registration order here is load-bearing.
+    lo_server_add_method(osc_server, NULL, NULL, generic_osc_handler, &active_knobs);
 
     // --sfz-vcoN startup loading: right here, after the OSC methods are registered (so a
     // subsequent /hds/zone/load_sfz can still layer on top live) but before open_pcm_stream()

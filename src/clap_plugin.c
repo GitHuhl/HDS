@@ -681,7 +681,6 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         lo_server_add_method(p->osc_server, "/hds/zone/upsert", "i" "ffffffffffffffffff" "s", zone_upsert_handler, &p->sample_engine);
         lo_server_add_method(p->osc_server, "/hds/zone/remove", "i", zone_remove_handler, &p->sample_engine);
         lo_server_add_method(p->osc_server, "/hds/zone/load_sfz", "is", zone_load_sfz_handler, &p->sample_engine);
-        lo_server_add_method(p->osc_server, NULL, NULL, generic_osc_handler, &p->knobs);
         char reply_port_str[16]; snprintf(reply_port_str, sizeof(reply_port_str), "%d", p->osc_reply_port);
         p->osc_reply_addr = lo_address_new(CLAP_OSC_REPLY_HOST, reply_port_str);
         // Registered here rather than in the block above -- needs p->osc_reply_addr, just resolved
@@ -697,6 +696,23 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         p->smf_import_track_ctx.engine = &p->engine;
         p->smf_import_track_ctx.reply_addr = p->osc_reply_addr;
         lo_server_add_method(p->osc_server, "/hds/song/import_smf_track", "sf", song_import_smf_track_handler, &p->smf_import_track_ctx);
+        // Bug fix: this catch-all (NULL path, NULL types -- matches every address) used to be
+        // registered FIRST, right after the three /hds/zone/* methods above. liblo tries a
+        // message's matching methods in REGISTRATION ORDER and stops at the first one that
+        // returns 0 ("fully handled") -- it does NOT prefer a more specific path match over a
+        // less specific one registered earlier. So every message to /hds/request_state or either
+        // /hds/song/import_smf* address matched THIS handler first, which (correctly, from its
+        // own perspective) treats an address absent from osc_dispatch_table as "unrecognized,"
+        // logs it, and returns 0 -- permanently preventing liblo from EVER trying the real,
+        // specific handler for that address. /hds/request_state -- the entire "pull this
+        // instance's live state on connect" mechanism a DAW-restored patch depends on -- was
+        // silently, deterministically dead code from the moment it was added: not a race, not
+        // host-dependent, never worked once, regardless of any frontend.py-side fix. Registering
+        // this catch-all LAST (after every specific method above) fixes it: liblo now reaches the
+        // specific handler for any of those exact addresses first, and only truly falls through
+        // to this catch-all for the ~1150 plain knob addresses that have no specific method of
+        // their own -- exactly its original intent.
+        lo_server_add_method(p->osc_server, NULL, NULL, generic_osc_handler, &p->knobs);
         p->osc_ready = true;
         fprintf(stderr, "[hds-clap] OSC listening on UDP port %d, status replies to %s:%d\n", p->osc_listen_port, CLAP_OSC_REPLY_HOST, p->osc_reply_port);
         if (p->host && p->host->get_extension) {
