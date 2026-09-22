@@ -1119,3 +1119,44 @@ back to flat/12-TET, and that function's own trailing
 erasing the real values rather than just failing to display them. Fixed
 by restoring both directly inside `_apply_program_fields()`, which fixes
 Program Load too, not just reconnect.
+
+A third pass found the actual root cause of reconnecting still silently
+corrupting a DAW-restored CLAP patch even with every field above correctly
+restorable: a genuine race, invisible to a script that feeds
+`_apply_full_state_fields()` a ready-made dict directly (how every fix
+above was verified) rather than exercising the real, asynchronous
+`/hds/request_state` round trip over actual sockets. `transmit_knob_packet()`'s
+very first-ever call after connecting -- from ANY connected signal,
+including the user simply touching a single knob -- sends a full snapshot
+of every widget's CURRENT value, since its own change-tracking dict
+(`_last_wire_state`) starts empty (see that function's own "first call
+after startup... sends everything" comment -- a deliberate, correct
+design for a genuinely fresh/never-configured backend). But if that first
+touch happens before the async state pull (send request -> backend builds
+a ~1150-field reply -> several chunked bundles arrive over possibly
+several polls -> a sentinel closes it out -> `_apply_full_state_fields()`
+applies it) has actually finished, this frontend's own construction-time
+defaults are still sitting in every widget the reply hasn't reached yet --
+so that first-ever transmit sends e.g. every oscillator reset to Off,
+permanently overwriting the DAW's real state, with the correct dump either
+arriving too late to matter or arriving into a backend that's already been
+overwritten. A real user has no reason to wait for an invisible background
+request before touching a knob, and reconnecting to a busy/loaded backend
+serving other instances makes the round trip slower, not faster -- so this
+wasn't a rare edge case, it was the common one. Fixed with an explicit
+guard (`_pending_state_restore`, set by `_begin_state_restore_guard()`):
+`transmit_knob_packet()` now refuses to send anything at all while a
+state pull is in flight (the touched widget still updates normally on
+screen -- only the OSC send is skipped), until either the dump's sentinel
+arrives (lifted from inside `_apply_program_fields()`'s own trailing
+transmit, which both call sites -- reconnect and Program Load -- funnel
+through, so a Program Load started in this same window isn't itself
+silently swallowed) or a 1.5-second timeout elapses with no reply at all
+(an old backend build that doesn't implement `/hds/request_state`, so
+normal operation resumes rather than leaving every control permanently
+inert). Verified with a real fake-backend-over-real-UDP-sockets test
+(offscreen Qt, real `pythonosc` bundle encoding/parsing, a genuine
+background thread standing in for the backend) reproducing the exact
+failure -- an immediate post-connect knob touch, with zero artificial
+delay -- both before this fix (a full default-laden packet went out) and
+after (nothing goes out until the real state has actually landed).

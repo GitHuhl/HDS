@@ -2362,6 +2362,21 @@ class SynthGui(QWidget):
         # listen_for_status_frames() polls, keyed by address exactly like _last_wire_state above,
         # until /hds/status/state_dump_complete arrives.
         self._state_dump_buffer = {}
+        # Guards against a real race that the offscreen dict-feeding tests used to develop
+        # _apply_full_state_fields() never exercised: transmit_knob_packet()'s very first-ever
+        # call (from ANY connected signal, e.g. the user simply touching a knob) sends a FULL
+        # snapshot of every current widget value, since _last_wire_state starts empty -- see that
+        # function's own "first call after startup... sends everything" comment. If the user
+        # touches ANYTHING before the async /hds/request_state round trip (send -> backend builds
+        # ~1150-field reply -> chunked bundles arrive over several listen_for_status_frames()
+        # polls -> sentinel -> _apply_full_state_fields()) has actually finished, that first-ever
+        # transmit fires with this GUI's own CONSTRUCTION-TIME DEFAULTS still sitting in every
+        # widget the reply hasn't reached yet -- permanently overwriting a DAW-restored CLAP
+        # patch's real state with e.g. every oscillator's shape reset to Off, the instant a
+        # real-world (impatient) user does anything at all before that pull completes. See
+        # _begin_state_restore_guard()/_end_state_restore_guard() and transmit_knob_packet()'s own
+        # early-return.
+        self._pending_state_restore = False
         # Reflected by _update_seq_sync_lock_label() next to the Sequencer tab's Sync combo -- see
         # /hds/status/midi_clock_locked's own comment in listen_for_status_frames().
         self._midi_clock_locked = False
@@ -6019,6 +6034,30 @@ class SynthGui(QWidget):
         self._current_program_category = category
         self._refresh_combi_program_combos()
 
+    # HDS_STATE_RESTORE_TIMEOUT_MS: safety net for _begin_state_restore_guard() below -- a normal
+    # /hds/request_state round trip over loopback completes in low single-digit milliseconds (the
+    # whole ~1150-field reply is a handful of UDP sends), so 1.5s is generous margin, not a delay
+    # users will ever actually feel, while still being short enough that connecting to an old
+    # backend build that doesn't implement /hds/request_state at all (silently never replies)
+    # doesn't leave every control feeling unresponsive for long.
+    HDS_STATE_RESTORE_TIMEOUT_MS = 1500
+
+    def _begin_state_restore_guard(self):
+        """Call right after sending /hds/request_state: suppresses transmit_knob_packet() (see its
+        own early-return) until the reply's sentinel arrives (_end_state_restore_guard(), called
+        from the state_dump_complete handler in listen_for_status_frames()) or this timeout fires,
+        whichever comes first. Without this, transmit_knob_packet()'s very first-ever call -- from
+        ANY connected signal, including the user simply touching a knob -- sends a full snapshot of
+        every widget's CURRENT value (since _last_wire_state starts empty), permanently clobbering
+        a DAW-restored CLAP patch with this fresh GUI's own construction-time defaults if that
+        first touch lands before the async state-pull finishes. See _pending_state_restore's own
+        comment in __init__."""
+        self._pending_state_restore = True
+        QTimer.singleShot(self.HDS_STATE_RESTORE_TIMEOUT_MS, self._end_state_restore_guard)
+
+    def _end_state_restore_guard(self):
+        self._pending_state_restore = False
+
     def _apply_full_state_fields(self, fields):
         """Applies a /hds/request_state reply (see listen_for_status_frames()'s sentinel
         handling) to this GUI's own widgets, so connecting to an already-configured backend
@@ -6414,6 +6453,19 @@ class SynthGui(QWidget):
             self.tuning_ref_freq_spin.setValue(float(fields["/hds/tuning/reference_freq"]))
             self.tuning_ref_freq_spin.blockSignals(False)
 
+        # Unconditionally lift the restore guard right here, not just in the state-dump sentinel
+        # handler that calls this function via _apply_full_state_fields(): this function is ALSO
+        # called directly by Program Load (loading a saved .hdsprog file), a completely separate
+        # path that never touches /hds/request_state at all. If the user loads a Program within
+        # the first HDS_STATE_RESTORE_TIMEOUT_MS after launching -- a real possibility, not just a
+        # theoretical race -- the guard set by this frontend's own boot-time state pull would still
+        # be pending, and without this, the transmit below (the ONLY thing that actually sends a
+        # freshly-loaded Program's values to the backend) would be silently swallowed, leaving the
+        # backend still holding whatever it had before the load. By the time this line runs, every
+        # widget this function is responsible for has already been set to a definitive, known-good
+        # value (either from a real backend dump or from the loaded file) -- so transmitting here
+        # is always correct, regardless of why this function was called.
+        self._end_state_restore_guard()
         self.transmit_knob_packet()
 
     def _apply_program_fields_filters(self, fields):
@@ -7150,6 +7202,10 @@ class SynthGui(QWidget):
                     # Sentinel closing out a /hds/request_state reply -- see
                     # send_full_state_dump() in backend.c. Apply everything buffered so far, then
                     # reset for next time (a stray sentinel with nothing buffered is harmless).
+                    # _apply_full_state_fields() ends by calling _apply_program_fields(), which
+                    # itself lifts the restore guard right before its own trailing
+                    # transmit_knob_packet() call -- see that function's own comment on why the
+                    # clear lives there rather than here.
                     self._apply_full_state_fields(self._state_dump_buffer)
                     self._state_dump_buffer = {}
                 elif (msg.params and not msg.address.startswith("/hds/status/")
@@ -7229,6 +7285,8 @@ class SynthGui(QWidget):
             request_msg = OscMessageBuilder(address="/hds/request_state")
             try: self.osc_client.send(request_msg.build())
             except OSError: pass
+            self._begin_state_restore_guard()
+
     def transmit_knob_packet(self):
         """Sends every knob's current value as one OSC bundle (one UDP datagram) to the backend --
         the OSC replacement for the old struct.pack'd binary_packet. Every value-computation line
@@ -7236,6 +7294,17 @@ class SynthGui(QWidget):
         message added to `bundle` via add_f()/add_s(), instead of packet_list.append()) differs.
         Addresses must match backend.c's OSC_PARAMS[] table exactly -- see
         scratchpad/check_osc_address_parity.py for the cross-check between the two."""
+        # Suppressed while an /hds/request_state reply is in flight -- see
+        # _begin_state_restore_guard()'s own comment. Without this, the very first call to this
+        # function after connecting (from ANY connected signal, e.g. the user simply touching a
+        # knob before the async state pull finishes) sends a full snapshot of every widget's
+        # CURRENT value, since _last_wire_state starts empty -- permanently overwriting a DAW-
+        # restored CLAP patch's real state with this fresh GUI's own construction-time defaults.
+        # The widget the user touched still visually updates normally (this only skips the OSC
+        # send), and the very next call once the guard lifts sends the correct, fully-restored
+        # state as its own genuine first full sync.
+        if self._pending_state_restore:
+            return
         glide_ms = self.glide_dial.value()
         self.glide_readout.setText(f"{glide_ms} ms")
         glide_random_pct = self.glide_random_dial.value()
@@ -7991,6 +8060,13 @@ def runtime_connect_and_bind(gui):
         request_msg = OscMessageBuilder(address="/hds/request_state")
         try: gui.osc_client.send(request_msg.build())
         except OSError: pass
+        # Suppress transmit_knob_packet() until the reply (or a timeout) arrives -- see
+        # _begin_state_restore_guard()'s own comment. Without this, a real user touching ANY
+        # control before this async round trip completes fires transmit_knob_packet()'s first-ever
+        # call -- which sends a full snapshot of every widget's own construction-time default,
+        # permanently overwriting a DAW-restored CLAP patch's real state before the correct values
+        # this very request is about to fetch ever get a chance to land.
+        gui._begin_state_restore_guard()
 
 
 if __name__ == "__main__":
