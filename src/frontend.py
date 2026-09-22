@@ -739,6 +739,20 @@ FX_TYPE_METADATA = [
         {"label": "Detune", "range": (0, 100), "default": 60},
         {"label": "Dry/Wet", "range": (0, 100), "default": 60},
     ]},
+    {"name": "TapeDelay2", "params": [
+        # Time is counter-intuitively inverted (0 = longest delay, 100 = shortest) -- that's the
+        # original plugin's own behavior (the knob really controls tape speed, not delay time
+        # directly), ported as-is; see FX_TYPE_TAPEDELAY2's own comment in backend.c.
+        {"label": "Time", "range": (0, 100), "default": 40},
+        {"label": "Regen", "range": (0, 100), "default": 35},
+        {"label": "Freq", "range": (0, 100), "default": 50},
+        {"label": "Reso", "range": (0, 100), "default": 30},
+        {"label": "Flutter", "range": (0, 100), "default": 0},
+        {"label": "Dry/Wet", "range": (0, 100), "default": 100},
+        # Ping-Pong: NOT part of the original plugin -- see FX_TYPE_TAPEDELAY2's own comment.
+        # Default Off reproduces the original algorithm exactly.
+        {"label": "Ping-Pong", "type": "choice", "options": ["Off", "On"], "default": 0},
+    ]},
 ]
 
 # Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --

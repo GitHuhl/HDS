@@ -399,6 +399,25 @@ typedef struct {
 // self-contained mix, independent of whatever the slot's outer Mix knob is doing. See
 // run_fx_stereodoubler().
 #define FX_TYPE_STEREODOUBLER 5
+// Ported from Airwindows TapeDelay2 (MIT license). A single tape-style echo: one modulated
+// (tape-flutter) delay line per channel, with a resonant lowpass INSIDE the feedback loop
+// (progressively darkening each successive repeat, the classic tape-echo "regen" filter) and a
+// second, slightly-higher-resonance lowpass on the way OUT of the delay (an "off the tape head"
+// tone-shaping stage). param[0] Time (counter-intuitively inverted, exactly as the original: 0.0
+// is the LONGEST delay, 1.0 the shortest -- the knob really controls tape speed, not delay time
+// directly), param[1] Regen (feedback amount), param[2] Freq (regen/out filter cutoff),
+// param[3] Reso (regen filter resonance -- the out filter's own resonance is always this times a
+// fixed golden-ratio multiplier, matching the original), param[4] Flutter (delay-speed vibrato
+// depth, scaled by Freq so brighter/faster settings flutter a little more, matching the
+// original), param[5] Dry/Wet (this effect's own internal blend -- NOT a crossfade: raising it
+// from 0 first fades in only the wet signal without turning down dry at all, matching the
+// original's own "submix echo" design so mixing this into a bus doesn't quietly pull back
+// everything else -- see run_fx_tapedelay2's own comment). param[6] Ping-Pong: NOT part of the
+// original TapeDelay2 -- a small addition (see run_fx_tapedelay2's own comment) that cross-feeds
+// each channel's delay output into the OTHER channel's feedback path for a stereo-alternating
+// echo, wired so that leaving it at its default (Off) reproduces the original algorithm exactly,
+// bit for bit.
+#define FX_TYPE_TAPEDELAY2 6
 #define FX_SLOT_PARAM_COUNT 8
 typedef struct {
     float fx_type;
@@ -2626,6 +2645,249 @@ static void run_fx_stereodoubler(FXSlotEngine *engine, const FXSlotParams *param
     *r = inputSampleR;
 }
 
+// --- FX_TYPE_TAPEDELAY2: ported from Airwindows TapeDelay2 (MIT license) --- see this effect's
+// own FX_TYPE_TAPEDELAY2 comment above for the full param map.
+//
+// Single-tap tape echo: a variable-speed (tape-flutter-modulated) delay line, feedback path run
+// through a resonant lowpass ("regen" filter, both channels sharing one set of coefficients) so
+// each successive repeat darkens progressively, then a second, slightly higher-resonance lowpass
+// on the way OUT of the delay. Both filters are the same biquad topology (state-variable-style
+// lowpass, coefficients recomputed from Freq/Reso every call -- cheap, and this dispatch is
+// already per-sample, matching every other ported effect here) with their own persistent
+// numerator/denominator state (index [7]/[8]) untouched by that recompute.
+//
+// The variable-speed write/read scheme (delayL/prevSampleL/increment below) is a real
+// resampling-safe delay line, not a fixed integer tap: each sample, the write cursor walks
+// backward by `speed` positions (fractional), linearly filling in the ring buffer between the
+// previous and current cursor position so a later, differently-sped read never hits a stale or
+// skipped sample -- this is what makes the tape-flutter pitch modulation sound smooth rather than
+// steppy. Buffer size/wrap constant (88200) kept exactly as the original's own 44.1kHz-baseline
+// sizing (matching FX_TYPE_ENSEMBLE's own precedent above of never rescaling a ported effect's
+// fixed buffer sizes for SAMPLE_RATE) -- Time/Flutter's musical range shifts very slightly at our
+// fixed 48kHz vs. the original's variable host rate, exactly the same "close enough, not worth a
+// second set of tuning constants" tradeoff already accepted by every other port in this file.
+typedef struct {
+    float dL[88211], dR[88211];
+    float prevSampleL, delayL, sweepL;
+    float prevSampleR, delayR, sweepR;
+    float regenFilterL[9], outFilterL[9], lastRefL[10];
+    float regenFilterR[9], outFilterR[9], lastRefR[10];
+    int cycle, cycle_end;
+    uint32_t fpdL, fpdR;
+} FxTapeDelay2State;
+
+static void run_fx_tapedelay2(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxTapeDelay2State *st = (FxTapeDelay2State *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxTapeDelay2State));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+        int cycle_end = SAMPLE_RATE / 44100; if (cycle_end < 1) cycle_end = 1; if (cycle_end > 4) cycle_end = 4;
+        st->cycle_end = cycle_end;
+        st->fpdL = (uint32_t)rand(); while (st->fpdL < 16386) st->fpdL = (uint32_t)rand();
+        st->fpdR = (uint32_t)rand(); while (st->fpdR < 16386) st->fpdR = (uint32_t)rand();
+    }
+    if (st->cycle > st->cycle_end - 1) st->cycle = st->cycle_end - 1;
+
+    // param[0..5] A-F, per this effect's own FX_TYPE_TAPEDELAY2 comment above.
+    float a = fmaxf(0.0f, fminf(1.0f, params->param[0])); // Time (inverted -- see the comment above)
+    float b = fmaxf(0.0f, fminf(1.0f, params->param[1])); // Regen
+    float c = fmaxf(0.0f, fminf(1.0f, params->param[2])); // Freq
+    float d = fmaxf(0.0f, fminf(1.0f, params->param[3])); // Reso
+    float e = fmaxf(0.0f, fminf(1.0f, params->param[4])); // Flutter
+    float f = fmaxf(0.0f, fminf(1.0f, params->param[5])); // Dry/Wet
+    // param[6] Ping-Pong -- see this effect's own comment above and the cross-feed just below.
+    // Off (0, the default) reproduces the pre-existing wiring exactly; only decoded when the
+    // slot's Type is actually this effect, per the "choice" param convention (see
+    // FX_TYPE_METADATA's own comment in frontend.py -- (int)(value * (N-1+0.999)) for N options).
+    bool pingpong = ((int)(fmaxf(0.0f, fminf(1.0f, params->param[6])) * 1.999f)) != 0;
+
+    float baseSpeed = (powf(a, 4.0f) * 25.0f) + 1.0f;
+    float feedback = b * b;
+
+    st->regenFilterL[0] = st->regenFilterR[0] = (powf(c, 3.0f) * 0.4f) + 0.0001f;
+    st->regenFilterL[1] = st->regenFilterR[1] = (d * d) + 0.01f;
+    float K = tanf((float)M_PI * st->regenFilterR[0]);
+    float norm = 1.0f / (1.0f + K / st->regenFilterR[1] + K * K);
+    st->regenFilterL[2] = st->regenFilterR[2] = K / st->regenFilterR[1] * norm;
+    st->regenFilterL[4] = st->regenFilterR[4] = -st->regenFilterR[2];
+    st->regenFilterL[5] = st->regenFilterR[5] = 2.0f * (K * K - 1.0f) * norm;
+    st->regenFilterL[6] = st->regenFilterR[6] = (1.0f - K / st->regenFilterR[1] + K * K) * norm;
+
+    st->outFilterL[0] = st->outFilterR[0] = st->regenFilterR[0];
+    st->outFilterL[1] = st->outFilterR[1] = st->regenFilterR[1] * 1.618033988749894848f; // golden ratio, matching the original exactly
+    K = tanf((float)M_PI * st->outFilterR[0]);
+    norm = 1.0f / (1.0f + K / st->outFilterR[1] + K * K);
+    st->outFilterL[2] = st->outFilterR[2] = K / st->outFilterR[1] * norm;
+    st->outFilterL[4] = st->outFilterR[4] = -st->outFilterR[2];
+    st->outFilterL[5] = st->outFilterR[5] = 2.0f * (K * K - 1.0f) * norm;
+    st->outFilterL[6] = st->outFilterR[6] = (1.0f - K / st->outFilterR[1] + K * K) * norm;
+
+    float vibSpeed = powf(e, 5.0f) * baseSpeed * ((st->regenFilterR[0] * 0.09f) + 0.025f);
+    float wet = fmaxf(0.0f, fminf(1.0f, f * 2.0f));
+    float dry = fmaxf(0.0f, fminf(1.0f, 2.0f - (f * 2.0f)));
+    // This echo makes 50% full dry AND full wet, not crossfaded (see the FX_TYPE_TAPEDELAY2
+    // comment above) -- so it can sit on a submix without cutting back the dry signal just
+    // because this effect's own Dry/Wet got turned up. The slot's own generic Mix knob (applied
+    // by process_fx_chain around this function's whole output) is a normal crossfade, layered on
+    // top exactly like FX_TYPE_STEREODOUBLER's own kept Dry/Wet already is.
+
+    float inputSampleL = *l, inputSampleR = *r;
+    if (fabsf(inputSampleL) < 1.18e-23f) inputSampleL = (float)st->fpdL * 1.18e-17f;
+    if (fabsf(inputSampleR) < 1.18e-23f) inputSampleR = (float)st->fpdR * 1.18e-17f;
+    float drySampleL = inputSampleL, drySampleR = inputSampleR;
+
+    st->cycle++;
+    if (st->cycle == st->cycle_end) {
+        float speedL = baseSpeed + (vibSpeed * (sinf(st->sweepL) + 1.0f));
+        float speedR = baseSpeed + (vibSpeed * (sinf(st->sweepR) + 1.0f));
+        st->sweepL += (0.05f * inputSampleL * inputSampleL); if (st->sweepL > 6.283185307179586f) st->sweepL -= 6.283185307179586f;
+        st->sweepR += (0.05f * inputSampleR * inputSampleR); if (st->sweepR > 6.283185307179586f) st->sweepR -= 6.283185307179586f;
+
+        // Ping-Pong cross-feed point: capture each channel's CURRENT delay-tap value before
+        // either channel's own write step touches it, so the choice of self-feed (Off, default)
+        // vs. cross-feed (On) is a pure selection between two already-computed values -- nothing
+        // else about the algorithm changes either way. With pingpong == false, feedSampleL/R are
+        // exactly dL[posL]/dR[posR] -- byte-for-byte the original's own self-feedback wiring.
+        int posL = (int)floorf(st->delayL);
+        int posR = (int)floorf(st->delayR);
+        float feedFromL = st->dL[posL];
+        float feedFromR = st->dR[posR];
+        float feedSampleL = pingpong ? feedFromR : feedFromL;
+        float feedSampleR = pingpong ? feedFromL : feedFromR;
+
+        // begin left channel
+        float newSample = inputSampleL + feedSampleL * feedback;
+        float tempSample = (newSample * st->regenFilterL[2]) + st->regenFilterL[7];
+        st->regenFilterL[7] = -(tempSample * st->regenFilterL[5]) + st->regenFilterL[8];
+        st->regenFilterL[8] = (newSample * st->regenFilterL[4]) - (tempSample * st->regenFilterL[6]);
+        newSample = tempSample;
+
+        st->delayL -= speedL; if (st->delayL < 0.0f) st->delayL += 88200.0f;
+        float increment = (newSample - st->prevSampleL) / speedL;
+        int pos = posL;
+        st->dL[pos] = st->prevSampleL;
+        while (pos != (int)floorf(st->delayL)) {
+            st->dL[pos] = st->prevSampleL;
+            st->prevSampleL += increment;
+            pos--; if (pos < 0) pos += 88200;
+        }
+        st->prevSampleL = newSample;
+        pos = (int)floorf(st->delayL); inputSampleL = st->dL[pos];
+        tempSample = (inputSampleL * st->outFilterL[2]) + st->outFilterL[7];
+        st->outFilterL[7] = -(tempSample * st->outFilterL[5]) + st->outFilterL[8];
+        st->outFilterL[8] = (inputSampleL * st->outFilterL[4]) - (tempSample * st->outFilterL[6]);
+        inputSampleL = tempSample;
+        // end left channel
+
+        // begin right channel
+        newSample = inputSampleR + feedSampleR * feedback;
+        tempSample = (newSample * st->regenFilterR[2]) + st->regenFilterR[7];
+        st->regenFilterR[7] = -(tempSample * st->regenFilterR[5]) + st->regenFilterR[8];
+        st->regenFilterR[8] = (newSample * st->regenFilterR[4]) - (tempSample * st->regenFilterR[6]);
+        newSample = tempSample;
+
+        st->delayR -= speedR; if (st->delayR < 0.0f) st->delayR += 88200.0f;
+        increment = (newSample - st->prevSampleR) / speedR;
+        pos = posR;
+        st->dR[pos] = st->prevSampleR;
+        while (pos != (int)floorf(st->delayR)) {
+            st->dR[pos] = st->prevSampleR;
+            st->prevSampleR += increment;
+            pos--; if (pos < 0) pos += 88200;
+        }
+        st->prevSampleR = newSample;
+        pos = (int)floorf(st->delayR); inputSampleR = st->dR[pos];
+        tempSample = (inputSampleR * st->outFilterR[2]) + st->outFilterR[7];
+        st->outFilterR[7] = -(tempSample * st->outFilterR[5]) + st->outFilterR[8];
+        st->outFilterR[8] = (inputSampleR * st->outFilterR[4]) - (tempSample * st->outFilterR[6]);
+        inputSampleR = tempSample;
+        // end right channel
+
+        // Downsampling-ladder reconstruction -- see run_fx_ensemble's identical pattern/comment.
+        if (st->cycle_end == 4) {
+            st->lastRefL[0] = st->lastRefL[4];
+            st->lastRefL[2] = (st->lastRefL[0] + inputSampleL) * 0.5f;
+            st->lastRefL[1] = (st->lastRefL[0] + st->lastRefL[2]) * 0.5f;
+            st->lastRefL[3] = (st->lastRefL[2] + inputSampleL) * 0.5f;
+            st->lastRefL[4] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[4];
+            st->lastRefR[2] = (st->lastRefR[0] + inputSampleR) * 0.5f;
+            st->lastRefR[1] = (st->lastRefR[0] + st->lastRefR[2]) * 0.5f;
+            st->lastRefR[3] = (st->lastRefR[2] + inputSampleR) * 0.5f;
+            st->lastRefR[4] = inputSampleR;
+        } else if (st->cycle_end == 3) {
+            st->lastRefL[0] = st->lastRefL[3];
+            st->lastRefL[2] = (st->lastRefL[0] + st->lastRefL[0] + inputSampleL) / 3.0f;
+            st->lastRefL[1] = (st->lastRefL[0] + inputSampleL + inputSampleL) / 3.0f;
+            st->lastRefL[3] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[3];
+            st->lastRefR[2] = (st->lastRefR[0] + st->lastRefR[0] + inputSampleR) / 3.0f;
+            st->lastRefR[1] = (st->lastRefR[0] + inputSampleR + inputSampleR) / 3.0f;
+            st->lastRefR[3] = inputSampleR;
+        } else if (st->cycle_end == 2) {
+            st->lastRefL[0] = st->lastRefL[2];
+            st->lastRefL[1] = (st->lastRefL[0] + inputSampleL) * 0.5f;
+            st->lastRefL[2] = inputSampleL;
+            st->lastRefR[0] = st->lastRefR[2];
+            st->lastRefR[1] = (st->lastRefR[0] + inputSampleR) * 0.5f;
+            st->lastRefR[2] = inputSampleR;
+        } else {
+            st->lastRefL[0] = inputSampleL;
+            st->lastRefR[0] = inputSampleR;
+        }
+        st->cycle = 0;
+        inputSampleL = st->lastRefL[st->cycle];
+        inputSampleR = st->lastRefR[st->cycle];
+    } else {
+        inputSampleL = st->lastRefL[st->cycle];
+        inputSampleR = st->lastRefR[st->cycle];
+    }
+
+    // Multi-pole average using lastRef[7]/[8] (a second, slower-tracking smoothing stage on top
+    // of the ladder above) -- a no-op at cycle_end == 1 (always true at this engine's fixed
+    // 48kHz), kept generic for the same "in case SAMPLE_RATE ever changes" reason as the ladder.
+    switch (st->cycle_end) {
+        case 4:
+            st->lastRefL[8] = inputSampleL; inputSampleL = (inputSampleL + st->lastRefL[7]) * 0.5f;
+            st->lastRefL[7] = st->lastRefL[8];
+            st->lastRefR[8] = inputSampleR; inputSampleR = (inputSampleR + st->lastRefR[7]) * 0.5f;
+            st->lastRefR[7] = st->lastRefR[8];
+            // fallthrough
+        case 3:
+            st->lastRefL[8] = inputSampleL; inputSampleL = (inputSampleL + st->lastRefL[6]) * 0.5f;
+            st->lastRefL[6] = st->lastRefL[8];
+            st->lastRefR[8] = inputSampleR; inputSampleR = (inputSampleR + st->lastRefR[6]) * 0.5f;
+            st->lastRefR[6] = st->lastRefR[8];
+            // fallthrough
+        case 2:
+            st->lastRefL[8] = inputSampleL; inputSampleL = (inputSampleL + st->lastRefL[5]) * 0.5f;
+            st->lastRefL[5] = st->lastRefL[8];
+            st->lastRefR[8] = inputSampleR; inputSampleR = (inputSampleR + st->lastRefR[5]) * 0.5f;
+            st->lastRefR[5] = st->lastRefR[8];
+            // fallthrough
+        case 1:
+        default:
+            break; // no further averaging
+    }
+
+    if (wet < 1.0f) { inputSampleL *= wet; inputSampleR *= wet; }
+    if (dry < 1.0f) { drySampleL *= dry; drySampleR *= dry; }
+    inputSampleL += drySampleL; inputSampleR += drySampleR;
+    // this is our submix echo dry/wet: 0.5 is BOTH at FULL VOLUME (see the comment above)
+
+    int expon;
+    frexpf(inputSampleL, &expon);
+    st->fpdL ^= st->fpdL << 13; st->fpdL ^= st->fpdL >> 17; st->fpdL ^= st->fpdL << 5;
+    inputSampleL += (((float)st->fpdL - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+    frexpf(inputSampleR, &expon);
+    st->fpdR ^= st->fpdR << 13; st->fpdR ^= st->fpdR >> 17; st->fpdR ^= st->fpdR << 5;
+    inputSampleR += (((float)st->fpdR - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+
+    *l = inputSampleL;
+    *r = inputSampleR;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -2733,6 +2995,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                 case FX_TYPE_DENSITY3: run_fx_density3(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_STEREOCHORUS: run_fx_stereochorus(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_STEREODOUBLER: run_fx_stereodoubler(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_TAPEDELAY2: run_fx_tapedelay2(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through

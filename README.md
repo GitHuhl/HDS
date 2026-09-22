@@ -484,7 +484,7 @@ once per block. `process_fx_chain()` in `backend.c` implements the
 per-source slot dispatch; each slot still has the same generic 8-param
 bank + mix + bypass it always did. Most slot types are still an
 unimplemented pass-through, ready for more effects to be ported into the
-dispatch switch. Five are implemented so far, all ported from Airwindows
+dispatch switch. Six are implemented so far, all ported from Airwindows
 (MIT license):
 
 - **Ensemble** — a 12-tap fixed-delay ensemble/chorus (not a reverb: no
@@ -521,6 +521,22 @@ dispatch switch. Five are implemented so far, all ported from Airwindows
   audible clicks a naive single-tap pitch shifter would produce. Params:
   Detune and Dry/Wet (kept as its own control here, unlike Density3's —
   see the `FX_TYPE_STEREODOUBLER` comment in `backend.c` for why).
+- **TapeDelay2** — a single-tap tape echo: a variable-speed
+  (tape-flutter-modulated) delay line whose feedback path runs through a
+  resonant lowpass inside the loop (each repeat darkens progressively,
+  the classic tape-echo "regen" filter), plus a second, slightly
+  higher-resonance lowpass on the way out of the delay. Params: Time
+  (inverted, as in the original — 0 is the longest delay, 100 the
+  shortest, since the knob really controls tape speed), Regen (feedback),
+  Freq/Reso (the regen/out filters' shared cutoff and resonance), Flutter
+  (delay-speed vibrato depth), Dry/Wet (this effect's own internal blend,
+  not a crossfade — like CreamCoat's Wetness, 50 is both dry and wet at
+  full strength, so it can sit on a submix without pulling back everything
+  else), and Ping-Pong — not part of the original plugin, a small,
+  additive toggle (default Off) that cross-feeds each channel's delay
+  output into the other channel's feedback path for a stereo-alternating
+  echo. Off reproduces the original algorithm exactly, bit for bit; see
+  `run_fx_tapedelay2`'s own comment in `backend.c` for how that's kept true.
 
   StereoChorus and StereoDoubler share an "air" comb-filter stage
   (compensating for the top-end loss a modulated/interpolated delay
