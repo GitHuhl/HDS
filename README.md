@@ -607,6 +607,70 @@ backend-side only while the Routing tab is actually the visible tab
 `frontend.py`) -- a true no-op the rest of the time, not just "computed
 but ignored."
 
+**External tempo sync** (Sequencer tab's Sync control): Internal (default,
+unchanged -- follows the Tempo knob/tempo-map) or External, which slaves
+`current_tempo_bpm` -- and therefore the Arp, LFO Tempo Sync, Quantize, and
+the metronome, all of which already just read whatever that one value
+resolves to -- to an outside source instead. In the standalone app,
+External means real incoming MIDI Clock (0xF8) over an ALSA sequencer
+connection, with MIDI Start/Continue/Stop (0xFA/0xFB/0xFC) driving the
+Sequencer's own transport the same way its Play/Pause/Stop buttons do
+(`hds_handle_midi_clock_tick()`/`hds_handle_midi_transport_*()` in
+backend.c); in the CLAP plugin, External instead reads the host's own
+`process->transport->tempo` directly (no MIDI bytes involved at all --
+`clap_plugin_process()` in clap_plugin.c), tempo-only, since a host's
+timeline position doesn't necessarily correspond to "the start of HDS's
+own recorded take" the way a real MIDI Start message does. Falls back to
+Internal automatically if no clock tick has arrived recently (a
+disconnected/unplugged external source degrades gracefully instead of
+freezing at a stale BPM) -- the Sync control's own lock indicator
+("Locked"/"Waiting for clock...") reflects this live.
+
+**Microtuning** (Scala `.scl` import, sidebar's Microtuning box): off by
+default (exact standard 12-tone equal temperament everywhere, unchanged).
+Loading a `.scl` file (`hds_tuning_load_scl()`/`hds_note_to_hz()` in
+backend.c -- backend-native file I/O, the OSC message carries just the
+path, matching `--sfz-vcoN`/`/hds/zone/load_sfz`'s own convention) and
+checking Enable retunes the primary oscillator pitch -- what frequency a
+played MIDI note actually sounds at -- to that scale, mapped chromatically
+from an adjustable reference note/frequency (defaults: Middle C at its own
+standard 12-TET pitch). Handles non-12-note and non-octave-period scales
+correctly (verified against a Bohlen-Pierce-style 13-tone/tritave test
+scale, not just plain 12-EDO). WAVE_SAMPLE playback's own root-note
+reference frequency is a deliberate, documented exception -- it stays
+12-TET regardless, rather than threading tuning state through the sample-
+streaming engine's own call chain for a comparatively obscure interaction.
+
+**CLAP: multi-out audio ports.** Alongside the existing single main stereo
+mix (port 0, unchanged for any host that doesn't care about multi-out),
+the plugin now also declares one more stereo output port per Combi Program
+(ports 1-8, `clap_audio_ports_get()` in clap_plugin.c) -- each carrying
+that Program's own fully-processed (post-EQ, post-FX) signal, so a host
+can route each part to its own track/bus instead of only ever getting the
+combined mix. A port the host doesn't connect costs nothing beyond
+`render_audio_block()`'s own per-sample capture into a scratch buffer
+(`per_program_out`, NULL-able and unused by the standalone app, which
+already has its own hardware-output-pair routing for this).
+
+**CLAP: params extension (host automation).** A curated ~55-parameter
+subset (`HDS_CLAP_PARAMS` in clap_plugin.c) -- all 5 filters'
+Cutoff/Resonance, the post-filter 3-band EQ, each oscillator's Volume/Pan
+and Amp EG (Attack/Decay/Sustain/Release), all 12 FX slots' Mix, Master
+Volume, and Transpose -- is exposed as real, host-automatable CLAP
+parameters, each with a hand-verified min/max/default matching
+`frontend.py`'s own widget ranges. Deliberately curated rather than
+exhaustive: backend.c's `OSC_PARAMS[]` (the single source of truth for
+every one of the ~1150 knobs' address/offset) carries no range metadata at
+all, since nothing needed it before this -- exposing all ~1150 would mean
+hand-authoring ~1150 rows of range data with no way to keep them in sync
+with the GUI, and would hand the host's automation-lane picker an
+unusably long flat list (the same reason most commercial synth plugins
+expose a curated "macro" page rather than every internal register).
+Bi-directional: a value changed via the GUI/OSC while hosted is also
+echoed back to the host as an output parameter-change event
+(`hds_clap_push_changed_params()`), so the host's own automation lane/UI
+stays in sync regardless of which side changed it.
+
 ## Build & run
 
 Requires ALSA dev headers (`libasound2-dev` on Debian/Ubuntu) and liblo dev

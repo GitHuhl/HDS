@@ -18,7 +18,7 @@ from pythonosc.osc_bundle_builder import OscBundleBuilder, IMMEDIATELY
 from pythonosc.osc_packet import OscPacket, ParseError as OscParseError
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
-                             QSlider, QPushButton, QProgressBar, QSpinBox, QLineEdit, QCheckBox,
+                             QSlider, QPushButton, QProgressBar, QSpinBox, QDoubleSpinBox, QLineEdit, QCheckBox,
                              QScrollArea, QMenu, QInputDialog, QFileDialog, QGridLayout, QMessageBox)
 from PySide6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor, QAction, QFont
 from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, Signal
@@ -2320,6 +2320,9 @@ class SynthGui(QWidget):
         # listen_for_status_frames() polls, keyed by address exactly like _last_wire_state above,
         # until /hds/status/state_dump_complete arrives.
         self._state_dump_buffer = {}
+        # Reflected by _update_seq_sync_lock_label() next to the Sequencer tab's Sync combo -- see
+        # /hds/status/midi_clock_locked's own comment in listen_for_status_frames().
+        self._midi_clock_locked = False
         # Program save/load: one subfolder per Program (~/HDS_Programs/<name>/<name>.hdsprog
         # [+ <name>.sfz]) -- mirrors the existing ~/HDS_Recordings convention (self.record_folder).
         self.programs_folder = os.path.expanduser("~/HDS_Programs")
@@ -2460,6 +2463,45 @@ class SynthGui(QWidget):
         self.transpose_readout = QLabel("0 st"); self.transpose_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         global_layout.addWidget(self.transpose_readout)
         global_layout.addSpacing(4)
+
+        # Microtuning (Scala .scl import) -- session-level, same "live performance control, not a
+        # patch property" placement as Transpose just above (see backend.c's tuning_enable
+        # comment). Off by default: standard 12-TET everywhere until a scale is loaded AND enabled.
+        tuning_box = QGroupBox("Microtuning")
+        tuning_lay = QVBoxLayout(); tuning_lay.setSpacing(4); tuning_lay.setContentsMargins(4, 4, 4, 4)
+        self.tuning_enable_check = QCheckBox("Enable")
+        self.tuning_enable_check.setToolTip("When off, always standard 12-tone equal temperament, regardless of any scale loaded below.")
+        tuning_lay.addWidget(self.tuning_enable_check)
+        self.btn_load_scale = QPushButton("Load Scale (.scl)…")
+        tuning_lay.addWidget(self.btn_load_scale)
+        self.tuning_scale_label = QLabel("No scale loaded (12-TET)")
+        self.tuning_scale_label.setStyleSheet("font-size: 9px; color: #888;")
+        self.tuning_scale_label.setWordWrap(True)
+        tuning_lay.addWidget(self.tuning_scale_label)
+        ref_row = QHBoxLayout(); ref_row.setSpacing(4)
+        ref_row.addWidget(QLabel("Ref Note:"))
+        self.tuning_ref_note_spin = QSpinBox()
+        self.tuning_ref_note_spin.setRange(0, 127)
+        self.tuning_ref_note_spin.setValue(60)
+        self.tuning_ref_note_spin.setToolTip("Which MIDI note is the scale's own 1/1 (unison) -- 60 = Middle C")
+        ref_row.addWidget(self.tuning_ref_note_spin)
+        tuning_lay.addLayout(ref_row)
+        freq_row = QHBoxLayout(); freq_row.setSpacing(4)
+        freq_row.addWidget(QLabel("Ref Freq:"))
+        self.tuning_ref_freq_spin = QDoubleSpinBox()
+        self.tuning_ref_freq_spin.setRange(20.0, 2000.0)
+        self.tuning_ref_freq_spin.setDecimals(2)
+        self.tuning_ref_freq_spin.setValue(261.6256)
+        self.tuning_ref_freq_spin.setSuffix(" Hz")
+        self.tuning_ref_freq_spin.setToolTip("What frequency the reference note above should sound at -- default is Middle C's own standard 12-TET pitch")
+        freq_row.addWidget(self.tuning_ref_freq_spin)
+        tuning_lay.addLayout(freq_row)
+        tuning_box.setLayout(tuning_lay)
+        global_layout.addWidget(tuning_box)
+        self.btn_load_scale.clicked.connect(self._pick_and_load_scale)
+        self.tuning_enable_check.toggled.connect(self.transmit_knob_packet)
+        self.tuning_ref_note_spin.valueChanged.connect(self.transmit_knob_packet)
+        self.tuning_ref_freq_spin.valueChanged.connect(self.transmit_knob_packet)
 
         sustain_box = QGroupBox("Sustain Pedal Polarity")
         sustain_lay = QHBoxLayout(); sustain_lay.setSpacing(6); sustain_lay.setContentsMargins(4, 4, 4, 4)
@@ -3761,6 +3803,24 @@ class SynthGui(QWidget):
         self.seq_quantize_resolution_combo.setToolTip("Quantize grid resolution")
         transport_lay.addWidget(QLabel("Resolution:"))
         transport_lay.addWidget(self.seq_quantize_resolution_combo)
+        # Tempo sync source: Internal (Tempo knob/tempo-map, unchanged default) or External --
+        # slaves tempo to incoming MIDI Clock (standalone app, real MIDI cable/hardware sequencer)
+        # or the host's own transport tempo (CLAP, hosted in a DAW) -- see backend.c's
+        # seq_sync_source comment. The lock label reflects /hds/status/midi_clock_locked so a
+        # missing/misrouted clock source shows as "Waiting..." instead of silently doing nothing.
+        self.seq_sync_source_combo = QComboBox()
+        self.seq_sync_source_combo.addItems(["Internal", "External (MIDI Clock / Host Tempo)"])
+        self.seq_sync_source_combo.setToolTip(
+            "Internal: follow the Tempo knob/tempo-map. External: slave to incoming MIDI Clock "
+            "(standalone, from a cable/hardware sequencer) or the host's own tempo (CLAP, in a DAW)."
+        )
+        transport_lay.addWidget(QLabel("Sync:"))
+        transport_lay.addWidget(self.seq_sync_source_combo)
+        self.seq_sync_lock_label = QLabel("")
+        self.seq_sync_lock_label.setStyleSheet("font-size: 9px; color: #888;")
+        transport_lay.addWidget(self.seq_sync_lock_label)
+        self.seq_sync_source_combo.currentIndexChanged.connect(self._update_seq_sync_lock_label)
+        self._update_seq_sync_lock_label()
         # Real, edge-triggered counters -- same idiom as each Sequencer audio lane's own Preview
         # button (_preview_seq_audio/preview_trigger): the backend's poll_transport_triggers
         # detects a change in the value since last block, so each click just increments and
@@ -3784,6 +3844,7 @@ class SynthGui(QWidget):
         self.seq_btn_metronome.toggled.connect(self.transmit_knob_packet)
         self.seq_btn_quantize.toggled.connect(self.transmit_knob_packet)
         self.seq_quantize_resolution_combo.currentIndexChanged.connect(self.transmit_knob_packet)
+        self.seq_sync_source_combo.currentIndexChanged.connect(self.transmit_knob_packet)
         transport_lay.addSpacing(16)
         self.seq_transport_state_label = QLabel("STOPPED")
         self.seq_transport_state_label.setStyleSheet("font-weight: bold;")
@@ -5397,6 +5458,22 @@ class SynthGui(QWidget):
         widgets["preview_trigger"] = widgets.get("preview_trigger", 0) + 1
         self.transmit_knob_packet()
 
+    def _pick_and_load_scale(self):
+        """Loads a Scala .scl file -- sends just the file path to the backend
+        (/hds/tuning/load_scl), which parses it directly (see hds_tuning_load_scl() in
+        backend.c), the same "OSC carries a path, the backend does the file I/O" shape as Song's
+        own MIDI save/load. There's no round-trip status message for this yet, so the label below
+        the button updates optimistically to the picked filename; a malformed/unreadable file is
+        instead reported on the backend's own stderr rather than back to this GUI."""
+        path, _ = QFileDialog.getOpenFileName(self, "Load Scale", "", "Scala scale files (*.scl)")
+        if not path:
+            return
+        msg = OscMessageBuilder(address="/hds/tuning/load_scl")
+        msg.add_arg(path, "s")
+        try: self.osc_client.send(msg.build())
+        except OSError: pass
+        self.tuning_scale_label.setText(f"Loaded: {os.path.basename(path)}")
+
     def _pick_and_save_song(self):
         """Saves the Sequencer's current state to ~/HDS_Songs/<name>/ -- each of the 32 lanes' own
         config (type, level/pan, MIDI channel, mute/rec/overdub, an Audio lane's own offset) plus,
@@ -5516,6 +5593,17 @@ class SynthGui(QWidget):
             msg.add_arg(midi_path, "s")
             try: self.osc_client.send(msg.build())
             except OSError: pass
+
+    def _update_seq_sync_lock_label(self, _index=None):
+        """Reflects /hds/status/midi_clock_locked next to the Sequencer tab's Sync combo -- blank
+        when Internal (nothing to lock onto), Locked/Waiting when External, so a missing or
+        misrouted clock source is visible instead of silently doing nothing."""
+        if self.seq_sync_source_combo.currentIndex() == 0:
+            self.seq_sync_lock_label.setText("")
+            return
+        locked = self._midi_clock_locked
+        self.seq_sync_lock_label.setText("● Locked" if locked else "○ Waiting for clock…")
+        self.seq_sync_lock_label.setStyleSheet(f"font-size: 9px; color: {'#2ecc71' if locked else '#e67e22'};")
 
     def _seq_transport_play(self):
         """Play button: edge-triggered counter, same idiom as _preview_seq_audio -- the backend's
@@ -6511,6 +6599,7 @@ class SynthGui(QWidget):
         "/hds/status/record_error", "/hds/status/detected_input_channels",
         "/hds/status/detected_output_channels", "/hds/status/tempo_bpm_live",
         "/hds/status/seq_elapsed_seconds", "/hds/status/seq_transport_state",
+        "/hds/status/midi_clock_locked",
     )
 
     def listen_for_status_frames(self):
@@ -6586,6 +6675,9 @@ class SynthGui(QWidget):
                     self._rebuild_routing_output_columns(min(out_channels // 2, OUTPUT_PAIR_MAX))
             if "/hds/status/tempo_bpm_live" in values:
                 self.tempo_live_readout.setText(f"engine: {values['/hds/status/tempo_bpm_live']:.1f} BPM")
+            if "/hds/status/midi_clock_locked" in values:
+                self._midi_clock_locked = bool(values["/hds/status/midi_clock_locked"])
+                self._update_seq_sync_lock_label()
             # Sequencer tab's transport readout -- real, live data (the transport's own real
             # playhead, seq_transport_state, plus current tempo). Bars:Beats is plain
             # presentation-layer math (assumes 4/4), same spirit as the rest of this file's habit
@@ -6699,6 +6791,9 @@ class SynthGui(QWidget):
         add_f("/hds/portamento_time_ms", g_time)
         add_f("/hds/master_volume", m_vol)
         add_f("/hds/transpose_semitones", self.transpose_dial.value())
+        add_f("/hds/tuning/enable", 1.0 if self.tuning_enable_check.isChecked() else 0.0)
+        add_f("/hds/tuning/reference_note", self.tuning_ref_note_spin.value())
+        add_f("/hds/tuning/reference_freq", self.tuning_ref_freq_spin.value())
         add_f("/hds/vco1/pan", v1_p)
         add_f("/hds/vco2/pan", v2_p)
         add_f("/hds/vco1/fine_tune", v1_fine)
@@ -6806,6 +6901,7 @@ class SynthGui(QWidget):
         add_f("/hds/seq/transport/metronome", 1.0 if self.seq_btn_metronome.isChecked() else 0.0)
         add_f("/hds/seq/quantize/enable", 1.0 if self.seq_btn_quantize.isChecked() else 0.0)
         add_f("/hds/seq/quantize/resolution", float(SEQ_QUANTIZE_RESOLUTIONS[self.seq_quantize_resolution_combo.currentIndex()]))
+        add_f("/hds/seq/sync_source", self.seq_sync_source_combo.currentIndex())
 
         # LFOs (incl. phase offset + mod source CC + Tempo Sync)
         for idx in range(LFO_COUNT):

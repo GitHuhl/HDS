@@ -856,6 +856,18 @@ typedef struct {
     // physically played key.
     float transpose_semitones;
 
+    // Microtuning (Scala .scl import -- see hds_note_to_hz()/HdsTuningTable's own comment).
+    // Session-level, not per-Program, same rationale as transpose_semitones above -- which scale
+    // you're playing in is a property of this performance, not of any one patch. tuning_enable
+    // off (default) reproduces standard 12-TET exactly regardless of whatever's loaded.
+    // tuning_reference_note/tuning_reference_freq pick which MIDI note is the scale's own 1/1 and
+    // what frequency that note should sound at -- defaults (60, 261.6256Hz) are Middle C at
+    // standard 12-TET pitch, so loading an ordinary 12-tone scale with unremarkable ratios lands
+    // close to familiar tuning rather than transposed to an unexpected register.
+    float tuning_enable;         // 0/1
+    float tuning_reference_note; // MIDI note 0-127
+    float tuning_reference_freq; // Hz
+
     // --- FX Bus + Multi-Source Routing Architecture --- deliberately session/rig-level, not
     // per-Program (see ProgramState's own comment for why): FX slots are shared, physical-insert-
     // like resources any source (a Program, the whole Combi stack, or an ext-in pair) can be
@@ -977,6 +989,18 @@ typedef struct {
     // 1 = Combi, 2 = Sequencer. (+1 float for the mode, +5*SEQ_LANE_COUNT for the lanes)
     float performance_mode;
     SeqLaneState seq_lanes[SEQ_LANE_COUNT];
+
+    // Tempo sync source: 0 = Internal (the Tempo knob/tempo-map, today's only behavior, unchanged
+    // default), 1 = External MIDI Clock -- slaves current_tempo_bpm to incoming MIDI Clock (0xF8)
+    // messages instead (see hds_handle_midi_clock_tick()/main()'s own current_tempo_bpm
+    // resolution), and lets incoming MIDI Start/Continue/Stop (0xFA/0xFB/0xFC) drive the
+    // transport the same way the Sequencer's own Play/Pause/Stop buttons do (see
+    // hds_handle_midi_transport_start/continue/stop()) -- gated behind this flag so a MIDI device
+    // that happens to relay clock/realtime bytes can never hijack the transport for someone not
+    // using external sync at all. Falls back to Internal automatically if no clock tick has
+    // arrived recently (see HDS_MIDI_CLOCK_TIMEOUT_SEC) -- an unplugged/disconnected external
+    // source degrades to the Tempo knob rather than freezing at a stale BPM.
+    float seq_sync_source;
 
     // Sequencer transport (Play/Pause/Stop) -- see poll_transport_triggers's own comment. Each
     // is a plain edge-triggered counter, same idiom as SeqLaneState.audio_preview_trigger: the
@@ -3037,6 +3061,9 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/7/portamento_time_ms", portamento_time_ms, 7),
     OSC_SCALAR("/hds/master_volume", master_volume),
     OSC_SCALAR("/hds/transpose_semitones", transpose_semitones),
+    OSC_SCALAR("/hds/tuning/enable", tuning_enable),
+    OSC_SCALAR("/hds/tuning/reference_note", tuning_reference_note),
+    OSC_SCALAR("/hds/tuning/reference_freq", tuning_reference_freq),
     OSC_PSCALAR("/hds/vco1/pan", vco1_pan),
     OSC_PSCALAR_AT("/hds/combi/0/vco1/pan", vco1_pan, 0),
     OSC_PSCALAR_AT("/hds/combi/1/vco1/pan", vco1_pan, 1),
@@ -4092,6 +4119,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/seq/transport/metronome", metronome_enable),
     OSC_SCALAR("/hds/seq/quantize/enable", seq_quantize_enable),
     OSC_SCALAR("/hds/seq/quantize/resolution", seq_quantize_resolution),
+    OSC_SCALAR("/hds/seq/sync_source", seq_sync_source),
 
     OSC_ARRAY("/hds/combi/%d/midi_channel", combi_lane_midi_channel, COMBI_PROGRAM_COUNT),
     OSC_ARRAY("/hds/combi/%d/key_lo", combi_lane_key_lo, COMBI_PROGRAM_COUNT),
@@ -4298,6 +4326,9 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].fm_intensity = 0.0f; knobs->programs[0].vco1_vol = 0.8f; knobs->programs[0].vco2_vol = 0.5f;
     knobs->programs[0].portamento_time_ms = 150.0f; knobs->master_volume = 0.50f;
     knobs->transpose_semitones = 0.0f; // centered, no transposition
+    knobs->tuning_enable = 0.0f; // standard 12-TET
+    knobs->tuning_reference_note = 60.0f;   // Middle C
+    knobs->tuning_reference_freq = 261.6256f; // Middle C's own standard 12-TET frequency
     knobs->programs[0].vco1_pan = 0.0f; knobs->programs[0].vco2_pan = 0.0f;
     knobs->programs[0].vco1_fine_tune = 0.0f; knobs->programs[0].vco2_pitch_offset = 0.0f; knobs->programs[0].vco2_fine_tune = 0.0f;
     // Filters: 5 flat slots, Series by default. Filter 0 reproduces today's exact single-LPF
@@ -4445,6 +4476,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->seq_transport_seek_fwd_trigger = 0.0f;
     knobs->seq_quantize_enable = 0.0f;
     knobs->seq_quantize_resolution = 4.0f; // sixteenth notes
+    knobs->seq_sync_source = 0.0f; // Internal
     knobs->metronome_enable = 0.0f;
     for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
         knobs->combi_lane_midi_channel[p] = 0.0f; // Omni
@@ -6535,6 +6567,9 @@ static float render_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr
     if (slot->unpitched) {
         ratio = 1.0f; // DRUM (Unpitched) -- always plays at its native recorded rate
     } else {
+        // Deliberately always standard 12-TET here, never hds_note_to_hz() -- see that function's
+        // own comment for why WAVE_SAMPLE's root-note reference is a documented microtuning scope
+        // boundary rather than an oversight.
         float root_hz = 440.0f * powf(2.0f, (float)(slot->root_note - 69) / 12.0f);
         ratio = (root_hz > 1.0f) ? fmaxf(0.01f, hz / root_hz) : 1.0f;
     }
@@ -6815,6 +6850,114 @@ static float sample_osc_zone_pan_offset(HdsSampleEngine *se, int stream_idx) {
 }
 
 // target_program: which of knobs->programs[COMBI_PROGRAM_COUNT] this note belongs to (0 in
+// --- Microtuning (Scala .scl import -- see SynthSharedControls.tuning_enable's own comment) ---
+//
+// Off by default (tuning_enable=0), reproducing today's exact 12-tone equal temperament (440Hz
+// A4) everywhere -- see hds_note_to_hz()'s own early-out. Applies to the primary oscillator pitch
+// only (handle_note_on/handle_note_off's target_hz below, i.e. what frequency a played MIDI note
+// actually sounds at) -- WAVE_SAMPLE playback's own root-note reference frequency
+// (render_sample_osc) deliberately stays 12-TET regardless, a documented scope boundary rather
+// than an oversight: retuning a sample's own playback-RATE reference would need threading knobs/
+// tuning state through the sample-streaming engine's own call chain, for a comparatively obscure
+// interaction (how fast a recorded sample plays back relative to its own root note) most players
+// retuning their oscillators would never even notice.
+//
+// A Scala .scl file lists N pitch ratios (each either a fraction like "3/2", a bare integer like
+// "2" meaning 2/1, or a cents value like "701.955" -- distinguished by containing a '.') relative
+// to an implicit unison (1/1) -- the LAST of the N ratios is the scale's own "period" (almost
+// always an octave, 2/1, but Scala doesn't require that). MIDI notes map onto scale degrees
+// chromatically from a chosen reference note (tuning_reference_note, default 60 = Middle C) at a
+// chosen reference frequency (tuning_reference_freq, default 261.6256Hz -- Middle C's own standard
+// 12-TET frequency), wrapping (and multiplying in another period) every N notes.
+#define HDS_TUNING_MAX_DEGREES 128
+typedef struct {
+    bool loaded;
+    int degree_count; // N -- pitch lines actually read from the file (NOT counting the implicit 1/1)
+    float degree_ratio[HDS_TUNING_MAX_DEGREES]; // degree_ratio[0..N-1]; degree_ratio[N-1] is the period (e.g. 2.0 for an octave-repeating scale)
+    char description[128];
+} HdsTuningTable;
+static HdsTuningTable g_tuning_table;
+
+// Parses one .scl pitch line into a ratio. Returns false (leaving *out_ratio untouched) if the
+// line has no parseable number at all -- a blank/malformed line the caller should skip rather
+// than insert a garbage degree.
+static bool hds_parse_scl_pitch_line(const char *line, float *out_ratio) {
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line == '\0' || *line == '!') return false; // blank or comment
+    if (strchr(line, '.')) {
+        *out_ratio = powf(2.0f, (float)(atof(line) / 1200.0)); // cents
+        return true;
+    }
+    long numerator = 0, denominator = 1; // denominator's own default covers a bare integer line ("2" means 2/1)
+    if (sscanf(line, "%ld / %ld", &numerator, &denominator) >= 1) {
+        if (denominator == 0) return false;
+        *out_ratio = (float)numerator / (float)denominator;
+        return true;
+    }
+    return false;
+}
+
+// Reads a Scala .scl file directly (backend-native, matching --sfz-vcoN/zone_load_sfz's own "OSC
+// carries just a path, the backend does the file I/O" shape) -- replaces the currently-loaded
+// scale wholesale on success; a malformed/truncated file is rejected with NOTHING changed (same
+// "no partial application" posture as hds_song_load_midi).
+static bool hds_tuning_load_scl(const char *file_path) {
+    FILE *f = fopen(file_path, "r");
+    if (!f) return false;
+    char line[256];
+    char description[256] = {0}; // matches line's own size (only the first 127 chars actually survive into g_tuning_table.description's own smaller buffer at the end)
+    int degree_count = -1; // -1 = "count line not seen yet"
+    float ratios[HDS_TUNING_MAX_DEGREES];
+    int parsed = 0;
+    bool have_description = false;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        char *cr = strchr(line, '\r'); if (cr) *cr = '\0'; // tolerate CRLF files
+        char *trimmed = line; while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        if (*trimmed == '!' || *trimmed == '\0') continue; // comment or blank -- never counts toward description/count/pitch lines
+        if (!have_description) {
+            snprintf(description, sizeof(description), "%s", trimmed);
+            have_description = true;
+        } else if (degree_count < 0) {
+            degree_count = atoi(trimmed);
+            if (degree_count <= 0 || degree_count > HDS_TUNING_MAX_DEGREES) { fclose(f); return false; }
+        } else if (parsed < degree_count) {
+            float ratio;
+            if (!hds_parse_scl_pitch_line(trimmed, &ratio) || ratio <= 0.0f) { fclose(f); return false; }
+            ratios[parsed++] = ratio;
+        }
+    }
+    fclose(f);
+    if (degree_count < 0 || parsed != degree_count) return false; // truncated -- fewer pitch lines than the count line promised
+    g_tuning_table.degree_count = degree_count;
+    memcpy(g_tuning_table.degree_ratio, ratios, sizeof(float) * (size_t)degree_count);
+    // %.127s (not a bare %s): description's own local buffer is 256 bytes (matching line[]) while
+    // g_tuning_table.description is a smaller, deliberately compact 128 -- an explicit precision
+    // matching that destination size lets the compiler verify no truncation risk regardless of
+    // optimization level, rather than relying on it proving that some other way.
+    snprintf(g_tuning_table.description, sizeof(g_tuning_table.description), "%.127s", description);
+    g_tuning_table.loaded = true;
+    return true;
+}
+
+// The one lookup every note-on/note-off pitch calculation goes through -- see this section's own
+// header comment for the mapping. Falls back to standard 12-TET (identical to this file's
+// original hardcoded formula) whenever tuning is off, nothing has been loaded yet, or the loaded
+// table is somehow empty, so a build/session that never touches tuning behaves byte-identically
+// to before this feature existed.
+static float hds_note_to_hz(const SynthSharedControls *knobs, int note) {
+    float standard_hz = 440.0f * powf(2.0f, (float)(note - 69) / 12.0f);
+    if (knobs->tuning_enable == 0.0f || !g_tuning_table.loaded || g_tuning_table.degree_count <= 0) return standard_hz;
+    int n = g_tuning_table.degree_count;
+    int reference_note = (int)knobs->tuning_reference_note;
+    int offset = note - reference_note;
+    int period_count = (offset >= 0) ? (offset / n) : -(((-offset) + n - 1) / n); // floor division, correct for negative offset too
+    int degree = offset - period_count * n; // always in [0, n-1] regardless of offset's sign
+    float degree_ratio = (degree == 0) ? 1.0f : g_tuning_table.degree_ratio[degree - 1];
+    float period_ratio = g_tuning_table.degree_ratio[n - 1];
+    return knobs->tuning_reference_freq * powf(period_ratio, (float)period_count) * degree_ratio;
+}
+
 // Single Program/Sequencer modes; 0-7 in Combi mode). Poly-mode voice claiming stays fully
 // program-agnostic (searches/steals across the whole shared pool, per the user's explicit "one
 // shared budget" requirement) -- only the claimed voice's program_index stamp and which
@@ -6859,7 +7002,7 @@ static void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthShared
         }
     } else { slot = target_program; }
 
-    float target_hz = 440.0f * powf(2.0f, (note - 69) / 12.0f);
+    float target_hz = hds_note_to_hz(knobs, note);
     voices[slot].program_index = target_program;
     voices[slot].midi_note = note;
     voices[slot].midi_velocity = velocity;
@@ -6990,7 +7133,7 @@ static void handle_note_off(HdsSampleEngine *se, SynthVoice voices[], const Synt
         // core mono-mode bug: releasing whichever key came down last used to kill the note
         // even when an earlier key was still held.
         int fallback_note = mono_stack->notes[mono_stack->count - 1];
-        float target_hz = 440.0f * powf(2.0f, (fallback_note - 69) / 12.0f);
+        float target_hz = hds_note_to_hz(knobs, fallback_note);
         mono_voice->midi_note = fallback_note;
         mono_voice->midi_velocity = mono_stack->velocities[mono_stack->count - 1];
         mono_voice->vco1_target_freq = target_hz;
@@ -7089,6 +7232,13 @@ typedef struct {
     double        transport_playhead_sec;
     float         transport_last_play_trigger, transport_last_pause_trigger, transport_last_stop_trigger;
     float         transport_last_seek_start_trigger, transport_last_seek_back_trigger, transport_last_seek_fwd_trigger;
+
+    // --- External MIDI Clock sync (see SynthSharedControls.seq_sync_source) ---
+    bool   midi_clock_valid;                  // true once enough consecutive ticks have arrived to trust midi_clock_bpm
+    float  midi_clock_bpm;                    // derived tempo, smoothed over a handful of ticks
+    float  midi_clock_tick_interval_smoothed; // seconds/tick, exponential moving average
+    double midi_clock_last_tick_sec;          // hds_monotonic_seconds() timestamp of the last received tick
+    int    midi_clock_tick_count;             // consecutive ticks seen since the last Start/long-gap reset
 
     // --- Metronome ---
     double        metronome_next_click_sec;
@@ -7254,6 +7404,72 @@ static void transport_start_fresh(HdsStreamsState *streams, HdsEngineState *engi
         engine->seq_midi[l].event_count = 0; // Overwrite (default) -- fresh take
     }
     transport_reposition_lanes(streams, engine, knobs);
+}
+
+// --- External MIDI Clock sync (see SynthSharedControls.seq_sync_source) ---
+//
+// MIDI Clock (0xF8) ticks 24 times per quarter note, with no tempo field of its own -- the
+// receiving device is expected to derive BPM purely from how far apart consecutive ticks land in
+// real time. Measured here via CLOCK_MONOTONIC wall-clock timestamps at the point each tick is
+// polled (this engine's MIDI input is polled once per audio block, not on a dedicated MIDI
+// thread, so tick timing carries up to one block's worth of jitter -- a few milliseconds at
+// typical block sizes, negligible for tempo derivation and the same polling-granularity tradeoff
+// every other block-polled input here already accepts).
+#define HDS_MIDI_CLOCK_TICKS_PER_QUARTER 24
+#define HDS_MIDI_CLOCK_TIMEOUT_SEC 2.0 // no tick for this long -> treat the external clock as gone
+
+static double hds_monotonic_seconds(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+// Hooked directly into process_midi_input's SND_SEQ_EVENT_CLOCK case -- runs unconditionally
+// regardless of seq_sync_source (cheap bookkeeping either way), so switching sync source live
+// doesn't need to "catch up" on tempo -- it's already tracked in the background.
+static void hds_handle_midi_clock_tick(HdsEngineState *engine) {
+    double now = hds_monotonic_seconds();
+    if (engine->midi_clock_tick_count > 0) {
+        double delta = now - engine->midi_clock_last_tick_sec;
+        if (delta > 0.0 && delta < HDS_MIDI_CLOCK_TIMEOUT_SEC) {
+            if (!engine->midi_clock_valid) {
+                engine->midi_clock_tick_interval_smoothed = (float)delta; // first real sample -- nothing to smooth against yet
+            } else {
+                // ~5-tick time constant: fast enough to track a live tempo ramp (a performer
+                // riding a hardware sequencer's tempo knob) without jittering the derived BPM on
+                // every single tick's own small timing noise.
+                float smoothing = 0.2f;
+                engine->midi_clock_tick_interval_smoothed += ((float)delta - engine->midi_clock_tick_interval_smoothed) * smoothing;
+            }
+            engine->midi_clock_bpm = 60.0f / (engine->midi_clock_tick_interval_smoothed * (float)HDS_MIDI_CLOCK_TICKS_PER_QUARTER);
+            if (engine->midi_clock_tick_count >= 4) engine->midi_clock_valid = true; // a few ticks in before trusting it
+        } else {
+            engine->midi_clock_tick_count = 0; // long gap (e.g. was stopped) -- restart clean rather than poisoning the average with one huge interval
+        }
+    }
+    engine->midi_clock_last_tick_sec = now;
+    engine->midi_clock_tick_count++;
+}
+
+// MIDI Start (0xFA): always begins from the top, exactly like the GUI's own Stop->Play transition
+// -- see transport_start_fresh()'s own comment for what "fresh" means for a Rec-armed lane.
+static void hds_handle_midi_transport_start(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
+    engine->transport_playhead_sec = 0.0;
+    engine->transport_state = TRANSPORT_PLAYING;
+    transport_start_fresh(streams, engine, knobs);
+}
+
+// MIDI Continue (0xFB): resumes from exactly wherever the transport currently sits -- no
+// repositioning, same as the GUI's own Paused->Playing transition.
+static void hds_handle_midi_transport_continue(HdsEngineState *engine) {
+    engine->transport_state = TRANSPORT_PLAYING;
+}
+
+// MIDI Stop (0xFC): PAUSES rather than resets to zero -- matches General MIDI/MIDI Machine
+// Control's own Stop/Continue semantics (a subsequent Continue must resume from here), the same
+// distinction the GUI's own separate Pause and Stop buttons already make. A performer who wants
+// to rewind to the top sends Start, not Stop, exactly as most DAWs already behave.
+static void hds_handle_midi_transport_stop(HdsEngineState *engine) {
+    if (engine->transport_state == TRANSPORT_PLAYING) engine->transport_state = TRANSPORT_PAUSED;
 }
 
 // --- Metronome state (declared here, ahead of poll_transport_triggers below, so a Seek can
@@ -7592,6 +7808,21 @@ static int song_load_midi_handler(const char *path, const char *types, lo_arg **
     const char *file_path = (const char *)&argv[0]->s;
     if (!hds_song_load_midi(engine, file_path)) {
         fprintf(stderr, "[song] failed to load MIDI data from '%s' (missing, unreadable, or wrong format/version)\n", file_path);
+    }
+    return 0;
+}
+
+// No context needed beyond the path itself -- hds_tuning_load_scl() writes straight into the
+// static g_tuning_table (see its own comment), the same "OSC carries just a path, the backend
+// does the file I/O" shape as zone_load_sfz_handler/song_load_midi_handler just above.
+static int tuning_load_scl_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)msg; (void)user_data;
+    if (argc != 1) return 0;
+    const char *file_path = (const char *)&argv[0]->s;
+    if (!hds_tuning_load_scl(file_path)) {
+        fprintf(stderr, "[tuning] failed to load '%s' (missing, unreadable, or malformed .scl)\n", file_path);
+    } else {
+        fprintf(stderr, "[tuning] loaded '%s': %d degrees (\"%s\")\n", file_path, g_tuning_table.degree_count, g_tuning_table.description);
     }
     return 0;
 }
@@ -8043,7 +8274,7 @@ static void midi_autoconnect_scan(snd_seq_t *seq, int our_port, const char *midi
 // our port to the ALSA announce port at startup (see main()'s comment on that subscription). The
 // actual musical response to each decoded event is dispatch_midi_event() above -- this function's
 // own job is purely "decode an ALSA sequencer event."
-static void process_midi_input(HdsEngineState *engine, HdsSampleEngine *se, snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live, float current_tempo_bpm) {
+static void process_midi_input(HdsStreamsState *streams, HdsEngineState *engine, HdsSampleEngine *se, snd_seq_t *seq_handle, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], int our_midi_port, MidiSourceList *midi_sources, MidiLiveState *midi_live, float current_tempo_bpm) {
     snd_seq_event_t *ev = NULL;
     while (snd_seq_event_input_pending(seq_handle, 1) > 0) {
         snd_seq_event_input(seq_handle, &ev); if (ev == NULL) continue;
@@ -8073,6 +8304,17 @@ static void process_midi_input(HdsEngineState *engine, HdsSampleEngine *se, snd_
             // but a stale tracked entry could otherwise be mistaken for a different device that
             // later reuses the same now-free client id.
             midi_source_list_remove_client(midi_sources, ev->data.addr.client);
+        } else if (ev->type == SND_SEQ_EVENT_CLOCK) {
+            // Tempo tracking runs unconditionally (see hds_handle_midi_clock_tick's own comment)
+            // -- only ACTING on it (feeding current_tempo_bpm) is gated on seq_sync_source, done
+            // once per block in main(), not here.
+            hds_handle_midi_clock_tick(engine);
+        } else if (ev->type == SND_SEQ_EVENT_START) {
+            if (knobs->seq_sync_source != 0.0f) hds_handle_midi_transport_start(streams, engine, knobs);
+        } else if (ev->type == SND_SEQ_EVENT_CONTINUE) {
+            if (knobs->seq_sync_source != 0.0f) hds_handle_midi_transport_continue(engine);
+        } else if (ev->type == SND_SEQ_EVENT_STOP) {
+            if (knobs->seq_sync_source != 0.0f) hds_handle_midi_transport_stop(engine);
         }
         snd_seq_free_event(ev);
     }
@@ -8200,7 +8442,15 @@ static void apply_program_eq(HdsEngineState *engine, int p, const EqBiquadCoeffs
     }
 }
 
-static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm, float ext_in_peak_out[EXT_IN_PAIR_COUNT]) {
+// per_program_out (NULL-able): when non-NULL, receives this block's fully-processed (post-EQ,
+// post-FX -- the exact same signal Combi Mix itself sums) per-Combi-Program stereo bus, laid out
+// as per_program_out[frame * COMBI_PROGRAM_COUNT * 2 + program * 2 + channel] -- i.e. the caller
+// owns a buffer of at least (frames handed to this call) * COMBI_PROGRAM_COUNT * 2 floats. Exists
+// for the CLAP plugin's multi-out audio ports (see clap_audio_ports_get() in clap_plugin.c) --
+// the standalone app has no equivalent need (its own Routing tab already sends any Program to any
+// real hardware output pair via out_buffer/output_channels) and always passes NULL here, at zero
+// extra cost beyond one null check per sample.
+static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm, float ext_in_peak_out[EXT_IN_PAIR_COUNT], float *per_program_out) {
     float peak = 0.0f;
     // Routing tab's per-ext-in-pair VU meters (see gui_routing_tab_visible's own comment): a true
     // no-op -- not just "computed but ignored" -- whenever the Routing tab isn't on-screen, so
@@ -9263,6 +9513,16 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         for (int src = 0; src < SOURCE_COUNT; src++) {
             if (!source_has_fx_slots[src]) continue;
             process_fx_chain(knobs->fx, fx_engine, (int)knobs->fx_source_routing_mode[src], src, &bus_l[src], &bus_r[src]);
+        }
+
+        // CLAP multi-out (see this function's own per_program_out comment) -- captured here,
+        // after FX, so each port carries the exact same fully-processed signal Combi Mix itself
+        // sums, not a pre-FX tap.
+        if (per_program_out) {
+            for (int p = 0; p < COMBI_PROGRAM_COUNT; p++) {
+                per_program_out[(size_t)i * COMBI_PROGRAM_COUNT * 2 + (size_t)p * 2 + 0] = bus_l[p];
+                per_program_out[(size_t)i * COMBI_PROGRAM_COUNT * 2 + (size_t)p * 2 + 1] = bus_r[p];
+            }
         }
 
         // No extra fixed headroom pad here beyond master_volume itself -- there used to be a
@@ -10463,6 +10723,11 @@ typedef struct {
     // same "computed and sent every status tick regardless, just usually zero" shape as peak
     // itself rather than a separate conditional message.
     float ext_in_peak[EXT_IN_PAIR_COUNT];
+    // 1.0 once External MIDI Clock sync is both selected AND actually locked onto real incoming
+    // ticks (see main()'s own use_external_clock resolution) -- lets the GUI show "Ext: Locked"
+    // vs "Ext: Waiting..." instead of leaving a player guessing whether a cable/routing problem is
+    // why tempo isn't moving.
+    float midi_clock_locked;
 } EngineStatus;
 
 // Sends the GUI-status snapshot as one OSC bundle (one UDP datagram, 8 messages) to the reply
@@ -10487,6 +10752,7 @@ static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
         snprintf(addr, sizeof(addr), "/hds/status/ext_in_peak/%d", p);
         m = lo_message_new(); lo_message_add_float(m, status->ext_in_peak[p]); lo_bundle_add_message(b, addr, m);
     }
+    m = lo_message_new(); lo_message_add_float(m, status->midi_clock_locked); lo_bundle_add_message(b, "/hds/status/midi_clock_locked", m);
     lo_send_bundle(reply_addr, b);
     lo_bundle_free_recursive(b); // frees the bundle AND every message added to it
 }
@@ -10603,6 +10869,7 @@ int main(int argc, char **argv) {
     lo_server_add_method(osc_server, "/hds/zone/load_sfz", "is", zone_load_sfz_handler, &g_sample_engine);
     lo_server_add_method(osc_server, "/hds/song/save_midi", "s", song_save_midi_handler, &g_engine);
     lo_server_add_method(osc_server, "/hds/song/load_midi", "s", song_load_midi_handler, &g_engine);
+    lo_server_add_method(osc_server, "/hds/tuning/load_scl", "s", tuning_load_scl_handler, NULL);
     lo_server_add_method(osc_server, NULL, NULL, generic_osc_handler, &active_knobs);
 
     char osc_reply_port_str[16]; snprintf(osc_reply_port_str, sizeof(osc_reply_port_str), "%d", osc_reply_port);
@@ -10741,7 +11008,16 @@ int main(int argc, char **argv) {
         // (EngineStatus.tempo_bpm_live) purely so the Tempo knob visibly does something
         // end-to-end even before a tempo-synced feature exists to actually use it.
         double engine_elapsed_seconds = (double)total_frames_rendered / (double)SAMPLE_RATE;
-        float current_tempo_bpm = compute_current_tempo_bpm(&active_knobs, engine_elapsed_seconds);
+        // External MIDI Clock sync (see SynthSharedControls.seq_sync_source): substitutes the
+        // clock-derived BPM for the Tempo knob/tempo-map's own result at this single resolution
+        // point -- every downstream consumer (Arp, LFO Tempo Sync, Quantize, the metronome, the
+        // Seek Back/Forward measure calc) already just takes whatever current_tempo_bpm resolves
+        // to here, so nothing else needs to know or care which source it came from. Falls back to
+        // Internal automatically if no clock tick has arrived recently (a disconnected/unplugged
+        // external source degrades to the Tempo knob rather than freezing at a stale BPM).
+        bool use_external_clock = (active_knobs.seq_sync_source != 0.0f) && g_engine.midi_clock_valid
+            && (hds_monotonic_seconds() - g_engine.midi_clock_last_tick_sec) < HDS_MIDI_CLOCK_TIMEOUT_SEC;
+        float current_tempo_bpm = use_external_clock ? g_engine.midi_clock_bpm : compute_current_tempo_bpm(&active_knobs, engine_elapsed_seconds);
 
         poll_transport_triggers(&g_streams_state, &g_engine, &active_knobs, current_tempo_bpm); // Play/Pause/Stop/Seek -- starts/freezes/resets/repositions the real Sequencer playhead
         poll_metronome(&g_engine, &active_knobs, current_tempo_bpm); // schedules the next click, if engaged and PLAYING
@@ -10802,7 +11078,7 @@ int main(int argc, char **argv) {
         // block (see its #define for the real-time trade-off this bounds).
         drain_pending_sample_loads(&g_sample_engine);
 
-        process_midi_input(&g_engine, &g_sample_engine, seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live, current_tempo_bpm);
+        process_midi_input(&g_streams_state, &g_engine, &g_sample_engine, seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live, current_tempo_bpm);
         seq_playback_midi_events(&g_engine, &g_sample_engine, voices, &active_knobs, global_lfo_phases, &mono_stacks[SINGLE_PROGRAM_SLOT], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets SINGLE_PROGRAM_SLOT)
 
         // block_size/voice_limit are computed fresh every iteration since both are live,
@@ -10845,7 +11121,7 @@ int main(int argc, char **argv) {
         struct timespec render_t0, render_t1;
         clock_gettime(CLOCK_MONOTONIC, &render_t0);
         float ext_in_peak[EXT_IN_PAIR_COUNT];
-        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer, current_tempo_bpm, ext_in_peak);
+        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer, current_tempo_bpm, ext_in_peak, NULL);
         clock_gettime(CLOCK_MONOTONIC, &render_t1);
         double render_ms = (render_t1.tv_sec - render_t0.tv_sec) * 1000.0 + (render_t1.tv_nsec - render_t0.tv_nsec) / 1e6;
         double budget_ms = (block_size / (double)SAMPLE_RATE) * 1000.0;
@@ -10941,6 +11217,7 @@ int main(int argc, char **argv) {
                 .seq_transport_state = (float)g_transport_state,
             };
             for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) status.ext_in_peak[p] = ext_in_peak[p];
+            status.midi_clock_locked = use_external_clock ? 1.0f : 0.0f;
             send_osc_status(osc_reply_addr, &status);
             send_seq_audio_status(&g_streams_state, osc_reply_addr);
             vu_decimator = 0;

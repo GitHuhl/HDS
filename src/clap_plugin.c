@@ -10,16 +10,15 @@
 // file just calls those same functions directly instead of main()'s own ALSA device-I/O loop.
 //
 // As a plugin, HDS stops owning audio device I/O and MIDI device I/O entirely -- the host
-// supplies both via CLAP's audio-ports/note-ports extensions -- but keeps its own control
-// surface unchanged: this file starts its own embedded OSC server (default ports 9010/9011,
-// distinct from the standalone app's 9000/9001) so frontend.py can drive it exactly as it drives
-// the standalone app, just pointed at a different port. There is no CLAP `params` extension in
-// this first version; the ~1150 knobs stay 100% OSC-driven.
-//
-// A CLAP `params` extension (host-automatable knobs) is explicitly out of scope for this version
-// -- see the plan doc's own stated scope boundaries. `state` (DAW project save/load) IS
-// implemented -- see its own section below. This project targets Linux only (see shell.nix's own
-// header comment), so there is no Windows build of this plugin, now or planned.
+// supplies both via CLAP's audio-ports/note-ports extensions (see the multi-out section below for
+// audio-ports specifically) -- but keeps its own control surface unchanged: this file starts its
+// own embedded OSC server (default ports 9010/9011, distinct from the standalone app's 9000/9001)
+// so frontend.py can drive it exactly as it drives the standalone app, just pointed at a different
+// port. The ~1150 knobs stay 100% OSC-driven; a CURATED subset of ~60 (see HDS_CLAP_PARAMS) is
+// ALSO exposed via a real `params` extension for host automation -- see that table's own comment
+// for why exhaustive (all ~1150) was deliberately not attempted. `state` (DAW project save/load)
+// is implemented too -- see its own section below. This project targets Linux only (see
+// shell.nix's own header comment), so there is no Windows build of this plugin, now or planned.
 
 #include <stdarg.h>
 #include "../third_party/clap/include/clap/clap.h"
@@ -77,6 +76,21 @@ typedef struct {
     HdsEngineState engine;
     HdsSampleEngine sample_engine;
 
+    // CLAP multi-out: one extra stereo audio-port per Combi Program (see clap_audio_ports_get()),
+    // alongside the existing main stereo mix. A per-instance field, not a process()-local stack
+    // array (BUFFER_SIZE * COMBI_PROGRAM_COUNT * 2 floats = 64KB) -- a real-time audio callback's
+    // own stack is a scarcer, less predictable resource than this struct's already-heap/static-
+    // lifetime allocation, and this buffer needs no more per-call isolation than chunk_buffer's
+    // own comment already requires (per-instance is enough; concurrent instances already don't
+    // share this struct).
+    float per_program_render_buf[BUFFER_SIZE * COMBI_PROGRAM_COUNT * 2];
+
+    // CLAP params extension (see HDS_CLAP_PARAMS/hds_clap_push_changed_params further down) --
+    // one shadow value per exposed param, used purely to detect an OSC/GUI-driven change so it
+    // can be echoed to the host as an output event. Sized/initialized once the table itself is
+    // known to exist (clap_factory_create_plugin sets every entry to that param's default_value).
+    double clap_param_shadow[64]; // >= HDS_CLAP_PARAM_COUNT; a plain fixed size since the table is a compile-time constant and this is just a shadow cache, not wire-visible
+
     uint64_t total_frames_rendered;
     int vu_decimator;
 
@@ -92,22 +106,35 @@ typedef struct {
 } HdsClapPlugin;
 
 // ---------------------------------------------------------------------------------------------
-// audio-ports extension: 1 stereo output, 0 inputs (external audio input is a standalone-only
-// feature for now -- matches the existing no-capture-device code path render_audio_block already
-// exercises when ext_in_channels=0/a NULL buffer).
+// audio-ports extension: 0 inputs (external audio input is a standalone-only feature for now --
+// matches the existing no-capture-device code path render_audio_block already exercises when
+// ext_in_channels=0/a NULL buffer). Outputs: port 0 is the main stereo mix (today's only output,
+// unchanged -- IS_MAIN, so a host that doesn't care about multi-out just uses this one and never
+// notices the rest exist), plus one more stereo port per Combi Program (ports 1-8) carrying that
+// Program's own fully-processed (post-EQ, post-FX) signal -- the same multi-source richness the
+// standalone app already exposes via its own Routing tab's hardware-output-pair grid, made
+// reachable to a DAW host as separate tracks/busses instead. A host that connects only port 0
+// hears the same identical mix as before this existed; per_program_render_buf (see this struct's
+// own field comment) is only ever populated for a port the host actually connected.
 // ---------------------------------------------------------------------------------------------
+#define CLAP_OUTPUT_PORT_COUNT (1 + COMBI_PROGRAM_COUNT)
 
 static uint32_t clap_audio_ports_count(const clap_plugin_t *plugin, bool is_input) {
     (void)plugin;
-    return is_input ? 0 : 1;
+    return is_input ? 0 : (uint32_t)CLAP_OUTPUT_PORT_COUNT;
 }
 
 static bool clap_audio_ports_get(const clap_plugin_t *plugin, uint32_t index, bool is_input, clap_audio_port_info_t *info) {
     (void)plugin;
-    if (is_input || index != 0) return false;
-    info->id = 0;
-    snprintf(info->name, sizeof(info->name), "%s", "Output");
-    info->flags = CLAP_AUDIO_PORT_IS_MAIN;
+    if (is_input || index >= (uint32_t)CLAP_OUTPUT_PORT_COUNT) return false;
+    info->id = index;
+    if (index == 0) {
+        snprintf(info->name, sizeof(info->name), "%s", "Main Output");
+        info->flags = CLAP_AUDIO_PORT_IS_MAIN;
+    } else {
+        snprintf(info->name, sizeof(info->name), "Program %u", (unsigned int)index);
+        info->flags = 0;
+    }
     info->channel_count = 2;
     info->port_type = CLAP_PORT_STEREO;
     info->in_place_pair = CLAP_INVALID_ID;
@@ -144,6 +171,239 @@ static bool clap_note_ports_get(const clap_plugin_t *plugin, uint32_t index, boo
 static const clap_plugin_note_ports_t k_note_ports_ext = {
     .count = clap_note_ports_count,
     .get = clap_note_ports_get,
+};
+
+// ---------------------------------------------------------------------------------------------
+// params extension: host automation for a CURATED set of the knobs a player would actually want
+// to automate/ride live, not all ~1150 -- see this table's own field comments. Deliberately
+// scoped rather than exhaustive: backend.c's OSC_PARAMS[] (the single source of truth for every
+// knob's address/offset -- see its own comment) carries NO min/max/default metadata at all, since
+// nothing needed it before this -- every real range today lives only in frontend.py's widget
+// construction (e.g. PotentiometerKnob.setRange(...)). Exposing all ~1150 as CLAP params would
+// mean hand-authoring ~1150 rows of range metadata from scratch (a huge, error-prone undertaking
+// with no way to keep it in sync with frontend.py automatically), and would hand the host's own
+// automation-lane picker an unusably long flat list -- the same reason most commercial synth
+// plugins expose a curated "macro" parameter page rather than every internal register. This list
+// (~60 params, each range hand-verified against frontend.py's own widget construction) covers:
+// all 5 filters' Cutoff/Resonance, the post-filter 3-band EQ, each oscillator's Volume/Pan, each
+// oscillator's own Amp EG (Attack/Decay/Sustain/Release), all 12 FX slots' Mix, Master Volume, and
+// Transpose. Every entry addresses SINGLE_PROGRAM_SLOT (or a session-level field) exactly like an
+// unprefixed "/hds/..." OSC address does -- Combi lanes and the Sequencer aren't exposed as CLAP
+// params in this pass (a plugin instance is used as one voice/patch from a host's perspective; see
+// this file's own header comment on the Combi/Sequencer machinery still being fully OSC-reachable
+// regardless).
+//
+// THREAD SAFETY: get_value()/get_info() run on the host's main thread while process() (which
+// writes these same SynthSharedControls fields, from OSC and from incoming param-value events
+// alike) runs on the audio thread -- a plain, unsynchronized float read/write race, same as every
+// other field in this ~1150-field struct already has with respect to OSC (this plugin drains its
+// OSC socket from inside process() itself, so that side was never actually concurrent -- CLAP's
+// own main-thread parameter calls are the first genuinely concurrent access here). Consistent
+// with this struct's existing floats-everywhere design (nothing in it is atomic), and a torn read
+// of a scalar float degrades to "the host's UI briefly shows a slightly stale value," never a
+// crash -- judged an acceptable, explicitly-noted simplification rather than introducing a second
+// synchronization discipline for just these 60 fields.
+typedef struct {
+    clap_id id;              // stable identifier -- hand-assigned below, never derived from array position (see this table's own comment on why)
+    const char *name;        // host-facing display name
+    size_t offset;           // offsetof(SynthSharedControls, ...) -- same offset-into-the-struct idea OSC_PARAMS itself uses
+    double min_value, max_value, default_value;
+    const char *unit;        // suffix for value_to_text(), e.g. " Hz" -- "" for a bare number
+} HdsClapParamInfo;
+
+#define HDS_CLAP_PPARAM(pid, nm, field, mn, mx, dflt, u) \
+    { (pid), (nm), offsetof(SynthSharedControls, programs[SINGLE_PROGRAM_SLOT].field), (mn), (mx), (dflt), (u) }
+#define HDS_CLAP_TPARAM(pid, nm, field, mn, mx, dflt, u) \
+    { (pid), (nm), offsetof(SynthSharedControls, field), (mn), (mx), (dflt), (u) }
+
+static const HdsClapParamInfo HDS_CLAP_PARAMS[] = {
+    HDS_CLAP_PPARAM(0,  "Filter 1 Cutoff",    filters[0].cutoff, 40.0, 18000.0, 800.0,  " Hz"),
+    HDS_CLAP_PPARAM(1,  "Filter 2 Cutoff",    filters[1].cutoff, 40.0, 18000.0, 2000.0, " Hz"),
+    HDS_CLAP_PPARAM(2,  "Filter 3 Cutoff",    filters[2].cutoff, 40.0, 18000.0, 2000.0, " Hz"),
+    HDS_CLAP_PPARAM(3,  "Filter 4 Cutoff",    filters[3].cutoff, 40.0, 18000.0, 2000.0, " Hz"),
+    HDS_CLAP_PPARAM(4,  "Filter 5 Cutoff",    filters[4].cutoff, 40.0, 18000.0, 2000.0, " Hz"),
+    HDS_CLAP_PPARAM(5,  "Filter 1 Resonance", filters[0].res_q,  0.0, 100.0, 20.0, ""),
+    HDS_CLAP_PPARAM(6,  "Filter 2 Resonance", filters[1].res_q,  0.0, 100.0, 20.0, ""),
+    HDS_CLAP_PPARAM(7,  "Filter 3 Resonance", filters[2].res_q,  0.0, 100.0, 20.0, ""),
+    HDS_CLAP_PPARAM(8,  "Filter 4 Resonance", filters[3].res_q,  0.0, 100.0, 20.0, ""),
+    HDS_CLAP_PPARAM(9,  "Filter 5 Resonance", filters[4].res_q,  0.0, 100.0, 20.0, ""),
+    HDS_CLAP_PPARAM(10, "EQ Low Freq",  eq_bands[0].freq,    20.0, 20000.0, 100.0,  " Hz"),
+    HDS_CLAP_PPARAM(11, "EQ Low Gain",  eq_bands[0].gain_db, -18.0, 18.0, 0.0, " dB"),
+    HDS_CLAP_PPARAM(12, "EQ Mid Freq",  eq_bands[1].freq,    20.0, 20000.0, 1000.0, " Hz"),
+    HDS_CLAP_PPARAM(13, "EQ Mid Gain",  eq_bands[1].gain_db, -18.0, 18.0, 0.0, " dB"),
+    HDS_CLAP_PPARAM(14, "EQ Mid Q",     eq_bands[1].q,       0.1, 10.0, 0.707, ""),
+    HDS_CLAP_PPARAM(15, "EQ High Freq", eq_bands[2].freq,    20.0, 20000.0, 5000.0, " Hz"),
+    HDS_CLAP_PPARAM(16, "EQ High Gain", eq_bands[2].gain_db, -18.0, 18.0, 0.0, " dB"),
+    HDS_CLAP_PPARAM(17, "Osc 1 Volume", vco1_vol, 0.0, 1.0, 0.8, ""),
+    HDS_CLAP_PPARAM(18, "Osc 2 Volume", vco2_vol, 0.0, 1.0, 0.5, ""),
+    HDS_CLAP_PPARAM(19, "Osc 3 Volume", vco3_vol, 0.0, 1.0, 0.0, ""),
+    HDS_CLAP_PPARAM(20, "Osc 4 Volume", vco4_vol, 0.0, 1.0, 0.0, ""),
+    HDS_CLAP_PPARAM(21, "Osc 1 Pan", vco1_pan, -1.0, 1.0, 0.0, ""),
+    HDS_CLAP_PPARAM(22, "Osc 2 Pan", vco2_pan, -1.0, 1.0, 0.0, ""),
+    HDS_CLAP_PPARAM(23, "Osc 3 Pan", vco3_pan, -1.0, 1.0, 0.0, ""),
+    HDS_CLAP_PPARAM(24, "Osc 4 Pan", vco4_pan, -1.0, 1.0, 0.0, ""),
+    HDS_CLAP_PPARAM(25, "Osc 1 Amp Attack",  eg[0].a,   1.0, 1000.0, 10.0,  " ms"),
+    HDS_CLAP_PPARAM(26, "Osc 1 Amp Decay",   eg[0].dec, 1.0, 2000.0, 150.0, " ms"),
+    HDS_CLAP_PPARAM(27, "Osc 1 Amp Sustain", eg[0].s,   0.0, 100.0, 80.0,  "%"),
+    HDS_CLAP_PPARAM(28, "Osc 1 Amp Release", eg[0].r,   1.0, 2000.0, 300.0, " ms"),
+    HDS_CLAP_PPARAM(29, "Osc 2 Amp Attack",  eg[1].a,   1.0, 1000.0, 10.0,  " ms"),
+    HDS_CLAP_PPARAM(30, "Osc 2 Amp Decay",   eg[1].dec, 1.0, 2000.0, 150.0, " ms"),
+    HDS_CLAP_PPARAM(31, "Osc 2 Amp Sustain", eg[1].s,   0.0, 100.0, 80.0,  "%"),
+    HDS_CLAP_PPARAM(32, "Osc 2 Amp Release", eg[1].r,   1.0, 2000.0, 300.0, " ms"),
+    HDS_CLAP_PPARAM(33, "Osc 3 Amp Attack",  eg[2].a,   1.0, 1000.0, 10.0,  " ms"),
+    HDS_CLAP_PPARAM(34, "Osc 3 Amp Decay",   eg[2].dec, 1.0, 2000.0, 150.0, " ms"),
+    HDS_CLAP_PPARAM(35, "Osc 3 Amp Sustain", eg[2].s,   0.0, 100.0, 80.0,  "%"),
+    HDS_CLAP_PPARAM(36, "Osc 3 Amp Release", eg[2].r,   1.0, 2000.0, 300.0, " ms"),
+    HDS_CLAP_PPARAM(37, "Osc 4 Amp Attack",  eg[3].a,   1.0, 1000.0, 10.0,  " ms"),
+    HDS_CLAP_PPARAM(38, "Osc 4 Amp Decay",   eg[3].dec, 1.0, 2000.0, 150.0, " ms"),
+    HDS_CLAP_PPARAM(39, "Osc 4 Amp Sustain", eg[3].s,   0.0, 100.0, 80.0,  "%"),
+    HDS_CLAP_PPARAM(40, "Osc 4 Amp Release", eg[3].r,   1.0, 2000.0, 300.0, " ms"),
+    HDS_CLAP_TPARAM(41, "FX 1 Mix",  fx[0].mix,  0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(42, "FX 2 Mix",  fx[1].mix,  0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(43, "FX 3 Mix",  fx[2].mix,  0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(44, "FX 4 Mix",  fx[3].mix,  0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(45, "FX 5 Mix",  fx[4].mix,  0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(46, "FX 6 Mix",  fx[5].mix,  0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(47, "FX 7 Mix",  fx[6].mix,  0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(48, "FX 8 Mix",  fx[7].mix,  0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(49, "FX 9 Mix",  fx[8].mix,  0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(50, "FX 10 Mix", fx[9].mix,  0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(51, "FX 11 Mix", fx[10].mix, 0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(52, "FX 12 Mix", fx[11].mix, 0.0, 100.0, 100.0, "%"),
+    HDS_CLAP_TPARAM(53, "Master Volume", master_volume, 0.0, 1.0, 0.5, ""),
+    HDS_CLAP_TPARAM(54, "Transpose", transpose_semitones, -16.0, 16.0, 0.0, " st"),
+};
+#define HDS_CLAP_PARAM_COUNT ((uint32_t)(sizeof(HDS_CLAP_PARAMS) / sizeof(HDS_CLAP_PARAMS[0])))
+// HdsClapPlugin.clap_param_shadow is a fixed size (64), declared long before this table exists in
+// the file -- this catches a future table growth past that size at compile time instead of a
+// silent out-of-bounds write.
+_Static_assert(HDS_CLAP_PARAM_COUNT <= 64, "HDS_CLAP_PARAMS grew past HdsClapPlugin.clap_param_shadow's fixed size -- grow that array too");
+
+static const HdsClapParamInfo *hds_clap_param_by_id(clap_id id) {
+    for (uint32_t i = 0; i < HDS_CLAP_PARAM_COUNT; i++) {
+        if (HDS_CLAP_PARAMS[i].id == id) return &HDS_CLAP_PARAMS[i];
+    }
+    return NULL;
+}
+
+static double hds_clap_param_read(const HdsClapPlugin *p, const HdsClapParamInfo *info) {
+    return (double)(*(const float *)((const char *)&p->knobs + info->offset));
+}
+static void hds_clap_param_write(HdsClapPlugin *p, const HdsClapParamInfo *info, double value) {
+    if (value < info->min_value) value = info->min_value;
+    if (value > info->max_value) value = info->max_value;
+    *(float *)((char *)&p->knobs + info->offset) = (float)value;
+}
+
+static uint32_t clap_params_count(const clap_plugin_t *plugin) {
+    (void)plugin;
+    return HDS_CLAP_PARAM_COUNT;
+}
+
+static bool clap_params_get_info(const clap_plugin_t *plugin, uint32_t index, clap_param_info_t *info) {
+    (void)plugin;
+    if (index >= HDS_CLAP_PARAM_COUNT) return false;
+    const HdsClapParamInfo *src = &HDS_CLAP_PARAMS[index];
+    memset(info, 0, sizeof(*info));
+    info->id = src->id;
+    info->flags = CLAP_PARAM_IS_AUTOMATABLE;
+    snprintf(info->name, sizeof(info->name), "%s", src->name);
+    info->min_value = src->min_value;
+    info->max_value = src->max_value;
+    info->default_value = src->default_value;
+    return true;
+}
+
+static bool clap_params_get_value(const clap_plugin_t *plugin, clap_id param_id, double *out_value) {
+    HdsClapPlugin *p = (HdsClapPlugin *)plugin->plugin_data;
+    const HdsClapParamInfo *info = hds_clap_param_by_id(param_id);
+    if (!info) return false;
+    *out_value = hds_clap_param_read(p, info);
+    return true;
+}
+
+static bool clap_params_value_to_text(const clap_plugin_t *plugin, clap_id param_id, double value, char *out_buffer, uint32_t out_buffer_capacity) {
+    (void)plugin;
+    const HdsClapParamInfo *info = hds_clap_param_by_id(param_id);
+    if (!info) return false;
+    snprintf(out_buffer, out_buffer_capacity, "%.2f%s", value, info->unit);
+    return true;
+}
+
+static bool clap_params_text_to_value(const clap_plugin_t *plugin, clap_id param_id, const char *param_value_text, double *out_value) {
+    (void)plugin;
+    const HdsClapParamInfo *info = hds_clap_param_by_id(param_id);
+    if (!info) return false;
+    char *end = NULL;
+    double v = strtod(param_value_text, &end);
+    if (end == param_value_text) return false; // no number found at all
+    *out_value = v;
+    return true;
+}
+
+// Shared by process()'s own in_events loop and flush() below -- applies one host->plugin
+// parameter change and immediately mirrors it into the shadow table so the diff-and-echo pass
+// (hds_clap_push_changed_params) doesn't needlessly bounce the exact same value straight back to
+// the host as if it had originated from the GUI/OSC side instead.
+static void hds_clap_apply_param_event(HdsClapPlugin *p, const clap_event_param_value_t *ev) {
+    const HdsClapParamInfo *info = hds_clap_param_by_id(ev->param_id);
+    if (!info) return;
+    hds_clap_param_write(p, info, ev->value);
+    // Mirror into the shadow immediately -- see hds_clap_push_changed_params()'s own comment for
+    // why (without this, the very next diff pass would wrongly treat the host's own automation as
+    // an OSC/GUI-driven change and echo it straight back).
+    size_t idx = (size_t)(info - HDS_CLAP_PARAMS);
+    p->clap_param_shadow[idx] = hds_clap_param_read(p, info);
+}
+
+// Bi-directional sync's other half: a value changed some OTHER way (the frontend's own GUI, over
+// OSC -- the two run concurrently, see this file's own header comment) needs to reach the host's
+// automation lane/UI too, not just the reverse. Diffs every exposed param's live value against
+// clap_param_shadow (updated here AND by hds_clap_apply_param_event above) and emits a
+// CLAP_EVENT_PARAM_VALUE output event for whatever actually changed. Cheap enough (60 float
+// comparisons) to just run once per process()/flush() call rather than tracking dirty bits.
+static void hds_clap_push_changed_params(HdsClapPlugin *p, const clap_output_events_t *out_events) {
+    if (!out_events) return;
+    for (uint32_t i = 0; i < HDS_CLAP_PARAM_COUNT; i++) {
+        const HdsClapParamInfo *info = &HDS_CLAP_PARAMS[i];
+        double current = hds_clap_param_read(p, info);
+        if (current == p->clap_param_shadow[i]) continue;
+        p->clap_param_shadow[i] = current;
+        clap_event_param_value_t ev = {0};
+        ev.header.size = sizeof(ev);
+        ev.header.time = 0;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_PARAM_VALUE;
+        ev.header.flags = 0;
+        ev.param_id = info->id;
+        ev.cookie = NULL;
+        ev.note_id = -1; ev.port_index = -1; ev.channel = -1; ev.key = -1;
+        ev.value = current;
+        out_events->try_push(out_events, &ev.header);
+    }
+}
+
+static void clap_params_flush(const clap_plugin_t *plugin, const clap_input_events_t *in, const clap_output_events_t *out) {
+    HdsClapPlugin *p = (HdsClapPlugin *)plugin->plugin_data;
+    if (in) {
+        uint32_t n = in->size(in);
+        for (uint32_t i = 0; i < n; i++) {
+            const clap_event_header_t *hdr = in->get(in, i);
+            if (hdr->space_id == CLAP_CORE_EVENT_SPACE_ID && hdr->type == CLAP_EVENT_PARAM_VALUE) {
+                hds_clap_apply_param_event(p, (const clap_event_param_value_t *)hdr);
+            }
+        }
+    }
+    hds_clap_push_changed_params(p, out);
+}
+
+static const clap_plugin_params_t k_params_ext = {
+    .count = clap_params_count,
+    .get_info = clap_params_get_info,
+    .get_value = clap_params_get_value,
+    .value_to_text = clap_params_value_to_text,
+    .text_to_value = clap_params_text_to_value,
+    .flush = clap_params_flush,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -537,6 +797,18 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
     poll_seq_audio_preview_triggers(&p->streams_state, &p->knobs);
     double engine_elapsed_seconds = (double)p->total_frames_rendered / (double)SAMPLE_RATE;
     float current_tempo_bpm = compute_current_tempo_bpm(&p->knobs, engine_elapsed_seconds);
+    // Host tempo sync (SynthSharedControls.seq_sync_source == 1, "External"): a CLAP host already
+    // hands its own tempo directly via process->transport -- no raw MIDI Clock bytes to parse at
+    // all here, unlike the standalone app's ALSA-sequencer path (see
+    // hds_handle_midi_clock_tick()/SND_SEQ_EVENT_CLOCK in backend.c's process_midi_input, the
+    // equivalent for a real external MIDI cable/hardware sequencer). Deliberately tempo-only: the
+    // host's own timeline position doesn't necessarily correspond to "the start of HDS's own
+    // recorded Sequencer take" the way a real MIDI Start message does, so the host's play/stop
+    // state is NOT wired to the Sequencer's own transport here -- that stays driven by its own
+    // Play/Pause/Stop buttons (or OSC), exactly as before.
+    if (p->knobs.seq_sync_source != 0.0f && process->transport && (process->transport->flags & CLAP_TRANSPORT_HAS_TEMPO)) {
+        current_tempo_bpm = (float)process->transport->tempo;
+    }
     poll_transport_triggers(&p->streams_state, &p->engine, &p->knobs, current_tempo_bpm);
     poll_metronome(&p->engine, &p->knobs, current_tempo_bpm);
     poll_seq_audio_transport_catchup(&p->streams_state, &p->engine, &p->knobs);
@@ -576,6 +848,8 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
                     dispatch_midi_event(&p->engine, &p->sample_engine, HDS_MIDI_CHANNEL_PRESSURE, midi_channel_1_16, 0, ev->data[1],
                                          p->voices, &p->knobs, p->global_lfo_phases, p->mono_stacks, &p->midi_live, current_tempo_bpm);
                 }
+            } else if (hdr->type == CLAP_EVENT_PARAM_VALUE) {
+                hds_clap_apply_param_event(p, (const clap_event_param_value_t *)hdr);
             }
         }
     }
@@ -593,6 +867,23 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         process->audio_outputs[0].channel_count >= 2 && process->audio_outputs[0].data32[0] && process->audio_outputs[0].data32[1]) {
         out = process->audio_outputs[0].data32;
         process->audio_outputs[0].constant_mask = 0;
+    }
+    // CLAP multi-out (see clap_audio_ports_get()): a per-Program port the host didn't connect
+    // (common -- most hosts default to just the main port) simply stays NULL here and is never
+    // written to, so render_audio_block's own per_program_out capture is the only cost paid
+    // regardless of how many of these are actually wired up in the host.
+    float *prog_out[COMBI_PROGRAM_COUNT][2] = {{0}};
+    bool any_prog_out_connected = false;
+    for (int prog = 0; prog < COMBI_PROGRAM_COUNT; prog++) {
+        uint32_t port_idx = (uint32_t)(1 + prog);
+        if (port_idx < process->audio_outputs_count && process->audio_outputs[port_idx].data32 &&
+            process->audio_outputs[port_idx].channel_count >= 2 &&
+            process->audio_outputs[port_idx].data32[0] && process->audio_outputs[port_idx].data32[1]) {
+            prog_out[prog][0] = process->audio_outputs[port_idx].data32[0];
+            prog_out[prog][1] = process->audio_outputs[port_idx].data32[1];
+            process->audio_outputs[port_idx].constant_mask = 0;
+            any_prog_out_connected = true;
+        }
     }
 
     float block_peak = 0.0f;
@@ -621,13 +912,23 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         // visibility for (see gui_routing_tab_visible's own comment) -- ext_in_peak_scratch is
         // therefore always all-zero (gui_routing_tab_visible defaults to 0) and simply discarded.
         float ext_in_peak_scratch[EXT_IN_PAIR_COUNT];
-        float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer, current_tempo_bpm, ext_in_peak_scratch);
+        float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer, current_tempo_bpm, ext_in_peak_scratch,
+                                         any_prog_out_connected ? p->per_program_render_buf : NULL);
         if (peak > block_peak) block_peak = peak;
 
         if (out) {
             for (int i = 0; i < block_size; i++) {
                 out[0][frames_done + (uint32_t)i] = chunk_buffer[i * 2 + 0];
                 out[1][frames_done + (uint32_t)i] = chunk_buffer[i * 2 + 1];
+            }
+        }
+        if (any_prog_out_connected) {
+            for (int prog = 0; prog < COMBI_PROGRAM_COUNT; prog++) {
+                if (!prog_out[prog][0]) continue; // this particular port wasn't connected -- skip it individually
+                for (int i = 0; i < block_size; i++) {
+                    prog_out[prog][0][frames_done + (uint32_t)i] = p->per_program_render_buf[(size_t)i * COMBI_PROGRAM_COUNT * 2 + (size_t)prog * 2 + 0];
+                    prog_out[prog][1][frames_done + (uint32_t)i] = p->per_program_render_buf[(size_t)i * COMBI_PROGRAM_COUNT * 2 + (size_t)prog * 2 + 1];
+                }
             }
         }
 
@@ -650,6 +951,12 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         }
     }
 
+    // Bi-directional param sync's OSC/GUI->host half -- see hds_clap_push_changed_params()'s own
+    // comment. Run every process() call (not just on the vu_decimator's slower cadence) so a
+    // knob turned in the GUI reaches the host's automation lane/UI promptly, not up to ~12 blocks
+    // late.
+    hds_clap_push_changed_params(p, process->out_events);
+
     return CLAP_PROCESS_CONTINUE;
 }
 
@@ -658,6 +965,7 @@ static const void *clap_plugin_get_extension(const clap_plugin_t *plugin, const 
     if (strcmp(id, CLAP_EXT_AUDIO_PORTS) == 0) return &k_audio_ports_ext;
     if (strcmp(id, CLAP_EXT_NOTE_PORTS) == 0) return &k_note_ports_ext;
     if (strcmp(id, CLAP_EXT_STATE) == 0) return &k_state_ext;
+    if (strcmp(id, CLAP_EXT_PARAMS) == 0) return &k_params_ext;
     return NULL; // NULL for everything else (including params) is spec-compliant -- hosts must tolerate it
 }
 
@@ -692,6 +1000,11 @@ static const clap_plugin_t *clap_factory_create_plugin(const clap_plugin_factory
 
     p->host = host;
     init_default_controls(&p->knobs);
+    // Seed the CLAP params shadow from the REAL live value init_default_controls() just set, not
+    // a separately-hardcoded copy -- if the two ever drift, this avoids a spurious "changed"
+    // event firing on this instance's very first process() call (see
+    // hds_clap_push_changed_params()'s own comment).
+    for (uint32_t i = 0; i < HDS_CLAP_PARAM_COUNT; i++) p->clap_param_shadow[i] = hds_clap_param_read(p, &HDS_CLAP_PARAMS[i]);
     for (int i = 0; i < MAX_VOICES; i++) init_voice(&p->voices[i]);
     for (int i = 0; i <= COMBI_PROGRAM_COUNT; i++) p->mono_stacks[i] = (MonoNoteStack){0};
 
