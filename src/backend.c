@@ -418,7 +418,35 @@ typedef struct {
 // echo, wired so that leaving it at its default (Off) reproduces the original algorithm exactly,
 // bit for bit.
 #define FX_TYPE_TAPEDELAY2 6
-#define FX_SLOT_PARAM_COUNT 8
+// Ported from Airwindows PointyGuitar (MIT license). A guitar-amp-style distortion: the input
+// runs through a cascade of `poles` (6-16, driven by Drive) identical stages, each stage itself
+// splitting the signal into 9 successively-slower one-pole lowpass "bands" (a fixed 0.618 ratio
+// apart -- the golden ratio, same constant used elsewhere in these ports) and re-summing them
+// weighted by 5 independently-controlled band gains (Presence/High/Mid/Low/Sub, with the 4
+// in-between weights each the plain average of their neighbors) before a hard clip -- so the
+// harmonic content the distortion generates is shaped by those 5 gains on the way through, not
+// just after the fact. A zero-crossing-aware noise gate runs on the CLEAN input (before
+// distortion) but is applied to the DISTORTED output (after), so the gate's timing tracks the
+// real signal while its "click-free" closing blends toward a soft cosine curve instead of hard
+// silence. Two speaker-cabinet-style filters finish the chain: HSpeakr (a genuine multi-pole
+// lowpass -- a cabinet's natural top-end rolloff) then LSpeakr (a partial bass cut -- a small
+// speaker's inability to reproduce sub content). This effect needs 10 real, independent params
+// (5 of them are the distortion's own core tone-shaping, not optional extras the way a plain
+// Dry/Wet would be) -- see FX_SLOT_PARAM_COUNT's own comment just below on why it was raised from
+// 8 to 10 to fit this port without dropping any of them.
+// param[0] Drive, param[1] Presence, param[2] High, param[3] Mid, param[4] Low, param[5] Sub,
+// param[6] HSpeakr, param[7] LSpeakr, param[8] Gate (threshold), param[9] Output (makeup gain) --
+// the original's own A-J order, unchanged.
+#define FX_TYPE_POINTYGUITAR 7
+// Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
+// 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
+// (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
+// PointyGuitar's 10 controls is a crossfade-equivalent safe to fold away; 5 of them (Presence/
+// High/Mid/Low/Sub) are the distortion's own core per-band tone shaping, not optional extras.
+// A purely additive, backward-compatible wire change: every existing effect's own param[0..7]
+// addresses are untouched, param[8]/param[9] are simply new addresses (defaulting to 0.0, like
+// any other never-set knob) that no earlier-ported effect type ever reads.
+#define FX_SLOT_PARAM_COUNT 10
 typedef struct {
     float fx_type;
     float param[FX_SLOT_PARAM_COUNT];
@@ -2888,6 +2916,219 @@ static void run_fx_tapedelay2(FXSlotEngine *engine, const FXSlotParams *params, 
     *r = inputSampleR;
 }
 
+// --- FX_TYPE_POINTYGUITAR: ported from Airwindows PointyGuitar (MIT license) --- see this
+// effect's own FX_TYPE_POINTYGUITAR comment above for the full param map and algorithm summary.
+//
+// angS/angA are the per-pole, per-band one-pole filter state (Position/Angle in this codebase's
+// usual naming for this "IIR" smoother shape, named angS/angA here to match the original's own
+// "angled" band-splitting terminology): angS[x][y] is band y's smoothed level within pole x,
+// angA[x][y] its own rate-of-change tracker. angG[0,2,4,6,8] are the 5 real band gains (Presence/
+// High/Mid/Low/Sub); angG[1,3,5,7] are the plain average of their neighbors (interpolated
+// in-between bands, not independently controlled); angG[9] repeats angG[8] (Sub) as the "band 9"
+// weight applied to whatever's left in the lowpass chain after 9 successive splits. angG[] is
+// shared by both channels (it depends only on params, not per-channel signal), matching the
+// original's own single shared array.
+typedef struct {
+    float angSL[18][12], angAL[18][12];
+    float angSR[18][12], angAR[18][12];
+    float iirHPositionL[37], iirHAngleL[37], iirBPositionL[37], iirBAngleL[37];
+    float iirHPositionR[37], iirHAngleR[37], iirBPositionR[37], iirBAngleR[37];
+    bool was_negative_l, was_negative_r;
+    int zero_cross_l, zero_cross_r;
+    float gateroller_l, gateroller_r;
+    float gate_l, gate_r;
+    uint32_t fpdL, fpdR;
+} FxPointyGuitarState;
+
+static void run_fx_pointyguitar(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxPointyGuitarState *st = (FxPointyGuitarState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxPointyGuitarState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+        st->fpdL = (uint32_t)rand(); while (st->fpdL < 16386) st->fpdL = (uint32_t)rand();
+        st->fpdR = (uint32_t)rand(); while (st->fpdR < 16386) st->fpdR = (uint32_t)rand();
+    }
+
+    // param[0..9] A-J, per this effect's own FX_TYPE_POINTYGUITAR comment above.
+    float a = fmaxf(0.0f, fminf(1.0f, params->param[0])); // Drive
+    float b = fmaxf(0.0f, fminf(1.0f, params->param[1])); // Presence
+    float c = fmaxf(0.0f, fminf(1.0f, params->param[2])); // High
+    float d = fmaxf(0.0f, fminf(1.0f, params->param[3])); // Mid
+    float e = fmaxf(0.0f, fminf(1.0f, params->param[4])); // Low
+    float f = fmaxf(0.0f, fminf(1.0f, params->param[5])); // Sub
+    float g = fmaxf(0.0f, fminf(1.0f, params->param[6])); // HSpeakr
+    float h = fmaxf(0.0f, fminf(1.0f, params->param[7])); // LSpeakr
+    float i_ = fmaxf(0.0f, fminf(1.0f, params->param[8])); // Gate
+    float j = fmaxf(0.0f, fminf(1.0f, params->param[9])); // Output
+
+    float overallscale = (float)SAMPLE_RATE / 44100.0f;
+
+    float drive = a + 0.618033988749894f;
+    float angG[10];
+    angG[0] = sqrtf(b * 2.0f);
+    angG[2] = sqrtf(c * 2.0f);
+    angG[4] = sqrtf(d * 2.0f);
+    angG[6] = sqrtf(e * 2.0f);
+    angG[8] = sqrtf(f * 2.0f);
+    angG[1] = (angG[0] + angG[2]) * 0.5f;
+    angG[3] = (angG[2] + angG[4]) * 0.5f;
+    angG[5] = (angG[4] + angG[6]) * 0.5f;
+    angG[7] = (angG[6] + angG[8]) * 0.5f;
+    angG[9] = angG[8];
+    int poles = (int)(drive * 10.0f); // 6-16 across Drive's full 0..1 range
+    if (poles > 17) poles = 17; // defensive: stay inside angSL/angAL's 18-row headroom regardless
+    float hFreq = powf(g, overallscale);
+    float lFreq = powf(h, overallscale + 3.0f);
+    // begin Gate
+    float onthreshold = (powf(i_, 3.0f) / 3.0f) + 0.00018f;
+    float offthreshold = onthreshold * 1.1f;
+    float release = 0.028331119964586f;
+    float absmax = 220.9f;
+    // end Gate
+    float output = j;
+
+    float inputSampleL = *l, inputSampleR = *r;
+    if (fabsf(inputSampleL) < 1.18e-23f) inputSampleL = (float)st->fpdL * 1.18e-17f;
+    if (fabsf(inputSampleR) < 1.18e-23f) inputSampleR = (float)st->fpdR * 1.18e-17f;
+
+    // begin Gate (left) -- zero-crossing-aware envelope follower on the CLEAN input, applied to
+    // the DISTORTED output further down (see this effect's own comment above for why).
+    if (inputSampleL > 0.0f) {
+        if (st->was_negative_l) st->zero_cross_l = (int)(absmax * 0.3f);
+        st->was_negative_l = false;
+    } else {
+        st->zero_cross_l += 1; st->was_negative_l = true;
+    }
+    if (st->zero_cross_l > absmax) st->zero_cross_l = (int)absmax;
+    if (st->gateroller_l == 0.0f) {
+        if (fabsf(inputSampleL) > onthreshold) {
+            if (st->gateroller_l == 0.0f) st->gateroller_l = (float)st->zero_cross_l;
+            else st->gateroller_l -= release;
+        } else st->gateroller_l -= release;
+    } else {
+        if (fabsf(inputSampleL) > offthreshold) {
+            if (st->gateroller_l < (float)st->zero_cross_l) st->gateroller_l = (float)st->zero_cross_l;
+            else st->gateroller_l -= release;
+        } else st->gateroller_l -= release;
+    }
+    if (st->gateroller_l < 0.0f) st->gateroller_l = 0.0f;
+    // end Gate (left)
+
+    for (int x = 0; x < poles; x++) {
+        float fr = 0.9f / overallscale;
+        float band = inputSampleL; inputSampleL = 0.0f;
+        for (int y = 0; y < 9; y++) {
+            st->angAL[x][y] = (st->angAL[x][y] * (1.0f - fr)) + ((band - st->angSL[x][y]) * fr);
+            float temp = band; band = ((st->angSL[x][y] + (st->angAL[x][y] * fr)) * (1.0f - fr)) + (band * fr);
+            st->angSL[x][y] = ((st->angSL[x][y] + (st->angAL[x][y] * fr)) * (1.0f - fr)) + (band * fr);
+            inputSampleL += ((temp - band) * angG[y]);
+            fr *= 0.618033988749894f;
+        }
+        inputSampleL += (band * angG[9]);
+        inputSampleL *= drive;
+        inputSampleL -= fminf(fmaxf((inputSampleL * (fabsf(inputSampleL) * 0.654f) * (fabsf(inputSampleL) * 0.654f)), -1.0f), 1.0f);
+    }
+
+    if (st->gateroller_l < 1.0f) {
+        st->gate_l = st->gateroller_l;
+        float bridgerectifier = 1.0f - cosf(fabsf(inputSampleL));
+        if (inputSampleL > 0.0f) inputSampleL = (inputSampleL * st->gate_l) + (bridgerectifier * (1.0f - st->gate_l));
+        else inputSampleL = (inputSampleL * st->gate_l) - (bridgerectifier * (1.0f - st->gate_l));
+        if (st->gate_l == 0.0f) inputSampleL = 0.0f;
+    } else st->gate_l = 1.0f;
+    // end Gate (left, applied)
+
+    float lowSample = inputSampleL;
+    int lPoles = (int)(3.0f + (lFreq * 32.0f));
+    for (int count = 0; count < lPoles; count++) {
+        st->iirBAngleL[count] = (st->iirBAngleL[count] * (1.0f - lFreq)) + ((lowSample - st->iirBPositionL[count]) * lFreq);
+        lowSample = ((st->iirBPositionL[count] + (st->iirBAngleL[count] * lFreq)) * (1.0f - lFreq)) + (lowSample * lFreq);
+        st->iirBPositionL[count] = ((st->iirBPositionL[count] + (st->iirBAngleL[count] * lFreq)) * (1.0f - lFreq)) + (lowSample * lFreq);
+        inputSampleL -= (lowSample * (1.0f / (3.0f + (lFreq * 32.0f))));
+    }
+
+    int hPoles = (int)(3.0f + (hFreq * 32.0f));
+    for (int count = 0; count < hPoles; count++) {
+        st->iirHAngleL[count] = (st->iirHAngleL[count] * (1.0f - hFreq)) + ((inputSampleL - st->iirHPositionL[count]) * hFreq);
+        inputSampleL = ((st->iirHPositionL[count] + (st->iirHAngleL[count] * hFreq)) * (1.0f - hFreq)) + (inputSampleL * hFreq);
+        st->iirHPositionL[count] = ((st->iirHPositionL[count] + (st->iirHAngleL[count] * hFreq)) * (1.0f - hFreq)) + (inputSampleL * hFreq);
+    } // the lowpass
+    inputSampleL *= output;
+
+    // begin Gate (right)
+    if (inputSampleR > 0.0f) {
+        if (st->was_negative_r) st->zero_cross_r = (int)(absmax * 0.3f);
+        st->was_negative_r = false;
+    } else {
+        st->zero_cross_r += 1; st->was_negative_r = true;
+    }
+    if (st->zero_cross_r > absmax) st->zero_cross_r = (int)absmax;
+    if (st->gateroller_r == 0.0f) {
+        if (fabsf(inputSampleR) > onthreshold) {
+            if (st->gateroller_r == 0.0f) st->gateroller_r = (float)st->zero_cross_r;
+            else st->gateroller_r -= release;
+        } else st->gateroller_r -= release;
+    } else {
+        if (fabsf(inputSampleR) > offthreshold) {
+            if (st->gateroller_r < (float)st->zero_cross_r) st->gateroller_r = (float)st->zero_cross_r;
+            else st->gateroller_r -= release;
+        } else st->gateroller_r -= release;
+    }
+    if (st->gateroller_r < 0.0f) st->gateroller_r = 0.0f;
+    // end Gate (right)
+
+    for (int x = 0; x < poles; x++) {
+        float fr = 0.9f / overallscale;
+        float band = inputSampleR; inputSampleR = 0.0f;
+        for (int y = 0; y < 9; y++) {
+            st->angAR[x][y] = (st->angAR[x][y] * (1.0f - fr)) + ((band - st->angSR[x][y]) * fr);
+            float temp = band; band = ((st->angSR[x][y] + (st->angAR[x][y] * fr)) * (1.0f - fr)) + (band * fr);
+            st->angSR[x][y] = ((st->angSR[x][y] + (st->angAR[x][y] * fr)) * (1.0f - fr)) + (band * fr);
+            inputSampleR += ((temp - band) * angG[y]);
+            fr *= 0.618033988749894f;
+        }
+        inputSampleR += (band * angG[9]);
+        inputSampleR *= drive;
+        inputSampleR -= fminf(fmaxf((inputSampleR * (fabsf(inputSampleR) * 0.654f) * (fabsf(inputSampleR) * 0.654f)), -1.0f), 1.0f);
+    }
+
+    if (st->gateroller_r < 1.0f) {
+        st->gate_r = st->gateroller_r;
+        float bridgerectifier = 1.0f - cosf(fabsf(inputSampleR));
+        if (inputSampleR > 0.0f) inputSampleR = (inputSampleR * st->gate_r) + (bridgerectifier * (1.0f - st->gate_r));
+        else inputSampleR = (inputSampleR * st->gate_r) - (bridgerectifier * (1.0f - st->gate_r));
+        if (st->gate_r == 0.0f) inputSampleR = 0.0f;
+    } else st->gate_r = 1.0f;
+    // end Gate (right, applied)
+
+    lowSample = inputSampleR;
+    for (int count = 0; count < lPoles; count++) {
+        st->iirBAngleR[count] = (st->iirBAngleR[count] * (1.0f - lFreq)) + ((lowSample - st->iirBPositionR[count]) * lFreq);
+        lowSample = ((st->iirBPositionR[count] + (st->iirBAngleR[count] * lFreq)) * (1.0f - lFreq)) + (lowSample * lFreq);
+        st->iirBPositionR[count] = ((st->iirBPositionR[count] + (st->iirBAngleR[count] * lFreq)) * (1.0f - lFreq)) + (lowSample * lFreq);
+        inputSampleR -= (lowSample * (1.0f / (3.0f + (lFreq * 32.0f))));
+    }
+
+    for (int count = 0; count < hPoles; count++) {
+        st->iirHAngleR[count] = (st->iirHAngleR[count] * (1.0f - hFreq)) + ((inputSampleR - st->iirHPositionR[count]) * hFreq);
+        inputSampleR = ((st->iirHPositionR[count] + (st->iirHAngleR[count] * hFreq)) * (1.0f - hFreq)) + (inputSampleR * hFreq);
+        st->iirHPositionR[count] = ((st->iirHPositionR[count] + (st->iirHAngleR[count] * hFreq)) * (1.0f - hFreq)) + (inputSampleR * hFreq);
+    } // the lowpass
+    inputSampleR *= output;
+
+    int expon;
+    frexpf(inputSampleL, &expon);
+    st->fpdL ^= st->fpdL << 13; st->fpdL ^= st->fpdL >> 17; st->fpdL ^= st->fpdL << 5;
+    inputSampleL += (((float)st->fpdL - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+    frexpf(inputSampleR, &expon);
+    st->fpdR ^= st->fpdR << 13; st->fpdR ^= st->fpdR >> 17; st->fpdR ^= st->fpdR << 5;
+    inputSampleR += (((float)st->fpdR - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+
+    *l = inputSampleL;
+    *r = inputSampleR;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -2996,6 +3237,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                 case FX_TYPE_STEREOCHORUS: run_fx_stereochorus(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_STEREODOUBLER: run_fx_stereodoubler(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_TAPEDELAY2: run_fx_tapedelay2(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_POINTYGUITAR: run_fx_pointyguitar(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through

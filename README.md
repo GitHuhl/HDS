@@ -481,10 +481,12 @@ compliant multichannel interface's extra outputs are reachable, not just
 its first pair. The always-on safety limiter (see above) is evaluated once
 per output pair, after every source routed there has been summed in, not
 once per block. `process_fx_chain()` in `backend.c` implements the
-per-source slot dispatch; each slot still has the same generic 8-param
-bank + mix + bypass it always did. Most slot types are still an
-unimplemented pass-through, ready for more effects to be ported into the
-dispatch switch. Six are implemented so far, all ported from Airwindows
+per-source slot dispatch; each slot still has the same generic param
+bank (raised from 8 to 10 slots for PointyGuitar's own real param
+count — see `FX_SLOT_PARAM_COUNT`'s own comment in `backend.c`) + mix +
+bypass it always did. Most slot types are still an unimplemented
+pass-through, ready for more effects to be ported into the dispatch
+switch. Seven are implemented so far, all ported from Airwindows
 (MIT license):
 
 - **Ensemble** — a 12-tap fixed-delay ensemble/chorus (not a reverb: no
@@ -537,6 +539,22 @@ dispatch switch. Six are implemented so far, all ported from Airwindows
   output into the other channel's feedback path for a stereo-alternating
   echo. Off reproduces the original algorithm exactly, bit for bit; see
   `run_fx_tapedelay2`'s own comment in `backend.c` for how that's kept true.
+- **PointyGuitar** — a guitar-amp-style distortion: the input runs
+  through a cascade of 6-16 identical stages (driven by Drive), each one
+  splitting the signal into 9 successively-slower one-pole lowpass
+  "bands" and re-summing them weighted by 5 independent band gains
+  before a hard clip, so the harmonic content the distortion generates
+  is shaped by those gains on the way through, not just tacked on after.
+  A zero-crossing-aware noise gate tracks the clean input but is applied
+  to the distorted output, closing toward a soft cosine curve instead of
+  hard silence. Two speaker-cabinet-style filters finish the chain:
+  HSpeakr (a genuine multi-pole lowpass — a cabinet's top-end rolloff)
+  and LSpeakr (a partial bass cut — a small speaker's inability to
+  reproduce sub content). Params: Drive, Presence/High/Mid/Low/Sub (the
+  5 band gains), HSpeakr, LSpeakr, Gate (threshold), and Output (makeup
+  gain) — all 10 real, independent controls, none foldable into the
+  slot's generic Mix the way an effect's own plain Dry/Wet sometimes is,
+  which is why `FX_SLOT_PARAM_COUNT` needed raising to fit this one.
 
   StereoChorus and StereoDoubler share an "air" comb-filter stage
   (compensating for the top-end loss a modulated/interpolated delay

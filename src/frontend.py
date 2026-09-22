@@ -583,9 +583,11 @@ OSC_STATUS_TIMEOUT_S = 1.5
 
 # Device name byte width must match AUDIO_DEVICE_NAME_LEN in backend.c exactly.
 AUDIO_DEVICE_NAME_LEN = 64
-# FX bus geometry must match FX_SLOT_COUNT / FX_SLOT_PARAM_COUNT in backend.c exactly.
+# FX bus geometry must match FX_SLOT_COUNT / FX_SLOT_PARAM_COUNT in backend.c exactly. Raised
+# from 8 to 10 for FX_TYPE_POINTYGUITAR's 10 real, independent params -- see that constant's own
+# comment in backend.c.
 FX_SLOT_COUNT = 12
-FX_SLOT_PARAM_COUNT = 8
+FX_SLOT_PARAM_COUNT = 10
 # Combi mode: up to COMBI_PROGRAM_COUNT independently-synthesizing Programs sharing one voice
 # pool -- must match COMBI_PROGRAM_COUNT in backend.c exactly. Defined here, ahead of
 # SOURCE_NAMES/SOURCE_COUNT below, since the bus/source model is built directly on top of it.
@@ -752,6 +754,19 @@ FX_TYPE_METADATA = [
         # Ping-Pong: NOT part of the original plugin -- see FX_TYPE_TAPEDELAY2's own comment.
         # Default Off reproduces the original algorithm exactly.
         {"label": "Ping-Pong", "type": "choice", "options": ["Off", "On"], "default": 0},
+    ]},
+    {"name": "PointyGuitar", "params": [
+        # Defaults match the original plugin's own init values (A-J) exactly.
+        {"label": "Drive", "range": (0, 100), "default": 60},
+        {"label": "Presence", "range": (0, 100), "default": 50},
+        {"label": "High", "range": (0, 100), "default": 80},
+        {"label": "Mid", "range": (0, 100), "default": 60},
+        {"label": "Low", "range": (0, 100), "default": 40},
+        {"label": "Sub", "range": (0, 100), "default": 50},
+        {"label": "HSpeakr", "range": (0, 100), "default": 70},
+        {"label": "LSpeakr", "range": (0, 100), "default": 40},
+        {"label": "Gate", "range": (0, 100), "default": 0},
+        {"label": "Output", "range": (0, 100), "default": 50},
     ]},
 ]
 
