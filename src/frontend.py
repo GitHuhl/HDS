@@ -772,6 +772,14 @@ FX_TYPE_METADATA = [
     # FX_TYPE_GUITARCONDITIONER's own comment in backend.c). Only the slot's generic Mix/Bypass
     # apply; every P1-P10 dial stays hidden, same as "Off".
     {"name": "GuitarConditioner", "params": []},
+    {"name": "Cabs2", "params": [
+        # Defaults match the original plugin's own init values (A=1.0 fully open, B=0.0 bypassed)
+        # -- see FX_TYPE_CABS2's own comment in backend.c for the inverted-sounding but correct
+        # "0 = darkest/most filtered, 1 = fully open" (Lowpass) vs. "0 = fully open, 1 = most
+        # filtered" (Hipass) polarity, ported as-is.
+        {"label": "Lowpass", "range": (0, 100), "default": 100},
+        {"label": "Hipass", "range": (0, 100), "default": 0},
+    ]},
 ]
 
 # Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --

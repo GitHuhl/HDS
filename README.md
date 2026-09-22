@@ -486,7 +486,7 @@ bank (raised from 8 to 10 slots for PointyGuitar's own real param
 count — see `FX_SLOT_PARAM_COUNT`'s own comment in `backend.c`) + mix +
 bypass it always did. Most slot types are still an unimplemented
 pass-through, ready for more effects to be ported into the dispatch
-switch. Eight are implemented so far, all ported from Airwindows
+switch. Nine are implemented so far, all ported from Airwindows
 (MIT license):
 
 - **Ensemble** — a 12-tap fixed-delay ensemble/chorus (not a reverb: no
@@ -564,6 +564,16 @@ switch. Eight are implemented so far, all ported from Airwindows
   highpasses alternate between two independent one-pole memories every
   other sample — the original's own technique, ported as-is. Only the
   slot's generic Mix/Bypass apply; there's nothing else to expose.
+- **Cabs2** — a simple speaker-cabinet-style tone shaper: a 21-stage
+  highpass (built, like GuitarConditioner's own filters, from cascaded
+  one-pole lowpass stages subtracted from the signal) followed by a
+  13-stage direct one-pole lowpass. Both stages self-bypass at their own
+  "wide open" extreme, zeroing their own filter memory the instant they
+  do so a later re-engage starts clean rather than resuming from stale
+  state. Params: Lowpass (0 = darkest, 100 = fully open/bypassed) and
+  Hipass (0 = fully open/bypassed, 100 = most filtered) — the two knobs
+  are deliberately inverted relative to each other, ported as-is from
+  the original.
 
   StereoChorus and StereoDoubler share an "air" comb-filter stage
   (compensating for the top-end loss a modulated/interpolated delay

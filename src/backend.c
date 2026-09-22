@@ -450,6 +450,15 @@ typedef struct {
 // keep here -- there's simply nothing to expose, the slot's generic Mix/Bypass are the only
 // controls this effect has.
 #define FX_TYPE_GUITARCONDITIONER 8
+// Ported from Airwindows Cabs2 (MIT license). A simple speaker-cabinet-style tone shaper: a
+// 21-stage highpass (built, like GuitarConditioner's own filters, from cascaded one-pole lowpass
+// stages subtracted from the signal rather than a direct highpass topology) followed by a
+// 13-stage direct one-pole lowpass. Both stages self-bypass at their own "wide open" extreme
+// (Hipass at its minimum, Lowpass at its maximum) -- and when a stage transitions INTO bypass, it
+// zeroes its own filter memory once, so re-engaging it later starts clean rather than resuming
+// from stale state. param[0] Lowpass (0 = darkest/most filtered, 1 = fully open/bypassed),
+// param[1] Hipass (0 = fully open/bypassed, 1 = most filtered).
+#define FX_TYPE_CABS2 9
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -3263,6 +3272,92 @@ static void run_fx_guitarconditioner(FXSlotEngine *engine, const FXSlotParams *p
     *r = inputSampleR;
 }
 
+// --- FX_TYPE_CABS2: ported from Airwindows Cabs2 (MIT license) --- see this effect's own
+// FX_TYPE_CABS2 comment above for the full algorithm summary and param map.
+typedef struct {
+    float iirHPositionL[23], iirHAngleL[23], iirHPositionR[23], iirHAngleR[23];
+    bool hBypass;
+    float iirLPositionL[15], iirLAngleL[15], iirLPositionR[15], iirLAngleR[15];
+    bool lBypass;
+    uint32_t fpdL, fpdR;
+} FxCabs2State;
+
+static void run_fx_cabs2(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxCabs2State *st = (FxCabs2State *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxCabs2State));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+        st->fpdL = (uint32_t)rand(); while (st->fpdL < 16386) st->fpdL = (uint32_t)rand();
+        st->fpdR = (uint32_t)rand(); while (st->fpdR < 16386) st->fpdR = (uint32_t)rand();
+        // hBypass/lBypass start false (calloc) -- matches the original's own constructor default.
+    }
+
+    float a = fmaxf(0.0f, fminf(1.0f, params->param[0])); // Lowpass
+    float b = fmaxf(0.0f, fminf(1.0f, params->param[1])); // Hipass
+    float overallscale = (float)SAMPLE_RATE / 44100.0f;
+    float lFreq = powf(fmaxf(a, 0.002f), overallscale); // the lowpass
+    float hFreq = powf(b, overallscale + 2.0f);          // the highpass
+
+    float inputSampleL = *l, inputSampleR = *r;
+    if (fabsf(inputSampleL) < 1.18e-23f) inputSampleL = (float)st->fpdL * 1.18e-17f;
+    if (fabsf(inputSampleR) < 1.18e-23f) inputSampleR = (float)st->fpdR * 1.18e-17f;
+
+    if (hFreq > 0.0f) {
+        float lowSampleL = inputSampleL, lowSampleR = inputSampleR;
+        for (int count = 0; count < 21; count++) {
+            st->iirHAngleL[count] = (st->iirHAngleL[count] * (1.0f - hFreq)) + ((lowSampleL - st->iirHPositionL[count]) * hFreq);
+            lowSampleL = ((st->iirHPositionL[count] + (st->iirHAngleL[count] * hFreq)) * (1.0f - hFreq)) + (lowSampleL * hFreq);
+            st->iirHPositionL[count] = ((st->iirHPositionL[count] + (st->iirHAngleL[count] * hFreq)) * (1.0f - hFreq)) + (lowSampleL * hFreq);
+            inputSampleL -= (lowSampleL * (1.0f / 21.0f)); // left
+            st->iirHAngleR[count] = (st->iirHAngleR[count] * (1.0f - hFreq)) + ((lowSampleR - st->iirHPositionR[count]) * hFreq);
+            lowSampleR = ((st->iirHPositionR[count] + (st->iirHAngleR[count] * hFreq)) * (1.0f - hFreq)) + (lowSampleR * hFreq);
+            st->iirHPositionR[count] = ((st->iirHPositionR[count] + (st->iirHAngleR[count] * hFreq)) * (1.0f - hFreq)) + (lowSampleR * hFreq);
+            inputSampleR -= (lowSampleR * (1.0f / 21.0f)); // right
+        } // the highpass
+        st->hBypass = false;
+    } else {
+        if (!st->hBypass) {
+            st->hBypass = true;
+            memset(st->iirHPositionL, 0, sizeof(st->iirHPositionL));
+            memset(st->iirHAngleL, 0, sizeof(st->iirHAngleL));
+            memset(st->iirHPositionR, 0, sizeof(st->iirHPositionR));
+            memset(st->iirHAngleR, 0, sizeof(st->iirHAngleR));
+        } // blank out highpass if just switched off
+    }
+
+    if (lFreq < 1.0f) {
+        for (int count = 0; count < 13; count++) {
+            st->iirLAngleL[count] = (st->iirLAngleL[count] * (1.0f - lFreq)) + ((inputSampleL - st->iirLPositionL[count]) * lFreq);
+            inputSampleL = ((st->iirLPositionL[count] + (st->iirLAngleL[count] * lFreq)) * (1.0f - lFreq)) + (inputSampleL * lFreq);
+            st->iirLPositionL[count] = ((st->iirLPositionL[count] + (st->iirLAngleL[count] * lFreq)) * (1.0f - lFreq)) + (inputSampleL * lFreq); // left
+            st->iirLAngleR[count] = (st->iirLAngleR[count] * (1.0f - lFreq)) + ((inputSampleR - st->iirLPositionR[count]) * lFreq);
+            inputSampleR = ((st->iirLPositionR[count] + (st->iirLAngleR[count] * lFreq)) * (1.0f - lFreq)) + (inputSampleR * lFreq);
+            st->iirLPositionR[count] = ((st->iirLPositionR[count] + (st->iirLAngleR[count] * lFreq)) * (1.0f - lFreq)) + (inputSampleR * lFreq); // right
+        } // the lowpass
+        st->lBypass = false;
+    } else {
+        if (!st->lBypass) {
+            st->lBypass = true;
+            memset(st->iirLPositionL, 0, sizeof(st->iirLPositionL));
+            memset(st->iirLAngleL, 0, sizeof(st->iirLAngleL));
+            memset(st->iirLPositionR, 0, sizeof(st->iirLPositionR));
+            memset(st->iirLAngleR, 0, sizeof(st->iirLAngleR));
+        } // blank out lowpass if just switched off
+    }
+
+    int expon;
+    frexpf(inputSampleL, &expon);
+    st->fpdL ^= st->fpdL << 13; st->fpdL ^= st->fpdL >> 17; st->fpdL ^= st->fpdL << 5;
+    inputSampleL += (((float)st->fpdL - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+    frexpf(inputSampleR, &expon);
+    st->fpdR ^= st->fpdR << 13; st->fpdR ^= st->fpdR >> 17; st->fpdR ^= st->fpdR << 5;
+    inputSampleR += (((float)st->fpdR - 2147483647.0f) * 5.5e-36f * powf(2.0f, (float)(expon + 62)));
+
+    *l = inputSampleL;
+    *r = inputSampleR;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -3373,6 +3468,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                 case FX_TYPE_TAPEDELAY2: run_fx_tapedelay2(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_POINTYGUITAR: run_fx_pointyguitar(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_GUITARCONDITIONER: run_fx_guitarconditioner(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_CABS2: run_fx_cabs2(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through
