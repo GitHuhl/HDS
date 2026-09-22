@@ -5,6 +5,26 @@ CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
 # dropped from here to match; re-add it alongside flipping that flag back to 1.
 LDLIBS := -lasound -lm -lpthread -llo
 
+# --- Optional PipeWire backend (native libpipewire client, alongside the always-present ALSA
+# backend -- see backend.c's "Audio platform shim" section) -- auto-detected via pkg-config rather
+# than a manual flag to flip (see HDS_WAVPACK_ENABLED's own comment for that pattern), so a machine
+# without libpipewire-0.3-dev (a plain apt-get libasound2-dev-only setup, or the Pi) still gets a
+# normal ALSA-only build with nothing to change by hand, while nix-shell (which provides pipewire
+# in shell.nix's buildInputs) picks it up automatically. --backend pipewire at runtime only exists
+# in a build where this actually detected true -- see backend.c's HDS_PIPEWIRE_ENABLED guard.
+# Scoped to $(BIN) only: the CLAP plugin target never touches audio device I/O at all (the host
+# owns that via CLAP's own audio-ports extension -- see clap_plugin.c's header comment), and the
+# arm64 cross-build has no cross-compiled pipewire package wired up, so neither needs this.
+PIPEWIRE_AVAILABLE := $(shell pkg-config --exists libpipewire-0.3 && echo 1 || echo 0)
+ifeq ($(PIPEWIRE_AVAILABLE),1)
+PIPEWIRE_CFLAGS := -DHDS_PIPEWIRE_ENABLED=1 $(shell pkg-config --cflags libpipewire-0.3)
+PIPEWIRE_LDLIBS := $(shell pkg-config --libs libpipewire-0.3)
+else
+PIPEWIRE_CFLAGS := -DHDS_PIPEWIRE_ENABLED=0
+PIPEWIRE_LDLIBS :=
+endif
+$(info PipeWire backend (--backend pipewire): $(if $(filter 1,$(PIPEWIRE_AVAILABLE)),enabled,disabled -- libpipewire-0.3 not found via pkg-config))
+
 BIN := synth_engine
 SRC := src/backend.c
 
@@ -76,7 +96,7 @@ ARM64_LIBDIR := arm64-libs
 all: $(BIN)
 
 $(BIN): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -o $@ $< $(LDLIBS) $(PIPEWIRE_LDLIBS)
 
 clap: $(CLAP_SRC)
 	$(CC) $(CFLAGS) -fPIC -shared -I$(CLAP_INC) -o $(CLAP_BIN) $(CLAP_SRC) $(LDLIBS)

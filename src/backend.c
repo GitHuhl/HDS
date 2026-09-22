@@ -36,6 +36,24 @@
 #endif
 #include <lo/lo.h>
 
+// Optional native PipeWire backend, alongside the always-present ALSA backend (see the "Audio
+// platform shim" section further down) -- HDS_PIPEWIRE_ENABLED is set by the Makefile via a
+// pkg-config auto-detection at build time (1 when libpipewire-0.3 is found, e.g. inside
+// nix-shell; 0 on a plain libasound2-dev-only setup, which still gets a normal ALSA-only build
+// with nothing to flip by hand). Same "opt-in dependency" posture as HDS_WAVPACK_ENABLED above,
+// just detected automatically instead of hand-toggled, since unlike WavPack this one has real
+// runtime value (PipeWire's own graph lets multiple apps share the audio device) whenever it's
+// available rather than being parked for later. See README.md's "PipeWire backend" section.
+#ifndef HDS_PIPEWIRE_ENABLED
+#define HDS_PIPEWIRE_ENABLED 0
+#endif
+#if HDS_PIPEWIRE_ENABLED
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+#include <spa/pod/builder.h>
+#include <semaphore.h>
+#endif
+
 #define SAMPLE_RATE 48000
 // BUFFER_SIZE and MAX_VOICES are now hard CEILINGS for array allocation only -- how many
 // frames actually get rendered per block, and how many voices are actually allowed to be
@@ -9018,10 +9036,66 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
 }
 // --- Audio platform shim ---
 // HdsPcmStream/HdsStreamDirection are the ONLY audio-I/O types anything outside this shim (main()
-// included) ever names -- HdsPcmStream is literally snd_pcm_t (a type alias, zero overhead, zero
-// behavior change); every function below is exactly the ALSA code that has always lived here.
-typedef snd_pcm_t HdsPcmStream;
+// included) ever names. HdsPcmStream used to be a bare type alias for snd_pcm_t; it's now a small
+// tagged wrapper so the exact same four functions (open/write/read/close, plus the two channel-
+// count probes just below) can transparently back onto either the ALSA device path that has
+// always lived here, OR a native PipeWire client stream (see the PipeWire backend section right
+// after open_pcm_stream()) -- chosen once at startup via --backend and never mixed within one
+// process. Every call site elsewhere in this file (main()'s setup and its live device-switching
+// loop) is completely unchanged by this -- it never touches the union's members directly.
+typedef enum { HDS_BACKEND_ALSA, HDS_BACKEND_PIPEWIRE } HdsAudioBackend;
+// Resolved once from --backend at the very top of main(), before any device is opened, and never
+// changed afterward except by the interactive output-device recovery path falling back from a
+// broken PipeWire connection to ALSA (see interactive_recover_output_device()).
+static HdsAudioBackend g_audio_backend = HDS_BACKEND_ALSA;
+
+#if HDS_PIPEWIRE_ENABLED
+// Bridges this engine's existing "blocking write / one-shot best-effort read" I/O contract (see
+// write_audio_block()/read_capture_block() below, which is exactly the ALSA behavior this file
+// has always had) onto PipeWire's own push-model client API: a pw_stream's process() callback
+// runs on PipeWire's OWN realtime thread and pulls/pushes data on ITS schedule, not the main
+// loop's -- unlike a blocking snd_pcm_writei()/readi() call, there's no way to just call into
+// PipeWire and have it synchronously hand back "the next block". A small lock-free SPSC ring
+// buffer per direction (same producer/consumer discipline as RecordRing elsewhere in this file)
+// closes that gap, plus one semaphore used ONLY on the playback side as a wake signal so
+// write_audio_block()'s pipewire branch can block until room frees up -- exactly mirroring
+// snd_pcm_writei()'s own blocking behavior, which is what actually paces this engine's entire main
+// loop today. The ring's atomics remain the actual source of truth for how much space/data is
+// available; the semaphore only avoids busy-spinning between checks.
+#define HDS_PW_RING_CAPACITY (1u << 16) // 65536 floats -- ~170ms at 48kHz/8ch, far more than one PipeWire quantum
+typedef struct {
+    float data[HDS_PW_RING_CAPACITY];
+    atomic_uint_fast32_t write_pos;
+    atomic_uint_fast32_t read_pos;
+} HdsPwRing;
+
+typedef struct {
+    struct pw_thread_loop *loop;
+    struct pw_stream *stream;
+    bool is_capture;
+    int channels;
+    HdsPwRing ring;
+    sem_t space_sem;     // posted by on_playback_process() whenever it frees ring space; unused on the capture side (read_capture_block() never blocks, matching the ALSA capture branch's own non-blocking, best-effort contract)
+    atomic_bool connected; // set once the stream reaches PW_STREAM_STATE_STREAMING
+    atomic_bool failed;    // set on PW_STREAM_STATE_ERROR/UNCONNECTED after having been open -- lets a blocked write_audio_block() bail out instead of hanging on a dead daemon/unplugged device
+} HdsPwStream;
+#endif
+
+typedef struct HdsPcmStream {
+    HdsAudioBackend backend;
+    snd_pcm_t *alsa;
+#if HDS_PIPEWIRE_ENABLED
+    HdsPwStream *pw;
+#endif
+} HdsPcmStream;
 typedef enum { HDS_STREAM_PLAYBACK, HDS_STREAM_CAPTURE } HdsStreamDirection;
+
+#if HDS_PIPEWIRE_ENABLED
+// Forward declaration: close_pcm_stream() (just below) needs to call this, but its real
+// definition lives down in the "PipeWire backend" section right before open_pcm_stream(), which
+// is the more natural place to read it alongside hds_pw_stream_open() and the process callbacks.
+static void hds_pw_stream_close(HdsPwStream *pw);
+#endif
 
 // DIAGNOSTIC: active_voices_count and render_ms are purely informational (see their computation
 // in main()'s loop) -- passed through so an underrun/xrun can be reported alongside what the
@@ -9033,16 +9107,48 @@ static void write_audio_block(HdsPcmStream *pcm_handle, const float *buffer, int
     // failed (e.g. a USB audio interface was physically unplugged) -- silently drop this block
     // rather than crash; main() will keep retrying the device on the next control packet.
     if (!pcm_handle) return;
-    snd_pcm_uframes_t written = 0;
-    while (written < frame_count && g_synth_running) {
-        snd_pcm_sframes_t res = snd_pcm_writei(pcm_handle, buffer + (written * (size_t)channels), frame_count - written);
-        if (res < 0) {
-            fprintf(stderr, "[audio] ALSA underrun/xrun (%s) -- %d active voices, last render_audio_block took %.3fms\n",
-                    snd_strerror((int)res), active_voices_count, render_ms);
-            res = snd_pcm_recover(pcm_handle, res, 0); if (res < 0) break;
+    if (pcm_handle->backend == HDS_BACKEND_ALSA) {
+        snd_pcm_uframes_t written = 0;
+        while (written < frame_count && g_synth_running) {
+            snd_pcm_sframes_t res = snd_pcm_writei(pcm_handle->alsa, buffer + (written * (size_t)channels), frame_count - written);
+            if (res < 0) {
+                fprintf(stderr, "[audio] ALSA underrun/xrun (%s) -- %d active voices, last render_audio_block took %.3fms\n",
+                        snd_strerror((int)res), active_voices_count, render_ms);
+                res = snd_pcm_recover(pcm_handle->alsa, res, 0); if (res < 0) break;
+            }
+            else { written += res; }
         }
-        else { written += res; }
+        return;
     }
+#if HDS_PIPEWIRE_ENABLED
+    // PipeWire side: push into the SPSC ring, blocking (via space_sem) exactly the way
+    // snd_pcm_writei() above blocks until the device wants more -- this is what keeps this
+    // engine's main loop paced at the real playback rate under PipeWire too, not just under ALSA.
+    HdsPwStream *pw = pcm_handle->pw;
+    uint32_t total_samples = frame_count * (uint32_t)channels;
+    uint32_t written_samples = 0;
+    while (written_samples < total_samples && g_synth_running) {
+        if (atomic_load_explicit(&pw->failed, memory_order_acquire)) {
+            fprintf(stderr, "[pipewire] output stream failed -- %d active voices, last render_audio_block took %.3fms\n", active_voices_count, render_ms);
+            break;
+        }
+        uint32_t write_pos = atomic_load_explicit(&pw->ring.write_pos, memory_order_relaxed);
+        uint32_t read_pos = atomic_load_explicit(&pw->ring.read_pos, memory_order_acquire);
+        uint32_t space = HDS_PW_RING_CAPACITY - (write_pos - read_pos);
+        if (space == 0) {
+            // sem_timedwait (not sem_wait) so a missed wakeup -- a post landing between the space
+            // check above and this wait -- can't block this thread, and therefore the whole main
+            // loop, forever; a timeout just re-checks the ring's real atomics on the next pass.
+            struct timespec deadline; clock_gettime(CLOCK_REALTIME, &deadline); deadline.tv_sec += 1;
+            sem_timedwait(&pw->space_sem, &deadline);
+            continue;
+        }
+        uint32_t take = space < (total_samples - written_samples) ? space : (total_samples - written_samples);
+        for (uint32_t i = 0; i < take; i++) pw->ring.data[(write_pos + i) & (HDS_PW_RING_CAPACITY - 1)] = buffer[written_samples + i];
+        atomic_store_explicit(&pw->ring.write_pos, write_pos + take, memory_order_release);
+        written_samples += take;
+    }
+#endif
 }
 
 // Reads up to block_size frames of capture audio, interleaved, `channels` per frame -- the exact
@@ -9052,10 +9158,28 @@ static void write_audio_block(HdsPcmStream *pcm_handle, const float *buffer, int
 // so device I/O stays isolated behind this shim rather than inlined into main()'s own loop.
 static uint32_t read_capture_block(HdsPcmStream *pcm_capture_handle, float *capture_buffer, int channels, uint32_t block_size) {
     if (!pcm_capture_handle) return 0;
-    (void)channels;
-    snd_pcm_sframes_t got = snd_pcm_readi(pcm_capture_handle, capture_buffer, block_size);
-    if (got < 0) { snd_pcm_recover(pcm_capture_handle, (int)got, 0); return 0; }
-    return (uint32_t)got;
+    if (pcm_capture_handle->backend == HDS_BACKEND_ALSA) {
+        (void)channels; // ALSA already knows its own channel count from the params negotiated at open time
+        snd_pcm_sframes_t got = snd_pcm_readi(pcm_capture_handle->alsa, capture_buffer, block_size);
+        if (got < 0) { snd_pcm_recover(pcm_capture_handle->alsa, (int)got, 0); return 0; }
+        return (uint32_t)got;
+    }
+#if HDS_PIPEWIRE_ENABLED
+    // Same non-blocking, best-effort contract as the ALSA branch above: pop whatever's already in
+    // the ring (filled by on_capture_process() on PipeWire's own thread) and return immediately --
+    // the caller (main()) already zero-fills any shortfall, same as a short ALSA read.
+    HdsPwStream *pw = pcm_capture_handle->pw;
+    uint32_t want_samples = block_size * (uint32_t)channels;
+    uint32_t write_pos = atomic_load_explicit(&pw->ring.write_pos, memory_order_acquire);
+    uint32_t read_pos = atomic_load_explicit(&pw->ring.read_pos, memory_order_relaxed);
+    uint32_t available = write_pos - read_pos;
+    uint32_t take = available < want_samples ? available : want_samples;
+    for (uint32_t i = 0; i < take; i++) capture_buffer[i] = pw->ring.data[(read_pos + i) & (HDS_PW_RING_CAPACITY - 1)];
+    atomic_store_explicit(&pw->ring.read_pos, read_pos + take, memory_order_release);
+    return take / (uint32_t)channels;
+#else
+    return 0; // unreachable: backend is always HDS_BACKEND_ALSA when HDS_PIPEWIRE_ENABLED==0 (see --backend validation in main())
+#endif
 }
 
 // Closes and frees a stream opened by open_pcm_stream() -- a NEW named function replacing
@@ -9063,7 +9187,15 @@ static uint32_t read_capture_block(HdsPcmStream *pcm_capture_handle, float *capt
 // Safe to call with NULL.
 static void close_pcm_stream(HdsPcmStream *handle) {
     if (!handle) return;
-    snd_pcm_close(handle);
+    if (handle->backend == HDS_BACKEND_ALSA) {
+        if (handle->alsa) snd_pcm_close(handle->alsa);
+    }
+#if HDS_PIPEWIRE_ENABLED
+    else {
+        hds_pw_stream_close(handle->pw);
+    }
+#endif
+    free(handle);
 }
 
 // Queries how many capture channels a device actually offers (opens it briefly just to ask, then
@@ -9072,6 +9204,13 @@ static void close_pcm_stream(HdsPcmStream *handle) {
 // guess. Falls back to 2 (plain stereo) on any failure -- an unopenable device will fail again,
 // loudly, when open_pcm_stream() itself tries.
 static int query_device_channel_count(const char *device_name) {
+    // PipeWire's own graph handles channel remixing between whatever this engine requests and
+    // whatever the real target node/hardware actually has, so there's no cheap local hw_params-
+    // style probe the way ALSA offers one -- this engine talks a fixed stereo capture stream to
+    // PipeWire (see hds_pw_stream_open()); a multichannel PipeWire target still works, just
+    // downmixed to stereo by the graph rather than reaching every raw channel individually the way
+    // the ALSA backend's own multichannel routing can.
+    if (g_audio_backend == HDS_BACKEND_PIPEWIRE) return 2;
     snd_pcm_t *probe = NULL;
     if (snd_pcm_open(&probe, device_name, SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK) < 0) return 2;
     snd_pcm_hw_params_t *hw_params = NULL;
@@ -9097,6 +9236,7 @@ static int query_device_channel_count(const char *device_name) {
 // interface's extra outputs need to actually be reachable, not just its first stereo pair. Falls
 // back to 2 (plain stereo) on any failure, same convention as the input side.
 static int query_output_device_channel_count(const char *device_name) {
+    if (g_audio_backend == HDS_BACKEND_PIPEWIRE) return 2; // see query_device_channel_count()'s own comment above
     snd_pcm_t *probe = NULL;
     if (snd_pcm_open(&probe, device_name, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) return 2;
     snd_pcm_hw_params_t *hw_params = NULL;
@@ -9125,13 +9265,219 @@ static int query_output_device_channel_count(const char *device_name) {
 // return values at all -- an unavailable "default" device (no sound card, no PulseAudio/ALSA
 // routing) left pcm_handle uninitialized/unusable and the very first snd_pcm_writei() call
 // would segfault or hang instead of failing with a clear message.
+#if HDS_PIPEWIRE_ENABLED
+// --- PipeWire backend (native libpipewire client -- --backend pipewire) ---
+//
+// This talks to the PipeWire daemon directly over its own client protocol (the same way
+// `pw-play`/`pw-cat`/`pw-record` do), NOT through the ALSA "pipewire" plugin
+// (libasound_module_pcm_pipewire.so) that snd_pcm_open("default", ...) would otherwise route
+// through on a PipeWire-based system. That ALSA plugin is a separate, optional compatibility shim
+// with its own load-time/ABI requirements independent of the PipeWire daemon itself -- exactly the
+// gap this backend exists to route around: a real, observed failure mode is that plugin failing to
+// load ("... cannot be opened or _snd_pcm_pipewire_open was not defined inside") while the
+// PipeWire daemon it would have connected to is running fine. A native pw_stream client has no
+// dependency on that plugin at all.
+//
+// Being a real PipeWire graph client (rather than an ALSA client of any kind) is also what makes
+// "run while other programs are running" work: PipeWire's own session manager mixes every client
+// stream in software, the same as it does for a browser tab and a media player sharing one output
+// today -- there's no exclusive hardware lock to contend over, unlike a raw ALSA hw: device.
+//
+// device_name here names a PipeWire target node (as `wpctl status`/`pw-cli ls Node` print it) --
+// "default"/"" leaves PW_KEY_TARGET_OBJECT unset, so PipeWire's own session manager
+// (wireplumber/pipewire-media-session) picks the default sink/source, mirroring what ALSA's
+// "default" PCM aims for.
+
+static void hds_pw_on_playback_process(void *userdata) {
+    HdsPwStream *pw = userdata;
+    struct pw_buffer *b = pw_stream_dequeue_buffer(pw->stream);
+    if (!b) return;
+    struct spa_buffer *buf = b->buffer;
+    float *dst = buf->datas[0].data;
+    if (!dst) { pw_stream_queue_buffer(pw->stream, b); return; }
+    uint32_t stride = sizeof(float) * (uint32_t)pw->channels;
+    uint32_t max_frames = buf->datas[0].maxsize / stride;
+    uint32_t want_frames = (b->requested > 0 && (uint32_t)b->requested < max_frames) ? (uint32_t)b->requested : max_frames;
+    uint32_t want_samples = want_frames * (uint32_t)pw->channels;
+
+    uint32_t write_pos = atomic_load_explicit(&pw->ring.write_pos, memory_order_acquire);
+    uint32_t read_pos = atomic_load_explicit(&pw->ring.read_pos, memory_order_relaxed);
+    uint32_t available = write_pos - read_pos;
+    uint32_t take = available < want_samples ? available : want_samples;
+    for (uint32_t i = 0; i < take; i++) dst[i] = pw->ring.data[(read_pos + i) & (HDS_PW_RING_CAPACITY - 1)];
+    if (take < want_samples) memset(dst + take, 0, (want_samples - take) * sizeof(float)); // underrun -- write_audio_block() hasn't fed the ring fast enough; silence the rest rather than play stale/garbage data
+    atomic_store_explicit(&pw->ring.read_pos, read_pos + take, memory_order_release);
+
+    buf->datas[0].chunk->offset = 0;
+    buf->datas[0].chunk->stride = (int32_t)stride;
+    buf->datas[0].chunk->size = want_samples * (uint32_t)sizeof(float);
+    pw_stream_queue_buffer(pw->stream, b);
+    sem_post(&pw->space_sem); // wake write_audio_block()'s pipewire branch -- more ring space just opened up
+}
+
+static void hds_pw_on_capture_process(void *userdata) {
+    HdsPwStream *pw = userdata;
+    struct pw_buffer *b = pw_stream_dequeue_buffer(pw->stream);
+    if (!b) return;
+    struct spa_buffer *buf = b->buffer;
+    float *src = buf->datas[0].data;
+    uint32_t stride = sizeof(float) * (uint32_t)pw->channels;
+    uint32_t n_samples = src ? (buf->datas[0].chunk->size / (uint32_t)sizeof(float)) : 0;
+    if (src && n_samples > 0) {
+        uint32_t write_pos = atomic_load_explicit(&pw->ring.write_pos, memory_order_relaxed);
+        uint32_t read_pos = atomic_load_explicit(&pw->ring.read_pos, memory_order_acquire);
+        uint32_t space = HDS_PW_RING_CAPACITY - (write_pos - read_pos);
+        uint32_t take = space < n_samples ? space : n_samples; // drop the tail on overflow (main thread reading too slowly) -- input is already documented best-effort elsewhere in this file
+        for (uint32_t i = 0; i < take; i++) pw->ring.data[(write_pos + i) & (HDS_PW_RING_CAPACITY - 1)] = src[i];
+        atomic_store_explicit(&pw->ring.write_pos, write_pos + take, memory_order_release);
+    }
+    (void)stride;
+    pw_stream_queue_buffer(pw->stream, b);
+}
+
+static void hds_pw_on_state_changed(void *userdata, enum pw_stream_state old, enum pw_stream_state state, const char *error) {
+    (void)old;
+    HdsPwStream *pw = userdata;
+    if (state == PW_STREAM_STATE_STREAMING) {
+        atomic_store_explicit(&pw->connected, true, memory_order_release);
+    } else if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED) {
+        atomic_store_explicit(&pw->connected, false, memory_order_release);
+        atomic_store_explicit(&pw->failed, true, memory_order_release);
+        if (error) fprintf(stderr, "[pipewire] stream error: %s\n", error);
+        sem_post(&pw->space_sem); // wake a blocked write_audio_block() rather than let it hang on a now-dead stream
+    }
+}
+
+static const struct pw_stream_events hds_pw_playback_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .state_changed = hds_pw_on_state_changed,
+    .process = hds_pw_on_playback_process,
+};
+static const struct pw_stream_events hds_pw_capture_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .state_changed = hds_pw_on_state_changed,
+    .process = hds_pw_on_capture_process,
+};
+
+static void hds_pw_stream_close(HdsPwStream *pw) {
+    if (!pw) return;
+    if (pw->loop) {
+        pw_thread_loop_stop(pw->loop);
+        if (pw->stream) pw_stream_destroy(pw->stream);
+        pw_thread_loop_destroy(pw->loop);
+    }
+    sem_destroy(&pw->space_sem);
+    free(pw);
+}
+
+static HdsPwStream *hds_pw_stream_open(const char *device_name, bool is_capture, int channels, float latency_ms) {
+    HdsPwStream *pw = calloc(1, sizeof(*pw));
+    if (!pw) return NULL;
+    pw->is_capture = is_capture;
+    pw->channels = channels;
+    sem_init(&pw->space_sem, 0, 0);
+
+    pw->loop = pw_thread_loop_new(is_capture ? "hds-pw-capture" : "hds-pw-playback", NULL);
+    if (!pw->loop) { sem_destroy(&pw->space_sem); free(pw); return NULL; }
+
+    pw_thread_loop_lock(pw->loop);
+
+    struct pw_properties *props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CATEGORY, is_capture ? "Capture" : "Playback",
+        PW_KEY_MEDIA_ROLE, "Production",
+        NULL);
+    if (device_name && device_name[0] != '\0' && strcmp(device_name, "default") != 0) {
+        pw_properties_set(props, PW_KEY_TARGET_OBJECT, device_name);
+    }
+    // Maps this engine's own audio_latency_ms control (Audio tab's Latency knob) onto PipeWire's
+    // node latency hint, the same way open_pcm_stream()'s ALSA branch maps it onto the ALSA buffer
+    // target -- kept consistent across both backends rather than PipeWire silently ignoring it.
+    char latency_prop[32];
+    unsigned int latency_frames = (unsigned int)fmaxf(64.0f, (latency_ms / 1000.0f) * (float)SAMPLE_RATE);
+    snprintf(latency_prop, sizeof(latency_prop), "%u/%u", latency_frames, (unsigned int)SAMPLE_RATE);
+    pw_properties_set(props, PW_KEY_NODE_LATENCY, latency_prop);
+
+    pw->stream = pw_stream_new_simple(
+        pw_thread_loop_get_loop(pw->loop),
+        is_capture ? "HDS Synth Input" : "HDS Synth Output",
+        props, // consumed by pw_stream_new_simple regardless of outcome -- never freed by us
+        is_capture ? &hds_pw_capture_events : &hds_pw_playback_events,
+        pw);
+    if (!pw->stream) {
+        pw_thread_loop_unlock(pw->loop);
+        pw_thread_loop_destroy(pw->loop);
+        sem_destroy(&pw->space_sem);
+        free(pw);
+        return NULL;
+    }
+
+    uint8_t pod_buffer[1024];
+    struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(pod_buffer, sizeof(pod_buffer));
+    struct spa_audio_info_raw info = { .format = SPA_AUDIO_FORMAT_F32, .channels = (uint32_t)channels, .rate = SAMPLE_RATE };
+    const struct spa_pod *params[1];
+    params[0] = spa_format_audio_raw_build(&pod_builder, SPA_PARAM_EnumFormat, &info);
+
+    int res = pw_stream_connect(pw->stream, is_capture ? PW_DIRECTION_INPUT : PW_DIRECTION_OUTPUT, PW_ID_ANY,
+        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS, params, 1);
+    if (res < 0) {
+        fprintf(stderr, "[pipewire] pw_stream_connect failed (%d)\n", res);
+        pw_thread_loop_unlock(pw->loop);
+        pw_stream_destroy(pw->stream);
+        pw_thread_loop_destroy(pw->loop);
+        sem_destroy(&pw->space_sem);
+        free(pw);
+        return NULL;
+    }
+    pw_thread_loop_unlock(pw->loop);
+
+    if (pw_thread_loop_start(pw->loop) < 0) {
+        pw_stream_destroy(pw->stream);
+        pw_thread_loop_destroy(pw->loop);
+        sem_destroy(&pw->space_sem);
+        free(pw);
+        return NULL;
+    }
+
+    // Give the daemon a real but bounded window to actually reach STREAMING -- a genuinely
+    // unreachable PipeWire daemon (or a bad target/permission) should fail startup here rather
+    // than the engine silently running with a dead audio stream, matching this shim's ALSA branch
+    // "fail loudly, don't hang" posture for the equivalent open.
+    for (int waited_ms = 0; waited_ms < 2000; waited_ms += 20) {
+        if (atomic_load_explicit(&pw->connected, memory_order_acquire)) break;
+        if (atomic_load_explicit(&pw->failed, memory_order_acquire)) break;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 20L * 1000L * 1000L };
+        nanosleep(&ts, NULL);
+    }
+    if (!atomic_load_explicit(&pw->connected, memory_order_acquire)) {
+        fprintf(stderr, "[pipewire] %s stream '%s' did not reach STREAMING state (daemon unreachable, or the target node/permission is wrong)\n",
+                is_capture ? "Input" : "Output", (device_name && device_name[0]) ? device_name : "default");
+        hds_pw_stream_close(pw);
+        return NULL;
+    }
+    return pw;
+}
+#endif // HDS_PIPEWIRE_ENABLED
+
 static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, HdsPcmStream **handle, float latency_ms, int channels) {
-    if (*handle) { snd_pcm_close(*handle); *handle = NULL; }
+    if (*handle) { close_pcm_stream(*handle); *handle = NULL; }
+#if HDS_PIPEWIRE_ENABLED
+    if (g_audio_backend == HDS_BACKEND_PIPEWIRE) {
+        HdsPwStream *pw = hds_pw_stream_open(device_name, stream == HDS_STREAM_CAPTURE, channels, latency_ms);
+        if (!pw) return false;
+        HdsPcmStream *s = calloc(1, sizeof(*s));
+        if (!s) { hds_pw_stream_close(pw); return false; }
+        s->backend = HDS_BACKEND_PIPEWIRE;
+        s->pw = pw;
+        *handle = s;
+        return true;
+    }
+#endif
+    snd_pcm_t *alsa = NULL;
     snd_pcm_stream_t alsa_stream = (stream == HDS_STREAM_PLAYBACK) ? SND_PCM_STREAM_PLAYBACK : SND_PCM_STREAM_CAPTURE;
-    int err = snd_pcm_open(handle, device_name, alsa_stream, 0);
+    int err = snd_pcm_open(&alsa, device_name, alsa_stream, 0);
     if (err < 0) {
         fprintf(stderr, "%s device '%s' failed to open: %s\n", stream == HDS_STREAM_PLAYBACK ? "Output" : "Input", device_name, snd_strerror(err));
-        *handle = NULL;
         return false;
     }
     // LATENCY: this target -- not BUFFER_SIZE -- is what actually sets the floor on output
@@ -9146,14 +9492,142 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
     // that depends on the target hardware's own headroom, not something to freeze at one value
     // for every machine this ever runs on.
     unsigned int latency_us = (unsigned int)fmaxf(1000.0f, latency_ms * 1000.0f);
-    err = snd_pcm_set_params(*handle, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, (unsigned int)channels, SAMPLE_RATE, 1, latency_us);
+    err = snd_pcm_set_params(alsa, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, (unsigned int)channels, SAMPLE_RATE, 1, latency_us);
     if (err < 0) {
         fprintf(stderr, "%s device '%s' failed to configure: %s\n", stream == HDS_STREAM_PLAYBACK ? "Output" : "Input", device_name, snd_strerror(err));
-        snd_pcm_close(*handle);
-        *handle = NULL;
+        snd_pcm_close(alsa);
         return false;
     }
+    HdsPcmStream *s = calloc(1, sizeof(*s));
+    if (!s) { snd_pcm_close(alsa); return false; }
+    s->backend = HDS_BACKEND_ALSA;
+    s->alsa = alsa;
+    *handle = s;
     return true;
+}
+
+// --- Interactive device recovery ---
+//
+// An output device that fails to open has always been FATAL at startup (see main()'s call to
+// open_pcm_stream() for HDS_STREAM_PLAYBACK) -- there's no way to reach the OSC server's
+// /hds/device/output handler if the process has already exited. That's still true for a
+// non-interactive launch (systemd unit, script, CI, a headless SSH session with stdin redirected
+// from /dev/null) -- it can never answer a prompt, so blocking on fgets() there would just hang
+// forever instead of failing. But an interactive launch (a real terminal) doesn't have to just
+// die on a bad/missing "default" device -- see interactive_recover_output_device() below and its
+// isatty() guard at the one call site in main().
+#define HDS_DEVICE_PROMPT_MAX 32
+
+// Enumerates ALSA PCM device names (+ short descriptions) via snd_device_name_hint -- the same
+// information `aplay -L`/`arecord -L` print (frontend.py's own device dropdown already shells out
+// to those, see _list_alsa_devices() there), but through libasound directly, so this prompt needs
+// no external alsa-utils binary to be installed.
+static int enumerate_pcm_devices(HdsStreamDirection stream, char names[][AUDIO_DEVICE_NAME_LEN], char descs[][128], int max_devices) {
+    void **hints = NULL;
+    if (snd_device_name_hint(-1, "pcm", &hints) < 0) return 0;
+    const char *want_ioid = (stream == HDS_STREAM_PLAYBACK) ? "Output" : "Input";
+    int count = 0;
+    for (void **n = hints; *n != NULL && count < max_devices; n++) {
+        char *name = snd_device_name_get_hint(*n, "NAME");
+        char *ioid = snd_device_name_get_hint(*n, "IOID"); // NULL means "works for both directions"
+        if (name && strcmp(name, "null") != 0 && (!ioid || strcmp(ioid, want_ioid) == 0)) {
+            snprintf(names[count], AUDIO_DEVICE_NAME_LEN, "%s", name);
+            char *desc = snd_device_name_get_hint(*n, "DESC");
+            if (desc) {
+                char *newline = strchr(desc, '\n'); // DESC can be two lines ("short\nlong") -- keep only the first for a compact prompt row
+                if (newline) *newline = '\0';
+            }
+            snprintf(descs[count], 128, "%s", desc ? desc : "");
+            free(desc);
+            count++;
+        }
+        free(name);
+        free(ioid);
+    }
+    snd_device_name_free_hint(hints);
+    return count;
+}
+
+// Interactively prompts on stdin for one of the enumerated ALSA device names.
+static bool prompt_for_pcm_device(HdsStreamDirection stream, char *out_device, size_t out_len) {
+    char names[HDS_DEVICE_PROMPT_MAX][AUDIO_DEVICE_NAME_LEN];
+    char descs[HDS_DEVICE_PROMPT_MAX][128];
+    int count = enumerate_pcm_devices(stream, names, descs, HDS_DEVICE_PROMPT_MAX);
+    if (count == 0) {
+        fprintf(stderr, "No ALSA %s devices found to choose from.\n", stream == HDS_STREAM_PLAYBACK ? "output" : "input");
+        return false;
+    }
+    for (;;) {
+        fprintf(stderr, "\nAvailable ALSA %s devices:\n", stream == HDS_STREAM_PLAYBACK ? "output" : "input");
+        for (int i = 0; i < count; i++) {
+            fprintf(stderr, "  [%d] %s%s%s\n", i + 1, names[i], descs[i][0] ? " -- " : "", descs[i]);
+        }
+        fprintf(stderr, "Select a device by number (or 'q' to quit): ");
+        fflush(stderr);
+        char line[64];
+        if (!fgets(line, sizeof(line), stdin)) return false; // EOF/closed stdin -- can't prompt further
+        line[strcspn(line, "\n")] = '\0';
+        if (line[0] == 'q' || line[0] == 'Q') return false;
+        int choice = atoi(line);
+        if (choice >= 1 && choice <= count) {
+            snprintf(out_device, out_len, "%s", names[choice - 1]);
+            return true;
+        }
+        fprintf(stderr, "Invalid selection.\n");
+    }
+}
+
+#if HDS_PIPEWIRE_ENABLED
+// PipeWire target nodes aren't cheap to enumerate the way ALSA's are (snd_device_name_hint is a
+// synchronous, local query; PipeWire's graph lives behind an async registry round-trip), so this
+// prompt asks for a target name directly rather than listing one -- `wpctl status`/`pw-cli ls
+// Node` show the names to try. Also offers falling back to the ALSA backend entirely, for the
+// case where the PipeWire daemon itself turns out to be unreachable.
+static bool prompt_pipewire_retry(char *out_device, size_t out_len, bool *fall_back_to_alsa) {
+    *fall_back_to_alsa = false;
+    fprintf(stderr, "\nEnter a PipeWire target node name (see `wpctl status` or `pw-cli ls Node`),\n"
+                     "leave blank to retry PipeWire's own default sink/source, type 'alsa' to fall\n"
+                     "back to the ALSA backend instead, or 'q' to give up: ");
+    fflush(stderr);
+    char line[AUDIO_DEVICE_NAME_LEN]; // matches out_device's own real capacity (always AUDIO_DEVICE_NAME_LEN at the one call site) so a long name truncates once, consistently, rather than risking a second truncation in the snprintf below
+    if (!fgets(line, sizeof(line), stdin)) return false;
+    line[strcspn(line, "\n")] = '\0';
+    if (line[0] == 'q' || line[0] == 'Q') return false;
+    if (strcasecmp(line, "alsa") == 0) { *fall_back_to_alsa = true; return true; }
+    snprintf(out_device, out_len, "%s", line);
+    return true;
+}
+#endif
+
+// The one place all of the above comes together: called only when the startup output device
+// failed to open AND stdin is a real terminal (see main()'s isatty() guard). Loops until either a
+// device opens successfully or the user gives up ('q'/EOF).
+static bool interactive_recover_output_device(SynthSharedControls *knobs, HdsPcmStream **pcm_handle, int *detected_output_channels) {
+    for (;;) {
+        char picked[AUDIO_DEVICE_NAME_LEN] = {0};
+        bool have_pick;
+        if (g_audio_backend == HDS_BACKEND_ALSA) {
+            have_pick = prompt_for_pcm_device(HDS_STREAM_PLAYBACK, picked, sizeof(picked));
+        }
+#if HDS_PIPEWIRE_ENABLED
+        else {
+            bool fall_back_to_alsa = false;
+            have_pick = prompt_pipewire_retry(picked, sizeof(picked), &fall_back_to_alsa);
+            if (have_pick && fall_back_to_alsa) {
+                g_audio_backend = HDS_BACKEND_ALSA;
+                snprintf(picked, sizeof(picked), "default");
+                fprintf(stderr, "Falling back to the ALSA backend.\n");
+            }
+        }
+#else
+        else { have_pick = false; }
+#endif
+        if (!have_pick) return false; // user gave up ('q'/EOF)
+        snprintf(knobs->output_device, AUDIO_DEVICE_NAME_LEN, "%s", picked[0] ? picked : "default");
+        *detected_output_channels = query_output_device_channel_count(knobs->output_device);
+        if (open_pcm_stream(knobs->output_device, HDS_STREAM_PLAYBACK, pcm_handle, knobs->audio_latency_ms, *detected_output_channels)) return true;
+        fprintf(stderr, "That device also failed to open. Try another, or 'q' to give up.\n");
+    }
 }
 
 // --- WAV recording (Recording tab) ---
@@ -9703,6 +10177,16 @@ int main(int argc, char **argv) {
     // here (e.g. `--output-device hw:1,0` or `--output-device plughw:1,0`).
     const char *cli_output_device = NULL;
     const char *cli_input_device = NULL;
+    // --backend alsa|pipewire: chooses the audio platform shim's backend (see the "Audio platform
+    // shim" section above) once at startup -- ALSA remains the default, unchanged. "pipewire"
+    // opens a native libpipewire client stream instead (only available in a build where the
+    // Makefile's pkg-config check found libpipewire-0.3 -- see HDS_PIPEWIRE_ENABLED), talking to
+    // the PipeWire daemon directly rather than through the ALSA "pipewire" plugin, so it works
+    // even when that plugin itself fails to load. Device names mean different things per backend:
+    // an ALSA device string (`aplay -l`-style, e.g. "hw:1,0") under --backend alsa, or a PipeWire
+    // target node name (`wpctl status`-style) -- or "default" for PipeWire's own session-manager
+    // default -- under --backend pipewire.
+    const char *cli_backend = "alsa";
     // --sfz-vco1 <path> .. --sfz-vco4 <path>: load a multisample instrument onto that oscillator
     // at startup, directly from the backend's own local filesystem -- no frontend needs to ever
     // connect for this synth to have playable sample content (see hds_load_sfz_for_osc() above
@@ -9714,10 +10198,26 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--osc-reply-port") == 0 && i + 1 < argc) osc_reply_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--output-device") == 0 && i + 1 < argc) cli_output_device = argv[++i];
         else if (strcmp(argv[i], "--input-device") == 0 && i + 1 < argc) cli_input_device = argv[++i];
+        else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) cli_backend = argv[++i];
         else if (strcmp(argv[i], "--sfz-vco1") == 0 && i + 1 < argc) cli_sfz_path[0] = argv[++i];
         else if (strcmp(argv[i], "--sfz-vco2") == 0 && i + 1 < argc) cli_sfz_path[1] = argv[++i];
         else if (strcmp(argv[i], "--sfz-vco3") == 0 && i + 1 < argc) cli_sfz_path[2] = argv[++i];
         else if (strcmp(argv[i], "--sfz-vco4") == 0 && i + 1 < argc) cli_sfz_path[3] = argv[++i];
+    }
+
+    if (strcmp(cli_backend, "pipewire") == 0) {
+#if HDS_PIPEWIRE_ENABLED
+        g_audio_backend = HDS_BACKEND_PIPEWIRE;
+        pw_init(&argc, &argv);
+#else
+        fprintf(stderr, "This build has no PipeWire support (the Makefile's pkg-config check didn't find "
+                         "libpipewire-0.3 at build time) -- rebuild inside nix-shell (see shell.nix), install "
+                         "libpipewire-0.3-dev and rebuild, or drop --backend pipewire to use ALSA.\n");
+        return 1;
+#endif
+    } else if (strcmp(cli_backend, "alsa") != 0) {
+        fprintf(stderr, "Unknown --backend '%s' -- expected 'alsa' or 'pipewire'.\n", cli_backend);
+        return 1;
     }
 
     SynthSharedControls active_knobs; init_default_controls(&active_knobs);
@@ -9771,8 +10271,19 @@ int main(int argc, char **argv) {
     int detected_output_channels = query_output_device_channel_count(active_knobs.output_device);
     HdsPcmStream *pcm_handle = NULL;
     if (!open_pcm_stream(active_knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels)) {
-        fprintf(stderr, "Cannot continue without an output device.\n");
-        lo_address_free(osc_reply_addr); lo_server_free(osc_server); return 1;
+        // Rather than exiting immediately, offer an interactive way out -- but only when stdin is
+        // actually a terminal (a non-interactive launch, e.g. a systemd unit or CI, can never
+        // answer a prompt and would otherwise hang forever on fgets() waiting for input that will
+        // never come). See interactive_recover_output_device()'s own comment for the full story.
+        bool opened = false;
+        if (isatty(STDIN_FILENO)) {
+            fprintf(stderr, "Could not open the configured output device ('%s').\n", active_knobs.output_device);
+            opened = interactive_recover_output_device(&active_knobs, &pcm_handle, &detected_output_channels);
+        }
+        if (!opened) {
+            fprintf(stderr, "Cannot continue without an output device.\n");
+            lo_address_free(osc_reply_addr); lo_server_free(osc_server); return 1;
+        }
     }
     char applied_output_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
@@ -10092,5 +10603,8 @@ int main(int argc, char **argv) {
     snd_seq_close(seq_handle);
     close_pcm_stream(pcm_handle);
     if (pcm_capture_handle) close_pcm_stream(pcm_capture_handle);
+#if HDS_PIPEWIRE_ENABLED
+    if (g_audio_backend == HDS_BACKEND_PIPEWIRE) pw_deinit();
+#endif
     return 0;
 }

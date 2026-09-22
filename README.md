@@ -542,7 +542,10 @@ knobs a given effect actually uses instead of 8 generic "P1..P8" dials.
 Requires ALSA dev headers (`libasound2-dev` on Debian/Ubuntu) and liblo dev
 headers (`liblo-dev`, the OSC control protocol -- see below). WavPack dev
 headers are NOT required -- WavPack recording support is currently disabled
-(see `HDS_WAVPACK_ENABLED` in `backend.c`).
+(see `HDS_WAVPACK_ENABLED` in `backend.c`). PipeWire dev headers
+(`libpipewire-0.3-dev`) are also NOT required -- the optional native PipeWire
+backend described below is auto-detected at build time and the ALSA backend
+is unaffected either way.
 
 ```sh
 make                    # builds ./synth_engine
@@ -559,9 +562,70 @@ entry -- see `shell.nix`'s own header comment for exactly what each target needs
 `make`/`make clap`** -- there is no "build outside nix-shell" path, and none should ever be
 suggested again.
 
-Linux (with ALSA) is the only supported platform -- there is no Windows build of any kind
-(standalone or CLAP), and none is planned: this project will not maintain a second platform audio
-backend (WASAPI) alongside ALSA.
+Linux is the only supported platform -- there is no Windows build of any kind (standalone or
+CLAP), and none is planned: this project will not maintain a second *platform* audio backend
+(WASAPI) alongside ALSA. ALSA remains the default and always-available backend either way; the
+PipeWire backend described below is an additional, opt-in way to talk to audio on the *same*
+platform, not a second platform.
+
+### If the engine won't start because of the audio device
+
+An output device that fails to open used to be an unconditional, unrecoverable startup failure --
+exactly the situation a machine whose "default" device doesn't work at all (a broken ALSA config,
+a PipeWire ALSA-compat plugin that fails to load, a USB interface that isn't there yet) would hit
+every single time, with no way to fix it short of editing a config file or passing
+`--output-device`/`--backend` blind and hoping. If launched from a real terminal (not a systemd
+unit, a script, or anything else with its stdin closed/redirected -- those can never answer a
+prompt, so they keep the old immediate-failure behavior instead of hanging), a failed output device
+now drops into an interactive picker instead of exiting: it lists the real ALSA devices found on
+the machine (the same information `aplay -L` shows) and lets you pick one, retrying until either
+one opens or you type `q` to give up. Under `--backend pipewire` (see below) it instead asks for a
+PipeWire target node name (or a blank line to retry PipeWire's own default sink), and can fall back
+to the ALSA backend entirely for that session by typing `alsa`.
+
+### PipeWire backend
+
+`--backend pipewire` (default: `alsa`, entirely unchanged) opens a native PipeWire client stream
+(via `libpipewire`) instead of an ALSA PCM device -- talking to the PipeWire daemon directly over
+its own client protocol, the same way `pw-play`/`pw-cat`/`pw-record` do. This is genuinely
+different from just pointing `--output-device` at a `pipewire`-named ALSA PCM: that route still
+goes through ALSA's own `libasound_module_pcm_pipewire.so` compatibility plugin, which has its own
+separate load-time/ABI requirements and can fail even while the PipeWire daemon itself is running
+fine (a real, observed failure: `... cannot be opened or _snd_pcm_pipewire_open was not defined
+inside`, immediately followed by `default` itself failing too since it was configured to route
+through that same broken plugin). The native backend has no dependency on that plugin at all.
+
+Being a real PipeWire graph client is also what lets other applications keep making sound at the
+same time -- PipeWire's own session manager mixes every client stream in software, the same way a
+browser tab and a media player already share one output today, with no exclusive hardware lock
+involved (unlike opening a raw ALSA `hw:` device directly).
+
+This is an *additional* backend, not a replacement: the ALSA path above is completely unchanged
+and remains the default, and the two are never mixed within one process (`--backend` is a
+startup-only choice, not a live Audio-tab dropdown item -- switching backends means restarting the
+engine, or using the interactive picker's own PipeWire→ALSA fallback described above).
+
+**Build-time only, auto-detected, no manual flag to flip:** the Makefile probes for
+`libpipewire-0.3` via `pkg-config` and only compiles the PipeWire code path in when it's found
+(`HDS_PIPEWIRE_ENABLED` in `backend.c`) -- a plain `libasound2-dev`-only setup (e.g. the Pi) still
+gets a normal ALSA-only build with nothing to change by hand, while `nix-shell` (which lists
+`pkgs.pipewire`/`pkgs.pkg-config` in `shell.nix`'s `buildInputs`) gets it automatically. `make`
+prints which way it went (`PipeWire backend (--backend pipewire): enabled`/`disabled`). Passing
+`--backend pipewire` to a build where it wasn't detected fails fast with a clear message rather
+than silently falling back to ALSA.
+
+**Device naming differs by backend:** an ALSA device string (`hw:1,0`, `plughw:1,0`, `default`,
+...) under the default `--backend alsa`, vs. a PipeWire target node name (as `wpctl status`/`pw-cli
+ls Node` print it) -- or `default`/empty for PipeWire's own session-manager default sink/source --
+under `--backend pipewire`.
+
+**Known scope limits, by design rather than oversight:** the PipeWire path always negotiates a
+fixed stereo stream (PipeWire's own graph remixes to whatever the real target/hardware actually
+has, so this doesn't lose audio, but it does mean the ALSA backend's own reach-every-raw-channel
+multichannel routing doesn't apply under PipeWire); and there's no cheap local way to enumerate the
+PipeWire graph's nodes the way `snd_device_name_hint` enumerates ALSA's (that's an async registry
+round-trip, not a synchronous local query), so the interactive recovery picker asks for a PipeWire
+target name directly under this backend rather than listing one -- see the previous section.
 
 ### Building for Raspberry Pi
 

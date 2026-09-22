@@ -58,6 +58,15 @@ pkgs.mkShell {
     pkgs.wavpack             # NOT currently linked -- WavPack recording is disabled (see
                               # HDS_WAVPACK_ENABLED in src/backend.c); left here so re-enabling it
                               # needs no shell.nix change, just that one flag flipped back.
+    pkgs.pipewire            # backend.c's OPTIONAL native PipeWire backend (--backend pipewire,
+                              # alongside the always-present ALSA backend above -- see
+                              # HDS_PIPEWIRE_ENABLED in src/backend.c). The Makefile auto-detects
+                              # this via `pkg-config --exists libpipewire-0.3` at build time, so
+                              # just having it on PATH here is what turns the feature on -- nothing
+                              # else in this file needs to change for that.
+    pkgs.pkg-config          # the Makefile's own PipeWire auto-detection needs `pkg-config` itself
+                              # on PATH -- not previously required here since every other dependency
+                              # (alsa-lib, liblo) is linked via hardcoded -l flags instead.
 
     # --- Python frontend (python3 src/frontend.py) --- PySide6/python-osc's exact pinned
     # versions (see requirements.txt) aren't reliably both present/current in every nixpkgs
@@ -91,7 +100,8 @@ pkgs.mkShell {
     echo "HDS dev shell -- native Linux build, CLAP plugin, Python frontend, and Raspberry Pi 5"
     echo "backend cross-build all ready."
     echo
-    echo "  make            -> ./synth_engine"
+    echo "  make            -> ./synth_engine   (pkg-config auto-detects PipeWire -- run with"
+    echo "                                       --backend pipewire once built to use it)"
     echo "  make clap       -> ./hds.clap"
     echo "  make arm64      -> synth_engine-arm64 (aarch64 Linux backend, e.g. Raspberry Pi 5)"
     echo
