@@ -1160,3 +1160,32 @@ background thread standing in for the backend) reproducing the exact
 failure -- an immediate post-connect knob touch, with zero artificial
 delay -- both before this fix (a full default-laden packet went out) and
 after (nothing goes out until the real state has actually landed).
+
+### Window was forced obnoxiously wide, LFO tab's knobs strayed from their labels
+
+Measuring `SynthGui`'s own minimum size hint traced this to the Sequencer
+tab's Transport toolbar: every seek/play/pause/stop/metronome/quantize
+button plus the resolution and tempo-sync-source combos and the
+elapsed/bars:beats readouts sat in one single, unbroken `QHBoxLayout`,
+whose combined minimum width measured ~1764px. `QTabWidget` sizes itself
+to fit its WIDEST tab's minimum size, not just whichever tab is actually
+showing (the same reason the EG/FX tabs already needed their own
+`QScrollArea` wrap, per those tabs' own comments) -- so that one toolbar
+was forcing the ENTIRE window (every tab, not just Sequencer) to a
+~1868px minimum width, overriding the ~1350px `setGeometry()` call at
+construction outright. On a tab whose own content needs far less than
+that -- the LFO tab measured ~522px -- the leftover ~1300px of forced
+width had nowhere to go but into any child widget still sitting at Qt's
+default "Expanding" horizontal size policy: a plain `QComboBox` with no
+`setFixedWidth` of its own. Three of the LFO row's five combos (the
+waveform selector, the Tempo Sync note-division selector, and the Key
+Sync selector) were exactly that, so they silently stretched to soak up
+that space, visibly separating each row's knobs from their own labels --
+"lots of free space padding" was that same forced width with nowhere
+else to be absorbed. Fixed two ways: the Transport toolbar is now two
+stacked rows instead of one (roughly halving its own forced minimum
+width, which brought the whole window's minimum back in line with its
+intended ~1350px), and all three previously-unconstrained LFO combos now
+have an explicit `setFixedWidth()` (62/90/65px) matching the existing
+pattern the LFO row's own destination-assignment combo, and the FX/EG
+tabs' combos, already used.

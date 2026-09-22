@@ -3872,7 +3872,22 @@ class SynthGui(QWidget):
         seq_outer_lay.setContentsMargins(6, 6, 6, 6); seq_outer_lay.setSpacing(6)
 
         transport_box = QGroupBox("Transport")
-        transport_lay = QHBoxLayout(transport_box); transport_lay.setSpacing(8)
+        # Two rows, not one long unbroken QHBoxLayout: a single row wide enough for every button
+        # + combo + readout below (measured ~1764px of minimum width) forced the WHOLE window
+        # (QTabWidget sizes itself to fit the widest tab's minimum size, not just the active
+        # one -- see the EG/FX tabs' own QScrollArea comments) to that same ~1764px minimum,
+        # regardless of which tab was actually open. On, say, the LFO tab -- whose own content
+        # only needs ~500px -- that forced leftover width had nowhere to go but into any child
+        # widget with Qt's default "Expanding" horizontal size policy (plain QComboBoxes without
+        # their own setFixedWidth), stretching them far wider than their text and shoving
+        # neighboring knobs away from their labels. Splitting this into two rows roughly halves
+        # the Sequencer tab's own forced minimum width, which is what was actually driving the
+        # whole window's.
+        transport_lay = QVBoxLayout(transport_box); transport_lay.setSpacing(2)
+        transport_row1 = QHBoxLayout(); transport_row1.setSpacing(8)
+        transport_row2 = QHBoxLayout(); transport_row2.setSpacing(8)
+        transport_lay.addLayout(transport_row1)
+        transport_lay.addLayout(transport_row2)
         # Seek controls (Reset/Back/Forward) precede Play/Pause/Stop, standard transport layout
         # order. All three work in every transport state (Stopped/Paused/Playing) and reposition
         # every lane's own playback position, not just the display -- see
@@ -3882,15 +3897,15 @@ class SynthGui(QWidget):
         self.seq_btn_seek_back = QPushButton("\u23ea 1 Measure")
         self.seq_btn_seek_back.setToolTip("Back one measure")
         for btn in (self.seq_btn_seek_start, self.seq_btn_seek_back):
-            transport_lay.addWidget(btn)
+            transport_row1.addWidget(btn)
         self.seq_btn_play = QPushButton("\u25b6 Play")
         self.seq_btn_pause = QPushButton("\u23f8 Pause")
         self.seq_btn_stop = QPushButton("\u23f9 Stop")
         for btn in (self.seq_btn_play, self.seq_btn_pause, self.seq_btn_stop):
-            transport_lay.addWidget(btn)
+            transport_row1.addWidget(btn)
         self.seq_btn_seek_fwd = QPushButton("1 Measure \u23e9")
         self.seq_btn_seek_fwd.setToolTip("Forward one measure")
-        transport_lay.addWidget(self.seq_btn_seek_fwd)
+        transport_row1.addWidget(self.seq_btn_seek_fwd)
         # Metronome: a plain on/off toggle (not an edge-triggered counter like the buttons above
         # -- this is sustained state), engaging a cheap, hardcoded 400Hz/8ms square-wave click on
         # each beat while the transport is PLAYING -- see poll_metronome() in backend.c. Not a
@@ -3899,7 +3914,7 @@ class SynthGui(QWidget):
         self.seq_btn_metronome = QPushButton("\U0001f3b5 Metronome")
         self.seq_btn_metronome.setCheckable(True)
         self.seq_btn_metronome.setToolTip("Click on each beat while playing (400Hz, 8ms square wave)")
-        transport_lay.addWidget(self.seq_btn_metronome)
+        transport_row1.addWidget(self.seq_btn_metronome)
         # Quantize: snaps a Rec-armed lane's recorded note-ON timestamps to the nearest grid line
         # at the current tempo (note lengths are left as-played -- see backend.c's
         # seq_quantize_enable comment). Off by default, same "opt-in, doesn't change existing
@@ -3910,13 +3925,13 @@ class SynthGui(QWidget):
             "Snap recorded note-ON timestamps to the nearest grid line at the current tempo "
             "(note lengths are left exactly as played)."
         )
-        transport_lay.addWidget(self.seq_btn_quantize)
+        transport_row1.addWidget(self.seq_btn_quantize)
         self.seq_quantize_resolution_combo = QComboBox()
         self.seq_quantize_resolution_combo.addItems(["1/4", "1/8", "1/8 Triplet", "1/16", "1/16 Triplet", "1/32"])
         self.seq_quantize_resolution_combo.setCurrentIndex(3)  # 1/16 -- matches backend's own default (seq_quantize_resolution=4)
         self.seq_quantize_resolution_combo.setToolTip("Quantize grid resolution")
-        transport_lay.addWidget(QLabel("Resolution:"))
-        transport_lay.addWidget(self.seq_quantize_resolution_combo)
+        transport_row1.addWidget(QLabel("Resolution:"))
+        transport_row1.addWidget(self.seq_quantize_resolution_combo)
         # Tempo sync source: Internal (Tempo knob/tempo-map, unchanged default) or External --
         # slaves tempo to incoming MIDI Clock (standalone app, real MIDI cable/hardware sequencer)
         # or the host's own transport tempo (CLAP, hosted in a DAW) -- see backend.c's
@@ -3928,11 +3943,12 @@ class SynthGui(QWidget):
             "Internal: follow the Tempo knob/tempo-map. External: slave to incoming MIDI Clock "
             "(standalone, from a cable/hardware sequencer) or the host's own tempo (CLAP, in a DAW)."
         )
-        transport_lay.addWidget(QLabel("Sync:"))
-        transport_lay.addWidget(self.seq_sync_source_combo)
+        transport_row1.addWidget(QLabel("Sync:"))
+        transport_row1.addWidget(self.seq_sync_source_combo)
         self.seq_sync_lock_label = QLabel("")
         self.seq_sync_lock_label.setStyleSheet("font-size: 9px; color: #888;")
-        transport_lay.addWidget(self.seq_sync_lock_label)
+        transport_row1.addWidget(self.seq_sync_lock_label)
+        transport_row1.addStretch()
         self.seq_sync_source_combo.currentIndexChanged.connect(self._update_seq_sync_lock_label)
         self._update_seq_sync_lock_label()
         # Real, edge-triggered counters -- same idiom as each Sequencer audio lane's own Preview
@@ -3959,24 +3975,24 @@ class SynthGui(QWidget):
         self.seq_btn_quantize.toggled.connect(self.transmit_knob_packet)
         self.seq_quantize_resolution_combo.currentIndexChanged.connect(self.transmit_knob_packet)
         self.seq_sync_source_combo.currentIndexChanged.connect(self.transmit_knob_packet)
-        transport_lay.addSpacing(16)
+        transport_row2.addSpacing(16)
         self.seq_transport_state_label = QLabel("STOPPED")
         self.seq_transport_state_label.setStyleSheet("font-weight: bold;")
-        transport_lay.addWidget(self.seq_transport_state_label)
-        transport_lay.addSpacing(16)
+        transport_row2.addWidget(self.seq_transport_state_label)
+        transport_row2.addSpacing(16)
         self.seq_elapsed_label = QLabel("00:00.0")
         self.seq_elapsed_label.setStyleSheet("font-family: monospace; font-size: 14px;")
-        transport_lay.addWidget(QLabel("Elapsed:")); transport_lay.addWidget(self.seq_elapsed_label)
+        transport_row2.addWidget(QLabel("Elapsed:")); transport_row2.addWidget(self.seq_elapsed_label)
         self.seq_bars_beats_label = QLabel("0:1")
         self.seq_bars_beats_label.setStyleSheet("font-family: monospace; font-size: 14px;")
-        transport_lay.addWidget(QLabel("Bars\u200a:\u200aBeats:")); transport_lay.addWidget(self.seq_bars_beats_label)
-        transport_lay.addStretch()
+        transport_row2.addWidget(QLabel("Bars\u200a:\u200aBeats:")); transport_row2.addWidget(self.seq_bars_beats_label)
+        transport_row2.addStretch()
         # Song save/load: a self-contained folder (config + recorded MIDI + copied-in audio) you
         # can come back to and keep working on later -- see _pick_and_save_song()'s own docstring.
         self.btn_save_song = QPushButton("Save Song")
         self.btn_load_song = QPushButton("Load Song")
-        transport_lay.addWidget(self.btn_save_song)
-        transport_lay.addWidget(self.btn_load_song)
+        transport_row2.addWidget(self.btn_save_song)
+        transport_row2.addWidget(self.btn_load_song)
         self.btn_save_song.clicked.connect(self._pick_and_save_song)
         self.btn_load_song.clicked.connect(self._pick_and_load_song)
         seq_outer_lay.addWidget(transport_box)
@@ -4313,6 +4329,13 @@ class SynthGui(QWidget):
             combo.addItems(["Tri", "Sine", "Saw", "Sq", "Off"])
             combo.setCurrentIndex(4)  # Off by default (per-user request: all 16 LFOs start bypassed)
             combo.setStyleSheet("font-size: 10px;")
+            # QComboBox defaults to an Expanding horizontal size policy -- with 16 rows stacked in
+            # a scroll area whose own tab can be forced far wider than its own content needs (see
+            # the Transport toolbar's own comment on the Sequencer tab driving the whole window's
+            # minimum width), an unconstrained combo here eagerly claims that entire leftover
+            # width, stretching far past its text and shoving every dial after it away from its
+            # label. Same fix as the dest-assign combo below, which already had setFixedWidth.
+            combo.setFixedWidth(62)
             vis = WaveformVisualizer()
             self.lfo_visualizers.append(vis)
             lfo_row.addWidget(combo)
@@ -4357,6 +4380,7 @@ class SynthGui(QWidget):
             sync_div_combo = QComboBox()
             sync_div_combo.addItems(LFO_SYNC_DIVISION_LABELS)
             sync_div_combo.setStyleSheet("font-size: 10px;")
+            sync_div_combo.setFixedWidth(90)  # see the waveform combo's own comment on Expanding-policy bloat, above
             sync_div_combo.setToolTip("Tempo Sync: locks this LFO's rate to a note division of the current tempo instead of the Rate dial's own Hz value")
             sync_div_combo.currentIndexChanged.connect(lambda idx, d=dial: d.setEnabled(idx == 0))
             lfo_row.addWidget(sync_div_combo)
@@ -4383,6 +4407,7 @@ class SynthGui(QWidget):
             s_combo = QComboBox()
             s_combo.addItems(["Free", "Sync", "Whl"])
             s_combo.setStyleSheet("font-size: 10px;")
+            s_combo.setFixedWidth(65)  # see the waveform combo's own comment on Expanding-policy bloat, above
             lfo_row.addWidget(s_combo)
             self.lfo_sync_combos.append(s_combo)
 
