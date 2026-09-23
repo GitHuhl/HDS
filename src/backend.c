@@ -1215,6 +1215,14 @@ typedef struct {
     // still reconnects automatically if that same-named device is unplugged and replugged.
     char midi_device[AUDIO_DEVICE_NAME_LEN];
 
+    // A user-settable label purely for the Instance Switcher's own scan results (see
+    // ping_handler()/subscribe_handler() and README's own section on this) -- lets "port 9012" show
+    // up as "Track 3 Guitar Amp" instead. Session/rig identity, not patch content, so it's excluded
+    // from Program scope (_is_program_scope_address() in frontend.py) exactly like master_volume/
+    // transpose_semitones are -- loading a Program should never rename the instance it's loaded
+    // into. Empty by default; the frontend falls back to displaying host:port when empty.
+    char instance_name[AUDIO_DEVICE_NAME_LEN];
+
     // Full filesystem path (not an ALSA device name, hence the bigger buffer than
     // AUDIO_DEVICE_NAME_LEN) the recorder writes to on the next record_enable 0->1 transition.
     // The frontend regenerates this to a fresh timestamped filename in the chosen Recordings
@@ -5143,6 +5151,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_STRING("/hds/device/output", output_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/input", input_device, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/device/midi", midi_device, AUDIO_DEVICE_NAME_LEN),
+    OSC_STRING("/hds/instance_name", instance_name, AUDIO_DEVICE_NAME_LEN),
     OSC_STRING("/hds/record/path", record_path, RECORD_PATH_LEN),
 };
 #define OSC_PARAMS_COUNT (sizeof(OSC_PARAMS) / sizeof(OSC_PARAMS[0]))
@@ -5285,7 +5294,6 @@ static void osc_error_handler(int num, const char *msg, const char *path) {
 // zone_remove_handler's own registration style with &g_sample_engine/&p->sample_engine.
 typedef struct {
     const SynthSharedControls *knobs;
-    lo_address reply_addr;
 } HdsStateRequestContext;
 
 // osc_dispatch_table holds ~4100 concrete addresses -- sent as one giant bundle that would
@@ -5326,9 +5334,72 @@ static void send_full_state_dump(lo_address reply_addr, const SynthSharedControl
 }
 
 static int request_state_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
-    (void)path; (void)types; (void)argv; (void)argc; (void)msg;
+    (void)path; (void)types; (void)argv; (void)argc;
     HdsStateRequestContext *ctx = (HdsStateRequestContext *)user_data;
-    send_full_state_dump(ctx->reply_addr, ctx->knobs);
+    // Reply to whoever actually sent this request (lo_message_get_source), not ctx->reply_addr's
+    // own fixed, startup-configured target -- this is what lets a frontend pull an instance's full
+    // state regardless of whether it's the one --osc-reply-host/--osc-reply-port (or CLAP's own
+    // paired port) originally pointed at, e.g. the Instance Switcher scanning/connecting to a
+    // DIFFERENT already-running instance than whichever frontend it was launched alongside. The
+    // source address liblo hands back here is exactly the socket the request arrived FROM -- see
+    // frontend.py's own comment on sending this one message from status_sock directly, not the
+    // general osc_client, so that source is its real listening address, not an unrelated ephemeral
+    // send-only port nothing is listening on.
+    lo_address source = lo_message_get_source(msg);
+    send_full_state_dump(source, ctx->knobs);
+    return 0;
+}
+
+// --- Instance Switcher support: "/hds/ping" (discovery) and "/hds/subscribe" (redirect this
+// instance's own ongoing status pushes) --- see README's own "Instance Switcher" section for the
+// full design. Both are registered per-instance (not via the generic catch-all), same reasoning as
+// request_state above.
+
+// A frontend scanning for reachable instances blasts this at a candidate host:port list and
+// collects whoever answers within a short timeout -- "replied just now" IS the liveness proof,
+// no separate registry/heartbeat bookkeeping needed. Reply-to-sender (see request_state_handler's
+// own comment) -- frontend.py sends this from its own status_sock so the reply lands back at its
+// actual listening port, not an unrelated scan-only socket.
+static int ping_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)argv; (void)argc;
+    const SynthSharedControls *knobs = (const SynthSharedControls *)user_data;
+    lo_address source = lo_message_get_source(msg);
+    if (!source) return 0;
+    lo_send(source, "/hds/pong", "s", knobs->instance_name);
+    return 0;
+}
+
+// Redirects this instance's own ONGOING, unprompted status pushes (VU meter, tempo, recording
+// state -- send_osc_status()/send_seq_audio_status(), called every block from a fixed target) to
+// whoever most recently subscribed, instead of only ever the --osc-reply-host/--osc-reply-port (or
+// CLAP's own paired port) configured at startup. Unlike request_state/SMF import above, there's no
+// per-push incoming message to reply to for an unprompted push, so this one genuinely needs to
+// remember a target rather than resolve it fresh each time -- *target is repointed at a freshly
+// allocated, independent lo_address (lo_message_get_source()'s own return value is explicitly
+// documented as "do not free" and owned by msg, not safe to store past this handler returning) built
+// from the sender's own host/port, replacing (and freeing) whatever was targeted before. The LAST
+// instance to subscribe wins -- this engine only ever had one live status target to begin with, so
+// "switching which instance a frontend controls" and "taking over as the new status target" are the
+// same action, not two.
+typedef struct {
+    lo_address *target; // points at the actual variable send_osc_status()/send_seq_audio_status()
+                         // read from at their own call sites -- backend.c's main() passes &(a local
+                         // variable already in scope there); clap_plugin.c passes &p->osc_reply_addr
+                         // directly, its own per-instance field.
+} HdsSubscribeContext;
+
+static int subscribe_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)argv; (void)argc;
+    HdsSubscribeContext *ctx = (HdsSubscribeContext *)user_data;
+    lo_address source = lo_message_get_source(msg);
+    if (!source) return 0;
+    const char *host = lo_address_get_hostname(source);
+    const char *port = lo_address_get_port(source);
+    if (!host || !port) return 0;
+    lo_address new_target = lo_address_new(host, port);
+    if (!new_target) return 0;
+    if (*ctx->target) lo_address_free(*ctx->target);
+    *ctx->target = new_target;
     return 0;
 }
 
@@ -9346,14 +9417,13 @@ static bool hds_song_import_smf_track(HdsEngineState *engine, int lane_index, co
 
 typedef struct {
     HdsEngineState *engine;
-    lo_address reply_addr;
 } HdsSmfTrackImportContext;
 
 // Fired once, synchronously -- same posture as song_import_smf_handler() just below, which this
 // mirrors closely (a per-lane import instead of a whole-song one, no tempo/knobs argument since
 // this never touches any).
 static int song_import_smf_track_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
-    (void)path; (void)types; (void)msg;
+    (void)path; (void)types;
     HdsSmfTrackImportContext *ctx = (HdsSmfTrackImportContext *)user_data;
     if (argc != 2) return 0;
     const char *file_path = (const char *)&argv[0]->s;
@@ -9362,7 +9432,12 @@ static int song_import_smf_track_handler(const char *path, const char *types, lo
     if (!hds_song_import_smf_track(ctx->engine, lane_index, file_path, &result)) {
         fprintf(stderr, "[smf] track import of '%s' into lane %d failed: %s\n", file_path, lane_index, result.error);
     }
-    if (!ctx->reply_addr) return 0;
+    // Reply to the actual sender (see request_state_handler's own comment on why) rather than
+    // ctx->reply_addr's fixed startup target -- whichever frontend just asked for this import is
+    // the one that should hear back, not necessarily whoever --osc-reply-host/--osc-reply-port
+    // originally pointed at.
+    lo_address reply_addr = lo_message_get_source(msg);
+    if (!reply_addr) return 0;
     lo_bundle b = lo_bundle_new(LO_TT_IMMEDIATE);
     lo_message m;
     m = lo_message_new(); lo_message_add_float(m, result.ok ? 1.0f : 0.0f); lo_bundle_add_message(b, "/hds/status/smf_import_track/ok", m);
@@ -9370,7 +9445,7 @@ static int song_import_smf_track_handler(const char *path, const char *types, lo
     m = lo_message_new(); lo_message_add_float(m, (float)result.lane); lo_bundle_add_message(b, "/hds/status/smf_import_track/lane", m);
     m = lo_message_new(); lo_message_add_float(m, (float)result.note_count); lo_bundle_add_message(b, "/hds/status/smf_import_track/note_count", m);
     m = lo_message_new(); lo_message_add_float(m, (float)result.tracks_with_notes); lo_bundle_add_message(b, "/hds/status/smf_import_track/tracks_with_notes", m);
-    lo_send_bundle(ctx->reply_addr, b);
+    lo_send_bundle(reply_addr, b);
     lo_bundle_free_recursive(b);
     return 0;
 }
@@ -9378,7 +9453,6 @@ static int song_import_smf_track_handler(const char *path, const char *types, lo
 typedef struct {
     HdsEngineState *engine;
     SynthSharedControls *knobs;
-    lo_address reply_addr;
 } HdsSmfImportContext;
 
 // Fired once, synchronously, right from this handler (same "rare, discrete, user-initiated
@@ -9387,7 +9461,7 @@ typedef struct {
 // -- there's no periodic per-block status poll for this the way send_seq_audio_status has, since
 // an import is a one-shot event, not ongoing state.
 static int song_import_smf_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
-    (void)path; (void)types; (void)msg;
+    (void)path; (void)types;
     HdsSmfImportContext *ctx = (HdsSmfImportContext *)user_data;
     if (argc != 2) return 0;
     const char *file_path = (const char *)&argv[0]->s;
@@ -9396,7 +9470,9 @@ static int song_import_smf_handler(const char *path, const char *types, lo_arg *
     if (!hds_song_import_smf(ctx->engine, ctx->knobs, file_path, import_tempo, &result)) {
         fprintf(stderr, "[smf] import of '%s' failed: %s\n", file_path, result.error);
     }
-    if (!ctx->reply_addr) return 0;
+    // Reply to the actual sender -- see request_state_handler's own comment.
+    lo_address reply_addr = lo_message_get_source(msg);
+    if (!reply_addr) return 0;
     lo_bundle b = lo_bundle_new(LO_TT_IMMEDIATE);
     lo_message m;
     m = lo_message_new(); lo_message_add_float(m, result.ok ? 1.0f : 0.0f); lo_bundle_add_message(b, "/hds/status/smf_import/ok", m);
@@ -9429,7 +9505,7 @@ static int song_import_smf_handler(const char *path, const char *types, lo_arg *
             m = lo_message_new(); lo_message_add_float(m, prog->tempo_marker_bpm[i]); lo_bundle_add_message(b, addr, m);
         }
     }
-    lo_send_bundle(ctx->reply_addr, b);
+    lo_send_bundle(reply_addr, b);
     lo_bundle_free_recursive(b);
     return 0;
 }
@@ -12541,22 +12617,32 @@ int main(int argc, char **argv) {
     lo_address osc_reply_addr = lo_address_new(osc_reply_host, osc_reply_port_str);
     fprintf(stderr, "[osc] listening on UDP port %d, status replies to %s:%d\n", osc_listen_port, osc_reply_host, osc_reply_port);
 
-    // "/hds/request_state" -- registered here (not alongside the other methods above) since it
-    // needs osc_reply_addr, just resolved. state_request_ctx has this function's own full
-    // lifetime (never returns before shutdown), so a pointer to it stays valid for as long as
-    // osc_server itself does.
-    HdsStateRequestContext state_request_ctx = { &active_knobs, osc_reply_addr };
+    // "/hds/request_state" -- registered here (not alongside the other methods above) purely by
+    // convention grouping, not because it still needs osc_reply_addr: it (and the two SMF import
+    // handlers below) now reply directly to whoever sent the request (lo_message_get_source), not
+    // a fixed configured target -- see request_state_handler's own comment on why. state_request_ctx
+    // has this function's own full lifetime (never returns before shutdown), so a pointer to it
+    // stays valid for as long as osc_server itself does.
+    HdsStateRequestContext state_request_ctx = { &active_knobs };
     lo_server_add_method(osc_server, "/hds/request_state", "", request_state_handler, &state_request_ctx);
 
-    // "/hds/song/import_smf" -- same reason as request_state above: needs osc_reply_addr to
-    // report the import's result (lanes used, markers found, tempo applied) back to the frontend.
-    HdsSmfImportContext smf_import_ctx = { &g_engine, &active_knobs, osc_reply_addr };
+    // "/hds/song/import_smf" -- see request_state's own comment just above on reply-to-sender.
+    HdsSmfImportContext smf_import_ctx = { &g_engine, &active_knobs };
     lo_server_add_method(osc_server, "/hds/song/import_smf", "sf", song_import_smf_handler, &smf_import_ctx);
 
-    // "/hds/song/import_smf_track" -- per-lane "Load MIDI..." (Sequencer tab), same
-    // needs-osc_reply_addr reason as the two contexts just above.
-    HdsSmfTrackImportContext smf_import_track_ctx = { &g_engine, osc_reply_addr };
+    // "/hds/song/import_smf_track" -- per-lane "Load MIDI..." (Sequencer tab), same reply-to-sender
+    // reasoning as the two contexts just above.
+    HdsSmfTrackImportContext smf_import_track_ctx = { &g_engine };
     lo_server_add_method(osc_server, "/hds/song/import_smf_track", "sf", song_import_smf_track_handler, &smf_import_track_ctx);
+
+    // "/hds/ping" and "/hds/subscribe" -- Instance Switcher support, see ping_handler()/
+    // subscribe_handler()'s own comments. subscribe_ctx.target points directly at osc_reply_addr
+    // itself (declared just above, same function scope, same lifetime as osc_server) -- the exact
+    // variable send_osc_status()/send_seq_audio_status() already read from at their own call sites
+    // further down this loop, so subscribing needs no changes there at all.
+    lo_server_add_method(osc_server, "/hds/ping", "", ping_handler, &active_knobs);
+    HdsSubscribeContext subscribe_ctx = { &osc_reply_addr };
+    lo_server_add_method(osc_server, "/hds/subscribe", "", subscribe_handler, &subscribe_ctx);
 
     // The real catch-all, registered LAST -- see its own comment above (right after the
     // /hds/tuning/load_scl registration) for why registration order here is load-bearing.

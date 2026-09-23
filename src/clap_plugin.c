@@ -109,13 +109,18 @@ typedef struct {
 
     // "/hds/request_state" support -- see HdsStateRequestContext's own comment in backend.c. Lets
     // a frontend that just connected to THIS instance's OSC port pull its current live state
-    // instead of blindly pushing GUI defaults over a DAW-restored patch.
+    // instead of blindly pushing GUI defaults over a DAW-restored patch. Replies go directly to
+    // whoever asked (lo_message_get_source), not a stored address -- these context structs just
+    // carry what each handler needs to actually DO the request, not where to reply.
     HdsStateRequestContext state_request_ctx;
-    // "/hds/song/import_smf" support -- see HdsSmfImportContext's own comment in backend.c. Same
-    // "needs this instance's own osc_reply_addr" reason as state_request_ctx just above.
+    // "/hds/song/import_smf" support -- see HdsSmfImportContext's own comment in backend.c.
     HdsSmfImportContext smf_import_ctx;
-    // "/hds/song/import_smf_track" support (per-lane "Load MIDI...") -- same reason.
+    // "/hds/song/import_smf_track" support (per-lane "Load MIDI...").
     HdsSmfTrackImportContext smf_import_track_ctx;
+    // "/hds/subscribe" support (Instance Switcher) -- see HdsSubscribeContext/subscribe_handler's
+    // own comment in backend.c. target points directly at THIS instance's own osc_reply_addr field
+    // just above, which send_osc_status()/the status-push call site in process() already read from.
+    HdsSubscribeContext subscribe_ctx;
 } HdsClapPlugin;
 
 // ---------------------------------------------------------------------------------------------
@@ -757,19 +762,24 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         lo_server_add_method(p->osc_server, "/hds/zone/load_sfz", "iis", zone_load_sfz_handler, &p->sample_engine);
         char reply_port_str[16]; snprintf(reply_port_str, sizeof(reply_port_str), "%d", p->osc_reply_port);
         p->osc_reply_addr = lo_address_new(CLAP_OSC_REPLY_HOST, reply_port_str);
-        // Registered here rather than in the block above -- needs p->osc_reply_addr, just resolved
-        // on the previous line. state_request_ctx lives as long as this instance does, so the
-        // pointer handed to liblo stays valid for the plugin's whole lifetime.
+        // Registered here rather than in the block above, purely by grouping convention -- these
+        // three no longer need p->osc_reply_addr at all: they reply directly to whoever sent the
+        // request (lo_message_get_source), not a fixed configured target -- see
+        // request_state_handler's own comment in backend.c. state_request_ctx lives as long as
+        // this instance does, so the pointer handed to liblo stays valid for the plugin's whole
+        // lifetime.
         p->state_request_ctx.knobs = &p->knobs;
-        p->state_request_ctx.reply_addr = p->osc_reply_addr;
         lo_server_add_method(p->osc_server, "/hds/request_state", "", request_state_handler, &p->state_request_ctx);
         p->smf_import_ctx.engine = &p->engine;
         p->smf_import_ctx.knobs = &p->knobs;
-        p->smf_import_ctx.reply_addr = p->osc_reply_addr;
         lo_server_add_method(p->osc_server, "/hds/song/import_smf", "sf", song_import_smf_handler, &p->smf_import_ctx);
         p->smf_import_track_ctx.engine = &p->engine;
-        p->smf_import_track_ctx.reply_addr = p->osc_reply_addr;
         lo_server_add_method(p->osc_server, "/hds/song/import_smf_track", "sf", song_import_smf_track_handler, &p->smf_import_track_ctx);
+        // "/hds/ping"/"/hds/subscribe" -- Instance Switcher support, see their own handler
+        // comments in backend.c.
+        lo_server_add_method(p->osc_server, "/hds/ping", "", ping_handler, &p->knobs);
+        p->subscribe_ctx.target = &p->osc_reply_addr;
+        lo_server_add_method(p->osc_server, "/hds/subscribe", "", subscribe_handler, &p->subscribe_ctx);
         // Bug fix: this catch-all (NULL path, NULL types -- matches every address) used to be
         // registered FIRST, right after the three /hds/zone/* methods above. liblo tries a
         // message's matching methods in REGISTRATION ORDER and stops at the first one that

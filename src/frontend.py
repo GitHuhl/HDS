@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QGroupBox, QRadioButton, QTabWidget,
                              QSlider, QPushButton, QProgressBar, QSpinBox, QDoubleSpinBox, QLineEdit, QCheckBox,
                              QScrollArea, QMenu, QInputDialog, QFileDialog, QGridLayout, QMessageBox,
-                             QListWidget, QListWidgetItem)
+                             QListWidget, QListWidgetItem, QDialog)
 from PySide6.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QWheelEvent, QCursor, QAction, QFont
 from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, Signal
 
@@ -2515,6 +2515,30 @@ class SynthGui(QWidget):
 
         global_layout.addWidget(prog_box)
         global_layout.addSpacing(4)
+
+        # Instance Switcher: which running HDS instance (standalone or CLAP-hosted, local or on
+        # the network) THIS window is currently controlling -- session identity, lives in the
+        # always-visible sidebar for the same reason Program does (relevant no matter which tab is
+        # open), not buried in a tab of its own. See _open_instance_switcher_dialog()/
+        # _scan_for_instances()/_switch_to_instance()'s own comments for the full design.
+        instance_box = QGroupBox("")
+        instance_lay = QHBoxLayout(); instance_lay.setContentsMargins(2, 2, 2, 2); instance_lay.setSpacing(4)
+        instance_lay.addWidget(QLabel("<b>Instance</b>"))
+        self.instance_label = QLabel(f"{OSC_HOST}:{OSC_SEND_PORT}")
+        self.instance_label.setStyleSheet("color: #00adb5; font-size: 10px;")
+        instance_lay.addWidget(self.instance_label, 1)
+        self.btn_switch_instance = QPushButton("Switch...")
+        self.btn_switch_instance.setFixedSize(60, 22)
+        self.btn_switch_instance.setStyleSheet("font-size: 9px;")
+        self.btn_switch_instance.setToolTip(
+            "Scan for other running HDS instances (standalone or CLAP-hosted, local or on the\n"
+            "network) and switch this window to controlling a different one -- no relaunch needed."
+        )
+        instance_lay.addWidget(self.btn_switch_instance)
+        instance_box.setLayout(instance_lay)
+        global_layout.addWidget(instance_box)
+        global_layout.addSpacing(4)
+
         self.poly_radio = QRadioButton("Poly")
         self.poly_radio.setChecked(True)
         self.mono_radio = QRadioButton("Mono Legato")
@@ -6264,13 +6288,30 @@ class SynthGui(QWidget):
     HDS_STATE_RESTORE_RETRY_COUNT = 3
     HDS_STATE_RESTORE_RETRY_INTERVAL_MS = 400
 
-    def _send_request_state(self):
-        if self.osc_client is None:
-            return
-        request_msg = OscMessageBuilder(address="/hds/request_state")
+    def _send_from_status_sock(self, address, target=None):
+        """Sends a bare (no-argument) OSC message directly from status_sock's own bound socket,
+        rather than through the general osc_client -- so the backend's reply-to-sender
+        (lo_message_get_source(), see request_state_handler/ping_handler/subscribe_handler's own
+        comments in backend.c) resolves to status_sock's REAL listening address, not an unrelated
+        ephemeral send-only port nothing is listening on. osc_client is a separate socket entirely
+        (python-osc's SimpleUDPClient opens its own) -- sending /hds/request_state or
+        /hds/subscribe through it would have the backend replying to a port this GUI never reads
+        from. `target` defaults to (self._target_host, self._target_port) -- the Instance
+        Switcher's own idea of "where am I currently pointed" (see connect_to_backend()) -- and is
+        only overridden by _scan_for_instances() sending a one-off /hds/ping to a candidate that
+        isn't (yet, or ever) the current target."""
+        if self.status_sock is None:
+            return False
+        dest = target if target is not None else (self._target_host, self._target_port)
+        msg = OscMessageBuilder(address=address).build()
         try:
-            self.osc_client.send(request_msg.build())
+            self.status_sock.sendto(msg.dgram, dest)
         except OSError:
+            return False
+        return True
+
+    def _send_request_state(self):
+        if not self._send_from_status_sock("/hds/request_state"):
             return
         self._begin_state_restore_guard()
         self._state_restore_retries_sent = 0
@@ -6288,15 +6329,174 @@ class SynthGui(QWidget):
             return
         if time.monotonic() - self._state_restore_last_send_time < self.HDS_STATE_RESTORE_RETRY_INTERVAL_MS / 1000.0:
             return
-        if self.osc_client is None:
-            return
-        request_msg = OscMessageBuilder(address="/hds/request_state")
-        try:
-            self.osc_client.send(request_msg.build())
-        except OSError:
+        if not self._send_from_status_sock("/hds/request_state"):
             return
         self._state_restore_retries_sent += 1
         self._state_restore_last_send_time = time.monotonic()
+
+    def _send_subscribe(self):
+        """Tells the CURRENT target to redirect its own ongoing status pushes (VU/tempo/recording
+        state) to status_sock -- see subscribe_handler's own comment in backend.c on why this is a
+        separate message from _send_request_state() (an unprompted, ongoing push has no per-push
+        incoming message to reply to, so the backend must be told once, explicitly, where to keep
+        sending future ones -- request_state's own reply-to-sender trick alone doesn't cover that).
+        Called once after every _switch_to_instance() (and once at initial connect, so even a
+        plain CLI-launched session -- never touching the switcher -- ends up on the exact same,
+        simplest code path as a switched one)."""
+        self._send_from_status_sock("/hds/subscribe")
+
+    # Candidate listen ports to scan: 9000 (the standalone app's own default --osc-listen-port)
+    # plus CLAP's own documented sequential paired-port range (9010, 9012, ... -- see
+    # CLAP_OSC_LISTEN_PORT_BASE in clap_plugin.c), enough for 20 simultaneous CLAP instances in one
+    # host. A custom --osc-listen-port on a standalone instance won't be found by a blind scan --
+    # the Remote host field's own scan still reaches it if you know where to point it, same as
+    # today's --osc-listen-port flag already requires knowing the number.
+    _SCAN_CANDIDATE_PORTS = [9000] + list(range(9010, 9050, 2))
+
+    def _scan_for_instances(self, remote_host=""):
+        """Blasts /hds/ping (see ping_handler's own comment in backend.c) at every candidate
+        port on 127.0.0.1 (always -- covers same-machine CLAP-in-a-DAW and standalone alike, CLAP
+        vs. standalone makes no difference here, both are just an OSC server on a port), a LAN
+        broadcast pass on the same ports (best-effort -- reaches a standalone instance on another
+        machine on the same subnet without needing its exact IP; silently a no-op wherever the
+        network/OS doesn't allow it, e.g. inside a container or behind a router that blocks
+        broadcast -- never the ONLY path), and remote_host if one was given (for a machine outside
+        local broadcast reach -- a different subnet, a VPN, whatever). Collects whoever answers
+        /hds/pong within a short window -- "replied just now" IS the liveness proof, no separate
+        registry/heartbeat bookkeeping needed. Returns a list of (host, port, instance_name)
+        sorted by (host, port); instance_name is "" if that instance never set one."""
+        targets = [("127.0.0.1", p) for p in self._SCAN_CANDIDATE_PORTS]
+        if remote_host:
+            targets += [(remote_host, p) for p in self._SCAN_CANDIDATE_PORTS]
+
+        scan_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        scan_sock.setblocking(False)
+        try:
+            scan_sock.bind(("0.0.0.0", 0))
+        except OSError:
+            return []
+        try:
+            scan_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except OSError:
+            pass  # broadcast pass below just silently sends nothing useful if this failed
+
+        ping_dgram = OscMessageBuilder(address="/hds/ping").build().dgram
+        for host, port in targets:
+            try: scan_sock.sendto(ping_dgram, (host, port))
+            except OSError: pass
+        for port in self._SCAN_CANDIDATE_PORTS:
+            try: scan_sock.sendto(ping_dgram, ("255.255.255.255", port))
+            except OSError: pass
+
+        found = {}  # (host, port) -> instance_name, naturally de-dupes a unicast+broadcast double-reply
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            try:
+                dgram, addr = scan_sock.recvfrom(4096)
+            except BlockingIOError:
+                time.sleep(0.01)
+                continue
+            except OSError:
+                break
+            try:
+                packet = OscPacket(dgram)
+            except OscParseError:
+                continue
+            for timed_msg in packet.messages:
+                msg = timed_msg.message
+                if msg.address == "/hds/pong":
+                    found[addr] = msg.params[0] if msg.params else ""
+        scan_sock.close()
+        return [(host, port, name) for (host, port), name in sorted(found.items())]
+
+    def _switch_to_instance(self, host, port, name=""):
+        """Retargets this whole GUI at a different running HDS instance -- standalone or CLAP,
+        local or on the network, no relaunch needed. Rebinds status_sock to a FRESH ephemeral local
+        port (not whichever one it already had) before subscribing: there's no unsubscribe message,
+        so whatever instance was targeted before simply keeps pushing status to its last-known
+        port forever -- fine as long as that's now an abandoned, unbound port the OS silently drops
+        packets to, rather than the SAME port a newly-subscribed instance's own pushes would land
+        on and interleave with (the exact "two sources writing one shared buffer" corruption class
+        the retry-timer fix earlier in this file's history already had to solve once). Then
+        subscribes the new target and pulls its full state immediately via the ordinary
+        _send_request_state() every connect already uses -- "instantly adapting to the target's
+        real state" comes for free from code that already exists and is already proven, not new
+        machinery built for this."""
+        if self.status_sock is not None:
+            try: self.status_sock.close()
+            except OSError: pass
+        new_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        new_sock.setblocking(False)
+        try:
+            new_sock.bind((OSC_BIND_HOST, 0))
+        except OSError as e:
+            print(f"--- could not bind a fresh status socket for instance switch: {e} ---")
+            self.status_sock = None
+            return
+        self.status_sock = new_sock
+        self._target_host = host
+        self._target_port = port
+        self.osc_client = SimpleUDPClient(host, port)
+        self.instance_label.setText(f"{name} ({host}:{port})" if name else f"{host}:{port}")
+        self._send_subscribe()
+        self._send_request_state()
+
+    def _open_instance_switcher_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Instance Switcher")
+        dlg.setMinimumWidth(380)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(f"Currently controlling: {self.instance_label.text()}"))
+
+        remote_row = QHBoxLayout()
+        remote_row.addWidget(QLabel("Remote host:"))
+        remote_field = QLineEdit()
+        remote_field.setPlaceholderText("optional -- e.g. 192.168.1.42 (blank = this machine + LAN broadcast)")
+        remote_row.addWidget(remote_field)
+        lay.addLayout(remote_row)
+
+        result_list = QListWidget()
+        lay.addWidget(result_list)
+
+        status_label = QLabel("")
+        status_label.setStyleSheet("color: #888;")
+        lay.addWidget(status_label)
+
+        btn_row = QHBoxLayout()
+        scan_btn = QPushButton("Scan")
+        connect_btn = QPushButton("Connect")
+        connect_btn.setEnabled(False)
+        btn_row.addWidget(scan_btn); btn_row.addWidget(connect_btn)
+        lay.addLayout(btn_row)
+
+        found = []  # kept in sync with result_list's own row order
+
+        def do_scan():
+            result_list.clear()
+            connect_btn.setEnabled(False)
+            status_label.setText("Scanning...")
+            QApplication.processEvents()  # paint "Scanning..." before the blocking ~0.5s scan window
+            found[:] = self._scan_for_instances(remote_field.text().strip())
+            for scan_host, scan_port, scan_name in found:
+                label = f"{scan_name} ({scan_host}:{scan_port})" if scan_name else f"{scan_host}:{scan_port}"
+                result_list.addItem(label)
+            status_label.setText(f"Found {len(found)} instance(s)." if found else "No instances found.")
+
+        def do_connect():
+            row = result_list.currentRow()
+            if not (0 <= row < len(found)):
+                return
+            connect_host, connect_port, connect_name = found[row]
+            self._switch_to_instance(connect_host, connect_port, connect_name)
+            dlg.accept()
+
+        result_list.currentRowChanged.connect(lambda r: connect_btn.setEnabled(0 <= r < len(found)))
+        result_list.itemDoubleClicked.connect(lambda _item: do_connect())
+        scan_btn.clicked.connect(do_scan)
+        connect_btn.clicked.connect(do_connect)
+
+        do_scan()
+        dlg.exec()
 
     def _apply_full_state_fields(self, fields):
         """Applies a /hds/request_state reply (see listen_for_status_frames()'s sentinel
@@ -7395,6 +7595,13 @@ class SynthGui(QWidget):
         # (/hds/zone/upsert, /hds/zone/remove) now -- the backend's OSC listener has a single
         # port for everything, so the old second socket is gone.
         self.osc_client = SimpleUDPClient(OSC_HOST, OSC_SEND_PORT)
+        # The Instance Switcher's own idea of "where am I currently pointed" -- starts out matching
+        # the CLI-flag defaults above, updated in place by _switch_to_instance() (see that method's
+        # own comment) without needing to reconstruct osc_client from scratch at every call site
+        # that needs to know the current target, e.g. _send_request_state()/_send_subscribe()
+        # sending directly from status_sock rather than through osc_client.
+        self._target_host = OSC_HOST
+        self._target_port = OSC_SEND_PORT
 
         self.status_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.status_sock.setblocking(False)
@@ -8151,6 +8358,9 @@ def runtime_connect_and_bind(gui):
     gui.btn_prev_prog.clicked.connect(lambda: gui._cycle_program(-1))
     gui.btn_next_prog.clicked.connect(lambda: gui._cycle_program(1))
 
+    # Instance Switcher
+    gui.btn_switch_instance.clicked.connect(gui._open_instance_switcher_dialog)
+
     # Core global mode switches
     gui.poly_radio.toggled.connect(gui.transmit_knob_packet)
     gui.mono_radio.toggled.connect(gui.transmit_knob_packet)
@@ -8393,6 +8603,11 @@ def runtime_connect_and_bind(gui):
         # few sequenced follow-up resends to close the activate()/state.load() ordering race
         # covered in that method's own comment, without ever risking two overlapping dumps.
         gui._send_request_state()
+        # Also subscribe at plain startup, not just after an Instance Switcher connect -- so a
+        # vanilla CLI launch that never touches the switcher still ends up on the exact same code
+        # path (the backend always has SOME status target, subscribed or CLI-flag-default, and
+        # never needs to special-case "has anyone subscribed yet").
+        gui._send_subscribe()
 
 
 if __name__ == "__main__":

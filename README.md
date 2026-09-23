@@ -1278,6 +1278,58 @@ failure -- an immediate post-connect knob touch, with zero artificial
 delay -- both before this fix (a full default-laden packet went out) and
 after (nothing goes out until the real state has actually landed).
 
+#### Instance Switcher
+
+Running several instances at once (HDS on multiple DAW tracks, or a mix
+of CLAP instances and a standalone `synth_engine`) used to mean one
+`frontend.py --osc-listen-port N --osc-reply-port N+1` per instance, each
+its own window, launched by hand once you'd found the right port pair in
+the host's log. The sidebar's **Instance** box replaces that with a
+**Switch...** button: it scans for every reachable HDS instance (CLAP or
+standalone, local or on the network -- the protocol is identical either
+way, so discovery doesn't need to know or care which kind it found) and
+lets you retarget the SAME window at a different one instantly, no
+relaunch, no manually working out port numbers.
+
+**Discovery** sends `/hds/ping` (an addition with no other purpose) to
+127.0.0.1 across the standalone default port plus CLAP's own documented
+sequential range, to a LAN broadcast address on the same ports
+(best-effort -- works within one broadcast domain, silently does nothing
+wherever the network/OS blocks it, e.g. inside a container; never the
+only path), and to an optional manually-entered remote host (for a
+machine outside broadcast reach -- a different subnet, a VPN). Whoever
+replies with `/hds/pong` within half a second is genuinely alive right
+now -- "replied just now" IS the liveness check, no separate registry or
+heartbeat bookkeeping to keep consistent. Each instance can be given its
+own name (`/hds/instance_name`, a plain settable field excluded from
+Program scope like Master Volume/Transpose -- loading a Program never
+renames the track it's on) so the scan list shows "Track 3 Guitar Amp"
+instead of a bare port number.
+
+**Switching** rebinds the frontend's own status-listening socket to a
+fresh local port, points it at the new instance, sends `/hds/subscribe`
+(tells that instance to redirect its own ongoing VU/tempo/recording-state
+pushes here), and immediately pulls its complete live state via the
+existing `/hds/request_state` mechanism above -- so the GUI instantly
+shows the new instance's real state, not stale leftovers from whichever
+one it was just looking at. This needed one real protocol change:
+`request_state_handler` and the two SMF import handlers used to always
+reply to whatever `--osc-reply-host`/`--osc-reply-port` (or CLAP's own
+paired port) was configured at startup; they now reply to whoever
+actually sent the request (liblo's `lo_message_get_source()`), so a
+frontend that scanned its way to a completely different instance than
+whichever one it originally launched alongside still gets its replies
+routed back correctly. The periodic, unprompted status pushes are
+different -- there's no incoming message to reply to for those, so
+`/hds/subscribe` is what tells an instance where to keep sending them;
+the last frontend to subscribe wins (this engine only ever had one live
+status target to begin with, so "switch which instance I'm watching" and
+"become the new status target" are the same action). An old, no-longer-
+subscribed instance simply keeps pushing to its last-known port forever
+with nothing listening there -- the OS silently drops those packets, and
+the fresh-port-per-switch design means that can never collide with a
+newly-subscribed instance's own pushes landing on the exact same socket.
+
 ### `/hds/request_state` never actually worked -- not a race, dead on arrival every time
 
 Every fix above (the Sequencer/Combi/FX-routing/tempo/tuning restore gaps,
