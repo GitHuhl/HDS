@@ -839,6 +839,30 @@ FX_TYPE_METADATA += [
         {"label": "Input Gain", "range": (0, 100), "default": 0},   # 0..+24dB
         {"label": "Release", "range": (0, 100), "default": 20},     # 10..500ms
     ]},
+    {"name": "HT76", "params": [
+        # Ported from fetcomp-dsp (github.com/Paulllux/fetcomp-dsp, MIT license), the DSP behind
+        # the HT-76/FetComp plugin -- a circuit-derived model of the UREI 1176LN FET limiting
+        # amplifier. See FX_TYPE_HT76's own (long) comment in backend.c for exactly what's kept
+        # faithful from the original circuit-derived model and what's simplified off its JUCE
+        # dependency. The hardware has no separate Threshold -- Input drives INTO a fixed one, so
+        # input level, gain reduction and distortion are genuinely inseparable here, same as there.
+        {"label": "Input", "range": (0, 100), "default": 55},      # -20..+40dB
+        {"label": "Output", "range": (0, 100), "default": 50},     # -20..+20dB
+        {"label": "Ratio", "type": "choice",
+         "options": ["4:1", "8:1", "12:1", "20:1", "All"], "default": 0},
+        {"label": "Attack", "range": (0, 100), "default": 30},     # 20..800us
+        {"label": "Release", "range": (0, 100), "default": 30},    # 50..1100ms
+        # The real unit's Attack knob has an OFF detent past its slowest setting: the cell stays
+        # open (no gain reduction) but signal still runs the whole Class A/transformer path, so
+        # the coloration stays without any compression -- a genuine "color box" use of the circuit.
+        {"label": "Limiting", "type": "choice", "options": ["Limit", "Character Only"], "default": 0},
+        # LN linearisation network feedback fraction. 0.5 exactly cancels the gain cell's own 2nd
+        # harmonic (quietest/cleanest); 0.0 is the earlier, dirtier Rev A response. Real units sit
+        # NEAR 0.5 but never exactly on it -- 0.47 (this default) is a plausible matched-pair
+        # residual.
+        {"label": "Character", "range": (0, 100), "default": 94},  # 0..0.5
+        {"label": "Iron", "range": (0, 100), "default": 100},      # 0..1, Class A/transformer drive
+    ]},
 ]
 
 # Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --

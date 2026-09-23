@@ -538,6 +538,28 @@ typedef struct {
 // that's the one thing that actually makes this "brick wall" (a slower attack would let a fast
 // transient through above Ceiling before the gain reduction catches up).
 #define FX_TYPE_LIMITER 13
+// Ported from fetcomp-dsp (github.com/Paulllux/fetcomp-dsp, MIT license) -- the DSP behind the
+// HT-76/FetComp plugin, a circuit-derived model of the UREI 1176LN FET limiting amplifier: a
+// voltage-divider gain cell (a JFET solved via a closed-form quadratic every sample, the same
+// equation the real Rev D schematic's own gain-reduction stage implies), a diode detector/two-node
+// timing network feeding it back (the sidechain taps AFTER the cell, closing the loop the way the
+// real unit does -- see run_fx_ht76()'s own comment for exactly what's ported faithfully and what's
+// simplified off the original's JUCE dependency). param[0] Input (-20..+40dB -- the hardware has no
+// separate Threshold; you drive INTO a fixed one with this knob, which is genuinely how the real
+// 1176 works and why input level/gain-reduction/distortion are inseparable here, same as there),
+// param[1] Output (-20..+20dB, makeup gain after the cell), param[2] Ratio (choice: 4:1/8:1/12:1/
+// 20:1/All -- All shorts every ratio position's own resistor tap in parallel, the real unit's own
+// "all buttons in" trick, steepest slope and lowest threshold of the five), param[3] Attack
+// (20..800us), param[4] Release (50..1100ms), param[5] Limiting (choice: Limit/Character Only --
+// the real unit's Attack knob has an OFF detent past its slowest setting where "signal is passing
+// through the circuitry but with a compression ratio of 1:1" -- all the gain-cell/Class-A/
+// transformer coloration, none of the gain reduction), param[6] Character (0..0.5 -- the LN
+// linearisation network's feedback fraction; 0.5 exactly cancels the cell's own 2nd harmonic, 0.0 is
+// the earlier, dirtier Rev A response with the full harmonic present), param[7] Iron (0..1 -- how
+// hard the Class A line amp and output transformer are driven; 0 takes both out of the signal path
+// entirely, leaving just the bare gain cell). No separate Mix param -- the slot's own generic Mix
+// knob already does that job, same convention as Density3/EQ3 above.
+#define FX_TYPE_HT76 14
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -3797,6 +3819,386 @@ static void run_fx_limiter(FXSlotEngine *engine, const FXSlotParams *params, flo
     *r = sr;
 }
 
+// --- FX_TYPE_HT76: ported from fetcomp-dsp (github.com/Paulllux/fetcomp-dsp, MIT license) --- see
+// FX_TYPE_HT76's own comment above for the param map. This is a genuinely large port (a real
+// circuit-derived model, not a simple filter), so this comment records exactly what's kept
+// faithful and what's deliberately changed from the original FetLimiterDsp.h:
+//
+// KEPT FAITHFUL: the gain-cell quadratic solve, the diode detector law, the two-node attack/
+// release timing network (including its log/pow-domain calibration curves -- these fit the real
+// measured behavior of the timing network itself, not a physical-potentiometer's rotation feel,
+// so they apply just as much to a plain 0-100 dial as to the original's own knob), the ratio bank's
+// per-position drive/bias constants, the Class A tanh output stage, and the full Jiles-Atherton
+// hysteresis transformer model (including the langevinPair() precision workaround -- that's a
+// property of the ANALYTIC FORMULA's own catastrophic cancellation near zero, true regardless of
+// which tanh implementation computes it).
+//
+// DELIBERATELY CHANGED:
+//   1. juce::jmin/jmax/jlimit/jmap -> fminf/fmaxf; juce::Decibels -> powf(10,db/20); JUCE is gone
+//      entirely -- this whole port exists because the original needs it only for these utilities,
+//      a buffer wrapper, and the oversampler below, none of which need a whole framework.
+//   2. The original's own "fast" tanh/exp2 polynomial approximations (dsp_math::fastTanh/fastExp2)
+//      are replaced with real libm tanhf/expf. Strictly more accurate, and it removes the
+//      overflow-to-NaN failure mode the original's own RailVolts clamp comment describes guarding
+//      against (a real tanhf saturates cleanly at +/-1 for a large argument; it cannot overflow).
+//   3. Oversampling: the original runs a runtime-switchable JUCE polyphase halfband IIR oversampler
+//      (1x/2x/4x). This port fixes a single 2x factor using one RBJ-cookbook Butterworth lowpass
+//      biquad on the way up (zero-stuff + filter + 2x gain) and a matching one on the way down
+//      (filter + decimate) -- see run_fx_ht76() itself. Less stopband rejection than a real
+//      polyphase halfband, but self-contained in ~10 lines against this file's own existing
+//      biquad runner, and more than enough to tame the aliasing a 20us attack's control-signal
+//      energy would otherwise fold back into the audible band.
+//   4. txModel/relModel are fixed at the original author's own "verdict Aug 2026" shipping
+//      defaults (physics-corrected iron, the fitted two-node release network) rather than exposed
+//      as runtime-switchable bench A/B toggles -- those exist upstream for the *author's own*
+//      shipped-vs-experimental comparison, not as a user-facing control. Likewise DiodeKneeV stays
+//      at its own shipping default of 0 (the "exact comparator law" -- the original's own comments
+//      mark the nonzero logistic-gate alternative "bench experiments ONLY: three formulations all
+//      measured worse than the UAD"), which drops the softplus/logistic discharge-gate branch
+//      entirely -- dead code at that default in the original too.
+//   5. idss/pinchOffV ("selected-part latitude", i.e. simulating a hand-picked FET) stay fixed at
+//      the original's own "typical small-signal n-JFET" defaults rather than exposed as user
+//      params -- a real per-unit trimming knob, not something a software knob should expose.
+//   6. No internal Mix/parallel-blend param -- the slot's own generic Mix knob already does that
+//      job, same convention as every other ported effect in this file.
+//
+// The gain cell's own detector/control-voltage loop is SHARED between L/R (one envelope, driven by
+// max(|L|,|R|)), exactly like the original -- an independent envelope per channel would let the
+// louder channel duck the quieter one out from under it and the stereo image would wander with the
+// programme material, which is precisely why the real hardware's own stereo-link mode exists.
+typedef struct { float h, m, lp; } Ht76TxState;
+typedef struct { float z; } Ht76HpState;
+
+typedef struct {
+    // Fixed coefficients, computed once when this slot's engine first activates. Fixed because
+    // idss/pinchOffV/txModel/relModel/DiodeKneeV are all fixed choices (see this effect's own
+    // top-of-section comment) -- none of these ever change again for the life of this state.
+    float hp_g;                                    // DC-blocking highpass (TPT one-pole)
+    float two_beta;                                 // JFET transconductance-derived constant
+    float class_a_bias_out;                         // tanh(ClassABias), Class A's DC-cancel term
+    float tx_decay, tx_leak_coef, tx_src_b, tx_b_trim;
+    float tx_a, tx_c, tx_alpha, tx_core_asym, tx_k;
+    float inv_tx_a, one_minus_c, one_minus_ck, c_alpha;
+    float rel_couple_a, rel_charge_b;                // two-node release network coupling (fixed)
+    EqBiquadCoeffs os_coeffs;                        // shared 2x oversampling lowpass (see above)
+    float smooth_coef;                               // input/output gain smoothing, at 2x rate
+
+    // Live state, updated every (oversampled) sample.
+    float env, env_res, env_discharge_gate, ctrl_volts; // SHARED across L/R -- see this section's
+                                                         // own top comment
+    Ht76TxState tx[2];                               // per-channel output transformer state
+    Ht76HpState hp[2];                                // per-channel DC-blocking highpass state
+    float os_up_z1[2], os_up_z2[2];                   // per-channel 2x-upsample filter state
+    float os_down_z1[2], os_down_z2[2];               // per-channel 2x-downsample filter state
+    float smoothed_in, smoothed_out;                  // ramped input/output gain (linear)
+} FxHt76State;
+
+#define HT76_R5 27000.0f               // gain-cell series resistor, from the Rev D drawing
+#define HT76_CELL_VOLTS_PER_UNIT 0.03f // 0dBFS -> volts at the FET (keeps the cell in its linear region)
+#define HT76_INV_CELL_VOLTS (1.0f / HT76_CELL_VOLTS_PER_UNIT)
+#define HT76_RAIL_VOLTS 40.0f          // the Class A stage cannot swing past its own supply rails
+#define HT76_CLASS_A_BIAS (-0.18f)
+#define HT76_MAX_ENVELOPE 4.0f
+#define HT76_MAX_CTRL_VOLTS 2.0f
+#define HT76_DETECTOR_INV_VT 180.0f
+#define HT76_DETECTOR_K 0.10f
+
+static void compute_ht76_os_lowpass_coeffs(EqBiquadCoeffs *c, float os_rate) {
+    const float freq = 21000.0f, q = 0.70710678f; // Butterworth Q, cutoff just under the base
+                                                   // Nyquist -- see this effect's own comment on
+                                                   // why this replaces the original's polyphase
+                                                   // halfband oversampler
+    const float w0 = 2.0f * (float)M_PI * freq / os_rate;
+    const float alpha = sinf(w0) / (2.0f * q);
+    const float cosw0 = cosf(w0);
+    const float a0 = 1.0f + alpha;
+    c->b0 = ((1.0f - cosw0) * 0.5f) / a0;
+    c->b1 = (1.0f - cosw0) / a0;
+    c->b2 = c->b0;
+    c->a1 = (-2.0f * cosw0) / a0;
+    c->a2 = (1.0f - alpha) / a0;
+}
+
+static void ht76_init(FxHt76State *st) {
+    const double os_rate = (double)SAMPLE_RATE * 2.0;
+
+    const double g = tan(M_PI * 8.0 / fmax(1.0, os_rate)); // CouplingHz = 8Hz
+    st->hp_g = (float)(g / (1.0 + g));
+
+    const float idss = 0.010f, pinch_off_v = -3.0f; // "typical small-signal n-JFET" (see comment)
+    const float beta = idss / (pinch_off_v * pinch_off_v);
+    st->two_beta = 2.0f * beta;
+
+    st->class_a_bias_out = tanhf(HT76_CLASS_A_BIAS);
+
+    const double w_lf = 2.0 * M_PI * 3.0 / fmax(1.0, os_rate); // TxLowCornerHz = 3Hz
+    st->tx_decay = (float)(1.0 - w_lf);
+    st->tx_leak_coef = (float)(1.0 - exp(-2.0 * M_PI * 32000.0 / fmax(1.0, os_rate))); // TxLeakageHz
+    st->tx_src_b = 0.5f;  // TxSrcB
+    st->tx_b_trim = 1.95f; // TxBTrim
+
+    st->tx_a = 0.063f;       // TxCoreA
+    st->tx_c = 0.17f;        // TxCoreC
+    st->tx_alpha = 0.0016f;  // TxCoreAlpha
+    st->tx_core_asym = 0.3f; // TxAsymB (physics-corrected iron model, always used -- see comment)
+    st->tx_k = 0.040f;       // TxCoreK * TxKScaleB
+
+    st->inv_tx_a = 1.0f / st->tx_a;
+    st->one_minus_c = 1.0f - st->tx_c;
+    st->one_minus_ck = st->one_minus_c * st->tx_k;
+    st->c_alpha = st->tx_c * st->tx_alpha;
+
+    st->rel_couple_a = (float)(1.0 - exp(-1.0 / (0.160 * os_rate))); // RelCoupleTauMs = 160ms
+    st->rel_charge_b = st->rel_couple_a; // RelCapRatio = 1.0 -- both nodes share one time constant
+
+    compute_ht76_os_lowpass_coeffs(&st->os_coeffs, (float)os_rate);
+    st->smooth_coef = (float)(1.0 - exp(-1.0 / (0.02 * os_rate))); // GainSmoothingSeconds = 20ms
+
+    st->smoothed_in = -1.0f; // sentinel: primed to the first target value on the very first call
+}
+
+static inline float ht76_highpass(float x, Ht76HpState *s, float g) {
+    const float v = (x - s->z) * g;
+    const float lp = v + s->z;
+    s->z = lp + v;
+    if (!isfinite(s->z)) s->z = 0.0f;
+    return x - lp;
+}
+
+// The closed-form divider solution (see FX_TYPE_HT76's own comment for the circuit derivation):
+//     R5*k*v^2 + (1 + R5*G0)*v - x = 0
+static inline float ht76_solve_cell(float x, float G0, float k) {
+    const float b = 1.0f + HT76_R5 * G0;
+    if (fabsf(k) < 1.0e-12f) return x / fmaxf(1.0e-6f, b);
+    const float a = HT76_R5 * k;
+    const float disc = b * b + 4.0f * a * x;
+    if (disc <= 0.0f) return -b / (2.0f * a);
+    return (-b + sqrtf(disc)) / (2.0f * a);
+}
+
+static inline float ht76_class_a(float x, float drive, float bias_out, float norm) {
+    const float xc = fmaxf(-HT76_RAIL_VOLTS, fminf(HT76_RAIL_VOLTS, x));
+    return (tanhf(drive * xc + HT76_CLASS_A_BIAS) - bias_out) * norm;
+}
+
+// Langevin function and its derivative. The |x|>0.5 threshold (rather than the ~1e-4 the
+// literature quotes) is load-bearing precision: at a much smaller x, 1/x^2 and coth^2(x) are both
+// huge and nearly equal, and subtracting them in float loses almost everything to cancellation --
+// a property of this ANALYTIC FORMULA, true no matter which tanh implementation computes coth.
+static inline void ht76_langevin_pair(float x, float *L, float *Lp) {
+    if (fabsf(x) > 0.5f) {
+        const float ct = 1.0f / tanhf(x);
+        *L = ct - 1.0f / x;
+        *Lp = 1.0f / (x * x) - ct * ct + 1.0f;
+        return;
+    }
+    const float x2 = x * x;
+    *L = x * (1.0f / 3.0f - x2 * (1.0f / 45.0f - x2 * (2.0f / 945.0f)));
+    *Lp = 1.0f / 3.0f - x2 * (1.0f / 15.0f - x2 * (2.0f / 189.0f));
+}
+
+// The Jiles-Atherton ODE (returns dM/dH_dot -- multiply by Hdot for dM/dt). Hysteresis is what
+// gives the transformer stage real loop area/remanence; the core asymmetry term (txCoreAsym) is
+// the only source of even harmonics here, modeling the single-ended Class A stage ahead of it
+// biasing the core off-center.
+static inline float ht76_jiles_atherton_slope(const FxHt76State *st, float M, float H, float Hdot) {
+    const float qRaw = (H + st->tx_alpha * M) * st->inv_tx_a;
+    const float aEff = 1.0f + st->tx_core_asym * tanhf(fmaxf(-HT76_RAIL_VOLTS, fminf(HT76_RAIL_VOLTS, qRaw)));
+    const float invAEff = 1.0f / aEff;
+    const float Q = qRaw * invAEff;
+    float Man, dManRaw;
+    ht76_langevin_pair(Q, &Man, &dManRaw);
+    const float dMan = dManRaw * st->inv_tx_a * invAEff;
+    const float diff = Man - M;
+    const float delta = (Hdot >= 0.0f) ? 1.0f : -1.0f;
+    const float deltaM = ((delta > 0.0f) == (diff > 0.0f)) ? 1.0f : 0.0f;
+    float den = st->one_minus_ck * delta - st->tx_alpha * diff;
+    if (fabsf(den) < 1.0e-6f) den = (den < 0.0f) ? -1.0e-6f : 1.0e-6f;
+    const float irr = st->one_minus_c * deltaM * diff / den;
+    const float rev = st->tx_c * dMan;
+    const float scale = 1.0f - st->c_alpha * dMan;
+    return (irr + rev) / ((fabsf(scale) < 1.0e-6f) ? 1.0e-6f : scale);
+}
+
+// Output transformer: flux is the integral of the winding voltage (that's why a 50Hz signal drives
+// far more core excursion than a 5kHz one at the same level -- the whole reason a static
+// waveshaper can't stand in for iron). "y" (not the J-A output) is the actual signal fed to the
+// leak-inductance one-pole -- H/M's own integration only feeds back into the NEXT sample's
+// impedance drop, matching the original's own physics-corrected topology exactly.
+static inline float ht76_transformer(const FxHt76State *st, float x, Ht76TxState *s, float tx_flux_gain) {
+    const float y = (x - st->tx_src_b * s->h) * st->tx_b_trim;
+    const float dB = y * tx_flux_gain;
+    const float s2b = ht76_jiles_atherton_slope(st, s->m, s->h, dB);
+    const float dH = dB / fmaxf(0.05f, 1.0f + s2b);
+    s->h += dH;
+    s->m += s2b * dH;
+    if (!isfinite(s->h)) s->h = 0.0f;
+    if (!isfinite(s->m)) s->m = 0.0f;
+    s->h *= st->tx_decay;
+    s->m = fmaxf(-4.0f, fminf(4.0f, s->m));
+    s->lp += (y - s->lp) * st->tx_leak_coef;
+    if (!isfinite(s->lp)) s->lp = 0.0f;
+    return s->lp;
+}
+
+// One (oversampled) sample's worth of gain cell + detector/timing network + output stage, both
+// channels at once (the detector/control loop is shared -- see this section's own top comment).
+static void ht76_process_subsample(FxHt76State *st, float xL, float xR,
+                                    float cell_k, float class_a_drive, float class_a_norm,
+                                    float tx_flux_gain, float attack_step, float attack_rc_coef,
+                                    float release_coef, float ratio_drive, float ratio_bias_v,
+                                    float env_bias, bool limiting, float *outL, float *outR) {
+    const float x  = ht76_highpass(xL * st->smoothed_in, &st->hp[0], st->hp_g);
+    const float xr = ht76_highpass(xR * st->smoothed_in, &st->hp[1], st->hp_g);
+
+    // Feedback: this sample's G0 comes from ctrl_volts computed at the END of the PREVIOUS
+    // sample -- a one-sample loop delay, which is what keeps a digital feedback compressor stable.
+    const float G0 = st->two_beta * st->ctrl_volts;
+    const float v  = ht76_solve_cell(x  * HT76_CELL_VOLTS_PER_UNIT, G0, cell_k) * HT76_INV_CELL_VOLTS;
+    const float vr = ht76_solve_cell(xr * HT76_CELL_VOLTS_PER_UNIT, G0, cell_k) * HT76_INV_CELL_VOLTS;
+
+    const float rect = fmaxf(fabsf(v), fabsf(vr)); // sidechain, tapped AFTER the cell
+
+    if (!limiting) {
+        // The real unit's Attack-knob OFF detent: cell stays open (no gain reduction), signal
+        // still runs the whole path (divider, Class A, transformer), so the coloration stays.
+        st->env = 0.0f;
+        st->env_res = 0.0f;
+    } else {
+        // Attack is slew-limited, not exponential -- see FX_TYPE_HT76's own comment on why this
+        // is what makes the Attack dial mean anything in a feedback topology.
+        const float over = rect - st->env;
+        if (over > 0.0f) st->env += fminf(attack_step, over * attack_rc_coef);
+        st->env_discharge_gate = (over > 0.0f) ? 0.0f : 1.0f; // shipping comparator law (DiodeKneeV=0)
+
+        // Release: exponential discharge toward the Q-bias point.
+        const float dis = (env_bias - st->env) * release_coef * st->env_discharge_gate;
+        st->env += dis;
+    }
+
+    // Two-node timing network: the release pot drains a fast node; the reservoir couples through
+    // a fixed resistance and has no path of its own -- this is what sheds a transient bump's gain
+    // reduction far faster than the same network's own sustained-material release time.
+    st->env     += (st->env_res - st->env) * st->rel_couple_a;
+    st->env_res += (st->env - st->env_res) * st->rel_charge_b;
+
+    if (!isfinite(st->env)) st->env = 0.0f;
+    if (!isfinite(st->env_res)) st->env_res = 0.0f;
+    st->env     = fmaxf(0.0f, fminf(HT76_MAX_ENVELOPE, st->env));
+    st->env_res = fmaxf(0.0f, fminf(HT76_MAX_ENVELOPE, st->env_res));
+
+    // Detector law: a diode (exp(x)-1 gives zero output below the bias for free).
+    const float arg = fmaxf(-30.0f, fminf(20.0f, (ratio_drive * st->env - ratio_bias_v) * HT76_DETECTOR_INV_VT));
+    st->ctrl_volts = fmaxf(0.0f, fminf(HT76_MAX_CTRL_VOLTS, HT76_DETECTOR_K * (expf(arg) - 1.0f)));
+
+    // Output section, following the hardware's own signal order: gain cell, Class A line amp,
+    // Output control, transformer.
+    const float stage_l = ht76_class_a(v,  class_a_drive, st->class_a_bias_out, class_a_norm) * st->smoothed_out;
+    const float stage_r = ht76_class_a(vr, class_a_drive, st->class_a_bias_out, class_a_norm) * st->smoothed_out;
+    *outL = ht76_transformer(st, stage_l, &st->tx[0], tx_flux_gain);
+    *outR = ht76_transformer(st, stage_r, &st->tx[1], tx_flux_gain);
+}
+
+static void run_fx_ht76(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxHt76State *st = (FxHt76State *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxHt76State));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+        ht76_init(st);
+    }
+
+    const float p0 = fmaxf(0.0f, fminf(1.0f, params->param[0]));
+    const float p1 = fmaxf(0.0f, fminf(1.0f, params->param[1]));
+    const float p2 = fmaxf(0.0f, fminf(1.0f, params->param[2]));
+    const float p3 = fmaxf(0.0f, fminf(1.0f, params->param[3]));
+    const float p4 = fmaxf(0.0f, fminf(1.0f, params->param[4]));
+    const bool limiting = params->param[5] < 0.5f; // choice: 0=Limit, 1=Character Only
+    const float p6 = fmaxf(0.0f, fminf(1.0f, params->param[6]));
+    const float p7 = fmaxf(0.0f, fminf(1.0f, params->param[7]));
+
+    const float input_db  = -20.0f + p0 * 60.0f; // -20..+40
+    const float output_db = -20.0f + p1 * 40.0f; // -20..+20
+    int ratio_idx = (int)(p2 * 4.0f + 0.5f);     // 0..4 -> 4:1/8:1/12:1/20:1/All
+    if (ratio_idx < 0) ratio_idx = 0; else if (ratio_idx > 4) ratio_idx = 4;
+    const float attack_us  = 20.0f + p3 * (800.0f - 20.0f);   // fastest at 0, slowest at 1
+    const float release_ms = 50.0f + p4 * (1100.0f - 50.0f);  // fastest at 0, slowest at 1
+    const float linearisation = p6 * 0.5f; // 0..0.5, LN feedback fraction
+    const float iron_amount = p7;          // 0..1, Class A/transformer drive
+
+    const double os_rate = (double)SAMPLE_RATE * 2.0;
+
+    const float target_in  = powf(10.0f, input_db  / 20.0f);
+    const float target_out = powf(10.0f, output_db / 20.0f);
+    if (st->smoothed_in < 0.0f) { st->smoothed_in = target_in; st->smoothed_out = target_out; }
+
+    const float cell_k = st->two_beta * 0.5f * (2.0f * linearisation - 1.0f);
+
+    // Ratio bank: each position's own drive/bias resistor-tap constants (from the Rev D drawing)
+    // times a per-position "pole B" trim (solved against measured hardware behavior -- see
+    // FX_TYPE_HT76's own comment; index 4 = All, which shorts every tap in parallel).
+    static const float fit_drive[5]    = { 0.166f, 0.207f, 0.275f, 0.456f, 0.456f };
+    static const float fit_bias_r[5]   = { 150.0f, 620.0f, 1180.0f, 2680.0f, 150.0f };
+    static const float pole_b_drive[5] = { 1.7507f, 2.5986f, 2.9198f, 3.2227f, 3.3415f };
+    static const float pole_b_bias[5]  = { 2.5505f, 1.3858f, 1.2092f, 1.1407f, 20.7546f };
+    const float ratio_drive  = fit_drive[ratio_idx] * pole_b_drive[ratio_idx];
+    const float ratio_bias_v = fit_bias_r[ratio_idx] * 3.3e-5f * pole_b_bias[ratio_idx];
+    const float env_bias     = ratio_bias_v / fmaxf(1.0e-6f, ratio_drive);
+
+    const float class_a_drive = 0.14f * fmaxf(1.0e-4f, iron_amount);
+    const float class_a_norm  = 1.0f / (class_a_drive * (1.0f - st->class_a_bias_out * st->class_a_bias_out));
+    const float tx_flux_gain  = 0.2f * iron_amount * (float)(2.0 * M_PI * 50.0 / os_rate);
+
+    // Attack/release timing: log-domain two-segment curves through a measured mid-anchor point --
+    // fitted to the real network's own step-response trajectories, not a UI pot taper (see this
+    // section's own top comment) -- so this applies to attack_us/release_ms as decoded above
+    // exactly as it would to a value that came off a physical dial.
+    const double atk_nom = (double)attack_us * 1.0e-6;
+    const double atk_frac = fmax(0.0, fmin(1.0, log(atk_nom / 20.0e-6) / log(800.0 / 20.0)));
+    const double atk_mid = sqrt(20.0e-6 * 800.0e-6) * 2.0; // AtkMidScale
+    const double attack_sec = (atk_frac <= 0.5)
+        ? 20.0e-6 * pow(atk_mid / 20.0e-6, atk_frac / 0.5)
+        : atk_mid * pow(800.0e-6 / atk_mid, (atk_frac - 0.5) / 0.5);
+    const float attack_step    = (float)(0.035 / fmax(1.0, attack_sec * os_rate));          // EnvSlewSpan
+    const float attack_rc_coef = (float)(1.0 - exp(-1.0 / fmax(1.0, 16.0 * attack_sec * os_rate))); // AtkLandFactor
+
+    const double release_sec = (double)release_ms * 1.0e-3;
+    const double rel_frac = fmax(0.0, fmin(1.0, log(release_sec / 0.050) / log(1.100 / 0.050)));
+    const double rel_r_mid = sqrt(270.0e3 * 5.27e6) * 1.85; // RelMidScale
+    const double rel_r = (rel_frac <= 0.5)
+        ? 270.0e3 * pow(rel_r_mid / 270.0e3, rel_frac / 0.5)
+        : rel_r_mid * pow(5.27e6 / rel_r_mid, (rel_frac - 0.5) / 0.5);
+    const double rel_seconds = rel_r * 0.22e-6 / 2.0; // RelCapRatio = 1.0 -> divide by (1+ratio)
+    const float release_coef = (float)((rel_seconds <= 0.0) ? 1.0 : (1.0 - exp(-1.0 / (rel_seconds * os_rate))));
+
+    // 2x oversampling: upsample (zero-stuff + lowpass, x2 gain to compensate), run the core engine
+    // at the oversampled rate for both resulting sub-samples, then lowpass + decimate back down --
+    // see FX_TYPE_HT76's own comment for why this replaces the original's polyphase oversampler.
+    float outL = *l, outR = *r;
+    for (int pass = 0; pass < 2; pass++) {
+        st->smoothed_in  += (target_in  - st->smoothed_in)  * st->smooth_coef;
+        st->smoothed_out += (target_out - st->smoothed_out) * st->smooth_coef;
+
+        const float in_l = (pass == 0) ? (*l * 2.0f) : 0.0f;
+        const float in_r = (pass == 0) ? (*r * 2.0f) : 0.0f;
+
+        const float up_l = run_eq_biquad(in_l, &st->os_coeffs, &st->os_up_z1[0], &st->os_up_z2[0]);
+        const float up_r = run_eq_biquad(in_r, &st->os_coeffs, &st->os_up_z1[1], &st->os_up_z2[1]);
+
+        float core_l, core_r;
+        ht76_process_subsample(st, up_l, up_r, cell_k, class_a_drive, class_a_norm, tx_flux_gain,
+                                attack_step, attack_rc_coef, release_coef, ratio_drive, ratio_bias_v,
+                                env_bias, limiting, &core_l, &core_r);
+
+        const float down_l = run_eq_biquad(core_l, &st->os_coeffs, &st->os_down_z1[0], &st->os_down_z2[0]);
+        const float down_r = run_eq_biquad(core_r, &st->os_coeffs, &st->os_down_z1[1], &st->os_down_z2[1]);
+
+        if (pass == 1) { outL = down_l; outR = down_r; } // decimate: keep the second sub-sample
+    }
+    *l = outL;
+    *r = outR;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -3922,6 +4324,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                 case FX_TYPE_GATE: run_fx_gate(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_EQ3: run_fx_eq3(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_LIMITER: run_fx_limiter(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_HT76: run_fx_ht76(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through

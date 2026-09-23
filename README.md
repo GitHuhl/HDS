@@ -1114,6 +1114,63 @@ effect rather than a ported third-party plugin:
   well-known instant-attack/smooth-release brick-wall technique real limiters (L1 included) are
   built on, not a clone of L1's own internals.
 
+### HT76 FX slot (1176-style FET limiter)
+
+An FX slot (Type: `HT76`) ported from [fetcomp-dsp](https://github.com/Paulllux/fetcomp-dsp)
+(Paul Ulrix, MIT license) -- the DSP behind the HT-76/FetComp plugin, a circuit-derived model of
+the UREI 1176LN FET limiting amplifier's own gain cell, detector/timing network, Class A line amp
+and output transformer. Unlike Gate/EQ3/Limiter above, this isn't a simple filter or envelope
+follower -- it's a real analog-circuit model: a voltage-divider gain cell (a JFET solved via a
+closed-form quadratic every sample, derived directly from the transistor's own device equation),
+fed back through a diode detector and a two-node timing network tapped *after* the cell (closing
+the loop the way the real hardware does, which is the structural reason a 1176 "grabs" rather than
+"clamps"), driving a Class A tanh output stage and a Jiles-Atherton hysteresis model of the output
+transformer. Eight params: **Input** (-20..+40dB) and **Output** (-20..+20dB) -- the real hardware
+has no separate Threshold knob; you drive *into* a fixed one with Input, which is why input level,
+gain reduction and distortion are genuinely inseparable on this unit, kept faithfully here rather
+than smoothed away into a conventional threshold/ratio compressor; **Ratio** (4:1/8:1/12:1/20:1/
+All -- All shorts every ratio position's resistor tap in parallel, the real "all buttons in" trick,
+steepest slope and lowest threshold of the five); **Attack** (20-800us) and **Release**
+(50-1100ms); **Limiting** (Limit / Character Only -- the real unit's Attack knob has an OFF detent
+past its slowest setting where the cell stays open and no gain reduction happens, but the signal
+still runs the whole Class A/transformer path, a genuine "color box" use of the circuit);
+**Character** (0-0.5, the LN linearisation network's feedback fraction -- 0.5 exactly cancels the
+gain cell's own 2nd harmonic, 0.0 is the earlier, dirtier Rev A response); **Iron** (0-1, how hard
+the Class A stage and output transformer are driven -- 0 takes both out of the path entirely,
+leaving just the bare gain cell). No separate Mix param -- the slot's own generic Mix knob already
+does that job.
+
+**What's ported faithfully vs. what changed going from the original's JUCE-based C++ to this file's
+plain C**: the gain-cell quadratic solve, the diode detector law, the two-node attack/release
+timing network (including its log/pow calibration curves -- these fit the timing network's own
+measured behavior, not a physical potentiometer's rotation feel, so they apply just as much to this
+slot's plain 0-100 dial as to the original hardware's own knob), the ratio bank's per-position
+drive/bias constants, the Class A stage, and the full Jiles-Atherton transformer hysteresis model
+are all kept as-is. What changed: (1) `juce::jmin`/`jmax`/`jlimit`/`Decibels` are gone, replaced
+with plain `fminf`/`fmaxf`/`powf` -- this port exists specifically so this effect needs no
+framework at all; (2) the original's own "fast" tanh/exp2 polynomial approximations are replaced
+with real libm `tanhf`/`expf` -- strictly more accurate, and it removes an overflow-to-NaN failure
+mode the original's own comments describe guarding against, since a real `tanhf` simply can't
+overflow; (3) the original's runtime-switchable JUCE polyphase halfband oversampler (1x/2x/4x) is
+replaced with a fixed 2x oversampling stage built from this file's own existing RBJ-cookbook biquad
+runner (one Butterworth lowpass on the way up, a matched one on the way down) -- less stopband
+rejection than a true polyphase halfband filter, but self-contained in a few lines and more than
+enough to tame the aliasing a 20us attack's control-signal energy would otherwise fold back into
+the audible band; (4) the original's bench-only A/B toggles (iron model, release-network model,
+diode-knee shape) are fixed at the author's own shipping defaults rather than exposed as user
+controls, since those exist upstream for the *author's* own shipped-vs-experimental comparison, not
+as a listener-facing knob; (5) the "selected FET part" latitude (Idss/pinch-off voltage) stays
+fixed at a typical small-signal JFET's values rather than exposed as a param, since that's a
+real per-unit trimming detail, not something a software knob should model. See `run_fx_ht76()`'s
+own (long) comment in `backend.c` for the complete list with the reasoning behind each change.
+
+Like every other FX slot, this runs on a real guitar/vocal/etc track's own audio too, not just a
+Program's synthesized voices -- see "CLAP: audio input ports" above for routing a track's signal
+into an FX slot's Source. Driving Input hard with Limiting set to Character Only can produce a very
+loud, heavily colored signal by design (that's the real hardware's own documented behavior) -- the
+always-on master bus safety limiter downstream catches any resulting overs before final output,
+the same as it would for a hot synth voice.
+
 ### Control protocol: OSC
 
 The backend is controlled entirely over OSC (Open Sound Control), via a
