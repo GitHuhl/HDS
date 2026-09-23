@@ -756,8 +756,11 @@ FX_TYPE_METADATA = [
         {"label": "Flutter", "range": (0, 100), "default": 0},
         {"label": "Dry/Wet", "range": (0, 100), "default": 100},
         # Ping-Pong: NOT part of the original plugin -- see FX_TYPE_TAPEDELAY2's own comment.
-        # Default Off reproduces the original algorithm exactly.
-        {"label": "Ping-Pong", "type": "choice", "options": ["Off", "On"], "default": 0},
+        # Default Off reproduces the original algorithm exactly, bit for bit. Stereo Ping-Pong
+        # cross-feeds L/R's feedback AND diverges their delay time together -- a cross-feed-only
+        # in-between option was tried and cut (see backend.c's own comment): without the time
+        # divergence too, it's nearly inaudible on anything but a strongly asymmetric source.
+        {"label": "Ping-Pong", "type": "choice", "options": ["Off", "Stereo Ping-Pong"], "default": 0},
     ]},
     {"name": "PointyGuitar", "params": [
         # Defaults match the original plugin's own init values (A-J) exactly.
@@ -4652,7 +4655,11 @@ class SynthGui(QWidget):
             # Each entry here has a matching FX_TYPE_* case in the backend's process_fx_chain
             # switch and an entry in FX_TYPE_METADATA -- the three must stay in step.
             type_combo.addItems([entry["name"] for entry in FX_TYPE_METADATA])
-            type_combo.setFixedWidth(80)
+            # 140px, not a round guess: Qt's own sizeHint() for this combo (9px font, the widest
+            # entry "GuitarConditioner") measures 137px including the dropdown arrow/frame -- 80px
+            # was truncating every multi-word effect name (GuitarConditioner, StereoChorus,
+            # StereoDoubler, PointyGuitar, ...).
+            type_combo.setFixedWidth(140)
             type_combo.setStyleSheet("font-size: 9px;")
             slot_lay.addWidget(type_combo)
             self.fx_type_combos.append(type_combo)

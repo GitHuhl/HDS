@@ -535,10 +535,15 @@ switch. Nine are implemented so far, all ported from Airwindows
   not a crossfade — like CreamCoat's Wetness, 50 is both dry and wet at
   full strength, so it can sit on a submix without pulling back everything
   else), and Ping-Pong — not part of the original plugin, a small,
-  additive toggle (default Off) that cross-feeds each channel's delay
-  output into the other channel's feedback path for a stereo-alternating
-  echo. Off reproduces the original algorithm exactly, bit for bit; see
-  `run_fx_tapedelay2`'s own comment in `backend.c` for how that's kept true.
+  additive toggle (default Off) offering a "Stereo Ping-Pong" mode that
+  both cross-feeds each channel's delay output into the other channel's
+  feedback path AND diverges L/R's own delay time (a fixed +/-15% spread
+  around the shared Time setting) -- both together, not the cross-feed
+  alone (tried and cut: without the time divergence too, cross-feeding is
+  nearly inaudible on anything but a strongly asymmetric source, since L
+  and R still land on the exact same beat). Off reproduces the original
+  algorithm exactly, bit for bit; see `run_fx_tapedelay2`'s own comment in
+  `backend.c` for how that's kept true.
 - **PointyGuitar** — a guitar-amp-style distortion: the input runs
   through a cascade of 6-16 identical stages (driven by Drive), each one
   splitting the signal into 9 successively-slower one-pole lowpass

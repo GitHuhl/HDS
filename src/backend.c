@@ -432,10 +432,12 @@ typedef struct {
 // from 0 first fades in only the wet signal without turning down dry at all, matching the
 // original's own "submix echo" design so mixing this into a bus doesn't quietly pull back
 // everything else -- see run_fx_tapedelay2's own comment). param[6] Ping-Pong: NOT part of the
-// original TapeDelay2 -- a small addition (see run_fx_tapedelay2's own comment) that cross-feeds
-// each channel's delay output into the OTHER channel's feedback path for a stereo-alternating
-// echo, wired so that leaving it at its default (Off) reproduces the original algorithm exactly,
-// bit for bit.
+// original TapeDelay2 -- a 2-way choice addition (see run_fx_tapedelay2's own comment), default
+// Off reproducing the original algorithm exactly, bit for bit. "Stereo Ping-Pong" cross-feeds each
+// channel's delay output into the OTHER channel's feedback path AND diverges L/R's own delay time
+// -- both together, not just the cross-feed alone (tried and cut -- a cross-feed with no time
+// divergence is nearly inaudible on anything but a strongly asymmetric source, since L and R would
+// still land on the exact same beat).
 #define FX_TYPE_TAPEDELAY2 6
 // Ported from Airwindows PointyGuitar (MIT license). A guitar-amp-style distortion: the input
 // runs through a cascade of `poles` (6-16, driven by Drive) identical stages, each stage itself
@@ -2791,11 +2793,16 @@ static void run_fx_tapedelay2(FXSlotEngine *engine, const FXSlotParams *params, 
     float d = fmaxf(0.0f, fminf(1.0f, params->param[3])); // Reso
     float e = fmaxf(0.0f, fminf(1.0f, params->param[4])); // Flutter
     float f = fmaxf(0.0f, fminf(1.0f, params->param[5])); // Dry/Wet
-    // param[6] Ping-Pong -- see this effect's own comment above and the cross-feed just below.
-    // Off (0, the default) reproduces the pre-existing wiring exactly; only decoded when the
-    // slot's Type is actually this effect, per the "choice" param convention (see
-    // FX_TYPE_METADATA's own comment in frontend.py -- (int)(value * (N-1+0.999)) for N options).
-    bool pingpong = ((int)(fmaxf(0.0f, fminf(1.0f, params->param[6])) * 1.999f)) != 0;
+    // param[6] Ping-Pong -- see this effect's own comment above and the cross-feed/divergence
+    // just below. Off (0, the default) reproduces the pre-existing wiring exactly, bit for bit.
+    // Stereo Ping-Pong (1) cross-feeds L/R's feedback AND diverges their delay time -- an
+    // in-between "cross-feed only, same shared time" option existed briefly but was cut: it's a
+    // strict subset of what Stereo Ping-Pong already does, and without the time divergence it's
+    // the same easy-to-miss, barely-audible effect Ping-Pong originally shipped as (see this
+    // effect's own comment history) -- no reason to keep a weaker redundant option once the
+    // stronger one exists. Only decoded when the slot's Type is actually this effect, per the
+    // "choice" param convention (see FX_TYPE_METADATA's own comment in frontend.py).
+    bool stereo_pingpong = ((int)(fmaxf(0.0f, fminf(1.0f, params->param[6])) * 1.999f)) != 0;
 
     float baseSpeed = (powf(a, 4.0f) * 25.0f) + 1.0f;
     float feedback = b * b;
@@ -2839,17 +2846,30 @@ static void run_fx_tapedelay2(FXSlotEngine *engine, const FXSlotParams *params, 
         st->sweepL += (0.05f * inputSampleL * inputSampleL); if (st->sweepL > 6.283185307179586f) st->sweepL -= 6.283185307179586f;
         st->sweepR += (0.05f * inputSampleR * inputSampleR); if (st->sweepR > 6.283185307179586f) st->sweepR -= 6.283185307179586f;
 
+        // Stereo Ping-Pong: spread L/R symmetrically around the Time knob's own shared center
+        // instead of the two channels always sharing one identical delay rate -- a fixed, tasteful
+        // +/-15% (chosen by ear, not derived from anything) rather than a further knob, per the
+        // user's own "easily integrate... as an option" ask. Genuinely new time divergence, not
+        // just alternating the SAME echo between speakers -- both channels still ultimately feed
+        // off the one Time/Regen/Freq/Reso setting, they just no longer land at the same moment.
+        // Off: stays at 1.0x, unaffected.
+        if (stereo_pingpong) {
+            speedL *= 0.85f;
+            speedR *= 1.15f;
+        }
+
         // Ping-Pong cross-feed point: capture each channel's CURRENT delay-tap value before
         // either channel's own write step touches it, so the choice of self-feed (Off, default)
-        // vs. cross-feed (On) is a pure selection between two already-computed values -- nothing
-        // else about the algorithm changes either way. With pingpong == false, feedSampleL/R are
-        // exactly dL[posL]/dR[posR] -- byte-for-byte the original's own self-feedback wiring.
+        // vs. cross-feed (Stereo Ping-Pong) is a pure selection between two already-computed
+        // values -- nothing else about the algorithm changes either way. With stereo_pingpong ==
+        // false, feedSampleL/R are exactly dL[posL]/dR[posR] -- byte-for-byte the original's own
+        // self-feedback wiring.
         int posL = (int)floorf(st->delayL);
         int posR = (int)floorf(st->delayR);
         float feedFromL = st->dL[posL];
         float feedFromR = st->dR[posR];
-        float feedSampleL = pingpong ? feedFromR : feedFromL;
-        float feedSampleR = pingpong ? feedFromL : feedFromR;
+        float feedSampleL = stereo_pingpong ? feedFromR : feedFromL;
+        float feedSampleR = stereo_pingpong ? feedFromL : feedFromR;
 
         // begin left channel
         float newSample = inputSampleL + feedSampleL * feedback;
