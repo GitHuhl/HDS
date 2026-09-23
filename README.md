@@ -1194,6 +1194,43 @@ in both `backend.c` and `clap_plugin.c` -- this was never a race, never
 host-dependent, and never worked once before this fix, exactly as
 reported.
 
+### A single missing field in a real dump silently aborted the ENTIRE restore
+
+Caught from a real user-reported traceback (not a synthetic test): a
+`KeyError: '/hds/eg/0/attack'` inside `_apply_program_fields_egs()`.
+That function gated a whole EG's restore on only `/hds/eg/{i}/delay`
+being present, then indexed `hold`/`attack`/`decay`/`sustain`/`release`
+directly with no further check -- silently assuming that if one field of
+the group survived, all six must have too. A real `/hds/request_state`
+reply is several chunked UDP datagrams with no delivery-order or
+delivery guarantee at all; losing or reordering even one of them left
+exactly this kind of hole. The uncaught `KeyError` aborted
+`_apply_program_fields()` PARTWAY THROUGH -- before oscillators/filters
+(restored later in that same function) ever got their turn, and before
+that function's own trailing `transmit_knob_packet()` (which also clears
+the reconnect-restore guard) ever ran. One crashed EG was enough to make
+the entire restore look completely non-functional. Fixed by making this
+function check each field it reads individually and fall back to the
+panel's own current value for whatever a partial dump dropped, matching
+every other restore helper in this chain -- audited the rest of the
+chain for the same "check one key, assume the whole group" pattern and
+found no other instance of it. Also added a safety net around the
+sentinel handler itself: any future exception during restore is now
+caught, logged loudly, and leaves the reconnect-restore guard alone
+(it lifts on its own via its existing timeout) instead of letting a
+silent crash corrupt the backend via a half-restored broadcast.
+
+Separately, but from the same traceback: `closeEvent()` crashed with
+`AttributeError: 'SimpleUDPClient' object has no attribute 'close'` on
+an older installed `pythonosc` version that predates that method. Since
+PySide6 only logs an exception raised inside an overridden `closeEvent`
+rather than propagating it, `event.accept()` and the next line
+(explicitly closing `status_sock`) never ran on every single window
+close -- exactly the kind of thing that can leave a socket lingering
+into the next launch of the same command. Fixed to fall back to closing
+the wrapped raw socket (`_sock`, present in every `pythonosc` release)
+when `.close()` itself doesn't exist.
+
 ### Window was forced obnoxiously wide, LFO tab's knobs strayed from their labels
 
 Measuring `SynthGui`'s own minimum size hint traced this to the Sequencer

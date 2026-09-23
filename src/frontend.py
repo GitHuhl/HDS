@@ -6536,21 +6536,38 @@ class SynthGui(QWidget):
     def _apply_program_fields_egs(self, fields):
         """Mirrors transmit_knob_packet()'s EG-params loop, reusing each EG panel's own existing
         get_state()/set_state() pair (already built for the "1->All"/Sync copy buttons) rather
-        than re-deriving the dial-by-dial logic a second time."""
+        than re-deriving the dial-by-dial logic a second time.
+
+        BUG FIX: this used to gate the whole per-EG block on ONLY /hds/eg/{i}/delay being present,
+        then index d/h/a/dec/s/r directly with no further check -- silently assuming that if one
+        field of the group survived, all six must have too. A real /hds/request_state reply is
+        several chunked UDP datagrams, which carry no delivery-order or delivery guarantee at all;
+        losing or reordering even one of them (measured happening in real use, not hypothetical)
+        left a hole like this one 'delay present, attack missing' -- an unguarded fields[...]
+        access then raised an uncaught KeyError that aborted _apply_program_fields() PARTWAY
+        THROUGH, before oscillators/filters (restored later in that same function) ever got their
+        turn, and before that function's own trailing transmit_knob_packet() (which also clears
+        the reconnect-restore guard) ever ran. That one crash was enough to make it look like
+        NOTHING recalled correctly, not just this EG. Every other field group in this restore
+        chain already checks each address it reads individually -- this one now does too, falling
+        back to the panel's own CURRENT value (via get_state()) for whichever fields a partial
+        dump happened to drop, instead of crashing the entire restore."""
         all_panels = [self.vco1_amp_eg, self.vco2_amp_eg, self.vco3_amp_eg, self.vco4_amp_eg] + self.envelopes
         for eg_idx, panel in enumerate(all_panels):
-            if f"/hds/eg/{eg_idx}/delay" not in fields:
-                continue  # this EG wasn't in the saved file -- leave it untouched
+            prefix = f"/hds/eg/{eg_idx}/"
+            if not any(f"{prefix}{suffix}" in fields for suffix in ("delay", "hold", "attack", "decay", "sustain", "release")):
+                continue  # this EG wasn't in the saved file/dump at all -- leave it untouched
+            current = panel.get_state()
             state = {
-                "type": int(round(fields.get(f"/hds/eg/{eg_idx}/topology_mode", panel.combo_type.currentIndex()))),
-                "d": fields[f"/hds/eg/{eg_idx}/delay"],
-                "h": fields[f"/hds/eg/{eg_idx}/hold"],
-                "a": fields[f"/hds/eg/{eg_idx}/attack"],
-                "dec": fields[f"/hds/eg/{eg_idx}/decay"],
-                "s": fields[f"/hds/eg/{eg_idx}/sustain"],
-                "r": fields[f"/hds/eg/{eg_idx}/release"],
-                "al": fields.get(f"/hds/eg/{eg_idx}/attack_start_pct", panel.attack_level_pct),
-                "pk": fields.get(f"/hds/eg/{eg_idx}/attack_peak_pct", panel.attack_peak_pct),
+                "type": int(round(fields.get(f"{prefix}topology_mode", panel.combo_type.currentIndex()))),
+                "d": fields.get(f"{prefix}delay", current["d"]),
+                "h": fields.get(f"{prefix}hold", current["h"]),
+                "a": fields.get(f"{prefix}attack", current["a"]),
+                "dec": fields.get(f"{prefix}decay", current["dec"]),
+                "s": fields.get(f"{prefix}sustain", current["s"]),
+                "r": fields.get(f"{prefix}release", current["r"]),
+                "al": fields.get(f"{prefix}attack_start_pct", panel.attack_level_pct),
+                "pk": fields.get(f"{prefix}attack_peak_pct", panel.attack_peak_pct),
             }
             panel.set_state(state)
 
@@ -7231,7 +7248,30 @@ class SynthGui(QWidget):
                     # itself lifts the restore guard right before its own trailing
                     # transmit_knob_packet() call -- see that function's own comment on why the
                     # clear lives there rather than here.
-                    self._apply_full_state_fields(self._state_dump_buffer)
+                    #
+                    # Safety net: a real /hds/request_state reply is several chunked UDP
+                    # datagrams with no delivery-order or delivery guarantee, so a partial/
+                    # malformed dump is a real possibility, not a hypothetical -- see
+                    # _apply_program_fields_egs()'s own comment on a KeyError from exactly this
+                    # once aborting the ENTIRE restore chain partway through (before oscillators/
+                    # filters ever got restored) with nothing to show for it but a silent
+                    # traceback and a GUI stuck straddling old defaults and a half-applied dump.
+                    # Every individual apply-function already guards its own field lookups, but
+                    # this catches anything that doesn't (a future bug, a field this build simply
+                    # doesn't know about yet) so a restore that goes wrong is loud and recoverable
+                    # -- not a silent, permanent corruption of a DAW-restored patch.
+                    try:
+                        self._apply_full_state_fields(self._state_dump_buffer)
+                    except Exception:
+                        import traceback
+                        traceback.print_exc()
+                        print("--- state restore failed partway through (see traceback above) -- "
+                              "some widgets may be stale, but nothing was transmitted to the "
+                              "backend from this failed attempt. Leaving the restore guard active "
+                              "(see _begin_state_restore_guard()) rather than clearing it here: it "
+                              "will lift on its own after HDS_STATE_RESTORE_TIMEOUT_MS, same as a "
+                              "reply that never arrived at all, instead of immediately broadcasting "
+                              "this same half-restored state right back out. ---")
                     self._state_dump_buffer = {}
                 elif (msg.params and not msg.address.startswith("/hds/status/")
                         and msg.address not in self._STATUS_ADDRESSES):
@@ -7835,7 +7875,22 @@ class SynthGui(QWidget):
             except OSError: pass
 
     def closeEvent(self, event):
-        if self.osc_client is not None: self.osc_client.close()
+        # Bug fix: SimpleUDPClient.close() doesn't exist in every installed pythonosc version --
+        # it was only added in a later release. Where it's missing, this raised an uncaught
+        # AttributeError on EVERY window close, which PySide6 only logs (it doesn't propagate),
+        # meaning event.accept() below it never ran and self.status_sock (needed for the NEXT
+        # frontend.py launch to bind the same --osc-reply-port) never got explicitly closed --
+        # exactly the kind of thing that can make "close this window, relaunch the same command"
+        # bind to a still-lingering socket and silently receive nothing. Falls back to closing the
+        # wrapped raw socket directly (`_sock` has been SimpleUDPClient's actual implementation
+        # for as long as pythonosc has existed, unlike the newer close() wrapper method).
+        if self.osc_client is not None:
+            try:
+                self.osc_client.close()
+            except AttributeError:
+                sock = getattr(self.osc_client, "_sock", None)
+                if sock is not None:
+                    sock.close()
         if self.status_sock is not None: self.status_sock.close()
         event.accept()
 def runtime_connect_and_bind(gui):
