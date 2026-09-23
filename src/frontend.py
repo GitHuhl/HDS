@@ -7190,7 +7190,21 @@ class SynthGui(QWidget):
         got_any = False
         while True:
             try:
-                dgram, _addr = self.status_sock.recvfrom(4096)
+                # 4096 used to be the buffer size here -- far too small. Measured directly: a
+                # /hds/request_state reply's own chunks (HDS_STATE_DUMP_CHUNK_SIZE=150 messages
+                # each, backend.c) run ~4900-5464 bytes each for this build's real address list --
+                # 8 of 9 chunks in a full dump silently exceed 4096 bytes. UDP truncates a datagram
+                # larger than the receiving buffer with NO error and NO indication it happened --
+                # recvfrom() just quietly returns the first 4096 bytes and discards the rest, so
+                # nearly every chunk of every real state-dump reply arrived corrupted, with
+                # whichever addresses happened to fall past the truncation point silently missing
+                # or mangled. This is why restoring a real backend's state looked ERRATIC rather
+                # than consistently broken or consistently working -- which specific fields
+                # survived depended on exact byte alignment that varies dump to dump. Raised to the
+                # largest a UDP datagram can legally be (65507 payload bytes, per IPv4's 65535-byte
+                # packet limit minus IP/UDP headers), rounded up to a clean power of two, so no
+                # datagram this or any other message on this socket could ever send is truncated.
+                dgram, _addr = self.status_sock.recvfrom(65536)
             except (BlockingIOError, OSError):
                 break
             try:

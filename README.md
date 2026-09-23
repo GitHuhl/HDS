@@ -1231,6 +1231,45 @@ into the next launch of the same command. Fixed to fall back to closing
 the wrapped raw socket (`_sock`, present in every `pythonosc` release)
 when `.close()` itself doesn't exist.
 
+### The status-reply socket's receive buffer silently truncated most of every real dump
+
+The last and, it turned out, dominant cause of erratic recall (working
+"mostly" on one connect, then looking just as broken as before on the
+very next one, with only a generic `Could not identify content type of
+dgram` warning and no traceback to point at): `listen_for_status_frames()`
+read every incoming status/reply datagram with `self.status_sock.recvfrom(4096)`.
+Measured directly against this build's own real, current address list:
+`send_full_state_dump()`'s own 150-message chunks (`backend.c`'s
+`HDS_STATE_DUMP_CHUNK_SIZE`) run ~4900-5464 bytes each -- 8 of the 9
+chunks in a full ~1235-address dump silently exceed that 4096-byte
+buffer. UDP truncates a datagram larger than the receiving buffer with
+no error and no way to detect it happened after the fact -- `recvfrom()`
+just quietly hands back the first 4096 bytes and discards the rest, so
+nearly every chunk of nearly every real dump arrived missing its tail,
+with whichever addresses happened to land past the truncation point
+(different every time, since it depends on exact byte alignment) simply
+absent or feeding a mangled remainder into the next parse attempt. This
+is what made the previous `_apply_program_fields_egs()` `KeyError` fix
+look incomplete rather than resolved: that fix stopped one specific
+missing-field shape from crashing the whole restore, but the underlying
+truncation kept producing new, different missing-field shapes on every
+single connection, some worse than others. The normal small per-block
+status broadcasts (VU meter, transport, and the rest of
+`_STATUS_ADDRESSES`) never exceed a few hundred bytes, which is exactly
+why ordinary live operation always looked fine and only the (much
+larger) state-dump reply was ever affected. Verified with the real
+current 1235-address list, real chunking, and real UDP sockets: 0
+mismatches restoring against a 65536-byte buffer, versus a mathematical
+certainty of truncation on 8 of 9 chunks at the old 4096-byte one. Fixed
+by raising the buffer to 65536 bytes -- comfortably above the largest a
+UDP datagram can legally be (65507 payload bytes), so no message this or
+any future growth of this protocol could ever send on this socket is at
+risk of truncation again. (Checked the other direction too, in case the
+backend's own receive path had the same class of bug for
+`transmit_knob_packet()`'s ~40KB single, unchunked bundle: it doesn't --
+liblo's own server-side receive delivered a realistic ~40KB/1235-message
+bundle intact with zero loss in a direct test.)
+
 ### Window was forced obnoxiously wide, LFO tab's knobs strayed from their labels
 
 Measuring `SynthGui`'s own minimum size hint traced this to the Sequencer
