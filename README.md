@@ -1034,6 +1034,24 @@ model/cab automatically. Runs on a real guitar/vocal/etc track's own audio too, 
 Program's synthesized voices -- see "CLAP: audio input ports" below for routing a track's signal
 into an FX slot's Source.
 
+**Loading a model/IR onto a remote instance** (via the Instance Switcher above): those same **Mdl**/
+**Cab** buttons send the actual file bytes, not a path, whenever the current target isn't this same
+machine -- a path on your machine means nothing on a different one. Unlike Sample Bank zones
+(SFZ/WAV), which stay purely path-based always (a sample *library* can be gigabytes, genuinely
+impractical to ship over a control protocol), a `.nam` model or cab IR is typically well under a
+few MB, small enough that "just send the bytes" is actually useful. Chunked over OSC (a
+`/hds/fx/upload_begin`/`upload_chunk`/`upload_end` sequence, `fx_upload_begin_handler`'s own comment
+in `backend.c`), verified with a whole-transfer CRC32 before anything touches disk or a real FX
+slot's path -- a truncated or corrupted upload must never reach the model loader as if it were the
+real file, unlike the periodic status stream where a dropped, stale value is fine since a fresher
+one is always coming. A failed verification retries the whole transfer (up to 3 times) rather than
+a per-chunk ACK scheme, a perfectly adequate answer to "OSC/UDP isn't reliable" given how small and
+quick these transfers are. One real limitation, not papered over: the backend writes an upload to
+its own temp file and points the live FX slot at that immediately, but that path isn't portable --
+a Program saved while pointed at a remote target won't meaningfully restore an uploaded model/IR
+reference on a future session the way a local path already does. Getting the file onto the remote
+instance's disk right now is what this solves; a portable reference is a separate problem.
+
 **Why this needed any C++ at all**: NeuralAmpModelerCore is a C++/Eigen library with no C API of
 its own, and this is otherwise an all-C codebase. `src/nam_bridge.h`/`.cpp` is the entire cost of
 that: a handful of `extern "C"` functions (`hds_nam_create`/`process`/`destroy`) wrapping the real

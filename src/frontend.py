@@ -10,6 +10,7 @@ import re
 import time
 import json
 import argparse
+import zlib
 from datetime import datetime
 import numpy as np
 from pythonosc.udp_client import SimpleUDPClient
@@ -5372,19 +5373,35 @@ class SynthGui(QWidget):
             panel.set_state(state)
             self.eg_dest_combos[i].setCurrentIndex(random.randint(0, self.eg_dest_combos[i].count() - 1))
 
+    def _is_target_local(self):
+        """True when the CURRENT target (self._target_host, set by connect_to_backend()/
+        _switch_to_instance()) is this same machine -- the plain path-based NAM/IR load below only
+        works there (the backend reads the path off ITS OWN disk). See _load_nam_model()'s own
+        comment on why NAM/IR alone switch to uploading actual file bytes when this is False, unlike
+        Sample Bank zones (SFZ/WAV), which stay purely path-based always -- a sample LIBRARY can be
+        gigabytes, genuinely impractical to ship over this control protocol; a .nam model or cab IR
+        is typically well under a few MB."""
+        return self._target_host in ("127.0.0.1", "localhost", "::1")
+
     def _load_nam_model(self, slot_idx):
-        """Loads a .nam amp-model file into FX slot slot_idx's own nam_model_path -- same "OSC
-        carries a path, the backend does the file I/O" shape as _pick_and_load_scale, and the same
-        once-per-block change-detection mechanism Sequencer audio lanes already use for their own
-        audio_path (see poll_fx_nam_requests() in backend.c): setting this field is enough by
-        itself, on a live edit or a restored CLAP/Program state alike, no separate load message
-        needed. No round-trip status message for this yet, so the button's tooltip updates
-        optimistically to the picked filename; a bad/unreadable model is instead reported on the
-        backend's own stderr."""
+        """Loads a .nam amp-model file into FX slot slot_idx. Same-machine target (the common
+        case): "OSC carries a path, the backend does the file I/O" shape as _pick_and_load_scale,
+        and the same once-per-block change-detection mechanism Sequencer audio lanes already use
+        for their own audio_path (see poll_fx_nam_requests() in backend.c) -- setting nam_model_path
+        is enough by itself, on a live edit or a restored CLAP/Program state alike, no separate
+        load message needed. A REMOTE target instead uploads the file's actual bytes (see
+        _upload_nam_file()'s own comment) since a path on THIS machine means nothing on a different
+        one. Either way the button's tooltip updates optimistically to the picked filename; a bad/
+        unreadable model, or an upload that fails after every retry, is reported back (backend
+        stderr for the local case, a message box for the upload case, since that failure mode is
+        genuinely more likely -- a real network, not loopback)."""
         path, _ = QFileDialog.getOpenFileName(self, "Load NAM Model", "", "NAM model files (*.nam)")
         if not path:
             return
-        self._send_nam_path(slot_idx, "nam_model_path", path)
+        if self._is_target_local():
+            self._send_nam_path(slot_idx, "nam_model_path", path)
+        else:
+            self._upload_nam_file(slot_idx, is_ir=False, local_path=path)
         self.fx_nam_model_loaded[slot_idx] = path
         self.fx_nam_model_buttons[slot_idx].setToolTip(f"Load a .nam amp model file for this slot\nLoaded: {os.path.basename(path)}")
 
@@ -5394,9 +5411,101 @@ class SynthGui(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "Load Cab IR", "", "WAV files (*.wav)")
         if not path:
             return
-        self._send_nam_path(slot_idx, "nam_ir_path", path)
+        if self._is_target_local():
+            self._send_nam_path(slot_idx, "nam_ir_path", path)
+        else:
+            self._upload_nam_file(slot_idx, is_ir=True, local_path=path)
         self.fx_nam_ir_loaded[slot_idx] = path
         self.fx_nam_ir_buttons[slot_idx].setToolTip(f"Load a cabinet impulse-response .wav file for this slot (see the Cab Enable param)\nLoaded: {os.path.basename(path)}")
+
+    _FX_UPLOAD_CHUNK_SIZE = 4096  # comfortably under UDP's ~65507-byte datagram ceiling
+    _FX_UPLOAD_MAX_RETRIES = 3
+    _FX_UPLOAD_RESULT_TIMEOUT_SEC = 2.0
+
+    def _upload_nam_file(self, slot_idx, is_ir, local_path):
+        """Sends local_path's own bytes to the CURRENT (non-local) target over OSC, instead of a
+        plain path it couldn't do anything useful with -- see fx_upload_begin_handler's own comment
+        in backend.c for the full three-message wire protocol (begin/chunk/end) and why a
+        whole-transfer CRC32 check + retry, not a per-chunk ACK scheme, is the right amount of
+        reliability engineering for files this small over OSC/UDP. Blocks briefly (bounded by
+        _FX_UPLOAD_RESULT_TIMEOUT_SEC per attempt) waiting for the result -- the same "short,
+        occasional, explicitly user-triggered network round-trip" posture _scan_for_instances()'s
+        own synchronous wait already uses, not a new pattern. Retries the WHOLE transfer up to
+        _FX_UPLOAD_MAX_RETRIES times on a CRC/size mismatch (a real possibility on an actual lossy
+        network, unlike loopback) before giving up and telling the user plainly.
+
+        NOTE this is a genuinely different persistence story than the local-path case: the backend
+        writes the received bytes to ITS OWN temp file and points nam_model_path/nam_ir_path at
+        that (see fx_upload_end_handler), so this instance's live audio picks it up immediately --
+        but that temp path isn't portable (a future session, or a different instance entirely, has
+        no reason to have that same file at that same path), so a Program saved while pointed at a
+        remote target won't meaningfully restore an uploaded model/IR reference the way a local
+        path already does. Getting the file onto the remote instance's disk right now is the
+        actual ask this solves; a portable reference is a separate, harder problem this doesn't
+        attempt."""
+        try:
+            with open(local_path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            QMessageBox.warning(self, "Upload failed", f"Could not read '{local_path}':\n{e}")
+            return
+        total_size = len(data)
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        # OSC's "i" is a signed int32; the backend reinterprets the same 32-bit pattern back to
+        # unsigned (see hds_crc32's own call site in backend.c), so this is just how that pattern
+        # has to travel across a wire format with no unsigned integer type of its own.
+        crc_signed = crc - 0x100000000 if crc >= 0x80000000 else crc
+        label = "cab IR" if is_ir else "NAM model"
+
+        for attempt in range(1, self._FX_UPLOAD_MAX_RETRIES + 1):
+            self._send_from_status_sock("/hds/fx/upload_begin", args=[
+                (slot_idx, "i"), (1 if is_ir else 0, "i"), (total_size, "i"), (crc_signed, "i"),
+            ])
+            for offset in range(0, total_size, self._FX_UPLOAD_CHUNK_SIZE):
+                chunk = data[offset:offset + self._FX_UPLOAD_CHUNK_SIZE]
+                self._send_from_status_sock("/hds/fx/upload_chunk", args=[(offset, "i"), (chunk, "b")])
+            self._send_from_status_sock("/hds/fx/upload_end")
+
+            if self._wait_for_upload_result(slot_idx, is_ir):
+                return
+            print(f"[nam-upload] {label} transfer attempt {attempt}/{self._FX_UPLOAD_MAX_RETRIES} failed" +
+                  (", retrying..." if attempt < self._FX_UPLOAD_MAX_RETRIES else "."))
+        QMessageBox.warning(self, "Upload failed",
+                             f"Could not upload the {label} to the remote instance after "
+                             f"{self._FX_UPLOAD_MAX_RETRIES} attempts (network issue?).")
+
+    def _wait_for_upload_result(self, slot_idx, is_ir):
+        """Blocks (bounded by _FX_UPLOAD_RESULT_TIMEOUT_SEC) reading status_sock directly for
+        /hds/status/fx_upload_result matching this exact slot/field -- see _upload_nam_file()'s
+        own comment on why a short synchronous wait here is fine. Any OTHER datagram arriving
+        during this window (a VU update, an in-flight state-dump chunk) is simply not re-queued --
+        dropped, same as a late arrival anywhere else in this protocol already tolerates, and
+        listen_for_status_frames()'s own retry mechanism already covers a dropped state-dump chunk
+        specifically."""
+        if self.status_sock is None:
+            return False
+        deadline = time.monotonic() + self._FX_UPLOAD_RESULT_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            try:
+                dgram, _addr = self.status_sock.recvfrom(65536)
+            except BlockingIOError:
+                time.sleep(0.01)
+                continue
+            except OSError:
+                return False
+            try:
+                packet = OscPacket(dgram)
+            except OscParseError:
+                continue
+            for timed_msg in packet.messages:
+                msg = timed_msg.message
+                if msg.address == "/hds/status/fx_upload_result" and len(msg.params) == 4:
+                    r_slot, r_is_ir, r_ok, r_error = msg.params
+                    if r_slot == slot_idx and bool(r_is_ir) == is_ir:
+                        if not r_ok:
+                            print(f"[nam-upload] backend reported: {r_error}")
+                        return bool(r_ok)
+        return False
 
     def _send_nam_path(self, slot_idx, field, path):
         """Sends one FX slot's nam_model_path/nam_ir_path by OSC -- shared by the Load buttons
@@ -6288,22 +6397,26 @@ class SynthGui(QWidget):
     HDS_STATE_RESTORE_RETRY_COUNT = 3
     HDS_STATE_RESTORE_RETRY_INTERVAL_MS = 400
 
-    def _send_from_status_sock(self, address, target=None):
-        """Sends a bare (no-argument) OSC message directly from status_sock's own bound socket,
-        rather than through the general osc_client -- so the backend's reply-to-sender
-        (lo_message_get_source(), see request_state_handler/ping_handler/subscribe_handler's own
-        comments in backend.c) resolves to status_sock's REAL listening address, not an unrelated
-        ephemeral send-only port nothing is listening on. osc_client is a separate socket entirely
-        (python-osc's SimpleUDPClient opens its own) -- sending /hds/request_state or
-        /hds/subscribe through it would have the backend replying to a port this GUI never reads
-        from. `target` defaults to (self._target_host, self._target_port) -- the Instance
-        Switcher's own idea of "where am I currently pointed" (see connect_to_backend()) -- and is
-        only overridden by _scan_for_instances() sending a one-off /hds/ping to a candidate that
-        isn't (yet, or ever) the current target."""
+    def _send_from_status_sock(self, address, target=None, args=None):
+        """Sends an OSC message directly from status_sock's own bound socket, rather than through
+        the general osc_client -- so the backend's reply-to-sender (lo_message_get_source(), see
+        request_state_handler/ping_handler/subscribe_handler's own comments in backend.c) resolves
+        to status_sock's REAL listening address, not an unrelated ephemeral send-only port nothing
+        is listening on. osc_client is a separate socket entirely (python-osc's SimpleUDPClient
+        opens its own) -- sending /hds/request_state, /hds/subscribe, or an FX upload chunk through
+        it would have the backend replying to a port this GUI never reads from. `target` defaults
+        to (self._target_host, self._target_port) -- the Instance Switcher's own idea of "where am
+        I currently pointed" (see connect_to_backend()) -- overridden by _scan_for_instances()
+        sending a one-off /hds/ping to a candidate that isn't (yet, or ever) the current target.
+        `args`, if given, is a list of (value, type_char) pairs, added in order -- see
+        _upload_nam_file() for the "ib"-typed FX upload messages this also serves."""
         if self.status_sock is None:
             return False
         dest = target if target is not None else (self._target_host, self._target_port)
-        msg = OscMessageBuilder(address=address).build()
+        builder = OscMessageBuilder(address=address)
+        for value, type_char in (args or []):
+            builder.add_arg(value, type_char)
+        msg = builder.build()
         try:
             self.status_sock.sendto(msg.dgram, dest)
         except OSError:

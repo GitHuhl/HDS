@@ -121,6 +121,12 @@ typedef struct {
     // own comment in backend.c. target points directly at THIS instance's own osc_reply_addr field
     // just above, which send_osc_status()/the status-push call site in process() already read from.
     HdsSubscribeContext subscribe_ctx;
+#if HDS_NAM_ENABLED
+    // FX slot NAM model/cab IR upload support -- see HdsFxUploadContext/fx_upload_begin_handler's
+    // own comment in backend.c. Gated like the rest of NAM support since it exists purely to feed
+    // that FX type.
+    HdsFxUploadContext fx_upload_ctx;
+#endif
 } HdsClapPlugin;
 
 // ---------------------------------------------------------------------------------------------
@@ -780,6 +786,13 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         lo_server_add_method(p->osc_server, "/hds/ping", "", ping_handler, &p->knobs);
         p->subscribe_ctx.target = &p->osc_reply_addr;
         lo_server_add_method(p->osc_server, "/hds/subscribe", "", subscribe_handler, &p->subscribe_ctx);
+#if HDS_NAM_ENABLED
+        p->fx_upload_ctx.engine = &p->engine;
+        p->fx_upload_ctx.knobs = &p->knobs;
+        lo_server_add_method(p->osc_server, "/hds/fx/upload_begin", "iiii", fx_upload_begin_handler, &p->fx_upload_ctx);
+        lo_server_add_method(p->osc_server, "/hds/fx/upload_chunk", "ib", fx_upload_chunk_handler, &p->fx_upload_ctx);
+        lo_server_add_method(p->osc_server, "/hds/fx/upload_end", "", fx_upload_end_handler, &p->fx_upload_ctx);
+#endif
         // Bug fix: this catch-all (NULL path, NULL types -- matches every address) used to be
         // registered FIRST, right after the three /hds/zone/* methods above. liblo tries a
         // message's matching methods in REGISTRATION ORDER and stops at the first one that
