@@ -36,6 +36,25 @@
 #endif
 #include <lo/lo.h>
 
+// FX_TYPE_NAM (Neural Amp Modeler) needs a small vendored C++ library (nam_bridge.h/.cpp over
+// third_party/NeuralAmpModelerCore) linked in -- same "opt-in dependency, detected/toggled by the
+// Makefile" posture as HDS_WAVPACK_ENABLED/HDS_PIPEWIRE_ENABLED just below, needed for one real
+// reason: the `arm64` cross-build target (see the Makefile's own comment) has no C++ cross-compiler
+// or cross-built Eigen wired up, so it builds with this off, and every bridge-touching line below
+// (not the harmless plain-data FX_TYPE_NAM enum value/param layout/wire fields, which stay
+// identical either way so a project file is portable between an HDS_NAM_ENABLED and non-enabled
+// build) is guarded accordingly. On by default -- unlike PipeWire, this isn't probing for an
+// optional system package (Eigen/NeuralAmpModelerCore are vendored, always present), so every
+// normal x86_64 build gets it for free with nothing to detect.
+#ifndef HDS_NAM_ENABLED
+#define HDS_NAM_ENABLED 1
+#endif
+#if HDS_NAM_ENABLED
+#include "nam_bridge.h" // extern "C" shim over NeuralAmpModelerCore -- see that header's own
+                         // comment and FX_TYPE_NAM below; this is the ONLY C++ this file touches,
+                         // and only indirectly through these few functions.
+#endif
+
 // Optional native PipeWire backend, alongside the always-present ALSA backend (see the "Audio
 // platform shim" section further down) -- HDS_PIPEWIRE_ENABLED is set by the Makefile via a
 // pkg-config auto-detection at build time (1 when libpipewire-0.3 is found, e.g. inside
@@ -459,6 +478,26 @@ typedef struct {
 // from stale state. param[0] Lowpass (0 = darkest/most filtered, 1 = fully open/bypassed),
 // param[1] Hipass (0 = fully open/bypassed, 1 = most filtered).
 #define FX_TYPE_CABS2 9
+// Neural Amp Modeler (NeuralAmpModelerCore, MIT license, vendored under
+// third_party/NeuralAmpModelerCore -- see nam_bridge.h/.cpp, the only C++ this codebase touches).
+// Runs a trained .nam amp-model file (a WaveNet or LSTM network, NOT an EQ/filter approximation
+// like GuitarConditioner/Cabs2 above) through two independent model instances, one per channel, so
+// each side's own convolution/hidden-state history stays genuinely separate -- see run_fx_nam()'s
+// own comment on why sharing one instance between L/R would be wrong. An optional cabinet
+// impulse-response convolution stage follows the model (NeuralAmpModelerCore itself only ships a
+// raw WAV-decode helper, not a ready convolution engine -- see run_fx_nam()'s own comment on why
+// this file's existing seq_audio_load_wav_from_disk() plus a hand-rolled direct-form FIR was used
+// instead of a second file-format dependency). param[0] Input Gain (0.0-1.0 like every other
+// effect's param[] -- see run_fx_nam()'s own comment for the +/-20dB mapping, pre-model trim: most
+// trained models expect a specific input level, this is how you match a hotter or quieter source
+// to what the model was trained on), param[1] Output Gain (same +/-20dB mapping, post-model/
+// post-cab makeup gain), param[2] Cab Enable (0/1 -- lets a loaded cab IR be A/B'd against the bare
+// model without unloading it). Model and cab IR are loaded via two dedicated string fields, nam_model_path and
+// nam_ir_path (see their own OSC_STRING_SUBARRAY registration below and poll_fx_nam_requests()'s
+// own comment on why a plain generic string field, not a dedicated load message, is exactly the
+// right mechanism here -- it's the same one Sequencer audio lanes already use for their own
+// audio_path).
+#define FX_TYPE_NAM 10
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -489,6 +528,13 @@ typedef struct {
     // mode (every slot there is already chained unconditionally) and on the last slot in the
     // array (there is no "next" to chain into). See process_fx_chain()'s own comment.
     float chain_to_next;
+    // FX_TYPE_NAM's own loaded-file paths (unused by every other effect type -- harmless dead
+    // bytes on their slots, same posture as param[] entries an effect doesn't read). Plain string
+    // fields, not a dedicated load message: see poll_fx_nam_requests()'s own comment for why this
+    // exact mechanism (already used by Sequencer audio lanes' own audio_path) is the right one
+    // here, including how it makes a CLAP state restore reload correctly for free.
+    char nam_model_path[SAMPLE_PATH_LEN];
+    char nam_ir_path[SAMPLE_PATH_LEN];
 } FXSlotParams;
 
 // One source's assignment onto the hardware output pairs -- a many-to-many grid (a source can
@@ -3358,6 +3404,187 @@ static void run_fx_cabs2(FXSlotEngine *engine, const FXSlotParams *params, float
     *r = inputSampleR;
 }
 
+#if HDS_NAM_ENABLED
+// Forward declaration -- the real definition lives much further down (it's Sequencer audio lanes'
+// own WAV loader), but fx_nam_reload_ir() below needs to call it and run_fx_nam() itself needs to
+// sit up here, before process_fx_chain()'s switch, matching every other ported effect's own
+// position in this file.
+static float *seq_audio_load_wav_from_disk(const char *path, int *out_frames, int *out_channels, int *out_sample_rate);
+
+// --- FX_TYPE_NAM: Neural Amp Modeler (NeuralAmpModelerCore, MIT license) --- see FX_TYPE_NAM's
+// own comment above for the param map and why this needed a small C++ bridge (nam_bridge.h/.cpp)
+// at all. model_l/model_r are opaque nam::DSP* handles from that bridge -- genuinely two separate
+// model instances loaded from the SAME file, never one instance shared between channels, because
+// each carries real internal state (WaveNet dilated-conv history, LSTM hidden state) that must not
+// leak between L and R the same way this file's other stereo effects (Cabs2's dual iirPosition/
+// iirAngle arrays above, PointyGuitar's own per-channel bands) never share state either.
+//
+// Cab IR convolution is plain C, not more C++: NeuralAmpModelerCore's own wav.h only exposes a raw
+// decode helper (load_wav_ir), not a ready convolution engine, and this file already has a working
+// WAV decoder (seq_audio_load_wav_from_disk, used by Sequencer audio lanes) -- reusing it here
+// avoids a second file-format dependency for the one new thing actually needed: the convolution
+// loop itself, a plain per-sample ring-buffer dot product like every other hand-rolled effect in
+// this file.
+typedef struct {
+    void *model_l, *model_r;                 // bridge-owned nam::DSP*, NULL until a model is loaded
+    char loaded_model_path[SAMPLE_PATH_LEN];   // "" if none -- compared against fx.nam_model_path
+    bool model_load_failed;                    // sticky until the path changes again -- avoids
+                                                // retrying a known-bad file every single block
+
+    float *ir_l, *ir_r;                        // coefficients, read-only once loaded -- NULL if no
+                                                // cab loaded; ir_r == ir_l for a mono IR (safe to
+                                                // alias since neither is ever written after load)
+    int ir_taps;
+    // Per-channel convolution HISTORY -- unlike ir_l/ir_r above, these are never aliased even for
+    // a mono IR: each ring holds that channel's own past INPUT samples, which differ between L and
+    // R regardless of whether they share one set of coefficients. Sharing these the way ir_l/ir_r
+    // can be shared would have L's and R's samples overwriting each other in the same ring.
+    float *ir_hist_l, *ir_hist_r;
+    int ir_hist_pos_l, ir_hist_pos_r;
+    char loaded_ir_path[SAMPLE_PATH_LEN];
+    bool ir_load_failed;
+} FxNamState;
+
+// A direct time-domain FIR: real guitar cab IRs decay within tens of milliseconds, so this cap
+// (~85ms at 48kHz) comfortably covers them while bounding the O(taps) per-sample cost this
+// approach has -- see poll_fx_nam_requests()'s own comment on why this is loaded on the main
+// thread rather than the realtime audio thread despite that cost.
+#define FX_NAM_IR_MAX_TAPS 4096
+
+static void fx_nam_free_ir(FxNamState *st) {
+    if (st->ir_r && st->ir_r != st->ir_l) free(st->ir_r);
+    free(st->ir_l);
+    st->ir_l = NULL; st->ir_r = NULL;
+    // ir_hist_l/ir_hist_r are always two independent allocations (see the struct's own comment on
+    // why they're never aliased even when ir_l/ir_r are) -- both are simply freed, no alias check.
+    free(st->ir_hist_l); free(st->ir_hist_r);
+    st->ir_hist_l = NULL; st->ir_hist_r = NULL;
+    st->ir_taps = 0;
+    st->ir_hist_pos_l = 0; st->ir_hist_pos_r = 0;
+}
+
+// Releases everything an FxNamState owns OTHER than the struct itself. Called from
+// sync_fx_engine_types() right before ITS OWN generic free(fx_engine[s].state) whenever a slot
+// changes away from FX_TYPE_NAM -- that generic free() is a plain libc free(), correct for every
+// other effect's plain-old-data state struct, but model_l/model_r point at real C++ objects
+// (owning Eigen matrices and weight vectors of their own) that a bare free() would leak rather than
+// destroy. This function's job is exactly that: run the proper destructor (via the bridge) on
+// anything that needs one, so the generic free() right after it only has to reclaim the outer
+// struct's own flat memory, same as any other effect's state.
+static void fx_nam_free_state(FxNamState *st) {
+    hds_nam_destroy(st->model_l);
+    hds_nam_destroy(st->model_r);
+    fx_nam_free_ir(st);
+}
+
+static void fx_nam_reload_model(FxNamState *st, const char *path) {
+    hds_nam_destroy(st->model_l); st->model_l = NULL;
+    hds_nam_destroy(st->model_r); st->model_r = NULL;
+    snprintf(st->loaded_model_path, SAMPLE_PATH_LEN, "%s", path);
+    st->model_load_failed = false;
+    if (path[0] == '\0') return; // cleared -- leave both NULL, run_fx_nam() then passes dry
+    // num_frames=1 is this call's own real usage pattern (see run_fx_nam()), but Reset() still
+    // wants a genuine max-block-size hint for any internal buffer sizing the model does up front.
+    st->model_l = hds_nam_create(path, (double)SAMPLE_RATE, 1);
+    st->model_r = hds_nam_create(path, (double)SAMPLE_RATE, 1);
+    if (!st->model_l || !st->model_r) {
+        fprintf(stderr, "[nam] failed to load model '%s'\n", path);
+        hds_nam_destroy(st->model_l); st->model_l = NULL;
+        hds_nam_destroy(st->model_r); st->model_r = NULL;
+        st->model_load_failed = true;
+    }
+}
+
+static void fx_nam_reload_ir(FxNamState *st, const char *path) {
+    fx_nam_free_ir(st);
+    snprintf(st->loaded_ir_path, SAMPLE_PATH_LEN, "%s", path);
+    st->ir_load_failed = false;
+    if (path[0] == '\0') return; // cleared -- leave NULL, run_fx_nam() then skips the cab stage
+
+    int frames = 0, channels = 0, sample_rate = 0;
+    float *pcm = seq_audio_load_wav_from_disk(path, &frames, &channels, &sample_rate);
+    if (!pcm || frames <= 0) { st->ir_load_failed = true; free(pcm); return; }
+
+    int taps = frames;
+    bool truncated = false;
+    if (taps > FX_NAM_IR_MAX_TAPS) { taps = FX_NAM_IR_MAX_TAPS; truncated = true; }
+
+    st->ir_l = malloc(sizeof(float) * (size_t)taps);
+    bool stereo = channels >= 2;
+    st->ir_r = stereo ? malloc(sizeof(float) * (size_t)taps) : st->ir_l;
+    if (!st->ir_l || (stereo && !st->ir_r)) {
+        fx_nam_free_ir(st); st->ir_load_failed = true; free(pcm); return;
+    }
+    for (int i = 0; i < taps; i++) {
+        st->ir_l[i] = pcm[(size_t)i * channels];
+        if (stereo) st->ir_r[i] = pcm[(size_t)i * channels + 1];
+    }
+    free(pcm);
+
+    st->ir_taps = taps;
+    // Always two independent rings, even for a mono IR -- see the struct's own comment on why
+    // ir_hist_l/ir_hist_r must never alias the way ir_l/ir_r (read-only coefficients) safely can.
+    st->ir_hist_l = calloc((size_t)taps, sizeof(float));
+    st->ir_hist_r = calloc((size_t)taps, sizeof(float));
+    st->ir_hist_pos_l = 0; st->ir_hist_pos_r = 0;
+    if (!st->ir_hist_l || !st->ir_hist_r) { fx_nam_free_ir(st); st->ir_load_failed = true; return; }
+
+    if (truncated) fprintf(stderr, "[nam] cab IR '%s' truncated to %d taps (was %d)\n", path, taps, frames);
+    if (sample_rate != 0 && sample_rate != SAMPLE_RATE) {
+        fprintf(stderr, "[nam] cab IR '%s' is %d Hz, engine runs at %d Hz -- loaded as-is, uncorrected\n", path, sample_rate, SAMPLE_RATE);
+    }
+}
+
+// One tap of the direct-form FIR: writes this sample into the ring, then walks it oldest-to-newest
+// against the IR (coeffs[0] is the IR's first/earliest tap) -- a plain per-sample convolution, the
+// same shape as any other hand-rolled filter in this file, just with a data-driven (not fixed-size)
+// coefficient count.
+static inline float fx_nam_convolve_tap(float *hist, int taps, int *pos, const float *coeffs, float in) {
+    hist[*pos] = in;
+    float acc = 0.0f;
+    int idx = *pos;
+    for (int i = 0; i < taps; i++) {
+        acc += coeffs[i] * hist[idx];
+        idx--; if (idx < 0) idx = taps - 1;
+    }
+    *pos += 1; if (*pos >= taps) *pos = 0;
+    return acc;
+}
+
+static void run_fx_nam(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxNamState *st = (FxNamState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxNamState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+
+    // param[0]/param[1] arrive as the same 0.0-1.0 fraction every other effect's param[] uses
+    // (see FX_SLOT_PARAM_COUNT's own comment and e.g. Cabs2/Density3 above) -- this effect's own
+    // meaning for that fraction is a +/-20dB trim, linearly mapped (0.5 = 0dB, matching the
+    // frontend dial's own default-at-midpoint convention for a centered knob).
+    float input_gain_db = (params->param[0] - 0.5f) * 40.0f;
+    float output_gain_db = (params->param[1] - 0.5f) * 40.0f;
+    float input_gain = powf(10.0f, input_gain_db / 20.0f);
+    float output_gain = powf(10.0f, output_gain_db / 20.0f);
+    bool cab_enabled = params->param[2] != 0.0f;
+
+    float sl = *l * input_gain, sr = *r * input_gain;
+    if (st->model_l && st->model_r) {
+        hds_nam_process(st->model_l, &sl, 1);
+        hds_nam_process(st->model_r, &sr, 1);
+    } // no model loaded (or load failed) -- passes the (gain-adjusted) dry signal straight through
+
+    if (cab_enabled && st->ir_l && st->ir_r) {
+        sl = fx_nam_convolve_tap(st->ir_hist_l, st->ir_taps, &st->ir_hist_pos_l, st->ir_l, sl);
+        sr = fx_nam_convolve_tap(st->ir_hist_r, st->ir_taps, &st->ir_hist_pos_r, st->ir_r, sr);
+    }
+
+    *l = sl * output_gain;
+    *r = sr * output_gain;
+}
+#endif // HDS_NAM_ENABLED
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -3419,6 +3646,14 @@ static void sync_fx_engine_types(const FXSlotParams fx_params[FX_SLOT_COUNT], FX
     for (int s = 0; s < FX_SLOT_COUNT; s++) {
         int type = (int)fx_params[s].fx_type;
         if (type != fx_engine[s].active_type) {
+            // FX_TYPE_NAM's state owns real C++ objects (via the bridge) that a bare free() would
+            // leak rather than destroy -- see fx_nam_free_state()'s own comment. Every other
+            // effect's state is plain data, safe for the generic free() below exactly as before.
+#if HDS_NAM_ENABLED
+            if (fx_engine[s].active_type == FX_TYPE_NAM && fx_engine[s].state) {
+                fx_nam_free_state((FxNamState *)fx_engine[s].state);
+            }
+#endif
             free(fx_engine[s].state);
             fx_engine[s].state = NULL;
             fx_engine[s].active_type = type;
@@ -3469,6 +3704,9 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                 case FX_TYPE_POINTYGUITAR: run_fx_pointyguitar(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_GUITARCONDITIONER: run_fx_guitarconditioner(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_CABS2: run_fx_cabs2(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+#if HDS_NAM_ENABLED
+                case FX_TYPE_NAM: run_fx_nam(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+#endif
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through
@@ -4453,6 +4691,15 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SUBARRAY("/hds/fx/%d/source", fx, FXSlotParams, fx_source, FX_SLOT_COUNT),
     OSC_SUBARRAY("/hds/fx/%d/chain_to_next", fx, FXSlotParams, chain_to_next, FX_SLOT_COUNT),
     OSC_NESTED("/hds/fx/%d/param/%d", fx, FXSlotParams, param, FX_SLOT_COUNT, FX_SLOT_PARAM_COUNT),
+    // FX_TYPE_NAM's own loaded-file paths -- plain string fields, generically saved/restored by
+    // CLAP state (see clap_state_save/load's own K/T-line walk over this whole table) with no
+    // special-casing needed there at all. Setting one of these live has no side effect by itself
+    // (same as every other OSC_STRING_SUBARRAY field, e.g. Sequencer's own audio_path) -- the
+    // actual model/IR (re)load happens once per block in poll_fx_nam_requests(), which notices the
+    // path changed and does the real work, whether it changed via a live OSC message or a CLAP
+    // state restore replaying this same field. See that function's own comment.
+    OSC_STRING_SUBARRAY("/hds/fx/%d/nam_model_path", fx, FXSlotParams, nam_model_path, FX_SLOT_COUNT, SAMPLE_PATH_LEN),
+    OSC_STRING_SUBARRAY("/hds/fx/%d/nam_ir_path", fx, FXSlotParams, nam_ir_path, FX_SLOT_COUNT, SAMPLE_PATH_LEN),
     OSC_ARRAY("/hds/fx_routing/%d/mode", fx_source_routing_mode, SOURCE_COUNT),
 
     // --- Multi-output hardware routing: which output pair(s) each source lands on ---
@@ -5165,6 +5412,8 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->fx[f].bypass = 0.0f;
         knobs->fx[f].fx_source = 0.0f; // Program -- reproduces today's exact behavior by default
         knobs->fx[f].chain_to_next = 0.0f; // every slot its own one-slot branch in Parallel mode -- today's exact behavior
+        knobs->fx[f].nam_model_path[0] = '\0';
+        knobs->fx[f].nam_ir_path[0] = '\0';
     }
     // Routing defaults: only the Program is routed anywhere (to output pair 0, i.e. today's only
     // output pair), every ext-in pair unrouted, every source's own FX chain in Series -- this
@@ -6458,6 +6707,40 @@ static void poll_seq_audio_load_requests(HdsStreamsState *streams, const SynthSh
         }
     }
 }
+
+#if HDS_NAM_ENABLED
+// Same "once-per-block change detection" shape as poll_seq_audio_load_requests() just above --
+// notices when an FX slot's nam_model_path/nam_ir_path differs from what that slot's own state
+// already has loaded, and (re)loads it. Unlike Sequencer audio lanes, this runs the load
+// SYNCHRONOUSLY on this thread (the same one OSC dispatch and audio rendering both run on -- see
+// this file's own single-threaded-main-loop design) rather than spawning a loader thread: a .nam
+// model file is a small, bounded JSON+weights blob (nothing like a whole song-length audio
+// recording), and a cab IR is capped at FX_NAM_IR_MAX_TAPS frames -- both comfortably finish within
+// one block's worth of stall, the same bet load_sample_slot() already makes for a sample zone's WAV
+// header + pre-roll. A real streaming thread would be the right call for something unboundedly
+// large; neither of these is.
+//
+// Only meaningful once a slot's own engine state actually exists as an FxNamState -- gated on
+// active_type == FX_TYPE_NAM, which sync_fx_engine_types() (called once per block from
+// render_audio_block, before this in the same iteration -- see main()'s own loop) guarantees is
+// current for any type change already applied by the time this runs; a slot switched to
+// FX_TYPE_NAM within the SAME block this runs simply picks up its load on the next block instead,
+// same one-block grace every other live-knob check in this loop already has.
+static void poll_fx_nam_requests(FXSlotEngine fx_engine[FX_SLOT_COUNT], const SynthSharedControls *knobs) {
+    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+        if (fx_engine[s].active_type != FX_TYPE_NAM || !fx_engine[s].state) continue;
+        FxNamState *st = (FxNamState *)fx_engine[s].state;
+        const char *want_model = knobs->fx[s].nam_model_path;
+        if (strncmp(want_model, st->loaded_model_path, SAMPLE_PATH_LEN) != 0) {
+            fx_nam_reload_model(st, want_model);
+        }
+        const char *want_ir = knobs->fx[s].nam_ir_path;
+        if (strncmp(want_ir, st->loaded_ir_path, SAMPLE_PATH_LEN) != 0) {
+            fx_nam_reload_ir(st, want_ir);
+        }
+    }
+}
+#endif // HDS_NAM_ENABLED
 
 // Renders one sample of preview playback for a single Sequencer audio lane (see the "Preview"
 // button comment on SeqLaneState.audio_preview_trigger), applying the lane's own volume/pan
@@ -12369,6 +12652,9 @@ int main(int argc, char **argv) {
         // dispatched, so nothing further is needed here once this returns 0 (no more pending).
         while (lo_server_recv_noblock(osc_server, 0) > 0) {}
         poll_seq_audio_load_requests(&g_streams_state, &active_knobs); // spawns a loader thread if a lane's audio_path changed
+#if HDS_NAM_ENABLED
+        poll_fx_nam_requests(g_engine.fx_engine, &active_knobs); // (re)loads a slot's .nam model/cab IR if its path changed
+#endif
         poll_seq_audio_preview_triggers(&g_streams_state, &active_knobs); // starts one-shot playback if a lane's Preview button was clicked
 
         // Programmable tempo: resolved once per block from the Tempo knob/tempo-map (see

@@ -27,6 +27,56 @@ $(info PipeWire backend (--backend pipewire): $(if $(filter 1,$(PIPEWIRE_AVAILAB
 
 BIN := synth_engine
 SRC := src/backend.c
+BUILD_DIR := build
+BIN_OBJ := $(BUILD_DIR)/backend.o
+CLAP_OBJ := $(BUILD_DIR)/clap_plugin.o
+
+# --- Neural Amp Modeler FX slot (FX_TYPE_NAM in backend.c) ---
+# NeuralAmpModelerCore is a C++/Eigen library with no C API -- src/nam_bridge.cpp is the one
+# extern "C" shim backend.c calls into (see its own header comment), and this is the ONLY C++ in
+# HDS. Both Eigen and NeuralAmpModelerCore are vendored whole under third_party/ (not a system
+# package like PipeWire -- there is nothing to auto-detect, so unlike HDS_PIPEWIRE_ENABLED's
+# pkg-config probe, this is simply on by default. $(BIN)/$(CLAP_BIN) are therefore now built as
+# C objects compiled by $(CC) and C++ objects compiled by $(CXX), linked together by $(CXX) (the
+# only correct final link driver for a mixed C/C++ binary -- see $(BIN)/clap's own rules below).
+#
+# Deliberately NOT wired into the `arm64` target: no C++ cross-compiler or cross-built Eigen is
+# configured for that toolchain (see arm64's own comment block), so that build instead compiles
+# with -DHDS_NAM_ENABLED=0 (see backend.c's own guard) and links as plain C exactly as before --
+# selecting FX_TYPE_NAM on that build is a harmless silent pass-through, same as any other
+# unhandled fx_type value.
+NAM_DIR := third_party/NeuralAmpModelerCore
+EIGEN_DIR := third_party/eigen
+NAM_BUILD_DIR := $(BUILD_DIR)/nam
+NAM_INC := -I$(NAM_DIR) -I$(NAM_DIR)/Dependencies/nlohmann -I$(EIGEN_DIR)
+# -fPIC unconditionally, not just for the `clap` target's shared-object link: these objects are
+# shared between $(BIN) (a plain executable) and $(CLAP_BIN) (a shared object, which REQUIRES
+# every object linked into it to be position-independent or the link fails outright) -- PIC code
+# runs correctly in a plain executable too (most distros build PIE executables by default anyway),
+# so there is no correctness cost to always compiling it this way, only the ability to reuse one
+# object set for both targets instead of building everything twice.
+NAM_CXXFLAGS := -O2 -std=c++20 -fPIC $(NAM_INC)
+NAM_SRCS := \
+	$(NAM_DIR)/NAM/activations.cpp \
+	$(NAM_DIR)/NAM/container.cpp \
+	$(NAM_DIR)/NAM/conv1d.cpp \
+	$(NAM_DIR)/NAM/convnet.cpp \
+	$(NAM_DIR)/NAM/dsp.cpp \
+	$(NAM_DIR)/NAM/get_dsp.cpp \
+	$(NAM_DIR)/NAM/linear.cpp \
+	$(NAM_DIR)/NAM/lstm.cpp \
+	$(NAM_DIR)/NAM/nam_file.cpp \
+	$(NAM_DIR)/NAM/ring_buffer.cpp \
+	$(NAM_DIR)/NAM/sequential.cpp \
+	$(NAM_DIR)/NAM/util.cpp \
+	$(NAM_DIR)/NAM/wav.cpp \
+	$(NAM_DIR)/NAM/wavenet/a2_fast.cpp \
+	$(NAM_DIR)/NAM/wavenet/model.cpp \
+	$(NAM_DIR)/NAM/wavenet/slimmable.cpp \
+	src/nam_bridge.cpp
+# Flattened into one directory (no name collisions between NAM/, NAM/wavenet/, and src/ -- verified
+# by hand against the list above) so the three pattern rules below can all target it uniformly.
+NAM_OBJS := $(addprefix $(NAM_BUILD_DIR)/,$(notdir $(NAM_SRCS:.cpp=.o)))
 
 # --- Linux CLAP plugin ---
 # Produces hds.clap (a plain ELF shared object under the required .clap extension -- real hosts
@@ -95,17 +145,39 @@ ARM64_LIBDIR := arm64-libs
 
 all: $(BIN)
 
-$(BIN): $(SRC)
-	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -o $@ $< $(LDLIBS) $(PIPEWIRE_LDLIBS)
+$(BUILD_DIR) $(NAM_BUILD_DIR):
+	mkdir -p $@
 
-clap: $(CLAP_SRC)
-	$(CC) $(CFLAGS) -fPIC -shared -I$(CLAP_INC) -o $(CLAP_BIN) $(CLAP_SRC) $(LDLIBS)
+# backend.c/clap_plugin.c stay plain C, compiled by $(CC) exactly as before -- only the FINAL link
+# step (below) needs $(CXX), to pull in libstdc++ for the NAM objects linked alongside them.
+$(BIN_OBJ): $(SRC) src/nam_bridge.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -c $(SRC) -o $@
+
+$(CLAP_OBJ): $(CLAP_SRC) src/nam_bridge.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
+
+# Three source directories (NAM/, NAM/wavenet/, src/) flattened into one object directory -- see
+# NAM_OBJS's own comment on why this is safe (no basename collisions).
+$(NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/%.cpp | $(NAM_BUILD_DIR)
+	$(CXX) $(NAM_CXXFLAGS) -c $< -o $@
+
+$(NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp | $(NAM_BUILD_DIR)
+	$(CXX) $(NAM_CXXFLAGS) -c $< -o $@
+
+$(NAM_BUILD_DIR)/%.o: src/%.cpp | $(NAM_BUILD_DIR)
+	$(CXX) $(NAM_CXXFLAGS) -c $< -o $@
+
+$(BIN): $(BIN_OBJ) $(NAM_OBJS)
+	$(CXX) -o $@ $(BIN_OBJ) $(NAM_OBJS) $(LDLIBS) $(PIPEWIRE_LDLIBS)
+
+clap: $(CLAP_OBJ) $(NAM_OBJS)
+	$(CXX) -shared -o $(CLAP_BIN) $(CLAP_OBJ) $(NAM_OBJS) $(LDLIBS)
 
 ARM64_INTERP := /lib/ld-linux-aarch64.so.1
 
 arm64: $(SRC)
 	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
-	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -o $(ARM64_BIN) $(SRC) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo
+	$(ARM64_CC) $(CFLAGS) -DHDS_NAM_ENABLED=0 $(ARM64_CFLAGS) -o $(ARM64_BIN) $(SRC) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo
 	mkdir -p $(ARM64_LIBDIR)
 	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
 	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_BIN)
@@ -118,4 +190,4 @@ run-frontend:
 
 clean:
 	rm -f $(BIN) $(CLAP_BIN) $(ARM64_BIN)
-	rm -rf $(ARM64_LIBDIR)
+	rm -rf $(ARM64_LIBDIR) $(BUILD_DIR)

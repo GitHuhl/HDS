@@ -995,6 +995,51 @@ the only failure is the audio device open (`libasound.so.2` / a real sound card)
 expected, documented, by-design gap this environment can't supply either (no real ALSA hardware in
 a sandbox, same as the Pi needs its own `apt-get install libasound2`).
 
+### Neural Amp Modeler (NAM) FX slot
+
+An FX slot (Type: `NAM`) that runs a trained [NeuralAmpModelerCore](https://github.com/sdatkinson/NeuralAmpModelerCore)
+amp model (a WaveNet or LSTM network trained to mimic a real amp/pedal's own nonlinear response --
+genuinely different from, and generally far more accurate than, the filter-based amp/cab shaping
+`GuitarConditioner`/`Cabs2` already provide) plus an optional cabinet impulse-response convolution
+stage after it. Three knobs: **Input Gain** and **Output Gain** (+/-20dB trim before/after the
+model -- most trained models expect a specific input level, so this is how you match a hotter or
+quieter source, and add makeup gain afterward) and **Cab Enable** (A/B a loaded cab IR against the
+bare model without unloading it). Two buttons on the slot itself, **Mdl** and **Cab**, each open a
+file picker -- `.nam` for the model, a mono or stereo `.wav` for the cabinet impulse response --
+and the loaded file's path is saved with everything else (a Program file, a DAW's own saved CLAP
+state) exactly like a Sample Bank zone's own file path already is, so a saved patch reloads its
+model/cab automatically.
+
+**Why this needed any C++ at all**: NeuralAmpModelerCore is a C++/Eigen library with no C API of
+its own, and this is otherwise an all-C codebase. `src/nam_bridge.h`/`.cpp` is the entire cost of
+that: a handful of `extern "C"` functions (`hds_nam_create`/`process`/`destroy`) wrapping the real
+C++ API, compiled as its own translation unit and linked into the otherwise-C `synth_engine`/
+`hds.clap` binaries via `g++` as the final link driver -- `backend.c` itself never sees a line of
+C++. Both NeuralAmpModelerCore and Eigen (its own linear-algebra dependency, needed only for
+`<Eigen/Dense>` and the FFT module one of NAM's layers uses) are vendored whole under `third_party/`
+(pinned to Eigen 3.4.0, the long-standing stable release, not the library's own bleeding-edge
+default branch) -- not a system package like PipeWire above, since there's nothing to
+version-mismatch against by vendoring a fixed copy, and every normal build gets this for free with
+nothing to `apt-get install`.
+
+**Two independent model instances per slot** (one per channel), not one shared between L and R --
+each carries real internal state (WaveNet dilated-convolution history, LSTM hidden state) that must
+never leak between channels, the same principle every other stereo effect in `backend.c` already
+follows for its own per-channel filter memory. The cabinet stage is plain C, not more C++:
+NeuralAmpModelerCore's own `wav.h` only exposes a raw WAV-decode helper, not a ready convolution
+engine, so the cab stage reuses this file's own existing WAV loader (`seq_audio_load_wav_from_disk`,
+already used by Sequencer audio lanes) into a hand-rolled direct-form FIR (capped at 4096 taps,
+~85ms at 48kHz -- comfortably covers real guitar cab IRs, which decay within tens of milliseconds)
+rather than pulling in a second file-format dependency for the one thing actually needed.
+
+**Not wired into the `make arm64` cross-build**: no C++ cross-compiler or cross-built Eigen is
+configured for that toolchain (see the Makefile's own comment on why bundling a pure-C-only
+dependency like liblo is straightforward but a real C++ numerical library isn't, for a target this
+session hasn't set up nix-shell for). That build instead compiles with `-DHDS_NAM_ENABLED=0` (see
+`backend.c`'s own guard around every bridge-touching line), which selecting `NAM` as an FX Type on
+that build falls through to as a harmless silent pass-through -- exactly like any other unhandled
+`fx_type` value already does today, not a crash or a build break.
+
 ### Control protocol: OSC
 
 The backend is controlled entirely over OSC (Open Sound Control), via a

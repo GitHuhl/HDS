@@ -784,7 +784,23 @@ FX_TYPE_METADATA = [
         {"label": "Lowpass", "range": (0, 100), "default": 100},
         {"label": "Hipass", "range": (0, 100), "default": 0},
     ]},
+    {"name": "NAM", "params": [
+        # +/-20dB, dial default 50 = the 0.0-1.0 fraction's own midpoint = 0dB -- see run_fx_nam()'s
+        # own comment in backend.c for the exact mapping. Model/cab-IR loading isn't a param at all
+        # (see the Load Model/Load Cab IR buttons this FX type gets in the slot UI, right below the
+        # dials -- _apply_fx_slot_type wires those up) -- it's two plain path fields the frontend
+        # sets directly by OSC address, the same mechanism Sequencer audio lanes' own "Load Audio"
+        # button already uses for audio_path.
+        {"label": "Input Gain", "range": (0, 100), "default": 50},
+        {"label": "Output Gain", "range": (0, 100), "default": 50},
+        {"label": "Cab Enable", "type": "choice", "options": ["Off", "On"], "default": 1},
+    ]},
 ]
+# NAM's own index into the list above -- it's the last entry, matching FX_TYPE_NAM=10 in
+# backend.c's own FX_TYPE_* enum exactly. Used only to show/hide the Model/Cab IR load buttons
+# (see _apply_fx_slot_type) -- every other type's own widgets are already handled generically by
+# FX_TYPE_METADATA's own params list, but "load a file" isn't a param at all.
+FX_TYPE_NAM = len(FX_TYPE_METADATA) - 1
 
 # Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --
 # must match the backend's own "auto"/empty-string convention in midi_client_should_autoconnect.
@@ -4610,6 +4626,15 @@ class SynthGui(QWidget):
         # Chain To Next -- see FXSlotParams.chain_to_next in backend.c and the button's own
         # tooltip/comment at its construction site below.
         self.fx_chain_to_next_buttons = []
+        # NAM-only Load Model / Load Cab IR buttons -- see their own construction-site comment and
+        # _apply_fx_slot_type (visibility) / _load_nam_model, _load_nam_ir (click handlers).
+        self.fx_nam_model_buttons, self.fx_nam_ir_buttons = [], []
+        # What each slot's own NAM buttons most recently loaded, purely for a status tooltip -- the
+        # backend is the actual source of truth (nam_model_path/nam_ir_path, saved/restored with
+        # everything else), this is only so the GUI shows *something* readable without needing a
+        # round-trip query. Indexed by slot; "" means nothing loaded (or not a NAM slot).
+        self.fx_nam_model_loaded = ["" for _ in range(FX_SLOT_COUNT)]
+        self.fx_nam_ir_loaded = ["" for _ in range(FX_SLOT_COUNT)]
         # Per-slot lists of the 8 generic param widgets, so _apply_fx_slot_type can relabel,
         # re-range/re-populate, and show/hide them once a slot's Type is known. Each param
         # position carries BOTH a knob and a combo (only one shown at a time) so a discrete
@@ -4685,6 +4710,27 @@ class SynthGui(QWidget):
             bypass_btn.setToolTip("Bypass this slot (keeps its state alive -- e.g. a delay's tail -- unlike switching Type to Off)")
             slot_lay.addWidget(bypass_btn)
             self.fx_bypass_buttons.append(bypass_btn)
+
+            # NAM-only: loads a .nam model / cab IR .wav by path, the same "OSC carries a path, the
+            # backend does the file I/O" shape _pick_and_load_scale already uses for Scala scales --
+            # see _load_nam_model/_load_nam_ir below. Always created (every slot's row has the same
+            # fixed widgets, matching every other per-slot button here) but only shown while this
+            # slot's Type is NAM -- see _apply_fx_slot_type.
+            nam_model_btn = QPushButton("Mdl")
+            nam_model_btn.setFixedSize(26, 22)
+            nam_model_btn.setStyleSheet("font-size: 8px;")
+            nam_model_btn.setToolTip("Load a .nam amp model file for this slot")
+            nam_model_btn.clicked.connect(lambda checked=False, s=slot_idx: self._load_nam_model(s))
+            slot_lay.addWidget(nam_model_btn)
+            self.fx_nam_model_buttons.append(nam_model_btn)
+
+            nam_ir_btn = QPushButton("Cab")
+            nam_ir_btn.setFixedSize(26, 22)
+            nam_ir_btn.setStyleSheet("font-size: 8px;")
+            nam_ir_btn.setToolTip("Load a cabinet impulse-response .wav file for this slot (see the Cab Enable param)")
+            nam_ir_btn.clicked.connect(lambda checked=False, s=slot_idx: self._load_nam_ir(s))
+            slot_lay.addWidget(nam_ir_btn)
+            self.fx_nam_ir_buttons.append(nam_ir_btn)
 
             # Chain To Next: only meaningful when this slot's SOURCE is running in Parallel mode
             # (see the per-source Series/Parallel toggles below) -- inert (harmless, no effect) in
@@ -5295,6 +5341,50 @@ class SynthGui(QWidget):
             panel.set_state(state)
             self.eg_dest_combos[i].setCurrentIndex(random.randint(0, self.eg_dest_combos[i].count() - 1))
 
+    def _load_nam_model(self, slot_idx):
+        """Loads a .nam amp-model file into FX slot slot_idx's own nam_model_path -- same "OSC
+        carries a path, the backend does the file I/O" shape as _pick_and_load_scale, and the same
+        once-per-block change-detection mechanism Sequencer audio lanes already use for their own
+        audio_path (see poll_fx_nam_requests() in backend.c): setting this field is enough by
+        itself, on a live edit or a restored CLAP/Program state alike, no separate load message
+        needed. No round-trip status message for this yet, so the button's tooltip updates
+        optimistically to the picked filename; a bad/unreadable model is instead reported on the
+        backend's own stderr."""
+        path, _ = QFileDialog.getOpenFileName(self, "Load NAM Model", "", "NAM model files (*.nam)")
+        if not path:
+            return
+        self._send_nam_path(slot_idx, "nam_model_path", path)
+        self.fx_nam_model_loaded[slot_idx] = path
+        self.fx_nam_model_buttons[slot_idx].setToolTip(f"Load a .nam amp model file for this slot\nLoaded: {os.path.basename(path)}")
+
+    def _load_nam_ir(self, slot_idx):
+        """Same as _load_nam_model just above, for FX slot slot_idx's cabinet impulse-response
+        (nam_ir_path) instead of its amp model -- see that method's own comment."""
+        path, _ = QFileDialog.getOpenFileName(self, "Load Cab IR", "", "WAV files (*.wav)")
+        if not path:
+            return
+        self._send_nam_path(slot_idx, "nam_ir_path", path)
+        self.fx_nam_ir_loaded[slot_idx] = path
+        self.fx_nam_ir_buttons[slot_idx].setToolTip(f"Load a cabinet impulse-response .wav file for this slot (see the Cab Enable param)\nLoaded: {os.path.basename(path)}")
+
+    def _send_nam_path(self, slot_idx, field, path):
+        """Sends one FX slot's nam_model_path/nam_ir_path by OSC -- shared by the Load buttons
+        above and _fx_slot_restore below (which also needs to move a NAM slot's loaded paths along
+        with everything else on a reorder, including sending "" to clear a destination slot that's
+        moving in a DIFFERENT slot's -- possibly empty -- paths). Also updates _last_wire_state
+        directly, same as transmit_knob_packet()'s own add_s() closure does for every OSC string it
+        sends (see __init__'s own comment on that dict) -- this bypasses transmit_knob_packet()
+        entirely (same one-off-message shape as _pick_and_load_scale), so without this, Program
+        Save's own `{addr: value for addr, value in self._last_wire_state.items() ...}` snapshot
+        would never learn this address was ever set, silently omitting a loaded NAM model/cab IR
+        from every saved Program."""
+        address = f"/hds/fx/{slot_idx}/{field}"
+        msg = OscMessageBuilder(address=address)
+        msg.add_arg(path, "s")
+        try: self.osc_client.send(msg.build())
+        except OSError: pass
+        self._last_wire_state[address] = path
+
     def _apply_fx_slot_type(self, slot_idx, type_index):
         """Reconfigures one FX slot's 8 generic param widgets for the effect Type just selected:
         relabels/re-ranges/shows the ones that effect actually uses (per FX_TYPE_METADATA) and
@@ -5332,6 +5422,9 @@ class SynthGui(QWidget):
                 dials[p_idx].setVisible(False)
                 combos[p_idx].setVisible(False)
                 columns[p_idx].setVisible(False)
+        is_nam = (type_index == FX_TYPE_NAM)
+        self.fx_nam_model_buttons[slot_idx].setVisible(is_nam)
+        self.fx_nam_ir_buttons[slot_idx].setVisible(is_nam)
 
     def _fx_slot_snapshot(self, slot_idx):
         """Captures everything that makes up one FX slot's configuration -- type, all 8 params
@@ -5355,6 +5448,10 @@ class SynthGui(QWidget):
             "mix": self.fx_mix_dials[slot_idx].value(),
             "bypass": self.fx_bypass_buttons[slot_idx].isChecked(),
             "chain_to_next": self.fx_chain_to_next_buttons[slot_idx].isChecked(),
+            # "" (nothing loaded) is captured just as faithfully as a real path -- see
+            # _fx_slot_restore's own comment on why a swap must send this even when empty.
+            "nam_model_path": self.fx_nam_model_loaded[slot_idx],
+            "nam_ir_path": self.fx_nam_ir_loaded[slot_idx],
         }
 
     def _fx_slot_restore(self, slot_idx, snapshot):
@@ -5389,6 +5486,18 @@ class SynthGui(QWidget):
         self.fx_chain_to_next_buttons[slot_idx].blockSignals(True)
         self.fx_chain_to_next_buttons[slot_idx].setChecked(snapshot["chain_to_next"])
         self.fx_chain_to_next_buttons[slot_idx].blockSignals(False)
+        # NAM's loaded model/cab IR live on the backend as plain path fields, not a dial/combo
+        # transmit_knob_packet() already covers -- move them explicitly, sending "" to clear a
+        # slot moving in another slot's empty path, so the backend never keeps a stale path for a
+        # position the UI now shows as unloaded (e.g. a NAM slot swapped with an Off slot).
+        for field, key, loaded_list, btn, tip in (
+            ("nam_model_path", "nam_model_path", self.fx_nam_model_loaded, self.fx_nam_model_buttons, "Load a .nam amp model file for this slot"),
+            ("nam_ir_path", "nam_ir_path", self.fx_nam_ir_loaded, self.fx_nam_ir_buttons, "Load a cabinet impulse-response .wav file for this slot (see the Cab Enable param)"),
+        ):
+            path = snapshot.get(key, "")
+            self._send_nam_path(slot_idx, field, path)
+            loaded_list[slot_idx] = path
+            btn[slot_idx].setToolTip(f"{tip}\nLoaded: {os.path.basename(path)}" if path else tip)
 
     def _swap_fx_slots(self, a, b):
         """Moves slot a's whole configuration to slot b's position and vice versa -- the row
@@ -6784,6 +6893,14 @@ class SynthGui(QWidget):
                 "mix": int(round(fields.get(f"/hds/fx/{slot_idx}/mix", self.fx_mix_dials[slot_idx].value()))),
                 "bypass": fields.get(f"/hds/fx/{slot_idx}/bypass", 0.0) != 0.0,
                 "chain_to_next": fields.get(f"/hds/fx/{slot_idx}/chain_to_next", 0.0) != 0.0,
+                # Both default to "" (not the widget's own current value) -- absent here means "this
+                # source genuinely has none," never "unknown, leave whatever was there," matching
+                # every other field above. On a reconnect's full-state dump these keys are always
+                # present (the backend's dump walks its whole dispatch table, empty string and
+                # all); on a Program file predating this feature they're legitimately absent, and
+                # "" is exactly the right value -- an old Program never had a NAM model to restore.
+                "nam_model_path": fields.get(f"/hds/fx/{slot_idx}/nam_model_path", ""),
+                "nam_ir_path": fields.get(f"/hds/fx/{slot_idx}/nam_ir_path", ""),
             }
             self._fx_slot_restore(slot_idx, snapshot)
 
