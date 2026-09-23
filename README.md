@@ -1082,6 +1082,38 @@ session hasn't set up nix-shell for). That build instead compiles with `-DHDS_NA
 that build falls through to as a harmless silent pass-through -- exactly like any other unhandled
 `fx_type` value already does today, not a crash or a build break.
 
+### Gate / EQ3 / Limiter FX slots
+
+Three more FX slot types, all plain C (no new dependencies), each a straightforward standalone
+effect rather than a ported third-party plugin:
+
+- **Gate** -- a simple, zero-latency noise gate. **Threshold** (-60..0dB) sets the level below which
+  the gate closes; **Attack** (0.1..20ms) and **Release** (5..500ms) are independent exponential
+  ramp times for opening/closing; **Range** (0..-80dB) is how much the signal is attenuated while
+  closed (Range=0 makes the gate a no-op regardless of Threshold). "Zero-latency" means exactly
+  that: no lookahead buffer anywhere, so gain reduction is computed and applied to the very same
+  sample that crossed the threshold -- the same posture the master bus's own always-on safety
+  limiter takes (see below), and the tradeoff is the same one every zero-latency gate has: a very
+  hard, very sudden transient can leak a few ms of attack time before the gate finishes opening.
+- **EQ3** -- the Program's own post-filter 3-band EQ (Low Shelf/Mid Peak/High Shelf), ported
+  verbatim onto an FX slot: same RBJ Audio-EQ-Cookbook biquad math (`compute_eq_band_coeffs`/
+  `run_eq_biquad` in `backend.c`), same +/-18dB gain range per band, same fixed 0.707 Q on the
+  shelves with an adjustable Mid Q (0.1..10). The one real difference from the Program EQ's own
+  dedicated dial is Freq: that dial uses a raw 20Hz-20kHz range directly, but every other FX slot
+  param rides a generic 0-100 dial that reaches the backend as a plain 0.0-1.0 fraction, so this
+  slot's Freq params use a log-frequency mapping (`20 * 1000^fraction`) to stay consistent with
+  every other effect's own dial convention instead of being a special case.
+- **Limiter** -- a digital brick-wall peak limiter: **Ceiling** (-20..0dB, the hard output cap),
+  **Input Gain** (0..+24dB, drive into the limiter), **Release** (10..500ms). Instant-attack (gain
+  reduction is computed and applied to the same sample, so nothing can ever exceed Ceiling even on
+  the very first sample of a transient) with an exponential smooth release back toward unity gain
+  -- the exact same technique `render_audio_block`'s own always-on master bus safety limiter already
+  uses, just exposed as a slot with its own adjustable Ceiling/Input Gain/Release instead of that
+  fixed, hardcoded safety net. Deliberately **not** a port of Waves L1: L1 is closed-source with no
+  public algorithm reference to port from, so this is an original implementation of the same
+  well-known instant-attack/smooth-release brick-wall technique real limiters (L1 included) are
+  built on, not a clone of L1's own internals.
+
 ### Control protocol: OSC
 
 The backend is controlled entirely over OSC (Open Sound Control), via a

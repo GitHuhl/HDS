@@ -800,11 +800,46 @@ FX_TYPE_METADATA = [
         {"label": "Cab Enable", "type": "choice", "options": ["Off", "On"], "default": 1},
     ]},
 ]
-# NAM's own index into the list above -- it's the last entry, matching FX_TYPE_NAM=10 in
-# backend.c's own FX_TYPE_* enum exactly. Used only to show/hide the Model/Cab IR load buttons
-# (see _apply_fx_slot_type) -- every other type's own widgets are already handled generically by
+# NAM's own index into the list above. Captured here (rather than "last entry") because Gate/
+# EQ3/Limiter are appended after it below -- must match FX_TYPE_NAM=10 in backend.c's own
+# FX_TYPE_* enum exactly. Used only to show/hide the Model/Cab IR load buttons (see
+# _apply_fx_slot_type) -- every other type's own widgets are already handled generically by
 # FX_TYPE_METADATA's own params list, but "load a file" isn't a param at all.
 FX_TYPE_NAM = len(FX_TYPE_METADATA) - 1
+
+FX_TYPE_METADATA += [
+    {"name": "Gate", "params": [
+        # A simple, zero-latency noise gate -- no lookahead, so a hard-transient source can clip
+        # a few ms of attack before the gate opens (see FX_TYPE_GATE's own comment in backend.c).
+        {"label": "Threshold", "range": (0, 100), "default": 50},  # -60..0dB
+        {"label": "Attack", "range": (0, 100), "default": 0},      # 0.1..20ms
+        {"label": "Release", "range": (0, 100), "default": 20},    # 5..500ms
+        {"label": "Range", "range": (0, 100), "default": 100},     # 0..-80dB attenuation when closed
+    ]},
+    {"name": "EQ3", "params": [
+        # The Program's own post-filter 3-band EQ, ported to an FX slot -- same biquad math
+        # (compute_eq_band_coeffs/run_eq_biquad) as the Program EQ dials elsewhere in this file,
+        # but Freq here rides the generic 0-100 dial convention (log-mapped to 20Hz-20kHz on the
+        # backend) rather than that dedicated dial's own raw-Hz range -- see FX_TYPE_EQ3's own
+        # comment in backend.c.
+        {"label": "Low Freq", "range": (0, 100), "default": 15},   # ~56Hz
+        {"label": "Low Gain", "range": (0, 100), "default": 50},   # +/-18dB, 50=0dB
+        {"label": "Mid Freq", "range": (0, 100), "default": 50},   # ~630Hz
+        {"label": "Mid Gain", "range": (0, 100), "default": 50},   # +/-18dB, 50=0dB
+        {"label": "Mid Q", "range": (0, 100), "default": 30},      # 0.1..10
+        {"label": "High Freq", "range": (0, 100), "default": 85},  # ~7.1kHz
+        {"label": "High Gain", "range": (0, 100), "default": 50},  # +/-18dB, 50=0dB
+    ]},
+    {"name": "Limiter", "params": [
+        # A digital brick-wall peak limiter -- instant-attack/smooth-release gain reduction, the
+        # same technique the master bus's own always-on safety limiter uses (not a literal port of
+        # Waves L1, which is closed-source with no public algorithm reference -- see FX_TYPE_LIMITER's
+        # own comment in backend.c).
+        {"label": "Ceiling", "range": (0, 100), "default": 100},    # -20..0dB
+        {"label": "Input Gain", "range": (0, 100), "default": 0},   # 0..+24dB
+        {"label": "Release", "range": (0, 100), "default": 20},     # 10..500ms
+    ]},
+]
 
 # Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --
 # must match the backend's own "auto"/empty-string convention in midi_client_should_autoconnect.

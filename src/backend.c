@@ -500,6 +500,44 @@ typedef struct {
 // right mechanism here -- it's the same one Sequencer audio lanes already use for their own
 // audio_path).
 #define FX_TYPE_NAM 10
+// A simple, zero-latency noise gate -- no lookahead buffer anywhere (see run_fx_gate()'s own
+// comment), so nothing here ever delays the signal path; only the GAIN this applies is smoothed
+// (an envelope, not a delay), the same "instant reaction, no added latency" posture the master bus
+// safety limiter below already uses. param[0] Threshold (-60..0dB -- the level a signal must be
+// AT OR ABOVE for the gate to open), param[1] Attack (0.1..20ms -- how fast the gate opens once
+// above threshold), param[2] Release (5..500ms -- how fast it closes once below threshold, slow
+// enough to avoid audibly chopping a decaying note's own tail), param[3] Range (0..-80dB -- how
+// much the signal is attenuated while closed; 0 makes this whole effect a no-op by design, a real
+// "Range" knob's own honest zero position, not a magic bypass case). Both channels always share
+// one gain value (see run_fx_gate()'s own comment) so the stereo image is never skewed by one side
+// gating independently of the other.
+#define FX_TYPE_GATE 11
+// The Program's own post-filter 3-band EQ (see EqBandParams/compute_eq_band_coeffs/run_eq_biquad
+// above), ported here unchanged -- same RBJ Audio-EQ-Cookbook biquad forms, same Low Shelf/Mid
+// Peak/High Shelf topology, just callable per FX slot instead of only once per Program. param[0]
+// Low Shelf Freq, param[1] Low Shelf Gain, param[2] Mid Peak Freq, param[3] Mid Peak Gain,
+// param[4] Mid Peak Q, param[5] High Shelf Freq, param[6] High Shelf Gain -- Freq params use the
+// same 0.0-1.0 fraction every other effect's param[] does (see run_fx_eq3()'s own comment for the
+// log-frequency mapping this decodes it with, 20Hz-20kHz); Gain is +/-18dB, matching
+// compute_eq_band_coeffs()'s own clamp exactly (so this can never do anything the Program EQ
+// itself couldn't already do). Shelf bands ignore Q entirely, same as the original.
+#define FX_TYPE_EQ3 12
+// A digital brick-wall peak limiter: the DAC (or the next thing in the chain) is mathematically
+// guaranteed to never see a sample above Ceiling, the same "instant attack, so THIS sample can
+// never clip" technique the always-on master bus safety limiter (see its own comment, further
+// down near render_audio_block) already uses for the exact same guarantee, just user-controllable
+// per slot here instead of a fixed, hidden safety net. NOT a port of Waves' L1 Ultramaximizer --
+// L1 is closed-source with no public algorithm reference, unlike the MIT-licensed Airwindows
+// effects this file otherwise ports verbatim -- this is an original implementation of the same
+// well-known DSP TECHNIQUE L1 popularized (instant peak-limiting to a hard ceiling with no
+// lookahead, so zero added latency, unlike a true lookahead limiter which needs a delay line to
+// see a transient coming). param[0] Ceiling (-20..0dB -- the hard output ceiling), param[1] Input
+// Gain (0..+24dB -- drives the signal INTO the limiter harder for a louder, denser result without
+// raising the ceiling, the classic "loudness maximizer" use of this exact knob pair), param[2]
+// Release (10..500ms). Attack is NOT a param -- always instant, like the master limiter, since
+// that's the one thing that actually makes this "brick wall" (a slower attack would let a fast
+// transient through above Ceiling before the gain reduction catches up).
+#define FX_TYPE_LIMITER 13
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -3613,6 +3651,152 @@ static void run_fx_nam(FXSlotEngine *engine, const FXSlotParams *params, float *
 }
 #endif // HDS_NAM_ENABLED
 
+// --- FX_TYPE_GATE: a simple, zero-latency noise gate --- see FX_TYPE_GATE's own comment above for
+// the param map. No lookahead buffer anywhere in this function -- the ONLY thing smoothed is the
+// gain itself (an envelope follower), never the audio, so nothing here ever delays the signal
+// path. Both channels' peak feeds ONE shared envelope/gain value (never independent per-channel
+// gains), the same reasoning FX_TYPE_LIMITER/the master bus limiter below both already use: a
+// signal panned other than dead-center would otherwise open/close each channel at a slightly
+// different moment, audibly skewing the stereo image every time the gate moved at all.
+typedef struct {
+    float gain; // 0.0 (fully closed, at Range) .. 1.0 (fully open) -- starts at 1.0 (calloc gives
+                 // 0.0, which would wrongly gate the very first block's audio before any real
+                 // envelope has been established), fixed up on first use below.
+    bool initialized;
+} FxGateState;
+
+static void run_fx_gate(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxGateState *st = (FxGateState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxGateState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+    if (!st->initialized) { st->gain = 1.0f; st->initialized = true; } // open by default, not closed
+
+    float threshold_db = -60.0f + fmaxf(0.0f, fminf(1.0f, params->param[0])) * 60.0f;
+    float attack_ms = 0.1f + fmaxf(0.0f, fminf(1.0f, params->param[1])) * 19.9f;
+    float release_ms = 5.0f + fmaxf(0.0f, fminf(1.0f, params->param[2])) * 495.0f;
+    float range_db = -80.0f * fmaxf(0.0f, fminf(1.0f, params->param[3]));
+
+    float threshold_lin = powf(10.0f, threshold_db / 20.0f);
+    float range_lin = powf(10.0f, range_db / 20.0f);
+    float peak = fmaxf(fabsf(*l), fabsf(*r));
+    float target_gain = (peak >= threshold_lin) ? 1.0f : range_lin;
+
+    // Same "instant attack, exponential release toward target" shape as the master bus limiter
+    // below, just with both directions smoothed here (a gate's own attack must still be a short
+    // ramp, not a literal single-sample jump, or opening/closing would click audibly -- "zero-
+    // latency" means no signal delay, not an instant, click-prone gain step).
+    float rate_ms = (target_gain > st->gain) ? attack_ms : release_ms;
+    float rate = 1.0f - expf(-1.0f / (0.001f * rate_ms * (float)SAMPLE_RATE));
+    st->gain += (target_gain - st->gain) * rate;
+
+    *l *= st->gain;
+    *r *= st->gain;
+}
+
+// --- FX_TYPE_EQ3: the Program's own post-filter 3-band EQ, ported to an FX slot --- see
+// FX_TYPE_EQ3's own comment above for the param map. Reuses compute_eq_band_coeffs()/
+// run_eq_biquad() (see their own comments, far above) completely unchanged -- this is genuinely
+// the SAME EQ, not a re-derivation of it, so it can never behave differently from the Program EQ
+// version for the same Freq/Gain/Q settings.
+typedef struct {
+    float z1[3][2], z2[3][2]; // [band][channel] -- band 0=Low Shelf, 1=Mid Peak, 2=High Shelf
+} FxEq3State;
+
+// 0.0-1.0 fraction -> 20Hz-20kHz, log-spaced (equal knob distance = equal perceived pitch change,
+// same musical mapping a hardware EQ's own frequency knob uses) -- needed because, unlike the
+// Program EQ's own dedicated frontend dial (which is hardcoded directly to a 20-20000 Hz range,
+// see frontend.py's own eq_freq_dials), this FX slot's Freq params are two more generic P1-P10
+// dials like every other effect's params, which always transmit as a plain 0.0-1.0 fraction (see
+// FX_TYPE_METADATA's own comment in frontend.py) -- decoding that fraction into Hz is this
+// function's job, not the frontend's, matching how every other unit conversion in this file (dB,
+// ms, Q, ...) already happens backend-side.
+static inline float fx_eq3_fraction_to_hz(float fraction) {
+    fraction = fmaxf(0.0f, fminf(1.0f, fraction));
+    return 20.0f * powf(1000.0f, fraction); // 20 * 1000^0 = 20Hz .. 20 * 1000^1 = 20000Hz
+}
+
+static void run_fx_eq3(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxEq3State *st = (FxEq3State *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxEq3State));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+
+    EqBandParams bands[3];
+    bands[0].freq = fx_eq3_fraction_to_hz(params->param[0]);
+    bands[0].gain_db = -18.0f + fmaxf(0.0f, fminf(1.0f, params->param[1])) * 36.0f;
+    bands[0].q = 0.707f; // ignored for shelf bands -- see compute_eq_band_coeffs()'s own comment
+    bands[1].freq = fx_eq3_fraction_to_hz(params->param[2]);
+    bands[1].gain_db = -18.0f + fmaxf(0.0f, fminf(1.0f, params->param[3])) * 36.0f;
+    bands[1].q = 0.1f + fmaxf(0.0f, fminf(1.0f, params->param[4])) * 9.9f;
+    bands[2].freq = fx_eq3_fraction_to_hz(params->param[5]);
+    bands[2].gain_db = -18.0f + fmaxf(0.0f, fminf(1.0f, params->param[6])) * 36.0f;
+    bands[2].q = 0.707f; // ignored for shelf bands
+
+    float sl = *l, sr = *r;
+    for (int band = 0; band < 3; band++) {
+        EqBiquadCoeffs c = compute_eq_band_coeffs(&bands[band], band);
+        sl = run_eq_biquad(sl, &c, &st->z1[band][0], &st->z2[band][0]);
+        sr = run_eq_biquad(sr, &c, &st->z1[band][1], &st->z2[band][1]);
+    }
+    *l = sl;
+    *r = sr;
+}
+
+// --- FX_TYPE_LIMITER: a digital brick-wall peak limiter --- see FX_TYPE_LIMITER's own comment
+// above for the param map and why this is an original implementation of the same technique the
+// master bus safety limiter below already uses, not a literal port of anything. Both channels
+// always share one gain value, same reasoning as FX_TYPE_GATE above -- the whole point of a
+// limiter is protecting levels without being audible as anything OTHER than "it got a little
+// quieter for a moment," and an independent per-channel gain would smear the stereo image on
+// every single gain-reduction event, not just an occasional one.
+typedef struct {
+    float gain; // starts at 1.0 -- see FxGateState's own comment on why calloc's 0.0 default would
+                 // be wrong here too (a fully-closed limiter on the very first block).
+    bool initialized;
+} FxLimiterState;
+
+static void run_fx_limiter(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxLimiterState *st = (FxLimiterState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxLimiterState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+    if (!st->initialized) { st->gain = 1.0f; st->initialized = true; }
+
+    float ceiling_db = -20.0f + fmaxf(0.0f, fminf(1.0f, params->param[0])) * 20.0f;
+    float input_gain_db = fmaxf(0.0f, fminf(1.0f, params->param[1])) * 24.0f;
+    float release_ms = 10.0f + fmaxf(0.0f, fminf(1.0f, params->param[2])) * 490.0f;
+
+    float ceiling = powf(10.0f, ceiling_db / 20.0f);
+    float input_gain = powf(10.0f, input_gain_db / 20.0f);
+    float sl = *l * input_gain, sr = *r * input_gain;
+
+    // Identical shape to the master bus limiter further down (see its own comment for the full
+    // rationale) -- instant attack ("this sample can never exceed ceiling" is only true if the
+    // gain reduction is computed and applied to the SAME sample it's measuring, not a future one),
+    // exponential release so the reduction isn't audible as pumping on an isolated transient.
+    float peak = fmaxf(fabsf(sl), fabsf(sr));
+    if (peak > ceiling || st->gain != 1.0f) {
+        float needed_gain = (peak > ceiling) ? (ceiling / peak) : 1.0f;
+        if (needed_gain < st->gain) {
+            st->gain = needed_gain; // attack: instant
+        } else {
+            float release_rate = 1.0f - expf(-1.0f / (0.001f * release_ms * (float)SAMPLE_RATE));
+            st->gain += (needed_gain - st->gain) * release_rate;
+        }
+        sl *= st->gain;
+        sr *= st->gain;
+    }
+    *l = sl;
+    *r = sr;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -3735,6 +3919,9 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
 #if HDS_NAM_ENABLED
                 case FX_TYPE_NAM: run_fx_nam(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
 #endif
+                case FX_TYPE_GATE: run_fx_gate(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_EQ3: run_fx_eq3(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_LIMITER: run_fx_limiter(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through
