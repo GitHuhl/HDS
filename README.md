@@ -1352,17 +1352,37 @@ arrives. That's a worse failure mode than the original race, not a fix
 for it.
 
 Fixed on the frontend side instead, where retries can be sequenced so
-at most one dump is ever in flight at a time: `_send_request_state()`
-sends the request and schedules a few follow-up resends
-(`HDS_STATE_RESTORE_RETRY_COUNT` at `HDS_STATE_RESTORE_RETRY_INTERVAL_MS`
-apart); each one is skipped entirely via `_maybe_retry_request_state()`
-if a reply has already started arriving (`_state_dump_buffer` has any
-content) or already finished (the restore guard's already been lifted)
--- a resend only actually fires when NOTHING has arrived yet, closing
-the race without ever risking two overlapping dumps. Verified directly:
-a fake backend that ignores the first two requests entirely (simulating
-the race window) and only answers the third still ends with all 1235
-addresses restored with zero mismatches.
+at most one dump is ever in flight at a time. A first version of this
+fix scheduled follow-up resends on independent `QTimer.singleShot`
+callbacks, each skipping itself if `_state_dump_buffer` already had
+content or the restore guard had already lifted. That still had its own,
+subtler copy of the same race: the retry check ran on a timer completely
+unsynchronized with `listen_for_status_frames()`'s own polling timer --
+the only thing that actually drains the socket and populates that
+buffer -- so a reply already sitting in the kernel's socket buffer, or
+still in flight over the wire, was invisible to a check running on a
+different clock. Confirmed in real use under a continuously-playing DAW
+session: roughly half of all reconnects still came back with pre-restore
+defaults, worse than before that fix existed.
+
+Fixed properly by moving the retry decision entirely inside
+`listen_for_status_frames()` itself, called right after that same
+function's own drain-everything-available loop for the current poll
+tick -- the one place that ever reads this socket, so "has anything
+arrived yet" is always checked in the same breath as actually checking
+for it, never from a second, independently-scheduled clock that can't
+see what's already sitting in the kernel buffer. `_maybe_retry_request_state()`
+tracks its own send timestamp and retry count directly (`_state_restore_last_send_time`/
+`_state_restore_retries_sent`, both reset by `_send_request_state()`)
+rather than inferring "is one in flight" from buffer contents alone.
+Verified two ways: a fake backend that ignores the first two requests
+entirely (simulating the original activate/state.load race window) and
+only answers the third; and, specifically targeting the timer-desync
+bug, a fake backend whose reply is deliberately delayed to land right at
+the retry boundary (simulating real system load, not an idle sandbox) --
+10/10 trials restored all 1235 addresses with zero mismatches under the
+second test, where the independent-timer version would have been
+expected to intermittently corrupt the buffer.
 
 ### Window was forced obnoxiously wide, LFO tab's knobs strayed from their labels
 

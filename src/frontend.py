@@ -2377,6 +2377,11 @@ class SynthGui(QWidget):
         # _begin_state_restore_guard()/_end_state_restore_guard() and transmit_knob_packet()'s own
         # early-return.
         self._pending_state_restore = False
+        # See _maybe_retry_request_state()'s own comment: tracked here rather than derived, so the
+        # retry decision made inside listen_for_status_frames() never depends on a second,
+        # independently-scheduled clock.
+        self._state_restore_retries_sent = 0
+        self._state_restore_last_send_time = 0.0
         # Reflected by _update_seq_sync_lock_label() next to the Sequencer tab's Sync combo -- see
         # /hds/status/midi_clock_locked's own comment in listen_for_status_frames().
         self._midi_clock_locked = False
@@ -6094,15 +6099,27 @@ class SynthGui(QWidget):
     # a frontend's own in-flight reply and interleave two dumps' chunks into one corrupted hybrid
     # buffer, since the wire protocol has no request/response token to tell overlapping dumps
     # apart -- confirmed to turn a previously-reliable reconnect into an intermittent one, which is
-    # worse than the race it was meant to fix. Fixed here instead, sequenced so at most one dump is
-    # ever in flight at a time: after the initial send, a few follow-up resends are scheduled, each
-    # one skipped entirely if a reply has already started arriving (self._state_dump_buffer has any
-    # content) or already finished (the guard's already been lifted) -- only firing when NOTHING
-    # has arrived yet, closing the race without ever risking two overlapping dumps.
+    # worse than the race it was meant to fix.
+    #
+    # Fixed here instead, sequenced so at most one dump is ever in flight at a time -- but a FIRST
+    # version of this fix (independent QTimer.singleShot callbacks deciding whether to resend by
+    # checking self._state_dump_buffer) had its own, subtler version of the exact same race: that
+    # check ran on a timer completely unsynchronized with listen_for_status_frames()'s own polling
+    # timer, the only thing that actually drains the socket and populates that buffer. A reply
+    # already sitting in the kernel's socket buffer, or already in flight over the wire, is
+    # invisible to a check running on a DIFFERENT clock -- so a retry could still fire while a
+    # legitimate reply was already inbound, creating the very overlap this was meant to prevent
+    # (confirmed: ~50% of real reconnects came back with pre-restore defaults under a
+    # continuously-playing DAW session, worse than before this "fix"). Retrying now happens
+    # exclusively from INSIDE listen_for_status_frames() itself, immediately after that same call's
+    # own drain-everything-currently-available loop -- the one place that ever reads this socket,
+    # so "has anything arrived yet" is always checked in the same breath as actually checking for
+    # it, never from a second, independently-scheduled clock that can't see what's already sitting
+    # in the kernel buffer.
     HDS_STATE_RESTORE_RETRY_COUNT = 3
     HDS_STATE_RESTORE_RETRY_INTERVAL_MS = 400
 
-    def _send_request_state(self, retry_index=0):
+    def _send_request_state(self):
         if self.osc_client is None:
             return
         request_msg = OscMessageBuilder(address="/hds/request_state")
@@ -6110,19 +6127,31 @@ class SynthGui(QWidget):
             self.osc_client.send(request_msg.build())
         except OSError:
             return
-        if retry_index == 0:
-            self._begin_state_restore_guard()
-        if retry_index < self.HDS_STATE_RESTORE_RETRY_COUNT:
-            QTimer.singleShot(self.HDS_STATE_RESTORE_RETRY_INTERVAL_MS,
-                               lambda i=retry_index + 1: self._maybe_retry_request_state(i))
+        self._begin_state_restore_guard()
+        self._state_restore_retries_sent = 0
+        self._state_restore_last_send_time = time.monotonic()
 
-    def _maybe_retry_request_state(self, retry_index):
-        if not self._pending_state_restore:
-            return  # already resolved (the sentinel already arrived) -- nothing to do
-        if self._state_dump_buffer:
-            return  # a reply is already arriving -- let it finish rather than risk a second,
-                     # overlapping one interleaving into the same buffer
-        self._send_request_state(retry_index)
+    def _maybe_retry_request_state(self):
+        """Call ONLY from listen_for_status_frames(), right after its own drain loop for this tick
+        -- see HDS_STATE_RESTORE_RETRY_COUNT's own comment on why anywhere else re-introduces the
+        exact race this replaced. Safe to call every poll tick: it's a no-op unless a restore is
+        genuinely still pending, nothing has arrived for it yet, the retry interval has actually
+        elapsed, and retries remain."""
+        if not self._pending_state_restore or self._state_dump_buffer:
+            return
+        if self._state_restore_retries_sent >= self.HDS_STATE_RESTORE_RETRY_COUNT:
+            return
+        if time.monotonic() - self._state_restore_last_send_time < self.HDS_STATE_RESTORE_RETRY_INTERVAL_MS / 1000.0:
+            return
+        if self.osc_client is None:
+            return
+        request_msg = OscMessageBuilder(address="/hds/request_state")
+        try:
+            self.osc_client.send(request_msg.build())
+        except OSError:
+            return
+        self._state_restore_retries_sent += 1
+        self._state_restore_last_send_time = time.monotonic()
 
     def _apply_full_state_fields(self, fields):
         """Applies a /hds/request_state reply (see listen_for_status_frames()'s sentinel
@@ -7403,6 +7432,10 @@ class SynthGui(QWidget):
         # regardless of launch order, and self-healing if the backend later restarts/reconnects.
         if was_mock and not self.mock_mode and self.osc_client is not None:
             self._send_request_state()
+        # Retry check runs LAST, every poll tick, right after this same function's own drain loop
+        # above -- see _maybe_retry_request_state()'s own comment on why this exact placement (not
+        # a separate timer) is what makes it safe.
+        self._maybe_retry_request_state()
 
     def transmit_knob_packet(self):
         """Sends every knob's current value as one OSC bundle (one UDP datagram) to the backend --
