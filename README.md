@@ -705,6 +705,23 @@ combined mix. A port the host doesn't connect costs nothing beyond
 (`per_program_out`, NULL-able and unused by the standalone app, which
 already has its own hardware-output-pair routing for this).
 
+**CLAP: audio input ports (use HDS as a pure FX processor).** The plugin
+also declares 8 stereo input ports (`Ext In 1`-`Ext In 8`,
+`clap_audio_ports_get()`), one per the standalone app's own "external
+input" bus (`EXT_IN_PAIR_COUNT` -- the same one a real hardware line-in
+already feeds there). Insert HDS on an audio track (a guitar, a vocal,
+anything), route that track's signal into input port 1, turn on
+`/hds/ext_in/0/enable` (the Routing tab's own Ext In 1 Enable checkbox in
+`frontend.py`), and set an FX slot's Source to `Ext In 1` -- the track's
+real audio now reaches that slot's own FX chain (the new NAM slot above,
+or any other effect) exactly like a Program's own voices do, no MIDI or
+notes required at all. Input port 1 is `IS_MAIN`, so a host that
+auto-wires an inserted effect's main input picks it correctly. A port the
+host doesn't connect costs nothing beyond the one-time per-block "is this
+connected" check (`any_ext_in_connected` in `clap_plugin.c`'s own
+`process()`) -- the common case for every existing instrument-only
+patch, unaffected either way.
+
 **CLAP: params extension (host automation).** A curated ~55-parameter
 subset (`HDS_CLAP_PARAMS` in clap_plugin.c) -- all 5 filters'
 Cutoff/Resonance, the post-filter 3-band EQ, each oscillator's Volume/Pan
@@ -1008,7 +1025,9 @@ bare model without unloading it). Two buttons on the slot itself, **Mdl** and **
 file picker -- `.nam` for the model, a mono or stereo `.wav` for the cabinet impulse response --
 and the loaded file's path is saved with everything else (a Program file, a DAW's own saved CLAP
 state) exactly like a Sample Bank zone's own file path already is, so a saved patch reloads its
-model/cab automatically.
+model/cab automatically. Runs on a real guitar/vocal/etc track's own audio too, not just a
+Program's synthesized voices -- see "CLAP: audio input ports" below for routing a track's signal
+into an FX slot's Source.
 
 **Why this needed any C++ at all**: NeuralAmpModelerCore is a C++/Eigen library with no C API of
 its own, and this is otherwise an all-C codebase. `src/nam_bridge.h`/`.cpp` is the entire cost of

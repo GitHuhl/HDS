@@ -85,6 +85,15 @@ typedef struct {
     // share this struct).
     float per_program_render_buf[BUFFER_SIZE * COMBI_PROGRAM_COUNT * 2];
 
+    // CLAP audio input (see clap_audio_ports_get()): one interleaved scratch buffer, same
+    // per-instance-field reasoning as per_program_render_buf just above (a real-time callback's
+    // own stack is scarcer than this struct's lifetime, and two instances must never share one
+    // buffer). Holds up to EXT_IN_PAIR_COUNT stereo pairs interleaved exactly the way
+    // render_audio_block's own ext_in_buffer parameter already expects (pair p at channels
+    // [2p, 2p+1]) -- built fresh each process() call from whichever CLAP input ports the host
+    // actually connected; see this file's own process() for how.
+    float ext_in_render_buf[BUFFER_SIZE * EXT_IN_PAIR_COUNT * 2];
+
     // CLAP params extension (see HDS_CLAP_PARAMS/hds_clap_push_changed_params further down) --
     // one shadow value per exposed param, used purely to detect an OSC/GUI-driven change so it
     // can be echoed to the host as an output event. Sized/initialized once the table itself is
@@ -110,28 +119,49 @@ typedef struct {
 } HdsClapPlugin;
 
 // ---------------------------------------------------------------------------------------------
-// audio-ports extension: 0 inputs (external audio input is a standalone-only feature for now --
-// matches the existing no-capture-device code path render_audio_block already exercises when
-// ext_in_channels=0/a NULL buffer). Outputs: port 0 is the main stereo mix (today's only output,
-// unchanged -- IS_MAIN, so a host that doesn't care about multi-out just uses this one and never
-// notices the rest exist), plus one more stereo port per Combi Program (ports 1-8) carrying that
-// Program's own fully-processed (post-EQ, post-FX) signal -- the same multi-source richness the
-// standalone app already exposes via its own Routing tab's hardware-output-pair grid, made
-// reachable to a DAW host as separate tracks/busses instead. A host that connects only port 0
-// hears the same identical mix as before this existed; per_program_render_buf (see this struct's
-// own field comment) is only ever populated for a port the host actually connected.
+// audio-ports extension. Outputs: port 0 is the main stereo mix (today's only output, unchanged --
+// IS_MAIN, so a host that doesn't care about multi-out just uses this one and never notices the
+// rest exist), plus one more stereo port per Combi Program (ports 1-8) carrying that Program's own
+// fully-processed (post-EQ, post-FX) signal -- the same multi-source richness the standalone app
+// already exposes via its own Routing tab's hardware-output-pair grid, made reachable to a DAW host
+// as separate tracks/busses instead. A host that connects only port 0 hears the same identical mix
+// as before this existed; per_program_render_buf (see this struct's own field comment) is only
+// ever populated for a port the host actually connected.
+//
+// Inputs: one stereo port per ext-in pair (0-7), feeding the SAME "external input" bus the
+// standalone app's own hardware capture device already feeds -- render_audio_block takes a plain
+// interleaved float*/channel-count for this, with no idea whether the signal came from ALSA or a
+// DAW host (see ext_in_render_buf's own comment on this struct). This is what lets HDS run as a
+// pure FX processor on an audio track, not just an instrument: route a track's own audio into
+// input port 0 (IS_MAIN here too, so a host auto-wiring an insert effect picks it correctly), turn
+// that ext-in pair on (/hds/ext_in/0/enable) and set an FX slot's Source to Ext In 1, and the
+// signal reaches the FX bus -- e.g. the NAM slot above -- exactly like a Program's own voices do.
+// Unconnected ports (the common case for a pure-instrument use) cost nothing extra: see
+// any_ext_in_connected in process().
 // ---------------------------------------------------------------------------------------------
 #define CLAP_OUTPUT_PORT_COUNT (1 + COMBI_PROGRAM_COUNT)
+#define CLAP_INPUT_PORT_COUNT EXT_IN_PAIR_COUNT
 
 static uint32_t clap_audio_ports_count(const clap_plugin_t *plugin, bool is_input) {
     (void)plugin;
-    return is_input ? 0 : (uint32_t)CLAP_OUTPUT_PORT_COUNT;
+    return is_input ? (uint32_t)CLAP_INPUT_PORT_COUNT : (uint32_t)CLAP_OUTPUT_PORT_COUNT;
 }
 
 static bool clap_audio_ports_get(const clap_plugin_t *plugin, uint32_t index, bool is_input, clap_audio_port_info_t *info) {
     (void)plugin;
-    if (is_input || index >= (uint32_t)CLAP_OUTPUT_PORT_COUNT) return false;
     info->id = index;
+    info->channel_count = 2;
+    info->port_type = CLAP_PORT_STEREO;
+    info->in_place_pair = CLAP_INVALID_ID;
+    if (is_input) {
+        if (index >= (uint32_t)CLAP_INPUT_PORT_COUNT) return false;
+        // "Ext In 1".."Ext In 8" -- matches SOURCE_NAMES in frontend.py exactly, so an FX slot's
+        // Source dropdown and a DAW host's own port list name the same pair identically.
+        snprintf(info->name, sizeof(info->name), "Ext In %u", (unsigned int)(index + 1));
+        info->flags = (index == 0) ? CLAP_AUDIO_PORT_IS_MAIN : 0;
+        return true;
+    }
+    if (index >= (uint32_t)CLAP_OUTPUT_PORT_COUNT) return false;
     if (index == 0) {
         snprintf(info->name, sizeof(info->name), "%s", "Main Output");
         info->flags = CLAP_AUDIO_PORT_IS_MAIN;
@@ -139,9 +169,6 @@ static bool clap_audio_ports_get(const clap_plugin_t *plugin, uint32_t index, bo
         snprintf(info->name, sizeof(info->name), "Program %u", (unsigned int)index);
         info->flags = 0;
     }
-    info->channel_count = 2;
-    info->port_type = CLAP_PORT_STEREO;
-    info->in_place_pair = CLAP_INVALID_ID;
     return true;
 }
 
@@ -967,6 +994,22 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         }
     }
 
+    // CLAP audio input (see clap_audio_ports_get()): resolved once per process() call, same as
+    // prog_out/any_prog_out_connected just above -- a port's connection status can't change
+    // mid-call, so there's no reason to re-check it every chunk.
+    const float *ext_in_ports[EXT_IN_PAIR_COUNT][2] = {{0}};
+    bool any_ext_in_connected = false;
+    for (int pair = 0; pair < EXT_IN_PAIR_COUNT; pair++) {
+        uint32_t port_idx = (uint32_t)pair;
+        if (port_idx < process->audio_inputs_count && process->audio_inputs[port_idx].data32 &&
+            process->audio_inputs[port_idx].channel_count >= 2 &&
+            process->audio_inputs[port_idx].data32[0] && process->audio_inputs[port_idx].data32[1]) {
+            ext_in_ports[pair][0] = process->audio_inputs[port_idx].data32[0];
+            ext_in_ports[pair][1] = process->audio_inputs[port_idx].data32[1];
+            any_ext_in_connected = true;
+        }
+    }
+
     float block_peak = 0.0f;
     uint32_t frames_done = 0;
     while (frames_done < process->frames_count) {
@@ -993,7 +1036,25 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         // visibility for (see gui_routing_tab_visible's own comment) -- ext_in_peak_scratch is
         // therefore always all-zero (gui_routing_tab_visible defaults to 0) and simply discarded.
         float ext_in_peak_scratch[EXT_IN_PAIR_COUNT];
-        float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases, NULL, 0, 2, &p->midi_live, chunk_buffer, current_tempo_bpm, ext_in_peak_scratch,
+        // Interleave this chunk's worth of whichever ext-in ports the host actually connected into
+        // p->ext_in_render_buf (pair p at channels [2p, 2p+1], exactly what render_audio_block's
+        // own ext_in_buffer/ext_in_channels parameters expect -- see that struct field's own
+        // comment). Skipped entirely when nothing's connected, the common pure-instrument case, so
+        // this costs nothing beyond the one bool check per chunk until someone actually routes
+        // audio into a port.
+        if (any_ext_in_connected) {
+            for (int i = 0; i < block_size; i++) {
+                for (int pair = 0; pair < EXT_IN_PAIR_COUNT; pair++) {
+                    p->ext_in_render_buf[(size_t)i * EXT_IN_PAIR_COUNT * 2 + (size_t)pair * 2 + 0] =
+                        ext_in_ports[pair][0] ? ext_in_ports[pair][0][frames_done + (uint32_t)i] : 0.0f;
+                    p->ext_in_render_buf[(size_t)i * EXT_IN_PAIR_COUNT * 2 + (size_t)pair * 2 + 1] =
+                        ext_in_ports[pair][1] ? ext_in_ports[pair][1][frames_done + (uint32_t)i] : 0.0f;
+                }
+            }
+        }
+        float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases,
+                                         any_ext_in_connected ? p->ext_in_render_buf : NULL, any_ext_in_connected ? EXT_IN_PAIR_COUNT * 2 : 0,
+                                         2, &p->midi_live, chunk_buffer, current_tempo_bpm, ext_in_peak_scratch,
                                          any_prog_out_connected ? p->per_program_render_buf : NULL);
         if (peak > block_peak) block_peak = peak;
 
