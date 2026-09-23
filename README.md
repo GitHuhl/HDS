@@ -806,6 +806,36 @@ CLAP), and none is planned: this project will not maintain a second *platform* a
 PipeWire backend described below is an additional, opt-in way to talk to audio on the *same*
 platform, not a second platform.
 
+### Command-line flags
+
+Every flag `./synth_engine` and `python3 src/frontend.py` accept, in one place -- each one is also
+covered in more depth in its own section elsewhere in this file (linked below) if you need the full
+story, but this is the quick reference for "what can I even pass."
+
+**`./synth_engine`:**
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--osc-listen-port <port>` | `9000` | Where incoming control messages (every knob, plus the Sample Bank's `/hds/zone/*`) are received. See "Control protocol: OSC". |
+| `--osc-reply-host <host>` | `127.0.0.1` | Where `/hds/status/*` feedback (VU meter, recording state, `/hds/request_state` replies, ...) is sent. Point this at a remote frontend machine's own IP for a cross-machine setup. |
+| `--osc-reply-port <port>` | `9001` | The port half of the above. |
+| `--output-device <name>` | `default` | ALSA device string (`hw:1,0`, `plughw:1,0`, `default`, ...) under `--backend alsa`; a PipeWire target node name (`wpctl status`-style), or `default`/empty for PipeWire's own session default, under `--backend pipewire`. See "If the engine won't start because of the audio device". |
+| `--input-device <name>` | `default` | Same naming rules as `--output-device`, for the External Input capture device. A capture device failing to open is never fatal (silent until a working name is picked live) -- only `--output-device` failing is. |
+| `--backend alsa\|pipewire` | `alsa` | Chooses the audio platform shim. `pipewire` only exists in a build where `libpipewire-0.3` was found at build time (`make` prints which way it went) -- passing it to a build without that support fails fast with a clear message. See "PipeWire backend". |
+| `--pipewire-force-quantum` | off | `--backend pipewire` only. Forces the whole PipeWire graph's buffer size down to match this engine's own Latency control, for real (not just a hint) -- but that also forces every OTHER PipeWire client on the same system down to that same small buffer while this engine is running, which can make an unrelated app (a browser tab, a video call) underrun/glitch. Opt-in, off by default, and trivially reversible (just don't pass it) precisely because of that system-wide side effect. See "PipeWire backend". |
+| `--sfz-vco1`/`--sfz-vco2`/`--sfz-vco3`/`--sfz-vco4 <path>` | none | Loads a `.sfz` instrument onto that oscillator at startup, before the audio device even opens (so a subsequent live `/hds/zone/load_sfz` can still layer on top). |
+
+**`python3 src/frontend.py`:**
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--osc-host <host>` | `127.0.0.1` | Hostname/IP the backend is running on. Set this for a cross-machine setup -- but the backend's own `--osc-reply-host` must then point back at THIS machine, or status feedback (VU meter, tempo, recording state) won't find its way back (knob control alone would still work one-way). |
+| `--osc-listen-port <port>` | `9000` | The backend's OSC listen port -- where this frontend sends knob/zone messages. `9000` for the standalone app, `9010`/`9012`/... for a CLAP instance (see "More than one instance in the same host" for the exact pattern, and check the host's own log for which pair a given instance actually bound). |
+| `--osc-reply-port <port>` | `9001` | The backend's OSC reply port -- where `/hds/status/*` feedback (including `/hds/request_state` replies) is received. `9001` standalone, `9011`/`9013`/... for a CLAP instance, one more than its own listen port. |
+
+Any other argument (`-style`, `-platform`, ...) is passed straight through to Qt untouched --
+`frontend.py` only intercepts the three flags above, via `parse_known_args`.
+
 ### If the engine won't start because of the audio device
 
 An output device that fails to open used to be an unconditional, unrecoverable startup failure --
@@ -864,6 +894,24 @@ multichannel routing doesn't apply under PipeWire); and there's no cheap local w
 PipeWire graph's nodes the way `snd_device_name_hint` enumerates ALSA's (that's an async registry
 round-trip, not a synchronous local query), so the interactive recovery picker asks for a PipeWire
 target name directly under this backend rather than listing one -- see the previous section.
+
+**Higher latency than ALSA, and why:** this backend sets `PW_KEY_NODE_LATENCY` from the Audio tab's
+own Latency control, mapped onto PipeWire's node latency property the same way the ALSA backend
+maps it onto the ALSA buffer target. That's only a *hint*, though -- PipeWire negotiates one shared
+buffer size (the graph's "quantum") across every client currently connected to the daemon, so a low
+request from this one node can still be silently overridden upward if anything else sharing the
+same daemon needs a bigger buffer. That's the structural reason this backend can measure higher
+latency than the ALSA one, which gets an exclusive, tightly-sized hardware buffer directly rather
+than negotiating a shared one.
+
+`--pipewire-force-quantum` (opt-in, off by default) is the real lever, not just a hint:
+`PW_KEY_NODE_FORCE_QUANTUM` actively forces the whole graph's quantum to this engine's own Latency
+setting for as long as this stream stays connected. Real tradeoff, not a free lunch: every OTHER
+PipeWire client on the same system (a browser tab, a video call, a media player) gets forced down
+to that same small buffer too while HDS is running, and can underrun/glitch if it can't keep up
+with it -- exactly why this is a separate opt-in flag rather than baked into `--backend pipewire`
+unconditionally: turning it off again needs nothing more than not passing the flag on the next
+launch, no code change or rebuild.
 
 ### Building for Raspberry Pi
 

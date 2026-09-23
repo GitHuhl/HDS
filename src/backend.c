@@ -10934,6 +10934,14 @@ typedef enum { HDS_BACKEND_ALSA, HDS_BACKEND_PIPEWIRE } HdsAudioBackend;
 // changed afterward except by the interactive output-device recovery path falling back from a
 // broken PipeWire connection to ALSA (see interactive_recover_output_device()).
 static HdsAudioBackend g_audio_backend = HDS_BACKEND_ALSA;
+// --pipewire-force-quantum: opt-in, default OFF. See hds_pw_stream_open()'s own comment on
+// PW_KEY_NODE_FORCE_QUANTUM for what this actually does and its real tradeoff (forces every OTHER
+// PipeWire client on the same system down to this stream's own small buffer too, for as long as
+// this one is connected -- can make an unrelated app underrun/glitch). Deliberately a separate
+// opt-in flag rather than baked into --backend pipewire unconditionally, specifically so it's
+// trivially reversible at runtime (just don't pass the flag) rather than needing a code revert if
+// it turns out to cause problems on some system.
+static bool g_pipewire_force_quantum = false;
 
 #if HDS_PIPEWIRE_ENABLED
 // Bridges this engine's existing "blocking write / one-shot best-effort read" I/O contract (see
@@ -11283,6 +11291,25 @@ static HdsPwStream *hds_pw_stream_open(const char *device_name, bool is_capture,
     unsigned int latency_frames = (unsigned int)fmaxf(64.0f, (latency_ms / 1000.0f) * (float)SAMPLE_RATE);
     snprintf(latency_prop, sizeof(latency_prop), "%u/%u", latency_frames, (unsigned int)SAMPLE_RATE);
     pw_properties_set(props, PW_KEY_NODE_LATENCY, latency_prop);
+    // PW_KEY_NODE_LATENCY above is only a HINT: PipeWire negotiates one shared buffer size (the
+    // graph "quantum") across every client currently connected to the daemon, so a lower request
+    // from this one node can still be silently overridden upward if anything else sharing the same
+    // daemon needs a bigger buffer -- the real, structural reason the PipeWire backend can measure
+    // higher latency than the ALSA one, which gets an exclusive, tightly-sized hardware buffer
+    // directly. PW_KEY_NODE_FORCE_QUANTUM instead actively forces the WHOLE graph's quantum to
+    // this value for as long as this stream is connected -- a real lever, not just a request, and
+    // exactly what a pro-audio PipeWire client is expected to do when the user wants low latency.
+    // Real tradeoff, not a free lunch: every OTHER PipeWire client on the same system (a browser
+    // tab, a video call, a media player) gets forced down to this same small buffer too for as
+    // long as HDS is running, and can underrun/glitch if it can't keep up with it. Opt-in only
+    // (--pipewire-force-quantum, default off) -- see g_pipewire_force_quantum's own comment for
+    // why this is a separate flag rather than unconditional under --backend pipewire. Set to the
+    // SAME value as the hint above so both stay consistent with whatever the Latency knob asks for.
+    if (g_pipewire_force_quantum) {
+        char force_quantum_prop[16];
+        snprintf(force_quantum_prop, sizeof(force_quantum_prop), "%u", latency_frames);
+        pw_properties_set(props, PW_KEY_NODE_FORCE_QUANTUM, force_quantum_prop);
+    }
 
     pw->stream = pw_stream_new_simple(
         pw_thread_loop_get_loop(pw->loop),
@@ -12101,6 +12128,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--output-device") == 0 && i + 1 < argc) cli_output_device = argv[++i];
         else if (strcmp(argv[i], "--input-device") == 0 && i + 1 < argc) cli_input_device = argv[++i];
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) cli_backend = argv[++i];
+        else if (strcmp(argv[i], "--pipewire-force-quantum") == 0) g_pipewire_force_quantum = true;
         else if (strcmp(argv[i], "--sfz-vco1") == 0 && i + 1 < argc) cli_sfz_path[0] = argv[++i];
         else if (strcmp(argv[i], "--sfz-vco2") == 0 && i + 1 < argc) cli_sfz_path[1] = argv[++i];
         else if (strcmp(argv[i], "--sfz-vco3") == 0 && i + 1 < argc) cli_sfz_path[2] = argv[++i];
