@@ -601,6 +601,26 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
     fprintf(stderr, "[hds-clap] state load: %d knob(s) applied, %d skipped (unrecognized address), %d zone(s) queued\n",
             applied_knobs, skipped_knobs, applied_zones);
     free(b.buf);
+
+    // Bug fix: a host loading a saved project can call this EITHER before or after activate()
+    // (the CLAP spec allows both, and hosts genuinely differ) -- but activate() is what starts
+    // this instance's own embedded OSC server and makes p->osc_ready true. If a frontend.py
+    // happens to connect and send /hds/request_state in the window between activate() and this
+    // function actually finishing (a real, observed race: a host that activates first, THEN
+    // loads state, with the two none too far apart in wall-clock time), that first reply would
+    // correctly, completely, and USELESSLY report this instance's still-default p->knobs --
+    // load() genuinely hadn't run yet at the moment it was asked. That reply looks exactly like a
+    // fresh, never-configured instance: internally consistent, syntactically complete, and simply
+    // wrong. If OSC is already up at this point (this call landed AFTER activate()), push the
+    // state this load just established right now, proactively -- no frontend needs to ask again,
+    // and any frontend that already got the earlier default-laden reply gets silently corrected
+    // by this second, later, definitely-current one (frontend.py applies any complete dump the
+    // same way regardless of whether it asked for this specific one). If OSC ISN'T up yet (this
+    // load() landed BEFORE activate(), the other legal ordering), there's nothing to push to --
+    // clap_plugin_activate()'s own matching push (see its own comment) covers that case instead.
+    if (p->osc_ready) {
+        send_full_state_dump(p->osc_reply_addr, &p->knobs);
+    }
     return true;
 }
 
@@ -715,6 +735,18 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         lo_server_add_method(p->osc_server, NULL, NULL, generic_osc_handler, &p->knobs);
         p->osc_ready = true;
         fprintf(stderr, "[hds-clap] OSC listening on UDP port %d, status replies to %s:%d\n", p->osc_listen_port, CLAP_OSC_REPLY_HOST, p->osc_reply_port);
+        // Bug fix: covers the other legal ordering from clap_state_load()'s own matching push --
+        // see that function's comment. If a host calls state.load() to restore a saved project's
+        // values BEFORE ever calling activate() (also a real, CLAP-spec-legal ordering, and one
+        // observed to matter here), p->knobs already holds the correct, real values by the time
+        // THIS line runs, but nothing could have pushed them out yet since the OSC server (and
+        // p->osc_reply_addr, just resolved above) didn't exist until now. Push once here too --
+        // harmless even when state.load() hasn't happened at all yet (a genuinely fresh instance
+        // just reports its own real defaults, a correct, if redundant, dump), and it's what
+        // finally makes a frontend.py connecting for the very first time to an already-loaded
+        // project see the REAL state immediately, rather than needing a second reconnect after
+        // whichever of these two functions happened to run last.
+        send_full_state_dump(p->osc_reply_addr, &p->knobs);
         if (p->host && p->host->get_extension) {
             const clap_host_log_t *log = (const clap_host_log_t *)p->host->get_extension(p->host, CLAP_EXT_LOG);
             if (log && log->log) {

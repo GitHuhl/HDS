@@ -1270,6 +1270,43 @@ backend's own receive path had the same class of bug for
 liblo's own server-side receive delivered a realistic ~40KB/1235-message
 bundle intact with zero loss in a direct test.)
 
+### First connect to a just-loaded DAW session still lagged one reconnect behind
+
+With every transport-layer bug above fixed, one gap remained, isolated
+by its own distinctive symptom: connecting fresh to a CLAP instance
+right as a DAW session finished loading came back wrong, but simply
+closing and reopening `frontend.py` against that SAME already-running
+instance moments later came back correct. That shape -- first connect
+wrong, every reconnect after it right, against unchanged backend memory
+-- is a startup race, not a data or transport bug: the CLAP spec allows
+a host to call `state.load()` (restoring a saved project's values into
+`p->knobs`) either before OR after `activate()` (which is what starts
+this instance's own embedded OSC server), and real hosts differ. If
+`frontend.py`'s own connect-time `/hds/request_state` happened to land
+in the narrow window between whichever of those two runs first and
+whichever runs second, the reply it got was completely valid, complete,
+and internally consistent -- and entirely wrong, reporting `p->knobs`
+in whatever state it happened to be in at that exact moment, which
+depending on the ordering could be pre-load defaults. By the time a
+user closed and reopened the frontend moments later, both had long
+since finished, so the reconnect was reliably right -- exactly matching
+the reported pattern. Fixed on the backend side, not the frontend: both
+`clap_plugin_activate()` and `clap_state_load()` now proactively push a
+fresh `send_full_state_dump()` once THEY finish, each guarded so it only
+actually sends once OSC is up (`p->osc_ready`/`p->osc_reply_addr` valid,
+resolved in `activate()`). Whichever of the two genuinely runs last ends
+up broadcasting the final, correct state on its own, with no frontend
+change needed -- `frontend.py` already applies any complete, sentinel-
+terminated dump it receives the same way regardless of whether it asked
+for that specific one, so an earlier wrong push simply gets silently,
+harmlessly superseded by the correct one moments later. Harmless when
+only one of the two ever fires meaningfully (state never loaded at all,
+a genuinely fresh instance: activate()'s own push just reports real,
+correct defaults) or when nothing is listening yet (a frontend that
+hasn't launched yet simply never receives that particular push -- its
+own later, explicit `/hds/request_state` at ITS OWN startup remains the
+primary mechanism for that far more common case).
+
 ### Window was forced obnoxiously wide, LFO tab's knobs strayed from their labels
 
 Measuring `SynthGui`'s own minimum size hint traced this to the Sequencer
