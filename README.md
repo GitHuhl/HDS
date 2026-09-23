@@ -1171,6 +1171,65 @@ loud, heavily colored signal by design (that's the real hardware's own documente
 always-on master bus safety limiter downstream catches any resulting overs before final output,
 the same as it would for a hot synth voice.
 
+### FairKid67 FX slot (vari-mu tube leveling amplifier)
+
+An FX slot (Type: `FairKid67`) ported from [PHU-FAIR-KID-67](https://github.com/huberp/phu-fair-kid-67)
+(Paul Huber, MIT license; DSP core from its sibling [phu-audio-lib](https://github.com/huberp/phu-audio-lib),
+also MIT) -- a circuit-derived model of a classic vari-mu tube leveling amplifier. Structurally
+different from FetComp's own single closed-form gain cell: every gain stage here (the preamp, a
+3-stage sidechain tube cascade, and both arms of a push-pull output stage -- six stages total, per
+channel) is its own small nonlinear circuit, solved every sample via warm-started Newton-Raphson on
+a Koren-model triode (Norman L. Koren, "Improved Vacuum-Tube Models for SPICE", 1996) -- the same
+plate/cathode KCL equations and closed-form 2x2 Jacobian solve the original library itself uses, not
+a simplified stand-in. Eight params: **Input** (-20..+40dB) and **Output** (-20..+20dB) -- no
+separate Threshold knob; **Threshold** (0..5V, this port's own calibration against what its detector
+chain can actually produce -- see `run_fx_fairkid67()`'s own comment) is subtracted from the raw
+detector voltage before any gain reduction can happen; **Time Constant** (choice: 6 positions
+matching the original's own timing-preset table, traced to the real schematic's own component
+values -- P5/P6 use a program-dependent dual-branch release for quick recovery after a brief
+transient and a long tail after sustained heavy drive); **Link Mode** (Independent/Linked-Max/
+Linked-Avg/Mid-Side -- how the L/R detector voltages combine before driving both channels); **Bias**
+(0..2V, an always-on additive offset to the detector voltage, for permanent light gain reduction if
+wanted); **Iron** (0.5-3.0x, scales all three transformers' own saturation drive together); **SC
+Gain** (0..2.0x, scales the sidechain tube cascade's own drive into the detector, independent of
+Input). No Ratio param -- like the real hardware, compression amount emerges entirely from
+Input/Threshold/tube nonlinearity, not a dialled-in slope.
+
+**Sidechain source, including external keying**: every FX slot now has a second combo next to its
+existing Source selector -- **Sidechain Source** (`/hds/fx/%d/sidechain_source`), defaulting to
+"Same as Source" (self-key, ordinary non-external-sidechain compression, the only mode the real
+hardware and the original plugin support). Pick any other source instead -- an individual Combi
+Program, the Combi Mix bus, or an ext-in pair -- and FairKid67's own detector keys off THAT signal
+while still compressing this slot's own audio, e.g. ducking a synth pad's Program under a kick drum
+routed in on an ext-in pair. Implemented via a per-sample snapshot of every source's own pre-FX dry
+signal (`sc_snapshot_l/r` in `process_fx_chain()`), taken once before any source's FX chain has
+mutated its own bus in place -- reading the live, in-place-mutated bus array instead would give a
+slot an order-dependent (sometimes pre-FX, sometimes post-FX) view of another source depending
+purely on which of the 17 sources happens to be processed first that sample. Only FairKid67 reads
+this field today, but it's a generic per-slot field (like `fx_source` itself), so a future
+sidechain-capable effect gets it for free.
+
+**What's ported faithfully vs. simplified off the original's JUCE-based C++**: the Koren triode
+model and its analytic partial derivatives; each stage's exact KCL equations and Cramer's-rule
+Newton step; warm-starting the solve from the previous SAMPLE's own converged operating point
+(what makes an 8-iteration cap enough -- steady-state audio converges in far fewer); the
+grid-conduction clamp; the push-pull topology's differential combination for even-harmonic
+cancellation (verified directly -- a symmetric-drive test shows a near-zero DC output average);
+the sidechain detector's forward-voltage dead zone and its full timing-preset table; the
+cubic-Hermite soft-knee CV limiter; and every link mode's combination formula. Changed: no JUCE
+anywhere; each stage's optional cathode bypass capacitor is omitted (nothing in this signal chain
+appears to actually enable one); each stage's small-signal quiescent gain (used to normalize it to
+unity at rest) is found via a one-time finite-difference probe rather than an analytic Jacobian --
+the same derivative, computed numerically, at zero per-sample cost since it only runs once when a
+slot first activates the effect; the NR iteration budget is fixed at 8 (the original's own "Draft"
+ceiling) rather than runtime-switchable; the output transformer's 2nd-order filter pair is
+reimplemented with this file's own existing RBJ-cookbook biquad code rather than guessing at a
+distinct class whose exact source wasn't available to this port's research. See
+`run_fx_fairkid67()`'s own (long) comment in `backend.c` for the complete list with the reasoning
+behind each change, and its own DSP test (compression scaling, external-sidechain routing, link
+mode differences, push-pull symmetry, and finiteness under pathological input) for how it was
+verified.
+
 ### Control protocol: OSC
 
 The backend is controlled entirely over OSC (Open Sound Control), via a

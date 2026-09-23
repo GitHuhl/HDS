@@ -863,6 +863,29 @@ FX_TYPE_METADATA += [
         {"label": "Character", "range": (0, 100), "default": 94},  # 0..0.5
         {"label": "Iron", "range": (0, 100), "default": 100},      # 0..1, Class A/transformer drive
     ]},
+    {"name": "FairKid67", "params": [
+        # Ported from PHU-FAIR-KID-67 (github.com/huberp/phu-fair-kid-67, MIT license; DSP core
+        # from its sibling github.com/huberp/phu-audio-lib, also MIT) -- a circuit-derived model of
+        # a classic vari-mu tube leveling amplifier's own gain stage: a warm-started
+        # Newton-Raphson solve of each triode's own plate/cathode KCL equations (not a closed-form
+        # quadratic like FetComp's own gain cell), a push-pull pair of these for even-harmonic
+        # cancellation, a tube sidechain amplifier cascade driving a diode-rectifier detector, and
+        # input/interstage/output transformer coloration. See FX_TYPE_FAIRKID67's own (long)
+        # comment in backend.c for exactly what's kept faithful and what's simplified off the
+        # original's JUCE dependency. No separate Ratio -- like the real hardware, compression
+        # amount emerges entirely from Input/Threshold/tube nonlinearity, not a dialled-in slope.
+        {"label": "Input", "range": (0, 100), "default": 60},       # -20..+40dB
+        {"label": "Output", "range": (0, 100), "default": 50},      # -20..+20dB
+        {"label": "Threshold", "range": (0, 100), "default": 40},   # 0..5V
+        {"label": "Time Const", "type": "choice",
+         "options": ["P1 (0.3s)", "P2 (0.8s)", "P3 (2.0s)", "P4 (5.0s)", "P5 (auto 10s)", "P6 (auto 25s)"],
+         "default": 1},
+        {"label": "Link Mode", "type": "choice",
+         "options": ["Independent", "Linked (Max)", "Linked (Avg)", "Mid-Side"], "default": 1},
+        {"label": "Bias", "range": (0, 100), "default": 0},         # 0..2V, always-on CV offset
+        {"label": "Iron", "range": (0, 100), "default": 20},        # 0.5..3.0x transformer drive
+        {"label": "SC Gain", "range": (0, 100), "default": 40},     # 0..2.0x sidechain cascade drive
+    ]},
 ]
 
 # Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --
@@ -4710,6 +4733,11 @@ class SynthGui(QWidget):
         # FXSlotParams in backend.c. Mirrors fx_type_combos in every way that matters for
         # snapshot/restore/swap (a slot's source assignment moves with it on reorder).
         self.fx_source_combos = []
+        # Sidechain Source -- see FXSlotParams.sidechain_source in backend.c. Index 0 ("Same as
+        # Source") is the default self-key behavior (wire value -1); every other index i maps to
+        # wire value i-1, one of SOURCE_NAMES. Only FX_TYPE_FAIRKID67 currently reads this, but it's
+        # sent/saved/restored for every slot regardless, same posture as fx_source itself.
+        self.fx_sidechain_combos = []
         # Chain To Next -- see FXSlotParams.chain_to_next in backend.c and the button's own
         # tooltip/comment at its construction site below.
         self.fx_chain_to_next_buttons = []
@@ -4760,6 +4788,21 @@ class SynthGui(QWidget):
             )
             slot_lay.addWidget(source_combo)
             self.fx_source_combos.append(source_combo)
+
+            sidechain_combo = QComboBox()
+            sidechain_combo.addItems(["Same as Source"] + SOURCE_NAMES)
+            sidechain_combo.setFixedWidth(90)
+            sidechain_combo.setStyleSheet("font-size: 9px;")
+            sidechain_combo.setToolTip(
+                "Which source drives this slot's OWN sidechain detector (only meaningful for\n"
+                "effects with a sidechain, e.g. FairKid67) -- \"Same as Source\" reproduces ordinary,\n"
+                "non-external-sidechain compression (the detector keys off this slot's own audio,\n"
+                "the only mode real hardware compressors like this one support). Any other choice\n"
+                "lets the detector key off a DIFFERENT source instead -- e.g. compressing a synth\n"
+                "pad's Program while ducking it from a kick drum on an ext-in pair."
+            )
+            slot_lay.addWidget(sidechain_combo)
+            self.fx_sidechain_combos.append(sidechain_combo)
 
             param_dials, param_combos, param_labels, param_columns = [], [], [], []
             for p_idx in range(FX_SLOT_PARAM_COUNT):
@@ -5643,6 +5686,7 @@ class SynthGui(QWidget):
         return {
             "type_idx": type_idx,
             "source_idx": self.fx_source_combos[slot_idx].currentIndex(),
+            "sidechain_idx": self.fx_sidechain_combos[slot_idx].currentIndex(),
             "params": params,
             "mix": self.fx_mix_dials[slot_idx].value(),
             "bypass": self.fx_bypass_buttons[slot_idx].isChecked(),
@@ -5665,6 +5709,9 @@ class SynthGui(QWidget):
         self.fx_source_combos[slot_idx].blockSignals(True)
         self.fx_source_combos[slot_idx].setCurrentIndex(snapshot["source_idx"])
         self.fx_source_combos[slot_idx].blockSignals(False)
+        self.fx_sidechain_combos[slot_idx].blockSignals(True)
+        self.fx_sidechain_combos[slot_idx].setCurrentIndex(snapshot.get("sidechain_idx", 0))
+        self.fx_sidechain_combos[slot_idx].blockSignals(False)
         for p_idx, (kind, value) in enumerate(snapshot["params"]):
             if kind == "combo":
                 combo = self.fx_param_combos[slot_idx][p_idx]
@@ -6751,6 +6798,13 @@ class SynthGui(QWidget):
             if addr in fields:
                 combo = self.fx_source_combos[slot_idx]
                 combo.blockSignals(True); combo.setCurrentIndex(int(round(fields[addr]))); combo.blockSignals(False)
+            sc_addr = f"/hds/fx/{slot_idx}/sidechain_source"
+            if sc_addr in fields:
+                # Wire value -1 ("Same as Source") -> combo index 0; wire value i -> combo index i+1.
+                sc_combo = self.fx_sidechain_combos[slot_idx]
+                sc_combo.blockSignals(True)
+                sc_combo.setCurrentIndex(int(round(fields[sc_addr])) + 1)
+                sc_combo.blockSignals(False)
         for src in range(SOURCE_COUNT):
             addr = f"/hds/fx_routing/{src}/mode"
             if addr in fields:
@@ -7268,6 +7322,7 @@ class SynthGui(QWidget):
             snapshot = {
                 "type_idx": type_idx,
                 "source_idx": self.fx_source_combos[slot_idx].currentIndex(),  # untouched -- routing, not patch
+                "sidechain_idx": self.fx_sidechain_combos[slot_idx].currentIndex(),  # untouched -- routing, not patch
                 "params": params,
                 "mix": int(round(fields.get(f"/hds/fx/{slot_idx}/mix", self.fx_mix_dials[slot_idx].value()))),
                 "bypass": fields.get(f"/hds/fx/{slot_idx}/bypass", 0.0) != 0.0,
@@ -8309,6 +8364,8 @@ class SynthGui(QWidget):
             type_idx = self.fx_type_combos[slot_idx].currentIndex()
             add_f(f"/hds/fx/{slot_idx}/type", type_idx)
             add_f(f"/hds/fx/{slot_idx}/source", float(self.fx_source_combos[slot_idx].currentIndex()))
+            # Combo index 0 ("Same as Source") -> wire value -1; index i -> wire value i-1.
+            add_f(f"/hds/fx/{slot_idx}/sidechain_source", float(self.fx_sidechain_combos[slot_idx].currentIndex() - 1))
             entry = FX_TYPE_METADATA[type_idx] if 0 <= type_idx < len(FX_TYPE_METADATA) else FX_TYPE_METADATA[0]
             params_meta = entry["params"]
             for p_idx in range(FX_SLOT_PARAM_COUNT):
@@ -8713,6 +8770,7 @@ def runtime_connect_and_bind(gui):
         )
         gui.fx_type_combos[slot_idx].currentIndexChanged.connect(gui.transmit_knob_packet)
         gui.fx_source_combos[slot_idx].currentIndexChanged.connect(gui.transmit_knob_packet)
+        gui.fx_sidechain_combos[slot_idx].currentIndexChanged.connect(gui.transmit_knob_packet)
         for p_dial in gui.fx_param_dials[slot_idx]:
             p_dial.valueChanged.connect(gui.transmit_knob_packet)
         for p_combo in gui.fx_param_combos[slot_idx]:

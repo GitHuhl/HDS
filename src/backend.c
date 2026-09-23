@@ -560,6 +560,31 @@ typedef struct {
 // entirely, leaving just the bare gain cell). No separate Mix param -- the slot's own generic Mix
 // knob already does that job, same convention as Density3/EQ3 above.
 #define FX_TYPE_FETCOMP 14
+// Ported from PHU-FAIR-KID-67 (github.com/huberp/phu-fair-kid-67, MIT license, DSP core from its
+// sibling github.com/huberp/phu-audio-lib, also MIT) -- a circuit-derived model of a classic
+// vari-mu tube leveling amplifier's own gain stage: a warm-started Newton-Raphson solve of each
+// triode's Koren-model plate/cathode KCL equations (not a closed-form quadratic like
+// FX_TYPE_FETCOMP's own gain cell -- see run_fx_fairkid67()'s own comment for exactly what's kept
+// faithful and what's simplified off the original's JUCE dependency), a push-pull pair of these
+// gain stages for even-harmonic cancellation, a tube sidechain amplifier cascade driving a
+// diode-rectifier detector, and input/interstage/output transformer coloration. param[0] Input
+// (-20..+40dB -- drives both the main signal path and the sidechain detector harder together,
+// same "no separate Threshold, you drive into a fixed one" posture as FX_TYPE_FETCOMP), param[1]
+// Output (-20..+20dB, makeup gain after the output transformer), param[2] Threshold (0..5V --
+// subtracted from the raw detector voltage before it can drive any gain reduction at all), param[3]
+// Time Constant (choice: 6 positions matching the original's own timing-preset table, P1 fastest
+// release through P6 slowest, P5/P6 using a program-dependent dual-branch release), param[4] Link
+// Mode (choice: Independent/Linked-Max/Linked-Avg/Mid-Side -- how the L/R detector voltages combine
+// before driving both channels' gain stages), param[5] Bias (0..2V, an always-on additive offset to
+// the detector voltage -- lets a slot sit in permanent light gain reduction if desired), param[6]
+// Iron (0.5..3.0x -- scales all three transformers' own saturation drive together), param[7]
+// Sidechain Gain (0..2.0x -- scales the tube cascade's own drive into the detector, independent of
+// Input). No separate Ratio param -- like the original hardware, compression amount emerges
+// entirely from Input/Threshold/tube nonlinearity, not a dialled-in slope. Sidechain Source is NOT
+// one of these params -- see FXSlotParams.sidechain_source's own comment for the dedicated per-slot
+// field (matching fx_source's own convention) that lets this effect's detector key off a
+// DIFFERENT source (e.g. an ext-in pair) than the audio it's actually compressing.
+#define FX_TYPE_FAIRKID67 15
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -590,6 +615,17 @@ typedef struct {
     // mode (every slot there is already chained unconditionally) and on the last slot in the
     // array (there is no "next" to chain into). See process_fx_chain()'s own comment.
     float chain_to_next;
+    // Sidechain Source (default -1 = "Same as Source" -- keys off this slot's OWN dry input,
+    // reproducing ordinary non-external-sidechain compression, e.g. FX_TYPE_FAIRKID67's real
+    // hardware ancestor, which has no external key input at all). Any other value is a source id
+    // (same numbering as fx_source/SOURCE_NAMES -- 0..COMBI_PROGRAM_COUNT-1 = a Combi Program,
+    // COMBI_PROGRAM_COUNT = Combi Mix, the rest = ext-in pairs) naming a DIFFERENT source's own
+    // pre-FX dry signal to drive the detector with instead -- e.g. compressing a synth pad while
+    // keying off a kick drum routed in on an ext-in pair. Harmless dead bytes on any effect type
+    // that doesn't read a sidechain key at all, same posture as param[] entries an effect ignores.
+    // See process_fx_chain()'s own sc_snapshot_l/r comment for why this reads a FROZEN snapshot of
+    // every source's dry signal rather than the live, in-place-mutated bus_l/bus_r array.
+    float sidechain_source;
     // FX_TYPE_NAM's own loaded-file paths (unused by every other effect type -- harmless dead
     // bytes on their slots, same posture as param[] entries an effect doesn't read). Plain string
     // fields, not a dedicated load message: see poll_fx_nam_requests()'s own comment for why this
@@ -4199,6 +4235,490 @@ static void run_fx_fetcomp(FXSlotEngine *engine, const FXSlotParams *params, flo
     *r = outR;
 }
 
+// --- FX_TYPE_FAIRKID67: ported from PHU-FAIR-KID-67 (github.com/huberp/phu-fair-kid-67, MIT
+// license; DSP core from its sibling github.com/huberp/phu-audio-lib, also MIT) --- see
+// FX_TYPE_FAIRKID67's own comment above for the param map. Like FX_TYPE_FETCOMP this is a genuine
+// circuit-derived model, but a structurally different one: instead of one closed-form quadratic
+// gain cell, every gain stage here (the preamp, the 3-stage sidechain tube cascade, and both arms
+// of the push-pull output stage -- SIX stages total, times 2 channels) is its own small nonlinear
+// circuit solved via warm-started Newton-Raphson on a Koren-model triode.
+//
+// KEPT FAITHFUL: the Koren triode current model (and its analytic partial derivatives) verbatim;
+// each stage's exact 2-node (plate/cathode) KCL equations and the closed-form 2x2 Cramer's-rule
+// Newton step derived from them; warm-starting the NR solve from the previous SAMPLE's converged
+// operating point (this is what makes 8 iterations, let alone the handful actually needed once
+// warmed up, enough -- a cold solve every sample would need far more); the grid-conduction clamp
+// (Vgk can never exceed 0, modeling a real triode's grid drawing current above that point); the
+// push-pull topology's own (outA-outB)/2 differential combination (arm B fed -sample, both arms
+// sharing one CV) for even-harmonic cancellation; the sidechain's diode-detector forward-voltage
+// dead zone and its 6-position timing-preset table (values traced to the real schematic's own
+// component values, not invented); the cubic-Hermite soft-knee CV limiter; and every LinkMode's
+// combination formula (Independent/Linked-Max/Linked-Avg/Mid-Side).
+//
+// DELIBERATELY CHANGED from the original JUCE-based C++:
+//   1. No JUCE anywhere -- juce::AudioBuffer/SmoothedValue/Decibels/jlimit are gone, replaced with
+//      plain arrays and fminf/fmaxf/powf, the same posture as every other ported effect in this
+//      file.
+//   2. Every stage's cathode bypass capacitor is omitted. The original library supports one as an
+//      optional per-stage feature (a trapezoidal companion model), but every stage this signal
+//      chain actually uses leaves it at that feature's own default of "none fitted" as far as this
+//      port's own research into the source could confirm -- so there is nothing here to omit
+//      faithfully, and adding unused capacitor-companion machinery would just be dead code.
+//   3. The original computes each stage's small-signal quiescent gain (used to normalize the
+//      stage to unity gain at rest, phase-corrected for the common-cathode stage's own inversion)
+//      analytically, from the linearized system's own Jacobian. This port gets the same NUMBER a
+//      different way: a one-time (not per-sample) finite-difference probe at the already-solved
+//      quiescent operating point -- nudge Vin by +-1mV, resolve, take the central difference. Both
+//      are literally computing the same derivative (a small-signal gain IS a derivative); this
+//      port just evaluates it numerically instead of deriving the closed form, at zero per-sample
+//      cost either way since it only runs once when a slot first activates this effect.
+//   4. The original exposes a runtime-switchable NR iteration budget (a "Draft" vs "High quality"
+//      toggle, 8 vs 20 iterations). This port fixes the per-sample cap at 8 (the original's own
+//      "Draft" ceiling) -- warm-starting means steady-state audio converges in far fewer than that
+//      regardless, so this only ever bites during a hard transient, exactly like the original's
+//      own Draft mode.
+//   5. The output transformer's own 2nd-order (vs. the other two transformers' 1st-order) filter
+//      pair is reimplemented with this file's own existing RBJ-cookbook biquad machinery (the same
+//      one EQ3/FETCOMP's own oversampling filter already use) rather than the original's own
+//      distinct class, since that specific class's exact source wasn't available to this port's
+//      research -- both are standard textbook 2-pole Butterworth (Q=0.7071) filter pairs, so this
+//      is a same-technique reimplementation, not a guess at different math.
+//   6. Sidechain routing: the original hardware (and this plugin) has no external sidechain input
+//      at all -- the detector always taps the same signal being compressed. This port adds one:
+//      the detector's own input transformer is a SEPARATE instance from the main path's, always
+//      fed from whatever FXSlotParams.sidechain_source resolves to (see that field's own comment
+//      and process_fx_chain()'s sc_l/sc_r) -- "Same as Source" reproduces the original's
+//      self-sidechain behavior exactly (sc_l/sc_r simply equal this slot's own dry input), while
+//      any other source lets this compressor duck/gate off a different signal entirely (e.g. a
+///     kick drum on an ext-in pair ducking a synth pad's Program bus).
+typedef struct { float mu, kp, kvb, kg1, x; } FK67TubeParams;
+
+static const FK67TubeParams FK67_TUBE_12AX7 = { 100.0f, 600.0f, 300.0f, 1060.0f, 1.4f };
+static const FK67TubeParams FK67_TUBE_12AU7 = { 21.5f, 84.5f, 0.0f, 1180.0f, 1.3f };
+static const FK67TubeParams FK67_TUBE_12BH7 = { 20.0f, 3000.0f, 150.0f, 1200.0f, 1.3f };
+static const FK67TubeParams FK67_TUBE_6386  = { 70.0f, 300.0f, 300.0f, 700.0f, 1.0f };
+
+#define FK67_VCC 250.0f
+#define FK67_RP 100000.0f
+#define FK67_RK 1500.0f
+#define FK67_INV_RP (1.0f / FK67_RP)
+#define FK67_INV_RK (1.0f / FK67_RK)
+#define FK67_INPUT_CLAMP_V 50.0f
+#define FK67_CV_MAX_V 6.0f
+#define FK67_SOFT_KNEE_V 0.75f
+#define FK67_FORWARD_VOLTAGE_V 0.8f
+#define FK67_VOLTS_PER_SAMPLE 10.0f
+#define FK67_MAX_NR_ITERATIONS 8
+
+// One 2-node (plate/cathode) triode stage's warm-started Newton-Raphson state -- shared shape for
+// every one of the six stage roles (preamp, 3-stage sidechain cascade, both push-pull arms), since
+// the original library itself uses the identical class for all of them (the ones that never
+// receive a nonzero control voltage simply never have setCv() called with anything else). double,
+// not float, MATCHING THE ORIGINAL EXACTLY (its own state is std::array<double,2>) -- this is not
+// a style choice: the Jacobian's determinant is the difference of two products of conductances
+// (~1e-4 S) and reciprocal resistances (~1e-5 to ~7e-4 S), and at the 12AU7's own bias point (the
+// one tube here with kvb=0) that difference loses enough precision in float that the solve stalls
+// at its own cold-start guess on iteration 0 forever -- confirmed directly (12AU7 alone came out
+// stuck exactly at the {Vcc*0.5, 1.5} initial guess, every other tube converged fine in float).
+// Double avoids the cancellation with room to spare, same as the original.
+typedef struct { double vp, vk; } FK67NodeState;
+
+// The closed-form 2x2 Cramer's-rule Newton step, warm-started from *st's own entry values and
+// falling back to them on a singular Jacobian, a non-finite result, or exceeding max_iters without
+// converging -- see this section's own top comment for why each of those is faithful to the
+// original's own NRPolicy, not a shortcut.
+static void fk67_stage_nr_solve(FK67NodeState *st, double vin, double cv_bias, const FK67TubeParams *tube, int max_iters) {
+    const double mu = tube->mu, kp = tube->kp, kvb = tube->kvb, kg1 = tube->kg1, x = tube->x;
+    vin = fmin(vin, st->vk); // grid-conduction clamp: Vgk can never exceed 0 (before the CV bias)
+    const double fallback_vp = st->vp, fallback_vk = st->vk;
+    double vp = st->vp, vk = st->vk;
+    for (int iter = 0; iter < max_iters; iter++) {
+        const double Vpk = vp - vk;
+        const double Vgk = vin - vk - cv_bias;
+
+        // Koren triode model, fused current + both analytic partials (Norman L. Koren, "Improved
+        // Vacuum-Tube Models for SPICE", 1996) -- numerically-stable softplus/sigmoid forms avoid
+        // overflow for large arguments.
+        const double V2 = fmax(kvb + Vpk * Vpk, 1e-12);
+        const double sqV2 = sqrt(V2);
+        const double u = kp * (1.0 / mu + Vgk / sqV2);
+        double sig;
+        if (u >= 0.0) sig = 1.0 / (1.0 + exp(-u));
+        else { const double eu = exp(u); sig = eu / (1.0 + eu); }
+        double sp;
+        if (u > 30.0) sp = u;
+        else if (u < -30.0) sp = exp(u);
+        else sp = log1p(exp(u));
+        const double E1 = (Vpk / kp) * sp;
+
+        double Ip = 0.0, gds = 0.0, gm = 0.0;
+        if (E1 > 0.0) {
+            const double Ex = pow(E1, x);
+            const double Exx1 = Ex / E1;
+            Ip = Ex / kg1;
+            const double sp_over_kp = (Vpk != 0.0) ? (E1 / Vpk) : (sp / kp);
+            const double dE1_dVpk = sp_over_kp - Vpk * Vpk * Vgk * sig / (V2 * sqV2);
+            const double dE1_dVgk = Vpk * sig / sqV2;
+            const double x_Exx1_kg1 = x * Exx1 / kg1;
+            gds = x_Exx1_kg1 * dE1_dVpk;
+            gm  = x_Exx1_kg1 * dE1_dVgk;
+        }
+
+        // KCL residuals (plate, cathode -- no cathode bypass companion terms, see this section's
+        // own top comment) and the resulting Jacobian, solved via Cramer's rule.
+        const double f1 = (FK67_VCC - vp) * FK67_INV_RP - Ip;
+        const double f2 = vk * FK67_INV_RK - Ip;
+        const double J00 = -FK67_INV_RP - gds;
+        const double J01 = gds + gm;
+        const double J10 = -gds;
+        const double J11 = FK67_INV_RK + gds + gm;
+        const double det = J00 * J11 - J01 * J10;
+        if (fabs(det) < 1e-30) { vp = fallback_vp; vk = fallback_vk; break; }
+
+        const double inv = 1.0 / det;
+        const double new_vp = vp + (-f1 * J11 + f2 * J01) * inv;
+        const double new_vk = vk + ( f1 * J10 - f2 * J00) * inv;
+        if (!isfinite(new_vp) || !isfinite(new_vk)) { vp = fallback_vp; vk = fallback_vk; break; }
+
+        const double dvp = new_vp - vp, dvk = new_vk - vk;
+        vp = new_vp; vk = new_vk;
+        const double delta_l2 = sqrt(dvp * dvp + dvk * dvk);
+        const double x_l2 = sqrt(vp * vp + vk * vk);
+        if (delta_l2 < 1e-9 * (x_l2 + 1.0)) break; // converged
+        if (iter == max_iters - 1) { vp = fallback_vp; vk = fallback_vk; } // exceeded budget -- fall back
+    }
+    st->vp = vp;
+    st->vk = vk;
+}
+
+// Per-channel, per-stage-role dynamic state: the NR node above plus the stage's own DC-blocking
+// output filter (models the real output coupling capacitor every one of these tube stages has --
+// without it the triode's own large quiescent plate voltage, ~100-200V, would swamp everything
+// downstream).
+typedef struct {
+    FK67NodeState node;
+    float dc_x1, dc_y1; // one-pole DC-blocking HPF state: y[n] = x[n]-x[n-1] + R*y[n-1], R ~10Hz
+} FK67StageState;
+
+// Precomputed once per distinct TUBE TYPE (not per channel/instance -- every stage using the same
+// tube+Vcc+Rp+Rk config shares one of these): the small-signal quiescent gain used to normalize
+// the stage to unity gain at rest (with the sign flip a common-cathode stage's own inversion
+// needs), and the quiescent operating point itself (state init / DC-blocker pre-charge).
+typedef struct { float inv_gain_mag; float vq; float vkq; } FK67StageCoeffs;
+
+static void fk67_compute_stage_coeffs(FK67StageCoeffs *out, const FK67TubeParams *tube) {
+    // One-time quiescent solve, generous iteration budget (this runs once when a slot first
+    // activates FX_TYPE_FAIRKID67, never per-sample -- see this section's own top comment).
+    FK67NodeState probe = { FK67_VCC * 0.5f, 1.5f };
+    fk67_stage_nr_solve(&probe, 0.0f, 0.0f, tube, 200);
+    out->vq = probe.vp;
+    out->vkq = probe.vk;
+
+    // Small-signal gain via a central-difference probe at the now-known quiescent point (see this
+    // section's own top comment for why this numeric approach is equivalent to the original's own
+    // analytic Jacobian-based one).
+    const float eps = 0.001f;
+    FK67NodeState probe_hi = { out->vq, out->vkq };
+    FK67NodeState probe_lo = { out->vq, out->vkq };
+    fk67_stage_nr_solve(&probe_hi, eps, 0.0f, tube, 20);
+    fk67_stage_nr_solve(&probe_lo, -eps, 0.0f, tube, 20);
+    const float dvp = (probe_hi.vp - probe_lo.vp) / (2.0f * eps);
+    out->inv_gain_mag = 1.0f / fmaxf(1e-6f, fabsf(dvp));
+}
+
+// One stage's full per-sample processing: volts scaling, the NR solve, DC blocking, and the
+// unity-gain-at-rest normalization (with the common-cathode stage's own phase-inversion corrected
+// so every stage's wet output stays in-phase with its dry input, matching the original).
+static inline float fk67_stage_process(FK67StageState *st, const FK67StageCoeffs *coeffs,
+                                        float dc_block_coeff, float sample, float cv_bias_raw,
+                                        const FK67TubeParams *tube) {
+    const float vin = fmaxf(-FK67_INPUT_CLAMP_V, fminf(FK67_INPUT_CLAMP_V, sample * FK67_VOLTS_PER_SAMPLE));
+    const float cv_bias = fmaxf(0.0f, fminf(FK67_CV_MAX_V, cv_bias_raw));
+    fk67_stage_nr_solve(&st->node, vin, cv_bias, tube, FK67_MAX_NR_ITERATIONS);
+
+    const float vp_norm = st->node.vp / FK67_VOLTS_PER_SAMPLE;
+    const float y = vp_norm - st->dc_x1 + dc_block_coeff * st->dc_y1;
+    st->dc_x1 = vp_norm;
+    st->dc_y1 = y;
+
+    return -coeffs->inv_gain_mag * y;
+}
+
+// First-order (one HPF pole, one LPF pole, both bilinear-transform-derived) transformer
+// coloration stage, used for the input/sidechain-input/interstage transformers. A memoryless tanh
+// saturator with unity small-signal gain (tanh(drive*x)/drive) follows.
+typedef struct {
+    float hpf_b0, hpf_b1, hpf_a1, hpf_x1, hpf_y1;
+    float lpf_b0, lpf_b1, lpf_a1, lpf_x1, lpf_y1;
+} FK67Xfmr1State;
+
+static void fk67_xfmr1_init(FK67Xfmr1State *s, float hpf_hz, float lpf_hz) {
+    const float fs = (float)SAMPLE_RATE;
+    const float hpf_c = fmaxf(1.0f, fminf(0.49f * fs, hpf_hz));
+    const float lpf_c = fmaxf(1.0f, fminf(0.49f * fs, lpf_hz));
+
+    const float Kh = tanf((float)M_PI * hpf_c / fs);
+    s->hpf_b0 = 1.0f / (1.0f + Kh);
+    s->hpf_b1 = -s->hpf_b0;
+    s->hpf_a1 = (1.0f - Kh) / (1.0f + Kh);
+    s->hpf_x1 = s->hpf_y1 = 0.0f;
+
+    const float Kl = tanf((float)M_PI * lpf_c / fs);
+    s->lpf_b0 = Kl / (1.0f + Kl);
+    s->lpf_b1 = s->lpf_b0;
+    s->lpf_a1 = (1.0f - Kl) / (1.0f + Kl);
+    s->lpf_x1 = s->lpf_y1 = 0.0f;
+}
+
+static inline float fk67_xfmr1_process(FK67Xfmr1State *s, float x, float drive) {
+    const float h = s->hpf_b0 * x + s->hpf_b1 * s->hpf_x1 + s->hpf_a1 * s->hpf_y1;
+    s->hpf_x1 = x; s->hpf_y1 = h;
+    const float lp = s->lpf_b0 * h + s->lpf_b1 * s->lpf_x1 + s->lpf_a1 * s->lpf_y1;
+    s->lpf_x1 = h; s->lpf_y1 = lp;
+    const float d = fmaxf(1.0f, drive);
+    return tanhf(d * lp) / d;
+}
+
+// Second-order (2-pole HPF + 2-pole LPF, Butterworth Q=0.7071) transformer coloration, used for
+// the output transformer -- see this section's own top comment (point 5) for why this reuses
+// EqBiquadCoeffs/run_eq_biquad rather than a bespoke class.
+typedef struct {
+    EqBiquadCoeffs hpf_coeffs, lpf_coeffs;
+    float hpf_z1, hpf_z2, lpf_z1, lpf_z2;
+} FK67Xfmr2State;
+
+static void fk67_xfmr2_init(FK67Xfmr2State *s, float hpf_hz, float lpf_hz, float q) {
+    const float fs = (float)SAMPLE_RATE;
+    {
+        const float w0 = 2.0f * (float)M_PI * hpf_hz / fs;
+        const float alpha = sinf(w0) / (2.0f * q);
+        const float cosw0 = cosf(w0);
+        const float a0 = 1.0f + alpha;
+        s->hpf_coeffs.b0 = ((1.0f + cosw0) * 0.5f) / a0;
+        s->hpf_coeffs.b1 = -(1.0f + cosw0) / a0;
+        s->hpf_coeffs.b2 = s->hpf_coeffs.b0;
+        s->hpf_coeffs.a1 = (-2.0f * cosw0) / a0;
+        s->hpf_coeffs.a2 = (1.0f - alpha) / a0;
+    }
+    {
+        const float w0 = 2.0f * (float)M_PI * lpf_hz / fs;
+        const float alpha = sinf(w0) / (2.0f * q);
+        const float cosw0 = cosf(w0);
+        const float a0 = 1.0f + alpha;
+        s->lpf_coeffs.b0 = ((1.0f - cosw0) * 0.5f) / a0;
+        s->lpf_coeffs.b1 = (1.0f - cosw0) / a0;
+        s->lpf_coeffs.b2 = s->lpf_coeffs.b0;
+        s->lpf_coeffs.a1 = (-2.0f * cosw0) / a0;
+        s->lpf_coeffs.a2 = (1.0f - alpha) / a0;
+    }
+    s->hpf_z1 = s->hpf_z2 = s->lpf_z1 = s->lpf_z2 = 0.0f;
+}
+
+static inline float fk67_xfmr2_process(FK67Xfmr2State *s, float x, float drive) {
+    const float h = run_eq_biquad(x, &s->hpf_coeffs, &s->hpf_z1, &s->hpf_z2);
+    const float lp = run_eq_biquad(h, &s->lpf_coeffs, &s->lpf_z1, &s->lpf_z2);
+    const float d = fmaxf(1.0f, drive);
+    return tanhf(d * lp) / d;
+}
+
+// Sidechain timing presets (6 positions) -- attack/release time constants traced to the real
+// schematic's own component values, not invented (positions 5/6 use a two-branch program-dependent
+// release: the output follows whichever of a fast or slow decaying branch is currently higher,
+// giving quick recovery after a brief transient and a long tail after sustained heavy drive).
+typedef struct { bool auto_release; float attack_sec, release_sec, fast_sec, slow_sec; } FK67TimingPreset;
+static const FK67TimingPreset FK67_TIMING_PRESETS[6] = {
+    { false, 0.0002f, 0.30f, 0.0f,  0.0f  },
+    { false, 0.0002f, 0.80f, 0.0f,  0.0f  },
+    { false, 0.0002f, 2.00f, 0.0f,  0.0f  },
+    { false, 0.0002f, 5.00f, 0.0f,  0.0f  },
+    { true,  0.0002f, 10.0f, 0.50f, 10.0f },
+    { true,  0.0002f, 25.0f, 1.00f, 25.0f },
+};
+
+typedef struct { float cv, cv_fast, cv_slow; } FK67DetectorState;
+
+static inline float fk67_alpha(float tau_sec) {
+    return expf(-1.0f / (tau_sec * (float)SAMPLE_RATE));
+}
+
+// Full-wave rectification with a forward-voltage dead zone (models the real twin-diode tube
+// rectifier's own forward voltage -- signals below it produce no detector response at all, which
+// is why this whole topology sounds gentle on low-level material even at maximum drive) followed
+// by one-pole attack/release smoothing, or the dual-branch program-dependent release above.
+static float fk67_detector_process(FK67DetectorState *st, float sample, const FK67TimingPreset *preset) {
+    const float rect_v = fmaxf(0.0f, fabsf(sample * FK67_VOLTS_PER_SAMPLE) - FK67_FORWARD_VOLTAGE_V);
+    const float alpha_attack = fk67_alpha(preset->attack_sec);
+    if (!preset->auto_release) {
+        const float alpha_release = fk67_alpha(preset->release_sec);
+        const float alpha = (rect_v > st->cv) ? alpha_attack : alpha_release;
+        st->cv = alpha * st->cv + (1.0f - alpha) * rect_v;
+    } else {
+        const float alpha_fast = fk67_alpha(preset->fast_sec);
+        const float alpha_slow = fk67_alpha(preset->slow_sec);
+        if (rect_v > st->cv_fast) st->cv_fast = alpha_attack * st->cv_fast + (1.0f - alpha_attack) * rect_v;
+        else st->cv_fast = alpha_fast * st->cv_fast;
+        st->cv_slow = alpha_slow * st->cv_slow + (1.0f - alpha_slow) * rect_v;
+        st->cv = fmaxf(st->cv_fast, st->cv_slow);
+    }
+    return st->cv;
+}
+
+// Cubic-Hermite soft-knee CV limiter: unit slope at the knee's start, zero slope at cv_max, so the
+// final approach to the stage's own hard CV ceiling is gradual rather than a sharp digital corner.
+static float fk67_soft_limit_cv(float cv, float cv_max, float knee) {
+    if (cv_max <= 0.0f) return 0.0f;
+    knee = fmaxf(0.0f, fminf(cv_max, knee));
+    if (knee <= 0.0f) return fmaxf(0.0f, fminf(cv_max, cv));
+    const float clamped = fmaxf(0.0f, cv);
+    const float knee_start = cv_max - knee;
+    if (clamped <= knee_start) return clamped;
+    if (clamped >= cv_max) return cv_max;
+    const float t = (clamped - knee_start) / knee;
+    const float p = t + t * t - t * t * t;
+    return knee_start + knee * p;
+}
+
+typedef struct {
+    // 6 stage roles x 2 channels: preamp, 3-stage sidechain cascade, push-pull arms A/B.
+    FK67StageState preamp[2], sc1[2], sc2[2], sc3[2], arm_a[2], arm_b[2];
+    // Coefficients, one per distinct tube type (shared by every stage/channel using that tube).
+    FK67StageCoeffs coeffs_12au7, coeffs_12ax7, coeffs_12bh7, coeffs_6386;
+    float dc_block_coeff; // ~10Hz one-pole DC blocker, same for every stage
+
+    // Main-path input transformer, a SEPARATE sidechain-key input transformer (see this section's
+    // own top comment, point 6), interstage transformer (all 1st-order), and output transformer
+    // (2nd-order) -- one instance per channel each.
+    FK67Xfmr1State xfmr_in[2], xfmr_sc_in[2], xfmr_interstage[2];
+    FK67Xfmr2State xfmr_out[2];
+
+    FK67DetectorState detector[2];
+
+    bool initialized;
+} FxFairKid67State;
+
+static void fk67_init(FxFairKid67State *st) {
+    fk67_compute_stage_coeffs(&st->coeffs_12au7, &FK67_TUBE_12AU7);
+    fk67_compute_stage_coeffs(&st->coeffs_12ax7, &FK67_TUBE_12AX7);
+    fk67_compute_stage_coeffs(&st->coeffs_12bh7, &FK67_TUBE_12BH7);
+    fk67_compute_stage_coeffs(&st->coeffs_6386, &FK67_TUBE_6386);
+    st->dc_block_coeff = expf(-2.0f * (float)M_PI * 10.0f / (float)SAMPLE_RATE);
+
+    // Warm-start every stage instance at its own tube type's quiescent point, and pre-charge its
+    // DC blocker there too (dc_x1 = vq, dc_y1 = 0 -> the very first real sample sees zero DC-block
+    // transient rather than a ~1s settle from a cold zero, matching the original's own documented
+    // behavior).
+    const FK67StageCoeffs *preamp_c = &st->coeffs_12au7;
+    const FK67StageCoeffs *sc12_c = &st->coeffs_12ax7;
+    const FK67StageCoeffs *sc3_c = &st->coeffs_12bh7;
+    const FK67StageCoeffs *arm_c = &st->coeffs_6386;
+    FK67StageState *all_stages[6][2] = {
+        { &st->preamp[0], &st->preamp[1] }, { &st->sc1[0], &st->sc1[1] },
+        { &st->sc2[0], &st->sc2[1] },       { &st->sc3[0], &st->sc3[1] },
+        { &st->arm_a[0], &st->arm_a[1] },   { &st->arm_b[0], &st->arm_b[1] },
+    };
+    const FK67StageCoeffs *role_coeffs[6] = { preamp_c, sc12_c, sc12_c, sc3_c, arm_c, arm_c };
+    for (int role = 0; role < 6; role++) {
+        for (int ch = 0; ch < 2; ch++) {
+            FK67StageState *s = all_stages[role][ch];
+            s->node.vp = role_coeffs[role]->vq;
+            s->node.vk = role_coeffs[role]->vkq;
+            s->dc_x1 = role_coeffs[role]->vq / FK67_VOLTS_PER_SAMPLE;
+            s->dc_y1 = 0.0f;
+        }
+    }
+
+    for (int ch = 0; ch < 2; ch++) {
+        fk67_xfmr1_init(&st->xfmr_in[ch], 30.0f, 30000.0f);
+        fk67_xfmr1_init(&st->xfmr_sc_in[ch], 30.0f, 30000.0f);
+        fk67_xfmr1_init(&st->xfmr_interstage[ch], 25.0f, 22000.0f);
+        fk67_xfmr2_init(&st->xfmr_out[ch], 30.0f, 18000.0f, 0.70710678f);
+        st->detector[ch].cv = st->detector[ch].cv_fast = st->detector[ch].cv_slow = 0.0f;
+    }
+}
+
+static void run_fx_fairkid67(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r, float sc_l, float sc_r) {
+    FxFairKid67State *st = (FxFairKid67State *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxFairKid67State));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+        fk67_init(st);
+    }
+
+    const float p0 = fmaxf(0.0f, fminf(1.0f, params->param[0]));
+    const float p1 = fmaxf(0.0f, fminf(1.0f, params->param[1]));
+    const float p2 = fmaxf(0.0f, fminf(1.0f, params->param[2]));
+    const float p3 = fmaxf(0.0f, fminf(1.0f, params->param[3]));
+    const float p4 = fmaxf(0.0f, fminf(1.0f, params->param[4]));
+    const float p5 = fmaxf(0.0f, fminf(1.0f, params->param[5]));
+    const float p6 = fmaxf(0.0f, fminf(1.0f, params->param[6]));
+    const float p7 = fmaxf(0.0f, fminf(1.0f, params->param[7]));
+
+    const float input_gain = powf(10.0f, (-20.0f + p0 * 60.0f) / 20.0f);  // -20..+40dB
+    const float output_gain = powf(10.0f, (-20.0f + p1 * 40.0f) / 20.0f); // -20..+20dB
+    const float threshold_v = p2 * 5.0f;                                    // 0..5V -- calibrated
+    // against what this port's own detector chain can actually produce (a raw CV around 2-3V even
+    // at a hot full-scale drive with Sidechain Gain around unity -- see this effect's own test
+    // harness), not the original library's own acThresholdVoltage default (10V), which lives in a
+    // different upstream gain-staging context this port doesn't reproduce.
+    int timing_idx = (int)(p3 * 5.0f + 0.5f);
+    if (timing_idx < 0) timing_idx = 0; else if (timing_idx > 5) timing_idx = 5;
+    int link_idx = (int)(p4 * 3.0f + 0.5f); // 0=Independent,1=Linked-Max,2=Linked-Avg,3=Mid-Side
+    if (link_idx < 0) link_idx = 0; else if (link_idx > 3) link_idx = 3;
+    const float bias_v = p5 * 2.0f;               // 0..2V
+    const float iron = 0.5f + p6 * 2.5f;          // 0.5..3.0x transformer drive multiplier
+    const float sc_gain = p7 * 2.0f;              // 0..2.0x sidechain cascade drive
+
+    const FK67TimingPreset *preset = &FK67_TIMING_PRESETS[timing_idx];
+
+    float main_in[2] = { *l * input_gain, *r * input_gain };
+    float sc_in[2] = { sc_l * input_gain, sc_r * input_gain };
+
+    float preamp_out[2], raw_cv[2];
+    for (int ch = 0; ch < 2; ch++) {
+        const float xfmr_in = fk67_xfmr1_process(&st->xfmr_in[ch], main_in[ch], 1.2f * iron);
+        preamp_out[ch] = fk67_stage_process(&st->preamp[ch], &st->coeffs_12au7, st->dc_block_coeff,
+                                             xfmr_in, 0.0f, &FK67_TUBE_12AU7);
+
+        const float sc_xfmr_in = fk67_xfmr1_process(&st->xfmr_sc_in[ch], sc_in[ch], 1.2f * iron);
+        const float sc1 = fk67_stage_process(&st->sc1[ch], &st->coeffs_12ax7, st->dc_block_coeff,
+                                              sc_xfmr_in, 0.0f, &FK67_TUBE_12AX7);
+        const float sc2 = fk67_stage_process(&st->sc2[ch], &st->coeffs_12ax7, st->dc_block_coeff,
+                                              sc1, 0.0f, &FK67_TUBE_12AX7);
+        const float sc3 = fk67_stage_process(&st->sc3[ch], &st->coeffs_12bh7, st->dc_block_coeff,
+                                              sc2, 0.0f, &FK67_TUBE_12BH7);
+        raw_cv[ch] = fk67_detector_process(&st->detector[ch], sc3 * sc_gain, preset);
+    }
+
+    // Stereo linking (see FX_TYPE_FAIRKID67's own comment for each mode).
+    float final_cv[2];
+    if (link_idx == 3) { // Mid-Side
+        const float mid = (raw_cv[0] + raw_cv[1]) * 0.5f;
+        final_cv[0] = final_cv[1] = fmaxf(0.0f, mid - threshold_v) + bias_v;
+    } else {
+        const float eff0 = fmaxf(0.0f, raw_cv[0] - threshold_v) + bias_v;
+        const float eff1 = fmaxf(0.0f, raw_cv[1] - threshold_v) + bias_v;
+        if (link_idx == 0) { // Independent
+            final_cv[0] = eff0; final_cv[1] = eff1;
+        } else { // Linked-Max (1) or Linked-Avg (2)
+            const float linked = (link_idx == 1) ? fmaxf(eff0, eff1) : (eff0 + eff1) * 0.5f;
+            final_cv[0] = final_cv[1] = linked;
+        }
+    }
+
+    for (int ch = 0; ch < 2; ch++) {
+        const float shaped_cv = fk67_soft_limit_cv(final_cv[ch], FK67_CV_MAX_V, FK67_SOFT_KNEE_V);
+        const float out_a = fk67_stage_process(&st->arm_a[ch], &st->coeffs_6386, st->dc_block_coeff,
+                                                 preamp_out[ch], shaped_cv, &FK67_TUBE_6386);
+        const float out_b = fk67_stage_process(&st->arm_b[ch], &st->coeffs_6386, st->dc_block_coeff,
+                                                 -preamp_out[ch], shaped_cv, &FK67_TUBE_6386);
+        const float gain_out = (out_a - out_b) * 0.5f;
+        const float interstage = fk67_xfmr1_process(&st->xfmr_interstage[ch], gain_out, 1.1f * iron);
+        const float output = fk67_xfmr2_process(&st->xfmr_out[ch], interstage, 1.0f * iron);
+        *(ch == 0 ? l : r) = output * output_gain;
+    }
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -4275,7 +4795,14 @@ static void sync_fx_engine_types(const FXSlotParams fx_params[FX_SLOT_COUNT], FX
     }
 }
 
-static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, float *l, float *r) {
+// sc_snapshot_l/r: every source's own pre-FX dry signal THIS SAME SAMPLE, frozen before any
+// source's own FX chain (including this call) has mutated its bus_l/bus_r in place -- see
+// FXSlotParams.sidechain_source's own comment for why a live/mutating read would give a slot an
+// order-dependent (sometimes pre-FX, sometimes post-FX) view of another source depending purely on
+// which SOURCE_COUNT index happens to be processed first. Read-only here; only FX_TYPE_FAIRKID67
+// currently uses it, via an explicit index lookup right after dry_l/dry_r below -- every other
+// effect ignores it completely, same posture as any other per-slot field it doesn't read.
+static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, const float sc_snapshot_l[SOURCE_COUNT], const float sc_snapshot_r[SOURCE_COUNT], float *l, float *r) {
     float parallel_in_l = *l, parallel_in_r = *r;
     float parallel_sum_l = 0.0f, parallel_sum_r = 0.0f;
     int parallel_branch_count = 0;
@@ -4303,6 +4830,18 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
             branch_open = true;
         }
 
+        // Sidechain key lookup (see this function's own sc_snapshot_l/r comment above and
+        // FXSlotParams.sidechain_source's own comment): "Same as Source" (the default, and any
+        // out-of-range value) self-keys off this slot's own dry input, exactly reproducing
+        // ordinary non-external-sidechain compression.
+        float sc_l, sc_r;
+        int sc_src = (int)fx_params[s].sidechain_source;
+        if (sc_src < 0 || sc_src >= SOURCE_COUNT) {
+            sc_l = dry_l; sc_r = dry_r;
+        } else {
+            sc_l = sc_snapshot_l[sc_src]; sc_r = sc_snapshot_r[sc_src];
+        }
+
         float out_l, out_r;
         if (fx_params[s].bypass != 0.0f || type == FX_TYPE_OFF) {
             out_l = dry_l; out_r = dry_r; // pass-through, dry
@@ -4325,6 +4864,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                 case FX_TYPE_EQ3: run_fx_eq3(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_LIMITER: run_fx_limiter(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_FETCOMP: run_fx_fetcomp(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_FAIRKID67: run_fx_fairkid67(&fx_engine[s], &fx_params[s], &wet_l, &wet_r, sc_l, sc_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through
@@ -5308,6 +5848,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SUBARRAY("/hds/fx/%d/bypass", fx, FXSlotParams, bypass, FX_SLOT_COUNT),
     OSC_SUBARRAY("/hds/fx/%d/source", fx, FXSlotParams, fx_source, FX_SLOT_COUNT),
     OSC_SUBARRAY("/hds/fx/%d/chain_to_next", fx, FXSlotParams, chain_to_next, FX_SLOT_COUNT),
+    OSC_SUBARRAY("/hds/fx/%d/sidechain_source", fx, FXSlotParams, sidechain_source, FX_SLOT_COUNT),
     OSC_NESTED("/hds/fx/%d/param/%d", fx, FXSlotParams, param, FX_SLOT_COUNT, FX_SLOT_PARAM_COUNT),
     // FX_TYPE_NAM's own loaded-file paths -- plain string fields, generically saved/restored by
     // CLAP state (see clap_state_save/load's own K/T-line walk over this whole table) with no
@@ -6093,6 +6634,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->fx[f].bypass = 0.0f;
         knobs->fx[f].fx_source = 0.0f; // Program -- reproduces today's exact behavior by default
         knobs->fx[f].chain_to_next = 0.0f; // every slot its own one-slot branch in Parallel mode -- today's exact behavior
+        knobs->fx[f].sidechain_source = -1.0f; // "Same as Source" -- self-key, ordinary compression by default
         knobs->fx[f].nam_model_path[0] = '\0';
         knobs->fx[f].nam_ir_path[0] = '\0';
     }
@@ -11937,6 +12479,15 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             }
         }
 
+        // Sidechain snapshot: every source's own pre-FX dry signal THIS SAME SAMPLE, taken now
+        // (bus_l/bus_r are fully populated for every source by this point, and the loop below is
+        // about to start mutating them in place one source at a time) -- see process_fx_chain's
+        // own sc_snapshot_l/r comment for why an external sidechain key must read this frozen copy
+        // rather than the live array.
+        float sc_snapshot_l[SOURCE_COUNT], sc_snapshot_r[SOURCE_COUNT];
+        memcpy(sc_snapshot_l, bus_l, sizeof(sc_snapshot_l));
+        memcpy(sc_snapshot_r, bus_r, sizeof(sc_snapshot_r));
+
         // FX Bus: each source runs its own chain independently, on its own bus -- see
         // process_fx_chain's own comment for the routing rationale and the source_routing comment
         // on SynthSharedControls for the bus/source model this generalizes to. A source that owns
@@ -11947,7 +12498,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // effect to.
         for (int src = 0; src < SOURCE_COUNT; src++) {
             if (!source_has_fx_slots[src]) continue;
-            process_fx_chain(knobs->fx, fx_engine, (int)knobs->fx_source_routing_mode[src], src, &bus_l[src], &bus_r[src]);
+            process_fx_chain(knobs->fx, fx_engine, (int)knobs->fx_source_routing_mode[src], src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src]);
         }
 
         // CLAP multi-out (see this function's own per_program_out comment) -- captured here,
