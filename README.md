@@ -1412,3 +1412,66 @@ intended ~1350px), and all three previously-unconstrained LFO combos now
 have an explicit `setFixedWidth()` (62/90/65px) matching the existing
 pattern the LFO row's own destination-assignment combo, and the FX/EG
 tabs' combos, already used.
+
+### The Sample Bank was one shared catalog, so loading any Program's SFZ loaded them all
+
+The Sample Bank was a single, unpartitioned catalog per oscillator
+(`SampleSlot` entries split only by `assigned_osc`, 0-3): nothing on the
+slot itself recorded WHICH Program a zone actually belonged to. That was
+invisible with one Program loaded at a time, but broke as soon as more
+than one thing could reference the sampler at once -- loading an SFZ for
+any Combi lane, or restoring a CLAP project with several Programs each
+carrying their own sample set, loaded every one of them into that same
+shared pool immediately and unconditionally, whether or not that
+Program was the one actually in use. Console output confirmed it: the
+CLAP build was visibly loading sample data for patches nothing had
+selected, purely because a `SampleSlot` for them happened to exist
+somewhere in memory.
+
+Fixed by giving every `SampleSlot` (backend.c), `ZoneRecordWire` (the
+OSC/state wire struct), and `SampleZone` (frontend.py) an explicit
+`owner_program` field: `0-7` for a Combi lane, or `SINGLE_PROGRAM_SLOT`
+(`8`) for the Single Program slot. `find_matching_sample_slot()` now
+filters on `owner_program` in all three of its internal search loops
+(round-robin hit-counts are indexed by owner too), so two Programs can
+each own a completely distinct sample set on the same oscillator without
+any collision or cross-talk between them. `hds_load_sfz_for_osc()`,
+`apply_zone_upsert()`, and every `handle_note_on` call site that starts
+sample playback (`start_sample_osc()`) all take/pass `owner_program`
+through explicitly; Program Save/Load and the Mapping tab's own zone
+list (`SamplerMappingGrid`) filter and tag by it the same way.
+
+The loading trigger itself stayed deliberately simple: a zone loads the
+moment it is actually assigned to a Program -- via Program Load, a Combi
+lane's Program picker, live editing in the Mapping tab, or CLAP state
+restore -- and for no other reason. An earlier version of this fix
+additionally gated loading on `performance_mode` (deferring a Combi
+lane's zones until Combi mode was actually the live mode), reasoning
+that an inactive lane's samples shouldn't need to be resident yet. That
+turned out to be solving a problem that doesn't exist: a lane with
+nothing assigned has no zones to defer in the first place, so mode-gating
+only added a second, redundant condition on top of ownership without
+preventing anything ownership alone didn't already prevent. Reverted
+entirely (`zone_owner_is_relevant()`, the deferred-load queue and its
+poll function, `HdsSampleEngine.knobs`) in favor of the simpler rule:
+**Programs own their SFZ zones, and that ownership alone is both
+necessary and sufficient to trigger loading.**
+
+The Mapping tab itself gained no new UI for this -- no "Program:"
+selector was added. Every other per-Program editing tab (Filters, EGs,
+LFOs, ...) already implicitly operates on "whatever Program is currently
+loaded into the one live editing surface," with no selector of its own,
+and the Mapping tab now follows the exact same convention:
+`SamplerMappingGrid.visible_zones()` filters to
+`owner_program == SINGLE_PROGRAM_SLOT` unconditionally, matching Combi
+lanes' zones being edited by loading that lane into the live surface the
+same way any other per-Program state already is.
+
+This is a wire-format-breaking change: `/hds/zone/upsert` gained a 19th
+float argument (`owner_program`, sent as `SINGLE_PROGRAM_SLOT` for the
+Single Program slot) and `/hds/zone/load_sfz` gained a leading int
+argument, so `HDS_CLAP_STATE_VERSION` was bumped `1` -> `2`. A version-1
+CLAP state file (no `owner_program` field on its `Z` lines) still loads
+correctly -- `clap_state_load()` branches on the saved version and
+defaults every zone from an old save to `SINGLE_PROGRAM_SLOT`, which
+matches how those zones actually behaved before this change existed.

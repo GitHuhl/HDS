@@ -5374,6 +5374,16 @@ typedef struct {
                        // find_matching_sample_slot()'s oscillator filter -- every WAVE_SAMPLE
                        // oscillator used to share one unpartitioned note/velocity-keyed catalog;
                        // this is what actually splits it into 4 independent ones.
+    int owner_program; // 0-7 = that Combi lane (programs[0..7]), SINGLE_PROGRAM_SLOT (8) = Single
+                       // Program mode's own slot. Set once at creation, same immutable posture as
+                       // assigned_osc/zone_id just above. Splits the catalog a second way, on top
+                       // of assigned_osc: two Programs can each have their OWN VCO1 sample set
+                       // rather than being forced to share one unpartitioned list just because
+                       // they use the same oscillator -- see find_matching_sample_slot()'s own
+                       // owner_program filter. This is also what makes restoring/loading a
+                       // Program's own saved state only ever touch that Program's own zones,
+                       // instead of every zone anyone ever created across every Program sharing
+                       // the same oscillator index.
     int zone_id;  // stable identity assigned by the frontend, used to reconcile ZONE_OP_UPSERT/
                   // ZONE_OP_REMOVE messages against this array -- see the OSC zone handlers.
     bool active;  // false = a tombstoned (removed) array position, permanently skipped; distinct
@@ -6768,6 +6778,9 @@ typedef struct {
     // Which oscillator (0-3) this zone belongs to -- appended (18th float), never renumbering the
     // 17 above, matching this file's own established convention. See SampleSlot.assigned_osc.
     float assigned_osc;
+    // Which Program owns this zone (0-7 a Combi lane, SINGLE_PROGRAM_SLOT a Single Program) --
+    // appended (19th float), same convention. See SampleSlot.owner_program.
+    float owner_program;
     char path[SAMPLE_PATH_LEN];
 } ZoneRecordWire;
 
@@ -6808,8 +6821,11 @@ typedef struct HdsPendingLoadState {
     // [assigned_osc][group_idx] -- scoped per-oscillator so two unrelated zone sets on different
     // oscillators that happen to both use round_robin_group=1 cycle independently instead of
     // sharing one counter. Index 0 of the inner dimension is unused (group 0 = "not grouped"),
-    // same convention as before this gained the outer oscillator dimension.
-    unsigned int round_robin_hit_count[4][MAX_ROUND_ROBIN_GROUPS + 1];
+    // same convention as before this gained the outer oscillator dimension. Outermost dimension is
+    // owner_program (0..SINGLE_PROGRAM_SLOT) -- added alongside owner_program itself, so two
+    // Programs sharing the same oscillator + round_robin_group number cycle independently too,
+    // same reasoning as the oscillator dimension's own comment.
+    unsigned int round_robin_hit_count[SINGLE_PROGRAM_SLOT + 1][4][MAX_ROUND_ROBIN_GROUPS + 1];
 } HdsPendingLoadState;
 static HdsPendingLoadState g_pending_load_state;
 #define g_pending_loads g_pending_load_state.pending_loads
@@ -6830,6 +6846,14 @@ static inline int clamp_assigned_osc(float raw) {
     int v = (int)raw;
     if (v < 0) return 0;
     if (v > 3) return 3;
+    return v;
+}
+
+// Same idea as clamp_assigned_osc() above, for ZoneRecordWire.owner_program's 0..SINGLE_PROGRAM_SLOT range.
+static inline int clamp_owner_program(float raw) {
+    int v = (int)raw;
+    if (v < 0) return 0;
+    if (v > SINGLE_PROGRAM_SLOT) return SINGLE_PROGRAM_SLOT;
     return v;
 }
 
@@ -6858,6 +6882,7 @@ static void enqueue_pending_sample_load(HdsSampleEngine *se, int slot_index, con
     se->pending->pending_load_tail = (se->pending->pending_load_tail + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
     se->pending->pending_load_count++;
 }
+
 
 // Converts loop-point fractions to real frame indices (shared by drain_pending_sample_loads() and
 // the "path unchanged" branch of an UPSERT, both of which need total_frames -- only known once a
@@ -6937,6 +6962,17 @@ static void drain_pending_sample_loads(HdsSampleEngine *se) {
 // Applies one zone upsert -- unchanged logic from the old wire-parsed version, just fed an
 // already-populated ZoneRecordWire (built from OSC args in zone_upsert_handler() below) instead
 // of parsing one out of a raw byte buffer.
+//
+// BUG FIX (the actual one, not an earlier mode-gated attempt that was tried and reverted -- see
+// git history/README): every zone used to live in one flat, unpartitioned-by-Program catalog,
+// split only by oscillator. Loading/restoring ANY Program's own saved samples meant every OTHER
+// Program that happened to share an oscillator index saw its zones silently dragged along too --
+// "patches existing" (in the shared catalog) was being treated as a reason to load their samples,
+// even for a Program nothing currently referenced. Fixed by owner_program (see SampleSlot's own
+// comment): each zone now genuinely belongs to ONE Program, so restoring/loading a Program's own
+// saved state only ever touches that Program's own zones. Loading itself stays exactly as
+// immediate as it always was -- there's no separate "is this relevant right now" gate here at
+// all; a zone loads because its owning Program actually has it assigned, full stop.
 static void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     int found_index = -1;
     for (int s = 0; s < se->slots->sample_slot_count; s++) {
@@ -6946,7 +6982,7 @@ static void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     if (found_index < 0) {
         // Brand new zone -- append. sample_slots is a plain static array (zero-initialized
         // BSS), so a never-before-used position already has loaded=false, pre_roll_l/r=NULL,
-        // etc.; only zone_id/active need setting explicitly here.
+        // etc.; only zone_id/active/owner_program need setting explicitly here.
         if (se->slots->sample_slot_count >= SAMPLE_SLOT_CAPACITY) {
             fprintf(stderr, "[samples] Sample Bank at its %d-zone capacity -- ignoring zone_id %d\n", SAMPLE_SLOT_CAPACITY, rec->zone_id);
             return;
@@ -6954,6 +6990,7 @@ static void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
         found_index = se->slots->sample_slot_count++;
         se->slots->sample_slots[found_index].zone_id = rec->zone_id;
         se->slots->sample_slots[found_index].active = true;
+        se->slots->sample_slots[found_index].owner_program = clamp_owner_program(rec->owner_program);
         enqueue_pending_sample_load(se, found_index, rec);
         return;
     }
@@ -6994,20 +7031,20 @@ static void apply_zone_remove(HdsSampleEngine *se, int32_t zone_id) {
     }
 }
 
-// "/hds/zone/upsert" i + 18 f's + s -- zone_id + 18 floats in ZoneRecordWire's own field order
+// "/hds/zone/upsert" i + 19 f's + s -- zone_id + 19 floats in ZoneRecordWire's own field order
 // (root_note, min_note, max_note, min_velocity, max_velocity, unpitched, loop_start, loop_end,
 // loop_enabled, round_robin_group, tune_cents, gain_db, pan, start_offset_frac, reverse,
-// loop_release_exit, end_frac, assigned_osc) + path. liblo only dispatches here when the incoming
-// type string matches exactly, so argc/types are already guaranteed correct -- no manual
-// validation needed, unlike generic_osc_handler's table.
+// loop_release_exit, end_frac, assigned_osc, owner_program) + path. liblo only dispatches here
+// when the incoming type string matches exactly, so argc/types are already guaranteed correct --
+// no manual validation needed, unlike generic_osc_handler's table.
 static int zone_upsert_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argc; (void)msg;
     HdsSampleEngine *se = (HdsSampleEngine *)user_data;
     ZoneRecordWire rec;
     rec.zone_id = argv[0]->i;
-    float *f = &rec.root_note; // root_note..assigned_osc are 18 consecutive floats
-    for (int i = 0; i < 18; i++) f[i] = argv[1 + i]->f;
-    snprintf(rec.path, SAMPLE_PATH_LEN, "%s", (const char *)&argv[19]->s);
+    float *f = &rec.root_note; // root_note..owner_program are 19 consecutive floats
+    for (int i = 0; i < 19; i++) f[i] = argv[1 + i]->f;
+    snprintf(rec.path, SAMPLE_PATH_LEN, "%s", (const char *)&argv[20]->s);
     apply_zone_upsert(se, &rec);
     return 0;
 }
@@ -7031,17 +7068,21 @@ static int32_t g_next_native_zone_id = -1; // decrements per native-loaded zone;
     // zone_ids are always >= 1 (SamplerMappingGrid._next_zone_id only ever increments from 1), so
     // this negative space can never collide with one.
 
-static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, const char *sfz_path) {
+static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_program, const char *sfz_path) {
     if (osc_index < 0 || osc_index > 3) return 0;
+    owner_program = clamp_owner_program((float)owner_program);
 
-    // Always "replace this oscillator's zone set" -- a no-op at empty-catalog startup time, the
-    // real live-reload behavior for /hds/zone/load_sfz. Collect ids first (a plain forward scan
-    // while tombstoning in place is safe here too, same as apply_zone_remove's own loop, but
-    // collecting first keeps this obviously correct regardless of how apply_zone_remove's own
-    // loop shape might change later).
+    // Always "replace THIS PROGRAM's own zone set on this oscillator" -- a no-op at empty-catalog
+    // startup time, the real live-reload behavior for /hds/zone/load_sfz. Scoped by owner_program
+    // too (not just osc_index) so loading a new SFZ for one Program's own VCO1 doesn't remove a
+    // DIFFERENT Program's own VCO1 zones that happen to share the oscillator index -- see
+    // SampleSlot.owner_program's own comment. Collect ids first (a plain forward scan while
+    // tombstoning in place is safe here too, same as apply_zone_remove's own loop, but collecting
+    // first keeps this obviously correct regardless of how apply_zone_remove's own loop shape
+    // might change later).
     for (int s = 0; s < se->slots->sample_slot_count; s++) {
         SampleSlot *slot = &se->slots->sample_slots[s];
-        if (slot->active && slot->assigned_osc == osc_index) apply_zone_remove(se, slot->zone_id);
+        if (slot->active && slot->assigned_osc == osc_index && slot->owner_program == owner_program) apply_zone_remove(se, slot->zone_id);
     }
 
     char default_path[SAMPLE_PATH_LEN];
@@ -7126,6 +7167,7 @@ static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, const char *
         rec.loop_release_exit = loop_release_exit ? 1.0f : 0.0f;
         rec.end_frac = end_frac;
         rec.assigned_osc = (float)osc_index;
+        rec.owner_program = (float)owner_program;
         snprintf(rec.path, SAMPLE_PATH_LEN, "%s", r->sample);
 
         apply_zone_upsert(se, &rec);
@@ -7134,17 +7176,19 @@ static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, const char *
     return queued;
 }
 
-// "/hds/zone/load_sfz" i s -- oscillator index (0-3) + a path, valid on the BACKEND's own
-// filesystem (never a payload the frontend decoded itself -- see this pass's own design
-// rationale: a backend on another system has its samples with it locally, so only a path needs
-// to cross the wire). Reuses the exact same hds_load_sfz_for_osc() the CLI --sfz-vcoN flags call.
+// "/hds/zone/load_sfz" i i s -- oscillator index (0-3), owner Program index (0-7 a Combi lane,
+// SINGLE_PROGRAM_SLOT a Single Program), and a path, valid on the BACKEND's own filesystem (never
+// a payload the frontend decoded itself -- see this pass's own design rationale: a backend on
+// another system has its samples with it locally, so only a path needs to cross the wire). Reuses
+// the exact same hds_load_sfz_for_osc() the CLI --sfz-vcoN flags call.
 static int zone_load_sfz_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argc; (void)msg;
     HdsSampleEngine *se = (HdsSampleEngine *)user_data;
     int osc_index = argv[0]->i;
-    const char *sfz_path = (const char *)&argv[1]->s;
-    int n = hds_load_sfz_for_osc(se, osc_index, sfz_path);
-    fprintf(stderr, "[sfz] /hds/zone/load_sfz osc=%d '%s': %d zone(s) queued\n", osc_index + 1, sfz_path, n);
+    int owner_program = argv[1]->i;
+    const char *sfz_path = (const char *)&argv[2]->s;
+    int n = hds_load_sfz_for_osc(se, osc_index, owner_program, sfz_path);
+    fprintf(stderr, "[sfz] /hds/zone/load_sfz osc=%d program=%d '%s': %d zone(s) queued\n", osc_index + 1, owner_program, sfz_path, n);
     return 0;
 }
 
@@ -7170,7 +7214,7 @@ static int zone_load_sfz_handler(const char *path, const char *types, lo_arg **a
 // here because g_sample_slots is strictly append-only (see its own comment) -- array index order
 // and zone_id creation order are the same thing. That invariant would need revisiting if slot
 // reuse/compaction is ever added later.
-static int find_matching_sample_slot(HdsSampleEngine *se, int assigned_osc, int note, int velocity) {
+static int find_matching_sample_slot(HdsSampleEngine *se, int assigned_osc, int owner_program, int note, int velocity) {
     long best_area = -1; // -1 sentinel: "no candidate yet", distinct from a real zero-area zone
     int first_best_idx = -1;
     int tie_count = 0;
@@ -7178,6 +7222,7 @@ static int find_matching_sample_slot(HdsSampleEngine *se, int assigned_osc, int 
         SampleSlot *slot = &se->slots->sample_slots[i];
         if (!slot->active || !slot->loaded) continue;
         if (slot->assigned_osc != assigned_osc) continue;
+        if (slot->owner_program != owner_program) continue;
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
         long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
@@ -7195,6 +7240,7 @@ static int find_matching_sample_slot(HdsSampleEngine *se, int assigned_osc, int 
         SampleSlot *slot = &se->slots->sample_slots[i];
         if (!slot->active || !slot->loaded) continue;
         if (slot->assigned_osc != assigned_osc) continue;
+        if (slot->owner_program != owner_program) continue;
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
         long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
@@ -7204,13 +7250,14 @@ static int find_matching_sample_slot(HdsSampleEngine *se, int assigned_osc, int 
 
     int group_idx = group;
     if (group_idx < 1) group_idx = 1; else if (group_idx > MAX_ROUND_ROBIN_GROUPS) group_idx = MAX_ROUND_ROBIN_GROUPS;
-    unsigned int hit = se->pending->round_robin_hit_count[assigned_osc][group_idx]++;
+    unsigned int hit = se->pending->round_robin_hit_count[owner_program][assigned_osc][group_idx]++;
     unsigned int target_ordinal = hit % (unsigned int)member_count;
     unsigned int ordinal = 0;
     for (int i = 0; i < se->slots->sample_slot_count; i++) {
         SampleSlot *slot = &se->slots->sample_slots[i];
         if (!slot->active || !slot->loaded) continue;
         if (slot->assigned_osc != assigned_osc) continue;
+        if (slot->owner_program != owner_program) continue;
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
         long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
@@ -7227,9 +7274,9 @@ static int find_matching_sample_slot(HdsSampleEngine *se, int assigned_osc, int 
 // find_matching_sample_slot finds a zone covering this note+velocity. Leaves *stream_idx at -1
 // (silent) if nothing matches or the stream pool is exhausted, rather than failing the whole
 // note-on.
-static void start_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr, bool *preroll, int assigned_osc, int note, int velocity) {
+static void start_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr, bool *preroll, int assigned_osc, int owner_program, int note, int velocity) {
     if (*stream_idx >= 0) { release_sample_stream(se, *stream_idx); *stream_idx = -1; }
-    int slot_idx = find_matching_sample_slot(se, assigned_osc, note, velocity);
+    int slot_idx = find_matching_sample_slot(se, assigned_osc, owner_program, note, velocity);
     unsigned int start_frame = 0;
     if (slot_idx >= 0) {
         SampleSlot *slot = &se->slots->sample_slots[slot_idx];
@@ -7781,25 +7828,25 @@ static void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthShared
         // and release any stream a stolen/retriggered voice was still holding from a previous
         // note even if this new note doesn't need one -- see start_sample_osc()'s comment.
         if ((WaveType)((int)prog->vco1_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, 0, note, velocity);
+            start_sample_osc(se, &voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, 0, target_program, note, velocity);
         } else if (voices[slot].vco1_sample_stream >= 0) {
             release_sample_stream(se, voices[slot].vco1_sample_stream);
             voices[slot].vco1_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco2_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, 1, note, velocity);
+            start_sample_osc(se, &voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, 1, target_program, note, velocity);
         } else if (voices[slot].vco2_sample_stream >= 0) {
             release_sample_stream(se, voices[slot].vco2_sample_stream);
             voices[slot].vco2_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco3_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, 2, note, velocity);
+            start_sample_osc(se, &voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, 2, target_program, note, velocity);
         } else if (voices[slot].vco3_sample_stream >= 0) {
             release_sample_stream(se, voices[slot].vco3_sample_stream);
             voices[slot].vco3_sample_stream = -1;
         }
         if ((WaveType)((int)prog->vco4_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, 3, note, velocity);
+            start_sample_osc(se, &voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, 3, target_program, note, velocity);
         } else if (voices[slot].vco4_sample_stream >= 0) {
             release_sample_stream(se, voices[slot].vco4_sample_stream);
             voices[slot].vco4_sample_stream = -1;
@@ -12164,9 +12211,9 @@ int main(int argc, char **argv) {
     char osc_listen_port_str[16]; snprintf(osc_listen_port_str, sizeof(osc_listen_port_str), "%d", osc_listen_port);
     lo_server osc_server = lo_server_new_with_proto(osc_listen_port_str, LO_UDP, osc_error_handler);
     if (!osc_server) { fprintf(stderr, "Cannot continue without an OSC listen socket on port %d.\n", osc_listen_port); return 1; }
-    lo_server_add_method(osc_server, "/hds/zone/upsert", "i" "ffffffffffffffffff" "s", zone_upsert_handler, &g_sample_engine);
+    lo_server_add_method(osc_server, "/hds/zone/upsert", "i" "fffffffffffffffffff" "s", zone_upsert_handler, &g_sample_engine);
     lo_server_add_method(osc_server, "/hds/zone/remove", "i", zone_remove_handler, &g_sample_engine);
-    lo_server_add_method(osc_server, "/hds/zone/load_sfz", "is", zone_load_sfz_handler, &g_sample_engine);
+    lo_server_add_method(osc_server, "/hds/zone/load_sfz", "iis", zone_load_sfz_handler, &g_sample_engine);
     lo_server_add_method(osc_server, "/hds/song/save_midi", "s", song_save_midi_handler, &g_engine);
     lo_server_add_method(osc_server, "/hds/song/load_midi", "s", song_load_midi_handler, &g_engine);
     lo_server_add_method(osc_server, "/hds/tuning/load_scl", "s", tuning_load_scl_handler, NULL);
@@ -12222,7 +12269,7 @@ int main(int argc, char **argv) {
     // starting -- never fatal, matching load_sample_slot()'s own established failure posture.
     for (int i = 0; i < 4; i++) {
         if (!cli_sfz_path[i]) continue;
-        int n = hds_load_sfz_for_osc(&g_sample_engine, i, cli_sfz_path[i]);
+        int n = hds_load_sfz_for_osc(&g_sample_engine, i, SINGLE_PROGRAM_SLOT, cli_sfz_path[i]);
         fprintf(stderr, "[sfz] --sfz-vco%d '%s': %d zone(s) queued\n", i + 1, cli_sfz_path[i], n);
     }
 

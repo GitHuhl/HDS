@@ -596,6 +596,10 @@ FX_SLOT_PARAM_COUNT = 10
 # fraction enum). Index into this list is the Resolution combo's currentIndex().
 SEQ_QUANTIZE_RESOLUTIONS = [1, 2, 3, 4, 6, 8]
 COMBI_PROGRAM_COUNT = 8
+# Must match SINGLE_PROGRAM_SLOT in backend.c exactly -- the Sample Bank's owner_program value
+# (SampleZone.owner_program/SamplerMappingGrid.selected_program) for Single Program mode's own
+# slot, as opposed to a Combi lane (0..COMBI_PROGRAM_COUNT-1).
+SINGLE_PROGRAM_SLOT = COMBI_PROGRAM_COUNT
 # Multi-source/multi-output audio routing: must match EXT_IN_PAIR_COUNT/SOURCE_COUNT/
 # OUTPUT_PAIR_MAX in backend.c exactly. BREAKING CHANGE (real Combi mode): source ids 0-7 are
 # now the COMBI_PROGRAM_COUNT Combi Programs (0 = today's single Program, unchanged), id 8 is
@@ -1614,6 +1618,15 @@ class SampleZone:
         # Set at creation time (drag-drop tags it with the Mapping tab's currently-selected
         # oscillator; SFZ import tags every zone it creates the same way) and otherwise left alone.
         self.assigned_osc = 0
+        # Which Program owns this zone -- 0..COMBI_PROGRAM_COUNT-1 a Combi lane,
+        # SINGLE_PROGRAM_SLOT Single Program mode's own slot -- see backend.c's
+        # SampleSlot.owner_program. Set at creation time the same way as assigned_osc (the Mapping
+        # tab's currently-selected Program), never changed after. This is what actually keeps two
+        # different Programs from sharing one VCO1 sample set just because they both use it, and
+        # what lets a Program's own samples stay unloaded on the backend until that Program is
+        # actually the one performance_mode makes audible -- see apply_zone_upsert()'s own comment
+        # in backend.c.
+        self.owner_program = SINGLE_PROGRAM_SLOT
 
 class MidiKeyButton(QPushButton):
     """A single piano key on the Mapping tab's reference keyboard -- visual only (no MIDI is
@@ -1684,11 +1697,17 @@ class SamplerMappingGrid(QWidget):
         return QRectF(float(lx), float(self.get_y_for_velocity(zone.max_velocity)), float((elx + ew) - lx), float(self.get_y_for_velocity(zone.min_velocity) - self.get_y_for_velocity(zone.max_velocity)))
 
     def visible_zones(self):
-        """Zones belonging to the currently-selected oscillator -- every interaction/rendering
-        method below iterates this instead of the full self.sample_zones list, so a zone on a
-        different oscillator is neither visible, clickable, nor reachable by a marquee/Delete
-        while that oscillator isn't selected."""
-        return [z for z in self.sample_zones if z.assigned_osc == self.selected_osc]
+        """Zones belonging to the currently-selected oscillator, for the active Program -- every
+        interaction/rendering method below iterates this instead of the full self.sample_zones
+        list, so a zone on a different oscillator is neither visible, clickable, nor reachable by
+        a marquee/Delete while that oscillator isn't selected. Always SINGLE_PROGRAM_SLOT, with no
+        separate Mapping-tab selector for it: this tab edits whatever's currently loaded into the
+        one live editing surface, exactly like the Filters/EGs/LFOs tabs already do -- editing a
+        Combi lane's own sound means loading that lane's Program INTO this same surface first (see
+        _edit_combi_lane_in_program_mode), not picking a different Program to view here. A Combi
+        lane's own zones only get their real owner_program (0-7) when a Program is pushed onto
+        that specific lane (_load_program_from_path(..., lane_idx=i)), never through this grid."""
+        return [z for z in self.sample_zones if z.assigned_osc == self.selected_osc and z.owner_program == SINGLE_PROGRAM_SLOT]
 
     def get_marquee_rect(self): return QRectF(QPointF(self.drag_start_pos), QPointF(self.marquee_current_pos)).normalized()
     def dragEnterEvent(self, e): e.acceptProposedAction() if e.mimeData().hasUrls() else None
@@ -6044,9 +6063,19 @@ class SynthGui(QWidget):
             # own file (<name>_vco{N}.sfz), recorded as a {"<osc_index>": "<filename>"} map --
             # replaces the old single shared file, which couldn't tell which oscillator a zone
             # belonged to. See _load_program_from_path()'s load-side mirror of this map.
+            #
+            # BUG FIX: scoped to owner_program == SINGLE_PROGRAM_SLOT -- this always exports
+            # whatever's currently in the ONE live editing surface (matching every field in
+            # `fields` above, which is also always that same surface's own state -- see
+            # _is_program_scope_address()), never a Combi lane's own zones that happen to share an
+            # oscillator index. Before this, Program Save exported the ENTIRE shared catalog for
+            # each oscillator regardless of which Program actually owned a given zone, so a saved
+            # .hdsprog could drag along totally unrelated Combi lanes' own sample content, and
+            # loading it back would silently reassign that content to whichever Program loaded the
+            # file next.
             sfz_map = {}
             for osc in range(4):
-                osc_zones = [z for z in self.mapping_grid.sample_zones if z.assigned_osc == osc]
+                osc_zones = [z for z in self.mapping_grid.sample_zones if z.assigned_osc == osc and z.owner_program == SINGLE_PROGRAM_SLOT]
                 if not osc_zones:
                     continue
                 sfz_filename = f"{name}_vco{osc + 1}.sfz"
@@ -6809,17 +6838,24 @@ class SynthGui(QWidget):
         cycling buttons (lane_idx=None: Single Program mode's own dedicated ProgramState), the
         Edit button below each loaded Combi lane (also lane_idx=None -- see
         _edit_combi_lane_in_program_mode), and each Combi lane's own Program picker (lane_idx
-        0-7): apply every included field via _apply_program_fields_to_combi_lane(), and -- only
-        when loading into Single Program mode's own slot (lane_idx is None) -- if the file
-        references any colocated per-oscillator .sfz files, REPLACE (not merge with) only the
-        REFERENCED oscillators' own zones -- a real, deliberate behavior difference from the SFZ
-        importer's own additive-only posture, because loading a *Program* means "this Program's
-        own samples for the oscillators it actually uses," not "add these on top of whatever was
-        already loaded" or "wipe every oscillator regardless of what this Program touches." An
-        oscillator this Program's sfz_file map doesn't mention is left completely untouched. The
-        Sample Bank is a single session-wide catalog with no per-Program partitioning (see the
-        Mapping tab's own zone-catalog design), so this pass deliberately does not attempt to load
-        a Combi lane's own colocated .sfz -- a documented scope boundary, not an oversight."""
+        0-7): apply every included field via _apply_program_fields_to_combi_lane(), and, if the
+        file references any colocated per-oscillator .sfz files, REPLACE (not merge with) only the
+        REFERENCED oscillators' own zones for the owning Program -- a real, deliberate behavior
+        difference from the SFZ importer's own additive-only posture, because loading a *Program*
+        means "this Program's own samples for the oscillators it actually uses," not "add these on
+        top of whatever was already loaded" or "wipe every oscillator regardless of what this
+        Program touches." An oscillator this Program's sfz_file map doesn't mention is left
+        completely untouched.
+
+        owner_program (see SampleZone.owner_program/backend.c's SampleSlot.owner_program) is
+        SINGLE_PROGRAM_SLOT when lane_idx is None, or lane_idx itself (0-7) otherwise -- this is
+        the ONE place a Combi lane's own zones ever get tagged with their real owner, since the
+        Mapping tab itself has no separate Program selector (it always edits the live editing
+        surface -- see SamplerMappingGrid.visible_zones()'s own comment) and Combi Load/the
+        per-lane Program picker both route through here with lane_idx already set. Removal/
+        replacement is scoped by BOTH assigned_osc and owner_program, so pushing a fresh SFZ onto
+        one Combi lane's own VCO1 never touches a different lane's (or Single Program's) own VCO1
+        zones just because they share an oscillator index."""
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -6827,8 +6863,7 @@ class SynthGui(QWidget):
             QMessageBox.warning(self, "Load Program", f"Could not read '{path}':\n{e}")
             return
         self._apply_program_fields_to_combi_lane(lane_idx, data.get("fields", {}))
-        if lane_idx is not None:
-            return
+        owner_program = SINGLE_PROGRAM_SLOT if lane_idx is None else lane_idx
 
         sfz_file = data.get("sfz_file")
         # Backward-compat: an old save's sfz_file was a bare filename (one shared file, no
@@ -6850,26 +6885,32 @@ class SynthGui(QWidget):
                 except (TypeError, ValueError):
                     continue
                 sfz_path = os.path.join(prog_dir, sfz_filename)
-                old_ids = [z.zone_id for z in self.mapping_grid.sample_zones if z.assigned_osc == osc]
+                old_ids = [z.zone_id for z in self.mapping_grid.sample_zones if z.assigned_osc == osc and z.owner_program == owner_program]
                 if old_ids:
                     self.transmit_zone_remove(old_ids)
-                    self.mapping_grid.sample_zones = [z for z in self.mapping_grid.sample_zones if z.assigned_osc != osc]
+                    self.mapping_grid.sample_zones = [z for z in self.mapping_grid.sample_zones if not (z.assigned_osc == osc and z.owner_program == owner_program)]
                 if os.path.isfile(sfz_path):
                     zones, warnings = _build_zones_from_sfz(sfz_path, self.mapping_grid._next_zone_id)
                     if zones:
                         self.mapping_grid._next_zone_id += len(zones)
-                        for z in zones: z.assigned_osc = osc
+                        for z in zones:
+                            z.assigned_osc = osc
+                            z.owner_program = owner_program
                         self.mapping_grid.sample_zones.extend(zones)
                         self.transmit_zone_upsert(zones)
-                    self.mapping_loaded_sfz_path[osc] = sfz_path
+                    if lane_idx is None:
+                        self.mapping_loaded_sfz_path[osc] = sfz_path
                     all_warnings.extend(warnings)
                 else:
                     all_warnings.append(f"{sfz_filename} (Osc {osc + 1}): file not found")
-            self.mapping_grid.update()
-            self._on_mapping_osc_changed(self.mapping_grid.selected_osc)  # refresh readout/status
+            if lane_idx is None:
+                self.mapping_grid.update()
+                self._on_mapping_osc_changed(self.mapping_grid.selected_osc)  # refresh readout/status
             if all_warnings:
                 QMessageBox.warning(self, "Load Program", f"Loaded '{data.get('name', '')}' with some sample issues:\n\n" + "\n".join(f"- {w}" for w in all_warnings))
 
+        if lane_idx is not None:
+            return
         self.program_name_field.setText(data.get("name", os.path.splitext(os.path.basename(path))[0]))
         self._current_program_category = data.get("category", "")
 
@@ -7896,11 +7937,11 @@ class SynthGui(QWidget):
     # backend.c). Each OSC message carries exactly ONE zone -- a Mapping tab edit touching several
     # zones just sends several messages back to back, unlike the old wire-framed socket's
     # one-message-covers-many-zones batching.
-    # zone_id (i) + 18 floats (root_note, min_note, max_note, min_velocity, max_velocity,
+    # zone_id (i) + 19 floats (root_note, min_note, max_note, min_velocity, max_velocity,
     # unpitched, loop_start, loop_end, loop_enabled, round_robin_group, tune_cents, gain_db, pan,
-    # start_offset_frac, reverse, loop_release_exit, end_frac, assigned_osc) + path (s) -- must
-    # match ZoneRecordWire's field order in backend.c exactly.
-    _ZONE_UPSERT_TYPES = "i" + "f" * 18 + "s"
+    # start_offset_frac, reverse, loop_release_exit, end_frac, assigned_osc, owner_program) + path
+    # (s) -- must match ZoneRecordWire's field order in backend.c exactly.
+    _ZONE_UPSERT_TYPES = "i" + "f" * 19 + "s"
 
     def _zone_to_osc_args(self, zone):
         is_drum = (zone.key_center == -1)
@@ -7919,6 +7960,7 @@ class SynthGui(QWidget):
             float(zone.start_offset), 1.0 if zone.reverse else 0.0,
             1.0 if zone.loop_release_exit else 0.0, float(zone.end_frac),
             float(zone.assigned_osc),
+            float(zone.owner_program),
             zone.file_path,
         )
 
