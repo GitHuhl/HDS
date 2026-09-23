@@ -1114,11 +1114,11 @@ effect rather than a ported third-party plugin:
   well-known instant-attack/smooth-release brick-wall technique real limiters (L1 included) are
   built on, not a clone of L1's own internals.
 
-### HT76 FX slot (1176-style FET limiter)
+### FetComp FX slot (1176-style FET limiter)
 
-An FX slot (Type: `HT76`) ported from [fetcomp-dsp](https://github.com/Paulllux/fetcomp-dsp)
-(Paul Ulrix, MIT license) -- the DSP behind the HT-76/FetComp plugin, a circuit-derived model of
-the UREI 1176LN FET limiting amplifier's own gain cell, detector/timing network, Class A line amp
+An FX slot (Type: `FetComp`) ported from [fetcomp-dsp](https://github.com/Paulllux/fetcomp-dsp)
+(Paul Ulrix, MIT license) -- a circuit-derived model of the UREI 1176LN FET limiting amplifier's
+own gain cell, detector/timing network, Class A line amp
 and output transformer. Unlike Gate/EQ3/Limiter above, this isn't a simple filter or envelope
 follower -- it's a real analog-circuit model: a voltage-divider gain cell (a JFET solved via a
 closed-form quadratic every sample, derived directly from the transistor's own device equation),
@@ -1161,7 +1161,7 @@ diode-knee shape) are fixed at the author's own shipping defaults rather than ex
 controls, since those exist upstream for the *author's* own shipped-vs-experimental comparison, not
 as a listener-facing knob; (5) the "selected FET part" latitude (Idss/pinch-off voltage) stays
 fixed at a typical small-signal JFET's values rather than exposed as a param, since that's a
-real per-unit trimming detail, not something a software knob should model. See `run_fx_ht76()`'s
+real per-unit trimming detail, not something a software knob should model. See `run_fx_fetcomp()`'s
 own (long) comment in `backend.c` for the complete list with the reasoning behind each change.
 
 Like every other FX slot, this runs on a real guitar/vocal/etc track's own audio too, not just a
