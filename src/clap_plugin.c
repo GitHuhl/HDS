@@ -602,25 +602,18 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
             applied_knobs, skipped_knobs, applied_zones);
     free(b.buf);
 
-    // Bug fix: a host loading a saved project can call this EITHER before or after activate()
-    // (the CLAP spec allows both, and hosts genuinely differ) -- but activate() is what starts
-    // this instance's own embedded OSC server and makes p->osc_ready true. If a frontend.py
-    // happens to connect and send /hds/request_state in the window between activate() and this
-    // function actually finishing (a real, observed race: a host that activates first, THEN
-    // loads state, with the two none too far apart in wall-clock time), that first reply would
-    // correctly, completely, and USELESSLY report this instance's still-default p->knobs --
-    // load() genuinely hadn't run yet at the moment it was asked. That reply looks exactly like a
-    // fresh, never-configured instance: internally consistent, syntactically complete, and simply
-    // wrong. If OSC is already up at this point (this call landed AFTER activate()), push the
-    // state this load just established right now, proactively -- no frontend needs to ask again,
-    // and any frontend that already got the earlier default-laden reply gets silently corrected
-    // by this second, later, definitely-current one (frontend.py applies any complete dump the
-    // same way regardless of whether it asked for this specific one). If OSC ISN'T up yet (this
-    // load() landed BEFORE activate(), the other legal ordering), there's nothing to push to --
-    // clap_plugin_activate()'s own matching push (see its own comment) covers that case instead.
-    if (p->osc_ready) {
-        send_full_state_dump(p->osc_reply_addr, &p->knobs);
-    }
+    // REVERTED: this used to also proactively push send_full_state_dump() here (and a matching
+    // push in clap_plugin_activate()) to close the activate()/state.load() ordering race -- see
+    // git history/README for the original reasoning. Backed out: an unsolicited push from here
+    // can arrive concurrently with a frontend's own in-flight /hds/request_state reply, and
+    // listen_for_status_frames() buffers every plain knob address into the SAME
+    // _state_dump_buffer regardless of which request it logically belongs to (the wire protocol
+    // has no request/response token to tell two overlapping dumps apart) -- so two dumps in
+    // flight at once can interleave into one corrupted hybrid before either sentinel arrives,
+    // which is worse than the original race, not a fix for it (confirmed: made the previously-
+    // working close-and-reopen case intermittent too). The actual fix for the ordering race
+    // belongs on the frontend side instead, where retries can be sequenced one at a time -- see
+    // _begin_state_restore_guard()'s own comment in frontend.py.
     return true;
 }
 
@@ -735,18 +728,12 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         lo_server_add_method(p->osc_server, NULL, NULL, generic_osc_handler, &p->knobs);
         p->osc_ready = true;
         fprintf(stderr, "[hds-clap] OSC listening on UDP port %d, status replies to %s:%d\n", p->osc_listen_port, CLAP_OSC_REPLY_HOST, p->osc_reply_port);
-        // Bug fix: covers the other legal ordering from clap_state_load()'s own matching push --
-        // see that function's comment. If a host calls state.load() to restore a saved project's
-        // values BEFORE ever calling activate() (also a real, CLAP-spec-legal ordering, and one
-        // observed to matter here), p->knobs already holds the correct, real values by the time
-        // THIS line runs, but nothing could have pushed them out yet since the OSC server (and
-        // p->osc_reply_addr, just resolved above) didn't exist until now. Push once here too --
-        // harmless even when state.load() hasn't happened at all yet (a genuinely fresh instance
-        // just reports its own real defaults, a correct, if redundant, dump), and it's what
-        // finally makes a frontend.py connecting for the very first time to an already-loaded
-        // project see the REAL state immediately, rather than needing a second reconnect after
-        // whichever of these two functions happened to run last.
-        send_full_state_dump(p->osc_reply_addr, &p->knobs);
+        // REVERTED: this used to also proactively push send_full_state_dump() here -- see
+        // clap_state_load()'s own comment on why (an unsolicited push racing a frontend's own
+        // in-flight request-driven reply can interleave two dumps into one corrupted hybrid,
+        // since the wire protocol has no request/response token to tell them apart -- confirmed
+        // to make previously-reliable reconnects intermittent instead of fixing the original
+        // race). Fixed on the frontend side instead.
         if (p->host && p->host->get_extension) {
             const clap_host_log_t *log = (const clap_host_log_t *)p->host->get_extension(p->host, CLAP_EXT_LOG);
             if (log && log->log) {

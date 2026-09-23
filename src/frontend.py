@@ -6083,6 +6083,47 @@ class SynthGui(QWidget):
     def _end_state_restore_guard(self):
         self._pending_state_restore = False
 
+    # A real, observed race: a CLAP host may call activate() (starts this instance's OSC server)
+    # and state.load() (restores a saved project's real values into the backend's own p->knobs) in
+    # either order, and the two aren't necessarily far apart in wall-clock time. A
+    # /hds/request_state sent once, immediately on connect, can land in the gap between whichever
+    # of those two runs first and whichever runs second -- getting a complete, internally
+    # consistent, and simply WRONG reply (accurately reporting p->knobs in whatever state it
+    # happened to be in at that exact moment). A backend-side fix (proactively pushing a fresh dump
+    # from both activate() and state.load() once each finishes) was tried and reverted: it can race
+    # a frontend's own in-flight reply and interleave two dumps' chunks into one corrupted hybrid
+    # buffer, since the wire protocol has no request/response token to tell overlapping dumps
+    # apart -- confirmed to turn a previously-reliable reconnect into an intermittent one, which is
+    # worse than the race it was meant to fix. Fixed here instead, sequenced so at most one dump is
+    # ever in flight at a time: after the initial send, a few follow-up resends are scheduled, each
+    # one skipped entirely if a reply has already started arriving (self._state_dump_buffer has any
+    # content) or already finished (the guard's already been lifted) -- only firing when NOTHING
+    # has arrived yet, closing the race without ever risking two overlapping dumps.
+    HDS_STATE_RESTORE_RETRY_COUNT = 3
+    HDS_STATE_RESTORE_RETRY_INTERVAL_MS = 400
+
+    def _send_request_state(self, retry_index=0):
+        if self.osc_client is None:
+            return
+        request_msg = OscMessageBuilder(address="/hds/request_state")
+        try:
+            self.osc_client.send(request_msg.build())
+        except OSError:
+            return
+        if retry_index == 0:
+            self._begin_state_restore_guard()
+        if retry_index < self.HDS_STATE_RESTORE_RETRY_COUNT:
+            QTimer.singleShot(self.HDS_STATE_RESTORE_RETRY_INTERVAL_MS,
+                               lambda i=retry_index + 1: self._maybe_retry_request_state(i))
+
+    def _maybe_retry_request_state(self, retry_index):
+        if not self._pending_state_restore:
+            return  # already resolved (the sentinel already arrived) -- nothing to do
+        if self._state_dump_buffer:
+            return  # a reply is already arriving -- let it finish rather than risk a second,
+                     # overlapping one interleaving into the same buffer
+        self._send_request_state(retry_index)
+
     def _apply_full_state_fields(self, fields):
         """Applies a /hds/request_state reply (see listen_for_status_frames()'s sentinel
         handling) to this GUI's own widgets, so connecting to an already-configured backend
@@ -7361,10 +7402,7 @@ class SynthGui(QWidget):
         # per-block status broadcast, which needs no request at all), it pulls the real state --
         # regardless of launch order, and self-healing if the backend later restarts/reconnects.
         if was_mock and not self.mock_mode and self.osc_client is not None:
-            request_msg = OscMessageBuilder(address="/hds/request_state")
-            try: self.osc_client.send(request_msg.build())
-            except OSError: pass
-            self._begin_state_restore_guard()
+            self._send_request_state()
 
     def transmit_knob_packet(self):
         """Sends every knob's current value as one OSC bundle (one UDP datagram) to the backend --
@@ -8151,16 +8189,11 @@ def runtime_connect_and_bind(gui):
     # connected, so simply not transmitting is the correct fallback -- transmitting defaults is
     # exactly the bug this replaces.
     if gui.osc_client is not None:
-        request_msg = OscMessageBuilder(address="/hds/request_state")
-        try: gui.osc_client.send(request_msg.build())
-        except OSError: pass
-        # Suppress transmit_knob_packet() until the reply (or a timeout) arrives -- see
-        # _begin_state_restore_guard()'s own comment. Without this, a real user touching ANY
-        # control before this async round trip completes fires transmit_knob_packet()'s first-ever
-        # call -- which sends a full snapshot of every widget's own construction-time default,
-        # permanently overwriting a DAW-restored CLAP patch's real state before the correct values
-        # this very request is about to fetch ever get a chance to land.
-        gui._begin_state_restore_guard()
+        # _send_request_state() also suppresses transmit_knob_packet() until a reply (or a
+        # timeout) arrives -- see _begin_state_restore_guard()'s own comment -- and schedules a
+        # few sequenced follow-up resends to close the activate()/state.load() ordering race
+        # covered in that method's own comment, without ever risking two overlapping dumps.
+        gui._send_request_state()
 
 
 if __name__ == "__main__":

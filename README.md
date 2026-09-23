@@ -1287,25 +1287,34 @@ in the narrow window between whichever of those two runs first and
 whichever runs second, the reply it got was completely valid, complete,
 and internally consistent -- and entirely wrong, reporting `p->knobs`
 in whatever state it happened to be in at that exact moment, which
-depending on the ordering could be pre-load defaults. By the time a
-user closed and reopened the frontend moments later, both had long
-since finished, so the reconnect was reliably right -- exactly matching
-the reported pattern. Fixed on the backend side, not the frontend: both
-`clap_plugin_activate()` and `clap_state_load()` now proactively push a
-fresh `send_full_state_dump()` once THEY finish, each guarded so it only
-actually sends once OSC is up (`p->osc_ready`/`p->osc_reply_addr` valid,
-resolved in `activate()`). Whichever of the two genuinely runs last ends
-up broadcasting the final, correct state on its own, with no frontend
-change needed -- `frontend.py` already applies any complete, sentinel-
-terminated dump it receives the same way regardless of whether it asked
-for that specific one, so an earlier wrong push simply gets silently,
-harmlessly superseded by the correct one moments later. Harmless when
-only one of the two ever fires meaningfully (state never loaded at all,
-a genuinely fresh instance: activate()'s own push just reports real,
-correct defaults) or when nothing is listening yet (a frontend that
-hasn't launched yet simply never receives that particular push -- its
-own later, explicit `/hds/request_state` at ITS OWN startup remains the
-primary mechanism for that far more common case).
+depending on the ordering could be pre-load defaults.
+
+A first attempt fixed this on the backend side: `clap_plugin_activate()`
+and `clap_state_load()` each proactively pushing a fresh
+`send_full_state_dump()` once THEY finished. Reverted -- confirmed to
+make things WORSE, turning the previously-reliable reconnect case
+intermittent too: an unsolicited push from one of those two functions
+can land while a frontend's own request-driven reply is still arriving
+in chunks, and `listen_for_status_frames()` buffers every plain knob
+address into the SAME `_state_dump_buffer` regardless of which request
+it logically belongs to (the wire protocol has no request/response
+token to tell two overlapping dumps apart) -- so two dumps in flight at
+once can interleave into one corrupted hybrid before either sentinel
+arrives. That's a worse failure mode than the original race, not a fix
+for it.
+
+Fixed on the frontend side instead, where retries can be sequenced so
+at most one dump is ever in flight at a time: `_send_request_state()`
+sends the request and schedules a few follow-up resends
+(`HDS_STATE_RESTORE_RETRY_COUNT` at `HDS_STATE_RESTORE_RETRY_INTERVAL_MS`
+apart); each one is skipped entirely via `_maybe_retry_request_state()`
+if a reply has already started arriving (`_state_dump_buffer` has any
+content) or already finished (the restore guard's already been lifted)
+-- a resend only actually fires when NOTHING has arrived yet, closing
+the race without ever risking two overlapping dumps. Verified directly:
+a fake backend that ignores the first two requests entirely (simulating
+the race window) and only answers the third still ends with all 1235
+addresses restored with zero mismatches.
 
 ### Window was forced obnoxiously wide, LFO tab's knobs strayed from their labels
 
