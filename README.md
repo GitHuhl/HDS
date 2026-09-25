@@ -809,6 +809,8 @@ is unaffected either way.
 
 ```sh
 make                    # builds ./synth_engine
+make clap               # builds hds.clap -- the synth as a CLAP instrument plugin
+make hds-fx             # builds hds_fx.clap -- the standalone multi-FX CLAP plugin (see its own section below)
 pip install -r requirements.txt
 
 ./synth_engine &        # start the audio/MIDI engine
@@ -819,8 +821,8 @@ On NixOS/Nix, `nix-shell` at the repo root provides every dependency above (plus
 backend cross-toolchain) in one shell, and auto-provisions a `.venv/` for `requirements.txt` on
 entry -- see `shell.nix`'s own header comment for exactly what each target needs from it.
 **`nix-shell` is the only supported way to build every target in this repo, including plain
-`make`/`make clap`** -- there is no "build outside nix-shell" path, and none should ever be
-suggested again.
+`make`/`make clap`/`make hds-fx`** -- there is no "build outside nix-shell" path, and none should
+ever be suggested again.
 
 Linux is the only supported platform -- there is no Windows build of any kind (standalone or
 CLAP), and none is planned: this project will not maintain a second *platform* audio backend
