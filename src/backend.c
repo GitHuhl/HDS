@@ -692,6 +692,31 @@ typedef struct {
 // quantized correction), param[6] Voice Range (choice: Bass/Tenor/Alto/Soprano/Wide -- narrows the
 // detector's own min/max Hz search window to the expected range for that voice type, which reduces
 // octave-detection errors, same reason real pitch correctors offer this; not just a cosmetic preset).
+// Two more inputs apply UNCONDITIONALLY (regardless of Target Source), as a final multiplicative
+// adjustment layered on top of the already-corrected pitch, never fed back into detection or
+// quantization above -- so neither can ever fight the correction: live MIDI pitch bend (see
+// g_hardtune_bend_semitones's own comment, reusing Program 0's own pb_range_up/down) and (not yet
+// wired) LFO-routable vibrato. MIDI Target Source itself reads g_hardtune_held_note, an
+// engine-wide monophonic last-note-priority tracker (see its own comment) updated by
+// handle_note_on/handle_note_off regardless of which Program a note targets or whether that
+// Program is in Poly or Mono mode -- deliberately separate from any Program's own mono_stack.
+//
+// KNOWN LIMIT, precisely measured (not a bug): this two-tap crossfade is genuinely accurate
+// (<0.1% frequency error, verified against a real periodic test signal) for corrections up to
+// about 3 semitones (a minor third) either direction, then degrades in a characteristic way, not a
+// vague "gets worse": the wrap/crossfade rate is exactly `target_hz - input_hz` (the two windows'
+// own modulation frequency), and once that's comparable to the target pitch itself, the perceived
+// output locks onto a rational sub-multiple of the intended target instead of the target itself --
+// measured exactly 2/3 of target for 4-9 semitones of correction, exactly 1/2 (an octave low) for
+// 10+ semitones. This can NEVER happen in Scale/Key mode: snapping to the nearest note in any of
+// the 5 scales offered is at most ~1.5-2 semitones away by construction (hardtune_snap_to_scale's
+// own search never needs to look further for any of them), well inside the clean range -- only MIDI
+// Target Source with a held note more than a minor third from the input (a deliberate wide-interval
+// harmony, not "correction"), or a large pitch bend stacked on top, can reach this. A cleaner fix
+// (tying grain_period to the TARGET period rather than the source's own detected period, the more
+// involved PSOLA design real harmonizer/pitch-shifter plugins use for large intervals) is a real,
+// scoped follow-up if wide-interval MIDI harmony ever becomes a use case here; not attempted yet
+// since it's a materially different, larger change than what pitch CORRECTION itself needs.
 #define FX_TYPE_HARDTUNE 20
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
@@ -5578,6 +5603,20 @@ static void run_fx_deesser(FXSlotEngine *engine, const FXSlotParams *params, flo
 // FX_HARDTUNE_MAX_LAG/MIN_LAG bound the compile-time scratch arrays (sized for this engine's own
 // absolute widest search range, 70-1100Hz); the actual per-call search range narrows to whichever
 // Voice Range preset is selected.
+// -1 = no note currently held (MIDI Target Source mode then falls back to no correction, same as an
+// unvoiced input); else the current monophonic MIDI note number. Set by handle_note_on/
+// handle_note_off (via g_hardtune_note_stack, declared later where MonoNoteStack is defined --
+// these two plain floats live here instead, before run_fx_hardtune's own definition, since that
+// function needs them and is defined well before MonoNoteStack is).
+static float g_hardtune_held_note = -1.0f;
+// Live pitch bend, in SEMITONES (already scaled by Program 0's own pb_range_up/pb_range_down, the
+// same convention render_audio_block's own per-Program pitch bend already uses -- see
+// dispatch_midi_event's own HDS_MIDI_PITCH_BEND branch). Applied by FX_TYPE_HARDTUNE as a final
+// multiplicative adjustment layered on top of its ALREADY-corrected pitch, unconditionally
+// (regardless of Target Source) -- see that effect's own comment for why it's never fed back into
+// detection or quantization.
+static float g_hardtune_bend_semitones = 0.0f;
+
 #define FX_HARDTUNE_ABS_MIN_HZ 70.0f
 #define FX_HARDTUNE_ABS_MAX_HZ 1100.0f
 #define FX_HARDTUNE_MIN_LAG 44  // SAMPLE_RATE/1100Hz
@@ -5801,10 +5840,14 @@ static void run_fx_hardtune(FXSlotEngine *engine, const FXSlotParams *params, fl
         float raw_target_ratio = 1.0f;
         if (st->voiced) {
             if (midi_target) {
-                // MIDI target-note mode isn't wired up yet (needs a new engine-wide "currently held
-                // MIDI note" -- see FX_TYPE_HARDTUNE's own #define comment) -- falls back to no
-                // correction (transparent passthrough) rather than guessing, until that lands.
-                raw_target_ratio = 1.0f;
+                // g_hardtune_held_note (see its own comment) is this engine-wide monophonic
+                // last-note-priority tracker, updated by handle_note_on/handle_note_off regardless
+                // of which Program a note targets -- if nothing is currently held, fall back to no
+                // correction, same posture as an unvoiced input.
+                if (g_hardtune_held_note >= 0.0f) {
+                    float midi = 69.0f + 12.0f * log2f(st->tracked_f0 / 440.0f);
+                    raw_target_ratio = exp2f((g_hardtune_held_note - midi) / 12.0f);
+                }
             } else {
                 float midi = 69.0f + 12.0f * log2f(st->tracked_f0 / 440.0f);
                 float target_midi = hardtune_snap_to_scale(midi, key, scale_idx);
@@ -5820,17 +5863,24 @@ static void run_fx_hardtune(FXSlotEngine *engine, const FXSlotParams *params, fl
     float log_cur = log2f(st->target_ratio) + (log2f(st->hop_target_ratio) - log2f(st->target_ratio)) * retune_rate;
     st->target_ratio = exp2f(log_cur);
 
+    // Live pitch bend (see g_hardtune_bend_semitones's own comment): a final multiplicative
+    // adjustment layered on TOP of the already-corrected ratio, unconditionally -- regardless of
+    // Target Source, and never fed back into detection/quantization above, so it can never fight
+    // the correction. Not smoothed here beyond whatever smoothing the MIDI pitch-bend wheel's own
+    // physical motion already has -- a real-time performance control, not a quantized target.
+    const float output_ratio = st->target_ratio * exp2f(g_hardtune_bend_semitones / 12.0f);
+
     // --- PSOLA resynthesis: two Hann-crossfaded taps, phase wraps mod grain_period (see this
     // effect's own top comment for why this never drifts unboundedly even under a sustained
     // non-1.0 ratio) ---
-    // Phase advances by (target_ratio - 1), NOT target_ratio: the actual buffer read position is
+    // Phase advances by (output_ratio - 1), NOT output_ratio: the actual buffer read position is
     // write_pos + offset, and write_pos ITSELF already advances by 1 every sample (real time) --
     // phase only needs to supply the DIFFERENCE from real-time so the read position's own total
-    // rate of advance through the buffer's content comes out to exactly target_ratio (1 from
-    // write_pos's own motion + (target_ratio-1) from phase = target_ratio). At target_ratio=1 this
+    // rate of advance through the buffer's content comes out to exactly output_ratio (1 from
+    // write_pos's own motion + (output_ratio-1) from phase = output_ratio). At output_ratio=1 this
     // correctly makes phase never move at all: a fixed offset behind write_pos is already a
     // transparent, undelayed-in-pitch copy, needing no wrapping/resets whatsoever.
-    st->phase += (st->target_ratio - 1.0f);
+    st->phase += (output_ratio - 1.0f);
     if (st->phase >= st->grain_period) st->phase -= st->grain_period;
     if (st->phase < 0.0f) st->phase += st->grain_period; // pitch-DOWN corrections drift phase negative
 
@@ -7928,6 +7978,23 @@ typedef struct {
                                       // note was struck last (see the fallback in handle_note_off).
     int count;
 } MonoNoteStack;
+
+// Engine-wide monophonic "currently held note" tracker for FX_TYPE_HARDTUNE's MIDI Target Source
+// mode -- deliberately separate from any Program's own per-Program mono_stack (which only exists/
+// updates while that Program is in Mono mode): this tracks every note-on/note-off globally,
+// regardless of which Program it targets or whether that Program is in Poly or Mono mode, since a
+// vocalist using this effect wants it to follow whatever note a MIDI controller is playing, not
+// tied to one Program's own voice-allocation mode. Last-note-priority monophonic, reusing the same
+// MonoNoteStack machinery already used everywhere else in this file. Updated only in
+// handle_note_on/handle_note_off (both unconditional on poly_mode_active), read only in
+// run_fx_hardtune -- safe as a plain global under this engine's single-threaded architecture (MIDI
+// dispatch and audio rendering already run on the same thread).
+// (g_hardtune_held_note/g_hardtune_bend_semitones -- the two plain floats run_fx_hardtune itself
+// reads -- are declared earlier in this file, right before FX_TYPE_HARDTUNE's own implementation,
+// since that function is defined well before MonoNoteStack is; only this struct-typed stack needs
+// to live here, where MonoNoteStack exists, since it's touched only by handle_note_on/
+// handle_note_off below, both much later in the file than run_fx_hardtune.)
+static MonoNoteStack g_hardtune_note_stack = {0};
 
 // Live performance-controller state -- continuously updated from incoming MIDI Control Change/
 // Pitch Bend/Channel Pressure messages (see process_midi_input), read every sample by
@@ -10434,6 +10501,11 @@ static float hds_note_to_hz(const SynthSharedControls *knobs, int note) {
 // today's hardcoded "mono always uses voice 0", byte-identical when target_program is always 0
 // (Single Program/Sequencer modes).
 static void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], int target_program, int note, int velocity, bool poly_mode_active, MonoNoteStack *mono_stack) {
+    // FX_TYPE_HARDTUNE's own global note tracker (see its own comment) -- unconditional on
+    // poly_mode_active, unlike the Program-scoped mono_stack just below.
+    mono_stack_push(&g_hardtune_note_stack, note, velocity);
+    g_hardtune_held_note = (float)note;
+
     const ProgramState *prog = &knobs->programs[target_program];
     int slot = -1;
     if (poly_mode_active) {
@@ -10579,6 +10651,12 @@ static void trigger_voice_release(HdsSampleEngine *se, SynthVoice *voice) {
 }
 
 static void handle_note_off(HdsSampleEngine *se, SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int target_program, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
+    // FX_TYPE_HARDTUNE's own global note tracker (see its own comment) -- unconditional on
+    // poly_mode_active, unlike the Program-scoped mono_stack below.
+    mono_stack_remove(&g_hardtune_note_stack, note);
+    g_hardtune_held_note = (g_hardtune_note_stack.count > 0)
+        ? (float)g_hardtune_note_stack.notes[g_hardtune_note_stack.count - 1] : -1.0f;
+
     if (poly_mode_active) {
         int voice_limit = effective_voice_limit(knobs);
         for (int v = 0; v < voice_limit; v++) { if (voices[v].midi_note == note && voices[v].program_index == target_program) {
@@ -12301,6 +12379,13 @@ static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, Hds
         }
     } else if (type == HDS_MIDI_PITCH_BEND) {
         midi_live->pitch_bend = fmaxf(-1.0f, fminf(1.0f, value / 8192.0f));
+        // FX_TYPE_HARDTUNE's own live pitch-bend feature (see its own comment) -- reuses Program
+        // 0's pb_range_up/pb_range_down exactly like render_audio_block's own per-Program pitch
+        // bend already does, since this global effect has no single Program of its own to read a
+        // range from.
+        g_hardtune_bend_semitones = (midi_live->pitch_bend >= 0.0f)
+            ? midi_live->pitch_bend * knobs->programs[0].pb_range_up
+            : midi_live->pitch_bend * knobs->programs[0].pb_range_down;
     } else if (type == HDS_MIDI_CHANNEL_PRESSURE) {
         midi_live->channel_pressure = fmaxf(0.0f, fminf(1.0f, value / 127.0f));
     }

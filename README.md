@@ -1393,19 +1393,18 @@ one starts. Same category of trade-off as PeakMax's own lookahead limiter.
 
 Three stages: **(1)** YIN (de Cheveigne & Kawahara, 2002) pitch detection, run every 10ms on a
 mono-summed analysis window; **(2)** the detected pitch is quantized to a target -- either the
-nearest note in a chosen Key/Scale, or (planned, not yet wired) whatever MIDI note is currently
-held -- with two independent smoothing stages: Tracking Speed (smooths the raw detected pitch before
-quantization) and Retune Speed (smooths the final corrected ratio); **(3)** a period-synchronous
-two-tap crossfaded delay-line read applies the correction -- PSOLA's own core resynthesis mechanism,
-without needing explicit pitch-mark placement: a phase accumulator advances at the pitch-shift rate
-and wraps modulo the detected input period, and two read taps 50% of a period apart, each windowed
-by a Hann function of its own phase, crossfade into each other with zero gain ripple at the wrap
-point (a Hann window's value at phase x and at x+50% sum to exactly 1, the standard constant-
-overlap-add property -- no extra normalization needed).
+nearest note in a chosen Key/Scale, or whatever MIDI note is currently held (monophonic, last-note-
+priority, engine-wide -- see `g_hardtune_held_note`) -- with two independent smoothing stages:
+Tracking Speed (smooths the raw detected pitch before quantization) and Retune Speed (smooths the
+final corrected ratio); **(3)** a period-synchronous two-tap crossfaded delay-line read applies the
+correction -- PSOLA's own core resynthesis mechanism, without needing explicit pitch-mark placement:
+a phase accumulator advances at the pitch-shift rate and wraps modulo the detected input period, and
+two read taps 50% of a period apart, each windowed by a Hann function of its own phase, crossfade
+into each other with zero gain ripple at the wrap point (a Hann window's value at phase x and at
+x+50% sum to exactly 1, the standard constant-overlap-add property -- no extra normalization needed).
 
 Seven params: **Key** (12 notes) and **Scale** (Chromatic/Major/Minor/Major Pentatonic/Minor
-Pentatonic) for the target grid; **Target Source** (Scale/Key, or MIDI -- planned, currently falls
-back to no correction until a new engine-wide "currently held MIDI note" mechanism is wired in);
+Pentatonic) for the target grid; **Target Source** (Scale/Key, or MIDI -- mutually exclusive);
 **Amount** (0-100%, blends none..full correction in semitone space); **Retune Speed** (glide time
 into the corrected note -- low is the instant "2006-era" hard-tune snap, higher is a natural,
 musical portamento; defaults moderate, not the extreme snap, so it's usable for a natural
@@ -1416,12 +1415,12 @@ own search window to the expected fundamental range for that voice type, which m
 octave-detection errors, the same real reason commercial pitch correctors offer this, not just a
 cosmetic preset).
 
-**Planned follow-ups, not yet built**: MIDI-note target mode (needs a new engine-wide monophonic
-"currently held note" tracker, reusing this engine's own `MonoNoteStack` convention); MIDI pitch
-bend (using the same pitch-bend-range convention already used elsewhere) and LFO-routable vibrato,
-both applied as a final multiplicative adjustment layered on top of the already-corrected ratio,
-never fed back into the detector or the quantization decision -- so neither one fights the
-correction, and both work identically regardless of whether the target came from Scale/Key or MIDI.
+Two more inputs apply unconditionally, regardless of Target Source: live **MIDI pitch bend**
+(reusing Program 0's own pitch-bend-range knobs, the same convention `render_audio_block`'s per-
+Program pitch bend already uses) and (not yet wired) **LFO-routable vibrato**. Both are a final
+multiplicative adjustment layered on top of the already-corrected ratio, computed AFTER Retune
+Speed's own smoothing and never fed back into detection or the quantization decision above -- so
+neither one can ever fight the correction.
 
 **A real bug found and fixed during testing**: the PSOLA read-position math initially accumulated
 the tap phase at the raw pitch-shift ratio, but since the read position is `write_pos + phase_offset`
@@ -1434,6 +1433,19 @@ sawtooth (glottal-pulse-like) test signal, autocorrelation-measured with parabol
 interpolation, lands within 0.1Hz of the intended target for both upward and downward corrections;
 latency measured via a tone-burst threshold matches the designed ~14ms exactly; Amount=0 stays
 transparent; silence produces no instability.
+
+**A known, precisely-measured limit, not a bug**: systematic testing (sweeping correction size in
+1-semitone steps against a real periodic test signal) found the two-tap crossfade is accurate to
+within 0.1% for corrections up to about 3 semitones (a minor third) either direction, then degrades
+in a characteristic, exactly-reproducible way rather than just "getting worse": the two windows' own
+crossfade rate is exactly `target_hz - input_hz`, and once that's comparable to the target pitch
+itself, the perceived output locks onto a rational sub-multiple of the intended target instead --
+measured exactly 2/3 of target for 4-9 semitones of correction, exactly 1/2 (an octave low) for 10+
+semitones. This can never happen in Scale/Key mode: snapping to the nearest note in any of the 5
+scales offered is at most ~1.5-2 semitones away by construction. Only MIDI Target Source with a held
+note more than a minor third from the input (a deliberate wide-interval harmony, not "correction"),
+or a large pitch bend stacked on top, can reach it -- a real but narrow, documented limitation of
+this simple technique at large intervals, not something ordinary pitch-correction use ever hits.
 
 ### Per-slot gain reduction (GR) metering
 
