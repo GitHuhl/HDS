@@ -849,6 +849,20 @@ story, but this is the quick reference for "what can I even pass."
 | `--program <path.hdsprog>` | none | Loads a full Program (every field a saved `.hdsprog`'s own `fields` object carries, plus any `sfz_file` map) directly off disk at startup -- no frontend needs to ever connect. Reuses the exact same address-dispatch table live OSC control already goes through, so a Program field can never mean something different loaded this way than it does over the network. A bad/missing/malformed file logs and continues starting, same posture as a bad `--sfz-vcoN` path. |
 | `--master-volume <0.0-1.0>` | none (leaves `init_default_controls()`'s own default) | Sets master volume once at startup. Independent of `--program` -- a Program's own saved fields never include master volume at all (`_is_program_scope_address()` in `frontend.py` excludes it as a mixing/session-level control, not patch content), so there's no interaction or ordering to know about between the two flags. |
 
+**Interactive arrow-key controls (no flag needed)**: whenever `./synth_engine`'s stdin is a real
+terminal (checked via `isatty()` -- a piped, redirected, or systemd/headless launch is completely
+unaffected, and stdin is left in its normal line-buffered/echoing mode in that case), the terminal is
+put into raw mode for the life of the process and the arrow keys become live controls, for the same
+"somewhat adjustable, not totally launch-bound" reason `--program`/`--master-volume` exist:
+**Up**/**Down** nudge master volume by 0.02 (clamped 0..1); **Left**/**Right** load the
+previous/next saved Program from `~/HDS_Programs/`, alphabetically, wrapping around -- the exact
+same list and order `src/frontend.py`'s own "◀"/"▶" Program-cycle buttons use
+(`_cycle_program()`/`_scan_programs_folder()`), just triggered from the backend's own terminal
+instead. Reuses the same `hds_load_program_file()` `--program` already uses, so it's the same
+small-text-file-only, never-blocks-the-audio-thread work an already-live `/hds/zone/load_sfz` OSC
+call does today -- not a new category of runtime risk. The terminal's original settings are always
+restored on exit (normal shutdown or Ctrl+C).
+
 **`python3 src/frontend.py`:**
 
 | Flag | Default | Meaning |

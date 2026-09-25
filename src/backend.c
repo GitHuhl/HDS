@@ -26,6 +26,7 @@
 #include <limits.h> // PATH_MAX, for the same parser's #include cycle-guard/path buffers
 #include <ctype.h>  // isalpha/isalnum/isspace, for the same parser's hand-written tokenizer
 #include <strings.h> // strcasecmp -- SFZ opcode names are conventionally lowercase, matched case-insensitively here for robustness
+#include <termios.h> // raw-mode stdin for the interactive arrow-key CLI controls (see poll_stdin_control)
 // WavPack recording is disabled for now (commented out via this single guard, not deleted --
 // flip to 1, re-add -lwavpack to the Makefile's LDLIBS, and re-enable the frontend.py format
 // radio button to bring it back). See WavPackRecorder further down for the real implementation
@@ -14233,6 +14234,152 @@ static void hds_load_program_file(SynthSharedControls *knobs, HdsSampleEngine *s
     fprintf(stderr, "[program] --program '%s': loaded\n", path);
 }
 
+// --- Interactive arrow-key CLI control (Up/Down = master volume, Left/Right = cycle saved
+// Programs) --- entirely optional, zero-risk, best-effort: guarded by isatty() so a headless/
+// systemd/piped launch (stdin not a real terminal) is completely unaffected -- poll_stdin_control()
+// below is a no-op unless hds_stdin_raw_mode_enable() actually managed to put a real terminal into
+// raw mode. Every load this triggers (arrow-key Program cycling) reuses hds_load_program_file()
+// itself, so it's the exact same bounded, small-text-file-only work --program already does at
+// startup, just triggered live instead -- and per the existing live /hds/zone/load_sfz OSC handler,
+// this file's PCM sample loading is already deferred/throttled (SAMPLE_LOADS_PER_BLOCK), so nothing
+// here can block the audio thread on real disk I/O.
+static struct termios g_stdin_orig_termios;
+static bool g_stdin_raw_mode_active = false;
+
+static void hds_stdin_raw_mode_enable(void) {
+    if (!isatty(STDIN_FILENO)) return; // piped/redirected/headless stdin -- leave it alone entirely
+    if (tcgetattr(STDIN_FILENO, &g_stdin_orig_termios) != 0) return;
+    struct termios raw = g_stdin_orig_termios;
+    raw.c_lflag &= (tcflag_t)~(ICANON | ECHO); // no line buffering, no local echo of the raw escape bytes
+    raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return;
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (flags == -1 || fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) == -1) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_stdin_orig_termios); // couldn't make it non-blocking -- don't leave the terminal half-configured
+        return;
+    }
+    g_stdin_raw_mode_active = true;
+    fprintf(stderr, "[cli] interactive terminal detected -- Up/Down: master volume, Left/Right: cycle saved Programs\n");
+}
+
+static void hds_stdin_raw_mode_restore(void) {
+    if (g_stdin_raw_mode_active) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_stdin_orig_termios);
+        g_stdin_raw_mode_active = false;
+    }
+}
+
+static int hds_qsort_strcmp(const void *a, const void *b) {
+    return strcmp(*(const char * const *)a, *(const char * const *)b);
+}
+
+// Sorted list of saved Program names -- one per ~/HDS_Programs/<name>/<name>.hdsprog subfolder,
+// mirroring _scan_programs_folder() in frontend.py exactly (same folder convention, same
+// alphabetical order) so Left/Right cycles through the identical list the frontend's own "<>"
+// buttons would. Caller owns the returned array (and each of its strings) via free(); returns NULL
+// (out_count 0) if ~/HDS_Programs doesn't exist or has no saved Programs.
+static char **hds_scan_programs_folder(int *out_count) {
+    *out_count = 0;
+    const char *home = getenv("HOME");
+    if (!home) return NULL;
+    char root[SAMPLE_PATH_LEN];
+    snprintf(root, sizeof(root), "%s/HDS_Programs", home);
+    DIR *d = opendir(root);
+    if (!d) return NULL;
+    char **names = NULL;
+    int count = 0, cap = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue; // skip "."/".."/hidden
+        char check_path[SAMPLE_PATH_LEN + 2 * (NAME_MAX + 1) + 16]; // root + "/" + d_name + "/" + d_name + ".hdsprog"
+        snprintf(check_path, sizeof(check_path), "%s/%s/%s.hdsprog", root, ent->d_name, ent->d_name);
+        FILE *f = fopen(check_path, "r");
+        if (!f) continue; // not a valid Program subfolder -- same test frontend.py's own scan uses
+        fclose(f);
+        if (count >= cap) {
+            cap = cap ? cap * 2 : 8;
+            char **grown = realloc(names, sizeof(char *) * (size_t)cap);
+            if (!grown) break; // allocation failure -- keep whatever's already collected
+            names = grown;
+        }
+        names[count++] = strdup(ent->d_name);
+    }
+    closedir(d);
+    if (count == 0) { free(names); return NULL; }
+    qsort(names, (size_t)count, sizeof(char *), hds_qsort_strcmp);
+    *out_count = count;
+    return names;
+}
+
+// Remembers the currently-loaded Program's name (best-effort -- seeded from --program at startup,
+// updated on every arrow-key cycle) so Left/Right can start cycling RELATIVE to it, matching
+// _cycle_program()'s own "if the current text matches a saved Program, cycle relative to it"
+// behavior in frontend.py -- an unrecognized/no current Program just starts at the first (Right) or
+// last (Left) saved Program instead, same as there.
+static char g_stdin_current_program_name[SAMPLE_PATH_LEN] = {0};
+
+static void hds_cycle_program(SynthSharedControls *knobs, HdsSampleEngine *se, int delta) {
+    int count = 0;
+    char **names = hds_scan_programs_folder(&count);
+    if (!names) {
+        fprintf(stderr, "[cli] no saved Programs in ~/HDS_Programs -- nothing to cycle to\n");
+        return;
+    }
+    int current_idx = -1;
+    if (g_stdin_current_program_name[0]) {
+        for (int i = 0; i < count; i++) {
+            if (strcmp(names[i], g_stdin_current_program_name) == 0) { current_idx = i; break; }
+        }
+    }
+    int next_idx = (current_idx >= 0) ? (((current_idx + delta) % count + count) % count)
+                                       : (delta > 0 ? 0 : count - 1);
+    const char *home = getenv("HOME"); // already validated non-NULL by hds_scan_programs_folder finding a folder under it
+    char path[SAMPLE_PATH_LEN + 2 * (NAME_MAX + 1) + 32];
+    snprintf(path, sizeof(path), "%s/HDS_Programs/%s/%s.hdsprog", home, names[next_idx], names[next_idx]);
+    fprintf(stderr, "[cli] %s: loading Program '%s'\n", delta > 0 ? "Right" : "Left", names[next_idx]);
+    hds_load_program_file(knobs, se, path);
+    snprintf(g_stdin_current_program_name, sizeof(g_stdin_current_program_name), "%s", names[next_idx]);
+    for (int i = 0; i < count; i++) free(names[i]);
+    free(names);
+}
+
+// Called once per main-loop iteration, alongside the OSC/MIDI polls -- a true no-op (one isatty-
+// gated bool check) unless hds_stdin_raw_mode_enable() actually put a real terminal into raw mode.
+// Parses ANSI cursor-key escape sequences (ESC '[' 'A'/'B'/'C'/'D') byte-by-byte via a small state
+// machine that persists across calls, since a slow terminal/pty could in principle deliver an
+// escape sequence's 3 bytes across more than one non-blocking read.
+static void poll_stdin_control(SynthSharedControls *knobs, HdsSampleEngine *se) {
+    if (!g_stdin_raw_mode_active) return;
+    static int esc_state = 0; // 0 = idle, 1 = saw ESC, 2 = saw ESC '['
+    unsigned char buf[64];
+    ssize_t n;
+    while ((n = read(STDIN_FILENO, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            unsigned char c = buf[i];
+            if (esc_state == 0) {
+                if (c == 0x1b) esc_state = 1;
+                continue;
+            }
+            if (esc_state == 1) {
+                esc_state = (c == '[') ? 2 : 0;
+                continue;
+            }
+            esc_state = 0; // esc_state == 2: this byte is the final one, recognized or not
+            if (c == 'A') { // Up
+                knobs->master_volume = fmaxf(0.0f, fminf(1.0f, knobs->master_volume + 0.02f));
+                fprintf(stderr, "[cli] Up: master volume -> %.3f\n", (double)knobs->master_volume);
+            } else if (c == 'B') { // Down
+                knobs->master_volume = fmaxf(0.0f, fminf(1.0f, knobs->master_volume - 0.02f));
+                fprintf(stderr, "[cli] Down: master volume -> %.3f\n", (double)knobs->master_volume);
+            } else if (c == 'C') { // Right
+                hds_cycle_program(knobs, se, 1);
+            } else if (c == 'D') { // Left
+                hds_cycle_program(knobs, se, -1);
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     assert_fm_algorithms_acyclic();
     signal(SIGINT, handle_sigint);
@@ -14406,7 +14553,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[sfz] --sfz-vco%d '%s': %d zone(s) queued\n", i + 1, cli_sfz_path[i], n);
     }
 
-    if (cli_program_path) hds_load_program_file(&active_knobs, &g_sample_engine, cli_program_path);
+    if (cli_program_path) {
+        hds_load_program_file(&active_knobs, &g_sample_engine, cli_program_path);
+        // Best-effort seed for the arrow-key Left/Right cycle's "start relative to the current
+        // Program" behavior (see hds_cycle_program's own comment) -- just the basename minus its
+        // extension, regardless of whether this path actually lives under ~/HDS_Programs. If it
+        // doesn't match any name hds_scan_programs_folder() later finds, cycling gracefully falls
+        // back to starting at the first/last saved Program instead, same as an unrecognized name in
+        // frontend.py's own _cycle_program().
+        const char *base = strrchr(cli_program_path, '/');
+        base = base ? base + 1 : cli_program_path;
+        snprintf(g_stdin_current_program_name, sizeof(g_stdin_current_program_name), "%s", base);
+        char *dot = strrchr(g_stdin_current_program_name, '.');
+        if (dot) *dot = '\0';
+    }
     if (cli_master_volume_set) {
         active_knobs.master_volume = cli_master_volume;
         fprintf(stderr, "[cli] --master-volume %.3f\n", (double)cli_master_volume);
@@ -14502,11 +14662,14 @@ int main(int argc, char **argv) {
     SynthVoice voices[MAX_VOICES]; for (int i = 0; i < MAX_VOICES; i++) init_voice(&voices[i]);
     MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1]; for (int mp = 0; mp <= COMBI_PROGRAM_COUNT; mp++) mono_stacks[mp] = (MonoNoteStack){0}; // index COMBI_PROGRAM_COUNT = SINGLE_PROGRAM_SLOT
 
+    hds_stdin_raw_mode_enable(); // no-op (prints nothing) unless stdin is a real interactive terminal
+
     while (g_synth_running) {
         // Drain every pending OSC datagram this block -- generic_osc_handler/zone_upsert_handler/
         // zone_remove_handler write directly into active_knobs/g_sample_slots as each message is
         // dispatched, so nothing further is needed here once this returns 0 (no more pending).
         while (lo_server_recv_noblock(osc_server, 0) > 0) {}
+        poll_stdin_control(&active_knobs, &g_sample_engine); // arrow keys: Up/Down = master volume, Left/Right = Program cycle -- see its own comment
         poll_seq_audio_load_requests(&g_streams_state, &active_knobs); // spawns a loader thread if a lane's audio_path changed
 #if HDS_NAM_ENABLED
         poll_fx_nam_requests(g_engine.fx_engine, &active_knobs); // (re)loads a slot's .nam model/cab IR if its path changed
@@ -14745,6 +14908,7 @@ int main(int argc, char **argv) {
         }
         write_audio_block(pcm_handle, buffer, detected_output_channels, block_size, active_voices_count, render_ms);
     }
+    hds_stdin_raw_mode_restore(); // no-op unless hds_stdin_raw_mode_enable() actually changed the terminal
     // Flush/finalize a still-running take on shutdown: signal the writer thread to stop (if a
     // recording was active) and to exit, then join it so its final fclose actually happens
     // before the process exits.
