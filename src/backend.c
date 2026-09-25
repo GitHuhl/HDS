@@ -692,14 +692,19 @@ typedef struct {
 // quantized correction), param[6] Voice Range (choice: Bass/Tenor/Alto/Soprano/Wide -- narrows the
 // detector's own min/max Hz search window to the expected range for that voice type, which reduces
 // octave-detection errors, same reason real pitch correctors offer this; not just a cosmetic preset).
-// Two more inputs apply UNCONDITIONALLY (regardless of Target Source), as a final multiplicative
-// adjustment layered on top of the already-corrected pitch, never fed back into detection or
-// quantization above -- so neither can ever fight the correction: live MIDI pitch bend (see
-// g_hardtune_bend_semitones's own comment, reusing Program 0's own pb_range_up/down) and (not yet
-// wired) LFO-routable vibrato. MIDI Target Source itself reads g_hardtune_held_note, an
-// engine-wide monophonic last-note-priority tracker (see its own comment) updated by
-// handle_note_on/handle_note_off regardless of which Program a note targets or whether that
-// Program is in Poly or Mono mode -- deliberately separate from any Program's own mono_stack.
+// param[7] Vibrato Rate (0.1..10Hz), param[8] Vibrato Depth (0..1.5 semitones peak, default 0 = off),
+// param[9] Vibrato Mod Source (choice: None/Mod Wheel (CC1)/Aftertouch -- gates Depth by a live
+// controller, same idea as PackLfoParams.mod_source_cc, but for this effect's own dedicated
+// per-slot sine LFO rather than the per-Program LFO matrix, which has no destination for a global
+// FX effect with no single Program/voice of its own). Three inputs apply UNCONDITIONALLY (regardless
+// of Target Source), as a final multiplicative adjustment layered on top of the already-corrected
+// pitch, never fed back into detection or quantization above -- so none of them can ever fight the
+// correction: live MIDI pitch bend (see g_hardtune_bend_semitones's own comment, reusing Program 0's
+// own pb_range_up/down), the Vibrato LFO just described, and Target Source (MIDI mode) itself, which
+// reads g_hardtune_held_note, an engine-wide monophonic last-note-priority tracker (see its own
+// comment) updated by handle_note_on/handle_note_off regardless of which Program a note targets or
+// whether that Program is in Poly or Mono mode -- deliberately separate from any Program's own
+// mono_stack.
 //
 // KNOWN LIMIT, precisely measured (not a bug): this two-tap crossfade is genuinely accurate
 // (<0.1% frequency error, verified against a real periodic test signal) for corrections up to
@@ -5616,6 +5621,14 @@ static float g_hardtune_held_note = -1.0f;
 // (regardless of Target Source) -- see that effect's own comment for why it's never fed back into
 // detection or quantization.
 static float g_hardtune_bend_semitones = 0.0f;
+// Mod Wheel (CC1) and channel aftertouch, mirrored from MidiLiveState purely so FX_TYPE_HARDTUNE's
+// own Vibrato Depth can be scaled by a live controller (same "gate an LFO depth with the mod
+// wheel" idea as PackLfoParams.mod_source_cc, but this global effect has no MidiLiveState of its
+// own to read -- same reason g_hardtune_bend_semitones/g_hardtune_held_note are globals instead).
+// Updated by dispatch_midi_event's HDS_MIDI_CC/HDS_MIDI_CHANNEL_PRESSURE branches, right alongside
+// their canonical MidiLiveState update.
+static float g_hardtune_modwheel = 0.0f;
+static float g_hardtune_channel_pressure = 0.0f;
 
 #define FX_HARDTUNE_ABS_MIN_HZ 70.0f
 #define FX_HARDTUNE_ABS_MAX_HZ 1100.0f
@@ -5747,6 +5760,8 @@ typedef struct {
     float target_ratio;      // Retune-Speed-smoothed ratio actually applied, updated every sample
     float phase;             // 0..grain_period, advances by target_ratio every sample
 
+    float vibrato_phase;     // 0..1, this effect's own dedicated vibrato LFO (see its own comment)
+
     bool initialized;
 } FxHardTuneState;
 
@@ -5792,6 +5807,9 @@ static void run_fx_hardtune(FXSlotEngine *engine, const FXSlotParams *params, fl
     const float tracking_ms = 0.1f + fmaxf(0.0f, fminf(1.0f, params->param[5])) * 499.9f; // 0.1..500ms
     int voice_range_idx = (int)(fmaxf(0.0f, fminf(1.0f, params->param[6])) * 4.0f + 0.5f);
     if (voice_range_idx < 0) voice_range_idx = 0; else if (voice_range_idx > 4) voice_range_idx = 4;
+    const float vibrato_rate_hz = 0.1f + fmaxf(0.0f, fminf(1.0f, params->param[7])) * 9.9f;  // 0.1..10Hz
+    const float vibrato_depth_semitones = fmaxf(0.0f, fminf(1.0f, params->param[8])) * 1.5f; // 0..1.5 semitones peak
+    const int vibrato_mod_choice = (int)(fmaxf(0.0f, fminf(1.0f, params->param[9])) * 2.0f + 0.5f); // 0=None,1=Mod Wheel,2=Aftertouch
     const float range_min_hz = HARDTUNE_VOICE_RANGE_HZ[voice_range_idx][0];
     const float range_max_hz = HARDTUNE_VOICE_RANGE_HZ[voice_range_idx][1];
     int min_lag = (int)((float)SAMPLE_RATE / range_max_hz);
@@ -5863,12 +5881,28 @@ static void run_fx_hardtune(FXSlotEngine *engine, const FXSlotParams *params, fl
     float log_cur = log2f(st->target_ratio) + (log2f(st->hop_target_ratio) - log2f(st->target_ratio)) * retune_rate;
     st->target_ratio = exp2f(log_cur);
 
+    // Live vibrato: this effect's own dedicated sine LFO (a per-slot instance, not the per-Program
+    // LFO matrix -- HardTune is a global FX effect with no single Program/voice of its own to hang
+    // a routing-matrix destination off of, same reason the MIDI note tracker/pitch bend above are
+    // plain globals rather than routed through that matrix). Optional Mod Source scaling (Mod Wheel
+    // CC1 or channel aftertouch) gates Depth the same way PackLfoParams.mod_source_cc gates a
+    // regular LFO's depth -- unassigned (None, the default) is a pure no-op at full knob depth.
+    // Like pitch bend, this is a FINAL multiplicative adjustment on top of the already-corrected
+    // ratio, computed after Retune Speed's own smoothing and never fed back into detection/
+    // quantization above, so it can never fight the correction either.
+    float vibrato_cc_scale = 1.0f;
+    if (vibrato_mod_choice == 1) vibrato_cc_scale = g_hardtune_modwheel;
+    else if (vibrato_mod_choice == 2) vibrato_cc_scale = g_hardtune_channel_pressure;
+    const float vibrato_semitones = sinf(2.0f * (float)M_PI * st->vibrato_phase) * vibrato_depth_semitones * vibrato_cc_scale;
+    st->vibrato_phase += vibrato_rate_hz / (float)SAMPLE_RATE;
+    if (st->vibrato_phase >= 1.0f) st->vibrato_phase -= 1.0f;
+
     // Live pitch bend (see g_hardtune_bend_semitones's own comment): a final multiplicative
     // adjustment layered on TOP of the already-corrected ratio, unconditionally -- regardless of
     // Target Source, and never fed back into detection/quantization above, so it can never fight
     // the correction. Not smoothed here beyond whatever smoothing the MIDI pitch-bend wheel's own
     // physical motion already has -- a real-time performance control, not a quantized target.
-    const float output_ratio = st->target_ratio * exp2f(g_hardtune_bend_semitones / 12.0f);
+    const float output_ratio = st->target_ratio * exp2f((g_hardtune_bend_semitones + vibrato_semitones) / 12.0f);
 
     // --- PSOLA resynthesis: two Hann-crossfaded taps, phase wraps mod grain_period (see this
     // effect's own top comment for why this never drifts unboundedly even under a sustained
@@ -12365,6 +12399,7 @@ static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, Hds
     } else if (type == HDS_MIDI_CC) {
         int cc_num = data1;
         if (cc_num >= 0 && cc_num < 128) midi_live->cc[cc_num] = fmaxf(0.0f, fminf(1.0f, value / 127.0f));
+        if (cc_num == 1) g_hardtune_modwheel = fmaxf(0.0f, fminf(1.0f, value / 127.0f)); // see its own comment
         if (cc_num == 64) {
             // Sustain pedal. polarity: 0 = Normal (>=64 means held, essentially every real
             // pedal), 1 = Inverted (for the rare one wired backwards). Uses Single Program
@@ -12388,6 +12423,7 @@ static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, Hds
             : midi_live->pitch_bend * knobs->programs[0].pb_range_down;
     } else if (type == HDS_MIDI_CHANNEL_PRESSURE) {
         midi_live->channel_pressure = fmaxf(0.0f, fminf(1.0f, value / 127.0f));
+        g_hardtune_channel_pressure = midi_live->channel_pressure; // see its own comment
     }
 }
 

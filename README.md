@@ -1403,24 +1403,30 @@ two read taps 50% of a period apart, each windowed by a Hann function of its own
 into each other with zero gain ripple at the wrap point (a Hann window's value at phase x and at
 x+50% sum to exactly 1, the standard constant-overlap-add property -- no extra normalization needed).
 
-Seven params: **Key** (12 notes) and **Scale** (Chromatic/Major/Minor/Major Pentatonic/Minor
+Ten params: **Key** (12 notes) and **Scale** (Chromatic/Major/Minor/Major Pentatonic/Minor
 Pentatonic) for the target grid; **Target Source** (Scale/Key, or MIDI -- mutually exclusive);
 **Amount** (0-100%, blends none..full correction in semitone space); **Retune Speed** (glide time
 into the corrected note -- low is the instant "2006-era" hard-tune snap, higher is a natural,
 musical portamento; defaults moderate, not the extreme snap, so it's usable for a natural
 performance out of the box); **Tracking Speed** (a separate smoothing stage on the raw detected
 pitch, before quantization -- how quickly the detector "believes" a new note started vs. treating a
-fast wobble as noise); and **Voice Range** (Bass/Tenor/Alto/Soprano/Wide -- narrows the detector's
+fast wobble as noise); **Voice Range** (Bass/Tenor/Alto/Soprano/Wide -- narrows the detector's
 own search window to the expected fundamental range for that voice type, which measurably reduces
 octave-detection errors, the same real reason commercial pitch correctors offer this, not just a
-cosmetic preset).
+cosmetic preset); and **Vibrato Rate**/**Vibrato Depth**/**Vibrato Mod Source** (this effect's own
+dedicated sine LFO -- Rate 0.1-10Hz, Depth 0-1.5 semitones peak, defaulting to 0/off so an existing
+patch's sound doesn't change until it's dialed in; Mod Source is None/Mod Wheel/Aftertouch, gating
+Depth by a live controller the same way `PackLfoParams.mod_source_cc` gates a regular LFO's depth).
 
-Two more inputs apply unconditionally, regardless of Target Source: live **MIDI pitch bend**
-(reusing Program 0's own pitch-bend-range knobs, the same convention `render_audio_block`'s per-
-Program pitch bend already uses) and (not yet wired) **LFO-routable vibrato**. Both are a final
-multiplicative adjustment layered on top of the already-corrected ratio, computed AFTER Retune
-Speed's own smoothing and never fed back into detection or the quantization decision above -- so
-neither one can ever fight the correction.
+Three inputs apply unconditionally, regardless of Target Source: live **MIDI pitch bend** (reusing
+Program 0's own pitch-bend-range knobs, the same convention `render_audio_block`'s per-Program pitch
+bend already uses), the **Vibrato** LFO just described, and Target Source's own MIDI mode (which
+reads an engine-wide monophonic note tracker, not any one Program's). Pitch bend and Vibrato are
+each a final multiplicative adjustment layered on top of the already-corrected ratio, computed AFTER
+Retune Speed's own smoothing and never fed back into detection or the quantization decision above --
+so neither one can ever fight the correction. Vibrato is a dedicated per-slot LFO rather than routed
+through the per-Program LFO matrix: HardTune is a global FX effect with no single Program or voice
+of its own for that matrix's destinations to target.
 
 **A real bug found and fixed during testing**: the PSOLA read-position math initially accumulated
 the tap phase at the raw pitch-shift ratio, but since the read position is `write_pos + phase_offset`

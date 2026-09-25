@@ -973,6 +973,14 @@ FX_TYPE_METADATA += [
         # detector locking onto a harmonic/subharmonic of the true pitch) and is cheaper to compute.
         {"label": "Voice Range", "type": "choice",
          "options": ["Bass", "Tenor", "Alto", "Soprano", "Wide"], "default": 4},
+        # Vibrato: this effect's own dedicated sine LFO, a final multiplicative pitch adjustment
+        # applied post-correction (never fed back into detection/quantization above), same posture
+        # as the live MIDI pitch bend this slot always honors. Depth defaults to 0 (off), so an
+        # existing patch's behavior is unchanged until this is dialed in on purpose.
+        {"label": "Vibrato Rate", "range": (0, 100), "default": 30},   # 0.1..10Hz
+        {"label": "Vibrato Depth", "range": (0, 100), "default": 0},   # 0..1.5 semitones peak
+        {"label": "Vibrato Mod Source", "type": "choice",
+         "options": ["None", "Mod Wheel", "Aftertouch"], "default": 0}, # gates Depth, like PackLfoParams.mod_source_cc
     ]},
 ]
 
