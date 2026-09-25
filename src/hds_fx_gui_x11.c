@@ -38,13 +38,32 @@ typedef struct {
     int screen;
     Window win;
     bool parented;
-    cairo_surface_t *surface;
+    cairo_surface_t *surface; // the real, on-screen Xlib surface -- touched exactly once per frame
     cairo_t *cr;
+    // Off-screen backbuffer (a plain in-memory image surface) every frame renders into first --
+    // see hds_fx_gui_redraw()'s own comment for why drawing dozens of separate primitives directly
+    // against the live X11 window surface (what this file did originally) is what caused visible
+    // flicker: each fill/stroke/paint call was its own separate request the X server executed
+    // against on-screen pixels immediately, so the window visibly redrew element-by-element, every
+    // ~33ms. Rendering to this backbuffer instead and blitting it to the window in ONE paint call
+    // per frame makes the on-screen update atomic from the server's point of view.
+    cairo_surface_t *backbuffer;
+    cairo_t *backbuffer_cr;
     HdsFxGuiViewState view;
     clap_id timer_id;
     bool timer_registered;
     bool visible;
 } HdsFxGuiWindow;
+
+// (Re)creates the backbuffer at the window's own current size -- called on create() and on every
+// resize (set_size()/a ConfigureNotify that actually changed size), always immediately after the
+// on-screen surface itself is resized, so the two are never out of sync.
+static void hds_fx_gui_resize_backbuffer(HdsFxGuiWindow *w) {
+    if (w->backbuffer_cr) cairo_destroy(w->backbuffer_cr);
+    if (w->backbuffer) cairo_surface_destroy(w->backbuffer);
+    w->backbuffer = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w->view.window_w, w->view.window_h);
+    w->backbuffer_cr = cairo_create(w->backbuffer);
+}
 
 static const clap_host_timer_support_t *hds_fx_gui_host_timers(HdsFxPlugin *p) {
     if (!p->host || !p->host->get_extension) return NULL;
@@ -62,8 +81,11 @@ static void hds_fx_gui_set_xembed_info(Display *dpy, Window win) {
 }
 
 static void hds_fx_gui_redraw(HdsFxGuiWindow *w) {
-    if (!w->cr) return;
-    hds_fx_gui_render(w->cr, w->plugin, &w->view);
+    if (!w->cr || !w->backbuffer_cr) return;
+    hds_fx_gui_render(w->backbuffer_cr, w->plugin, &w->view); // draw the whole frame off-screen first
+    cairo_surface_flush(w->backbuffer);
+    cairo_set_source_surface(w->cr, w->backbuffer, 0, 0);     // then blit it to the real window --
+    cairo_paint(w->cr);                                       // ONE operation, no visible flicker
     cairo_surface_flush(w->surface);
     XFlush(w->display);
 }
@@ -88,6 +110,7 @@ static void hds_fx_gui_pump_events(HdsFxGuiWindow *w) {
                 if (ev.xconfigure.width != w->view.window_w || ev.xconfigure.height != w->view.window_h) {
                     hds_fx_gui_on_resize(&w->view, ev.xconfigure.width, ev.xconfigure.height);
                     cairo_xlib_surface_set_size(w->surface, ev.xconfigure.width, ev.xconfigure.height);
+                    hds_fx_gui_resize_backbuffer(w);
                 }
                 break;
             default: break;
@@ -138,10 +161,17 @@ static bool hds_fx_gui_create(const clap_plugin_t *plugin, const char *api, bool
                                   (unsigned int)w->view.window_w, (unsigned int)w->view.window_h, 0,
                                   BlackPixel(w->display, w->screen), BlackPixel(w->display, w->screen));
     XSelectInput(w->display, w->win, ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
+    // Without this, the X server auto-clears the window to its background pixel on its own (a
+    // resize, an Expose from the window manager, ...) independently of our own ~30Hz redraw --
+    // a second, compounding source of visible flicker beyond the multi-primitive-direct-to-window
+    // drawing hds_fx_gui_redraw() itself already fixed. With None, only OUR OWN backbuffer blit
+    // ever touches this window's pixels.
+    XSetWindowBackgroundPixmap(w->display, w->win, None);
     hds_fx_gui_set_xembed_info(w->display, w->win);
 
     w->surface = cairo_xlib_surface_create(w->display, w->win, DefaultVisual(w->display, w->screen), w->view.window_w, w->view.window_h);
     w->cr = cairo_create(w->surface);
+    hds_fx_gui_resize_backbuffer(w);
 
     p->gui_window = w;
     return true;
@@ -154,6 +184,8 @@ static void hds_fx_gui_destroy_internal(HdsFxPlugin *p) {
         const clap_host_timer_support_t *timers = hds_fx_gui_host_timers(p);
         if (timers) timers->unregister_timer(p->host, w->timer_id);
     }
+    if (w->backbuffer_cr) cairo_destroy(w->backbuffer_cr);
+    if (w->backbuffer) cairo_surface_destroy(w->backbuffer);
     if (w->cr) cairo_destroy(w->cr);
     if (w->surface) cairo_surface_destroy(w->surface);
     if (w->display) { XDestroyWindow(w->display, w->win); XCloseDisplay(w->display); }
@@ -200,6 +232,7 @@ static bool hds_fx_gui_set_size(const clap_plugin_t *plugin, uint32_t width, uin
     hds_fx_gui_on_resize(&w->view, (int)width, (int)height);
     XResizeWindow(w->display, w->win, (unsigned int)w->view.window_w, (unsigned int)w->view.window_h);
     cairo_xlib_surface_set_size(w->surface, w->view.window_w, w->view.window_h);
+    hds_fx_gui_resize_backbuffer(w);
     return true;
 }
 
