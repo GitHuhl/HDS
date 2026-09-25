@@ -257,7 +257,11 @@ static bool g_pipewire_force_quantum = false;
 // snd_pcm_writei()'s own blocking behavior, which is what actually paces this engine's entire main
 // loop today. The ring's atomics remain the actual source of truth for how much space/data is
 // available; the semaphore only avoids busy-spinning between checks.
-#define HDS_PW_RING_CAPACITY (1u << 16) // 65536 floats -- ~170ms at 48kHz/8ch, far more than one PipeWire quantum
+// 65536 floats -- purely a physical safety cap on the ring array's own size (so a slow/stalled
+// PipeWire graph can never write out of bounds), NOT the target latency -- see
+// HdsPwStream.high_water_samples/write_audio_block()'s own comment for what actually paces this
+// buffer's real steady-state depth (and therefore round-trip latency) down near the Latency knob.
+#define HDS_PW_RING_CAPACITY (1u << 16)
 typedef struct {
     float data[HDS_PW_RING_CAPACITY];
     atomic_uint_fast32_t write_pos;
@@ -273,6 +277,13 @@ typedef struct {
     sem_t space_sem;     // posted by on_playback_process() whenever it frees ring space; unused on the capture side (read_capture_block() never blocks, matching the ALSA capture branch's own non-blocking, best-effort contract)
     atomic_bool connected; // set once the stream reaches PW_STREAM_STATE_STREAMING
     atomic_bool failed;    // set on PW_STREAM_STATE_ERROR/UNCONNECTED after having been open -- lets a blocked write_audio_block() bail out instead of hanging on a dead daemon/unplugged device
+    // Playback-only real latency throttle -- see write_audio_block()'s own comment on why this,
+    // not HDS_PW_RING_CAPACITY, is what actually bounds round-trip latency. Set once in
+    // hds_pw_stream_open() from the same latency_ms the Latency knob already maps onto
+    // PW_KEY_NODE_LATENCY, so both halves of "how much this backend buffers" stay in sync instead
+    // of the ring silently overriding the knob with its own much larger fixed capacity. Plain
+    // uint32_t, not atomic: written once before pw_thread_loop_start(), read-only from then on.
+    uint32_t high_water_samples;
 } HdsPwStream;
 #endif
 
@@ -319,6 +330,16 @@ static void write_audio_block(HdsPcmStream *pcm_handle, const float *buffer, int
     // PipeWire side: push into the SPSC ring, blocking (via space_sem) exactly the way
     // snd_pcm_writei() above blocks until the device wants more -- this is what keeps this
     // engine's main loop paced at the real playback rate under PipeWire too, not just under ALSA.
+    //
+    // FIXED (real round-trip-latency bug, not an environment/PipeWire-daemon issue): this used to
+    // only block when the ring was COMPLETELY FULL (space == 0), i.e. up to HDS_PW_RING_CAPACITY's
+    // own ~170ms(8ch)-680ms(2ch) physical size -- regardless of how small the negotiated PipeWire
+    // quantum was. A tool like `pw-top` only shows PipeWire's OWN graph-level buffering; it has no
+    // visibility into this client's own software ring sitting upstream of that, so lowering the
+    // quantum (even confirmed low via pw-top) never touched the real bottleneck. Now throttled
+    // against pw->high_water_samples (2x the Latency knob's own target -- see its own comment)
+    // instead, so the ring's actual steady-state depth tracks the knob, not its own much larger
+    // physical capacity.
     HdsPwStream *pw = pcm_handle->pw;
     uint32_t total_samples = frame_count * (uint32_t)channels;
     uint32_t written_samples = 0;
@@ -329,16 +350,19 @@ static void write_audio_block(HdsPcmStream *pcm_handle, const float *buffer, int
         }
         uint32_t write_pos = atomic_load_explicit(&pw->ring.write_pos, memory_order_relaxed);
         uint32_t read_pos = atomic_load_explicit(&pw->ring.read_pos, memory_order_acquire);
-        uint32_t space = HDS_PW_RING_CAPACITY - (write_pos - read_pos);
-        if (space == 0) {
-            // sem_timedwait (not sem_wait) so a missed wakeup -- a post landing between the space
+        uint32_t queued = write_pos - read_pos;
+        if (queued >= pw->high_water_samples) {
+            // sem_timedwait (not sem_wait) so a missed wakeup -- a post landing between the queued
             // check above and this wait -- can't block this thread, and therefore the whole main
             // loop, forever; a timeout just re-checks the ring's real atomics on the next pass.
             struct timespec deadline; clock_gettime(CLOCK_REALTIME, &deadline); deadline.tv_sec += 1;
             sem_timedwait(&pw->space_sem, &deadline);
             continue;
         }
-        uint32_t take = space < (total_samples - written_samples) ? space : (total_samples - written_samples);
+        uint32_t space = HDS_PW_RING_CAPACITY - queued;              // physical headroom -- never overflow the real array
+        uint32_t room_to_target = pw->high_water_samples - queued;   // the actual throttle: don't overshoot the latency target either
+        uint32_t allowed = space < room_to_target ? space : room_to_target;
+        uint32_t take = allowed < (total_samples - written_samples) ? allowed : (total_samples - written_samples);
         for (uint32_t i = 0; i < take; i++) pw->ring.data[(write_pos + i) & (HDS_PW_RING_CAPACITY - 1)] = buffer[written_samples + i];
         atomic_store_explicit(&pw->ring.write_pos, write_pos + take, memory_order_release);
         written_samples += take;
@@ -592,6 +616,13 @@ static HdsPwStream *hds_pw_stream_open(const char *device_name, bool is_capture,
     unsigned int latency_frames = (unsigned int)fmaxf(64.0f, (latency_ms / 1000.0f) * (float)SAMPLE_RATE);
     snprintf(latency_prop, sizeof(latency_prop), "%u/%u", latency_frames, (unsigned int)SAMPLE_RATE);
     pw_properties_set(props, PW_KEY_NODE_LATENCY, latency_prop);
+    // THE actual round-trip-latency fix (see this struct field's own comment): double-buffer worth
+    // of headroom above the requested latency (standard low-latency-audio practice -- enough slack
+    // to absorb this thread's own normal scheduling jitter between successive write_audio_block()
+    // calls without a real-time xrun, while staying close to what the Latency knob actually asked
+    // for) rather than the ~170-680ms (depending on channel count) the ring's own full physical
+    // capacity previously silently allowed to build up before write_audio_block() ever blocked.
+    pw->high_water_samples = 2u * latency_frames * (uint32_t)channels;
     // PW_KEY_NODE_LATENCY above is only a HINT: PipeWire negotiates one shared buffer size (the
     // graph "quantum") across every client currently connected to the daemon, so a lower request
     // from this one node can still be silently overridden upward if anything else sharing the same

@@ -947,7 +947,7 @@ engine, or using the interactive picker's own PipeWire→ALSA fallback described
 
 **Build-time only, auto-detected, no manual flag to flip:** the Makefile probes for
 `libpipewire-0.3` via `pkg-config` and only compiles the PipeWire code path in when it's found
-(`HDS_PIPEWIRE_ENABLED` in `backend.c`) -- a plain `libasound2-dev`-only setup (e.g. the Pi) still
+(`HDS_PIPEWIRE_ENABLED` in `src/hds_standalone.c`) -- a plain `libasound2-dev`-only setup (e.g. the Pi) still
 gets a normal ALSA-only build with nothing to change by hand, while `nix-shell` (which lists
 `pkgs.pipewire`/`pkgs.pkg-config` in `shell.nix`'s `buildInputs`) gets it automatically. `make`
 prints which way it went (`PipeWire backend (--backend pipewire): enabled`/`disabled`). Passing
@@ -967,14 +967,30 @@ PipeWire graph's nodes the way `snd_device_name_hint` enumerates ALSA's (that's 
 round-trip, not a synchronous local query), so the interactive recovery picker asks for a PipeWire
 target name directly under this backend rather than listing one -- see the previous section.
 
-**Higher latency than ALSA, and why:** this backend sets `PW_KEY_NODE_LATENCY` from the Audio tab's
-own Latency control, mapped onto PipeWire's node latency property the same way the ALSA backend
-maps it onto the ALSA buffer target. That's only a *hint*, though -- PipeWire negotiates one shared
-buffer size (the graph's "quantum") across every client currently connected to the daemon, so a low
-request from this one node can still be silently overridden upward if anything else sharing the
-same daemon needs a bigger buffer. That's the structural reason this backend can measure higher
+**A real round-trip-latency bug, found and fixed:** for a long stretch this backend's actual latency
+was nowhere near usable regardless of the Latency knob or `pw-top`'s own reported graph quantum --
+because the real bottleneck was never PipeWire's graph at all. `write_audio_block()`'s PipeWire
+branch bridges this engine's blocking `snd_pcm_writei()`-style write contract onto PipeWire's
+callback-driven API via a small software ring buffer, and that ring only ever blocked the main loop
+once it was **completely full** -- its own fixed physical capacity (65536 samples), not the
+configured Latency target. At stereo (2 channels) that's up to **683ms** of backlog silently
+buffered client-side, upstream of PipeWire's own graph entirely -- invisible to `pw-top`, which only
+ever sees PipeWire's own graph-level buffering, never a client's internal software queue sitting in
+front of it. Lowering the quantum (even confirmed low via `pw-top`) could never have touched this,
+because the bottleneck wasn't the quantum. Fixed by throttling the ring against the SAME
+`latency_ms` this backend already computes for `PW_KEY_NODE_LATENCY` (double-buffered for
+scheduling headroom) instead of the ring's own much larger physical capacity -- verified via an
+isolated test driving the real `write_audio_block()` against a simulated PipeWire consumer: a
+worst-case, no-delay producer now plateaus at the intended ~2x-Latency-knob depth instead of
+ballooning toward the ring's full size.
+
+PipeWire's own shared-quantum negotiation is a real, secondary factor that still applies on top of
+this fix: `PW_KEY_NODE_LATENCY` is only a *hint* -- PipeWire negotiates one shared buffer size (the
+graph's "quantum") across every client currently connected to the daemon, so a low request from this
+one node can still be silently overridden upward if anything else sharing the same daemon needs a
+bigger buffer. That's the remaining structural reason this backend can still measure somewhat higher
 latency than the ALSA one, which gets an exclusive, tightly-sized hardware buffer directly rather
-than negotiating a shared one.
+than negotiating a shared one -- just no longer the dominant one.
 
 `--pipewire-force-quantum` (opt-in, off by default) is the real lever, not just a hint:
 `PW_KEY_NODE_FORCE_QUANTUM` actively forces the whole graph's quantum to this engine's own Latency
