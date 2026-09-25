@@ -1351,13 +1351,42 @@ gain reduction matching the reference formula to 5 decimal places, correct relat
 timing, exact makeup-gain math, and correct shared-detector stereo behavior (a loud channel driving
 gain reduction on both).
 
+### DeEsser FX slot (split-band sibilance control)
+
+An FX slot (Type: `DeEsser`) -- unlike the compressors above, this one isn't a clone of any specific
+hardware or plugin (there's no "coveted vintage character" angle to a de-esser the way there is for
+the LA-2A/L2/1176/Fairchild-style units), just this engine's own original implementation of the
+standard modern technique: split the signal into a low band and a high (sibilance) band, compress
+only the high band, then recombine.
+
+The split reuses ONE highpass -- FX_TYPE_MULTIFILTER's own 2-pole TPT stage, fixed at Butterworth Q
+with no resonance -- to get the high band, and derives the low band as `input - high` rather than
+running a second, separately-designed lowpass: since `low + high == input` is then true BY
+CONSTRUCTION regardless of the highpass's own shape, this guarantees exact, phase-coherent
+recombination with only one filter running and no matched-crossover design needed at all (verified
+directly: output equals input bit-for-bit whenever the high band's own level stays under Threshold).
+The high band's own level (self-detecting, no external sidechain) then drives a hard-knee power-law
+gain computer identical in shape to OptoComp's, using this file's own native exponential attack/
+release convention (matching Gate/Limiter) rather than borrowing 4a2a's own specific calibration,
+since nothing here is emulating that plugin.
+
+Six params: **Frequency** (1-16kHz, log -- the crossover/detection point, typically 4-8kHz for
+sibilance), **Threshold** (-40..0dB, keyed off the high band's own level), **Ratio** (1..20),
+**Attack** (0.1..20ms -- fast, since sibilance is a short transient), **Release** (5..300ms -- also
+fast, to avoid audibly pumping the top end), and **Listen** (Off/On -- solos the RAW, pre-gain-
+reduction high band in place of the normal output, so Frequency can be dialed in by ear before
+trusting Threshold/Ratio to do anything useful). Verified with a standalone test harness: exact
+(bit-identical) reconstruction below threshold, correct gain reduction on a loud high-frequency
+tone, Listen mode correctly isolating the high band (near-silent on a pure low-frequency input,
+passing a pure high-frequency input through), and stability under extreme settings.
+
 ### Per-slot gain reduction (GR) metering
 
-Gate, Limiter, FetComp, FairKid67, PeakMax, and OptoComp -- the 6 FX types with a real gain-reduction stage --
+Gate, Limiter, FetComp, FairKid67, PeakMax, OptoComp, and DeEsser -- the 7 FX types with a real gain-reduction stage --
 each report their current reduction in dB over OSC as `/hds/status/fx_gr/<slot>` (0 for a bypassed,
 Off, or non-GR-capable slot), sent every status tick (~31Hz) alongside the rest of
 `/hds/status/*`. The frontend shows this as a small "GR" readout next to each FX slot's Mix/Bypass
-controls, visible only while that slot's Type is one of the six above. Computed per effect from
+controls, visible only while that slot's Type is one of the seven above. Computed per effect from
 whatever state that effect already tracks, no extra DSP added purely for metering:
 - **Gate/Limiter**: both already track one applied linear gain multiplier (`gain`, 1.0 = no
   reduction) -- `-20*log10(gain)`, clamped >=0.
@@ -1378,6 +1407,8 @@ whatever state that effect already tracks, no extra DSP added purely for meterin
   computing it IS how the limiter works -- `-20*log10(output_gr)`, clamped >=0, no extra work at all.
 - **OptoComp**: same shape as Gate/Limiter -- already tracks one applied linear gain multiplier
   (`gain_smoothed`) as part of normal operation -- `-20*log10(gain_smoothed)`, clamped >=0.
+- **DeEsser**: same shape again -- `gain_smoothed` here is the gain applied to the high (sibilance)
+  band specifically, not the full signal -- `-20*log10(gain_smoothed)`, clamped >=0.
 
 ### Control protocol: OSC
 

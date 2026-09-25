@@ -931,13 +931,26 @@ FX_TYPE_METADATA += [
         {"label": "Release", "range": (0, 100), "default": 11},    # 100..1000ms, default ~200ms
         {"label": "Makeup", "range": (0, 100), "default": 50},     # -12..+12dB, default 0dB
     ]},
+    {"name": "DeEsser", "params": [
+        # A split-band de-esser -- this engine's own original implementation of the standard modern
+        # technique (not a clone of a specific plugin, unlike the compressors above -- see
+        # FX_TYPE_DEESSER's own comment in backend.c). Splits into a low band and a high (sibilance)
+        # band via one highpass (the low band is `input - high`, exact by construction), compresses
+        # only the high band off its own level, then recombines.
+        {"label": "Frequency", "range": (0, 100), "default": 65},  # 1-16kHz, log -- ~6kHz default
+        {"label": "Threshold", "range": (0, 100), "default": 50},  # -40..0dB
+        {"label": "Ratio", "range": (0, 100), "default": 47},      # 1..20, default ~10:1
+        {"label": "Attack", "range": (0, 100), "default": 0},      # 0.1..20ms, fastest
+        {"label": "Release", "range": (0, 100), "default": 17},    # 5..300ms, ~55ms
+        {"label": "Listen", "type": "choice", "options": ["Off", "On"], "default": 0},
+    ]},
 ]
 
-# The 6 FX types whose backend state exposes a real GR (gain reduction) reading -- see
+# The 7 FX types whose backend state exposes a real GR (gain reduction) reading -- see
 # process_fx_chain's own gr_db_out comment in backend.c. Looked up by name rather than a hardcoded
 # index (like FX_TYPE_NAM above) since these are spread across the pre- and post-NAM halves of
 # FX_TYPE_METADATA; used only by _apply_fx_slot_type to show/hide each slot's GR label.
-FX_TYPE_GR_CAPABLE_INDICES = {i for i, e in enumerate(FX_TYPE_METADATA) if e["name"] in ("Gate", "Limiter", "FetComp", "FairKid67", "PeakMax", "OptoComp")}
+FX_TYPE_GR_CAPABLE_INDICES = {i for i, e in enumerate(FX_TYPE_METADATA) if e["name"] in ("Gate", "Limiter", "FetComp", "FairKid67", "PeakMax", "OptoComp", "DeEsser")}
 
 # Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --
 # must match the backend's own "auto"/empty-string convention in midi_client_should_autoconnect.

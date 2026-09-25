@@ -644,6 +644,26 @@ typedef struct {
 // per-channel" posture as FX_TYPE_GATE/FX_TYPE_LIMITER above, for the identical reason (an
 // independent per-channel envelope would skew the stereo image every time the compressor moved).
 #define FX_TYPE_OPTOCOMP 18
+// A split-band de-esser -- not a clone of any specific hardware/plugin (there isn't the same
+// "coveted vintage character" angle here that justified porting a specific reference for the other
+// compressors above), just this engine's own original implementation of the standard modern
+// technique: split into a low band and a high (sibilance) band, compress only the high band, then
+// recombine. The split reuses ONE highpass -- FX_TYPE_MULTIFILTER's own 2-pole TPT stage
+// (fx_multifilter_2pole_stage(), fixed at Butterworth Q, no resonance) -- to get the high band, and
+// derives the low band as `input - high` rather than running a second, separately-designed lowpass:
+// since low+high==input is then true BY CONSTRUCTION regardless of the highpass's own shape, this
+// guarantees exact, phase-coherent recombination with only one filter running, no matched-crossover
+// design needed at all. The high band's own level (self-detecting, no external sidechain) drives a
+// power-law gain computer identical in shape to FX_TYPE_OPTOCOMP's, using this file's OWN native
+// exponential attack/release convention (matching FX_TYPE_GATE/FX_TYPE_LIMITER) rather than 4a2a's
+// own specific calibration, since nothing here is emulating that plugin. param[0] Frequency
+// (1-16kHz, log -- the crossover/detection point, typically 4-8kHz for sibilance), param[1]
+// Threshold (-40..0dB, keyed off the high band's own level), param[2] Ratio (1..20), param[3] Attack
+// (0.1..20ms -- fast, sibilance is a short transient), param[4] Release (5..300ms -- also fast, to
+// avoid audibly pumping the top end), param[5] Listen (choice: Off/On -- solos the RAW (pre-gain-
+// reduction) high band in place of the normal output, so Frequency can be dialed in by ear before
+// trusting Threshold/Ratio to do anything useful).
+#define FX_TYPE_DEESSER 19
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -5434,6 +5454,73 @@ static void run_fx_optocomp(FXSlotEngine *engine, const FXSlotParams *params, fl
     st->last_gr_db = fmaxf(0.0f, -20.0f * log10f(fmaxf(1e-6f, st->gain_smoothed)));
 }
 
+// --- FX_TYPE_DEESSER: see its own #define comment above for the full design. ---
+typedef struct {
+    float low_state[2];  // [channel] -- the crossover highpass's own 2-pole TPT state
+    float band_state[2]; // [channel]
+    float gain_smoothed; // starts at 1.0 -- see FxGateState's own comment on why calloc's 0.0 would be wrong
+    bool initialized;
+    float last_gr_db;
+} FxDeEsserState;
+
+static void run_fx_deesser(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxDeEsserState *st = (FxDeEsserState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxDeEsserState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+    if (!st->initialized) { st->gain_smoothed = 1.0f; st->initialized = true; }
+
+    // 1kHz * 16^fraction -> 1kHz..16kHz, log-mapped -- same style as fx_eq3_fraction_to_hz's own
+    // 20Hz-20kHz range, just narrowed to where sibilance actually lives.
+    const float freq_hz = 1000.0f * powf(16.0f, fmaxf(0.0f, fminf(1.0f, params->param[0])));
+    const float threshold_db = -40.0f + fmaxf(0.0f, fminf(1.0f, params->param[1])) * 40.0f; // -40..0dB
+    const float ratio = 1.0f + fmaxf(0.0f, fminf(1.0f, params->param[2])) * 19.0f;          // 1..20
+    const float attack_ms = 0.1f + fmaxf(0.0f, fminf(1.0f, params->param[3])) * 19.9f;      // 0.1..20ms
+    const float release_ms = 5.0f + fmaxf(0.0f, fminf(1.0f, params->param[4])) * 295.0f;    // 5..300ms
+    const bool listen = params->param[5] >= 0.5f;
+
+    // Crossover: one fixed-Q (Butterworth, no resonance -- this is a clean split, not a tone-shaping
+    // filter) 2-pole TPT highpass reused directly from FX_TYPE_MULTIFILTER, giving the high
+    // (sibilance) band; the low band is `input - high`, exact by construction (see this effect's
+    // own #define comment for why that needs no separately-designed lowpass at all).
+    const float k = 1.41421356f; // Q = 1/k = 0.7071, Butterworth
+    const float g = tanf((float)M_PI * freq_hz / (float)SAMPLE_RATE);
+    const float a1 = 1.0f / (1.0f + g * (g + k));
+    const float a2 = g * a1;
+    const float a3 = g * a2;
+
+    const float high_l = fx_multifilter_2pole_stage(*l, k, a1, a2, a3, 2 /* HPF */, &st->low_state[0], &st->band_state[0]);
+    const float high_r = fx_multifilter_2pole_stage(*r, k, a1, a2, a3, 2 /* HPF */, &st->low_state[1], &st->band_state[1]);
+    const float low_l = *l - high_l;
+    const float low_r = *r - high_r;
+
+    // Same hard-knee power-law gain computer as FX_TYPE_OPTOCOMP, applied to the high band's own
+    // level only (self-detecting) -- but this file's own native exponential attack/release
+    // convention (FX_TYPE_GATE/FX_TYPE_LIMITER's own `1-exp(-1/(0.001*ms*SAMPLE_RATE))`), not
+    // 4a2a's specific calibration, since nothing here is emulating that plugin.
+    const float threshold_gain = powf(10.0f, threshold_db / 20.0f);
+    const float comp_slope = 1.0f - 1.0f / ratio;
+    const float level = fmaxf(fabsf(high_l), fabsf(high_r));
+    const float gain_target = fminf(1.0f, powf(level / threshold_gain, -comp_slope));
+    const float rate_ms = (gain_target < st->gain_smoothed) ? attack_ms : release_ms;
+    const float rate = 1.0f - expf(-1.0f / (0.001f * rate_ms * (float)SAMPLE_RATE));
+    st->gain_smoothed += (gain_target - st->gain_smoothed) * rate;
+
+    st->last_gr_db = fmaxf(0.0f, -20.0f * log10f(fmaxf(1e-6f, st->gain_smoothed)));
+
+    if (listen) {
+        // Solo the RAW (pre-gain-reduction) high band -- for dialing in Frequency by ear, so
+        // Threshold/Ratio can then be trusted to actually be listening to the sibilance.
+        *l = high_l;
+        *r = high_r;
+    } else {
+        *l = low_l + high_l * st->gain_smoothed;
+        *r = low_r + high_r * st->gain_smoothed;
+    }
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -5608,6 +5695,10 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                 case FX_TYPE_OPTOCOMP:
                     run_fx_optocomp(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
                     if (fx_engine[s].state) gr_db_out[s] = ((FxOptoCompState *)fx_engine[s].state)->last_gr_db;
+                    break;
+                case FX_TYPE_DEESSER:
+                    run_fx_deesser(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
+                    if (fx_engine[s].state) gr_db_out[s] = ((FxDeEsserState *)fx_engine[s].state)->last_gr_db;
                     break;
                 case FX_TYPE_OFF:
                 default:
