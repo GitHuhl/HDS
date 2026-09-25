@@ -1,5 +1,6 @@
 synth_engine
 hds.clap
+hds_fx.clap
 synth_engine-arm64
 /arm64-libs/
 *.o

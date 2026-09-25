@@ -300,17 +300,6 @@ typedef struct {
     float cutoff_mod_source_cc;
 } FilterParams;
 
-// One band of a Program's post-filter 3-band EQ (see ProgramState.eq_bands[3] and
-// run_eq_band()/render_audio_block's EQ dispatch for the DSP). Band 0 = Low Shelf, band 1 = Mid
-// Peak, band 2 = High Shelf -- a standard channel-strip topology, RBJ Audio-EQ-Cookbook biquad
-// forms (shelf bands ignore `q`, using a fixed shelf slope instead -- see run_eq_band()). All
-// gain in dB, +-18dB range (generous for tone-shaping without inviting a full mixing-console's
-// worth of gain-staging risk); freq in Hz.
-typedef struct {
-    float freq;
-    float gain_db;
-    float q; // Mid Peak only; ignored for the two Shelf bands
-} EqBandParams;
 
 // One lane in the Combi/Sequencer 32-lane pool (see SEQ_LANE_COUNT's own comment above). Purely
 // a mixer-strip + assignment data model this pass -- nothing in render_audio_block reads any of
@@ -1453,71 +1442,6 @@ static float run_svf_filter_p(float input, const FilterParams *p, float cutoff_m
     return run_svf_filter(input, p->cutoff + cutoff_mod, p->res_q + res_mod, (int)p->filter_type, (int)p->slope_poles, low_state, band_state);
 }
 
-// --- Post-filter 3-band EQ (see EqBandParams/ProgramState.eq_bands) ---
-// RBJ Audio-EQ-Cookbook biquad coefficients, Direct Form II Transposed (2 state variables: y =
-// b0*x + z1; z1' = b1*x - a1*y + z2; z2' = b2*x - a2*y -- the standard, numerically robust
-// implementation for a musical shelf/peak EQ band). Every coefficient here is already normalized
-// by the cookbook's own a0 (a0 == 1 implicitly), so run_eq_biquad() never needs it.
-typedef struct { float b0, b1, b2, a1, a2; } EqBiquadCoeffs;
-
-// band_index: 0 = Low Shelf, 1 = Mid Peak, 2 = High Shelf (see EqBandParams' own comment). Shelf
-// slope is fixed at S=1 (a gentle, musical shelf -- the cookbook's own suggested default): this
-// engine exposes freq/gain per shelf band, not a separate slope control, matching a typical
-// hardware channel-strip EQ rather than a fully general parametric-shelf design. gain_db==0 is a
-// true identity filter algebraically (b0=a0/b1=a1/b2=a2 before normalizing falls out of the same
-// formulas at A=1), but skipped here anyway as a cheap, explicit bypass -- no trig needed at all
-// for a band a player has left flat.
-static EqBiquadCoeffs compute_eq_band_coeffs(const EqBandParams *band, int band_index) {
-    EqBiquadCoeffs c = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f }; // transparent passthrough
-    float gain_db = fmaxf(-18.0f, fminf(18.0f, band->gain_db));
-    if (gain_db == 0.0f) return c;
-    float freq_hz = fmaxf(20.0f, fminf(20000.0f, band->freq));
-    float A = powf(10.0f, gain_db / 40.0f);
-    float w0 = 2.0f * (float)M_PI * freq_hz / (float)SAMPLE_RATE;
-    float cos_w0 = cosf(w0), sin_w0 = sinf(w0);
-    float b0, b1, b2, a0, a1, a2;
-    if (band_index == 1) {
-        float q = fmaxf(0.1f, fminf(10.0f, band->q));
-        float alpha = sin_w0 / (2.0f * q);
-        b0 = 1.0f + alpha * A;   b1 = -2.0f * cos_w0;   b2 = 1.0f - alpha * A;
-        a0 = 1.0f + alpha / A;   a1 = -2.0f * cos_w0;   a2 = 1.0f - alpha / A;
-    } else {
-        const float S = 1.0f; // shelf slope, see this function's own comment
-        float alpha = sin_w0 / 2.0f * sqrtf((A + 1.0f / A) * (1.0f / S - 1.0f) + 2.0f);
-        float sqrtA2alpha = 2.0f * sqrtf(A) * alpha;
-        if (band_index == 0) { // Low Shelf
-            b0 =        A * ((A + 1.0f) - (A - 1.0f) * cos_w0 + sqrtA2alpha);
-            b1 =  2.0f * A * ((A - 1.0f) - (A + 1.0f) * cos_w0);
-            b2 =        A * ((A + 1.0f) - (A - 1.0f) * cos_w0 - sqrtA2alpha);
-            a0 =             (A + 1.0f) + (A - 1.0f) * cos_w0 + sqrtA2alpha;
-            a1 =       -2.0f * ((A - 1.0f) + (A + 1.0f) * cos_w0);
-            a2 =             (A + 1.0f) + (A - 1.0f) * cos_w0 - sqrtA2alpha;
-        } else { // High Shelf (band_index == 2)
-            b0 =        A * ((A + 1.0f) + (A - 1.0f) * cos_w0 + sqrtA2alpha);
-            b1 = -2.0f * A * ((A - 1.0f) + (A + 1.0f) * cos_w0);
-            b2 =        A * ((A + 1.0f) + (A - 1.0f) * cos_w0 - sqrtA2alpha);
-            a0 =             (A + 1.0f) - (A - 1.0f) * cos_w0 + sqrtA2alpha;
-            a1 =        2.0f * ((A - 1.0f) - (A + 1.0f) * cos_w0);
-            a2 =             (A + 1.0f) - (A - 1.0f) * cos_w0 - sqrtA2alpha;
-        }
-    }
-    float inv_a0 = 1.0f / a0;
-    c.b0 = b0 * inv_a0; c.b1 = b1 * inv_a0; c.b2 = b2 * inv_a0;
-    c.a1 = a1 * inv_a0; c.a2 = a2 * inv_a0;
-    return c;
-}
-
-static inline float run_eq_biquad(float input, const EqBiquadCoeffs *c, float *z1, float *z2) {
-    float y = c->b0 * input + *z1;
-    float new_z1 = c->b1 * input - c->a1 * y + *z2;
-    float new_z2 = c->b2 * input - c->a2 * y;
-    // Same defense-in-depth hard state clamp as run_svf_filter's own low_state/band_state -- see
-    // its comment for the rationale (a held note running this recursively for minutes should
-    // degrade to a recoverable clip, never a permanent NaN/Inf lockup, however unlikely).
-    *z1 = fmaxf(-1.0e6f, fminf(1.0e6f, new_z1));
-    *z2 = fmaxf(-1.0e6f, fminf(1.0e6f, new_z2));
-    return y;
-}
 
 // apply_program_eq() (cascades all 3 bands over one Program's bus) lives further down, right
 // before render_audio_block -- it needs HdsEngineState, which isn't a complete type yet at this

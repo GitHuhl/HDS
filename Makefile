@@ -102,6 +102,17 @@ CLAP_INC := third_party/clap/include
 CLAP_BIN := hds.clap
 CLAP_SRC := src/clap_plugin.c
 
+# --- HDS FX: standalone, synth-free CLAP effects plugin (make hds-fx) ---
+# Produces hds_fx.clap. Unlike $(CLAP_BIN) above, this does NOT #include backend.c at all -- see
+# src/hds_fx_plugin.c's own header comment for why (no OSC/networking, no synth, just src/fx_types.h
+# + src/fx_chain.c, the same FX DSP backend.c's own embedded FX bus already runs). NAM
+# (FX_TYPE_NAM) is compiled out entirely here (HDS_NAM_ENABLED 0 in hds_fx_plugin.c itself), so
+# this is the one real target in this Makefile that needs neither $(CXX) nor any NAM_OBJS -- a
+# plain $(CC) link, pure C, no liblo/-llo either.
+HDS_FX_SRC := src/hds_fx_plugin.c
+HDS_FX_BIN := hds_fx.clap
+HDS_FX_OBJ := $(BUILD_DIR)/hds_fx_plugin.o
+
 # --- Raspberry Pi 5 / aarch64 Linux cross-build (make arm64) ---
 # Cross-compiles synth_engine (the backend engine only -- no GUI client for this target) for
 # aarch64 Linux (a Raspberry Pi 5, or any other aarch64 Linux host) from this x86_64 machine --
@@ -160,7 +171,7 @@ ARM64_BIN := synth_engine-arm64
 # $ORIGIN-relative, i.e. "next to me".
 ARM64_LIBDIR := arm64-libs
 
-.PHONY: all run-backend run-frontend clean clap arm64
+.PHONY: all run-backend run-frontend clean clap hds-fx arm64
 
 all: $(BIN)
 
@@ -181,6 +192,9 @@ $(BIN_OBJ): $(SRC) src/backend.c src/fx_types.h src/fx_chain.c src/sequencer.c s
 $(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
+$(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fPIC -I$(CLAP_INC) -c $(HDS_FX_SRC) -o $@
+
 # Three source directories (NAM/, NAM/wavenet/, src/) flattened into one object directory -- see
 # NAM_OBJS's own comment on why this is safe (no basename collisions).
 $(NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/%.cpp | $(NAM_BUILD_DIR)
@@ -197,6 +211,9 @@ $(BIN): $(BIN_OBJ) $(NAM_OBJS)
 
 clap: $(CLAP_OBJ) $(NAM_OBJS)
 	$(CXX) -shared -o $(CLAP_BIN) $(CLAP_OBJ) $(NAM_OBJS) $(LDLIBS)
+
+hds-fx: $(HDS_FX_OBJ)
+	$(CC) -shared -o $(HDS_FX_BIN) $(HDS_FX_OBJ) -lm
 
 # arm64's own NAM object set: SEPARATE .o files from $(NAM_OBJS) above (wrong ISA to reuse, even
 # though the flags are identical -- NAM_CXXFLAGS needs nothing arm64-specific since NAM_INC is just
@@ -238,5 +255,5 @@ run-frontend:
 	python3 src/frontend.py
 
 clean:
-	rm -f $(BIN) $(CLAP_BIN) $(ARM64_BIN)
+	rm -f $(BIN) $(CLAP_BIN) $(HDS_FX_BIN) $(ARM64_BIN)
 	rm -rf $(ARM64_LIBDIR) $(BUILD_DIR)

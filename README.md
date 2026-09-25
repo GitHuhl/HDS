@@ -950,6 +950,69 @@ Sequencer-tab-only control, so it no longer lives exclusively in that tab. The u
 address, `/hds/seq/transport/metronome`, is unchanged despite both the backend and UI moves, so an
 older saved Program or DAW automation that already references it keeps working exactly as before.
 
+### HDS FX: a standalone, synth-free CLAP effects plugin (experimental)
+
+`make hds-fx` builds `hds_fx.clap` from `src/hds_fx_plugin.c` -- a second, independent CLAP plugin
+alongside the main HDS synth/`hds.clap`, exposing "the normal HDS FX section" (the same FX_TYPE_*
+DSP as backend.c's own embedded FX bus) with no synth voice, no note-port, and no OSC/networking of
+any kind. Where `clap_plugin.c` starts an embedded `liblo` OSC server so `frontend.py` can drive it
+exactly like the standalone app, HDS FX doesn't need that at all -- it will only ever be a normal
+host-automated/UI-driven DAW plugin, so `src/hds_fx_plugin.c` never `#include`s `backend.c`; it
+pulls in only `src/fx_types.h` (the FX slot data model) and `src/fx_chain.c` (the actual
+`run_fx_*`/`process_fx_chain` DSP) directly, the same two files backend.c itself uses for its own FX
+bus. A slot's parameters (`FXSlotParams`) are the exact same struct either way, so they're already
+byte-for-byte interchangeable between the synth's embedded FX and this plugin.
+
+**Multi-input + chaining, "as the normal HDS FX section"**: 8 independent stereo buses (`HDS_FX_BUS_COUNT`),
+each its own `SOURCE_COUNT`-shaped chain of up to 12 (`FX_SLOT_COUNT`) FX slots -- the exact same
+`fx_source`/`fx_source_routing_mode`/`chain_to_next`/`sidechain_source` model backend.c's own 8
+ext-in pairs already use (see `process_fx_chain()`'s own comment in fx_chain.c), just with no
+synth ("Program") bus at all. A host that only cares about one signal path just wires up bus 0 (its
+audio ports are named "Input 1"/"Output 1", `IS_MAIN` on both sides); a host that wants HDS FX
+processing several buses in one instance wires up as many of the other 7 as it wants.
+
+**Multi-instance is free, not new work**: `process_fx_chain()`/`sync_fx_engine_types()`/
+`reset_fx_engine()` already take every piece of state as an explicit parameter and touch no globals
+of their own (verified directly -- this was already true before this plugin existed, since
+`clap_plugin.c`'s own multi-instance safety already depended on it). Running several HDS FX
+instances in one DAW session is exactly as safe as running several HDS synth instances already is.
+
+**What this first pass deliberately leaves out**, each a real, separate, scoped follow-up rather
+than an oversight:
+- **NAM (`FX_TYPE_NAM`) is compiled out entirely** (`HDS_NAM_ENABLED 0` in hds_fx_plugin.c) -- it
+  needs the small C++ bridge (`nam_bridge.h`/`.cpp` over the vendored NeuralAmpModelerCore)
+  `clap_plugin.c` also links against; pulling that in (and its C++ toolchain requirement) is
+  deferred until the rest of this plugin is proven. `hds-fx`'s own build is otherwise pure C, no
+  `$(CXX)` needed at all, which is also why `hds_fx.clap` is under 100KB versus `hds.clap`'s ~1.5MB.
+- **HardTune's (`FX_TYPE_HARDTUNE`) live-MIDI vibrato control is inert.** It reads four small
+  globals (`g_hardtune_held_note`/`g_hardtune_bend_semitones`/`g_hardtune_modwheel`/
+  `g_hardtune_channel_pressure`) that backend.c's own MIDI dispatch normally feeds; this plugin has
+  no note-port at all, so nothing ever writes them and vibrato-from-CC/pitch-bend simply never
+  engages. HardTune's actual pitch correction is unaffected. A real MIDI input (for CC/pitch-bend
+  modulation of FX params generally, not just this one effect's vibrato) is a natural, separate
+  future addition.
+- **Params extension exposes Mix only** (96 = 8 buses x 12 slots), the same curated "expose Mix,
+  not every field" choice `clap_plugin.c`'s own `HDS_CLAP_PARAMS` already made for the synth's FX
+  slots, for the same reason (no min/max/default metadata exists for the other ~5 fields per slot
+  without hand-authoring it, and a host's automation-lane picker gets unusable fast past a few
+  hundred entries). Type/Bypass/routing are meant to be driven by this plugin's own native GUI
+  instead (see below) -- writing directly into the plugin's per-instance struct, the same plain
+  unsynchronized main-thread-writes/audio-thread-reads float race `clap_plugin.c`'s own `p->knobs`
+  already accepts.
+- **No `state` extension (DAW project save/load) yet.** A real, known gap for an "experiment" build,
+  not silently swept under anything -- a host that doesn't get state persistence for this plugin
+  will say so.
+- **No native GUI wired up yet either** -- see the next section.
+
+Verified without a real CLAP host (none is available in this sandbox): a from-scratch offline test
+harness links `hds_fx_plugin.c` directly, calls its own factory to build a real plugin instance, and
+drives it through `activate()`/`process()`/`deactivate()`/`destroy()` with synthetic audio and
+manually-built `clap_process_t`/extension calls. Confirmed: an all-`FX_TYPE_OFF` bus is an exact,
+bit-for-bit passthrough; a bus with `FX_TYPE_LIMITER` engaged genuinely reduces peak level (0.9 ->
+0.16 on a test tone, not a no-op); unconnected buses don't crash; the audio-ports extension reports
+8 correctly-named/flagged ports each way; the params extension reports all 96 Mix params with
+correct default values and round-trips a value write.
+
 ### Command-line flags
 
 Every flag `./synth_engine` and `python3 src/frontend.py` accept, in one place -- each one is also
