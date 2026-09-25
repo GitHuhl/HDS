@@ -830,15 +830,21 @@ platform, not a second platform.
 
 ### Source layout: backend.c is the shared core, not a standalone entry point
 
-Three files, one architecture: `src/backend.c` is the shared DSP/OSC/state engine (oscillators,
-filters, the FX chain, the OSC control protocol, the sequencer/arpeggiator, sample streaming --
-everything that doesn't touch a physical device directly), and it is never compiled on its own.
-Both real targets pull it in with a plain `#include` (one translation unit per binary, this
-project's existing convention -- see `clap_plugin.c`'s own header comment): `src/hds_standalone.c`
-adds the ALSA/PipeWire audio shim, the ALSA MIDI sequencer client, recording, the `--program` JSON
-loader, the interactive arrow-key CLI, and `main()` itself, and is what `$(BIN)`/`$(ARM64_BIN)`
-actually compile; `src/clap_plugin.c` adds only what a CLAP host needs, since the host owns the
-actual audio device and hands MIDI in through its own event API.
+Four files, one architecture: `src/backend.c` is the shared DSP/OSC/state engine (oscillators,
+filters, the OSC control protocol, the sequencer/arpeggiator, sample streaming -- everything that
+doesn't touch a physical device directly and isn't the FX chain's own bulk), and it is never
+compiled on its own. Both real targets pull it in with a plain `#include` (one translation unit per
+binary, this project's existing convention -- see `clap_plugin.c`'s own header comment):
+`src/hds_standalone.c` adds the ALSA/PipeWire audio shim, the ALSA MIDI sequencer client, recording,
+the `--program` JSON loader, the interactive arrow-key CLI, `main()` itself, and (see below) the
+Sequencer transport/lane/MIDI-playback machinery and a handful of other standalone-only helpers, and
+is what `$(BIN)`/`$(ARM64_BIN)` actually compile; `src/clap_plugin.c` adds only what a CLAP host
+needs, since the host owns the actual audio device and hands MIDI in through its own event API;
+`src/fx_chain.c` holds every FX slot's own DSP (`run_fx_*`, `reset_fx_engine`,
+`sync_fx_engine_types`, `process_fx_chain`) -- split out purely for human-manageability as the FX
+section grew past 4000 lines, `#include`d by `backend.c` at the exact position that code used to
+occupy, with `FXSlotParams`/`FXSlotEngine`/the `FX_TYPE_*` enum deliberately left behind in
+`backend.c` proper since the OSC control table indexes into them directly.
 
 This split (`hds_standalone.c` used to just be the tail end of `backend.c`) exists so a host-driven
 target never needs real device code compiled in at all -- confirmed directly, not assumed: `hds.clap`
@@ -860,7 +866,74 @@ which the CLAP `.so` never populates. In other words, Sequencer audio-lane playb
 work in the CLAP plugin today, independent of this refactor entirely (confirmed via `grep`: nothing
 in `clap_plugin.c` ever touches the bare `g_streams_state` global). Fixing it means parametrizing
 `render_audio_block()` to take a streams pointer like it does everything else -- a real, scoped, not
-yet attempted follow-up, not something to bundle into a file-organization change.
+yet attempted follow-up, not something to bundle into a file-organization change. A second, smaller
+instance of the same shape: `poll_fx_nam_requests()` (the once-per-block check that (re)loads a
+FX_TYPE_NAM slot's `.nam` model/cab IR when its path changes) was already only ever called from
+`main()`'s own loop, never from `clap_plugin.c`'s `process()` -- so a CLAP instance's NAM FX slots
+can never actually load a model or cab IR. Not introduced by this pass (confirmed the call was never
+there before it either); just newly visible once the function's own file-location honestly reflects
+that.
+
+Every symbol above that had genuinely zero remaining reference from anything `clap_plugin.c`
+compiles now lives in `hds_standalone.c` instead of `backend.c` -- not just the ALSA/PipeWire shim
+from the original split, but a second pass that closed out a full cascade of
+`-Wunused-function`/`-Wunused-variable` warnings the CLAP build had been quietly carrying (this
+project targets clean compiles when it's easy to get them): the MIDI Clock/Start/Continue/Stop
+transport handlers, the Scala tuning and song-as-MIDI OSC handlers, `g_sample_engine`'s own global
+instance (its three constituent globals -- `g_sample_slot_state`, `g_pending_load_state`, and
+`g_streams_state` -- stay in `backend.c`; the first two turned out to have no genuine core-code
+reference either and moved too, but `g_streams_state` is the one real exception, for the
+`g_seq_audio` reason above), `poll_fx_nam_requests()` and its two model/IR reload helpers, and the
+entire Sequencer transport/lane/MIDI-playback call chain (`poll_seq_audio_load_requests`,
+`poll_seq_audio_preview_triggers`, `poll_transport_triggers`, `poll_seq_audio_transport_catchup`,
+`advance_transport_playhead`, `seq_playback_midi_events`, plus their own
+`transport_start_fresh`/`transport_reposition_lanes`/`seq_audio_start_transport_playback`/
+`seq_audio_load_wav_from_disk`/`seq_audio_resample_linear`/`seq_audio_loader_thread_main` helpers --
+see "Sequencer scope in the CLAP plugin" below for why none of it is reachable from CLAP any more in
+the first place). Pure code motion throughout, verified the same way as the original split: both
+targets still build with zero warnings and byte-identical DSP output.
+
+### Sequencer scope in the CLAP plugin
+
+The Sequencer tab's own transport (Play/Pause/Stop/Seek), its audio/MIDI lanes, and recorded-MIDI
+playback are deliberately **not** reachable from a CLAP plugin instance -- `clap_plugin_process()`
+never calls `poll_seq_audio_load_requests`, `poll_seq_audio_preview_triggers`,
+`poll_transport_triggers`, `poll_seq_audio_transport_catchup`, or `seq_playback_midi_events`, and
+never advances the transport playhead. A DAW host hosting this plugin already owns sequencing, MIDI
+routing, and audio routing for everything running inside it, so this engine's own parallel take on
+the same job is redundant surface that only invites bugs and confusion for a plugin user who was
+always going to use their DAW's own timeline instead. The Sequencer tab's widgets, and every
+`/hds/seq/*` OSC address, still exist and can still be set (including from a saved CLAP host state,
+for backward compatibility) -- they simply never drive anything inside a CLAP instance, since
+`p->engine.transport_state` can never leave `TRANSPORT_STOPPED` there.
+
+This is a scoping decision, not a wholesale MIDI-only mode: the **Arpeggiator** and **host tempo
+sync** are explicitly excluded from the removal and work exactly as they do in the standalone app.
+`compute_current_tempo_bpm()` plus the `seq_sync_source == 1` ("External") host-tempo override still
+run every `process()` call, and `poll_arpeggiator()` still fires on every Program with `arp_enabled`
+set, fed by the same MIDI note-on/off events the host sends this plugin -- neither of those is
+"sequencing" in the sense being scoped out here, both are live-performance features a plugin user
+would actually reach for.
+
+### Metronome: an independent clock
+
+The metronome used to be a strict function of the Sequencer transport -- `poll_metronome()` only
+scheduled clicks while `transport_state == TRANSPORT_PLAYING`, using the transport's own
+`transport_playhead_sec` as its clock, so it was silent unless the Sequencer's Play button (or a
+CLAP host's OSC-driven equivalent) had actually been pressed at least once. It now runs its own
+free-running clock (`HdsEngineState.metronome_elapsed_sec`, advanced by `poll_metronome()` itself
+using the caller's own `block_size`), gated only on the Metronome toggle -- no transport-state check
+at all -- matching the Arpeggiator's own long-standing transport-independence. This means the
+metronome now works as a plain practice/click-track tool in the standalone app whether or not the
+Sequencer has ever been touched, and it's one of the few Sequencer-adjacent things that stays fully
+wired up in the CLAP plugin too (see "Sequencer scope in the CLAP plugin" above), called every
+`process()` with the host's own `frames_count` as its block size.
+
+The toggle itself moved in `frontend.py`, from the Sequencer tab's transport row into the Global
+Configurations sidebar (next to the Tempo dial, above the Arpeggiator box) -- it's no longer a
+Sequencer-tab-only control, so it no longer lives exclusively in that tab. The underlying OSC
+address, `/hds/seq/transport/metronome`, is unchanged despite both the backend and UI moves, so an
+older saved Program or DAW automation that already references it keeps working exactly as before.
 
 ### Command-line flags
 

@@ -2958,6 +2958,22 @@ class SynthGui(QWidget):
         self.tempo_live_readout.setStyleSheet("color: #888; font-size: 9px;")
         global_layout.addWidget(self.tempo_live_readout)
 
+        # Metronome: a plain on/off toggle (not an edge-triggered counter like the Sequencer
+        # tab's own transport buttons -- this is sustained state), engaging a cheap, hardcoded
+        # 400Hz/8ms square-wave click on each beat -- see poll_metronome() in backend.c. Lives here
+        # in the Global panel (not the Sequencer tab) since it now runs its own free-running clock,
+        # entirely independent of the Sequencer transport, so it's usable with or without ever
+        # touching that tab -- same "always available" posture as the Arpeggiator just below. Not
+        # a Program voice, so it deliberately never touches the oscillator/filter/envelope
+        # machinery, and stays off by default (metronome_enable defaults to 0). Still wired to the
+        # existing /hds/seq/transport/metronome OSC address -- unchanged despite the UI move, so
+        # an older saved Program/DAW state that already set it keeps working exactly as before.
+        self.seq_btn_metronome = QPushButton("\U0001f3b5 Metronome")
+        self.seq_btn_metronome.setCheckable(True)
+        self.seq_btn_metronome.setToolTip("Click on each beat (400Hz, 8ms square wave) -- works with or without the Sequencer transport running")
+        global_layout.addWidget(self.seq_btn_metronome)
+        global_layout.addSpacing(4)
+
         # Arpeggiator -- a patch property (like Hard Sync/Poly-Mono above), not a live
         # performance override (unlike Transpose), so it's Program-scoped and saves/loads with
         # the patch -- see ProgramState's own "Arpeggiator" comment in backend.c. On/off, Style,
@@ -4191,15 +4207,12 @@ class SynthGui(QWidget):
         self.seq_btn_seek_fwd = QPushButton("1 Measure \u23e9")
         self.seq_btn_seek_fwd.setToolTip("Forward one measure")
         transport_row1.addWidget(self.seq_btn_seek_fwd)
-        # Metronome: a plain on/off toggle (not an edge-triggered counter like the buttons above
-        # -- this is sustained state), engaging a cheap, hardcoded 400Hz/8ms square-wave click on
-        # each beat while the transport is PLAYING -- see poll_metronome() in backend.c. Not a
-        # Program voice, so it deliberately never touches the oscillator/filter/envelope
-        # machinery, and stays off by default (metronome_enable defaults to 0).
-        self.seq_btn_metronome = QPushButton("\U0001f3b5 Metronome")
-        self.seq_btn_metronome.setCheckable(True)
-        self.seq_btn_metronome.setToolTip("Click on each beat while playing (400Hz, 8ms square wave)")
-        transport_row1.addWidget(self.seq_btn_metronome)
+        # Metronome: lives in the Global Configurations panel now (self.seq_btn_metronome is
+        # created there, near the Tempo dial), not here -- it runs its own free-running clock
+        # independent of the Sequencer transport (see poll_metronome() in backend.c), so it makes
+        # sense with or without ever touching this tab. The OSC address stays
+        # /hds/seq/transport/metronome unchanged for backward compatibility with saved
+        # Programs/DAW state despite the UI move.
         # Quantize: snaps a Rec-armed lane's recorded note-ON timestamps to the nearest grid line
         # at the current tempo (note lengths are left as-played -- see backend.c's
         # seq_quantize_enable comment). Off by default, same "opt-in, doesn't change existing

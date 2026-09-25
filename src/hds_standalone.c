@@ -15,20 +15,26 @@
 // backend.c, so both targets still compile as ONE translation unit each, exactly as before --
 // there is no new cross-TU call, no inlining lost, and no behavior change of any kind.
 //
-// NOT moved, on purpose, despite also only being reachable from main()'s own code (confirmed by a
-// real, if harmless, cascade of -Wunused-function/-Wunused-variable warnings the CLAP build shows
-// for them): g_sample_engine (and its 3 constituent globals), poll_fx_nam_requests, the MIDI Clock/
-// Start/Continue/Stop transport handlers, and the Scala tuning / song-as-MIDI OSC handlers.
-// render_audio_block's own Sequencer-audio-lane playback block reads g_streams_state (via the
-// g_seq_audio macro) DIRECTLY BY NAME rather than through a parameter, even though every other
-// piece of state it touches is passed in -- so g_streams_state has to stay declared before
-// backend.c's own content, which only this file's OWN prior position (not after an #include of
-// it) can satisfy. This is a genuine pre-existing wrinkle, not something this split created: it
-// means a CLAP plugin instance's Sequencer "Load Audio" feature loads into that instance's own
-// p->streams_state but render_audio_block's playback code reads the standalone's global instead
-// -- i.e. Sequencer audio-lane playback likely does not work in the CLAP plugin today, independent
-// of this refactor entirely. Left exactly as found; fixing it (parametrizing render_audio_block
-// to take a streams pointer) is a real, separate, scoped follow-up, not bundled into this split.
+// Also moved here, in a later pass (see the "Standalone-only backend logic" comment further
+// down, right before process_midi_input): g_sample_engine itself (its 3 constituent globals --
+// g_sample_slot_state, g_streams_state, g_pending_load_state -- did NOT move, see below),
+// poll_fx_nam_requests, the MIDI Clock/Start/Continue/Stop transport handlers, and the Scala
+// tuning / song-as-MIDI OSC handlers. This closed out a real, if harmless, cascade of
+// -Wunused-function/-Wunused-variable warnings the CLAP build used to show for all of it (none of
+// it is reachable from clap_plugin.c).
+//
+// g_sample_slot_state/g_streams_state/g_pending_load_state themselves stay declared in backend.c
+// (NOT moved, unlike the g_sample_engine wrapper that points at all three): render_audio_block's
+// own Sequencer-audio-lane playback block reads g_streams_state (via the g_seq_audio macro)
+// DIRECTLY BY NAME rather than through a parameter, even though every other piece of state it
+// touches is passed in -- so g_streams_state has to stay declared before backend.c's own content,
+// which only backend.c's OWN prior position (not after an #include of it) can satisfy. This is a
+// genuine pre-existing wrinkle, not something this split created: it means a CLAP plugin
+// instance's Sequencer "Load Audio" feature loads into that instance's own p->streams_state but
+// render_audio_block's playback code reads the standalone's global instead -- i.e. Sequencer
+// audio-lane playback likely does not work in the CLAP plugin today, independent of this refactor
+// entirely. Left exactly as found; fixing it (parametrizing render_audio_block to take a streams
+// pointer) is a real, separate, scoped follow-up, not bundled into this split.
 #include <alsa/asoundlib.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -168,6 +174,880 @@ static void midi_autoconnect_scan(snd_seq_t *seq, int our_port, const char *midi
             midi_connect_client(seq, our_port, client_id, tracked);
         }
     }
+}
+
+// --- Standalone-only backend logic moved here verbatim from backend.c (see this file's own
+// header comment): a real, if harmless, cascade of -Wunused-function/-Wunused-variable
+// warnings the CLAP build showed for all of it -- none of it is reachable from anywhere
+// clap_plugin.c calls, since a CLAP host owns its own timeline/tempo (no raw MIDI Clock bytes
+// to parse) and never touches the Scala tuning / song-as-MIDI OSC handlers (registered only
+// by this file's own lo_server_add_method calls below). Pure code motion -- see each block's
+// own original comment for what it actually does; nothing here was rewritten.
+
+// --- Sequencer transport / audio-lane polling (moved here, verbatim, from backend.c): all of
+// it was already only reachable from main()'s own loop (a CLAP plugin instance never calls
+// any of it -- see clap_plugin_process()'s own header comment on why the Sequencer tab's
+// transport/lane/MIDI-playback workflow is deliberately standalone-only), so leaving it in
+// backend.c only cost the CLAP build a cascade of -Wunused-function warnings once
+// clap_plugin.c stopped calling any of it. transport_start_fresh/transport_reposition_lanes/
+// seq_audio_start_transport_playback come first since hds_handle_midi_transport_start just
+// below needs transport_start_fresh already defined.
+
+// Actually starts (or repositions) one Seq-mode audio lane's transport-driven playback: its file
+// position is audio_offset_sec (the lane's own knob, "start reading the file from here") PLUS
+// the transport's own current playhead (g_transport_playhead_sec) -- so a lane repositions
+// correctly whether this is a fresh Play from Stop (playhead is 0 there), a late-loading lane
+// catching up mid-song (poll_seq_audio_transport_catchup), or a Seek (transport_reposition_lanes,
+// playhead already updated by the caller before this runs). Shared by all three callers. Caller
+// must have already confirmed load_state == SEQ_AUDIO_READY.
+static void seq_audio_start_transport_playback(HdsEngineState *engine, SeqAudioLane *al, float audio_offset_sec) {
+    long start_frame = 0;
+    float target_sec = audio_offset_sec + (float)engine->transport_playhead_sec;
+    if (target_sec > 0.0f && al->sample_rate > 0) {
+        start_frame = (long)(target_sec * (float)al->sample_rate);
+        if (start_frame >= al->frame_count) start_frame = al->frame_count - 1;
+    }
+    al->play_frame = start_frame;
+    al->is_playing = true;
+    al->driven_by_transport = true;
+    al->armed_for_transport = false;
+}
+
+// Repositions every playback-eligible lane's own playback state (Audio lanes' play_frame, MIDI
+// lanes' playback_cursor) to match wherever g_transport_playhead_sec CURRENTLY is -- shared by
+// transport_start_fresh (a fresh Play from Stop, playhead already reset to the target by the
+// caller) and the Seek triggers below (Reset/Back/Forward, playhead already moved by the caller
+// before this runs). Off lanes and Rec-armed lanes are both deliberately left untouched -- an Off
+// lane does nothing at all (see SeqLaneState's own precedence comment), and a Rec-armed lane has
+// no "position" to seek to (repositioning would either discard an in-progress take or make no
+// sense for one that hasn't started), so a seek simply doesn't affect either.
+static void transport_reposition_lanes(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        if ((int)knobs->seq_lanes[l].seq_mode == 1) continue; // Off -- a real bypass, the transport never touches this lane
+        bool is_audio_lane = (knobs->seq_lanes[l].lane_type != 0.0f);
+        if (is_audio_lane) {
+            // Audio lanes never record -- rec_armed is meaningless for them.
+            SeqAudioLane *al = &streams->seq_audio[l];
+            if (atomic_load_explicit(&al->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !al->pcm || al->frame_count <= 0) {
+                // Not ready yet -- arm it so poll_seq_audio_transport_catchup starts it at the
+                // right (already-updated) position the moment it becomes ready.
+                al->armed_for_transport = true;
+                continue;
+            }
+            seq_audio_start_transport_playback(engine, al, knobs->seq_lanes[l].audio_offset_sec);
+        } else {
+            if (knobs->seq_lanes[l].rec_armed != 0.0f) continue; // Rec-armed lanes have no playback position to reposition
+            SeqMidiLane *ml = &engine->seq_midi[l];
+            // Events are stored in non-decreasing time order (real-time recording can't record
+            // out of order -- see SeqMidiLane's own comment), so the new cursor is just "how many
+            // events have a timestamp at or before the new playhead," found by a plain forward
+            // scan from 0. Cheap even for a full 8192-event lane; only runs on an actual seek
+            // (button click), never per-block.
+            int cursor = 0;
+            while (cursor < ml->event_count && ml->events[cursor].time_sec <= (float)engine->transport_playhead_sec) cursor++;
+            ml->playback_cursor = cursor;
+        }
+    }
+}
+
+// Called once, only on a STOPPED -> PLAYING transition (never on PAUSED -> PLAYING/resume, which
+// must leave every lane's position exactly where it was): repositions every playback-eligible
+// lane to match the transport's current playhead (transport_reposition_lanes -- ordinarily 0,
+// unless the transport was seeked while Stopped, in which case Play correctly starts from there
+// instead of silently snapping back to the top). A lane armed to Rec starts a genuinely fresh
+// take (clears its previously recorded events) UNLESS rec_overdub is set, in which case its
+// existing events are deliberately left in place -- newly recorded notes get merged into them in
+// time order instead (see seq_record_midi_event).
+static void transport_start_fresh(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        if (knobs->seq_lanes[l].lane_type != 0.0f) continue; // Audio lanes never record
+        if ((int)knobs->seq_lanes[l].seq_mode == 1) continue; // Off -- untouched
+        if (knobs->seq_lanes[l].rec_armed == 0.0f) continue; // not armed to Rec
+        if (knobs->seq_lanes[l].rec_overdub != 0.0f) continue; // Overdub -- keep existing events
+        engine->seq_midi[l].event_count = 0; // Overwrite (default) -- fresh take
+    }
+    transport_reposition_lanes(streams, engine, knobs);
+}
+
+
+// Reads an entire WAV file into a newly malloc'd interleaved float buffer. Deliberately separate
+// from load_sample_slot() above (which only caches a short pre-roll and hands the rest to
+// on-demand disk streaming) -- an audio lane's whole clip lives in RAM at once, so this is a
+// plain one-shot full-file decode, run only on seq_audio_loader_thread_main's own thread. Keeps
+// every channel present in the file (unlike the sampler's mono/stereo-only pre-roll) since a
+// lane's own future mixdown, not this loader, should decide how to handle >2 channels. Returns
+// NULL on any failure (out_frames/out_channels/out_sample_rate left at 0).
+static float *seq_audio_load_wav_from_disk(const char *path, int *out_frames, int *out_channels, int *out_sample_rate) {
+    *out_frames = 0; *out_channels = 0; *out_sample_rate = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[seq-audio] failed to open '%s': %s\n", path, strerror(errno)); return NULL; }
+
+    char chunk_id[4];
+    fseek(f, 12, SEEK_SET);
+    if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    while (strncmp(chunk_id, "fmt ", 4) != 0) {
+        unsigned int chunk_size;
+        if (fread(&chunk_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+        fseek(f, chunk_size, SEEK_CUR);
+        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    }
+
+    unsigned int subchunk1_size; unsigned short audio_format, num_channels;
+    unsigned int sample_rate, byte_rate; unsigned short block_align, bits_per_sample;
+    if (fread(&subchunk1_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&audio_format, 2, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&num_channels, 2, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&sample_rate, 4, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&byte_rate, 4, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&block_align, 2, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&bits_per_sample, 2, 1, f) != 1) { fclose(f); return NULL; }
+    (void)byte_rate; (void)block_align;
+
+    if (audio_format != 1 && audio_format != 3) {
+        fprintf(stderr, "[seq-audio] '%s': unsupported WAV format tag %u (need 1=PCM or 3=float)\n", path, audio_format);
+        fclose(f); return NULL;
+    }
+    if (audio_format == 1 && bits_per_sample != 16 && bits_per_sample != 24 && bits_per_sample != 32) {
+        fprintf(stderr, "[seq-audio] '%s': unsupported %u-bit PCM\n", path, bits_per_sample);
+        fclose(f); return NULL;
+    }
+    if (audio_format == 3 && bits_per_sample != 32) {
+        fprintf(stderr, "[seq-audio] '%s': float WAV must be 32-bit\n", path);
+        fclose(f); return NULL;
+    }
+    if (num_channels == 0) { fclose(f); return NULL; }
+    if (subchunk1_size > 16) fseek(f, subchunk1_size - 16, SEEK_CUR);
+
+    if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    while (strncmp(chunk_id, "data", 4) != 0) {
+        unsigned int chunk_size;
+        if (fread(&chunk_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+        fseek(f, chunk_size, SEEK_CUR);
+        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    }
+    unsigned int data_size;
+    if (fread(&data_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+
+    int bytes_per_sample = bits_per_sample / 8;
+    unsigned int total_frames = data_size / (unsigned int)(num_channels * bytes_per_sample);
+    if (total_frames == 0) { fclose(f); return NULL; }
+
+    float *pcm = malloc((size_t)total_frames * num_channels * sizeof(float));
+    if (!pcm) { fprintf(stderr, "[seq-audio] '%s': out of memory (%u frames x %u ch)\n", path, total_frames, num_channels); fclose(f); return NULL; }
+
+    for (unsigned int i = 0; i < total_frames * num_channels; i++) {
+        float sample = 0.0f;
+        bool ok = true;
+        if (audio_format == 1) {
+            if (bits_per_sample == 16) {
+                short raw16;
+                if (fread(&raw16, 2, 1, f) != 1) ok = false; else sample = (float)raw16 / 32768.0f;
+            } else if (bits_per_sample == 24) {
+                unsigned char b24[3];
+                if (fread(b24, 1, 3, f) != 3) ok = false;
+                else { int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); sample = (float)v / 2147483648.0f; }
+            } else {
+                int raw32;
+                if (fread(&raw32, 4, 1, f) != 1) ok = false; else sample = (float)raw32 / 2147483648.0f;
+            }
+        } else {
+            if (fread(&sample, 4, 1, f) != 1) ok = false;
+        }
+        if (!ok) { fprintf(stderr, "[seq-audio] '%s': truncated read at sample %u\n", path, i); free(pcm); fclose(f); return NULL; }
+        pcm[i] = sample;
+    }
+    fclose(f);
+    *out_frames = (int)total_frames;
+    *out_channels = (int)num_channels;
+    *out_sample_rate = (int)sample_rate;
+    return pcm;
+}
+
+// Linear-interpolation sample-rate conversion. Runs once, only on this (non-realtime) loader
+// thread, so a plain single-pass linear resample is more than adequate -- nothing here needs to
+// be low-latency or audio-thread-safe. Returns a newly malloc'd interleaved buffer at to_rate and
+// writes its frame count to *out_frames; returns NULL (leaving *out_frames untouched) if nothing
+// needs doing or on allocation failure, in which case the caller keeps the original buffer as-is.
+static float *seq_audio_resample_linear(const float *pcm, int frames, int channels, int from_rate, int to_rate, int *out_frames) {
+    if (from_rate <= 0 || to_rate <= 0 || from_rate == to_rate || frames <= 0) return NULL;
+    double ratio = (double)to_rate / (double)from_rate;
+    int new_frames = (int)((double)frames * ratio + 0.5);
+    if (new_frames < 1) new_frames = 1;
+    float *out = malloc((size_t)new_frames * (size_t)channels * sizeof(float));
+    if (!out) return NULL;
+    double step = (double)from_rate / (double)to_rate;
+    for (int i = 0; i < new_frames; i++) {
+        double src_pos = (double)i * step;
+        long idx0 = (long)src_pos;
+        if (idx0 >= frames) idx0 = frames - 1;
+        long idx1 = idx0 + 1;
+        if (idx1 >= frames) idx1 = frames - 1;
+        double frac = src_pos - (double)idx0;
+        for (int c = 0; c < channels; c++) {
+            float s0 = pcm[idx0 * channels + c];
+            float s1 = pcm[idx1 * channels + c];
+            out[i * channels + c] = (float)((double)s0 + ((double)s1 - (double)s0) * frac);
+        }
+    }
+    *out_frames = new_frames;
+    return out;
+}
+
+static void *seq_audio_loader_thread_main(void *arg) {
+    SeqAudioLoadRequest *req = (SeqAudioLoadRequest *)arg;
+    SeqAudioLane *lane = &req->owner->seq_audio[req->lane_index];
+    int frames = 0, channels = 0, sample_rate = 0;
+    float *pcm = seq_audio_load_wav_from_disk(req->path, &frames, &channels, &sample_rate);
+    // Safe to read/free the previous buffer here without its own atomic: loads for this lane are
+    // serialized by the main-loop gate (see below), and its write happens-before this thread's
+    // own start via the acquire/release pair on load_state plus pthread_create's own
+    // synchronizes-with guarantee -- see this file's SeqAudioLane comment.
+    float *old_pcm = lane->pcm;
+    if (pcm && sample_rate > 0 && sample_rate != SAMPLE_RATE) {
+        // The playback loop (render_seq_audio_preview_sample) reads one PCM frame per rendered
+        // sample with no rate conversion of its own -- a file whose native rate differs from the
+        // engine's would otherwise play back at the wrong pitch/speed. Resample here, once, on
+        // this background thread, so every loaded lane always plays back correctly regardless of
+        // its source file's native rate.
+        int resampled_frames = 0;
+        float *resampled = seq_audio_resample_linear(pcm, frames, channels, sample_rate, SAMPLE_RATE, &resampled_frames);
+        if (resampled) {
+            free(pcm);
+            pcm = resampled;
+            frames = resampled_frames;
+            sample_rate = SAMPLE_RATE;
+        }
+        // resampled == NULL (allocation failure): fall through and keep the original-rate
+        // buffer -- still playable, just at the wrong pitch/speed, same as before this feature
+        // existed, rather than losing the load entirely over a resample-only OOM.
+    }
+    if (pcm) {
+        lane->frame_count = frames;
+        lane->channels = channels;
+        lane->sample_rate = sample_rate;
+        lane->pcm = pcm;
+        atomic_store_explicit(&lane->load_state, SEQ_AUDIO_READY, memory_order_release);
+    } else {
+        lane->pcm = NULL;
+        lane->frame_count = 0;
+        lane->channels = 0;
+        lane->sample_rate = 0;
+        atomic_store_explicit(&lane->load_state, SEQ_AUDIO_ERROR, memory_order_release);
+    }
+    free(old_pcm);
+    free(req);
+    return NULL;
+}
+
+// Once-per-block change detection (mirrors the existing output_device/input_device strncmp
+// pattern in main()'s loop): notices when a lane's requested audio_path differs from what's
+// already loading/loaded, and spawns a loader thread for it -- never more than one in flight per
+// lane at a time. Call this from main()'s loop, same cadence as every other live-knob check.
+static void poll_seq_audio_load_requests(HdsStreamsState *streams, const SynthSharedControls *knobs) {
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        SeqAudioLane *lane = &streams->seq_audio[l];
+        const char *want_path = knobs->seq_lanes[l].audio_path;
+        if (want_path[0] == '\0') continue;
+        if (strncmp(want_path, lane->last_requested_path, SEQ_AUDIO_PATH_LEN) == 0) continue;
+        int state = atomic_load_explicit(&lane->load_state, memory_order_acquire);
+        if (state == SEQ_AUDIO_LOADING) continue; // catches up once the in-flight load finishes
+        snprintf(lane->last_requested_path, SEQ_AUDIO_PATH_LEN, "%s", want_path);
+        // A previous load for this lane may still be un-joined (this is a later reload of the
+        // same lane) -- join it now before reusing the tracking slot below, so this instance
+        // never leaks a thread handle across repeated reloads. Cheap in practice: gated by
+        // load_state != LOADING just above, so any earlier thread already finished its work by
+        // the time control reaches here -- see SeqAudioLoadRequest.owner's own comment on why
+        // this join (not a detach) is now required at all.
+        if (streams->seq_audio_loader_thread_active[l]) {
+            pthread_join(streams->seq_audio_loader_thread[l], NULL);
+            streams->seq_audio_loader_thread_active[l] = false;
+        }
+        SeqAudioLoadRequest *req = malloc(sizeof(SeqAudioLoadRequest));
+        if (!req) continue;
+        req->lane_index = l;
+        req->owner = streams;
+        snprintf(req->path, SEQ_AUDIO_PATH_LEN, "%s", want_path);
+        atomic_store_explicit(&lane->load_state, SEQ_AUDIO_LOADING, memory_order_release);
+        if (pthread_create(&streams->seq_audio_loader_thread[l], NULL, seq_audio_loader_thread_main, req) == 0) {
+            streams->seq_audio_loader_thread_active[l] = true;
+        } else {
+            fprintf(stderr, "[seq-audio] failed to spawn loader thread for lane %d\n", l);
+            free(req);
+            atomic_store_explicit(&lane->load_state, SEQ_AUDIO_ERROR, memory_order_release);
+        }
+    }
+}
+
+
+// "Preview" one-shot playback trigger detection (see SeqLaneState.audio_preview_trigger's own
+// comment). Edge-triggered: the frontend increments the trigger value by 1 on every click, so
+// any change (not just "> last") starts (or restarts) that lane's playback from the beginning --
+// or audio_offset_sec seconds in, if positive. Deliberately independent of the Sequencer
+// transport (see poll_transport_triggers/transport_start_fresh, added alongside this): a
+// Preview-triggered lane always plays through to completion regardless of Play/Pause/Stop state,
+// unlike a transport-driven lane -- auditioning a sound must never depend on whether the
+// Sequencer happens to be running. Call once per block from main()'s loop, same as
+// poll_seq_audio_load_requests.
+static void poll_seq_audio_preview_triggers(HdsStreamsState *streams, const SynthSharedControls *knobs) {
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        SeqAudioLane *lane = &streams->seq_audio[l];
+        float want_trigger = knobs->seq_lanes[l].audio_preview_trigger;
+        if (want_trigger == lane->last_seen_trigger) continue;
+        lane->last_seen_trigger = want_trigger;
+        if (atomic_load_explicit(&lane->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !lane->pcm || lane->frame_count <= 0) {
+            continue; // nothing loaded (yet) for this lane -- silently ignore the trigger
+        }
+        float offset_sec = knobs->seq_lanes[l].audio_offset_sec;
+        long start_frame = 0;
+        if (offset_sec > 0.0f && lane->sample_rate > 0) {
+            start_frame = (long)(offset_sec * (float)lane->sample_rate);
+            if (start_frame >= lane->frame_count) start_frame = lane->frame_count - 1;
+        }
+        lane->play_frame = start_frame;
+        lane->is_playing = true;
+        lane->driven_by_transport = false;
+    }
+}
+
+
+// Edge-triggered, same idiom as poll_seq_audio_preview_triggers: each button increments its own
+// counter on every click and resends the whole packet, so a genuine change (not just "button
+// held") is what starts/pauses/stops/seeks the transport -- immune to a stale resend
+// re-triggering anything. Call once per block from main()'s loop. current_tempo_bpm is this
+// block's already-resolved tempo (see the Seek Back/Forward triggers' own comment on why "right
+// now" rather than "at the seek target").
+static void poll_transport_triggers(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs, float current_tempo_bpm) {
+    if (knobs->seq_transport_play_trigger != engine->transport_last_play_trigger) {
+        engine->transport_last_play_trigger = knobs->seq_transport_play_trigger;
+        if (engine->transport_state != TRANSPORT_PLAYING) {
+            bool was_stopped = (engine->transport_state == TRANSPORT_STOPPED);
+            engine->transport_state = TRANSPORT_PLAYING;
+            if (was_stopped) transport_start_fresh(streams, engine, knobs);
+            // PAUSED -> PLAYING: deliberately does nothing else -- every lane's play_frame/
+            // playback_cursor already holds exactly where it was paused.
+        }
+    }
+    if (knobs->seq_transport_pause_trigger != engine->transport_last_pause_trigger) {
+        engine->transport_last_pause_trigger = knobs->seq_transport_pause_trigger;
+        if (engine->transport_state == TRANSPORT_PLAYING) engine->transport_state = TRANSPORT_PAUSED;
+    }
+    if (knobs->seq_transport_stop_trigger != engine->transport_last_stop_trigger) {
+        engine->transport_last_stop_trigger = knobs->seq_transport_stop_trigger;
+        engine->transport_state = TRANSPORT_STOPPED;
+        engine->transport_playhead_sec = 0.0;
+        for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+            // Only stop lanes the TRANSPORT itself started -- a manually Preview-triggered lane
+            // keeps playing through Stop exactly as it already does today (Preview is fully
+            // independent of transport state, per its own existing contract).
+            if (streams->seq_audio[l].driven_by_transport) {
+                streams->seq_audio[l].is_playing = false;
+                streams->seq_audio[l].driven_by_transport = false;
+            }
+            streams->seq_audio[l].armed_for_transport = false;
+            engine->seq_midi[l].playback_cursor = 0;
+        }
+    }
+
+    // Seek: "very beginning" reset, and back/forward by one whole measure. Works in every
+    // transport state (Stopped/Paused/Playing) -- none of these three requires PLAYING first,
+    // unlike Play/Pause/Stop's own state-transition guards above. A measure is 4 beats (this
+    // engine has no time-signature concept yet, so 4/4 is assumed -- matching the Sequencer tab's
+    // own bars:beats readout, which already makes the same assumption) at current_tempo_bpm;
+    // clamped to a sane floor so a pathologically low/zero tempo can't produce an infinite or
+    // negative-duration measure.
+    float measure_sec = 4.0f * 60.0f / fmaxf(1.0f, current_tempo_bpm);
+    bool seeked = false;
+    if (knobs->seq_transport_seek_start_trigger != engine->transport_last_seek_start_trigger) {
+        engine->transport_last_seek_start_trigger = knobs->seq_transport_seek_start_trigger;
+        engine->transport_playhead_sec = 0.0;
+        seeked = true;
+    }
+    if (knobs->seq_transport_seek_back_trigger != engine->transport_last_seek_back_trigger) {
+        engine->transport_last_seek_back_trigger = knobs->seq_transport_seek_back_trigger;
+        engine->transport_playhead_sec = fmax(0.0, engine->transport_playhead_sec - (double)measure_sec);
+        seeked = true;
+    }
+    if (knobs->seq_transport_seek_fwd_trigger != engine->transport_last_seek_fwd_trigger) {
+        engine->transport_last_seek_fwd_trigger = knobs->seq_transport_seek_fwd_trigger;
+        engine->transport_playhead_sec += (double)measure_sec;
+        seeked = true;
+    }
+    // Seek-to-arbitrary-position ("jump to marker" -- see SynthSharedControls' own comment):
+    // jumps straight to the requested absolute position rather than a relative one-measure step.
+    if (knobs->seq_transport_seek_to_trigger != engine->transport_last_seek_to_trigger) {
+        engine->transport_last_seek_to_trigger = knobs->seq_transport_seek_to_trigger;
+        engine->transport_playhead_sec = fmax(0.0, (double)knobs->seq_transport_seek_to_target_sec);
+        seeked = true;
+    }
+    if (seeked) {
+        transport_reposition_lanes(streams, engine, knobs);
+        // Metronome no longer resyncs here -- it runs its own free-running clock now (see
+        // poll_metronome()'s own comment), entirely independent of the Sequencer transport's
+        // playhead, so a Sequencer seek has nothing to do with its schedule any more.
+    }
+}
+
+
+// Called every block from main()'s loop (see seq_audio_start_transport_playback's own comment
+// on why this exists): starts any lane transport_start_fresh had to skip because its load hadn't
+// finished yet, the moment SEQ_AUDIO_READY actually lands, as long as the transport is still
+// PLAYING when that happens. A cheap, unconditional scan -- armed_for_transport is false for
+// every lane in the overwhelmingly common case (load already finished before Play was pressed),
+// so this is a no-op most of the time.
+static void poll_seq_audio_transport_catchup(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
+    if (engine->transport_state != TRANSPORT_PLAYING) return;
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        SeqAudioLane *al = &streams->seq_audio[l];
+        if (!al->armed_for_transport) continue;
+        if (atomic_load_explicit(&al->load_state, memory_order_acquire) != SEQ_AUDIO_READY || !al->pcm || al->frame_count <= 0) continue;
+        seq_audio_start_transport_playback(engine, al, knobs->seq_lanes[l].audio_offset_sec);
+    }
+}
+
+// Advances the real playhead by exactly one block's worth of time, only while PLAYING. Call once
+// per block from main()'s loop, after block_size is known for this iteration.
+static void advance_transport_playhead(HdsEngineState *engine, int block_size) {
+    if (engine->transport_state == TRANSPORT_PLAYING) {
+        engine->transport_playhead_sec += (double)block_size / (double)SAMPLE_RATE;
+    }
+}
+
+
+// Called once per block, right after process_midi_input -- walks every Seq-mode Program/MIDI
+// lane's recorded events and fires any whose timestamp has now been reached, via the exact same
+// handle_note_on/handle_note_off functions live MIDI already calls (see this section's own scope
+// comment for why that's a deliberate choice, not a shortcut).
+static void seq_playback_midi_events(HdsEngineState *engine, HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack *mono_stack, const MidiLiveState *midi_live) {
+    if (engine->transport_state != TRANSPORT_PLAYING) return;
+    // Sequencer's recorded MIDI always targets Single Program mode's own dedicated ProgramState
+    // (SINGLE_PROGRAM_SLOT, not any Combi lane -- see this section's scope comment and
+    // ProgramState's own comment on the mutual-exclusivity fix) -- so its own poly/mono mode is
+    // always that slot's is_polyphonic, computed once here.
+    bool poly_mode_active = (knobs->programs[SINGLE_PROGRAM_SLOT].is_polyphonic != 0.0f);
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        if (knobs->seq_lanes[l].lane_type != 0.0f) continue;
+        if ((int)knobs->seq_lanes[l].seq_mode == 1) continue; // Off -- a real bypass, see SeqLaneState's own precedence comment
+        if (knobs->seq_lanes[l].rec_armed != 0.0f) continue; // Rec-armed lanes don't play back at all
+        bool muted = (knobs->seq_lanes[l].mute != 0.0f);
+        SeqMidiLane *ml = &engine->seq_midi[l];
+        while (ml->playback_cursor < ml->event_count && ml->events[ml->playback_cursor].time_sec <= (float)engine->transport_playhead_sec) {
+            SeqMidiEvent *e = &ml->events[ml->playback_cursor];
+            // Mute still walks the cursor forward in step with the playhead -- just without ever
+            // calling handle_note_on/off -- so un-muting resumes wherever the playhead currently
+            // is instead of bursting out every note that was skipped while muted. Same "stay in
+            // sync, just silence the output" shape as the audio-lane Mute fix right above this
+            // function's own mix-loop call site.
+            if (!muted) {
+                // Sequencer's own recorded MIDI always targets SINGLE_PROGRAM_SLOT -- see this
+                // section's scope comment (a separate, parallel concern from Combi's own live
+                // dispatch) and ProgramState's own comment on why this is no longer Program 0.
+                if (e->type == 0) handle_note_on(se, voices, knobs, global_lfo_phases, SINGLE_PROGRAM_SLOT, e->note, e->velocity, poly_mode_active, mono_stack);
+                else handle_note_off(se, voices, knobs, midi_live, SINGLE_PROGRAM_SLOT, e->note, poly_mode_active, mono_stack);
+            }
+            ml->playback_cursor++;
+        }
+    }
+}
+
+
+// --- External MIDI Clock sync (see SynthSharedControls.seq_sync_source) ---
+//
+// MIDI Clock (0xF8) ticks 24 times per quarter note, with no tempo field of its own -- the
+// receiving device is expected to derive BPM purely from how far apart consecutive ticks land in
+// real time. Measured here via CLOCK_MONOTONIC wall-clock timestamps at the point each tick is
+// polled (this engine's MIDI input is polled once per audio block, not on a dedicated MIDI
+// thread, so tick timing carries up to one block's worth of jitter -- a few milliseconds at
+// typical block sizes, negligible for tempo derivation and the same polling-granularity tradeoff
+// every other block-polled input here already accepts).
+#define HDS_MIDI_CLOCK_TICKS_PER_QUARTER 24
+#define HDS_MIDI_CLOCK_TIMEOUT_SEC 2.0 // no tick for this long -> treat the external clock as gone
+
+static double hds_monotonic_seconds(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+// Hooked directly into process_midi_input's SND_SEQ_EVENT_CLOCK case -- runs unconditionally
+// regardless of seq_sync_source (cheap bookkeeping either way), so switching sync source live
+// doesn't need to "catch up" on tempo -- it's already tracked in the background.
+static void hds_handle_midi_clock_tick(HdsEngineState *engine) {
+    double now = hds_monotonic_seconds();
+    if (engine->midi_clock_tick_count > 0) {
+        double delta = now - engine->midi_clock_last_tick_sec;
+        if (delta > 0.0 && delta < HDS_MIDI_CLOCK_TIMEOUT_SEC) {
+            if (!engine->midi_clock_valid) {
+                engine->midi_clock_tick_interval_smoothed = (float)delta; // first real sample -- nothing to smooth against yet
+            } else {
+                // ~5-tick time constant: fast enough to track a live tempo ramp (a performer
+                // riding a hardware sequencer's tempo knob) without jittering the derived BPM on
+                // every single tick's own small timing noise.
+                float smoothing = 0.2f;
+                engine->midi_clock_tick_interval_smoothed += ((float)delta - engine->midi_clock_tick_interval_smoothed) * smoothing;
+            }
+            engine->midi_clock_bpm = 60.0f / (engine->midi_clock_tick_interval_smoothed * (float)HDS_MIDI_CLOCK_TICKS_PER_QUARTER);
+            if (engine->midi_clock_tick_count >= 4) engine->midi_clock_valid = true; // a few ticks in before trusting it
+        } else {
+            engine->midi_clock_tick_count = 0; // long gap (e.g. was stopped) -- restart clean rather than poisoning the average with one huge interval
+        }
+    }
+    engine->midi_clock_last_tick_sec = now;
+    engine->midi_clock_tick_count++;
+}
+
+// MIDI Start (0xFA): always begins from the top, exactly like the GUI's own Stop->Play transition
+// -- see transport_start_fresh()'s own comment for what "fresh" means for a Rec-armed lane.
+static void hds_handle_midi_transport_start(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
+    engine->transport_playhead_sec = 0.0;
+    engine->transport_state = TRANSPORT_PLAYING;
+    transport_start_fresh(streams, engine, knobs);
+}
+
+// MIDI Continue (0xFB): resumes from exactly wherever the transport currently sits -- no
+// repositioning, same as the GUI's own Paused->Playing transition.
+static void hds_handle_midi_transport_continue(HdsEngineState *engine) {
+    engine->transport_state = TRANSPORT_PLAYING;
+}
+
+// MIDI Stop (0xFC): PAUSES rather than resets to zero -- matches General MIDI/MIDI Machine
+// Control's own Stop/Continue semantics (a subsequent Continue must resume from here), the same
+// distinction the GUI's own separate Pause and Stop buttons already make. A performer who wants
+// to rewind to the top sends Start, not Stop, exactly as most DAWs already behave.
+static void hds_handle_midi_transport_stop(HdsEngineState *engine) {
+    if (engine->transport_state == TRANSPORT_PLAYING) engine->transport_state = TRANSPORT_PAUSED;
+}
+
+
+// g_sample_slot_state/g_pending_load_state: the standalone-only global instances of the two
+// sample-engine tiers that have no genuine core-code reference by name (unlike g_streams_state,
+// which stays declared in backend.c -- see this file's own header comment on why). The TYPES
+// (HdsSampleSlotState/HdsPendingLoadState) still have to stay in backend.c, since a CLAP plugin
+// instance holds its own per-instance fields of both (HdsClapPlugin.sample_slot_state/
+// pending_load_state) -- only these two process-wide instances, and the macros aliasing their
+// members, are standalone-only.
+static HdsSampleSlotState g_sample_slot_state;
+#define g_sample_slots g_sample_slot_state.sample_slots
+#define g_sample_slot_count g_sample_slot_state.sample_slot_count
+static HdsPendingLoadState g_pending_load_state;
+#define g_pending_loads g_pending_load_state.pending_loads
+#define g_pending_load_head g_pending_load_state.pending_load_head
+#define g_pending_load_tail g_pending_load_state.pending_load_tail
+#define g_pending_load_count g_pending_load_state.pending_load_count
+#define g_round_robin_hit_count g_pending_load_state.round_robin_hit_count
+
+// The actual HdsSampleEngine global instance -- the type itself is forward-declared much earlier
+// in backend.c (right after HdsSampleSlotState, see that comment for why) so load_sample_slot()
+// and friends can take it as a parameter; the instance is only declared here, now that all three
+// tiers' globals it points at actually exist.
+static HdsSampleEngine g_sample_engine = { &g_sample_slot_state, &g_streams_state, &g_pending_load_state };
+
+
+#if HDS_NAM_ENABLED
+// fx_nam_reload_model/fx_nam_reload_ir: moved here from fx_chain.c alongside poll_fx_nam_requests
+// just below, their only caller -- FxNamState itself, fx_nam_free_ir/fx_nam_free_state (which
+// sync_fx_engine_types() in the shared core still calls directly), and run_fx_nam() all stay in
+// fx_chain.c. NOTE: as a direct result, a CLAP plugin instance's FX_TYPE_NAM slots can never
+// actually load a model or cab IR -- poll_fx_nam_requests (the only thing that ever calls these)
+// was already standalone-only before this move (never called from clap_plugin.c's process()), so
+// this was a pre-existing gap this refactor exposed rather than introduced, same shape as the
+// already-documented Sequencer-audio-lane-in-CLAP issue above. A real, separate, scoped follow-up.
+static void fx_nam_reload_model(FxNamState *st, const char *path) {
+    hds_nam_destroy(st->model_l); st->model_l = NULL;
+    hds_nam_destroy(st->model_r); st->model_r = NULL;
+    snprintf(st->loaded_model_path, SAMPLE_PATH_LEN, "%s", path);
+    st->model_load_failed = false;
+    if (path[0] == '\0') return; // cleared -- leave both NULL, run_fx_nam() then passes dry
+    // num_frames=1 is this call's own real usage pattern (see run_fx_nam()), but Reset() still
+    // wants a genuine max-block-size hint for any internal buffer sizing the model does up front.
+    st->model_l = hds_nam_create(path, (double)SAMPLE_RATE, 1);
+    st->model_r = hds_nam_create(path, (double)SAMPLE_RATE, 1);
+    if (!st->model_l || !st->model_r) {
+        fprintf(stderr, "[nam] failed to load model '%s'\n", path);
+        hds_nam_destroy(st->model_l); st->model_l = NULL;
+        hds_nam_destroy(st->model_r); st->model_r = NULL;
+        st->model_load_failed = true;
+    }
+}
+
+static void fx_nam_reload_ir(FxNamState *st, const char *path) {
+    fx_nam_free_ir(st);
+    snprintf(st->loaded_ir_path, SAMPLE_PATH_LEN, "%s", path);
+    st->ir_load_failed = false;
+    if (path[0] == '\0') return; // cleared -- leave NULL, run_fx_nam() then skips the cab stage
+
+    int frames = 0, channels = 0, sample_rate = 0;
+    float *pcm = seq_audio_load_wav_from_disk(path, &frames, &channels, &sample_rate);
+    if (!pcm || frames <= 0) { st->ir_load_failed = true; free(pcm); return; }
+
+    int taps = frames;
+    bool truncated = false;
+    if (taps > FX_NAM_IR_MAX_TAPS) { taps = FX_NAM_IR_MAX_TAPS; truncated = true; }
+
+    st->ir_l = malloc(sizeof(float) * (size_t)taps);
+    bool stereo = channels >= 2;
+    st->ir_r = stereo ? malloc(sizeof(float) * (size_t)taps) : st->ir_l;
+    if (!st->ir_l || (stereo && !st->ir_r)) {
+        fx_nam_free_ir(st); st->ir_load_failed = true; free(pcm); return;
+    }
+    for (int i = 0; i < taps; i++) {
+        st->ir_l[i] = pcm[(size_t)i * channels];
+        if (stereo) st->ir_r[i] = pcm[(size_t)i * channels + 1];
+    }
+    free(pcm);
+
+    st->ir_taps = taps;
+    // Always two independent rings, even for a mono IR -- see the struct's own comment on why
+    // ir_hist_l/ir_hist_r must never alias the way ir_l/ir_r (read-only coefficients) safely can.
+    st->ir_hist_l = calloc((size_t)taps, sizeof(float));
+    st->ir_hist_r = calloc((size_t)taps, sizeof(float));
+    st->ir_hist_pos_l = 0; st->ir_hist_pos_r = 0;
+    if (!st->ir_hist_l || !st->ir_hist_r) { fx_nam_free_ir(st); st->ir_load_failed = true; return; }
+
+    if (truncated) fprintf(stderr, "[nam] cab IR '%s' truncated to %d taps (was %d)\n", path, taps, frames);
+    if (sample_rate != 0 && sample_rate != SAMPLE_RATE) {
+        fprintf(stderr, "[nam] cab IR '%s' is %d Hz, engine runs at %d Hz -- loaded as-is, uncorrected\n", path, sample_rate, SAMPLE_RATE);
+    }
+}
+
+// Same "once-per-block change detection" shape as poll_seq_audio_load_requests() just above --
+// notices when an FX slot's nam_model_path/nam_ir_path differs from what that slot's own state
+// already has loaded, and (re)loads it. Unlike Sequencer audio lanes, this runs the load
+// SYNCHRONOUSLY on this thread (the same one OSC dispatch and audio rendering both run on -- see
+// this file's own single-threaded-main-loop design) rather than spawning a loader thread: a .nam
+// model file is a small, bounded JSON+weights blob (nothing like a whole song-length audio
+// recording), and a cab IR is capped at FX_NAM_IR_MAX_TAPS frames -- both comfortably finish within
+// one block's worth of stall, the same bet load_sample_slot() already makes for a sample zone's WAV
+// header + pre-roll. A real streaming thread would be the right call for something unboundedly
+// large; neither of these is.
+//
+// Only meaningful once a slot's own engine state actually exists as an FxNamState -- gated on
+// active_type == FX_TYPE_NAM, which sync_fx_engine_types() (called once per block from
+// render_audio_block, before this in the same iteration -- see main()'s own loop) guarantees is
+// current for any type change already applied by the time this runs; a slot switched to
+// FX_TYPE_NAM within the SAME block this runs simply picks up its load on the next block instead,
+// same one-block grace every other live-knob check in this loop already has.
+static void poll_fx_nam_requests(FXSlotEngine fx_engine[FX_SLOT_COUNT], const SynthSharedControls *knobs) {
+    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+        if (fx_engine[s].active_type != FX_TYPE_NAM || !fx_engine[s].state) continue;
+        FxNamState *st = (FxNamState *)fx_engine[s].state;
+        const char *want_model = knobs->fx[s].nam_model_path;
+        if (strncmp(want_model, st->loaded_model_path, SAMPLE_PATH_LEN) != 0) {
+            fx_nam_reload_model(st, want_model);
+        }
+        const char *want_ir = knobs->fx[s].nam_ir_path;
+        if (strncmp(want_ir, st->loaded_ir_path, SAMPLE_PATH_LEN) != 0) {
+            fx_nam_reload_ir(st, want_ir);
+        }
+    }
+}
+#endif // HDS_NAM_ENABLED
+
+
+// --- Song save/load: recorded Sequencer MIDI data (SeqMidiLane.events[]) ---
+//
+// Everything else a "song" needs (each lane's own type/volume/pan/midi_channel/mute/rec state,
+// and an Audio lane's own audio_path/offset) already lives on SynthSharedControls, addressed by
+// the existing /hds/seq/%d/... OSC entries -- the frontend saves/restores all of that itself the
+// exact same way it already saves/restores a Program's fields, no new backend involvement needed.
+// The ONE piece that can't work that way is a Rec-armed lane's actual recorded performance
+// (SeqMidiLane.events[], up to SEQ_MIDI_EVENT_CAPACITY=8192 per lane): pure runtime state, never
+// exposed as an OSC-addressable knob at all (there's no single "current value" to read/write one
+// at a time the way a fader position is), and too large to safely shuttle over a UDP OSC bundle in
+// the worst case (32 fully-packed lanes would be several times over a single UDP datagram's
+// realistic safe size). Backend-native file I/O instead -- the same "OSC carries just a path
+// string, the backend does the actual file work" shape as --sfz-vcoN/zone_load_sfz_handler's SFZ
+// loading, applied here to this engine's own small binary dump instead of a third-party format.
+//
+// REALTIME NOTE: unlike WAV recording/sample streaming (continuous for a take's whole duration,
+// so routed through a dedicated writer/loader thread specifically to keep file I/O off the audio
+// thread), this runs synchronously on a Save/Load button click -- a rare, discrete, user-initiated
+// action, not something that happens while notes are actively being processed. A worst-case
+// fully-packed take (32 lanes x 8192 events, 8 bytes/event) is still only ~2MB, a few
+// milliseconds of disk I/O even on a slow card -- an explicitly accepted tradeoff against building
+// a whole second dedicated-thread pipeline for something this infrequent, not an oversight.
+#define HDS_SONG_MIDI_MAGIC 0x48445351u // "HDSQ" as a little-endian u32
+#define HDS_SONG_MIDI_VERSION 1u
+
+static void hds_song_write_u32(FILE *f, uint32_t v) {
+    uint8_t b[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
+    fwrite(b, 1, 4, f);
+}
+static uint32_t hds_song_read_u32(FILE *f) {
+    uint8_t b[4] = {0};
+    if (fread(b, 1, 4, f) != 4) return 0;
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+static void hds_song_write_f32(FILE *f, float v) {
+    uint32_t bits; memcpy(&bits, &v, sizeof(bits));
+    hds_song_write_u32(f, bits);
+}
+static float hds_song_read_f32(FILE *f) {
+    uint32_t bits = hds_song_read_u32(f);
+    float v; memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+// Writes every lane's recorded MIDI events to file_path (created/overwritten). Format: magic (u32)
+// + version (u32) + lane count (u32), then per lane: event_count (u32) followed by that many
+// (time_sec:f32, type:u8, note:u8, velocity:u8) records -- explicit byte-level fields throughout
+// (not a raw struct dump), so the file is portable across this project's own x86_64/aarch64
+// targets regardless of either platform's struct padding/alignment rules.
+static bool hds_song_save_midi(const HdsEngineState *engine, const char *file_path) {
+    FILE *f = fopen(file_path, "wb");
+    if (!f) return false;
+    hds_song_write_u32(f, HDS_SONG_MIDI_MAGIC);
+    hds_song_write_u32(f, HDS_SONG_MIDI_VERSION);
+    hds_song_write_u32(f, (uint32_t)SEQ_LANE_COUNT);
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        const SeqMidiLane *ml = &engine->seq_midi[l];
+        hds_song_write_u32(f, (uint32_t)ml->event_count);
+        for (int e = 0; e < ml->event_count; e++) {
+            hds_song_write_f32(f, ml->events[e].time_sec);
+            uint8_t rec[3] = { ml->events[e].type, ml->events[e].note, ml->events[e].velocity };
+            fwrite(rec, 1, 3, f);
+        }
+    }
+    bool ok = (ferror(f) == 0);
+    fclose(f);
+    return ok;
+}
+
+// Reads back a file written by hds_song_save_midi(), replacing every lane's current recorded
+// events entirely (a real Load, not a merge) and resetting playback_cursor to 0 so Play starts
+// from the top of whatever was just loaded. A truncated/corrupt/version-mismatched file is
+// rejected wholesale, with NOTHING applied -- silently applying half a load would leave some
+// lanes holding a stale previous take and others the new one, worse than just refusing outright.
+static bool hds_song_load_midi(HdsEngineState *engine, const char *file_path) {
+    FILE *f = fopen(file_path, "rb");
+    if (!f) return false;
+    uint32_t magic = hds_song_read_u32(f);
+    uint32_t version = hds_song_read_u32(f);
+    uint32_t lane_count = hds_song_read_u32(f);
+    if (magic != HDS_SONG_MIDI_MAGIC || version != HDS_SONG_MIDI_VERSION || lane_count != (uint32_t)SEQ_LANE_COUNT || ferror(f)) {
+        fclose(f);
+        return false;
+    }
+    // Too large for main()'s stack (~2MB worst case, same reasoning as capture_buffer/RecordRing
+    // elsewhere in this file) -- static is safe here since this is only ever reached synchronously
+    // from the single OSC-dispatch thread, one call at a time (see this section's own REALTIME
+    // NOTE), never concurrently.
+    static SeqMidiLane loaded[SEQ_LANE_COUNT];
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) {
+        uint32_t count = hds_song_read_u32(f);
+        if (count > (uint32_t)SEQ_MIDI_EVENT_CAPACITY || ferror(f)) { fclose(f); return false; }
+        loaded[l].event_count = (int)count;
+        loaded[l].playback_cursor = 0;
+        for (uint32_t e = 0; e < count; e++) {
+            float t = hds_song_read_f32(f);
+            uint8_t rec[3] = {0};
+            if (fread(rec, 1, 3, f) != 3) { fclose(f); return false; }
+            loaded[l].events[e] = (SeqMidiEvent){ t, rec[0], rec[1], rec[2] };
+        }
+    }
+    fclose(f);
+    // Only commit into the real engine state once the whole file has parsed cleanly -- see this
+    // function's own "nothing applied on failure" comment.
+    for (int l = 0; l < SEQ_LANE_COUNT; l++) engine->seq_midi[l] = loaded[l];
+    return true;
+}
+
+static int song_save_midi_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)msg;
+    HdsEngineState *engine = (HdsEngineState *)user_data;
+    if (argc != 1) return 0;
+    const char *file_path = (const char *)&argv[0]->s;
+    if (!hds_song_save_midi(engine, file_path)) {
+        fprintf(stderr, "[song] failed to save MIDI data to '%s'\n", file_path);
+    }
+    return 0;
+}
+
+static int song_load_midi_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)msg;
+    HdsEngineState *engine = (HdsEngineState *)user_data;
+    if (argc != 1) return 0;
+    const char *file_path = (const char *)&argv[0]->s;
+    if (!hds_song_load_midi(engine, file_path)) {
+        fprintf(stderr, "[song] failed to load MIDI data from '%s' (missing, unreadable, or wrong format/version)\n", file_path);
+    }
+    return 0;
+}
+
+
+// Parses one .scl pitch line into a ratio. Returns false (leaving *out_ratio untouched) if the
+// line has no parseable number at all -- a blank/malformed line the caller should skip rather
+// than insert a garbage degree.
+static bool hds_parse_scl_pitch_line(const char *line, float *out_ratio) {
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line == '\0' || *line == '!') return false; // blank or comment
+    if (strchr(line, '.')) {
+        *out_ratio = powf(2.0f, (float)(atof(line) / 1200.0)); // cents
+        return true;
+    }
+    long numerator = 0, denominator = 1; // denominator's own default covers a bare integer line ("2" means 2/1)
+    if (sscanf(line, "%ld / %ld", &numerator, &denominator) >= 1) {
+        if (denominator == 0) return false;
+        *out_ratio = (float)numerator / (float)denominator;
+        return true;
+    }
+    return false;
+}
+
+// Reads a Scala .scl file directly (backend-native, matching --sfz-vcoN/zone_load_sfz's own "OSC
+// carries just a path, the backend does the file I/O" shape) -- replaces the currently-loaded
+// scale wholesale on success; a malformed/truncated file is rejected with NOTHING changed (same
+// "no partial application" posture as hds_song_load_midi).
+static bool hds_tuning_load_scl(const char *file_path) {
+    FILE *f = fopen(file_path, "r");
+    if (!f) return false;
+    char line[256];
+    char description[256] = {0}; // matches line's own size (only the first 127 chars actually survive into g_tuning_table.description's own smaller buffer at the end)
+    int degree_count = -1; // -1 = "count line not seen yet"
+    float ratios[HDS_TUNING_MAX_DEGREES];
+    int parsed = 0;
+    bool have_description = false;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        char *cr = strchr(line, '\r'); if (cr) *cr = '\0'; // tolerate CRLF files
+        char *trimmed = line; while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        if (*trimmed == '!' || *trimmed == '\0') continue; // comment or blank -- never counts toward description/count/pitch lines
+        if (!have_description) {
+            snprintf(description, sizeof(description), "%s", trimmed);
+            have_description = true;
+        } else if (degree_count < 0) {
+            degree_count = atoi(trimmed);
+            if (degree_count <= 0 || degree_count > HDS_TUNING_MAX_DEGREES) { fclose(f); return false; }
+        } else if (parsed < degree_count) {
+            float ratio;
+            if (!hds_parse_scl_pitch_line(trimmed, &ratio) || ratio <= 0.0f) { fclose(f); return false; }
+            ratios[parsed++] = ratio;
+        }
+    }
+    fclose(f);
+    if (degree_count < 0 || parsed != degree_count) return false; // truncated -- fewer pitch lines than the count line promised
+    g_tuning_table.degree_count = degree_count;
+    memcpy(g_tuning_table.degree_ratio, ratios, sizeof(float) * (size_t)degree_count);
+    // %.127s (not a bare %s): description's own local buffer is 256 bytes (matching line[]) while
+    // g_tuning_table.description is a smaller, deliberately compact 128 -- an explicit precision
+    // matching that destination size lets the compiler verify no truncation risk regardless of
+    // optimization level, rather than relying on it proving that some other way.
+    snprintf(g_tuning_table.description, sizeof(g_tuning_table.description), "%.127s", description);
+    g_tuning_table.loaded = true;
+    return true;
+}
+
+// No context needed beyond the path itself -- hds_tuning_load_scl() writes straight into the
+// static g_tuning_table (see its own comment), the same "OSC carries just a path, the backend
+// does the file I/O" shape as zone_load_sfz_handler/song_load_midi_handler just above.
+static int tuning_load_scl_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)msg; (void)user_data;
+    if (argc != 1) return 0;
+    const char *file_path = (const char *)&argv[0]->s;
+    if (!hds_tuning_load_scl(file_path)) {
+        fprintf(stderr, "[tuning] failed to load '%s' (missing, unreadable, or malformed .scl)\n", file_path);
+    } else {
+        fprintf(stderr, "[tuning] loaded '%s': %d degrees (\"%s\")\n", file_path, g_tuning_table.degree_count, g_tuning_table.description);
+    }
+    return 0;
 }
 
 // our_midi_port/midi_sources are only needed for hotplug auto-connect (SND_SEQ_EVENT_PORT_START/
@@ -2119,8 +2999,14 @@ int main(int argc, char **argv) {
             && (hds_monotonic_seconds() - g_engine.midi_clock_last_tick_sec) < HDS_MIDI_CLOCK_TIMEOUT_SEC;
         float current_tempo_bpm = use_external_clock ? g_engine.midi_clock_bpm : compute_current_tempo_bpm(&active_knobs, g_transport_playhead_sec);
 
+        // block_size is computed here rather than down at its own former spot (right before
+        // advance_transport_playhead) so poll_metronome -- which now runs its own free-running
+        // clock in whole blocks, independent of the Sequencer transport (see its own comment) --
+        // has it available too. effective_block_size() is a pure, trivial clamp of a knob value,
+        // so calling it this much earlier costs nothing.
+        int block_size = effective_block_size(&active_knobs);
         poll_transport_triggers(&g_streams_state, &g_engine, &active_knobs, current_tempo_bpm); // Play/Pause/Stop/Seek -- starts/freezes/resets/repositions the real Sequencer playhead
-        poll_metronome(&g_engine, &active_knobs, current_tempo_bpm); // schedules the next click, if engaged and PLAYING
+        poll_metronome(&g_engine, &active_knobs, current_tempo_bpm, block_size); // schedules the next click, if engaged -- independent of transport state
         poll_seq_audio_transport_catchup(&g_streams_state, &g_engine, &active_knobs); // starts any lane whose load finished after Play was already pressed
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
@@ -2181,12 +3067,11 @@ int main(int argc, char **argv) {
         process_midi_input(&g_streams_state, &g_engine, &g_sample_engine, seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live, current_tempo_bpm);
         seq_playback_midi_events(&g_engine, &g_sample_engine, voices, &active_knobs, global_lfo_phases, &mono_stacks[SINGLE_PROGRAM_SLOT], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets SINGLE_PROGRAM_SLOT)
 
-        // block_size/voice_limit are computed fresh every iteration since both are live,
-        // user-adjustable controls (Audio tab: Block Size, Polyphony) -- see
-        // effective_block_size()/effective_voice_limit(). capture_buffer/buffer stay declared
-        // at the hard BUFFER_SIZE ceiling; only the first block_size frames of each are
-        // actually read/written/rendered this iteration.
-        int block_size = effective_block_size(&active_knobs);
+        // voice_limit is computed fresh every iteration since it's a live, user-adjustable
+        // control (Audio tab: Polyphony) -- see effective_voice_limit(). block_size itself was
+        // already resolved earlier this iteration, above, so poll_metronome could use it too.
+        // capture_buffer/buffer stay declared at the hard BUFFER_SIZE ceiling; only the first
+        // block_size frames of each are actually read/written/rendered this iteration.
         advance_transport_playhead(&g_engine, block_size); // advances the real Sequencer playhead by exactly this block's worth of time, only while PLAYING
         poll_arpeggiator(&g_engine, &g_sample_engine, voices, &active_knobs, global_lfo_phases, mono_stacks, &midi_live, block_size); // fires the next arp step(s) for every Program with arp_enabled, independent of Sequencer transport state
 

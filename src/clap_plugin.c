@@ -5,9 +5,11 @@
 // functions/globals with zero header-extraction refactor -- backend.c itself is not modified at
 // all for this (see /root/.claude/plans/wobbly-marinating-prism.md, "Linux CLAP plugin support",
 // Phase 1: every function main() calls to drive the engine one block at a time --
-// poll_seq_audio_load_requests, drain_pending_sample_loads, dispatch_midi_event,
-// render_audio_block, etc. -- is already a standalone function with explicit parameters, so this
-// file just calls those same functions directly instead of main()'s own ALSA device-I/O loop.
+// drain_pending_sample_loads, dispatch_midi_event, poll_arpeggiator, render_audio_block, etc. --
+// is already a standalone function with explicit parameters, so this file just calls those same
+// functions directly instead of main()'s own ALSA device-I/O loop. NOT every one of them, though
+// -- see clap_plugin_process()'s own comment on the Sequencer tab's transport/lane/MIDI-playback
+// functions, deliberately never called from here.
 //
 // As a plugin, HDS stops owning audio device I/O and MIDI device I/O entirely -- the host
 // supplies both via CLAP's audio-ports/note-ports extensions (see the multi-out section below for
@@ -918,31 +920,36 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         while (lo_server_recv_noblock(p->osc_server, 0) > 0) {}
     }
 
-    // Engine-driving polls that main() also runs once per block -- see this file's own header
-    // comment. Sequencer/Combi lanes are fully reachable via OSC (performance_mode, seq_lanes[],
-    // etc. are ordinary knobs), so this plugin supports the same architecture as the standalone
-    // app, not just a stripped-down MIDI-only mode.
-    poll_seq_audio_load_requests(&p->streams_state, &p->knobs);
-    poll_seq_audio_preview_triggers(&p->streams_state, &p->knobs);
-    // Resolved against the Sequencer's own playhead position, not this instance's uptime -- see
-    // backend.c main()'s own identical fix and comment (a song's tempo map is relative to song
-    // position, not to how long this plugin instance has been running).
-    float current_tempo_bpm = compute_current_tempo_bpm(&p->knobs, p->engine.transport_playhead_sec);
+    // The Sequencer tab's own transport/lane/MIDI-playback workflow is deliberately NOT reachable
+    // from a CLAP instance (poll_seq_audio_load_requests/poll_seq_audio_preview_triggers/
+    // poll_transport_triggers/poll_seq_audio_transport_catchup/seq_playback_midi_events are all
+    // standalone-only now, called only from main()'s own loop): a DAW host already owns
+    // sequencing, MIDI, and audio routing for its plugins, so this engine's own take on the same
+    // job is redundant, bug-prone surface a CLAP user would never actually reach for -- per the
+    // user's explicit direction. Arpeggiator and host tempo sync are NOT part of that removal --
+    // both stay fully live in CLAP, same as the standalone app, just below.
+    //
+    // Resolved against 0.0 (the Sequencer playhead never advances in this plugin any more -- see
+    // advance_transport_playhead's own removal further down) rather than this instance's uptime --
+    // see backend.c main()'s own identical fix and comment on why a tempo MAP (e.g. imported from
+    // an SMF file) must be resolved against a stable position, not wall-clock time. With no
+    // markers programmed (the common case) this is just the flat Tempo knob either way.
+    float current_tempo_bpm = compute_current_tempo_bpm(&p->knobs, 0.0);
     // Host tempo sync (SynthSharedControls.seq_sync_source == 1, "External"): a CLAP host already
     // hands its own tempo directly via process->transport -- no raw MIDI Clock bytes to parse at
     // all here, unlike the standalone app's ALSA-sequencer path (see
     // hds_handle_midi_clock_tick()/SND_SEQ_EVENT_CLOCK in backend.c's process_midi_input, the
-    // equivalent for a real external MIDI cable/hardware sequencer). Deliberately tempo-only: the
-    // host's own timeline position doesn't necessarily correspond to "the start of HDS's own
-    // recorded Sequencer take" the way a real MIDI Start message does, so the host's play/stop
-    // state is NOT wired to the Sequencer's own transport here -- that stays driven by its own
-    // Play/Pause/Stop buttons (or OSC), exactly as before.
+    // equivalent for a real external MIDI cable/hardware sequencer). Every downstream consumer of
+    // current_tempo_bpm (Arp, LFO Tempo Sync, the metronome) just takes whatever this resolves to,
+    // same as the standalone app.
     if (p->knobs.seq_sync_source != 0.0f && process->transport && (process->transport->flags & CLAP_TRANSPORT_HAS_TEMPO)) {
         current_tempo_bpm = (float)process->transport->tempo;
     }
-    poll_transport_triggers(&p->streams_state, &p->engine, &p->knobs, current_tempo_bpm);
-    poll_metronome(&p->engine, &p->knobs, current_tempo_bpm);
-    poll_seq_audio_transport_catchup(&p->streams_state, &p->engine, &p->knobs);
+    // Independent of the Sequencer transport (see poll_metronome()'s own comment) -- same "host's
+    // full frames_count as one lump elapsed-sample count" granularity poll_arpeggiator already
+    // uses below, for the same reason (block_size itself isn't resolved until the chunking loop
+    // further down).
+    poll_metronome(&p->engine, &p->knobs, current_tempo_bpm, (int)process->frames_count);
     drain_pending_sample_loads(&p->sample_engine);
 
     if (process->in_events) {
@@ -985,7 +992,10 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         }
     }
 
-    seq_playback_midi_events(&p->engine, &p->sample_engine, p->voices, &p->knobs, p->global_lfo_phases, &p->mono_stacks[SINGLE_PROGRAM_SLOT], &p->midi_live);
+    // seq_playback_midi_events() (fires a Sequencer lane's recorded MIDI events) is deliberately
+    // NOT called here -- see this function's own header comment on why the Sequencer's transport/
+    // lane/MIDI-playback workflow is standalone-only now.
+    //
     // Coarser than the standalone app's own per-block call (main() polls once per its own,
     // smaller render block; this fires once per this entire process() call, using the host's
     // full frames_count as one lump elapsed-sample count) -- acceptable given a host's own
@@ -1051,7 +1061,11 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         // terminates correctly either way.
         p->knobs.block_size_frames = (float)chunk;
         int block_size = effective_block_size(&p->knobs);
-        advance_transport_playhead(&p->engine, block_size);
+        // advance_transport_playhead() is deliberately NOT called here -- the Sequencer transport
+        // never runs in this plugin any more (see clap_plugin_process()'s own header comment), so
+        // p->engine.transport_state can never be TRANSPORT_PLAYING and this would always be a
+        // no-op; p->engine.transport_playhead_sec simply stays at 0.0 for this instance's whole
+        // lifetime.
 
         // Not `static`: this buffer must be per-instance (and per-call), since two HdsClapPlugin
         // instances can now genuinely render concurrently -- a `static` buffer here would let one
