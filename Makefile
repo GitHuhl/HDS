@@ -175,10 +175,10 @@ $(BUILD_DIR) $(NAM_BUILD_DIR) $(ARM64_NAM_BUILD_DIR):
 # same story but ONLY for $(BIN_OBJ)/$(ARM64_BIN_OBJ): it's #include'd by hds_standalone.c alone
 # (never reachable from a CLAP plugin instance -- see its own header comment), so it's deliberately
 # left off $(CLAP_OBJ)'s own prerequisite list below.
-$(BIN_OBJ): $(SRC) src/backend.c src/fx_chain.c src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
+$(BIN_OBJ): $(SRC) src/backend.c src/fx_types.h src/fx_chain.c src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -c $(SRC) -o $@
 
-$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_chain.c src/nam_bridge.h | $(BUILD_DIR)
+$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
 # Three source directories (NAM/, NAM/wavenet/, src/) flattened into one object directory -- see
@@ -221,7 +221,7 @@ ARM64_BIN_OBJ := $(BUILD_DIR)/hds_standalone-arm64.o
 # hds_standalone.c itself stays plain C, compiled by $(ARM64_CC) exactly like the native
 # $(BIN_OBJ) rule above -- only the FINAL link step needs $(ARM64_CXX), to pull in libstdc++ for
 # the NAM objects linked alongside it, same reasoning as $(BIN)/clap's own rules.
-$(ARM64_BIN_OBJ): $(SRC) src/backend.c src/fx_chain.c src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
+$(ARM64_BIN_OBJ): $(SRC) src/backend.c src/fx_types.h src/fx_chain.c src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
 	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $(SRC) -o $@
 
