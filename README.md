@@ -1250,13 +1250,55 @@ behind each change, and its own DSP test (compression scaling, external-sidechai
 mode differences, push-pull symmetry, and finiteness under pathological input) for how it was
 verified.
 
+### PeakMax FX slot (lookahead peak limiter / loudness maximizer)
+
+An FX slot (Type: `PeakMax`) ported from [JClones_L2](https://github.com/JClones/JSFXClones) (MIT
+license) -- a clone of a widely-used mastering peak limiter/loudness maximizer. The first FX type in
+this file that's genuinely lookahead: it delays its own audio by a fixed ~1.3ms (64 samples at this
+engine's 48kHz) so gain reduction can already account for a peak before it reaches the output --
+true brickwall behavior, not just a very fast attack. That delay is real, unavoidable added latency
+on whichever slot uses this effect (nothing else in this file adds any); this engine has no
+plugin-delay-compensation mechanism to time-align a delayed source's bus against an undelayed one
+live, and doesn't report the latency to a CLAP host yet either -- both real, currently-unaddressed
+follow-ups if this ever needs to sit alongside undelayed material in a live mix.
+
+Seven params: **Threshold** (-30..0dB -- really an input gain boost of the opposite sign, so
+limiting always happens against a fixed internal 0dBFS point, the same "boost in, brickwall at a
+fixed point, trim on the way out" shape the original uses) and **Ceiling** (-30..0dB, final output
+trim); **Auto Release** (Off/On) and **Release** (six fixed times, 0.01ms-1000ms, ignored while Auto
+Release is On) -- On replaces the fixed release with a 3-stage adaptive detector (slow/fast/dynamic,
+with a piecewise-linear release-time-vs-program-material curve) that's the original's own signature
+"intelligent release" behavior, ported in full; **Quantize** (16/18/20/22/24-bit), **Dither**
+(None/Type1/Type2), **Shaping** (None/Moderate/Normal/Ultra) -- a complete IDR-style dither/noise-
+shaping stage (full coefficient table, both PRNGs, truncate-with-error-feedback), included in full
+even though it's arguably a mastering/bit-depth-delivery feature rather than something this always-
+float engine strictly needs -- it's still a well-defined, self-contained coloration effect on a
+float signal regardless of what's downstream, the same reasoning any bit-crusher effect already
+relies on. At the defaults (24-bit, Type1, Normal), the added dither noise is only about ±0.5 LSB of
+a 24-bit signal (roughly -144dBFS) -- inaudible unless Quantize is deliberately lowered.
+
+**What's ported faithfully vs. changed**: the entire signal path is kept faithful -- the gain-staging
+shape, the lookahead peak detector (an exact minimum of the per-sample gain-needed value over the
+upcoming window), the two-stage triangular smoothing after the release envelope, the manual release,
+the full auto-release cascade with its 3 fixed calibration time constants, and the complete dither
+stage. Changed: no JSFX/EEL2 runtime, so its dynamic memory pool becomes fixed-size C arrays; the
+original's own bespoke branching-factor-8 min-tree is replaced with a standard monotonic-deque
+sliding-window minimum -- a different exact algorithm for the identical well-defined quantity ("the
+minimum of the last N pushed values"), not an approximation of it; the dither's 32-bit LCG uses plain
+`uint32_t` wraparound arithmetic rather than EEL2's own value-reinterpreted-as-integer semantics
+(the same modular arithmetic either way); no internal Mix param and no sidechain input, matching the
+original, which works on its own stereo signal only. See `run_fx_peakmax()`'s own (long) comment in
+`backend.c` for the complete list, and its own DSP test (brickwall accuracy against a known input
+level, quiet-signal gain staging, exact lookahead-latency verification via an impulse, auto-release
+engage/release behavior, and dithered-output finiteness) for how it was verified.
+
 ### Per-slot gain reduction (GR) metering
 
-Gate, Limiter, FetComp, and FairKid67 -- the 4 FX types with a real gain-reduction stage -- each
-report their current reduction in dB over OSC as `/hds/status/fx_gr/<slot>` (0 for a bypassed,
+Gate, Limiter, FetComp, FairKid67, and PeakMax -- the 5 FX types with a real gain-reduction stage --
+each report their current reduction in dB over OSC as `/hds/status/fx_gr/<slot>` (0 for a bypassed,
 Off, or non-GR-capable slot), sent every status tick (~31Hz) alongside the rest of
 `/hds/status/*`. The frontend shows this as a small "GR" readout next to each FX slot's Mix/Bypass
-controls, visible only while that slot's Type is one of the four above. Computed per effect from
+controls, visible only while that slot's Type is one of the five above. Computed per effect from
 whatever state that effect already tracks, no extra DSP added purely for metering:
 - **Gate/Limiter**: both already track one applied linear gain multiplier (`gain`, 1.0 = no
   reduction) -- `-20*log10(gain)`, clamped >=0.
@@ -1272,6 +1314,9 @@ whatever state that effect already tracks, no extra DSP added purely for meterin
   (found once, at slot activation, via a finite-difference probe -- see the FairKid67 section
   above) to get a ratio, worst-case (max) across both arms/both channels. One extra model
   evaluation per stage per sample, no extra Newton iterations.
+- **PeakMax**: unlike the other four, this one already computes a real applied gain multiplier
+  (`output_gr`, after its own triangular smoothing) as part of normal operation, purely because
+  computing it IS how the limiter works -- `-20*log10(output_gr)`, clamped >=0, no extra work at all.
 
 ### Control protocol: OSC
 

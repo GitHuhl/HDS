@@ -886,13 +886,29 @@ FX_TYPE_METADATA += [
         {"label": "Iron", "range": (0, 100), "default": 20},        # 0.5..3.0x transformer drive
         {"label": "SC Gain", "range": (0, 100), "default": 40},     # 0..2.0x sidechain cascade drive
     ]},
+    {"name": "PeakMax", "params": [
+        # Ported from JClones_L2 (github.com/JClones/JSFXClones, MIT license) -- a lookahead peak
+        # limiter/loudness maximizer. See FX_TYPE_PEAKMAX's own (long) comment in backend.c for what's
+        # kept faithful (the whole DSP, including the full auto-release cascade and dither/noise-
+        # shaping stage) and what's a same-result implementation swap (the sliding-window-minimum
+        # algorithm). Unlike every other FX type here, this one adds real latency to whatever source
+        # uses it (~1.3ms, a fixed lookahead the limiting needs) -- see that same comment.
+        {"label": "Threshold", "range": (0, 100), "default": 100},  # -30..0dB -- 0dB = no boost, matching the original's own default
+        {"label": "Ceiling", "range": (0, 100), "default": 100},    # -30..0dB -- 0dB = no output trim
+        {"label": "Auto Release", "type": "choice", "options": ["Off", "On"], "default": 1},
+        {"label": "Release", "type": "choice",
+         "options": ["0.01 ms", "0.1 ms", "1.0 ms", "10.0 ms", "100 ms", "1000 ms"], "default": 2},
+        {"label": "Quantize", "type": "choice", "options": ["16-bit", "18-bit", "20-bit", "22-bit", "24-bit"], "default": 4},
+        {"label": "Dither", "type": "choice", "options": ["None", "Type1", "Type2"], "default": 1},
+        {"label": "Shaping", "type": "choice", "options": ["None", "Moderate", "Normal", "Ultra"], "default": 2},
+    ]},
 ]
 
-# The 4 FX types whose backend state exposes a real GR (gain reduction) reading -- see
+# The 5 FX types whose backend state exposes a real GR (gain reduction) reading -- see
 # process_fx_chain's own gr_db_out comment in backend.c. Looked up by name rather than a hardcoded
-# index (like FX_TYPE_NAM above) since these four are spread across the pre- and post-NAM halves of
+# index (like FX_TYPE_NAM above) since these are spread across the pre- and post-NAM halves of
 # FX_TYPE_METADATA; used only by _apply_fx_slot_type to show/hide each slot's GR label.
-FX_TYPE_GR_CAPABLE_INDICES = {i for i, e in enumerate(FX_TYPE_METADATA) if e["name"] in ("Gate", "Limiter", "FetComp", "FairKid67")}
+FX_TYPE_GR_CAPABLE_INDICES = {i for i, e in enumerate(FX_TYPE_METADATA) if e["name"] in ("Gate", "Limiter", "FetComp", "FairKid67", "PeakMax")}
 
 # Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --
 # must match the backend's own "auto"/empty-string convention in midi_client_should_autoconnect.
