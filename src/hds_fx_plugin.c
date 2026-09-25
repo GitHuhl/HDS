@@ -34,19 +34,38 @@
 // several HDS FX instances in one DAW session is exactly as safe as running several HDS instrument
 // instances already is today: each HdsFxPlugin below is its own independent calloc'd struct.
 //
-// Multi-input + chaining "as the normal HDS FX section": HDS_FX_BUS_COUNT (8) independent stereo
-// input/output pairs, each its own SOURCE_COUNT-shaped bus -- the exact same fx_source/
-// fx_source_routing_mode/chain_to_next model backend.c's own ext-in pairs already use, just with no
-// "Program" bus (there is no synth here at all). See clap_audio_ports_get() below for the port
-// layout and HdsFxPlugin's own comment for how the slot pool is shared across all 8 buses, exactly
-// like the synth's own SynthSharedControls.fx[FX_SLOT_COUNT].
+// This is just a multi-FX: a flat, ordered pool of slots, freely wired to whatever the DAW routes
+// in. No "bus" concept anywhere (Reaper doesn't have one, and neither does this plugin) -- 8 real,
+// full stereo CLAP ports each way (HDS_FX_PORT_COUNT), the same physical shape as any normal stereo
+// insert effect's ports. What's NOT assumed anymore is that a port is always used in stereo: each
+// slot's own Input selector picks which one of the 8 ports feeds it AND whether this chain treats
+// that port as Mono (only the port's L channel is read, centered to dry_l=dry_r before any FX runs)
+// or Stereo (L and R both read as a genuine stereo signal) -- only meaningful for a slot that's the
+// HEAD of its own chain (see hds_fx_slot_is_chain_head()); a slot fed by the previous slot's own
+// Chain-to-Next just inherits that running signal instead, no Input of its own. Once a slot's own
+// Chain-to-Next is off (it's the TAIL of its chain, or a standalone single-slot chain), its own
+// Output selector -- independent of its Input, same Mono/Stereo choice, either of which is a REAL
+// stereo port either way -- says which port the result actually lands on and how: Mono writes the
+// identical value to BOTH L and R of the chosen port (a proper centered mono-to-stereo placement,
+// never just one ear), Stereo writes l to L and r to R. A chain reading Port 3 can perfectly well
+// come back out on Port 7. Chain-to-Next always works, full stop, on every slot, unconditionally --
+// there is no separate Series/Parallel mode to gate it: Parallel mode's own existing semantics
+// (every owned slot starts a fresh branch UNLESS the previous owned slot's own Chain-to-Next says
+// otherwise) ALREADY reproduce plain Series exactly when every slot chains to the next (the branch
+// divisor becomes 1, i.e. no attenuation) -- so this plugin just always calls process_fx_chain() in
+// Parallel mode and the redundant mode switch is gone entirely (an earlier draft copied it from the
+// synth's own per-source grid and it never made sense here).
 //
-// A slot's Source (fx_source) is freely reassignable to ANY of the 8 buses, not pinned at creation
-// -- see HdsFxPlugin's own comment for why this requires ONE shared pool of slots (matching the
-// synth's real architecture) rather than 8 independent pinned arrays, which was this file's own
-// first-draft mistake (a slot could never be moved to a different bus's input, since
-// process_fx_chain()'s own bucketing is entirely driven by each slot's fx_source field matching the
-// caller's source_id -- a pinned array made that always trivially true for exactly one bus).
+// A slot's own fx_source is which of the 8 ports its chain's Input reads from -- freely
+// reassignable, not pinned at creation, see HdsFxPlugin's own comment for why this needs ONE shared
+// pool of slots (matching the synth's real architecture) rather than per-port pinned arrays.
+// Reordering (Up/Down) is disabled outright on any slot that's part of a chain link (either end) --
+// a value-swap would silently rewire which chain a slot's params actually belong to, since a chain
+// link is defined by ARRAY POSITION + matching fx_source, not by an ID that travels with the slot.
+//
+// The synth's own ext-in pairs don't have this Mono/Stereo choice yet (they always assume full
+// stereo) -- a real, separate, cross-cutting follow-up (OSC wire + state save/load + frontend UI),
+// not bundled into this file.
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -55,7 +74,7 @@
 #include <string.h>
 #include <math.h>
 #include <stddef.h>
-#include "../third_party/clap/include/clap/clap.h"
+#include "../third_party/clap/include/clap/clap.h" // already pulls in ext/gui.h and ext/timer-support.h
 
 // The handful of plain constants fx_types.h/fx_chain.c need defined before they're #include'd --
 // backend.c normally supplies these (see its own header comment on each); this file supplies its
@@ -66,19 +85,21 @@
 #define SAMPLE_PATH_LEN 256
 // The synth's own FX bus uses 12 (SynthSharedControls.fx[FX_SLOT_COUNT]) because it's a shared
 // budget with everything else a Combi Program needs; HDS FX has no synth competing for that budget
-// at all, so this is sized generously -- 32 slots shared across all 8 buses, plenty of headroom for
-// several buses each running a real multi-slot chain at once. FX_SLOT_COUNT is the exact macro name
+// at all, so this is sized generously -- 32 slots shared across all 8 ports, plenty of headroom for
+// several chains each running a real multi-slot chain at once. FX_SLOT_COUNT is the exact macro name
 // process_fx_chain()/sync_fx_engine_types()/reset_fx_engine() (fx_chain.c) size their own array
 // parameters by -- this file is its own separate translation unit (never linked with backend.c's
 // copy of fx_chain.c), so redefining it here to a different value than backend.c's own 12 is safe
 // and gives the exact same shared-pool bucketing model fx_chain.c already implements, for free, at
 // whatever pool size this plugin wants.
 #define FX_SLOT_COUNT 32
-#define HDS_FX_BUS_COUNT 8
-// process_fx_chain()'s own sidechain model addresses a "source" by a plain 0..SOURCE_COUNT-1 index
-// (see FXSlotParams.sidechain_source's own comment in fx_types.h) -- here that's just "which of
-// this plugin's own 8 buses", with no separate synth "Program" source to account for.
-#define SOURCE_COUNT HDS_FX_BUS_COUNT
+// 8 real stereo CLAP ports each way -- see this file's own header comment for why a port's own
+// Mono/Stereo USE is a per-slot-group choice, not baked into the port count/shape itself. A slot's
+// fx_source (0..HDS_FX_PORT_COUNT-1) picks which one of these 8 ports its chain's Input reads from;
+// that same 0-7 id is also process_fx_chain()'s own "source" concept (SOURCE_COUNT below) and
+// sidechain_source's own numbering (see fx_types.h) -- one flat id space throughout.
+#define HDS_FX_PORT_COUNT 8
+#define SOURCE_COUNT HDS_FX_PORT_COUNT
 #define HDS_NAM_ENABLED 0
 
 // fx_chain.c's own g_hardtune_held_note/g_hardtune_bend_semitones/g_hardtune_modwheel/
@@ -92,56 +113,86 @@
 // ---------------------------------------------------------------------------------------------
 // Plugin instance
 // ---------------------------------------------------------------------------------------------
-// fx/fx_engine: ONE shared pool of FX_SLOT_COUNT slots across ALL 8 buses -- physically identical
+// fx/fx_engine: ONE shared pool of FX_SLOT_COUNT slots across ALL 8 ports -- physically identical
 // model to backend.c's own SynthSharedControls.fx[FX_SLOT_COUNT]/FXSlotEngine
 // fx_engine[FX_SLOT_COUNT], just sized bigger (see FX_SLOT_COUNT's own comment) since there's no
-// synth sharing the budget here. Each slot's own fx_source field (0..HDS_FX_BUS_COUNT-1) says which
-// ONE bus it currently serves -- process_fx_chain()'s own bucketing (`fx_params[s].fx_source ==
-// source_id`) is what makes this genuinely reassignable: a slot can move from Bus 3 to Bus 5 just
-// by writing a new fx_source, no engine-state shuffling needed. fx_engine[] stays indexed by
-// physical POOL slot regardless of which bus owns it this block, so a slot's lazily-allocated DSP
-// state (e.g. a delay's buffered tail) survives a live bus reassignment exactly like it already
-// survives a live bypass toggle -- see process_fx_chain()'s own comment. Every slot defaults to Bus
-// 1 (fx_source = 0) at creation, matching the Standalone FX tab's own "every slot defaults to
-// Program" convention -- see hds_fx_init_pool_defaults().
+// synth sharing the budget here. Each slot's own fx_source field (0..HDS_FX_PORT_COUNT-1) says which
+// ONE port its chain's Input reads from -- process_fx_chain()'s own bucketing
+// (`fx_params[s].fx_source == source_id`) is what makes this genuinely reassignable: a slot can move
+// from Port 3 to Port 5 just by writing a new fx_source, no engine-state shuffling needed.
+// fx_engine[] stays indexed by physical POOL slot regardless of which port owns it this block, so a
+// slot's lazily-allocated DSP state (e.g. a delay's buffered tail) survives a live port reassignment
+// exactly like it already survives a live bypass toggle -- see process_fx_chain()'s own comment.
+// Every slot defaults to Port 1 (fx_source = 0) at creation, matching the Standalone FX tab's own
+// "every slot defaults to Program" convention -- see hds_fx_init_pool_defaults().
 typedef struct {
     clap_plugin_t plugin;
     const clap_host_t *host;
 
     FXSlotParams fx[FX_SLOT_COUNT];
     FXSlotEngine fx_engine[FX_SLOT_COUNT];
-    float bus_routing_mode[HDS_FX_BUS_COUNT]; // 0 = Series, 1 = Parallel, one per BUS (not per slot) -- see process_fx_chain()'s own routing_mode parameter
-    float gr_db_scratch[FX_SLOT_COUNT]; // required non-NULL out-param, not yet exposed to the host/GUI -- shared across all 8 buses' own calls, same convention as backend.c's own gr_db_out (see render_audio_block)
+
+    // Per-port Input routing: whether a chain reading this port treats it as Mono (only L is read,
+    // centered to dry_l=dry_r) or Stereo (L and R both read as a genuine stereo pair) -- see this
+    // file's own header comment. Indexed by the SAME 0..HDS_FX_PORT_COUNT-1 id every chain-head
+    // slot's own fx_source already uses, since this is a property of the PORT/chain, not of any one
+    // slot (every slot sharing a chain necessarily shares its own chain's Input).
+    float port_input_stereo[HDS_FX_PORT_COUNT];
+    // Per-port Output routing (only consulted for a chain TAIL slot, chain_to_next == 0): which
+    // port (0..HDS_FX_PORT_COUNT-1) the result is written to -- independent of the chain's own
+    // Input port -- and Mono (identical value written to both L and R of that port, a proper
+    // centered placement) or Stereo (l -> L, r -> R). Indexed by fx_source (which chain/group this
+    // is), same as port_input_stereo above. Defaults to output_channel==the port's own index and
+    // Stereo, i.e. today's obvious behavior (read Port N stereo, write back to Port N stereo)
+    // reproduced exactly until a chain's tail slot changes it.
+    float port_output_channel[HDS_FX_PORT_COUNT];
+    float port_output_stereo[HDS_FX_PORT_COUNT];
+
+    float gr_db_scratch[FX_SLOT_COUNT]; // required non-NULL out-param, not yet exposed to the host/GUI -- shared across all 8 ports' own calls, same convention as backend.c's own gr_db_out (see render_audio_block)
 
     // CLAP params extension shadow (see hds_fx_push_changed_params's own comment, same pattern
     // clap_plugin.c already uses for HDS_CLAP_PARAMS) -- one entry per exposed param.
     double param_shadow[FX_SLOT_COUNT];
 
-    bool gui_open;
+    // Opaque HdsFxGuiWindow* (defined in hds_fx_gui_x11.c, #include'd below) -- NULL whenever no GUI
+    // is open. Deliberately typed void* here rather than forward-declaring the real struct: this
+    // file's own HdsFxPlugin definition has no business knowing X11/Cairo types at all, only the
+    // platform-specific GUI file does -- see hds_fx_gui_draw.c's own header comment on why the
+    // draw/layout code and the platform window code are two separate files in the first place.
+    void *gui_window;
 } HdsFxPlugin;
 
+// hds_fx_gui_draw.c: pure Cairo, platform-agnostic layout/drawing/hit-testing (needs HdsFxPlugin,
+// just defined above, plus FXSlotParams/FX_TYPE_*/FX_SLOT_COUNT, all already in scope from
+// fx_types.h/this file's own defines). hds_fx_gui_x11.c: the X11/XEmbed/event-pump shim, needs
+// everything hds_fx_gui_draw.c defines (HdsFxGuiViewState, hds_fx_gui_render, hds_fx_gui_on_*).
+#include "hds_fx_gui_draw.c"
+#include "hds_fx_gui_x11.c"
+
 // ---------------------------------------------------------------------------------------------
-// audio-ports extension: HDS_FX_BUS_COUNT stereo inputs, HDS_FX_BUS_COUNT stereo outputs, named
-// to match each other 1:1 ("Input N" -> that same bus's own "Output N") -- a host inserting this on
-// a single track just uses pair 0 (IS_MAIN on both sides) and never notices the other 7 exist; a
-// host that wants HDS FX processing several buses at once (e.g. several tracks' sends summed into
-// one plugin instance rather than one instance per track) wires up as many of the rest as it wants.
-// An unconnected input bus is silence in (see process()'s own per-bus null check) -- harmless,
-// exactly the ext-in pattern backend.c's own audio-ports extension already established.
+// audio-ports extension: HDS_FX_PORT_COUNT real stereo inputs, HDS_FX_PORT_COUNT real stereo
+// outputs, named to match each other 1:1 ("Input N" -> "Output N") -- a host inserting this on a
+// single track just uses pair 0 (IS_MAIN on both sides) and never notices the other 7 exist; a host
+// that wants HDS FX processing several ports at once (e.g. several tracks' sends summed into one
+// plugin instance rather than one instance per track) wires up as many of the rest as it wants.
+// Whether a given port is actually USED as mono or stereo is a per-chain choice made in the GUI
+// (port_input_stereo/port_output_stereo), never baked into the port declaration itself -- see this
+// file's own header comment. An unconnected input port is silence in (see process()'s own null
+// check) -- harmless, exactly the ext-in pattern backend.c's own audio-ports extension established.
 // ---------------------------------------------------------------------------------------------
 
 static uint32_t hds_fx_audio_ports_count(const clap_plugin_t *plugin, bool is_input) {
     (void)plugin; (void)is_input;
-    return (uint32_t)HDS_FX_BUS_COUNT;
+    return (uint32_t)HDS_FX_PORT_COUNT;
 }
 
 static bool hds_fx_audio_ports_get(const clap_plugin_t *plugin, uint32_t index, bool is_input, clap_audio_port_info_t *info) {
     (void)plugin;
-    if (index >= (uint32_t)HDS_FX_BUS_COUNT) return false;
+    if (index >= (uint32_t)HDS_FX_PORT_COUNT) return false;
     info->id = index;
     info->channel_count = 2;
     info->port_type = CLAP_PORT_STEREO;
-    info->in_place_pair = index; // this bus's input can safely alias its own output buffer -- process() never reads input[bus] after writing output[bus]
+    info->in_place_pair = index; // this port's input can safely alias its own output buffer -- process() never reads input[port] after writing output[port]
     snprintf(info->name, sizeof(info->name), "%s %u", is_input ? "Input" : "Output", (unsigned int)(index + 1));
     info->flags = (index == 0) ? CLAP_AUDIO_PORT_IS_MAIN : 0;
     return true;
@@ -268,18 +319,25 @@ static void hds_fx_init_pool_defaults(HdsFxPlugin *p) {
         p->fx[s].fx_type = FX_TYPE_OFF;
         p->fx[s].mix = 100.0f;
         p->fx[s].bypass = 0.0f;
-        p->fx[s].fx_source = 0.0f; // every slot defaults to Bus 1 -- freely reassignable via the GUI's own Source pill, see HdsFxPlugin's own comment
+        p->fx[s].fx_source = 0.0f; // every slot defaults to Port 1 -- freely reassignable via the GUI's own Input pill, see HdsFxPlugin's own comment
         p->fx[s].chain_to_next = 0.0f;
         p->fx[s].sidechain_source = -1.0f; // "Same as Source" -- see FXSlotParams' own comment
     }
     reset_fx_engine(p->fx_engine);
-    for (int bus = 0; bus < HDS_FX_BUS_COUNT; bus++) p->bus_routing_mode[bus] = 0.0f; // Series
+    for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
+        p->port_input_stereo[port] = 1.0f;  // default: read the port as real stereo, today's obvious behavior
+        p->port_output_channel[port] = (float)port; // default: write back to the SAME port
+        p->port_output_stereo[port] = 1.0f;
+    }
 }
 
 static bool hds_fx_plugin_init(const clap_plugin_t *plugin) { (void)plugin; return true; }
 
 static void hds_fx_plugin_destroy(const clap_plugin_t *plugin) {
     HdsFxPlugin *p = (HdsFxPlugin *)plugin->plugin_data;
+    // Defensive: a well-behaved host always calls clap_plugin_gui->destroy() before this, but
+    // clean up an open X11 window/Display here too rather than leak it if one doesn't.
+    hds_fx_gui_destroy_internal(p);
     free(p);
 }
 
@@ -312,10 +370,13 @@ static void hds_fx_plugin_reset(const clap_plugin_t *plugin) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// process(): per-sample, per-bus -- process_fx_chain() itself already operates one sample at a
+// process(): per-sample, per-port -- process_fx_chain() itself already operates one sample at a
 // time (see its own signature), so there is no BUFFER_SIZE-chunking loop to manage here the way
 // clap_plugin.c's own render_audio_block-driven process() needs; this just walks frames_count
-// directly, reading/writing straight from/to the host's own port buffers.
+// directly, reading/writing straight from/to the host's own port buffers. Always calls
+// process_fx_chain() in Parallel mode (routing_mode==1) -- see this file's own header comment for
+// why that alone, combined with chain_to_next, already reproduces plain Series exactly when every
+// slot in a chain chains to the next, so there's no separate mode to thread through here at all.
 // ---------------------------------------------------------------------------------------------
 
 static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, const clap_process_t *process) {
@@ -333,40 +394,71 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
 
     // PRECONDITION for process_fx_chain() (see its own comment): a slot's active_type must be
     // synced to its current fx_type once per block, before any per-sample dispatch. One call now
-    // (not once per bus) -- there's only one pool.
+    // (not once per port) -- there's only one pool.
     sync_fx_engine_types(p->fx, p->fx_engine);
-    // gr_db_scratch zeroed once per block, then refreshed by whichever bus's call owns each slot
+    // gr_db_scratch zeroed once per block, then refreshed by whichever port's call owns each slot
     // this sample -- same convention as backend.c's own gr_db_out (see render_audio_block).
     for (int s = 0; s < FX_SLOT_COUNT; s++) p->gr_db_scratch[s] = 0.0f;
 
-    float *in_l[HDS_FX_BUS_COUNT], *in_r[HDS_FX_BUS_COUNT], *out_l[HDS_FX_BUS_COUNT], *out_r[HDS_FX_BUS_COUNT];
-    for (int bus = 0; bus < HDS_FX_BUS_COUNT; bus++) {
-        bool has_in = bus < (int)process->audio_inputs_count && process->audio_inputs[bus].data32 &&
-                      process->audio_inputs[bus].channel_count >= 2 && process->audio_inputs[bus].data32[0] && process->audio_inputs[bus].data32[1];
-        in_l[bus] = has_in ? process->audio_inputs[bus].data32[0] : NULL;
-        in_r[bus] = has_in ? process->audio_inputs[bus].data32[1] : NULL;
-        bool has_out = bus < (int)process->audio_outputs_count && process->audio_outputs[bus].data32 &&
-                       process->audio_outputs[bus].channel_count >= 2 && process->audio_outputs[bus].data32[0] && process->audio_outputs[bus].data32[1];
-        out_l[bus] = has_out ? process->audio_outputs[bus].data32[0] : NULL;
-        out_r[bus] = has_out ? process->audio_outputs[bus].data32[1] : NULL;
-        if (has_out) process->audio_outputs[bus].constant_mask = 0;
+    float *in_l[HDS_FX_PORT_COUNT], *in_r[HDS_FX_PORT_COUNT], *out_l[HDS_FX_PORT_COUNT], *out_r[HDS_FX_PORT_COUNT];
+    for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
+        bool has_in = port < (int)process->audio_inputs_count && process->audio_inputs[port].data32 &&
+                      process->audio_inputs[port].channel_count >= 2 && process->audio_inputs[port].data32[0] && process->audio_inputs[port].data32[1];
+        in_l[port] = has_in ? process->audio_inputs[port].data32[0] : NULL;
+        in_r[port] = has_in ? process->audio_inputs[port].data32[1] : NULL;
+        bool has_out = port < (int)process->audio_outputs_count && process->audio_outputs[port].data32 &&
+                       process->audio_outputs[port].channel_count >= 2 && process->audio_outputs[port].data32[0] && process->audio_outputs[port].data32[1];
+        out_l[port] = has_out ? process->audio_outputs[port].data32[0] : NULL;
+        out_r[port] = has_out ? process->audio_outputs[port].data32[1] : NULL;
+        if (has_out) {
+            process->audio_outputs[port].constant_mask = 0;
+            // Zeroed up front, once per block, then ACCUMULATED into below (+=) -- an Output
+            // selector can point several different chains at the SAME physical port (see this
+            // file's own header comment), so this can't just be overwritten per chain the way a
+            // fixed 1:1 input->output mapping could.
+            memset(out_l[port], 0, sizeof(float) * process->frames_count);
+            memset(out_r[port], 0, sizeof(float) * process->frames_count);
+        }
     }
 
-    float sc_snapshot_l[HDS_FX_BUS_COUNT], sc_snapshot_r[HDS_FX_BUS_COUNT];
+    float sc_snapshot_l[HDS_FX_PORT_COUNT], sc_snapshot_r[HDS_FX_PORT_COUNT];
     for (uint32_t i = 0; i < process->frames_count; i++) {
-        // Freeze every bus's own pre-FX dry sample first (see process_fx_chain()'s own
-        // sc_snapshot_l/r comment for why this must happen before ANY bus's chain runs this
-        // sample -- an order-dependent live read would give a slot a sometimes-pre-FX,
-        // sometimes-post-FX view of another bus depending purely on which bus number is smaller).
-        for (int bus = 0; bus < HDS_FX_BUS_COUNT; bus++) {
-            sc_snapshot_l[bus] = in_l[bus] ? in_l[bus][i] : 0.0f;
-            sc_snapshot_r[bus] = in_r[bus] ? in_r[bus][i] : 0.0f;
+        // Freeze every port's own pre-FX dry sample first (see process_fx_chain()'s own
+        // sc_snapshot_l/r comment for why this must happen before ANY chain runs this sample -- an
+        // order-dependent live read would give a slot a sometimes-pre-FX, sometimes-post-FX view of
+        // another port depending purely on which port number is smaller). A Mono-Input port reads
+        // ONLY its own L channel, centered to both dry_l/dry_r -- see this file's own header
+        // comment on why that's the correct "proper M->S" treatment, not an average or an ignored R.
+        for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
+            float l = in_l[port] ? in_l[port][i] : 0.0f;
+            if (p->port_input_stereo[port] != 0.0f) {
+                sc_snapshot_l[port] = l;
+                sc_snapshot_r[port] = in_r[port] ? in_r[port][i] : 0.0f;
+            } else {
+                sc_snapshot_l[port] = l;
+                sc_snapshot_r[port] = l; // centered mono
+            }
         }
-        for (int bus = 0; bus < HDS_FX_BUS_COUNT; bus++) {
-            float l = sc_snapshot_l[bus], r = sc_snapshot_r[bus];
-            process_fx_chain(p->fx, p->fx_engine, (int)p->bus_routing_mode[bus], bus, sc_snapshot_l, sc_snapshot_r, &l, &r, p->gr_db_scratch);
-            if (out_l[bus]) out_l[bus][i] = l;
-            if (out_r[bus]) out_r[bus][i] = r;
+        for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
+            float l = sc_snapshot_l[port], r = sc_snapshot_r[port];
+            process_fx_chain(p->fx, p->fx_engine, /* always Parallel */ 1, port, sc_snapshot_l, sc_snapshot_r, &l, &r, p->gr_db_scratch);
+
+            // Output routing is per-CHAIN (keyed by fx_source == port, same id process_fx_chain()
+            // just bucketed slots by), not fixed to this same port -- see this file's own header
+            // comment. A port that owns zero slots is a no-op passthrough from process_fx_chain()
+            // itself (its own zero-slot-count guard), so this still correctly writes that port's
+            // own dry signal out via ITS OWN Output selector (today's obvious default: right back
+            // to the same port), rather than silently dropping unconfigured ports.
+            int out_ch = (int)p->port_output_channel[port];
+            if (out_ch < 0 || out_ch >= HDS_FX_PORT_COUNT) out_ch = port;
+            if (p->port_output_stereo[port] != 0.0f) {
+                if (out_l[out_ch]) out_l[out_ch][i] += l;
+                if (out_r[out_ch]) out_r[out_ch][i] += r;
+            } else {
+                float centered = 0.5f * (l + r); // proper centered mono-to-stereo placement, never just one ear
+                if (out_l[out_ch]) out_l[out_ch][i] += centered;
+                if (out_r[out_ch]) out_r[out_ch][i] += centered;
+            }
         }
     }
 
@@ -378,6 +470,11 @@ static const void *hds_fx_plugin_get_extension(const clap_plugin_t *plugin, cons
     (void)plugin;
     if (strcmp(id, CLAP_EXT_AUDIO_PORTS) == 0) return &k_audio_ports_ext;
     if (strcmp(id, CLAP_EXT_PARAMS) == 0) return &k_params_ext;
+    if (strcmp(id, CLAP_EXT_GUI) == 0) return &k_gui_ext;
+    // Our own clap_plugin_timer_support_t -- lets the HOST call our on_timer(). Separately, this
+    // plugin also calls the host's OWN clap_host_timer_support_t (register_timer/unregister_timer,
+    // via p->host->get_extension in hds_fx_gui_x11.c's show()/hide()) to actually request one.
+    if (strcmp(id, CLAP_EXT_TIMER_SUPPORT) == 0) return &k_timer_support_ext;
     return NULL;
 }
 
@@ -399,8 +496,9 @@ static const clap_plugin_descriptor_t k_descriptor = {
     .support_url = "",
     .version = "0.1.0-experiment",
     .description = "HDS's FX chain (HT-76, Fairchild 670, LA-2A, FDNVerb, ...) as a standalone, "
-                    "synth-free Linux CLAP effects plugin. 8 independent stereo buses sharing a pool "
-                    "of 32 chained/parallel-routed, freely reassignable FX slots -- "
+                    "synth-free Linux CLAP multi-FX plugin. 8 real stereo ports each way, each "
+                    "independently Mono- or Stereo-capable, sharing a pool of 32 freely reassignable, "
+                    "freely chained FX slots with independent per-chain Input/Output routing -- "
                     "host-automatable/UI-driven only, no networking.",
     .features = k_features,
 };

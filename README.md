@@ -963,35 +963,64 @@ pulls in only `src/fx_types.h` (the FX slot data model) and `src/fx_chain.c` (th
 bus. A slot's parameters (`FXSlotParams`) are the exact same struct either way, so they're already
 byte-for-byte interchangeable between the synth's embedded FX and this plugin.
 
-**Multi-input + chaining, "as the normal HDS FX section"**: 8 independent stereo buses
-(`HDS_FX_BUS_COUNT`) sharing ONE pool of 32 (`FX_SLOT_COUNT`) FX slots -- the exact same
-`fx_source`/`fx_source_routing_mode`/`chain_to_next`/`sidechain_source` model backend.c's own
-`SynthSharedControls.fx[FX_SLOT_COUNT]`/8 ext-in pairs already use (see `process_fx_chain()`'s own
-comment in fx_chain.c), just with no synth ("Program") bus and a bigger pool (nothing else is
-competing for the slot budget here). Each slot's own `fx_source` field says which ONE of the 8 buses
-it currently serves, and is freely reassignable -- moving a slot from Bus 3 to Bus 5 is just writing
-a new `fx_source`, no engine-state shuffling needed, since `fx_engine[]` stays indexed by physical
-pool slot regardless of which bus owns it this block (a slot's lazily-allocated DSP state, e.g. a
-delay's buffered tail, survives a live bus reassignment exactly like it already survives a live
-bypass toggle). A host that only cares about one signal path just wires up bus 0 (its audio ports
-are named "Input 1"/"Output 1", `IS_MAIN` on both sides); a host that wants HDS FX processing
-several buses in one instance wires up as many of the other 7 as it wants.
+**This is just a multi-FX** -- a flat, ordered pool of 32 (`FX_SLOT_COUNT`) slots, freely wired to
+whatever the DAW routes in, with no "bus" concept anywhere (Reaper doesn't have one, and neither does
+this plugin). 8 real stereo CLAP ports each way (`HDS_FX_PORT_COUNT`) -- the same physical shape as
+any normal stereo insert effect's ports, not 16 raw mono ports and not a mixer-strip's worth of
+always-simultaneous buses. What's explicit rather than assumed is how a port gets USED: each slot's
+own Input picks which of the 8 ports feeds its chain AND whether that chain treats the port as Mono
+(only L is read, centered to `dry_l == dry_r` before any FX runs) or Stereo (L and R both read as a
+real stereo signal) -- live only on a chain HEAD (`hds_fx_slot_is_chain_head()`; a slot fed by the
+previous slot's own Chain-to-Next has no Input of its own, it just inherits the running signal).
+Once a slot's own Chain-to-Next is off (it's a chain TAIL, or a standalone single-slot chain), its
+own Output -- independent of its Input, same Mono/Stereo choice -- says which port the result lands
+on and how: Mono writes the identical value to BOTH L and R of the chosen port (a proper centered
+placement, never stuck in one ear), Stereo writes `l` to L and `r` to R. A chain reading Port 3 can
+perfectly well come back out on Port 7.
 
-This shared-pool model replaced this file's own first-draft design (8 independent, pinned 12-slot
-arrays, one hardcoded to each bus) once it became clear that design could never let a slot be
-reassigned to a different bus's input at all: `process_fx_chain()`'s own bucketing is driven
-entirely by each slot's `fx_source` field matching the caller's `source_id`, and a pinned array made
-that trivially true for exactly one bus, permanently. `FX_SLOT_COUNT` is the exact macro name
+**Chain-to-Next always works, full stop, on every slot, unconditionally -- there is no separate
+Series/Parallel mode to gate it.** An earlier draft copied the synth's own per-source
+Series/Parallel routing grid wholesale; that fell apart once it became clear Parallel mode's own
+existing semantics already subsume Series exactly: "every owned slot starts a fresh branch UNLESS
+the previous owned slot's own Chain-to-Next says otherwise" means that chaining EVERY slot in a
+group reproduces plain Series bit-for-bit (the branch divisor becomes 1, i.e. no attenuation) --
+so `hds_fx_plugin_process()` just always calls `process_fx_chain()` in Parallel mode, and the
+redundant mode switch is gone entirely, along with the "only meaningful in Parallel" caveat
+Chain-to-Next used to carry.
+
+A slot's own `fx_source` (0..7) is which port its chain's Input reads from -- freely reassignable,
+not pinned at creation: moving a slot to a different port is just writing a new `fx_source`, no
+engine-state shuffling needed, since `fx_engine[]` stays indexed by physical pool slot regardless of
+which port owns it this block (a slot's lazily-allocated DSP state, e.g. a delay's buffered tail,
+survives a live reassignment exactly like it already survives a live bypass toggle). This shared-pool
+model replaced this file's own first-draft design (8 independent, pinned 12-slot arrays, one
+hardcoded to each port) once it became clear that design could never let a slot be reassigned to a
+different port's input at all: `process_fx_chain()`'s own bucketing is driven entirely by each
+slot's `fx_source` field matching the caller's `source_id`, and a pinned array made that trivially
+true for exactly one port, permanently. `FX_SLOT_COUNT` is the exact macro name
 `process_fx_chain()`/`sync_fx_engine_types()`/`reset_fx_engine()` (fx_chain.c) size their own array
 parameters by; since `src/hds_fx_plugin.c` is its own separate translation unit (never linked with
-backend.c's own copy of fx_chain.c), redefining it here to 32 rather than backend.c's own 12 is safe
-and gives this exact shared-pool bucketing model for free, at whatever pool size this plugin wants.
+backend.c's own copy of fx_chain.c), redefining it here to 32 rather than backend.c's own 12 is safe.
+
+**Reordering (Up/Down) is disabled outright on any slot that's part of a chain link, either end** --
+see `hds_fx_slot_participates_in_chain()`. A value-swap would silently rewire which chain a slot's
+own configuration belongs to, since a chain link is defined by ARRAY POSITION + matching `fx_source`,
+not by an ID that travels with a slot's own params; rather than attempt a more surgical (and more
+bug-prone) partial allowance, a slot touching a chain link simply can't be reordered until it's
+unchained first.
 
 **Multi-instance is free, not new work**: `process_fx_chain()`/`sync_fx_engine_types()`/
 `reset_fx_engine()` already take every piece of state as an explicit parameter and touch no globals
 of their own (verified directly -- this was already true before this plugin existed, since
 `clap_plugin.c`'s own multi-instance safety already depended on it). Running several HDS FX
-instances in one DAW session is exactly as safe as running several HDS synth instances already is.
+instances in one DAW session -- one per track that needs it, same as loading any plugin on multiple
+channels -- is exactly as safe as running several HDS synth instances already is; this is a normal
+insert effect, not a mixer-strip design, so "used many times" was never about one instance handling
+several tracks at once.
+
+The synth's own ext-in pairs don't have this Mono/Stereo choice yet (`backend.c`/`clap_plugin.c`
+still assume full stereo always) -- a real, separate, cross-cutting follow-up (OSC wire format +
+state save/load + `frontend.py`'s own Ext In config UI), not bundled into this plugin.
 
 **What this first pass deliberately leaves out**, each a real, separate, scoped follow-up rather
 than an oversight:
@@ -999,7 +1028,8 @@ than an oversight:
   needs the small C++ bridge (`nam_bridge.h`/`.cpp` over the vendored NeuralAmpModelerCore)
   `clap_plugin.c` also links against; pulling that in (and its C++ toolchain requirement) is
   deferred until the rest of this plugin is proven. `hds-fx`'s own build is otherwise pure C, no
-  `$(CXX)` needed at all, which is also why `hds_fx.clap` is under 100KB versus `hds.clap`'s ~1.5MB.
+  `$(CXX)` needed at all (Cairo + X11 for the real GUI, see below, are both plain C libraries linked
+  via pkg-config), which is also why `hds_fx.clap` is ~110KB versus `hds.clap`'s ~1.5MB.
 - **HardTune's (`FX_TYPE_HARDTUNE`) live-MIDI vibrato control is inert.** It reads four small
   globals (`g_hardtune_held_note`/`g_hardtune_bend_semitones`/`g_hardtune_modwheel`/
   `g_hardtune_channel_pressure`) that backend.c's own MIDI dispatch normally feeds; this plugin has
@@ -1007,31 +1037,101 @@ than an oversight:
   engages. HardTune's actual pitch correction is unaffected. A real MIDI input (for CC/pitch-bend
   modulation of FX params generally, not just this one effect's vibrato) is a natural, separate
   future addition.
-- **Params extension exposes Mix only** (32, one per pool slot, not per bus x slot -- a slot's bus
+- **Params extension exposes Mix only** (32, one per pool slot, not per port x slot -- a slot's port
   is dynamic now, not part of its identity), the same curated "expose Mix, not every field" choice
   `clap_plugin.c`'s own `HDS_CLAP_PARAMS` already made for the synth's FX slots, for the same reason
-  (no min/max/default metadata exists for the other ~5 fields per slot without hand-authoring it,
-  and a host's automation-lane picker gets unusable fast past a few hundred entries). Type/Bypass/
-  Source/routing are meant to be driven by this plugin's own native GUI instead (see below) --
+  (no min/max/default metadata exists for the other fields per slot without hand-authoring it, and a
+  host's automation-lane picker gets unusable fast past a few hundred entries). Type/Bypass/Input/
+  Output/Chain-to-Next are meant to be driven by this plugin's own native GUI instead (see below) --
   writing directly into the plugin's per-instance struct, the same plain unsynchronized
   main-thread-writes/audio-thread-reads float race `clap_plugin.c`'s own `p->knobs` already accepts.
 - **No `state` extension (DAW project save/load) yet.** A real, known gap for an "experiment" build,
   not silently swept under anything -- a host that doesn't get state persistence for this plugin
   will say so.
-- **No native GUI wired up yet either** -- see the next section.
 
 Verified without a real CLAP host (none is available in this sandbox): a from-scratch offline test
 harness links `hds_fx_plugin.c` directly, calls its own factory to build a real plugin instance, and
 drives it through `activate()`/`process()`/`deactivate()`/`destroy()` with synthetic audio and
-manually-built `clap_process_t`/extension calls. Confirmed: every pool slot defaults to `fx_source
-== 0` (Bus 1); a bus owning zero slots is an exact, bit-for-bit passthrough; a bus with
-`FX_TYPE_LIMITER` engaged genuinely reduces peak level (0.9 -> 0.16 on a test tone, not a no-op);
-reassigning a slot's `fx_source` live, mid-session, moves the effect to the new bus, leaves the old
-bus back at plain passthrough, and does NOT reallocate that slot's `FXSlotEngine.state` (verified by
-comparing the raw pointer before/after -- only a `fx_type` change may ever do that) -- the actual
-architectural fix this rearchitecture exists for; unconnected buses don't crash; the audio-ports
-extension reports 8 correctly-named/flagged ports each way; the params extension reports all 32 Mix
+manually-built `clap_process_t`/extension calls. Confirmed: every pool slot defaults to `fx_source ==
+0` (Port 1); a port owning only default-Off slots is passthrough within 1 float ULP (Parallel mode's
+own branch-averaging of several Off slots parked on the same port introduces the usual sub-ULP
+division rounding a true zero-owned-slots port doesn't have -- confirmed by direct inspection, not
+guessed, and inaudible at any real bit depth); a port with `FX_TYPE_LIMITER` engaged genuinely reduces
+peak level (0.9 -> 0.16 on a test tone, not a no-op); reassigning a slot's `fx_source` live,
+mid-session, moves the effect to the new port, leaves the old port back at plain passthrough, and
+does NOT reallocate that slot's `FXSlotEngine.state` (verified by comparing the raw pointer
+before/after -- only a `fx_type` change may ever do that) -- the actual architectural fix the
+shared-pool rearchitecture exists for; unconnected ports don't crash; the audio-ports extension
+reports 8 correctly-named/flagged stereo ports each way; the params extension reports all 32 Mix
 params with correct default values and round-trips a value write.
+
+#### Native embedded GUI: `src/hds_fx_gui_draw.c` + `src/hds_fx_gui_x11.c`
+
+A real, working `clap_plugin_gui_t` (X11-embedded, not a mockup) split across two files on purpose,
+so a future port to another OS is additive rather than a rewrite:
+
+- **`src/hds_fx_gui_draw.c`** -- ALL layout, drawing, and hit-testing, against a plain `cairo_t*`
+  with zero windowing references of any kind. This is the file that gets reused unchanged on another
+  platform: Cairo's own drawing API is identical across its Xlib, Win32 (`cairo_win32_surface_create`,
+  a real, official backend targeting a Windows `HDC`), and Quartz backends, so only the *surface* a
+  future port creates differs, never the drawing calls themselves.
+- **`src/hds_fx_gui_x11.c`** -- the one platform-specific file: opens an `X11` `Display`, creates the
+  plugin's own window, does the client-side half of XEmbed (`_XEMBED_INFO` + `XReparentWindow` into
+  the host-supplied window from `set_parent()` -- the full two-way XEmbed message protocol is a
+  scoped follow-up, not needed for embedding/rendering/input to work), and pumps X11 events off a
+  CLAP host timer (`clap_host_timer_support_t`, ~30Hz) into `hds_fx_gui_draw.c`'s own
+  `hds_fx_gui_on_button_press`/`on_motion`/`on_button_release`/`on_scroll`/`on_resize` functions.
+
+Layout is modeled on the Standalone FX tab's real structure (see `frontend.py`'s own FX tab
+construction, ~line 4919): **one flat, scrollable list of all 32 pool slots** -- no tabs, no
+per-port grid of any kind, and (after the I/O model above landed) no global mode switch either.
+A column-header strip (TYPE/IN/SC/PARAMS/OUT/MIX/BY/CH) sits above the list, reading its own
+x-positions off the exact same row-layout function every row itself uses so a header can never
+drift out of alignment with its column. Every row:
+- a **Type** pill (click to cycle forward, right-click back -- skips `FX_TYPE_NAM`, which this
+  plugin compiles out, so the pill can never land on a silently-inert selection);
+- an **Input** pill ("In 3" mono / "In 3+4" stereo -- cycles both the port and the Mono/Stereo
+  choice in one unified sequence), live only on a chain HEAD (`hds_fx_slot_is_chain_head()`) --
+  greyed out on a slot that's just inheriting a chain's running signal, since it has no Input of
+  its own to set;
+- a **Sidechain** pill, only ever live for `FX_TYPE_FAIRKID67` (the one type that actually reads
+  it) -- greyed out and inert on every other type, directly fixing early feedback that sidechain
+  looked selectable on effects that don't use it;
+- up to 10 **param knobs**, each with its own real, short label directly above it (e.g. "Thresh",
+  "Attack" -- `hds_fx_type_param_label()`, ported straight from each `FX_TYPE_*`'s own doc comment
+  in fx_types.h, never invented) and its current value as a "NN%" readout directly below -- label,
+  knob, and value are all pinned at fixed offsets from the row's own top, so the whole group is
+  guaranteed to stay inside that one row's own bounds, never bleeding into a neighbor;
+- an **Output** pill ("Out 7" / "Out 7+8", same unified cycle as Input, independent port/mode),
+  live only on a chain TAIL (`hds_fx_slot_is_chain_tail()` -- i.e. `chain_to_next == 0`) -- a slot
+  still chaining forward doesn't decide where anything lands yet;
+- a **Mix** knob (same value-readout treatment, no separate top label -- the MIX column header
+  already identifies it);
+- a **Bypass** toggle;
+- a **Chain-to-Next** toggle, highlighted whenever it's on, unconditionally -- no mode to gate it
+  anymore (see above);
+- **Up/Down** reorder arrows -- `hds_fx_swap_slots()` swaps two neighboring pool slots' whole
+  `FXSlotParams` value and deliberately leaves `FXSlotEngine` alone (a type change naturally resets
+  engine state next block via `sync_fx_engine_types()`; reordering two same-type slots preserves
+  their live DSP state, e.g. a delay's buffered tail, across the swap) -- both arrows disabled
+  outright on a slot that participates in a chain link, per `hds_fx_slot_participates_in_chain()`.
+
+Verified two ways, both exercising the real production code, no host available in this sandbox:
+1. **Visual**: `hds_fx_gui_render()` -- the exact function the X11 shim calls every frame -- rendered
+   directly into a `cairo_image_surface` (the same technique the earlier design mockups used, now
+   applied to the shipping code instead of a throwaway copy) and saved to PNG for visual review.
+2. **Interaction, end-to-end, at the X server level**: a test harness opens a real `Display` against
+   a running Xvfb, creates a "fake host" window, drives the actual `clap_plugin_gui_t` vtable exactly
+   as a host would (`create`/`set_parent`/`show`), confirms via `XQueryTree` that `XReparentWindow`
+   genuinely re-parented our window into the fake host's window (not just that the call didn't
+   crash), then uses the **XTest** extension to inject real server-level mouse clicks, drags, and
+   scroll-wheel events -- not direct function calls -- at coordinates computed from this file's own
+   real row-layout function. Confirmed: a real injected click on the Type pill cycles `fx_type`
+   (Off -> Ensemble); on the Input pill cycles `fx_source` (Port 1 -> Port 2); on Bypass toggles it; a
+   real injected drag on a Mix knob increases `mix` on an upward drag; a real injected click on a
+   slot's Up arrow swaps that slot's whole `FXSlotParams` with its neighbor; a real injected
+   scroll-wheel event moves the list's scroll offset; `show()`/`hide()` genuinely
+   register/unregister a host timer; `destroy()` genuinely frees the GUI window.
 
 ### Command-line flags
 
