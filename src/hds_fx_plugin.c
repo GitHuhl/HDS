@@ -147,6 +147,12 @@ typedef struct {
     // reproduced exactly until a chain's tail slot changes it.
     float port_output_channel[HDS_FX_PORT_COUNT];
     float port_output_stereo[HDS_FX_PORT_COUNT];
+    // Off: this chain's Input reads silence (port_input_off) / this chain's Output goes nowhere
+    // (port_output_off), regardless of whatever port/stereo choice is otherwise remembered for it
+    // -- a real, separate state from any port number, not a sentinel value squeezed into one. See
+    // hds_fx_gui_draw.c's own "Dropdowns" section for how the GUI presents this as its own option.
+    float port_input_off[HDS_FX_PORT_COUNT];
+    float port_output_off[HDS_FX_PORT_COUNT];
 
     float gr_db_scratch[FX_SLOT_COUNT]; // required non-NULL out-param, not yet exposed to the host/GUI -- shared across all 8 ports' own calls, same convention as backend.c's own gr_db_out (see render_audio_block)
 
@@ -328,6 +334,8 @@ static void hds_fx_init_pool_defaults(HdsFxPlugin *p) {
         p->port_input_stereo[port] = 1.0f;  // default: read the port as real stereo, today's obvious behavior
         p->port_output_channel[port] = (float)port; // default: write back to the SAME port
         p->port_output_stereo[port] = 1.0f;
+        p->port_input_off[port] = 0.0f;
+        p->port_output_off[port] = 0.0f;
     }
 }
 
@@ -430,6 +438,11 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
         // ONLY its own L channel, centered to both dry_l/dry_r -- see this file's own header
         // comment on why that's the correct "proper M->S" treatment, not an average or an ignored R.
         for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
+            if (p->port_input_off[port] != 0.0f) {
+                sc_snapshot_l[port] = 0.0f; // Off: this chain's Input reads silence, regardless of
+                sc_snapshot_r[port] = 0.0f; // whatever port/stereo choice is otherwise remembered
+                continue;
+            }
             float l = in_l[port] ? in_l[port][i] : 0.0f;
             if (p->port_input_stereo[port] != 0.0f) {
                 sc_snapshot_l[port] = l;
@@ -442,6 +455,8 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
         for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
             float l = sc_snapshot_l[port], r = sc_snapshot_r[port];
             process_fx_chain(p->fx, p->fx_engine, /* always Parallel */ 1, port, sc_snapshot_l, sc_snapshot_r, &l, &r, p->gr_db_scratch);
+
+            if (p->port_output_off[port] != 0.0f) continue; // Off: this chain's Output goes nowhere
 
             // Output routing is per-CHAIN (keyed by fx_source == port, same id process_fx_chain()
             // just bucketed slots by), not fixed to this same port -- see this file's own header

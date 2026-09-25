@@ -1051,14 +1051,28 @@ than an oversight:
   not silently swept under anything -- a host that doesn't get state persistence for this plugin
   will say so.
 
+**A real bug this surfaced, found from a live DAW test, not guessed**: a slot sharing its port with
+several idle default `Off` slots (HDS FX's own normal starting state -- every never-configured slot
+defaults to the same port) had its output measurably diluted in Parallel mode. Root cause was in
+`process_fx_chain()` itself (`src/fx_chain.c`, shared verbatim with the synth's own FX bus, so this
+fix applies to both): Parallel mode's branch-averaging counted every idle `Off`/bypassed slot that
+wasn't continuing an existing chain as its OWN separate one-slot branch, then divided the sum by the
+total branch count -- so one real effect sharing a port with 31 idle `Off` slots got averaged down to
+roughly 1/32 of its real level (confirmed directly: a Limiter reducing 0.9 to 0.16 alone measured
+identically at ~0.88 once diluted against 31 do-nothing branches -- nearly unprocessed). Fixed by
+excluding an `Off`/bypassed slot that isn't continuing a branch from branch accounting entirely (no
+branch opens, nothing is summed) rather than letting it open and count a throwaway branch of its own
+-- a source/port with only idle slots now correctly falls through to this function's own existing
+"zero owned slots" passthrough case instead. Reproduced and verified fixed with a dedicated test
+comparing a Limiter's output completely alone against the same Limiter sharing its source with 31
+idle `Off` slots in Parallel mode: bit-identical after the fix (measurably different before it).
+
 Verified without a real CLAP host (none is available in this sandbox): a from-scratch offline test
 harness links `hds_fx_plugin.c` directly, calls its own factory to build a real plugin instance, and
 drives it through `activate()`/`process()`/`deactivate()`/`destroy()` with synthetic audio and
 manually-built `clap_process_t`/extension calls. Confirmed: every pool slot defaults to `fx_source ==
-0` (Port 1); a port owning only default-Off slots is passthrough within 1 float ULP (Parallel mode's
-own branch-averaging of several Off slots parked on the same port introduces the usual sub-ULP
-division rounding a true zero-owned-slots port doesn't have -- confirmed by direct inspection, not
-guessed, and inaudible at any real bit depth); a port with `FX_TYPE_LIMITER` engaged genuinely reduces
+0` (Port 1); a port owning only default-Off slots is an exact, bit-for-bit passthrough; a port with
+`FX_TYPE_LIMITER` engaged genuinely reduces
 peak level (0.9 -> 0.16 on a test tone, not a no-op); reassigning a slot's `fx_source` live,
 mid-session, moves the effect to the new port, leaves the old port back at plain passthrough, and
 does NOT reallocate that slot's `FXSlotEngine.state` (verified by comparing the raw pointer
@@ -1090,23 +1104,33 @@ per-port grid of any kind, and (after the I/O model above landed) no global mode
 A column-header strip (TYPE/IN/SC/PARAMS/OUT/MIX/BY/CH) sits above the list, reading its own
 x-positions off the exact same row-layout function every row itself uses so a header can never
 drift out of alignment with its column. Every row:
-- a **Type** pill (click to cycle forward, right-click back -- skips `FX_TYPE_NAM`, which this
-  plugin compiles out, so the pill can never land on a silently-inert selection);
-- an **Input** pill ("In 3" mono / "In 3+4" stereo -- cycles both the port and the Mono/Stereo
-  choice in one unified sequence), live only on a chain HEAD (`hds_fx_slot_is_chain_head()`) --
-  greyed out on a slot that's just inheriting a chain's running signal, since it has no Input of
-  its own to set;
+- a **Type** pill -- clicking it opens a real dropdown listing all 20 selectable types (skips
+  `FX_TYPE_NAM`, which this plugin compiles out, so the list can never offer a silently-inert
+  selection), current type highlighted; clicking an option applies it and closes the list, clicking
+  anywhere else just closes it. Click-to-cycle (the original design) was dropped after direct
+  feedback that stepping through 20 types one click at a time was unusable;
+- an **Input** pill ("In 3" mono / "In 3+4" stereo / **"Off"**), live only on a chain HEAD
+  (`hds_fx_slot_is_chain_head()`) -- greyed out on a slot that's just inheriting a chain's running
+  signal, since it has no Input of its own to set. Same dropdown treatment as Type (16 options: Off
+  + 8 mono ports + 7 stereo pairs) rather than cycling. **Off is a real, separate state
+  (`port_input_off[]`), not a sentinel squeezed into the port number** -- selecting it forces that
+  port's audio to silence for every chain reading it, but deliberately leaves the remembered
+  port/Mono-Stereo choice untouched, so switching back to a real port later resumes exactly where it
+  was rather than forgetting it. Added directly in response to feedback that there was no way to say
+  "this chain has no input" short of routing it to an unused port and hoping nothing else used it;
 - a **Sidechain** pill, only ever live for `FX_TYPE_FAIRKID67` (the one type that actually reads
   it) -- greyed out and inert on every other type, directly fixing early feedback that sidechain
-  looked selectable on effects that don't use it;
+  looked selectable on effects that don't use it. Same dropdown treatment (9 options: "Same as
+  Source" + 8 sidechain inputs);
 - up to 10 **param knobs**, each with its own real, short label directly above it (e.g. "Thresh",
   "Attack" -- `hds_fx_type_param_label()`, ported straight from each `FX_TYPE_*`'s own doc comment
   in fx_types.h, never invented) and its current value as a "NN%" readout directly below -- label,
   knob, and value are all pinned at fixed offsets from the row's own top, so the whole group is
   guaranteed to stay inside that one row's own bounds, never bleeding into a neighbor;
-- an **Output** pill ("Out 7" / "Out 7+8", same unified cycle as Input, independent port/mode),
-  live only on a chain TAIL (`hds_fx_slot_is_chain_tail()` -- i.e. `chain_to_next == 0`) -- a slot
-  still chaining forward doesn't decide where anything lands yet;
+- an **Output** pill ("Out 7" / "Out 7+8" / **"Off"**, same dropdown treatment and independent
+  `port_output_off[]` state as Input, described above), live only on a chain TAIL
+  (`hds_fx_slot_is_chain_tail()` -- i.e. `chain_to_next == 0`) -- a slot still chaining forward
+  doesn't decide where anything lands yet;
 - a **Mix** knob (same value-readout treatment, no separate top label -- the MIX column header
   already identifies it);
 - a **Bypass** toggle;
@@ -1121,19 +1145,40 @@ drift out of alignment with its column. Every row:
 Verified two ways, both exercising the real production code, no host available in this sandbox:
 1. **Visual**: `hds_fx_gui_render()` -- the exact function the X11 shim calls every frame -- rendered
    directly into a `cairo_image_surface` (the same technique the earlier design mockups used, now
-   applied to the shipping code instead of a throwaway copy) and saved to PNG for visual review.
+   applied to the shipping code instead of a throwaway copy) and saved to PNG for visual review,
+   including a render with a dropdown deliberately left open (`HdsFxGuiViewState.dropdown` set before
+   calling render) to confirm the option list itself draws correctly: an opaque bordered box, every
+   option labeled, the current selection highlighted, drawn last so it's never clipped by the
+   scrollable row list beneath it.
 2. **Interaction, end-to-end, at the X server level**: a test harness opens a real `Display` against
    a running Xvfb, creates a "fake host" window, drives the actual `clap_plugin_gui_t` vtable exactly
    as a host would (`create`/`set_parent`/`show`), confirms via `XQueryTree` that `XReparentWindow`
    genuinely re-parented our window into the fake host's window (not just that the call didn't
    crash), then uses the **XTest** extension to inject real server-level mouse clicks, drags, and
    scroll-wheel events -- not direct function calls -- at coordinates computed from this file's own
-   real row-layout function. Confirmed: a real injected click on the Type pill cycles `fx_type`
-   (Off -> Ensemble); on the Input pill cycles `fx_source` (Port 1 -> Port 2); on Bypass toggles it; a
-   real injected drag on a Mix knob increases `mix` on an upward drag; a real injected click on a
-   slot's Up arrow swaps that slot's whole `FXSlotParams` with its neighbor; a real injected
-   scroll-wheel event moves the list's scroll offset; `show()`/`hide()` genuinely
-   register/unregister a host timer; `destroy()` genuinely frees the GUI window.
+   real row-layout function AND `hds_fx_dropdown_option_rect()` (the exact geometry function the
+   production hit-test itself uses, so draw and test can never quietly disagree about where an option
+   sits). Confirmed: a real injected click on the Type pill opens the Type dropdown without changing
+   `fx_type` yet; a second real injected click on the Ensemble option row applies it (Off -> Ensemble)
+   and closes the dropdown; the same open-then-select flow on the Input pill's dropdown moves
+   `fx_source` (Port 1 -> Port 2); a real injected click on the Input dropdown's **Off** option sets
+   `port_input_off[]` without touching the remembered `fx_source`, and clicking a real port option
+   afterward un-Offs it and resumes that same port; on Bypass toggles it; a real injected drag on a
+   Mix knob increases `mix` on an upward drag; a real injected click on a slot's Up arrow swaps that
+   slot's whole `FXSlotParams` with its neighbor; a real injected scroll-wheel event moves the list's
+   scroll offset (also closing any open dropdown, since its on-screen anchor is captured in absolute
+   coordinates at open time and a scroll/resize can move everything under it); `show()`/`hide()`
+   genuinely register/unregister a host timer; `destroy()` genuinely frees the GUI window.
+3. **Off silences real audio, not just a GUI flag**: a separate offline harness applies
+   `hds_fx_dropdown_apply()` -- the exact function the dropdown's own click handler calls, not the
+   raw `port_input_off`/`port_output_off` fields directly -- then drives a real `process()` call with
+   a live `FX_TYPE_LIMITER` on that port. Confirmed: before Off, the port carries real, measurably
+   limited audio (0.9 -> 0.16 peak); selecting Input Off makes that port's output exact bit-for-bit
+   silence (the chain's own dry input is force-zeroed before any FX runs, not just attenuated);
+   selecting Output Off leaves the port's output buffer exact silence even though its chain still
+   runs every block (the accumulation into that port's output is skipped, not the processing itself);
+   `fx_source`/`port_output_channel` are provably untouched by either, and un-Offing the Input
+   immediately restores the exact same real signal.
 
 ### Command-line flags
 

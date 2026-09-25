@@ -4369,6 +4369,23 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
             dry_l = *l; dry_r = *r; // Series -- chain_to_next ignored, always the running chain result
         } else if (continue_branch) {
             dry_l = branch_l; dry_r = branch_r; // Parallel, continuing an already-open branch
+        } else if (fx_params[s].bypass != 0.0f || type == FX_TYPE_OFF) {
+            // Parallel, NOT continuing a branch, and this slot does nothing (Off or bypassed): a
+            // pure dry-passthrough slot like this would otherwise open its own one-slot branch,
+            // averaged in at full weight against every real effect sharing this source -- diluting
+            // them proportionally to how many unused/Off slots merely happen to share this source,
+            // never a musically intended result. This is exactly what a shared FX-slot pool makes
+            // likely (e.g. HDS FX's own pool defaults every never-configured slot to the same
+            // source) -- confirmed directly: a single real effect sharing a source with 31 default
+            // Off slots was audible at roughly 1/32 its real level before this fix. Skip it
+            // entirely instead: no branch opens, gr_db_out already defaults to 0.0f for it below,
+            // and the NEXT owned slot starts fresh rather than "continuing" a branch that never
+            // really existed. A source with ONLY Off/bypassed slots therefore still ends with
+            // parallel_branch_count == 0 -- the exact same, already-correct "no owned slots"
+            // passthrough this function's own finalization below already handles.
+            gr_db_out[s] = 0.0f;
+            continue_branch = false;
+            continue;
         } else {
             if (branch_open) { parallel_sum_l += branch_l; parallel_sum_r += branch_r; parallel_branch_count++; }
             dry_l = parallel_in_l; dry_r = parallel_in_r; // Parallel, starting a fresh branch

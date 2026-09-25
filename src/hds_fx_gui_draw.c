@@ -16,11 +16,17 @@
 // mode's own existing chain_to_next semantics already reproduce plain Series exactly when every
 // slot in a chain chains to the next one -- see hds_fx_plugin.c's own header comment), and no
 // assumed stereo grouping across ports. Every slot has an Input (which of the 8 real stereo ports
-// feeds its own chain, and whether that chain treats the port as Mono or Stereo) -- shown/editable
-// only on a chain HEAD slot (hds_fx_slot_is_chain_head()) -- and, once its own Chain-to-Next is off
-// (a chain TAIL), an Output (which port the result lands on, independent of the Input, same
-// Mono/Stereo choice). Reordering (Up/Down) is disabled outright on any slot touching a chain link,
-// in either direction -- see hds_fx_slot_participates_in_chain()'s own comment.
+// feeds its own chain, whether that chain treats the port as Mono or Stereo, or Off -- silence in,
+// independent of whatever port is otherwise remembered) -- shown/editable only on a chain HEAD slot
+// (hds_fx_slot_is_chain_head()) -- and, once its own Chain-to-Next is off (a chain TAIL), an Output
+// (which port the result lands on, independent of the Input, same Mono/Stereo/Off choice).
+// Reordering (Up/Down) is disabled outright on any slot touching a chain link, in either direction
+// -- see hds_fx_slot_participates_in_chain()'s own comment.
+//
+// Type/Input/Sidechain/Output each have too many possible values (up to 21) for click-to-cycle to
+// be usable -- clicking one of these pills opens a real dropdown option list instead (see the
+// "Dropdowns" section further down); Bypass/Chain-to-Next stay plain click-to-toggle buttons (only
+// two states each), and Mix/param knobs stay click-and-drag.
 #include <cairo/cairo.h>
 #include <string.h>
 #include <math.h>
@@ -63,6 +69,11 @@ static const int HDS_FX_SELECTABLE_TYPES[] = {
     FX_TYPE_FDNVERB,
 };
 #define HDS_FX_SELECTABLE_TYPE_COUNT (int)(sizeof(HDS_FX_SELECTABLE_TYPES) / sizeof(HDS_FX_SELECTABLE_TYPES[0]))
+
+static int hds_fx_selectable_type_index(int fx_type) {
+    for (int i = 0; i < HDS_FX_SELECTABLE_TYPE_COUNT; i++) if (HDS_FX_SELECTABLE_TYPES[i] == fx_type) return i;
+    return 0;
+}
 
 static const char *hds_fx_type_name(int fx_type) {
     switch (fx_type) {
@@ -212,6 +223,23 @@ static bool hds_fx_slot_participates_in_chain(const HdsFxPlugin *p, int slot) {
 // platform state (that's HdsFxGuiWindow in hds_fx_gui_x11.c). Owned by the platform shim, passed by
 // pointer into every function below.
 // ---------------------------------------------------------------------------------------------
+// Which dropdown (if any) is currently open -- Type/Input/Sidechain/Output all have too many
+// possible values (up to 21) for click-to-cycle to be usable, so each opens a real option list
+// instead (see the "Dropdowns" section further down). Only one can ever be open at a time.
+#define HDS_FX_DROPDOWN_NONE 0
+#define HDS_FX_DROPDOWN_TYPE 1
+#define HDS_FX_DROPDOWN_INPUT 2
+#define HDS_FX_DROPDOWN_SIDECHAIN 3
+#define HDS_FX_DROPDOWN_OUTPUT 4
+
+typedef struct { double x, y, w, h; } HdsFxRect;
+
+typedef struct {
+    int kind;         // one of HDS_FX_DROPDOWN_* above; NONE when closed
+    int row;          // which pool slot this dropdown belongs to
+    HdsFxRect anchor; // the pill's own rect at the moment it was opened -- positions the list
+} HdsFxDropdown;
+
 typedef struct {
     int window_w, window_h;
     double scroll_offset_px;
@@ -223,6 +251,8 @@ typedef struct {
     int drag_param_index;
     double drag_start_y;
     float drag_start_value;
+
+    HdsFxDropdown dropdown;
 } HdsFxGuiViewState;
 
 static void hds_fx_gui_view_state_init(HdsFxGuiViewState *vs) {
@@ -342,8 +372,6 @@ static void hds_fx_draw_knob(cairo_t *cr, double cx, double cy, double radius, f
 // are actually meaningful via hds_fx_type_param_count(), keeping this geometry dead simple.
 // Column order: # | Type | In | SC | [params...] | Out | Mix | By | Chain | Up/Down.
 // ---------------------------------------------------------------------------------------------
-typedef struct { double x, y, w, h; } HdsFxRect;
-
 typedef struct {
     HdsFxRect row;
     HdsFxRect type_pill;
@@ -431,6 +459,180 @@ static void hds_fx_format_io_pill(char *buf, size_t buflen, const char *prefix, 
     else snprintf(buf, buflen, "%s %d", prefix, port + 1);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Dropdowns -- Type (21 options), Input/Output (Off + 8 mono + 7 stereo = 16 each), and Sidechain
+// (Same as Source + 8 = 9) all have too many possible values for click-to-cycle to be usable.
+// Clicking one of these pills opens a real option list instead (see HdsFxGuiViewState.dropdown);
+// clicking an option applies it and closes the list, clicking anywhere else just closes it.
+// ---------------------------------------------------------------------------------------------
+
+static int hds_fx_dropdown_option_count(int kind) {
+    switch (kind) {
+        case HDS_FX_DROPDOWN_TYPE: return HDS_FX_SELECTABLE_TYPE_COUNT;
+        case HDS_FX_DROPDOWN_INPUT:
+        case HDS_FX_DROPDOWN_OUTPUT: return 1 + HDS_FX_PORT_COUNT + (HDS_FX_PORT_COUNT - 1); // Off + mono + stereo
+        case HDS_FX_DROPDOWN_SIDECHAIN: return 1 + HDS_FX_PORT_COUNT; // "Same as Source" + 8
+        default: return 0;
+    }
+}
+
+// Pure text for option `idx` -- doesn't need plugin state, just which list and which row within it.
+static void hds_fx_dropdown_option_label(int kind, int idx, char *buf, size_t buflen) {
+    switch (kind) {
+        case HDS_FX_DROPDOWN_TYPE:
+            snprintf(buf, buflen, "%s", hds_fx_type_name(HDS_FX_SELECTABLE_TYPES[idx]));
+            return;
+        case HDS_FX_DROPDOWN_INPUT:
+        case HDS_FX_DROPDOWN_OUTPUT: {
+            const char *prefix = (kind == HDS_FX_DROPDOWN_INPUT) ? "In" : "Out";
+            if (idx == 0) { snprintf(buf, buflen, "Off"); return; }
+            int j = idx - 1;
+            if (j < HDS_FX_PORT_COUNT) hds_fx_format_io_pill(buf, buflen, prefix, j, false);
+            else hds_fx_format_io_pill(buf, buflen, prefix, j - HDS_FX_PORT_COUNT, true);
+            return;
+        }
+        case HDS_FX_DROPDOWN_SIDECHAIN:
+            if (idx == 0) snprintf(buf, buflen, "Same as Source");
+            else snprintf(buf, buflen, "SC In %d", idx);
+            return;
+        default: buf[0] = 0; return;
+    }
+}
+
+// Which option index is this slot's CURRENT value -- drives the highlighted row in the open list.
+static int hds_fx_dropdown_current_index(const HdsFxPlugin *p, int kind, int row) {
+    switch (kind) {
+        case HDS_FX_DROPDOWN_TYPE:
+            return hds_fx_selectable_type_index((int)p->fx[row].fx_type);
+        case HDS_FX_DROPDOWN_INPUT: {
+            int port = (int)p->fx[row].fx_source;
+            if (port < 0 || port >= HDS_FX_PORT_COUNT) port = 0;
+            if (p->port_input_off[port] != 0.0f) return 0;
+            bool stereo = p->port_input_stereo[port] != 0.0f;
+            return 1 + (stereo ? HDS_FX_PORT_COUNT + port : port);
+        }
+        case HDS_FX_DROPDOWN_OUTPUT: {
+            int g = (int)p->fx[row].fx_source;
+            if (g < 0 || g >= HDS_FX_PORT_COUNT) g = 0;
+            if (p->port_output_off[g] != 0.0f) return 0;
+            int ch = (int)p->port_output_channel[g];
+            if (ch < 0 || ch >= HDS_FX_PORT_COUNT) ch = g;
+            bool stereo = p->port_output_stereo[g] != 0.0f;
+            return 1 + (stereo ? HDS_FX_PORT_COUNT + ch : ch);
+        }
+        case HDS_FX_DROPDOWN_SIDECHAIN: {
+            int sc = (int)p->fx[row].sidechain_source;
+            return (sc < 0 || sc >= HDS_FX_PORT_COUNT) ? 0 : sc + 1;
+        }
+        default: return -1;
+    }
+}
+
+// Applies option `idx` to `row`. Input/Output's "Off" (idx 0) deliberately leaves fx_source/
+// port_output_channel untouched -- Off is "this chain reads/writes silence right now", not a
+// different port choice, so switching away from Off later returns to whatever port was last set.
+static void hds_fx_dropdown_apply(HdsFxPlugin *p, int kind, int row, int idx) {
+    switch (kind) {
+        case HDS_FX_DROPDOWN_TYPE:
+            p->fx[row].fx_type = (float)HDS_FX_SELECTABLE_TYPES[idx];
+            return;
+        case HDS_FX_DROPDOWN_INPUT: {
+            int port = (int)p->fx[row].fx_source;
+            if (port < 0 || port >= HDS_FX_PORT_COUNT) port = 0;
+            if (idx == 0) { p->port_input_off[port] = 1.0f; return; }
+            int j = idx - 1;
+            int new_port = (j < HDS_FX_PORT_COUNT) ? j : (j - HDS_FX_PORT_COUNT);
+            bool new_stereo = j >= HDS_FX_PORT_COUNT;
+            p->fx[row].fx_source = (float)new_port;
+            p->port_input_stereo[new_port] = new_stereo ? 1.0f : 0.0f;
+            p->port_input_off[new_port] = 0.0f;
+            return;
+        }
+        case HDS_FX_DROPDOWN_OUTPUT: {
+            int g = (int)p->fx[row].fx_source;
+            if (g < 0 || g >= HDS_FX_PORT_COUNT) g = 0;
+            if (idx == 0) { p->port_output_off[g] = 1.0f; return; }
+            int j = idx - 1;
+            int new_ch = (j < HDS_FX_PORT_COUNT) ? j : (j - HDS_FX_PORT_COUNT);
+            bool new_stereo = j >= HDS_FX_PORT_COUNT;
+            p->port_output_channel[g] = (float)new_ch;
+            p->port_output_stereo[g] = new_stereo ? 1.0f : 0.0f;
+            p->port_output_off[g] = 0.0f;
+            return;
+        }
+        case HDS_FX_DROPDOWN_SIDECHAIN:
+            p->fx[row].sidechain_source = (idx == 0) ? -1.0f : (float)(idx - 1);
+            return;
+        default: return;
+    }
+}
+
+#define HDS_FX_DROPDOWN_ROW_H 20.0
+
+static double hds_fx_dropdown_width(int kind) {
+    switch (kind) {
+        case HDS_FX_DROPDOWN_TYPE: return 130.0;
+        case HDS_FX_DROPDOWN_SIDECHAIN: return 110.0;
+        default: return 90.0; // Input/Output
+    }
+}
+
+// The open list's own background rect -- flips to open ABOVE the anchor pill instead of below if
+// the list would otherwise run off the window's own bottom edge. Same geometry
+// hds_fx_dropdown_option_rect() below builds each individual option row from, so draw and
+// hit-test can never disagree about where anything is.
+static void hds_fx_dropdown_bg_rect(const HdsFxDropdown *dd, int window_h, HdsFxRect *out) {
+    int count = hds_fx_dropdown_option_count(dd->kind);
+    double w = hds_fx_dropdown_width(dd->kind);
+    double list_h = count * HDS_FX_DROPDOWN_ROW_H;
+    double below_y = dd->anchor.y + dd->anchor.h + 2.0;
+    double y0 = (below_y + list_h > (double)window_h) ? (dd->anchor.y - list_h - 2.0) : below_y;
+    if (y0 < 0.0) y0 = 0.0;
+    *out = (HdsFxRect){dd->anchor.x, y0, w, list_h};
+}
+
+static void hds_fx_dropdown_option_rect(const HdsFxDropdown *dd, int window_h, int idx, HdsFxRect *out) {
+    HdsFxRect bg;
+    hds_fx_dropdown_bg_rect(dd, window_h, &bg);
+    *out = (HdsFxRect){bg.x, bg.y + idx * HDS_FX_DROPDOWN_ROW_H, bg.w, HDS_FX_DROPDOWN_ROW_H};
+}
+
+static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewState *vs) {
+    if (vs->dropdown.kind == HDS_FX_DROPDOWN_NONE) return;
+    const HdsFxDropdown *dd = &vs->dropdown;
+    int count = hds_fx_dropdown_option_count(dd->kind);
+    int current = hds_fx_dropdown_current_index(p, dd->kind, dd->row);
+
+    HdsFxRect bg;
+    hds_fx_dropdown_bg_rect(dd, vs->window_h, &bg);
+    hds_fx_rgb(cr, 0.13, 0.13, 0.16);
+    cairo_new_path(cr);
+    cairo_rectangle(cr, bg.x, bg.y, bg.w, bg.h);
+    cairo_fill(cr);
+    hds_fx_rgba(cr, 1, 1, 1, 0.25);
+    cairo_new_path(cr);
+    cairo_set_line_width(cr, 1.0);
+    cairo_rectangle(cr, bg.x + 0.5, bg.y + 0.5, bg.w - 1, bg.h - 1);
+    cairo_stroke(cr);
+
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 9.5);
+    for (int i = 0; i < count; i++) {
+        HdsFxRect r;
+        hds_fx_dropdown_option_rect(dd, vs->window_h, i, &r);
+        if (i == current) {
+            hds_fx_rgb(cr, 0.22, 0.32, 0.36);
+            cairo_new_path(cr);
+            cairo_rectangle(cr, r.x, r.y, r.w, r.h);
+            cairo_fill(cr);
+        }
+        char label[24];
+        hds_fx_dropdown_option_label(dd->kind, i, label, sizeof(label));
+        hds_fx_rgb(cr, i == current ? 0.92 : 0.78, i == current ? 0.95 : 0.78, i == current ? 0.92 : 0.81);
+        hds_fx_left_text(cr, r.x + 6, r.y + r.h / 2 + 3.5, label);
+    }
+}
+
 static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewState *vs) {
     int width = vs->window_w, height = vs->window_h;
 
@@ -499,11 +701,15 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
         hds_fx_draw_pill(cr, L.type_pill.x, L.type_pill.y, L.type_pill.w, L.type_pill.h, hds_fx_type_name(fx_type), fx_type != FX_TYPE_OFF, false);
 
         // Input pill: only live on a chain HEAD -- a continuation slot has no Input of its own, it
-        // just inherits the running signal from whatever chains into it.
+        // just inherits the running signal from whatever chains into it. "Off" (silence in,
+        // instead of any physical port) is its own selectable state, independent of which port
+        // number is stored -- see hds_fx_dropdown_apply()'s own comment.
         {
             char inbuf[16];
-            hds_fx_format_io_pill(inbuf, sizeof(inbuf), "In", port, p->port_input_stereo[port] != 0.0f);
-            hds_fx_draw_pill(cr, L.input_pill.x, L.input_pill.y, L.input_pill.w, L.input_pill.h, inbuf, is_head, !is_head);
+            bool input_off = p->port_input_off[port] != 0.0f;
+            if (input_off) snprintf(inbuf, sizeof(inbuf), "Off");
+            else hds_fx_format_io_pill(inbuf, sizeof(inbuf), "In", port, p->port_input_stereo[port] != 0.0f);
+            hds_fx_draw_pill(cr, L.input_pill.x, L.input_pill.y, L.input_pill.w, L.input_pill.h, inbuf, is_head && !input_off, !is_head);
         }
 
         if (uses_sc) {
@@ -521,13 +727,19 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
         }
 
         // Output pill: only live on a chain TAIL -- a slot still chaining forward doesn't decide
-        // where anything lands yet, the tail of its own chain does.
+        // where anything lands yet, the tail of its own chain does. "Off" (result goes nowhere)
+        // is its own selectable state, independent of which port number is stored.
         {
-            int out_ch = (int)p->port_output_channel[port];
-            if (out_ch < 0 || out_ch >= HDS_FX_PORT_COUNT) out_ch = port;
+            bool output_off = p->port_output_off[port] != 0.0f;
             char outbuf[16];
-            hds_fx_format_io_pill(outbuf, sizeof(outbuf), "Out", out_ch, p->port_output_stereo[port] != 0.0f);
-            hds_fx_draw_pill(cr, L.output_pill.x, L.output_pill.y, L.output_pill.w, L.output_pill.h, outbuf, is_tail, !is_tail);
+            if (output_off) {
+                snprintf(outbuf, sizeof(outbuf), "Off");
+            } else {
+                int out_ch = (int)p->port_output_channel[port];
+                if (out_ch < 0 || out_ch >= HDS_FX_PORT_COUNT) out_ch = port;
+                hds_fx_format_io_pill(outbuf, sizeof(outbuf), "Out", out_ch, p->port_output_stereo[port] != 0.0f);
+            }
+            hds_fx_draw_pill(cr, L.output_pill.x, L.output_pill.y, L.output_pill.w, L.output_pill.h, outbuf, is_tail && !output_off, !is_tail);
         }
 
         hds_fx_draw_knob(cr, L.mix_knob.x, L.mix_knob.y, L.mix_knob.w, slot->mix / 100.0f, false, y, NULL);
@@ -582,6 +794,8 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
         cairo_fill(cr);
         cairo_new_path(cr);
     }
+
+    hds_fx_gui_render_dropdown(cr, p, vs); // last -- on top of everything else, unclipped by the list's own scroll region
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -605,67 +819,30 @@ static void hds_fx_swap_slots(HdsFxPlugin *p, int a, int b) {
     p->fx[b] = tmp;
 }
 
-static int hds_fx_selectable_type_index(int fx_type) {
-    for (int i = 0; i < HDS_FX_SELECTABLE_TYPE_COUNT; i++) if (HDS_FX_SELECTABLE_TYPES[i] == fx_type) return i;
-    return 0;
-}
 
-static void hds_fx_cycle_type(HdsFxPlugin *p, int slot, int dir) {
-    int idx = hds_fx_selectable_type_index((int)p->fx[slot].fx_type);
-    idx = (idx + dir + HDS_FX_SELECTABLE_TYPE_COUNT) % HDS_FX_SELECTABLE_TYPE_COUNT;
-    p->fx[slot].fx_type = (float)HDS_FX_SELECTABLE_TYPES[idx];
-}
-
-// Input pill: unified Mono/Stereo + port cycle -- mono positions 0..HDS_FX_PORT_COUNT-1, then
-// stereo positions 0..HDS_FX_PORT_COUNT-2 (a stereo pair can't start on the last port, nothing to
-// pair it with), wrapping. Mutates p->port_input_stereo[] -- a property of the PORT/chain a slot's
-// own fx_source names, not of the individual slot -- see HdsFxPlugin's own comment.
-static void hds_fx_cycle_input(HdsFxPlugin *p, int slot, int dir) {
-    int port = (int)p->fx[slot].fx_source;
-    if (port < 0 || port >= HDS_FX_PORT_COUNT) port = 0;
-    bool stereo = p->port_input_stereo[port] != 0.0f;
-    int mono_count = HDS_FX_PORT_COUNT, stereo_count = HDS_FX_PORT_COUNT - 1;
-    int total = mono_count + stereo_count;
-    int pos = stereo ? (mono_count + port) : port;
-    pos = ((pos + dir) % total + total) % total;
-    int new_port = (pos < mono_count) ? pos : (pos - mono_count);
-    bool new_stereo = pos >= mono_count;
-    p->fx[slot].fx_source = (float)new_port;
-    p->port_input_stereo[new_port] = new_stereo ? 1.0f : 0.0f;
-}
-
-// Output pill: same unified cycle as Input, but keyed by fx_source (which chain this is) and
-// mutating port_output_channel/port_output_stereo instead -- see HdsFxPlugin's own comment on why
-// Output is independent of Input.
-static void hds_fx_cycle_output(HdsFxPlugin *p, int slot, int dir) {
-    int g = (int)p->fx[slot].fx_source;
-    if (g < 0 || g >= HDS_FX_PORT_COUNT) g = 0;
-    int ch = (int)p->port_output_channel[g];
-    if (ch < 0 || ch >= HDS_FX_PORT_COUNT) ch = g;
-    bool stereo = p->port_output_stereo[g] != 0.0f;
-    int mono_count = HDS_FX_PORT_COUNT, stereo_count = HDS_FX_PORT_COUNT - 1;
-    int total = mono_count + stereo_count;
-    int pos = stereo ? (mono_count + ch) : ch;
-    pos = ((pos + dir) % total + total) % total;
-    int new_ch = (pos < mono_count) ? pos : (pos - mono_count);
-    bool new_stereo = pos >= mono_count;
-    p->port_output_channel[g] = (float)new_ch;
-    p->port_output_stereo[g] = new_stereo ? 1.0f : 0.0f;
-}
-
-// -1 ("Same as Source") .. HDS_FX_PORT_COUNT-1, cycling forward/back through that whole range.
-static void hds_fx_cycle_sidechain(HdsFxPlugin *p, int slot, int dir) {
-    int sc = (int)p->fx[slot].sidechain_source;
-    sc = ((sc + 1 + dir) % (HDS_FX_PORT_COUNT + 1) + (HDS_FX_PORT_COUNT + 1)) % (HDS_FX_PORT_COUNT + 1) - 1;
-    p->fx[slot].sidechain_source = (float)sc;
-}
-
-// Returns true if the click was consumed by a row control (bypass/chain/up/down toggled
-// immediately; a knob starts a drag tracked in *vs instead). button: 1 = left (forward-cycle /
-// primary action), 3 = right (backward-cycle).
+// Returns true if the click was consumed. If a dropdown is currently open, this ONLY interacts
+// with it (selecting an option if the click landed inside it, closing it either way) -- a click
+// can never both close one dropdown and immediately act on whatever's underneath it. Otherwise:
+// Type/Input/Sidechain/Output pills OPEN their own dropdown (see the "Dropdowns" section above)
+// rather than mutating anything directly; bypass/chain/up/down toggle immediately; a knob starts a
+// drag tracked in *vs instead.
 static bool hds_fx_gui_on_button_press(HdsFxPlugin *p, HdsFxGuiViewState *vs, double x, double y, int button) {
     int width = vs->window_w;
-    int dir = (button == 3) ? -1 : 1;
+
+    if (vs->dropdown.kind != HDS_FX_DROPDOWN_NONE) {
+        int count = hds_fx_dropdown_option_count(vs->dropdown.kind);
+        for (int i = 0; i < count; i++) {
+            HdsFxRect r;
+            hds_fx_dropdown_option_rect(&vs->dropdown, vs->window_h, i, &r);
+            if (hds_fx_rect_contains(&r, x, y)) {
+                if (button == 1) hds_fx_dropdown_apply(p, vs->dropdown.kind, vs->dropdown.row, i);
+                vs->dropdown.kind = HDS_FX_DROPDOWN_NONE;
+                return true;
+            }
+        }
+        vs->dropdown.kind = HDS_FX_DROPDOWN_NONE; // clicked outside the open list -- just close it
+        return true;
+    }
 
     if (y < HDS_FX_GUI_HEADER_H) return false;
 
@@ -675,13 +852,22 @@ static bool hds_fx_gui_on_button_press(HdsFxPlugin *p, HdsFxGuiViewState *vs, do
     HdsFxRowLayout L;
     hds_fx_gui_compute_row_layout(width, row_y, &L);
 
-    if (hds_fx_rect_contains(&L.type_pill, x, y)) { hds_fx_cycle_type(p, row, dir); return true; }
-    if (hds_fx_slot_is_chain_head(p, row) && hds_fx_rect_contains(&L.input_pill, x, y)) { hds_fx_cycle_input(p, row, dir); return true; }
-    if (hds_fx_type_uses_sidechain((int)p->fx[row].fx_type) && hds_fx_rect_contains(&L.sidechain_pill, x, y)) {
-        hds_fx_cycle_sidechain(p, row, dir);
+    if (hds_fx_rect_contains(&L.type_pill, x, y)) {
+        vs->dropdown.kind = HDS_FX_DROPDOWN_TYPE; vs->dropdown.row = row; vs->dropdown.anchor = L.type_pill;
         return true;
     }
-    if (hds_fx_slot_is_chain_tail(p, row) && hds_fx_rect_contains(&L.output_pill, x, y)) { hds_fx_cycle_output(p, row, dir); return true; }
+    if (hds_fx_slot_is_chain_head(p, row) && hds_fx_rect_contains(&L.input_pill, x, y)) {
+        vs->dropdown.kind = HDS_FX_DROPDOWN_INPUT; vs->dropdown.row = row; vs->dropdown.anchor = L.input_pill;
+        return true;
+    }
+    if (hds_fx_type_uses_sidechain((int)p->fx[row].fx_type) && hds_fx_rect_contains(&L.sidechain_pill, x, y)) {
+        vs->dropdown.kind = HDS_FX_DROPDOWN_SIDECHAIN; vs->dropdown.row = row; vs->dropdown.anchor = L.sidechain_pill;
+        return true;
+    }
+    if (hds_fx_slot_is_chain_tail(p, row) && hds_fx_rect_contains(&L.output_pill, x, y)) {
+        vs->dropdown.kind = HDS_FX_DROPDOWN_OUTPUT; vs->dropdown.row = row; vs->dropdown.anchor = L.output_pill;
+        return true;
+    }
     if (hds_fx_rect_contains(&L.bypass_btn, x, y)) { if (button == 1) p->fx[row].bypass = (p->fx[row].bypass != 0.0f) ? 0.0f : 1.0f; return true; }
     if (hds_fx_rect_contains(&L.chain_btn, x, y)) { if (button == 1 && row < FX_SLOT_COUNT - 1) p->fx[row].chain_to_next = (p->fx[row].chain_to_next != 0.0f) ? 0.0f : 1.0f; return true; }
     if (hds_fx_rect_contains(&L.up_btn, x, y)) { if (button == 1 && !hds_fx_slot_participates_in_chain(p, row)) hds_fx_swap_slots(p, row, row - 1); return true; }
@@ -737,6 +923,9 @@ static void hds_fx_gui_on_scroll(HdsFxGuiViewState *vs, int delta) {
     double max_scroll = hds_fx_gui_max_scroll(vs);
     if (vs->scroll_offset_px < 0.0) vs->scroll_offset_px = 0.0;
     if (vs->scroll_offset_px > max_scroll) vs->scroll_offset_px = max_scroll;
+    // A dropdown's own anchor rect is captured in absolute window coordinates at open time --
+    // scrolling the list would leave it floating, visually detached from the row it belongs to.
+    vs->dropdown.kind = HDS_FX_DROPDOWN_NONE;
 }
 
 static void hds_fx_gui_on_resize(HdsFxGuiViewState *vs, int w, int h) {
@@ -745,4 +934,5 @@ static void hds_fx_gui_on_resize(HdsFxGuiViewState *vs, int w, int h) {
     vs->window_w = w; vs->window_h = h;
     double max_scroll = hds_fx_gui_max_scroll(vs);
     if (vs->scroll_offset_px > max_scroll) vs->scroll_offset_px = max_scroll;
+    vs->dropdown.kind = HDS_FX_DROPDOWN_NONE; // same reasoning as hds_fx_gui_on_scroll's own comment
 }
