@@ -902,6 +902,21 @@ FX_TYPE_METADATA += [
         {"label": "Dither", "type": "choice", "options": ["None", "Type1", "Type2"], "default": 1},
         {"label": "Shaping", "type": "choice", "options": ["None", "Moderate", "Normal", "Ultra"], "default": 2},
     ]},
+    {"name": "MultiFilter", "params": [
+        # A general-purpose filter with a much wider Slope range than the per-Program filter slots
+        # (Filters tab) offer -- see FX_TYPE_MULTIFILTER's own comment in backend.c for the full
+        # design (cascaded TPT state-variable stages, same technique the per-voice filters use, just
+        # a separate self-contained implementation so this can never affect those). Every stage
+        # shares one Cutoff/Resonance, so resonance compounds at steep slopes -- expected, the same
+        # "cascaded analog stages" character, not a bug.
+        {"label": "Type", "type": "choice", "options": ["Lowpass", "Highpass", "Bandpass", "Notch"], "default": 0},
+        {"label": "Cutoff", "range": (0, 100), "default": 50},    # 20Hz-20kHz, log-mapped
+        {"label": "Resonance", "range": (0, 100), "default": 0},  # 0 = no added resonance
+        {"label": "Slope", "type": "choice",
+         "options": ["6 dB/oct", "12 dB/oct", "18 dB/oct", "24 dB/oct", "30 dB/oct", "36 dB/oct",
+                     "42 dB/oct", "48 dB/oct", "60 dB/oct", "72 dB/oct", "84 dB/oct", "96 dB/oct"],
+         "default": 1},
+    ]},
 ]
 
 # The 5 FX types whose backend state exposes a real GR (gain reduction) reading -- see

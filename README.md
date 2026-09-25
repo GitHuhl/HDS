@@ -1292,6 +1292,33 @@ original, which works on its own stereo signal only. See `run_fx_peakmax()`'s ow
 level, quiet-signal gain staging, exact lookahead-latency verification via an impulse, auto-release
 engage/release behavior, and dithered-output finiteness) for how it was verified.
 
+### MultiFilter FX slot (wide-range steepness filter)
+
+An FX slot (Type: `MultiFilter`) for a much steeper (or shallower) filter than the per-Program
+filter slots (Filters tab, `ProgramState.filters[5]`) offer -- those stay exactly as they are; this
+is a separate, self-contained implementation reusing the same underlying technique (Vadim
+Zavalishin's topology-preserving-transform state-variable filter, "The Art of VA Filter Design" --
+the same reference this engine's own per-voice filters already credit) so this addition can never
+affect that existing feature's behavior.
+
+Four params: **Type** (Lowpass/Highpass/Bandpass/Notch, the same exclusive-pick vocabulary the
+per-voice filters use), **Cutoff** (20Hz-20kHz, log-mapped), **Resonance** (0-100, same damping-floor
+formula the per-voice filters use, so it feels identical), and **Slope** -- 12 choices from 6dB/oct
+up to 96dB/oct in 6dB steps, built by cascading 1-8 identical 2-pole TPT stages (12dB/oct each) plus
+a single extra 1-pole stage for an odd 6dB remainder on Lowpass/Highpass. Bandpass/Notch have no
+natural 1-pole equivalent: an odd Slope choice on those two types rounds down to the next 12dB step,
+and 6dB itself clamps up to the smallest meaningful bandpass/notch this topology can express (one
+2-pole stage, 12dB/oct) rather than silently doing nothing. Every cascaded stage shares one Cutoff/
+Resonance, so resonance compounds at steep slopes -- an expected "cascaded analog stages" character,
+not a textbook per-stage-tuned Butterworth design, and not a bug.
+
+Verified with a standalone frequency-response test: measured attenuation two octaves from cutoff
+scales almost exactly linearly with the Slope choice (~-12.5dB per 6dB step, matching a clean N-pole
+rolloff) until the test's own measurement floor takes over well past -90dB; the passband stays flat
+(under 1dB of ripple) even at 96dB/oct; the Bandpass/Notch odd-slope clamp behaves correctly (6dB and
+12dB give identical, filtered -- not silently bypassed -- output); and an 8-stage cascade at maximum
+resonance stays finite and bounded over 200,000 samples (~4 seconds).
+
 ### Per-slot gain reduction (GR) metering
 
 Gate, Limiter, FetComp, FairKid67, and PeakMax -- the 5 FX types with a real gain-reduction stage --

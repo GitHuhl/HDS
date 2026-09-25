@@ -609,6 +609,26 @@ typedef struct {
 // away from the most audible range). No Mix-redundant param and no sidechain input -- like the
 // original, this works on its own stereo signal only.
 #define FX_TYPE_PEAKMAX 16
+// A general-purpose steep/shallow filter for the FX bus -- distinct from the per-Program filter
+// slots (ProgramState.filters[5]/FilterParams), which stay exactly as they are; this is its own
+// self-contained implementation reusing the SAME proven TPT state-variable filter math (Vadim
+// Zavalishin's "Art of VA Filter Design", the same reference run_svf_filter's own comment already
+// credits) rather than sharing that function directly, so this addition can never change the
+// existing per-voice filters' own behavior. param[0] Type (choice: Lowpass/Highpass/Bandpass/Notch,
+// same exclusive-pick vocabulary as FilterParams.filter_type), param[1] Cutoff (20Hz-20kHz,
+// log-mapped, same fx_eq3_fraction_to_hz() convention as FX_TYPE_EQ3's own Freq params), param[2]
+// Resonance (0-100, same k=max(0.05,2*(1-res/100)) damping-floor formula as run_svf_filter's own
+// Res knob, so it feels identical to the synth's own filters), param[3] Slope (choice: 12 steps,
+// 6/12/18/24/30/36/42/48/60/72/84/96 dB/oct -- built by cascading N identical 2-pole TPT SVF
+// stages, one 12dB/oct step each, plus a single extra 1-pole stage for an odd 6dB remainder on
+// Lowpass/Highpass only; Bandpass/Notch have no natural 1-pole equivalent, so an odd slope choice
+// on those two types rounds DOWN to the next 12dB step, and 6dB itself clamps up to 12dB -- the
+// smallest meaningful bandpass/notch this topology can express). Every stage shares the same
+// Cutoff/Resonance, so resonance compounds across stages at steep slopes -- the same cascaded-
+// identical-stages character run_svf_filter's own existing 12->24dB step already has, just carried
+// further; this is expected, not a bug (the same "analog ladder cascade" flavor, not a textbook
+// per-stage-tuned Butterworth design).
+#define FX_TYPE_MULTIFILTER 17
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -5249,6 +5269,98 @@ static void run_fx_peakmax(FXSlotEngine *engine, const FXSlotParams *params, flo
     *r = out_r;
 }
 
+// --- FX_TYPE_MULTIFILTER: see its own #define comment above for the full param map and design
+// rationale. Building blocks below are a standalone extraction of run_svf_filter's own per-stage
+// TPT (topology-preserving-transform) math -- same formulas, same stability floor on resonance --
+// generalized to run any number of cascaded stages instead of that function's own hardcoded 1-or-2,
+// so this effect can never change ProgramState.filters[5]'s own existing behavior (a completely
+// separate function and state struct, sharing only the underlying technique).
+#define FX_FILTER_MAX_2POLE_STAGES 8 // 8 stages * 12dB/oct = 96dB/oct, this effect's own steepest Slope option
+
+// One 2-pole TPT SVF stage. a1/a2/a3/k are precomputed once per sample (same cutoff/resonance for
+// every cascaded stage) and passed in rather than recomputed per stage.
+static inline float fx_multifilter_2pole_stage(float input, float k, float a1, float a2, float a3, int filter_type, float *low_state, float *band_state) {
+    float v3 = input - *low_state;
+    float v1 = a1 * (*band_state) + a2 * v3; // bandpass output
+    float v2 = *low_state + a2 * (*band_state) + a3 * v3; // lowpass output
+    *band_state = 2.0f * v1 - *band_state;
+    *low_state = 2.0f * v2 - *low_state;
+    // Same defense-in-depth hard state clamp as run_svf_filter's own -- see its comment.
+    *band_state = fmaxf(-1.0e6f, fminf(1.0e6f, *band_state));
+    *low_state = fmaxf(-1.0e6f, fminf(1.0e6f, *low_state));
+    float high = input - k * v1 - v2;
+    switch (filter_type) {
+        case 1:  return v2;        // LPF
+        case 2:  return high;      // HPF
+        case 3:  return v1;        // BPF
+        default: return v2 + high; // Notch (filter_type == 4)
+    }
+}
+
+// One 1-pole TPT stage, for a Slope choice's odd 6dB remainder (Lowpass/Highpass only -- see this
+// effect's own #define comment for why Bandpass/Notch never call this). Same trapezoidal-integrator
+// family as the 2-pole stage above (and as this file's own fetcomp_highpass/FairKid67 DC blockers),
+// just first-order: g_one is tan(pi*fc/fs), the same prewarped coefficient the 2-pole stages use.
+static inline float fx_multifilter_1pole_stage(float input, float g_one, int filter_type, float *z) {
+    float G = g_one / (1.0f + g_one);
+    float v = (input - *z) * G;
+    float lp = v + *z;
+    *z = lp + v;
+    return (filter_type == 2) ? (input - lp) : lp; // HPF: input minus lowpass; LPF: the lowpass itself
+}
+
+typedef struct {
+    float low_state[FX_FILTER_MAX_2POLE_STAGES][2];  // [stage][channel]
+    float band_state[FX_FILTER_MAX_2POLE_STAGES][2];
+    float onepole_z[2]; // [channel] -- only used when the Slope choice needs the odd-6dB extra stage
+} FxMultiFilterState;
+
+static void run_fx_multifilter(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxMultiFilterState *st = (FxMultiFilterState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxMultiFilterState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+
+    int filter_type = 1 + (int)(fmaxf(0.0f, fminf(1.0f, params->param[0])) * 3.0f + 0.5f); // 0..3 -> 1..4 (LP/HP/BP/Notch)
+    if (filter_type < 1) filter_type = 1; else if (filter_type > 4) filter_type = 4;
+
+    float cutoff_hz = fmaxf(40.0f, fminf(18000.0f, fx_eq3_fraction_to_hz(params->param[1])));
+    float res_q = fmaxf(0.0f, fminf(100.0f, params->param[2]));
+
+    static const int slope_db_table[12] = { 6, 12, 18, 24, 30, 36, 42, 48, 60, 72, 84, 96 };
+    int slope_idx = (int)(fmaxf(0.0f, fminf(1.0f, params->param[3])) * 11.0f + 0.5f);
+    if (slope_idx < 0) slope_idx = 0; else if (slope_idx > 11) slope_idx = 11;
+    int total_poles = slope_db_table[slope_idx] / 6;
+    int two_pole_stages = total_poles / 2;
+    bool has_extra_onepole = ((total_poles % 2) == 1) && (filter_type == 1 || filter_type == 2);
+    // Bandpass/Notch have no natural 1-pole equivalent (see this effect's own #define comment) --
+    // an odd Slope choice just rounds down for those two types, and 6dB itself (which would
+    // otherwise resolve to zero stages, i.e. a silent full bypass) clamps up to the smallest
+    // meaningful bandpass/notch this topology can express: one 2-pole stage, 12dB/oct.
+    if ((filter_type == 3 || filter_type == 4) && two_pole_stages < 1) two_pole_stages = 1;
+    if (two_pole_stages > FX_FILTER_MAX_2POLE_STAGES) two_pole_stages = FX_FILTER_MAX_2POLE_STAGES;
+
+    const float k = fmaxf(0.05f, 2.0f * (1.0f - res_q / 100.0f));
+    const float g = tanf((float)M_PI * cutoff_hz / (float)SAMPLE_RATE);
+    const float a1 = 1.0f / (1.0f + g * (g + k));
+    const float a2 = g * a1;
+    const float a3 = g * a2;
+
+    float *chan[2] = { l, r };
+    for (int ch = 0; ch < 2; ch++) {
+        float sig = *chan[ch];
+        for (int s = 0; s < two_pole_stages; s++) {
+            sig = fx_multifilter_2pole_stage(sig, k, a1, a2, a3, filter_type, &st->low_state[s][ch], &st->band_state[s][ch]);
+        }
+        if (has_extra_onepole) {
+            sig = fx_multifilter_1pole_stage(sig, g, filter_type, &st->onepole_z[ch]);
+        }
+        *chan[ch] = sig;
+    }
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -5419,6 +5531,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                     run_fx_peakmax(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
                     if (fx_engine[s].state) gr_db_out[s] = ((FxPeakMaxState *)fx_engine[s].state)->last_gr_db;
                     break;
+                case FX_TYPE_MULTIFILTER: run_fx_multifilter(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through
