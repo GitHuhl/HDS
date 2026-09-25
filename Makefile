@@ -40,14 +40,20 @@ CLAP_OBJ := $(BUILD_DIR)/clap_plugin.o
 # C objects compiled by $(CC) and C++ objects compiled by $(CXX), linked together by $(CXX) (the
 # only correct final link driver for a mixed C/C++ binary -- see $(BIN)/clap's own rules below).
 #
-# Deliberately NOT wired into the `arm64` target: no C++ cross-compiler or cross-built Eigen is
-# configured for that toolchain (see arm64's own comment block), so that build instead compiles
-# with -DHDS_NAM_ENABLED=0 (see backend.c's own guard) and links as plain C exactly as before --
-# selecting FX_TYPE_NAM on that build is a harmless silent pass-through, same as any other
-# unhandled fx_type value.
+# Also wired into the `arm64` target (see its own comment block for ARM64_CXX/ARM64_NAM_OBJS) --
+# there never was a real "no C++ cross-compiler" problem, only a missing recipe: shell.nix's
+# aarch64.stdenv.cc already installs a full aarch64-unknown-linux-gnu-g++ alongside its own -gcc,
+# it just went unused. Eigen needs nothing extra either way (header-only, architecture-independent).
 NAM_DIR := third_party/NeuralAmpModelerCore
 EIGEN_DIR := third_party/eigen
 NAM_BUILD_DIR := $(BUILD_DIR)/nam
+# Defined here (not down by the arm64 target's own NAM pattern rules) specifically because the
+# shared $(BUILD_DIR) $(NAM_BUILD_DIR) $(ARM64_NAM_BUILD_DIR): directory rule below references it --
+# a := variable used in a target/prerequisite list expands to whatever value it holds AT THAT LINE,
+# not its final value, so defining this any later left that combined rule silently missing the
+# arm64-nam target entirely (confirmed directly: `make -n arm64` failed with "No rule to make
+# target 'build/arm64-nam/activations.o'" until this moved up here).
+ARM64_NAM_BUILD_DIR := $(BUILD_DIR)/arm64-nam
 NAM_INC := -I$(NAM_DIR) -I$(NAM_DIR)/Dependencies/nlohmann -I$(EIGEN_DIR)
 # -fPIC unconditionally, not just for the `clap` target's shared-object link: these objects are
 # shared between $(BIN) (a plain executable) and $(CLAP_BIN) (a shared object, which REQUIRES
@@ -134,6 +140,11 @@ CLAP_SRC := src/clap_plugin.c
 # -- check the Pi's glibc version (`ldd --version`) against this if a binary that has the right
 # interpreter and libraries still won't run.
 ARM64_CC ?= aarch64-unknown-linux-gnu-gcc
+# Already installed by shell.nix's aarch64.stdenv.cc alongside ARM64_CC above (same package
+# installs both under this prefix) -- used only for the NAM objects and the arm64 target's own
+# final link (see NAM's own comment on why $(CXX)/$(ARM64_CXX), not the C compiler, has to be the
+# final link driver for a mixed C/C++ binary).
+ARM64_CXX ?= aarch64-unknown-linux-gnu-g++
 ARM64_BIN := synth_engine-arm64
 # Where liblo gets copied to, alongside the binary, so the Pi needs no apt-get for it (see above
 # for why alsa-lib itself is excluded from this bundle on purpose). Copy this directory to the Pi
@@ -145,7 +156,7 @@ ARM64_LIBDIR := arm64-libs
 
 all: $(BIN)
 
-$(BUILD_DIR) $(NAM_BUILD_DIR):
+$(BUILD_DIR) $(NAM_BUILD_DIR) $(ARM64_NAM_BUILD_DIR):
 	mkdir -p $@
 
 # backend.c/clap_plugin.c stay plain C, compiled by $(CC) exactly as before -- only the FINAL link
@@ -173,11 +184,35 @@ $(BIN): $(BIN_OBJ) $(NAM_OBJS)
 clap: $(CLAP_OBJ) $(NAM_OBJS)
 	$(CXX) -shared -o $(CLAP_BIN) $(CLAP_OBJ) $(NAM_OBJS) $(LDLIBS)
 
-ARM64_INTERP := /lib/ld-linux-aarch64.so.1
+# arm64's own NAM object set: SEPARATE .o files from $(NAM_OBJS) above (wrong ISA to reuse, even
+# though the flags are identical -- NAM_CXXFLAGS needs nothing arm64-specific since NAM_INC is just
+# header paths, architecture-independent either way), built by $(ARM64_CXX) into their own
+# directory so a `make` and a `make arm64` in the same tree never fight over the same .o files.
+# (ARM64_NAM_BUILD_DIR itself is defined up with NAM_BUILD_DIR near the top of this file, not here
+# -- see that definition's own comment for why.)
+ARM64_NAM_OBJS := $(addprefix $(ARM64_NAM_BUILD_DIR)/,$(notdir $(NAM_SRCS:.cpp=.o)))
 
-arm64: $(SRC)
+$(ARM64_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/%.cpp | $(ARM64_NAM_BUILD_DIR)
+	$(ARM64_CXX) $(NAM_CXXFLAGS) -c $< -o $@
+
+$(ARM64_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp | $(ARM64_NAM_BUILD_DIR)
+	$(ARM64_CXX) $(NAM_CXXFLAGS) -c $< -o $@
+
+$(ARM64_NAM_BUILD_DIR)/%.o: src/%.cpp | $(ARM64_NAM_BUILD_DIR)
+	$(ARM64_CXX) $(NAM_CXXFLAGS) -c $< -o $@
+
+ARM64_INTERP := /lib/ld-linux-aarch64.so.1
+ARM64_BIN_OBJ := $(BUILD_DIR)/backend-arm64.o
+
+# backend.c itself stays plain C, compiled by $(ARM64_CC) exactly like the native $(BIN_OBJ) rule
+# above -- only the FINAL link step needs $(ARM64_CXX), to pull in libstdc++ for the NAM objects
+# linked alongside it, same reasoning as $(BIN)/clap's own rules.
+$(ARM64_BIN_OBJ): $(SRC) src/nam_bridge.h | $(BUILD_DIR)
 	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
-	$(ARM64_CC) $(CFLAGS) -DHDS_NAM_ENABLED=0 $(ARM64_CFLAGS) -o $(ARM64_BIN) $(SRC) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo
+	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $(SRC) -o $@
+
+arm64: $(ARM64_BIN_OBJ) $(ARM64_NAM_OBJS)
+	$(ARM64_CXX) -o $(ARM64_BIN) $(ARM64_BIN_OBJ) $(ARM64_NAM_OBJS) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo
 	mkdir -p $(ARM64_LIBDIR)
 	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
 	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_BIN)

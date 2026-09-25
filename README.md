@@ -1076,13 +1076,17 @@ already used by Sequencer audio lanes) into a hand-rolled direct-form FIR (cappe
 ~85ms at 48kHz -- comfortably covers real guitar cab IRs, which decay within tens of milliseconds)
 rather than pulling in a second file-format dependency for the one thing actually needed.
 
-**Not wired into the `make arm64` cross-build**: no C++ cross-compiler or cross-built Eigen is
-configured for that toolchain (see the Makefile's own comment on why bundling a pure-C-only
-dependency like liblo is straightforward but a real C++ numerical library isn't, for a target this
-session hasn't set up nix-shell for). That build instead compiles with `-DHDS_NAM_ENABLED=0` (see
-`backend.c`'s own guard around every bridge-touching line), which selecting `NAM` as an FX Type on
-that build falls through to as a harmless silent pass-through -- exactly like any other unhandled
-`fx_type` value already does today, not a crash or a build break.
+**Now wired into the `make arm64` cross-build too**: there never was a real "no C++ cross-compiler"
+problem, only a missing Makefile recipe -- `shell.nix`'s `aarch64.stdenv.cc` already installs a full
+`aarch64-unknown-linux-gnu-g++` alongside its own `-gcc`, it just went unused. `make arm64` now
+cross-compiles NAM's own objects into a separate `build/arm64-nam/` directory (so a native `make`
+and a `make arm64` in the same tree never fight over the same `.o` files) and links
+`synth_engine-arm64` with the cross `g++` for the same reason the native build already links with
+`$(CXX)` instead of `$(CC)` -- pulling in libstdc++ for the NAM objects linked alongside an
+otherwise-C binary. Eigen needed nothing extra either way (header-only, architecture-independent).
+`shell.nix` now also bundles the cross-built `libstdc++.so.6`/`libgcc_s.so.1` alongside the binary,
+same reasoning as the existing liblo bundling (don't gamble on whatever version happens to already
+be on a given Pi's own OS image).
 
 ### Gate / EQ3 / Limiter FX slots
 

@@ -129,7 +129,21 @@ pkgs.mkShell {
     # chip. Bundling this one wouldn't just risk "missing files" the way liblo's absence would --
     # it risks the audio device silently behaving wrong. See the Makefile's own comment and the
     # README's apt-get instructions for what the Pi needs installed for alsa-lib instead.
-    export ARM64_BUNDLE_LIBS="${aarch64.liblo}/lib/liblo.so.7"
+    #
+    # libstdc++/libgcc_s: needed now that the NAM FX slot's C++ objects are cross-compiled and
+    # linked into synth_engine-arm64 too (see the Makefile's own ARM64_CXX comment). Bundled for
+    # the exact same reason as the glibc-version note in the Makefile's own arm64 comment block --
+    # this cross toolchain's libstdc++ needs to be no OLDER than what the binary's own
+    # GLIBCXX_x.x.x-versioned symbol references need, and there's no reason to gamble on whatever
+    # libstdc++6 happens to already be on a given Pi's own Raspberry Pi OS image when bundling the
+    # matching one is this cheap. `stdenv.cc.cc` is nixpkgs' own name for the unwrapped compiler
+    # package underneath the aarch64-unknown-linux-gnu-g++ wrapper on PATH above; `.lib` is its
+    # output containing these two runtime shared libraries -- the standard nixpkgs convention for
+    # this, though not independently re-verified against this specific pinned nixpkgs-24.05
+    # revision the way the liblo/alsa-lib paths above were (no Nix available to re-check from
+    # inside this port's own dev environment -- worth confirming with `ls` on the actual path
+    # `nix-shell` resolves this to, the first time this target is built for real).
+    export ARM64_BUNDLE_LIBS="${aarch64.liblo}/lib/liblo.so.7 ${aarch64.stdenv.cc.cc.lib}/lib/libstdc++.so.6 ${aarch64.stdenv.cc.cc.lib}/lib/libgcc_s.so.1"
 
     # Auto-provision a local venv for the PySide6 frontend, matching requirements.txt exactly --
     # created once, reused (and only re-synced when requirements.txt actually changes) on every
