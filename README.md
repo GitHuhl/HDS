@@ -963,13 +963,29 @@ pulls in only `src/fx_types.h` (the FX slot data model) and `src/fx_chain.c` (th
 bus. A slot's parameters (`FXSlotParams`) are the exact same struct either way, so they're already
 byte-for-byte interchangeable between the synth's embedded FX and this plugin.
 
-**Multi-input + chaining, "as the normal HDS FX section"**: 8 independent stereo buses (`HDS_FX_BUS_COUNT`),
-each its own `SOURCE_COUNT`-shaped chain of up to 12 (`FX_SLOT_COUNT`) FX slots -- the exact same
-`fx_source`/`fx_source_routing_mode`/`chain_to_next`/`sidechain_source` model backend.c's own 8
-ext-in pairs already use (see `process_fx_chain()`'s own comment in fx_chain.c), just with no
-synth ("Program") bus at all. A host that only cares about one signal path just wires up bus 0 (its
-audio ports are named "Input 1"/"Output 1", `IS_MAIN` on both sides); a host that wants HDS FX
-processing several buses in one instance wires up as many of the other 7 as it wants.
+**Multi-input + chaining, "as the normal HDS FX section"**: 8 independent stereo buses
+(`HDS_FX_BUS_COUNT`) sharing ONE pool of 32 (`FX_SLOT_COUNT`) FX slots -- the exact same
+`fx_source`/`fx_source_routing_mode`/`chain_to_next`/`sidechain_source` model backend.c's own
+`SynthSharedControls.fx[FX_SLOT_COUNT]`/8 ext-in pairs already use (see `process_fx_chain()`'s own
+comment in fx_chain.c), just with no synth ("Program") bus and a bigger pool (nothing else is
+competing for the slot budget here). Each slot's own `fx_source` field says which ONE of the 8 buses
+it currently serves, and is freely reassignable -- moving a slot from Bus 3 to Bus 5 is just writing
+a new `fx_source`, no engine-state shuffling needed, since `fx_engine[]` stays indexed by physical
+pool slot regardless of which bus owns it this block (a slot's lazily-allocated DSP state, e.g. a
+delay's buffered tail, survives a live bus reassignment exactly like it already survives a live
+bypass toggle). A host that only cares about one signal path just wires up bus 0 (its audio ports
+are named "Input 1"/"Output 1", `IS_MAIN` on both sides); a host that wants HDS FX processing
+several buses in one instance wires up as many of the other 7 as it wants.
+
+This shared-pool model replaced this file's own first-draft design (8 independent, pinned 12-slot
+arrays, one hardcoded to each bus) once it became clear that design could never let a slot be
+reassigned to a different bus's input at all: `process_fx_chain()`'s own bucketing is driven
+entirely by each slot's `fx_source` field matching the caller's `source_id`, and a pinned array made
+that trivially true for exactly one bus, permanently. `FX_SLOT_COUNT` is the exact macro name
+`process_fx_chain()`/`sync_fx_engine_types()`/`reset_fx_engine()` (fx_chain.c) size their own array
+parameters by; since `src/hds_fx_plugin.c` is its own separate translation unit (never linked with
+backend.c's own copy of fx_chain.c), redefining it here to 32 rather than backend.c's own 12 is safe
+and gives this exact shared-pool bucketing model for free, at whatever pool size this plugin wants.
 
 **Multi-instance is free, not new work**: `process_fx_chain()`/`sync_fx_engine_types()`/
 `reset_fx_engine()` already take every piece of state as an explicit parameter and touch no globals
@@ -991,14 +1007,14 @@ than an oversight:
   engages. HardTune's actual pitch correction is unaffected. A real MIDI input (for CC/pitch-bend
   modulation of FX params generally, not just this one effect's vibrato) is a natural, separate
   future addition.
-- **Params extension exposes Mix only** (96 = 8 buses x 12 slots), the same curated "expose Mix,
-  not every field" choice `clap_plugin.c`'s own `HDS_CLAP_PARAMS` already made for the synth's FX
-  slots, for the same reason (no min/max/default metadata exists for the other ~5 fields per slot
-  without hand-authoring it, and a host's automation-lane picker gets unusable fast past a few
-  hundred entries). Type/Bypass/routing are meant to be driven by this plugin's own native GUI
-  instead (see below) -- writing directly into the plugin's per-instance struct, the same plain
-  unsynchronized main-thread-writes/audio-thread-reads float race `clap_plugin.c`'s own `p->knobs`
-  already accepts.
+- **Params extension exposes Mix only** (32, one per pool slot, not per bus x slot -- a slot's bus
+  is dynamic now, not part of its identity), the same curated "expose Mix, not every field" choice
+  `clap_plugin.c`'s own `HDS_CLAP_PARAMS` already made for the synth's FX slots, for the same reason
+  (no min/max/default metadata exists for the other ~5 fields per slot without hand-authoring it,
+  and a host's automation-lane picker gets unusable fast past a few hundred entries). Type/Bypass/
+  Source/routing are meant to be driven by this plugin's own native GUI instead (see below) --
+  writing directly into the plugin's per-instance struct, the same plain unsynchronized
+  main-thread-writes/audio-thread-reads float race `clap_plugin.c`'s own `p->knobs` already accepts.
 - **No `state` extension (DAW project save/load) yet.** A real, known gap for an "experiment" build,
   not silently swept under anything -- a host that doesn't get state persistence for this plugin
   will say so.
@@ -1007,11 +1023,15 @@ than an oversight:
 Verified without a real CLAP host (none is available in this sandbox): a from-scratch offline test
 harness links `hds_fx_plugin.c` directly, calls its own factory to build a real plugin instance, and
 drives it through `activate()`/`process()`/`deactivate()`/`destroy()` with synthetic audio and
-manually-built `clap_process_t`/extension calls. Confirmed: an all-`FX_TYPE_OFF` bus is an exact,
-bit-for-bit passthrough; a bus with `FX_TYPE_LIMITER` engaged genuinely reduces peak level (0.9 ->
-0.16 on a test tone, not a no-op); unconnected buses don't crash; the audio-ports extension reports
-8 correctly-named/flagged ports each way; the params extension reports all 96 Mix params with
-correct default values and round-trips a value write.
+manually-built `clap_process_t`/extension calls. Confirmed: every pool slot defaults to `fx_source
+== 0` (Bus 1); a bus owning zero slots is an exact, bit-for-bit passthrough; a bus with
+`FX_TYPE_LIMITER` engaged genuinely reduces peak level (0.9 -> 0.16 on a test tone, not a no-op);
+reassigning a slot's `fx_source` live, mid-session, moves the effect to the new bus, leaves the old
+bus back at plain passthrough, and does NOT reallocate that slot's `FXSlotEngine.state` (verified by
+comparing the raw pointer before/after -- only a `fx_type` change may ever do that) -- the actual
+architectural fix this rearchitecture exists for; unconnected buses don't crash; the audio-ports
+extension reports 8 correctly-named/flagged ports each way; the params extension reports all 32 Mix
+params with correct default values and round-trips a value write.
 
 ### Command-line flags
 

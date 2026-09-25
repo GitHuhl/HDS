@@ -38,7 +38,15 @@
 // input/output pairs, each its own SOURCE_COUNT-shaped bus -- the exact same fx_source/
 // fx_source_routing_mode/chain_to_next model backend.c's own ext-in pairs already use, just with no
 // "Program" bus (there is no synth here at all). See clap_audio_ports_get() below for the port
-// layout and HdsFxPlugin's own comment for how a bus's FX_SLOT_COUNT slots are stored.
+// layout and HdsFxPlugin's own comment for how the slot pool is shared across all 8 buses, exactly
+// like the synth's own SynthSharedControls.fx[FX_SLOT_COUNT].
+//
+// A slot's Source (fx_source) is freely reassignable to ANY of the 8 buses, not pinned at creation
+// -- see HdsFxPlugin's own comment for why this requires ONE shared pool of slots (matching the
+// synth's real architecture) rather than 8 independent pinned arrays, which was this file's own
+// first-draft mistake (a slot could never be moved to a different bus's input, since
+// process_fx_chain()'s own bucketing is entirely driven by each slot's fx_source field matching the
+// caller's source_id -- a pinned array made that always trivially true for exactly one bus).
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -56,7 +64,16 @@
 #define SAMPLE_RATE 48000
 #define BUFFER_SIZE 1024
 #define SAMPLE_PATH_LEN 256
-#define FX_SLOT_COUNT 12
+// The synth's own FX bus uses 12 (SynthSharedControls.fx[FX_SLOT_COUNT]) because it's a shared
+// budget with everything else a Combi Program needs; HDS FX has no synth competing for that budget
+// at all, so this is sized generously -- 32 slots shared across all 8 buses, plenty of headroom for
+// several buses each running a real multi-slot chain at once. FX_SLOT_COUNT is the exact macro name
+// process_fx_chain()/sync_fx_engine_types()/reset_fx_engine() (fx_chain.c) size their own array
+// parameters by -- this file is its own separate translation unit (never linked with backend.c's
+// copy of fx_chain.c), so redefining it here to a different value than backend.c's own 12 is safe
+// and gives the exact same shared-pool bucketing model fx_chain.c already implements, for free, at
+// whatever pool size this plugin wants.
+#define FX_SLOT_COUNT 32
 #define HDS_FX_BUS_COUNT 8
 // process_fx_chain()'s own sidechain model addresses a "source" by a plain 0..SOURCE_COUNT-1 index
 // (see FXSlotParams.sidechain_source's own comment in fx_types.h) -- here that's just "which of
@@ -75,26 +92,30 @@
 // ---------------------------------------------------------------------------------------------
 // Plugin instance
 // ---------------------------------------------------------------------------------------------
-// fx[bus]/fx_engine[bus]: HDS_FX_BUS_COUNT independent FX_SLOT_COUNT-slot chains, one per audio
-// bus -- physically identical shape to backend.c's own SynthSharedControls.fx[FX_SLOT_COUNT]/
-// FXSlotEngine fx_engine[FX_SLOT_COUNT], just duplicated per bus instead of shared by every
-// source. fx[bus][s].fx_source is always == bus (see clap_factory_create_plugin's own
-// initialization) -- a slot never crosses buses, unlike the synth's own model where any slot can
-// be assigned to any source; that generality bought nothing here since there's no UI reason to let
-// a slot on Input 3 process Input 5's signal instead; the field stays (process_fx_chain needs it),
-// it's just pinned per-bus by construction.
+// fx/fx_engine: ONE shared pool of FX_SLOT_COUNT slots across ALL 8 buses -- physically identical
+// model to backend.c's own SynthSharedControls.fx[FX_SLOT_COUNT]/FXSlotEngine
+// fx_engine[FX_SLOT_COUNT], just sized bigger (see FX_SLOT_COUNT's own comment) since there's no
+// synth sharing the budget here. Each slot's own fx_source field (0..HDS_FX_BUS_COUNT-1) says which
+// ONE bus it currently serves -- process_fx_chain()'s own bucketing (`fx_params[s].fx_source ==
+// source_id`) is what makes this genuinely reassignable: a slot can move from Bus 3 to Bus 5 just
+// by writing a new fx_source, no engine-state shuffling needed. fx_engine[] stays indexed by
+// physical POOL slot regardless of which bus owns it this block, so a slot's lazily-allocated DSP
+// state (e.g. a delay's buffered tail) survives a live bus reassignment exactly like it already
+// survives a live bypass toggle -- see process_fx_chain()'s own comment. Every slot defaults to Bus
+// 1 (fx_source = 0) at creation, matching the Standalone FX tab's own "every slot defaults to
+// Program" convention -- see hds_fx_init_pool_defaults().
 typedef struct {
     clap_plugin_t plugin;
     const clap_host_t *host;
 
-    FXSlotParams fx[HDS_FX_BUS_COUNT][FX_SLOT_COUNT];
-    FXSlotEngine fx_engine[HDS_FX_BUS_COUNT][FX_SLOT_COUNT];
-    float bus_routing_mode[HDS_FX_BUS_COUNT]; // 0 = Series, 1 = Parallel -- see process_fx_chain()'s own routing_mode parameter
-    float gr_db_scratch[HDS_FX_BUS_COUNT][FX_SLOT_COUNT]; // required non-NULL out-param, not yet exposed to the host/GUI
+    FXSlotParams fx[FX_SLOT_COUNT];
+    FXSlotEngine fx_engine[FX_SLOT_COUNT];
+    float bus_routing_mode[HDS_FX_BUS_COUNT]; // 0 = Series, 1 = Parallel, one per BUS (not per slot) -- see process_fx_chain()'s own routing_mode parameter
+    float gr_db_scratch[FX_SLOT_COUNT]; // required non-NULL out-param, not yet exposed to the host/GUI -- shared across all 8 buses' own calls, same convention as backend.c's own gr_db_out (see render_audio_block)
 
     // CLAP params extension shadow (see hds_fx_push_changed_params's own comment, same pattern
     // clap_plugin.c already uses for HDS_CLAP_PARAMS) -- one entry per exposed param.
-    double param_shadow[HDS_FX_BUS_COUNT * FX_SLOT_COUNT];
+    double param_shadow[FX_SLOT_COUNT];
 
     bool gui_open;
 } HdsFxPlugin;
@@ -132,32 +153,28 @@ static const clap_plugin_audio_ports_t k_audio_ports_ext = {
 };
 
 // ---------------------------------------------------------------------------------------------
-// params extension: per-bus, per-slot Mix -- same curated "expose Mix only, drive everything else
-// (Type, Bypass, routing) from the plugin's own GUI" choice clap_plugin.c's own HDS_CLAP_PARAMS
+// params extension: per-slot Mix -- same curated "expose Mix only, drive everything else (Type,
+// Bypass, Source, routing) from the plugin's own GUI" choice clap_plugin.c's own HDS_CLAP_PARAMS
 // already made for the synth's 12 FX slots (see that table's own comment for the full reasoning:
 // no min/max/default metadata exists for the other ~9 fields per slot without hand-authoring it,
-// and a host's automation-lane picker gets unusable if handed hundreds of raw entries). Every
-// other field (fx_type, bypass, fx_source's fixed pin, chain_to_next, sidechain_source) is written
-// directly by this plugin's own GUI -- see hds_fx_gui.c -- the same plain unsynchronized
-// main-thread-writes/audio-thread-reads float race clap_plugin.c's own p->knobs already accepts
-// (a torn read degrades to "the GUI briefly shows a stale value," never a crash).
-#define HDS_FX_PARAM_COUNT (HDS_FX_BUS_COUNT * FX_SLOT_COUNT)
-
-// A param's id IS bus*FX_SLOT_COUNT+slot directly -- no separate id<->(bus,slot) forward mapping
-// needed, just this one inverse.
-static void hds_fx_param_id_to_bus_slot(clap_id id, int *bus, int *slot) { *bus = (int)id / FX_SLOT_COUNT; *slot = (int)id % FX_SLOT_COUNT; }
+// and a host's automation-lane picker gets unusable if handed hundreds of raw entries). One param
+// per POOL slot (not per bus*slot -- see HdsFxPlugin's own comment, a slot's bus is now dynamic,
+// not part of its identity). Every other field (fx_type, bypass, fx_source, chain_to_next,
+// sidechain_source) is written directly by this plugin's own GUI -- see hds_fx_gui.c -- the same
+// plain unsynchronized main-thread-writes/audio-thread-reads float race clap_plugin.c's own
+// p->knobs already accepts (a torn read degrades to "the GUI briefly shows a stale value," never a
+// crash).
+#define HDS_FX_PARAM_COUNT FX_SLOT_COUNT
 
 static uint32_t hds_fx_params_count(const clap_plugin_t *plugin) { (void)plugin; return HDS_FX_PARAM_COUNT; }
 
 static bool hds_fx_params_get_info(const clap_plugin_t *plugin, uint32_t index, clap_param_info_t *info) {
     (void)plugin;
     if (index >= HDS_FX_PARAM_COUNT) return false;
-    int bus, slot;
-    hds_fx_param_id_to_bus_slot((clap_id)index, &bus, &slot);
     memset(info, 0, sizeof(*info));
     info->id = (clap_id)index;
     info->flags = CLAP_PARAM_IS_AUTOMATABLE;
-    snprintf(info->name, sizeof(info->name), "Bus %d Slot %d Mix", bus + 1, slot + 1);
+    snprintf(info->name, sizeof(info->name), "Slot %u Mix", (unsigned int)(index + 1));
     info->min_value = 0.0;
     info->max_value = 100.0;
     info->default_value = 100.0;
@@ -167,9 +184,7 @@ static bool hds_fx_params_get_info(const clap_plugin_t *plugin, uint32_t index, 
 static bool hds_fx_params_get_value(const clap_plugin_t *plugin, clap_id param_id, double *out_value) {
     HdsFxPlugin *p = (HdsFxPlugin *)plugin->plugin_data;
     if (param_id >= HDS_FX_PARAM_COUNT) return false;
-    int bus, slot;
-    hds_fx_param_id_to_bus_slot(param_id, &bus, &slot);
-    *out_value = (double)p->fx[bus][slot].mix;
+    *out_value = (double)p->fx[param_id].mix;
     return true;
 }
 
@@ -192,11 +207,9 @@ static bool hds_fx_params_text_to_value(const clap_plugin_t *plugin, clap_id par
 
 static void hds_fx_apply_param_event(HdsFxPlugin *p, const clap_event_param_value_t *ev) {
     if (ev->param_id >= HDS_FX_PARAM_COUNT) return;
-    int bus, slot;
-    hds_fx_param_id_to_bus_slot(ev->param_id, &bus, &slot);
     double v = ev->value;
     if (v < 0.0) v = 0.0; else if (v > 100.0) v = 100.0;
-    p->fx[bus][slot].mix = (float)v;
+    p->fx[ev->param_id].mix = (float)v;
     p->param_shadow[ev->param_id] = v;
 }
 
@@ -206,9 +219,7 @@ static void hds_fx_apply_param_event(HdsFxPlugin *p, const clap_event_param_valu
 static void hds_fx_push_changed_params(HdsFxPlugin *p, const clap_output_events_t *out_events) {
     if (!out_events) return;
     for (uint32_t i = 0; i < HDS_FX_PARAM_COUNT; i++) {
-        int bus, slot;
-        hds_fx_param_id_to_bus_slot((clap_id)i, &bus, &slot);
-        double current = (double)p->fx[bus][slot].mix;
+        double current = (double)p->fx[i].mix;
         if (current == p->param_shadow[i]) continue;
         p->param_shadow[i] = current;
         clap_event_param_value_t ev = {0};
@@ -251,18 +262,18 @@ static const clap_plugin_params_t k_params_ext = {
 // Plugin lifecycle
 // ---------------------------------------------------------------------------------------------
 
-static void hds_fx_init_bus_defaults(HdsFxPlugin *p, int bus) {
+static void hds_fx_init_pool_defaults(HdsFxPlugin *p) {
     for (int s = 0; s < FX_SLOT_COUNT; s++) {
-        p->fx[bus][s] = (FXSlotParams){0};
-        p->fx[bus][s].fx_type = FX_TYPE_OFF;
-        p->fx[bus][s].mix = 100.0f;
-        p->fx[bus][s].bypass = 0.0f;
-        p->fx[bus][s].fx_source = (float)bus; // pinned -- see HdsFxPlugin's own comment
-        p->fx[bus][s].chain_to_next = 0.0f;
-        p->fx[bus][s].sidechain_source = -1.0f; // "Same as Source" -- see FXSlotParams' own comment
+        p->fx[s] = (FXSlotParams){0};
+        p->fx[s].fx_type = FX_TYPE_OFF;
+        p->fx[s].mix = 100.0f;
+        p->fx[s].bypass = 0.0f;
+        p->fx[s].fx_source = 0.0f; // every slot defaults to Bus 1 -- freely reassignable via the GUI's own Source pill, see HdsFxPlugin's own comment
+        p->fx[s].chain_to_next = 0.0f;
+        p->fx[s].sidechain_source = -1.0f; // "Same as Source" -- see FXSlotParams' own comment
     }
-    reset_fx_engine(p->fx_engine[bus]);
-    p->bus_routing_mode[bus] = 0.0f; // Series
+    reset_fx_engine(p->fx_engine);
+    for (int bus = 0; bus < HDS_FX_BUS_COUNT; bus++) p->bus_routing_mode[bus] = 0.0f; // Series
 }
 
 static bool hds_fx_plugin_init(const clap_plugin_t *plugin) { (void)plugin; return true; }
@@ -290,15 +301,13 @@ static void hds_fx_plugin_stop_processing(const clap_plugin_t *plugin) { (void)p
 
 static void hds_fx_plugin_reset(const clap_plugin_t *plugin) {
     HdsFxPlugin *p = (HdsFxPlugin *)plugin->plugin_data;
-    // Full DSP state reset (delay lines, filter memories, envelope followers) per bus, parameter
-    // values (fx[][].mix/fx_type/etc.) unchanged -- matches CLAP's own contract for reset(), same
-    // as clap_plugin_reset()'s own posture in clap_plugin.c.
-    for (int bus = 0; bus < HDS_FX_BUS_COUNT; bus++) {
-        for (int s = 0; s < FX_SLOT_COUNT; s++) {
-            free(p->fx_engine[bus][s].state);
-            p->fx_engine[bus][s].state = NULL;
-            p->fx_engine[bus][s].active_type = FX_TYPE_OFF;
-        }
+    // Full DSP state reset (delay lines, filter memories, envelope followers) across the whole
+    // pool, parameter values (fx[].mix/fx_type/etc.) unchanged -- matches CLAP's own contract for
+    // reset(), same as clap_plugin_reset()'s own posture in clap_plugin.c.
+    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+        free(p->fx_engine[s].state);
+        p->fx_engine[s].state = NULL;
+        p->fx_engine[s].active_type = FX_TYPE_OFF;
     }
 }
 
@@ -323,8 +332,12 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
     }
 
     // PRECONDITION for process_fx_chain() (see its own comment): a slot's active_type must be
-    // synced to its current fx_type once per block, before any per-sample dispatch.
-    for (int bus = 0; bus < HDS_FX_BUS_COUNT; bus++) sync_fx_engine_types(p->fx[bus], p->fx_engine[bus]);
+    // synced to its current fx_type once per block, before any per-sample dispatch. One call now
+    // (not once per bus) -- there's only one pool.
+    sync_fx_engine_types(p->fx, p->fx_engine);
+    // gr_db_scratch zeroed once per block, then refreshed by whichever bus's call owns each slot
+    // this sample -- same convention as backend.c's own gr_db_out (see render_audio_block).
+    for (int s = 0; s < FX_SLOT_COUNT; s++) p->gr_db_scratch[s] = 0.0f;
 
     float *in_l[HDS_FX_BUS_COUNT], *in_r[HDS_FX_BUS_COUNT], *out_l[HDS_FX_BUS_COUNT], *out_r[HDS_FX_BUS_COUNT];
     for (int bus = 0; bus < HDS_FX_BUS_COUNT; bus++) {
@@ -351,7 +364,7 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
         }
         for (int bus = 0; bus < HDS_FX_BUS_COUNT; bus++) {
             float l = sc_snapshot_l[bus], r = sc_snapshot_r[bus];
-            process_fx_chain(p->fx[bus], p->fx_engine[bus], (int)p->bus_routing_mode[bus], bus, sc_snapshot_l, sc_snapshot_r, &l, &r, p->gr_db_scratch[bus]);
+            process_fx_chain(p->fx, p->fx_engine, (int)p->bus_routing_mode[bus], bus, sc_snapshot_l, sc_snapshot_r, &l, &r, p->gr_db_scratch);
             if (out_l[bus]) out_l[bus][i] = l;
             if (out_r[bus]) out_r[bus][i] = r;
         }
@@ -386,9 +399,9 @@ static const clap_plugin_descriptor_t k_descriptor = {
     .support_url = "",
     .version = "0.1.0-experiment",
     .description = "HDS's FX chain (HT-76, Fairchild 670, LA-2A, FDNVerb, ...) as a standalone, "
-                    "synth-free Linux CLAP effects plugin. 8 independent stereo buses, each with "
-                    "up to 12 chained/parallel-routed FX slots -- host-automatable/UI-driven only, "
-                    "no networking.",
+                    "synth-free Linux CLAP effects plugin. 8 independent stereo buses sharing a pool "
+                    "of 32 chained/parallel-routed, freely reassignable FX slots -- "
+                    "host-automatable/UI-driven only, no networking.",
     .features = k_features,
 };
 
@@ -400,7 +413,7 @@ static const clap_plugin_t *hds_fx_factory_create_plugin(const clap_plugin_facto
     if (!p) return NULL;
 
     p->host = host;
-    for (int bus = 0; bus < HDS_FX_BUS_COUNT; bus++) hds_fx_init_bus_defaults(p, bus);
+    hds_fx_init_pool_defaults(p);
     for (uint32_t i = 0; i < HDS_FX_PARAM_COUNT; i++) p->param_shadow[i] = 100.0; // matches mix's own default above
 
     p->plugin.desc = &k_descriptor;
