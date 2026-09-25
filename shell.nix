@@ -3,6 +3,8 @@
 ##
 ##   make                  -> ./synth_engine        (native Linux backend, ALSA)
 ##   make clap             -> ./hds.clap            (Linux CLAP plugin)
+##   make hds-fx           -> ./hds_fx.clap         (standalone multi-FX CLAP plugin -- needs Cairo +
+##                                                    X11, see pkgs.cairo/pkgs.xorg.libX11 below)
 ##   python3 src/frontend.py                        (PySide6 GUI -- see the auto-venv shellHook below)
 ##
 ##   make arm64            -> synth_engine-arm64    (aarch64 Linux, e.g. Raspberry Pi 5)
@@ -66,7 +68,16 @@ pkgs.mkShell {
                               # else in this file needs to change for that.
     pkgs.pkg-config          # the Makefile's own PipeWire auto-detection needs `pkg-config` itself
                               # on PATH -- not previously required here since every other dependency
-                              # (alsa-lib, liblo) is linked via hardcoded -l flags instead.
+                              # (alsa-lib, liblo) is linked via hardcoded -l flags instead. Also what
+                              # `make hds-fx` uses to find Cairo/X11 below (see HDS_FX_CFLAGS/
+                              # HDS_FX_LDLIBS in the Makefile).
+
+    # --- HDS FX's own real embedded GUI (make hds-fx) --- src/hds_fx_gui_draw.c (Cairo drawing)
+    # + src/hds_fx_gui_x11.c (the X11 window/XEmbed/event-pump shim, see that file's own header
+    # comment). Found via `pkg-config --cflags/--libs cairo x11` in the Makefile, same
+    # auto-detection posture as the PipeWire block above -- just needs both on PATH here.
+    pkgs.cairo
+    pkgs.xorg.libX11
 
     # --- Python frontend (python3 src/frontend.py) --- PySide6/python-osc's exact pinned
     # versions (see requirements.txt) aren't reliably both present/current in every nixpkgs
@@ -103,6 +114,7 @@ pkgs.mkShell {
     echo "  make            -> ./synth_engine   (pkg-config auto-detects PipeWire -- run with"
     echo "                                       --backend pipewire once built to use it)"
     echo "  make clap       -> ./hds.clap"
+    echo "  make hds-fx     -> ./hds_fx.clap    (standalone multi-FX CLAP plugin, real embedded GUI)"
     echo "  make arm64      -> synth_engine-arm64 (aarch64 Linux backend, e.g. Raspberry Pi 5)"
     echo
 
