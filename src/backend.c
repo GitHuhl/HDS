@@ -723,6 +723,63 @@ typedef struct {
 // scoped follow-up if wide-interval MIDI harmony ever becomes a use case here; not attempted yet
 // since it's a materially different, larger change than what pitch CORRECTION itself needs.
 #define FX_TYPE_HARDTUNE 20
+// Algorithmic hall/plate/room reverb built on an 8x8 Feedback Delay Network (FDN) -- like
+// MultiFilter/DeEsser/HardTune, an original implementation of a well-established, generic,
+// published DSP architecture (Jot/Stautner-Puckette-style FDNs with an energy-preserving
+// Hadamard mixing matrix -- textbook material, e.g. Valimaki et al.'s reverb literature), not a
+// clone of any specific commercial unit's own internals. Ported from and informed by
+// github.com/ninuxi/MAI_verb (MIT licensed) -- specifically its FDN8x8 and EarlyReflections
+// engines -- restructured from JUCE's block-oriented API into this engine's own per-sample
+// dispatch (see run_fx_fdnverb()'s own comment for the conversion, the same kind HardTune's own
+// PSOLA needed).
+//
+// Two real, audible-nothing quirks found in the reference source while reading its own call
+// graph (not guessed) and deliberately NOT carried over as knobs here: (1) its Decay Low/Decay
+// High controls are stored but never read by anything that touches audio -- its own
+// updateFeedbackGains() only ever reads rt60Mid, so only ONE decay time does anything acoustically;
+// (2) its Damping Low control computes an hpFreq/hpCoeff that its own FeedbackFilter::process()
+// never applies (only that one-pole filter's lowpass half is ever used) -- Damping Low is
+// silently inert too. Porting either as a real param here would just be two dead pots; the
+// param budget saved is spent on Early Reflections Decay instead, a control the reference's own
+// panel already exposes and one that IS real.
+//
+// param[0] Decay (RT60 -- the actual -60dB decay time, 0.3-12s, log taper: feedback gain per
+// delay line is 10^(-3*delayLenSamples/(RT60*sampleRate)), the standard exponential-decay-per-
+// round-trip formula), param[1] Size (0-100%, scales all 8 delay lengths 0.3x-1.5x -- bigger room,
+// longer pre-mix time before the tail proper), param[2] Pre-Delay (0-250ms, a plain delay ahead
+// of both Early Reflections and the FDN -- the gap before any reflection arrives, reads as
+// physical room distance), param[3] Damping (0-100%, a one-pole lowpass in the feedback path's
+// own loop -- HIGHER damping = darker, faster-decaying highs, exactly like real room air
+// absorption and the one damping control that's actually real), param[4] Diffusion (0-100%,
+// blends each delay's raw tap against the full Hadamard-mixed sum, AND sets the input allpass
+// diffusers' own coefficient -- low is glassy/metallic with audible early echoes, high is a dense,
+// smooth wash), param[5] Mod Rate (0.1-10Hz) and param[6] Mod Depth (0-100%, together a per-delay-
+// line sinusoidal read-position wobble, decorrelated per line via fixed rate/phase offsets -- this
+// is what keeps a long, high-diffusion tail from ringing at a fixed metallic pitch, the same
+// "chorused feedback" trick most algorithmic reverbs use), param[7] Early Reflections Level
+// (0-100%) and param[8] Early Reflections Decay (0-100%, shapes how quickly the 16 discrete
+// early-reflection taps -- alternating polarity, decorrelated L/R timing, simulating real wall
+// bounces -- fall off; Level near 0 isolates the FDN's own smooth tail, useful for hearing it in
+// isolation), param[9] Freeze (choice: Off/On -- forces every feedback gain to 1.0 and stops new
+// input from entering the delay lines, the standard "infinite sustain" reverb-freeze trick:
+// whatever's already circulating loops forever, unchanged, until Freeze is released).
+//
+// Deliberately preserved from the source rather than "cleaned up": Early Level's mix is NOT a
+// clean crossfade of just the reflections -- the source's own ER working buffer starts as a copy
+// of the (pre-delayed) dry signal, EarlyReflections adds its taps ONTO that copy in place, and the
+// WHOLE thing (dry copy + taps together) is what gets scaled by Early Level before summing with
+// the FDN tail. Raising Early Level therefore also proportionally reintroduces a scaled copy of
+// the dry signal into the wet bus, on top of this slot's own generic Mix -- a real, audible
+// characteristic of how the reference algorithm actually sounds, kept here on purpose.
+// One genuine redundancy WAS quietly corrected, though: the reference bakes Early Level into each
+// tap's own gain (EarlyReflections::updateTaps) AND THEN multiplies the already-scaled result by
+// Early Level a second time (M7ReverbEngine::process's own `erOut * currentEarlyLevel`) -- so its
+// knob actually shapes the taps by Level^2 while the dry leak above only sees Level^1, a
+// mismatched, almost certainly unintentional double-application (nothing in the source explains
+// or relies on it). Level is applied exactly ONCE here (as that single final multiply on dry+taps
+// together), giving a knob that responds linearly, the way every other knob in this effect (and
+// this whole engine) does.
+#define FX_TYPE_FDNVERB 21
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -5935,6 +5992,301 @@ static void run_fx_hardtune(FXSlotEngine *engine, const FXSlotParams *params, fl
     st->write_pos++;
 }
 
+// --- FX_TYPE_FDNVERB: see its own #define comment above for the full design, provenance, and the
+// two dead reference-source params deliberately not carried over. Rate ratio is fixed at compile
+// time (unlike the reference's own runtime sampleRate) since this engine's own SAMPLE_RATE always
+// is -- every delay length below is the reference's own 44100Hz table scaled by this ratio once.
+static const float FX_FDNVERB_RATE_RATIO = (float)SAMPLE_RATE / 44100.0f;
+
+#define FX_FDNVERB_NUM_DELAYS 8
+// Power of 2 for cheap masking; comfortably covers this effect's own largest possible base delay
+// (2251 samples @ 44100Hz * this engine's rate ratio * Size's own max 1.5x scale, ~3674 samples
+// @ 48kHz) plus modulation's own few-sample wobble, with real margin -- deliberately NOT the
+// reference's own wasteful flat "2 seconds" allocation, which this design never needs (see the
+// max-base-delay arithmetic above).
+#define FX_FDNVERB_BUF_SIZE 4096
+#define FX_FDNVERB_BUF_MASK (FX_FDNVERB_BUF_SIZE - 1)
+#define FX_FDNVERB_NUM_DIFFUSERS 4
+// Covers every scaled diffuser delay used below (input diffusers up to ~195 samples, Early
+// Reflections' own up to ~178) with real margin -- these are small, fixed, never-modulated
+// integer delays (a true allpass comb, not a fractional/interpolated read), so plain modulo
+// indexing against each instance's own capacity (not a power-of-2 mask) matches the reference
+// exactly.
+#define FX_FDNVERB_SMALL_DIFFUSER_CAP 256
+#define FX_FDNVERB_ER_TAPS 16
+#define FX_FDNVERB_ER_DIFFUSERS 2
+// Power of 2 covering the largest scaled Early Reflections tap delay (87.5ms reference tap *
+// Size's own max 1.5x scale * 48 samples/ms, ~6300 samples) with real margin.
+#define FX_FDNVERB_ER_BUF_SIZE 8192
+#define FX_FDNVERB_ER_BUF_MASK (FX_FDNVERB_ER_BUF_SIZE - 1)
+// Power of 2 covering this effect's own max Pre-Delay (250ms * 48kHz = 12000 samples) with margin.
+#define FX_FDNVERB_PREDELAY_BUF_SIZE 16384
+#define FX_FDNVERB_PREDELAY_MASK (FX_FDNVERB_PREDELAY_BUF_SIZE - 1)
+
+// Hadamard 8x8 matrix, pre-normalized by 1/sqrt(8) -- energy-preserving (orthogonal) mixing, the
+// same matrix the reference uses verbatim.
+static const float FX_FDNVERB_NORM = 0.35355339059327379f; // 1/sqrt(8)
+static const float FX_FDNVERB_HADAMARD[FX_FDNVERB_NUM_DELAYS][FX_FDNVERB_NUM_DELAYS] = {
+    { 1, 1, 1, 1, 1, 1, 1, 1},
+    { 1,-1, 1,-1, 1,-1, 1,-1},
+    { 1, 1,-1,-1, 1, 1,-1,-1},
+    { 1,-1,-1, 1, 1,-1,-1, 1},
+    { 1, 1, 1, 1,-1,-1,-1,-1},
+    { 1,-1, 1,-1,-1, 1,-1, 1},
+    { 1, 1,-1,-1,-1,-1, 1, 1},
+    { 1,-1,-1, 1,-1, 1, 1,-1},
+}; // each entry above is implicitly * FX_FDNVERB_NORM (applied once at point of use, not stored
+   // 64 times over -- the reference stores it pre-multiplied; this is numerically identical)
+
+// Prime-length delays at 44100Hz (20-51ms range) -- scaled by FX_FDNVERB_RATE_RATIO and Size's own
+// sizeScale at point of use, since Size can change live.
+static const int FX_FDNVERB_BASE_DELAYS_44100[FX_FDNVERB_NUM_DELAYS] = {
+    887, 1097, 1361, 1559, 1709, 1867, 2053, 2251
+};
+// Per-delay-line LFO rate multipliers and starting phases (radians) -- fixed, decorrelated offsets
+// so all 8 lines' modulation never lines up, the reference's own anti-metallic-ringing trick.
+static const float FX_FDNVERB_LFO_RATES[FX_FDNVERB_NUM_DELAYS] = {
+    0.31f, 0.37f, 0.43f, 0.53f, 0.61f, 0.71f, 0.79f, 0.89f
+};
+static const float FX_FDNVERB_LFO_PHASES[FX_FDNVERB_NUM_DELAYS] = {
+    0.0f, 0.79f, 1.57f, 2.36f, 3.14f, 3.93f, 4.71f, 5.50f
+};
+// Input diffuser delays at 44100Hz (prime), chained in series ahead of the FDN's own 8 lines.
+static const int FX_FDNVERB_DIFFUSER_DELAYS_44100[FX_FDNVERB_NUM_DIFFUSERS] = {53, 89, 127, 179};
+
+// Early Reflections: 16 taps, different L/R times for stereo imaging, alternating polarity gains
+// simulating real wall reflections (odd bounce counts invert, same idea a real room's own early
+// echoes have). All in ms at 44100Hz-equivalent (scaled by Size, like everything else here).
+static const float FX_FDNVERB_ER_TAP_MS_L[FX_FDNVERB_ER_TAPS] = {
+    3.5f, 7.1f, 11.2f, 15.7f, 19.3f, 24.1f, 29.8f, 33.5f,
+    38.7f, 43.2f, 49.1f, 55.3f, 61.7f, 68.4f, 76.2f, 85.0f
+};
+static const float FX_FDNVERB_ER_TAP_MS_R[FX_FDNVERB_ER_TAPS] = {
+    5.2f, 9.3f, 13.8f, 17.1f, 22.0f, 26.4f, 31.5f, 36.2f,
+    41.0f, 46.8f, 52.3f, 58.1f, 64.5f, 71.9f, 79.0f, 87.5f
+};
+static const float FX_FDNVERB_ER_TAP_GAIN_BASE[FX_FDNVERB_ER_TAPS] = {
+    0.85f, -0.72f, 0.65f, -0.58f, 0.52f, -0.46f, 0.41f, -0.37f,
+    0.33f, -0.29f, 0.26f, -0.23f, 0.20f, -0.17f, 0.15f, -0.13f
+};
+// Early Reflections' own 2 input diffusers per channel (different L/R delays for stereo).
+static const int FX_FDNVERB_ER_DIFFUSER_DELAYS_L[FX_FDNVERB_ER_DIFFUSERS] = {75, 137};
+static const int FX_FDNVERB_ER_DIFFUSER_DELAYS_R[FX_FDNVERB_ER_DIFFUSERS] = {93, 163};
+
+// A small, fixed-integer-delay allpass comb -- used for both the FDN's own input diffusers and
+// Early Reflections' own per-channel diffusers (identical structure in the reference, just
+// different delay tables). Unlike the FDN's own modulated delay lines, delaySamples here is a
+// fixed integer set once at init, never modulated, so plain modulo indexing (against this
+// instance's own capacity) needs no interpolation -- matches the reference's AllpassFilter exactly.
+typedef struct {
+    float buf[FX_FDNVERB_SMALL_DIFFUSER_CAP];
+    int cap;           // buffer capacity actually in use (delay_samples + 4, <= the array's own fixed size)
+    int write_pos;
+    int delay_samples;
+    float coeff;
+} FdnverbAllpass;
+
+static float fdnverb_allpass_process(FdnverbAllpass *ap, float input) {
+    int read_pos = ap->write_pos - ap->delay_samples;
+    read_pos %= ap->cap; if (read_pos < 0) read_pos += ap->cap;
+    float delayed = ap->buf[read_pos];
+    float output = delayed - ap->coeff * input;
+    ap->buf[ap->write_pos] = input + ap->coeff * delayed;
+    ap->write_pos = (ap->write_pos + 1) % ap->cap;
+    return output;
+}
+
+// Bounded-offset interpolated circular-buffer read, identical in spirit to hardtune_read_interp
+// (see its own comment on why the small relative offset -- never the absolute, ever-growing
+// write_pos -- is what goes through float math) but against this effect's own FX_FDNVERB_BUF_MASK,
+// kept as this effect's own small helper rather than reaching into HardTune's private one so a
+// future change to either effect's own buffer size can never silently affect the other.
+static float fdnverb_read_interp(const float *buf, uint32_t write_pos, float rel_offset) {
+    float floor_offset = floorf(rel_offset);
+    int32_t int_offset = (int32_t)floor_offset;
+    float frac = rel_offset - floor_offset;
+    uint32_t base_idx = (uint32_t)((int32_t)write_pos + int_offset);
+    float s0 = buf[base_idx & FX_FDNVERB_BUF_MASK];
+    float s1 = buf[(base_idx + 1) & FX_FDNVERB_BUF_MASK];
+    return s0 + (s1 - s0) * frac;
+}
+
+typedef struct {
+    // --- Pre-delay: plain stereo ring buffer, interpolated read (Pre-Delay is knob-adjustable
+    // live, so the read offset is a float, not a fixed integer) ---
+    float predelay_buf[2][FX_FDNVERB_PREDELAY_BUF_SIZE];
+    uint32_t predelay_write_pos;
+
+    // --- FDN core ---
+    float fdn_buf[FX_FDNVERB_NUM_DELAYS][FX_FDNVERB_BUF_SIZE];
+    uint32_t fdn_write_pos;  // shared: all 8 lines advance in lockstep, exactly 1/sample, like the reference
+    float fdn_lfo_phase[FX_FDNVERB_NUM_DELAYS];
+    float fdn_damping_lp_state[FX_FDNVERB_NUM_DELAYS]; // one-pole HF-damping filter, in the feedback path
+    FdnverbAllpass input_diffusers[FX_FDNVERB_NUM_DIFFUSERS];
+
+    // --- Early Reflections ---
+    float er_buf[2][FX_FDNVERB_ER_BUF_SIZE];
+    uint32_t er_write_pos; // shared L/R, same lockstep reasoning as fdn_write_pos
+    FdnverbAllpass er_diffusers[2][FX_FDNVERB_ER_DIFFUSERS]; // [channel][diffuser]
+    int er_tap_delay[2][FX_FDNVERB_ER_TAPS];
+    float er_tap_gain[2][FX_FDNVERB_ER_TAPS];
+
+    bool initialized;
+} FxFdnverbState;
+
+static void run_fx_fdnverb(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxFdnverbState *st = (FxFdnverbState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxFdnverbState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+    if (!st->initialized) {
+        for (int i = 0; i < FX_FDNVERB_NUM_DELAYS; i++) st->fdn_lfo_phase[i] = FX_FDNVERB_LFO_PHASES[i];
+        for (int i = 0; i < FX_FDNVERB_NUM_DIFFUSERS; i++) {
+            int d = (int)(FX_FDNVERB_DIFFUSER_DELAYS_44100[i] * FX_FDNVERB_RATE_RATIO);
+            st->input_diffusers[i].delay_samples = d;
+            st->input_diffusers[i].cap = d + 4;
+        }
+        for (int ch = 0; ch < 2; ch++) {
+            const int *dl = (ch == 0) ? FX_FDNVERB_ER_DIFFUSER_DELAYS_L : FX_FDNVERB_ER_DIFFUSER_DELAYS_R;
+            for (int i = 0; i < FX_FDNVERB_ER_DIFFUSERS; i++) {
+                int d = (int)(dl[i] * FX_FDNVERB_RATE_RATIO);
+                st->er_diffusers[ch][i].delay_samples = d;
+                st->er_diffusers[ch][i].cap = d + 4;
+            }
+        }
+        st->initialized = true;
+    }
+
+    const float rt60 = 0.3f * powf(12.0f / 0.3f, fmaxf(0.0f, fminf(1.0f, params->param[0])));   // 0.3..12s, log taper
+    const float room_size = fmaxf(0.0f, fminf(1.0f, params->param[1]));
+    const float predelay_ms = fmaxf(0.0f, fminf(1.0f, params->param[2])) * 250.0f;
+    const float damping = fmaxf(0.0f, fminf(1.0f, params->param[3]));
+    const float diffusion = fmaxf(0.0f, fminf(1.0f, params->param[4]));
+    const float mod_rate_hz = 0.1f + fmaxf(0.0f, fminf(1.0f, params->param[5])) * 9.9f;
+    const float mod_depth = fmaxf(0.0f, fminf(1.0f, params->param[6]));
+    const float early_level = fmaxf(0.0f, fminf(1.0f, params->param[7]));
+    const float early_decay = fmaxf(0.0f, fminf(1.0f, params->param[8]));
+    const bool freeze = params->param[9] >= 0.5f;
+
+    // --- Pre-delay ---
+    uint32_t pd_idx = st->predelay_write_pos & FX_FDNVERB_PREDELAY_MASK;
+    st->predelay_buf[0][pd_idx] = *l;
+    st->predelay_buf[1][pd_idx] = *r;
+    const float predelay_samples = predelay_ms * (float)SAMPLE_RATE / 1000.0f;
+    // Reuses fdnverb_read_interp's own bounded-offset trick even though this buffer's mask
+    // differs -- the function only ever masks with FX_FDNVERB_BUF_MASK, so a raw manual
+    // interpolated read is done here instead rather than parametrizing the mask for one call site.
+    {
+        float floor_off = floorf(-predelay_samples);
+        int32_t int_off = (int32_t)floor_off;
+        float frac = -predelay_samples - floor_off;
+        uint32_t base = (uint32_t)((int32_t)st->predelay_write_pos + int_off);
+        float l0 = st->predelay_buf[0][base & FX_FDNVERB_PREDELAY_MASK];
+        float l1 = st->predelay_buf[0][(base + 1) & FX_FDNVERB_PREDELAY_MASK];
+        float r0 = st->predelay_buf[1][base & FX_FDNVERB_PREDELAY_MASK];
+        float r1 = st->predelay_buf[1][(base + 1) & FX_FDNVERB_PREDELAY_MASK];
+        *l = l0 + (l1 - l0) * frac;
+        *r = r0 + (r1 - r0) * frac;
+    }
+    st->predelay_write_pos++;
+    const float predelayed_l = *l, predelayed_r = *r;
+
+    // --- Early Reflections (operates on the pre-delayed signal, see this effect's own top
+    // comment for why Level applies once, to dry+taps together, rather than the reference's own
+    // double-counted version) ---
+    {
+        float size_scale = 0.3f + room_size * 1.2f;
+        float ms_to_samples = (float)SAMPLE_RATE / 1000.0f;
+        for (int t = 0; t < FX_FDNVERB_ER_TAPS; t++) {
+            int dl = (int)(FX_FDNVERB_ER_TAP_MS_L[t] * size_scale * ms_to_samples); if (dl < 1) dl = 1;
+            int dr = (int)(FX_FDNVERB_ER_TAP_MS_R[t] * size_scale * ms_to_samples); if (dr < 1) dr = 1;
+            st->er_tap_delay[0][t] = dl;
+            st->er_tap_delay[1][t] = dr;
+            float time_norm = (float)t / (float)(FX_FDNVERB_ER_TAPS - 1);
+            float decay_factor = powf(1.0f - early_decay * 0.6f, time_norm * 3.0f);
+            st->er_tap_gain[0][t] = FX_FDNVERB_ER_TAP_GAIN_BASE[t] * decay_factor;
+            st->er_tap_gain[1][t] = FX_FDNVERB_ER_TAP_GAIN_BASE[t] * decay_factor;
+        }
+    }
+    float er_result[2];
+    for (int ch = 0; ch < 2; ch++) {
+        float in = (ch == 0) ? predelayed_l : predelayed_r;
+        float diffused = in;
+        for (int i = 0; i < FX_FDNVERB_ER_DIFFUSERS; i++) diffused = fdnverb_allpass_process(&st->er_diffusers[ch][i], diffused);
+        uint32_t idx = st->er_write_pos & FX_FDNVERB_ER_BUF_MASK;
+        st->er_buf[ch][idx] = diffused;
+        float tap_sum = 0.0f;
+        for (int t = 0; t < FX_FDNVERB_ER_TAPS; t++) {
+            uint32_t ridx = (uint32_t)((int32_t)st->er_write_pos - st->er_tap_delay[ch][t]) & FX_FDNVERB_ER_BUF_MASK;
+            tap_sum += st->er_buf[ch][ridx] * st->er_tap_gain[ch][t];
+        }
+        er_result[ch] = (in + tap_sum) * early_level;
+    }
+    st->er_write_pos++;
+
+    // --- FDN8x8 late reverb (operates on the SAME pre-delayed signal) ---
+    float fdn_out_l, fdn_out_r;
+    {
+        float mono_in = (predelayed_l + predelayed_r) * 0.5f;
+        float diff_coeff = 0.3f + diffusion * 0.4f;
+        for (int i = 0; i < FX_FDNVERB_NUM_DIFFUSERS; i++) {
+            st->input_diffusers[i].coeff = diff_coeff;
+            mono_in = fdnverb_allpass_process(&st->input_diffusers[i], mono_in);
+        }
+
+        float size_scale = 0.3f + room_size * 1.2f;
+        float lp_freq = 1000.0f + (1.0f - damping) * 14000.0f;
+        lp_freq = fmaxf(200.0f, fminf((float)SAMPLE_RATE * 0.49f, lp_freq));
+        float lp_coeff = expf(-2.0f * (float)M_PI * lp_freq / (float)SAMPLE_RATE);
+
+        float delay_out[FX_FDNVERB_NUM_DELAYS];
+        float base_delay[FX_FDNVERB_NUM_DELAYS];
+        for (int i = 0; i < FX_FDNVERB_NUM_DELAYS; i++) {
+            base_delay[i] = (float)FX_FDNVERB_BASE_DELAYS_44100[i] * FX_FDNVERB_RATE_RATIO * size_scale;
+            // Phase advances THEN is read this same sample, matching the reference's own order.
+            float rate_hz = FX_FDNVERB_LFO_RATES[i] * mod_rate_hz;
+            st->fdn_lfo_phase[i] += 2.0f * (float)M_PI * rate_hz / (float)SAMPLE_RATE;
+            if (st->fdn_lfo_phase[i] >= 2.0f * (float)M_PI) st->fdn_lfo_phase[i] -= 2.0f * (float)M_PI;
+            float depth_samples = 0.5f + mod_depth * 3.0f;
+            float mod_offset = sinf(st->fdn_lfo_phase[i]) * depth_samples;
+            delay_out[i] = fdnverb_read_interp(st->fdn_buf[i], st->fdn_write_pos, -base_delay[i] + mod_offset);
+        }
+
+        float filtered[FX_FDNVERB_NUM_DELAYS];
+        for (int i = 0; i < FX_FDNVERB_NUM_DELAYS; i++) {
+            st->fdn_damping_lp_state[i] = delay_out[i] * (1.0f - lp_coeff) + st->fdn_damping_lp_state[i] * lp_coeff;
+            float feedback_gain = freeze ? 1.0f : powf(10.0f, -3.0f * base_delay[i] / (rt60 * (float)SAMPLE_RATE));
+            filtered[i] = st->fdn_damping_lp_state[i] * feedback_gain;
+        }
+
+        float mixed[FX_FDNVERB_NUM_DELAYS];
+        for (int i = 0; i < FX_FDNVERB_NUM_DELAYS; i++) {
+            float matrix_sum = 0.0f;
+            for (int j = 0; j < FX_FDNVERB_NUM_DELAYS; j++) matrix_sum += FX_FDNVERB_HADAMARD[i][j] * FX_FDNVERB_NORM * filtered[j];
+            mixed[i] = (1.0f - diffusion) * filtered[i] + diffusion * matrix_sum;
+        }
+
+        uint32_t widx = st->fdn_write_pos & FX_FDNVERB_BUF_MASK;
+        for (int i = 0; i < FX_FDNVERB_NUM_DELAYS; i++) {
+            float new_sample = tanhf(mixed[i] + mono_in * 0.25f);
+            if (!freeze) st->fdn_buf[i][widx] = new_sample;
+        }
+        st->fdn_write_pos++;
+
+        fdn_out_l = 0.0f; fdn_out_r = 0.0f;
+        for (int i = 0; i < FX_FDNVERB_NUM_DELAYS; i++) {
+            if (i % 2 == 0) { fdn_out_l += delay_out[i]; fdn_out_r -= delay_out[i] * 0.25f; }
+            else            { fdn_out_r += delay_out[i]; fdn_out_l -= delay_out[i] * 0.25f; }
+        }
+        fdn_out_l *= 0.2f; fdn_out_r *= 0.2f;
+    }
+
+    *l = er_result[0] + fdn_out_l;
+    *r = er_result[1] + fdn_out_r;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -6115,6 +6467,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                     if (fx_engine[s].state) gr_db_out[s] = ((FxDeEsserState *)fx_engine[s].state)->last_gr_db;
                     break;
                 case FX_TYPE_HARDTUNE: run_fx_hardtune(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_FDNVERB: run_fx_fdnverb(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through

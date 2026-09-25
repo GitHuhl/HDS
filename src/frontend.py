@@ -982,6 +982,27 @@ FX_TYPE_METADATA += [
         {"label": "Vibrato Mod Source", "type": "choice",
          "options": ["None", "Mod Wheel", "Aftertouch"], "default": 0}, # gates Depth, like PackLfoParams.mod_source_cc
     ]},
+    {"name": "FDNVerb", "params": [
+        # Algorithmic hall/plate/room reverb -- an 8x8 Feedback Delay Network (Hadamard-matrix
+        # mixed, RT60-derived feedback gains, per-line modulated delay reads to kill metallic
+        # ringing) plus a 16-tap decorrelated Early Reflections bank. Like MultiFilter/DeEsser/
+        # HardTune, an original implementation of a well-established, published DSP architecture,
+        # not a clone of a specific commercial unit -- ported from and informed by the MIT-licensed
+        # github.com/ninuxi/MAI_verb. See FX_TYPE_FDNVERB's own (long) comment in backend.c for the
+        # full design, including two dead knobs found in that reference and deliberately not
+        # carried over here (its own Decay Low/High and Damping Low never actually touch its audio
+        # output -- verified by reading its own call graph, not guessed).
+        {"label": "Decay", "range": (0, 100), "default": 62},         # 0.3-12s RT60, log taper
+        {"label": "Size", "range": (0, 100), "default": 85},          # scales all 8 delay lengths 0.3x-1.5x
+        {"label": "Pre-Delay", "range": (0, 100), "default": 8},      # 0-250ms
+        {"label": "Damping", "range": (0, 100), "default": 40},       # HF damping in the feedback loop
+        {"label": "Diffusion", "range": (0, 100), "default": 75},     # glassy/echoey (low) .. smooth wash (high)
+        {"label": "Mod Rate", "range": (0, 100), "default": 7},       # 0.1-10Hz, per-delay-line read wobble
+        {"label": "Mod Depth", "range": (0, 100), "default": 25},
+        {"label": "Early Refl. Level", "range": (0, 100), "default": 50},
+        {"label": "Early Refl. Decay", "range": (0, 100), "default": 50},
+        {"label": "Freeze", "type": "choice", "options": ["Off", "On"], "default": 0}, # infinite sustain
+    ]},
 ]
 
 # The 7 FX types whose backend state exposes a real GR (gain reduction) reading -- see

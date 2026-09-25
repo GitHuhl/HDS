@@ -1453,6 +1453,65 @@ note more than a minor third from the input (a deliberate wide-interval harmony,
 or a large pitch bend stacked on top, can reach it -- a real but narrow, documented limitation of
 this simple technique at large intervals, not something ordinary pitch-correction use ever hits.
 
+### FDNVerb FX slot (algorithmic hall/plate/room reverb)
+
+An FX slot (Type: `FDNVerb`) -- like MultiFilter/DeEsser/HardTune, an original implementation of a
+well-established, published DSP architecture (an 8x8 Feedback Delay Network with an
+energy-preserving Hadamard mixing matrix -- textbook Jot/Stautner-Puckette-style reverb design),
+not a clone of any specific commercial unit's own internals. Ported from and informed by the
+MIT-licensed [ninuxi/MAI_verb](https://github.com/ninuxi/MAI_verb) -- specifically its FDN8x8 and
+EarlyReflections engines -- restructured from JUCE's block-oriented API into this engine's own
+per-sample dispatch.
+
+Signal path: input -> Pre-Delay -> **(a)** a 16-tap, dual-diffused, L/R-decorrelated Early
+Reflections bank (alternating-polarity tap gains simulate real wall bounces) and **(b)** the FDN8x8
+late reverb -- 4 nested allpass filters diffuse the input, 8 prime-length delay lines (each with its
+own decorrelated sinusoidal read-position wobble, killing metallic ringing) feed an 8x8 Hadamard
+matrix mix blended against their own raw taps by Diffusion, each tap damped by a one-pole lowpass
+and scaled by an RT60-derived feedback gain before recirculating (soft-clipped via `tanh` for
+safety) -- with (a) and (b) summed into the final wet output.
+
+Ten params: **Decay** (0.3-12s RT60, log taper -- the actual -60dB decay time, verified end-to-end
+via windowed energy measurement against a real impulse: measured RT60 tracked the target formula
+closely across the full range, e.g. 0.62 -> measured 3.00s vs. a 3.00s target); **Size** (scales all
+8 delay lengths 0.3x-1.5x -- bigger room, longer pre-mix time before the tail proper); **Pre-Delay**
+(0-250ms, the gap before any reflection arrives -- reads as physical room distance); **Damping**
+(a one-pole lowpass in the feedback loop -- higher = darker, faster-decaying highs, like real room
+air absorption); **Diffusion** (glassy/metallic with audible early echoes at low settings, a dense
+smooth wash at high); **Mod Rate**/**Mod Depth** (a per-delay-line sinusoidal read-position wobble,
+decorrelated per line via fixed rate/phase offsets -- the standard "chorused feedback" trick that
+keeps a long, high-diffusion tail from ringing at a fixed metallic pitch); **Early Reflections
+Level**/**Early Reflections Decay** (the 16-tap bank's overall amount and how quickly its taps fall
+off -- Level near 0 isolates the FDN's own smooth tail for critical listening); and **Freeze**
+(Off/On -- forces every feedback gain to 1.0 and stops new input from entering the delay lines, the
+standard "infinite sustain" trick: whatever's already circulating loops forever, verified to hold
+within 0.4dB over 5 seconds once engaged after the tank has filled). Overall dry/wet uses this
+slot's own generic Mix, like every other FX type.
+
+**Two dead knobs found in the reference and deliberately not carried over** (found by reading its
+own call graph, not guessed): its Decay Low/Decay High controls are stored but never read by
+anything that touches audio -- its own feedback-gain calculation only ever reads the Mid decay time,
+so only ONE decay control does anything acoustically; and its Damping Low control computes a
+highpass frequency/coefficient that its own feedback filter's `process()` never applies (only that
+one-pole filter's lowpass half is ever used) -- Damping Low is silently inert too. Porting either as
+a real knob here would just be two dead pots on the panel; the param budget saved went to Early
+Reflections Decay instead, a control the reference's own panel already exposes and one that IS real.
+
+**One genuine redundancy was quietly corrected**: the reference bakes Early (Reflections) Level into
+each tap's own gain, then multiplies the already-scaled result by Early Level a SECOND time when
+combining with the FDN tail -- so its knob shapes the taps by Level² while a separate dry-signal
+leak into the same sum (see below) only sees Level¹, a mismatched, almost certainly unintentional
+double-application nothing in the source explains. Level is applied exactly once here, giving a
+knob that responds linearly like every other control in this engine.
+
+**Preserved deliberately, not cleaned up**: Early Level's mix is not a clean crossfade of just the
+reflections -- the reference's own ER working buffer starts as a copy of the (pre-delayed) dry
+signal, the 16 taps get added onto that copy in place, and the WHOLE thing (dry copy plus taps
+together) is what gets scaled by Early Level before summing with the FDN tail. Raising Early Level
+therefore also proportionally reintroduces a scaled copy of the dry signal into the wet bus, on top
+of this slot's own generic Mix -- a real, audible characteristic of how the reference algorithm
+actually sounds, kept here on purpose.
+
 ### Per-slot gain reduction (GR) metering
 
 Gate, Limiter, FetComp, FairKid67, PeakMax, OptoComp, and DeEsser -- the 7 FX types with a real gain-reduction stage --
