@@ -1512,6 +1512,38 @@ therefore also proportionally reintroduces a scaled copy of the dry signal into 
 of this slot's own generic Mix -- a real, audible characteristic of how the reference algorithm
 actually sounds, kept here on purpose.
 
+### Reverse Sawtooth (Rev Saw): oscillator waveform and LFO shape
+
+Osc 1-4's Shape dropdown gains a `Rev Saw` entry (a descending ramp, +1 -> -1 across the cycle,
+appended after `Off` rather than inserted next to `Saw` so `Off`'s own numeric index never shifts),
+and the LFO section's own `Saw` dropdown entry (which was already a descending ramp, just not
+labeled as one) is relabeled `Rev Saw` for clarity, with a genuine ascending `Saw` appended as a new
+entry after `Off`. Both are alias-free (PolyBLEP-corrected) and both support hard sync.
+
+A plain sawtooth and its reverse are **spectrally identical** -- every harmonic has the same
+magnitude, just phase-inverted -- so a single Rev Saw oscillator sounds the same as a single Saw
+oscillator alone; that's expected, not a bug (verified: measured RMS energy identical to 6 decimal
+places, and `Saw(t) == -RevSaw(t)` exactly at every sample). It matters the moment something else is
+introduced:
+
+- **Two oscillators summed**: a Saw and a Rev Saw at the exact same phase are perfect negatives of
+  each other and cancel to silence (verified directly). At ANY other relative phase offset, their
+  equal-and-opposite slopes make the sum's slope zero everywhere except at the two (now separated)
+  discontinuities, producing an exact two-level rectangle wave -- 180 degrees gives a symmetric
+  square, other offsets give an asymmetric pulse, and detuning one oscillator against the other
+  continuously sweeps the offset, i.e. PWM. This was verified by direct algebra (not just visually):
+  at a 90-degree offset the ideal sum lands on exactly two flat levels, `[-1.5, 0.5]` -- a real,
+  25/75-duty pulse, not the symmetric square a quick skim of some forum explanations claims (180
+  degrees is the special case that gives an exact symmetric square; 90 degrees gives a specific
+  asymmetric one).
+- **Hard sync**: a sync reset snaps phase back to 0, which lands on the OPPOSITE value for a Rev Saw
+  (+1) vs. a Saw (-1) -- giving a genuinely different sync-sweep timbre, and both are BLEP-corrected
+  for the discontinuity that reset creates.
+- **As an LFO/mod source**: rising vs. falling gives an audibly opposite modulation contour even
+  though the two would sound identical as a lone audio tone -- snap-then-rise vs. rise-then-snap when
+  routed to something like filter cutoff. This is the reason hardware like the Moog Model D/Roland
+  SE-02 offers a dedicated reverse-saw option specifically on a modulation oscillator.
+
 ### Per-slot gain reduction (GR) metering
 
 Gate, Limiter, FetComp, FairKid67, PeakMax, OptoComp, and DeEsser -- the 7 FX types with a real gain-reduction stage --

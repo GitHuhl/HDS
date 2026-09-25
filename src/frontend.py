@@ -632,8 +632,10 @@ TEMPO_MARKER_MAX = 16
 SAMPLE_PATH_LEN = 256
 MAX_ROUND_ROBIN_GROUPS = 256
 # 4-oscillator architecture: all 4 oscillators (Osc 1-4) share this exact shape palette --
-# must match WaveType in backend.c exactly (append-only order, "Off" last).
-OSC_SHAPE_NAMES = ["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample", "Off"]
+# must match WaveType in backend.c exactly (append-only order -- "Rev Saw" was appended AFTER
+# "Off" rather than next to "Saw" so "Off"'s own numeric index never shifts, same reason "Off"
+# itself isn't first).
+OSC_SHAPE_NAMES = ["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample", "Off", "Rev Saw"]
 # LFO count: must match LFO_COUNT in backend.c exactly.
 LFO_COUNT = 16
 # LFO Tempo Sync divisions -- index 0 ("Free") means "use the Rate dial's own Hz value", matching
@@ -1105,7 +1107,7 @@ class WaveformVisualizer(QWidget):
                     rel_x = x / draw_w
                     y = mid_y - math.sin(rel_x * 2 * math.pi) * (mid_y - margin)
                     path.lineTo(margin + x, y)
-            elif self.waveform_type == 2:  # Saw Down
+            elif self.waveform_type == 2:  # Rev Saw (descending ramp)
                 path.moveTo(margin, margin)
                 path.lineTo(margin + draw_w, h - margin)
                 path.lineTo(margin + draw_w, margin)
@@ -1122,6 +1124,11 @@ class WaveformVisualizer(QWidget):
                 painter.setPen(pen)
                 path.moveTo(margin, mid_y)
                 path.lineTo(margin + draw_w, mid_y)
+            elif self.waveform_type == 5:  # Saw Up -- mirror image of Saw Down (index 2), same
+                # icon as the oscillator visualizer's own index-0 Saw.
+                path.moveTo(margin, h - margin)
+                path.lineTo(margin + draw_w, margin)
+                path.lineTo(margin + draw_w, h - margin)
         else:
             if self.waveform_type == 0:  # Saw Up
                 path.moveTo(margin, h - margin)
@@ -1188,6 +1195,11 @@ class WaveformVisualizer(QWidget):
                 painter.setPen(pen)
                 path.moveTo(margin, mid_y)
                 path.lineTo(margin + draw_w, mid_y)
+            elif self.waveform_type == 9:  # Rev Saw -- mirror image of Saw Up (index 0): falls
+                # from top-left to bottom-right, then jumps back up at the right edge.
+                path.moveTo(margin, margin)
+                path.lineTo(margin + draw_w, h - margin)
+                path.lineTo(margin + draw_w, margin)
 
         painter.drawPath(path)
 class PotentiometerKnob(QWidget):
@@ -4599,7 +4611,13 @@ class SynthGui(QWidget):
             lfo_row.addWidget(QLabel(f"<b>LFO {x}</b>"))
 
             combo = QComboBox()
-            combo.addItems(["Tri", "Sine", "Saw", "Sq", "Off"])
+            # "Saw" here (index 2) is a DESCENDING ramp -- relabeled "Rev Saw" for clarity; the
+            # complementary ascending ramp is "Saw" at index 5, appended after Off rather than
+            # inserted next to Rev Saw so Off's own numeric index (4) never shifts (same "append,
+            # don't insert" convention as WaveType's own WAVE_REVSAW in backend.c). Both ramp
+            # directions matter for an LFO driving something like filter cutoff even though they'd
+            # sound identical as a lone audio tone -- see lookup_lfo_waveform's own comment.
+            combo.addItems(["Tri", "Sine", "Rev Saw", "Sq", "Off", "Saw"])
             combo.setCurrentIndex(4)  # Off by default (per-user request: all 16 LFOs start bypassed)
             combo.setStyleSheet("font-size: 10px;")
             # QComboBox defaults to an Expanding horizontal size policy -- with 16 rows stacked in
@@ -4615,9 +4633,9 @@ class SynthGui(QWidget):
             lfo_row.addWidget(vis)
             self.lfo_combos.append(combo)
 
-            # Curve/Drive: visible only for Tri/Sine/Saw (indices 0/1/2), hidden for Sq/Off --
-            # see PackLfoParams.curve_drive's own comment. Label swaps "Curve"<->"Drive" on wave
-            # change (wired in the shared post-construction signal loop, below).
+            # Curve/Drive: visible only for Tri/Rev Saw/Sine/Saw (indices 0/2/1/5), hidden for
+            # Sq/Off -- see PackLfoParams.curve_drive's own comment. Label swaps "Curve"<->"Drive"
+            # on wave change (wired in the shared post-construction signal loop, below).
             curve_label = QLabel("Curve")
             curve_label.setStyleSheet("font-size: 9px;")
             curve_dial = PotentiometerKnob(f"LFO {x} Curve/Drive", self)
@@ -5558,6 +5576,7 @@ class SynthGui(QWidget):
         SAW_INDEX = OSC_SHAPE_NAMES.index("Saw")
         TRIANGLE_INDEX = OSC_SHAPE_NAMES.index("Triangle")
         SINE_INDEX = OSC_SHAPE_NAMES.index("Sine")
+        REVSAW_INDEX = OSC_SHAPE_NAMES.index("Rev Saw")
 
         def _wire_osc_strip(combo, vis, unison_box, pulse_box, pulse_label, pulse_knob, mono_check, curve_box, curve_label):
             def on_shape_changed(idx):
@@ -5578,7 +5597,7 @@ class SynthGui(QWidget):
                 # Curve/Drive: same single physical pot, reinterpreted by Shape (see
                 # ProgramState.vco{1-4}_curve_drive's own comment, backend.c) -- visible only for
                 # the 3 shapes it applies to, label swaps between the two meanings.
-                curve_box.setVisible(idx in (SAW_INDEX, TRIANGLE_INDEX, SINE_INDEX))
+                curve_box.setVisible(idx in (SAW_INDEX, TRIANGLE_INDEX, SINE_INDEX, REVSAW_INDEX))
                 curve_label.setText("Drive" if idx == SINE_INDEX else "Curve")
             combo.currentIndexChanged.connect(on_shape_changed)
             on_shape_changed(combo.currentIndex())
@@ -7366,9 +7385,10 @@ class SynthGui(QWidget):
                 self.lfo_combos[idx].setCurrentIndex(wave_idx)
                 self.lfo_combos[idx].blockSignals(False)
                 # Curve/Drive box visibility + label don't ride the (blocked) currentIndexChanged
-                # signal -- set directly, mirroring _on_lfo_wave_changed's own logic.
-                self.lfo_curve_labels[idx].setVisible(wave_idx in (0, 1, 2))
-                self.lfo_curve_dials[idx].setVisible(wave_idx in (0, 1, 2))
+                # signal -- set directly, mirroring _on_lfo_wave_changed's own logic. Tri/Rev Saw/
+                # Sine/Saw = indices 0/2/1/5 (Sq/Off = 3/4, no Curve).
+                self.lfo_curve_labels[idx].setVisible(wave_idx in (0, 1, 2, 5))
+                self.lfo_curve_dials[idx].setVisible(wave_idx in (0, 1, 2, 5))
                 self.lfo_curve_labels[idx].setText("Drive" if wave_idx == 1 else "Curve")
             if f"/hds/lfo/{idx}/curve_drive" in fields:
                 self.lfo_curve_dials[idx].blockSignals(True)
@@ -8898,11 +8918,13 @@ def runtime_connect_and_bind(gui):
             lambda idx_cb, i=idx: gui.lfo_visualizers[i].set_waveform(idx_cb, is_lfo=True)
         )
         gui.lfo_visualizers[idx].set_waveform(gui.lfo_combos[idx].currentIndex(), is_lfo=True)
-        # Curve/Drive visibility + label ("Curve" for Tri/Saw = idx 0/2, "Drive" for Sine = idx 1,
-        # hidden for Sq/Off = idx 3/4) -- combo indices match LFO_WAVE order ["Tri","Sine","Saw","Sq","Off"].
+        # Curve/Drive visibility + label ("Curve" for Tri/Rev Saw/Saw = idx 0/2/5, "Drive" for Sine
+        # = idx 1, hidden for Sq/Off = idx 3/4) -- combo indices match LFO_WAVE order
+        # ["Tri","Sine","Rev Saw","Sq","Off","Saw"] (Saw appended after Off -- see that combo's own
+        # comment on why -- so it's index 5, not 2).
         def _on_lfo_wave_changed(wave_idx, i=idx):
-            gui.lfo_curve_labels[i].setVisible(wave_idx in (0, 1, 2))
-            gui.lfo_curve_dials[i].setVisible(wave_idx in (0, 1, 2))
+            gui.lfo_curve_labels[i].setVisible(wave_idx in (0, 1, 2, 5))
+            gui.lfo_curve_dials[i].setVisible(wave_idx in (0, 1, 2, 5))
             gui.lfo_curve_labels[i].setText("Drive" if wave_idx == 1 else "Curve")
         gui.lfo_combos[idx].currentIndexChanged.connect(_on_lfo_wave_changed)
         _on_lfo_wave_changed(gui.lfo_combos[idx].currentIndex())

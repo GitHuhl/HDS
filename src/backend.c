@@ -221,9 +221,32 @@ typedef enum {
     WAVE_NOISE,
     WAVE_PULSE, // appended (not inserted) so existing saved patches' numeric shape indices don't shift
     WAVE_SAMPLE, // DFD-streamed multisample playback -- see render_sample_osc()/SampleStream. Also appended.
-    WAVE_OFF // Compute-bypass: skips pan trig + render + mix for this oscillator. Phase still
-             // advances and its envelope still ticks (Hard Sync/FM and voice-idle logic depend on
-             // both staying live), so nothing downstream needs to special-case an Off oscillator.
+    WAVE_OFF, // Compute-bypass: skips pan trig + render + mix for this oscillator. Phase still
+              // advances and its envelope still ticks (Hard Sync/FM and voice-idle logic depend on
+              // both staying live), so nothing downstream needs to special-case an Off oscillator.
+    WAVE_REVSAW // Reverse (descending-ramp) sawtooth -- appended after WAVE_OFF (not inserted next
+                // to WAVE_SAW) for the same reason WAVE_PULSE/WAVE_SAMPLE were appended: existing
+                // saved patches' numeric shape indices, WAVE_OFF's own included, must never shift.
+                // A plain sawtooth and its reverse are spectrally identical (every harmonic has the
+                // same magnitude, just phase-inverted) -- inaudibly different alone, on a single
+                // oscillator, by design (human hearing is essentially deaf to a steady tone's inter-
+                // harmonic phase). It matters the moment a SECOND thing enters the picture: (1) two
+                // oscillators, one Saw and one Rev Saw, summed -- perfectly in phase they cancel to
+                // silence (they're exact negatives of each other), but at any OTHER phase offset
+                // between them their equal-and-opposite slopes make the sum's slope zero everywhere
+                // except at the two (now separated) discontinuities, producing an exact two-level
+                // rectangle/pulse wave whose duty cycle is set by that offset -- 180 degrees gives a
+                // symmetric square, other offsets give asymmetric PWM, and detuning one against the
+                // other continuously sweeps it (the mechanism a real subtractive synth's "two saws"
+                // trick and analog PWM-via-two-ramps both actually rely on -- verified here by
+                // direct algebra, not folklore); (2) hard sync, where the reset instant lands on a
+                // different point of a reverse ramp than a forward one, giving a distinct sync-sweep
+                // timbre (see this WaveType's own case in render_fm_oscillator's hard-sync block);
+                // (3) as an LFO/mod source (see lookup_lfo_waveform's new case 5) driving something
+                // like filter cutoff, where a rising vs. falling ramp gives an audibly OPPOSITE
+                // contour (snap-then-rise vs. rise-then-snap) even though neither would sound
+                // different as a lone audio tone -- the classic reason hardware like the Moog Model
+                // D/Roland SE-02 offers a dedicated reverse-saw option on a modulation oscillator.
 } WaveType;
 
 typedef struct {
@@ -6542,6 +6565,14 @@ static inline float apply_sine_drive(float sine_val, float drive) {
 float lookup_osc_sample(WaveType type, float phase, float dt, float pulse_width_frac, float *tri_integrator, float curve_drive) {
     switch (type) {
         case WAVE_SAW: { float warped = apply_wave_curve(phase, curve_drive); float n = (warped * 2.0f) - 1.0f; return n - poly_blep_step(phase, dt); }
+        // Same construction as WAVE_SAW, mirrored: apply_wave_curve reads from (1-phase) instead
+        // of phase, so the ramp runs +1 -> -1 across the cycle instead of -1 -> +1 (matching
+        // lookup_lfo_waveform's own existing descending-Saw case). WAVE_SAW's own discontinuity
+        // JUMPS DOWN at wrap (subtracting poly_blep_step corrects a downward jump); this shape's
+        // discontinuity JUMPS UP at the exact same point instead (value is -1 just before phase=1,
+        // +1 just after phase=0) -- the opposite direction, so the correction is ADDED, the same
+        // sign band_limited_pulse already uses for its own upward edge at phase 0.
+        case WAVE_REVSAW: { float warped = apply_wave_curve(1.0f - phase, curve_drive); float n = (warped * 2.0f) - 1.0f; return n + poly_blep_step(phase, dt); }
         case WAVE_SQUARE: return band_limited_pulse(phase, dt, 0.5f);
         case WAVE_PULSE: {
             // Clamped away from the extremes: at duty 0 or 1 the pulse degenerates to DC (no
@@ -6641,15 +6672,21 @@ float render_unison_saw(float phases[UNISON_SAW_VOICES], float base_dt, float de
     return sum_mono * inv_n;
 }
 
-// wave_type: 0=Triangle, 1=Sine, 2=Saw (descending ramp), 3=Square, 4=Off (never reaches here --
-// callers short-circuit type==4 before calling). curve_drive: same single-pot, shape-reinterpreted
-// value as lookup_osc_sample's own -- meaningful for Triangle/Saw (bipolar Curve) and Sine
-// (unipolar Drive, clamped internally), ignored for Square.
+// wave_type: 0=Triangle, 1=Sine, 2=Rev Saw (descending ramp), 3=Square, 4=Off (never reaches here --
+// callers short-circuit type==4 before calling), 5=Saw (ascending ramp -- appended after Off, same
+// "don't shift existing indices" reasoning as WaveType's own WAVE_REVSAW). Rising vs. falling matters
+// here even though it wouldn't for a lone audio oscillator (see WAVE_REVSAW's own comment): an LFO
+// driving, say, filter cutoff gives an audibly opposite contour depending on which ramp direction is
+// chosen -- rise-then-snap vs. snap-then-rise -- the classic reason hardware like the Moog Model D/
+// Roland SE-02 offers a dedicated reverse-saw option on a modulation oscillator. curve_drive: same
+// single-pot, shape-reinterpreted value as lookup_osc_sample's own -- meaningful for Triangle/Saw
+// (bipolar Curve) and Sine (unipolar Drive, clamped internally), ignored for Square.
 float lookup_lfo_waveform(int type, float phase, float curve_drive) {
     switch (type) {
         case 1: return apply_sine_drive(sinf(phase * 2.0f * M_PI), curve_drive);
         case 2: { float warped = apply_wave_curve(1.0f - phase, curve_drive); return (warped * 2.0f) - 1.0f; }
         case 3: return (phase < 0.5f) ? 1.0f : -1.0f;
+        case 5: { float warped = apply_wave_curve(phase, curve_drive); return (warped * 2.0f) - 1.0f; }
         case 0:
         default: {
             if (curve_drive == 0.0f) return (phase < 0.5f) ? (phase * 4.0f) - 1.0f : 3.0f - (phase * 4.0f);
@@ -10667,10 +10704,14 @@ static float render_fm_oscillator(
     // BLEP-corrects the discontinuity that reset will create.
     out += *pending_sync_correction;
     *pending_sync_correction = 0.0f;
-    if (do_sync && (shape == WAVE_SAW || shape == WAVE_SQUARE || shape == WAVE_PULSE)) {
+    if (do_sync && (shape == WAVE_SAW || shape == WAVE_REVSAW || shape == WAVE_SQUARE || shape == WAVE_PULSE)) {
         float phase_at_sync = fmodf(own_phase + t_wrap * dt, 1.0f); if (phase_at_sync < 0.0f) phase_at_sync += 1.0f;
         float val_before, val_after;
         if (shape == WAVE_SAW) { val_before = phase_at_sync * 2.0f - 1.0f; val_after = -1.0f; }
+        // Mirror image of WAVE_SAW's own case: the ramp runs from +1 (at phase_at_sync=0) down to
+        // -1 (as phase_at_sync->1), and a sync reset snaps phase back to 0 -- i.e. back UP to +1 --
+        // so val_after is +1 here where WAVE_SAW's own is -1.
+        else if (shape == WAVE_REVSAW) { val_before = 1.0f - phase_at_sync * 2.0f; val_after = 1.0f; }
         else {
             float duty = (shape == WAVE_SQUARE) ? 0.5f : fmaxf(0.02f, fminf(0.98f, pulse_or_tilt_input / 100.0f));
             val_before = (phase_at_sync < duty) ? 1.0f : -1.0f; val_after = 1.0f;
