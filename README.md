@@ -802,7 +802,7 @@ arpeggiator was already independently doing for the same reason.
 Requires ALSA dev headers (`libasound2-dev` on Debian/Ubuntu) and liblo dev
 headers (`liblo-dev`, the OSC control protocol -- see below). WavPack dev
 headers are NOT required -- WavPack recording support is currently disabled
-(see `HDS_WAVPACK_ENABLED` in `backend.c`). PipeWire dev headers
+(see `HDS_WAVPACK_ENABLED` in `src/hds_standalone.c`). PipeWire dev headers
 (`libpipewire-0.3-dev`) are also NOT required -- the optional native PipeWire
 backend described below is auto-detected at build time and the ALSA backend
 is unaffected either way.
@@ -827,6 +827,40 @@ CLAP), and none is planned: this project will not maintain a second *platform* a
 (WASAPI) alongside ALSA. ALSA remains the default and always-available backend either way; the
 PipeWire backend described below is an additional, opt-in way to talk to audio on the *same*
 platform, not a second platform.
+
+### Source layout: backend.c is the shared core, not a standalone entry point
+
+Three files, one architecture: `src/backend.c` is the shared DSP/OSC/state engine (oscillators,
+filters, the FX chain, the OSC control protocol, the sequencer/arpeggiator, sample streaming --
+everything that doesn't touch a physical device directly), and it is never compiled on its own.
+Both real targets pull it in with a plain `#include` (one translation unit per binary, this
+project's existing convention -- see `clap_plugin.c`'s own header comment): `src/hds_standalone.c`
+adds the ALSA/PipeWire audio shim, the ALSA MIDI sequencer client, recording, the `--program` JSON
+loader, the interactive arrow-key CLI, and `main()` itself, and is what `$(BIN)`/`$(ARM64_BIN)`
+actually compile; `src/clap_plugin.c` adds only what a CLAP host needs, since the host owns the
+actual audio device and hands MIDI in through its own event API.
+
+This split (`hds_standalone.c` used to just be the tail end of `backend.c`) exists so a host-driven
+target never needs real device code compiled in at all -- confirmed directly, not assumed: `hds.clap`
+now links with zero ALSA or PipeWire symbols (`nm -D`/`ldd` show nothing), whereas before this split
+`backend.c`'s unconditional `#include <alsa/asoundlib.h>` meant the CLAP build always carried ALSA
+along as unreferenced-but-compiled-in dead code, and could never be retargeted at a non-ALSA platform
+without either writing a second full platform backend or untangling this exact coupling first. It's
+a pure code-motion refactor -- `hds_standalone.c` still `#include`s `backend.c`, so both binaries
+compile as one translation unit each exactly as before, with no new cross-file call, no inlining
+lost, and no behavior change (verified: re-ran the FDNVerb RT60 and Rev Saw isolated checks
+post-split, both matched their pre-split results exactly).
+
+**A real, pre-existing gap this surfaced, left alone on purpose**: `render_audio_block()`'s own
+Sequencer-audio-lane playback block reads the standalone app's `g_streams_state` global directly (via
+a `g_seq_audio` macro) rather than through a parameter, even though every other piece of state it
+touches is passed in. A CLAP plugin instance's Sequencer "Load Audio" loads into that instance's own
+per-plugin `p->streams_state`, but this one playback path reads the standalone's global instead --
+which the CLAP `.so` never populates. In other words, Sequencer audio-lane playback likely does not
+work in the CLAP plugin today, independent of this refactor entirely (confirmed via `grep`: nothing
+in `clap_plugin.c` ever touches the bare `g_streams_state` global). Fixing it means parametrizing
+`render_audio_block()` to take a streams pointer like it does everything else -- a real, scoped, not
+yet attempted follow-up, not something to bundle into a file-organization change.
 
 ### Command-line flags
 

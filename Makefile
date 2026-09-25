@@ -1,17 +1,18 @@
 CC ?= cc
 CXX ?= g++
 CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
-# WavPack recording is disabled for now (see HDS_WAVPACK_ENABLED in src/backend.c) -- -lwavpack
-# dropped from here to match; re-add it alongside flipping that flag back to 1.
+# WavPack recording is disabled for now (see HDS_WAVPACK_ENABLED in src/hds_standalone.c) --
+# -lwavpack dropped from here to match; re-add it alongside flipping that flag back to 1.
 LDLIBS := -lasound -lm -lpthread -llo
 
 # --- Optional PipeWire backend (native libpipewire client, alongside the always-present ALSA
-# backend -- see backend.c's "Audio platform shim" section) -- auto-detected via pkg-config rather
-# than a manual flag to flip (see HDS_WAVPACK_ENABLED's own comment for that pattern), so a machine
-# without libpipewire-0.3-dev (a plain apt-get libasound2-dev-only setup, or the Pi) still gets a
-# normal ALSA-only build with nothing to change by hand, while nix-shell (which provides pipewire
-# in shell.nix's buildInputs) picks it up automatically. --backend pipewire at runtime only exists
-# in a build where this actually detected true -- see backend.c's HDS_PIPEWIRE_ENABLED guard.
+# backend -- see hds_standalone.c's "Audio platform shim" section) -- auto-detected via pkg-config
+# rather than a manual flag to flip (see HDS_WAVPACK_ENABLED's own comment for that pattern), so a
+# machine without libpipewire-0.3-dev (a plain apt-get libasound2-dev-only setup, or the Pi) still
+# gets a normal ALSA-only build with nothing to change by hand, while nix-shell (which provides
+# pipewire in shell.nix's buildInputs) picks it up automatically. --backend pipewire at runtime
+# only exists in a build where this actually detected true -- see hds_standalone.c's own
+# HDS_PIPEWIRE_ENABLED guard.
 # Scoped to $(BIN) only: the CLAP plugin target never touches audio device I/O at all (the host
 # owns that via CLAP's own audio-ports extension -- see clap_plugin.c's header comment), and the
 # arm64 cross-build has no cross-compiled pipewire package wired up, so neither needs this.
@@ -25,10 +26,16 @@ PIPEWIRE_LDLIBS :=
 endif
 $(info PipeWire backend (--backend pipewire): $(if $(filter 1,$(PIPEWIRE_AVAILABLE)),enabled,disabled -- libpipewire-0.3 not found via pkg-config))
 
+# SRC/BIN_OBJ point at hds_standalone.c (the platform I/O layer: ALSA/PipeWire audio, ALSA MIDI
+# sequencer, recording, --program loading, the interactive CLI, and main() itself), NOT backend.c
+# (the shared DSP/OSC/state core) -- backend.c is never compiled standalone, exactly like
+# clap_plugin.c already treats it. hds_standalone.c #includes backend.c, so this is still a single
+# translation unit per binary, same as before this split -- see hds_standalone.c's own header
+# comment for the full rationale.
 BIN := synth_engine
-SRC := src/backend.c
+SRC := src/hds_standalone.c
 BUILD_DIR := build
-BIN_OBJ := $(BUILD_DIR)/backend.o
+BIN_OBJ := $(BUILD_DIR)/hds_standalone.o
 CLAP_OBJ := $(BUILD_DIR)/clap_plugin.o
 
 # --- Neural Amp Modeler FX slot (FX_TYPE_NAM in backend.c) ---
@@ -87,9 +94,10 @@ NAM_OBJS := $(addprefix $(NAM_BUILD_DIR)/,$(notdir $(NAM_SRCS:.cpp=.o)))
 # --- Linux CLAP plugin ---
 # Produces hds.clap (a plain ELF shared object under the required .clap extension -- real hosts
 # scan for it at ~/.clap/, /usr/lib/clap/, or $CLAP_PATH). #include's the whole of backend.c (see
-# src/clap_plugin.c's own header comment), so every ALSA-touching symbol still needs linking even
-# though the plugin's own vtable never calls open_pcm_stream/write_audio_block -- they're simply
-# unreferenced-but-compiled-in dead code sharing the translation unit.
+# src/clap_plugin.c's own header comment) -- backend.c is the shared DSP/OSC/state core ONLY,
+# with every ALSA/PipeWire-touching line long since moved out to src/hds_standalone.c (see that
+# file's own header comment), so this build never sees alsa/asoundlib.h or any device-I/O symbol
+# at all, exactly as a plugin whose host owns the actual audio device should.
 CLAP_INC := third_party/clap/include
 CLAP_BIN := hds.clap
 CLAP_SRC := src/clap_plugin.c
@@ -126,7 +134,7 @@ CLAP_SRC := src/clap_plugin.c
 #
 # $(ARM64_LIBDIR) bundles liblo only -- a pure protocol library with no external config files or
 # hardware coupling, confirmed safe to ship as a plain .so file (WavPack was bundled here too
-# before it was disabled -- see src/backend.c's HDS_WAVPACK_ENABLED). alsa-lib is deliberately
+# before it was disabled -- see src/hds_standalone.c's HDS_WAVPACK_ENABLED). alsa-lib is deliberately
 # NOT bundled -- `strings` on the cross-built libasound.so.2 shows its compiled-in default config
 # directory is THIS BUILD MACHINE's own Nix store path (where alsa.conf, card definitions, and
 # dmix/plug setups live). That directory won't exist on the Pi, and even if it did, it would
@@ -161,10 +169,14 @@ $(BUILD_DIR) $(NAM_BUILD_DIR) $(ARM64_NAM_BUILD_DIR):
 
 # backend.c/clap_plugin.c stay plain C, compiled by $(CC) exactly as before -- only the FINAL link
 # step (below) needs $(CXX), to pull in libstdc++ for the NAM objects linked alongside them.
-$(BIN_OBJ): $(SRC) src/nam_bridge.h | $(BUILD_DIR)
+# src/backend.c is listed explicitly (not just $(SRC)/$(CLAP_SRC)) because both source files
+# #include it rather than link against it -- without this, editing backend.c alone wouldn't
+# trigger a rebuild of either object, a real (if previously narrower) gap that matters more now
+# that backend.c and its two includers are three separate files instead of two.
+$(BIN_OBJ): $(SRC) src/backend.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -c $(SRC) -o $@
 
-$(CLAP_OBJ): $(CLAP_SRC) src/nam_bridge.h | $(BUILD_DIR)
+$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
 # Three source directories (NAM/, NAM/wavenet/, src/) flattened into one object directory -- see
@@ -202,12 +214,12 @@ $(ARM64_NAM_BUILD_DIR)/%.o: src/%.cpp | $(ARM64_NAM_BUILD_DIR)
 	$(ARM64_CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
 ARM64_INTERP := /lib/ld-linux-aarch64.so.1
-ARM64_BIN_OBJ := $(BUILD_DIR)/backend-arm64.o
+ARM64_BIN_OBJ := $(BUILD_DIR)/hds_standalone-arm64.o
 
-# backend.c itself stays plain C, compiled by $(ARM64_CC) exactly like the native $(BIN_OBJ) rule
-# above -- only the FINAL link step needs $(ARM64_CXX), to pull in libstdc++ for the NAM objects
-# linked alongside it, same reasoning as $(BIN)/clap's own rules.
-$(ARM64_BIN_OBJ): $(SRC) src/nam_bridge.h | $(BUILD_DIR)
+# hds_standalone.c itself stays plain C, compiled by $(ARM64_CC) exactly like the native
+# $(BIN_OBJ) rule above -- only the FINAL link step needs $(ARM64_CXX), to pull in libstdc++ for
+# the NAM objects linked alongside it, same reasoning as $(BIN)/clap's own rules.
+$(ARM64_BIN_OBJ): $(SRC) src/backend.c src/nam_bridge.h | $(BUILD_DIR)
 	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $(SRC) -o $@
 
