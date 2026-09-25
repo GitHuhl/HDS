@@ -917,13 +917,27 @@ FX_TYPE_METADATA += [
                      "42 dB/oct", "48 dB/oct", "60 dB/oct", "72 dB/oct", "84 dB/oct", "96 dB/oct"],
          "default": 1},
     ]},
+    {"name": "OptoComp", "params": [
+        # Ported from 4a2a (github.com/aim-qmul/4a2a, MPL-2.0 license) -- a feed-forward digital
+        # approximation of a classic optical leveling amplifier/compressor. See FX_TYPE_OPTOCOMP's
+        # own comment in backend.c for the full DSP (a hard-knee power-law gain computer, no separate
+        # detector stage, plus one asymmetric attack/release smoother on the gain itself) and what
+        # was left out (the original's own single-knob "peak reduction" GUI macro, and an unused
+        # "limitMode" param its own DSP never reads). Genuinely small -- this is close to the whole
+        # algorithm.
+        {"label": "Threshold", "range": (0, 100), "default": 50},  # -60..0dB, default -30dB
+        {"label": "Ratio", "range": (0, 100), "default": 0},       # 1..20, default 1 (no compression)
+        {"label": "Attack", "range": (0, 100), "default": 1},      # 0.1..100ms, default ~1ms
+        {"label": "Release", "range": (0, 100), "default": 11},    # 100..1000ms, default ~200ms
+        {"label": "Makeup", "range": (0, 100), "default": 50},     # -12..+12dB, default 0dB
+    ]},
 ]
 
-# The 5 FX types whose backend state exposes a real GR (gain reduction) reading -- see
+# The 6 FX types whose backend state exposes a real GR (gain reduction) reading -- see
 # process_fx_chain's own gr_db_out comment in backend.c. Looked up by name rather than a hardcoded
 # index (like FX_TYPE_NAM above) since these are spread across the pre- and post-NAM halves of
 # FX_TYPE_METADATA; used only by _apply_fx_slot_type to show/hide each slot's GR label.
-FX_TYPE_GR_CAPABLE_INDICES = {i for i, e in enumerate(FX_TYPE_METADATA) if e["name"] in ("Gate", "Limiter", "FetComp", "FairKid67", "PeakMax")}
+FX_TYPE_GR_CAPABLE_INDICES = {i for i, e in enumerate(FX_TYPE_METADATA) if e["name"] in ("Gate", "Limiter", "FetComp", "FairKid67", "PeakMax", "OptoComp")}
 
 # Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --
 # must match the backend's own "auto"/empty-string convention in midi_client_should_autoconnect.

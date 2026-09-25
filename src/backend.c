@@ -629,6 +629,21 @@ typedef struct {
 // further; this is expected, not a bug (the same "analog ladder cascade" flavor, not a textbook
 // per-stage-tuned Butterworth design).
 #define FX_TYPE_MULTIFILTER 17
+// Ported from 4a2a (github.com/aim-qmul/4a2a, MPL-2.0 license) -- a feed-forward digital
+// approximation of a classic optical leveling amplifier/compressor. Genuinely small: a hard-knee
+// power-law gain computer (no separate detector/envelope stage -- the instantaneous absolute sample
+// value IS the level reading) followed by one asymmetric-coefficient one-pole smoother on the
+// resulting gain value itself, then makeup gain. param[0] Threshold (-60..0dB), param[1] Ratio
+// (1..20 -- 1 is the original's own default, i.e. no compression at all until turned up), param[2]
+// Attack (0.1..100ms), param[3] Release (100..1000ms), param[4] Makeup Gain (-12..+12dB). The
+// original's own sixth ("peakReduction", a single-knob macro mapped onto these five in its GUI
+// layer) and seventh ("limitMode", declared but never read by its own DSP) params are both left out
+// -- the macro is UI convenience, not DSP, and limitMode has no effect in the source this was ported
+// from. The original is mono-only (its own input/output buses are both `.mono()`); this stereo
+// adaptation follows the exact same "one shared gain value off max(|L|,|R|), never independent
+// per-channel" posture as FX_TYPE_GATE/FX_TYPE_LIMITER above, for the identical reason (an
+// independent per-channel envelope would skew the stereo image every time the compressor moved).
+#define FX_TYPE_OPTOCOMP 18
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -5361,6 +5376,64 @@ static void run_fx_multifilter(FXSlotEngine *engine, const FXSlotParams *params,
     }
 }
 
+// --- FX_TYPE_OPTOCOMP: ported from 4a2a (github.com/aim-qmul/4a2a, MPL-2.0 license) --- see
+// FX_TYPE_OPTOCOMP's own #define comment above for the param map and what was left out. Kept
+// faithful: the hard-knee power-law gain computer (no threshold-offset-in-dB detector math, no
+// separate envelope stage -- literally `min(1, (|x|/thresholdGain)^-slope)` computed fresh every
+// sample from the instantaneous absolute input value), the asymmetric attack/release one-pole
+// smoothing applied to that resulting gain value itself, and the original's own specific `m2c()`
+// time-constant calibration (`1 - exp(-2200/(ms*srate))` -- note ms is used AS GIVEN, not converted
+// to seconds first; ported exactly, not "corrected" to a more usual seconds-based convention, since
+// this specific formula is what gives the port its actual timing feel). Changed: the original's own
+// per-BLOCK array-with-carry implementation (`gBuffer`, sized samplesPerBlock+1, textbook JUCE
+// block-processing style) becomes a single persistent float here, since this engine calls every FX
+// effect once per SAMPLE, not once per block -- this is an adaptation of the reference's own
+// block-oriented plumbing to this engine's per-sample calling convention, not a change to the DSP
+// itself (sample-for-sample identical results either way, one state float updated every sample vs.
+// the same math spread across a block-sized array with a value carried at the boundary).
+typedef struct {
+    float gain_smoothed; // starts at 1.0 -- see FxGateState's own comment on why calloc's 0.0
+                           // default would wrongly compress the very first block's audio.
+    bool initialized;
+    float last_gr_db;
+} FxOptoCompState;
+
+static void run_fx_optocomp(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxOptoCompState *st = (FxOptoCompState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxOptoCompState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+    if (!st->initialized) { st->gain_smoothed = 1.0f; st->initialized = true; }
+
+    const float threshold_db = -60.0f + fmaxf(0.0f, fminf(1.0f, params->param[0])) * 60.0f; // -60..0dB
+    const float ratio = 1.0f + fmaxf(0.0f, fminf(1.0f, params->param[1])) * 19.0f;           // 1..20
+    const float attack_ms = 0.1f + fmaxf(0.0f, fminf(1.0f, params->param[2])) * 99.9f;       // 0.1..100ms
+    const float release_ms = 100.0f + fmaxf(0.0f, fminf(1.0f, params->param[3])) * 900.0f;   // 100..1000ms
+    const float makeup_db = -12.0f + fmaxf(0.0f, fminf(1.0f, params->param[4])) * 24.0f;     // -12..+12dB
+
+    const float threshold_gain = powf(10.0f, threshold_db / 20.0f);
+    const float makeup_gain = powf(10.0f, makeup_db / 20.0f);
+    const float attack_coef = 1.0f - expf(-2200.0f / (attack_ms * (float)SAMPLE_RATE));
+    const float release_coef = 1.0f - expf(-2200.0f / (release_ms * (float)SAMPLE_RATE));
+    const float comp_slope = 1.0f - 1.0f / ratio;
+
+    // Shared mono detector/envelope -- see this effect's own #define comment for why.
+    const float level = fmaxf(fabsf(*l), fabsf(*r));
+    // powf(0, negative) is +Infinity (IEEE 754, not a domain error), and fminf(1.0, Infinity) is
+    // 1.0 -- the same implicit "true silence never needs a special case" behavior the original's
+    // own std::fmin/std::pow already relies on, ported as-is with no extra guard needed.
+    const float gain_target = fminf(1.0f, powf(level / threshold_gain, -comp_slope));
+    const float coef = (gain_target < st->gain_smoothed) ? attack_coef : release_coef;
+    st->gain_smoothed = gain_target * coef + st->gain_smoothed * (1.0f - coef);
+
+    *l = *l * st->gain_smoothed * makeup_gain;
+    *r = *r * st->gain_smoothed * makeup_gain;
+
+    st->last_gr_db = fmaxf(0.0f, -20.0f * log10f(fmaxf(1e-6f, st->gain_smoothed)));
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -5532,6 +5605,10 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                     if (fx_engine[s].state) gr_db_out[s] = ((FxPeakMaxState *)fx_engine[s].state)->last_gr_db;
                     break;
                 case FX_TYPE_MULTIFILTER: run_fx_multifilter(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_OPTOCOMP:
+                    run_fx_optocomp(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
+                    if (fx_engine[s].state) gr_db_out[s] = ((FxOptoCompState *)fx_engine[s].state)->last_gr_db;
+                    break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through

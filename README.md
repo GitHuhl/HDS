@@ -1319,13 +1319,45 @@ rolloff) until the test's own measurement floor takes over well past -90dB; the 
 12dB give identical, filtered -- not silently bypassed -- output); and an 8-stage cascade at maximum
 resonance stays finite and bounded over 200,000 samples (~4 seconds).
 
+### OptoComp FX slot (feed-forward optical-compressor approximation)
+
+An FX slot (Type: `OptoComp`) ported from [4a2a](https://github.com/aim-qmul/4a2a) (MPL-2.0
+license) -- a feed-forward digital approximation of a classic optical leveling amplifier/compressor.
+Genuinely compact: a hard-knee power-law gain computer with no separate detector/envelope stage at
+all (the instantaneous absolute sample value directly drives `min(1, (|x|/thresholdGain)^-slope)`),
+followed by one asymmetric-coefficient one-pole smoother applied to that resulting gain value itself,
+then makeup gain.
+
+Five params: **Threshold** (-60..0dB), **Ratio** (1..20 -- 1 is the original's own default, meaning
+no compression at all until turned up), **Attack** (0.1..100ms), **Release** (100..1000ms), and
+**Makeup Gain** (-12..+12dB). Left out: the original's own sixth ("Peak Reduction," a single-knob
+macro that maps onto these five params in its own GUI layer -- UI convenience, not DSP) and seventh
+("Limit Mode," a boolean the original declares but its own `processBlock()` never actually reads).
+The original is mono-only (its own JUCE input/output buses are both declared `.mono()`); this stereo
+adaptation shares one detector/gain value off `max(|L|,|R|)` across both channels, the same posture
+FX_TYPE_GATE/FX_TYPE_LIMITER already use and for the identical reason (an independent per-channel
+envelope would skew the stereo image every time the compressor moved).
+
+**What's ported faithfully vs. adapted**: the entire DSP is kept faithful, including the original's
+own specific `m2c()` time-constant calibration (`1 - exp(-2200/(ms*srate))` -- note `ms` is used
+exactly as given, not converted to seconds first; ported as-is rather than "corrected" to a more
+usual convention, since this specific formula is what gives the port its actual timing feel). The
+only adaptation: the original's own per-BLOCK array-with-carry state (JUCE's typical block-processing
+style) becomes a single persistent float here, since this engine calls every FX effect once per
+SAMPLE rather than once per block -- an adaptation of the reference's own block-oriented plumbing to
+this engine's calling convention, not a change to the DSP (sample-for-sample identical results
+either way). Verified with a standalone test harness: bit-exact transparency at Ratio=1, steady-state
+gain reduction matching the reference formula to 5 decimal places, correct relative attack/release
+timing, exact makeup-gain math, and correct shared-detector stereo behavior (a loud channel driving
+gain reduction on both).
+
 ### Per-slot gain reduction (GR) metering
 
-Gate, Limiter, FetComp, FairKid67, and PeakMax -- the 5 FX types with a real gain-reduction stage --
+Gate, Limiter, FetComp, FairKid67, PeakMax, and OptoComp -- the 6 FX types with a real gain-reduction stage --
 each report their current reduction in dB over OSC as `/hds/status/fx_gr/<slot>` (0 for a bypassed,
 Off, or non-GR-capable slot), sent every status tick (~31Hz) alongside the rest of
 `/hds/status/*`. The frontend shows this as a small "GR" readout next to each FX slot's Mix/Bypass
-controls, visible only while that slot's Type is one of the five above. Computed per effect from
+controls, visible only while that slot's Type is one of the six above. Computed per effect from
 whatever state that effect already tracks, no extra DSP added purely for metering:
 - **Gate/Limiter**: both already track one applied linear gain multiplier (`gain`, 1.0 = no
   reduction) -- `-20*log10(gain)`, clamped >=0.
@@ -1344,6 +1376,8 @@ whatever state that effect already tracks, no extra DSP added purely for meterin
 - **PeakMax**: unlike the other four, this one already computes a real applied gain multiplier
   (`output_gr`, after its own triangular smoothing) as part of normal operation, purely because
   computing it IS how the limiter works -- `-20*log10(output_gr)`, clamped >=0, no extra work at all.
+- **OptoComp**: same shape as Gate/Limiter -- already tracks one applied linear gain multiplier
+  (`gain_smoothed`) as part of normal operation -- `-20*log10(gain_smoothed)`, clamped >=0.
 
 ### Control protocol: OSC
 
