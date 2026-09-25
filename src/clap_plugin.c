@@ -1034,6 +1034,9 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
     }
 
     float block_peak = 0.0f;
+    // Holds the LAST chunk's GR readings once the frames_done loop below finishes -- same "latest
+    // reading is all the status tick needs" convention as backend.c's own standalone main loop.
+    float gr_db_scratch[FX_SLOT_COUNT] = {0};
     uint32_t frames_done = 0;
     while (frames_done < process->frames_count) {
         uint32_t remaining = process->frames_count - frames_done;
@@ -1078,7 +1081,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases,
                                          any_ext_in_connected ? p->ext_in_render_buf : NULL, any_ext_in_connected ? EXT_IN_PAIR_COUNT * 2 : 0,
                                          2, &p->midi_live, chunk_buffer, current_tempo_bpm, ext_in_peak_scratch,
-                                         any_prog_out_connected ? p->per_program_render_buf : NULL);
+                                         any_prog_out_connected ? p->per_program_render_buf : NULL, gr_db_scratch);
         if (peak > block_peak) block_peak = peak;
 
         if (out) {
@@ -1109,6 +1112,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
             status.tempo_bpm_live = current_tempo_bpm;
             status.seq_elapsed_seconds = (float)p->engine.transport_playhead_sec;
             status.seq_transport_state = (float)p->engine.transport_state;
+            for (int s = 0; s < FX_SLOT_COUNT; s++) status.fx_gain_reduction_db[s] = gr_db_scratch[s];
             send_osc_status(p->osc_reply_addr, &status);
             send_seq_audio_status(&p->streams_state, p->osc_reply_addr);
             p->vu_decimator = 0;

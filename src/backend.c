@@ -3721,6 +3721,8 @@ typedef struct {
                  // 0.0, which would wrongly gate the very first block's audio before any real
                  // envelope has been established), fixed up on first use below.
     bool initialized;
+    float last_gr_db; // -20*log10(gain), clamped >=0 -- this slot's current gain reduction in dB,
+                        // read back by process_fx_chain() for the /hds/status/fx_gr/<slot> meter.
 } FxGateState;
 
 static void run_fx_gate(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
@@ -3752,6 +3754,7 @@ static void run_fx_gate(FXSlotEngine *engine, const FXSlotParams *params, float 
 
     *l *= st->gain;
     *r *= st->gain;
+    st->last_gr_db = fmaxf(0.0f, -20.0f * log10f(fmaxf(1e-6f, st->gain)));
 }
 
 // --- FX_TYPE_EQ3: the Program's own post-filter 3-band EQ, ported to an FX slot --- see
@@ -3816,6 +3819,7 @@ typedef struct {
     float gain; // starts at 1.0 -- see FxGateState's own comment on why calloc's 0.0 default would
                  // be wrong here too (a fully-closed limiter on the very first block).
     bool initialized;
+    float last_gr_db; // -20*log10(gain), clamped >=0 -- see FxGateState.last_gr_db's own comment.
 } FxLimiterState;
 
 static void run_fx_limiter(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
@@ -3853,6 +3857,7 @@ static void run_fx_limiter(FXSlotEngine *engine, const FXSlotParams *params, flo
     }
     *l = sl;
     *r = sr;
+    st->last_gr_db = fmaxf(0.0f, -20.0f * log10f(fmaxf(1e-6f, st->gain)));
 }
 
 // --- FX_TYPE_FETCOMP: ported from fetcomp-dsp (github.com/Paulllux/fetcomp-dsp, MIT license) --- see
@@ -3927,6 +3932,11 @@ typedef struct {
     float os_up_z1[2], os_up_z2[2];                   // per-channel 2x-upsample filter state
     float os_down_z1[2], os_down_z2[2];               // per-channel 2x-downsample filter state
     float smoothed_in, smoothed_out;                  // ramped input/output gain (linear)
+    float last_gr_db; // the gain cell's own current reduction: at ctrl_volts=0 (quiescent) the
+                        // closed-form solve's small-signal gain is exactly 1 (see fetcomp_solve_cell's
+                        // own comment), so unlike FairKid67 below this needs no separate quiescent
+                        // probe -- 20*log10(1+R5*G0) directly gives the reduction relative to that
+                        // unity baseline. Read back by process_fx_chain() for the GR meter.
 } FxFetCompState;
 
 #define FETCOMP_R5 27000.0f               // gain-cell series resistor, from the Rev D drawing
@@ -4233,6 +4243,8 @@ static void run_fx_fetcomp(FXSlotEngine *engine, const FXSlotParams *params, flo
     }
     *l = outL;
     *r = outR;
+    const float g0_now = st->two_beta * st->ctrl_volts;
+    st->last_gr_db = fmaxf(0.0f, 20.0f * log10f(1.0f + FETCOMP_R5 * g0_now));
 }
 
 // --- FX_TYPE_FAIRKID67: ported from PHU-FAIR-KID-67 (github.com/huberp/phu-fair-kid-67, MIT
@@ -4391,6 +4403,54 @@ static void fk67_stage_nr_solve(FK67NodeState *st, double vin, double cv_bias, c
     st->vk = vk;
 }
 
+// Small-signal gain (|dVp/dVin|) of a triode stage AT ITS CURRENT (already NR-converged) operating
+// point -- used only for the push-pull arms' GR metering (see FX_TYPE_FAIRKID67's own GR comment
+// below). At a fixed point f(vp,vk,vin)=0 of the same two KCL residuals fk67_stage_nr_solve zeroes,
+// implicit differentiation gives J*d(vp,vk)/dVin = -df/dVin, and since Vin only enters both residuals
+// through Vgk (df1/dVin = df2/dVin = -gm), Cramer's rule on that 2x2 system gives
+// dVp/dVin = gm*(J11-J01)/det directly from the SAME Jacobian terms the NR solve itself computes on
+// every iteration. Rather than threading those terms out of fk67_stage_nr_solve's loop (which would
+// touch every one of its 6 call sites for a value only 2 of them need), this re-evaluates the Koren
+// model once more at the already-converged (vp,vk) -- one extra model evaluation per stage per
+// sample, no extra Newton iterations, and mathematically identical since the Jacobian at a converged
+// point doesn't depend on how it was reached.
+static double fk67_stage_signal_gain(const FK67NodeState *st, double vin, double cv_bias, const FK67TubeParams *tube) {
+    const double mu = tube->mu, kp = tube->kp, kvb = tube->kvb, kg1 = tube->kg1, x = tube->x;
+    const double vp = st->vp, vk = st->vk;
+    vin = fmin(vin, vk);
+    const double Vpk = vp - vk;
+    const double Vgk = vin - vk - cv_bias;
+    const double V2 = fmax(kvb + Vpk * Vpk, 1e-12);
+    const double sqV2 = sqrt(V2);
+    const double u = kp * (1.0 / mu + Vgk / sqV2);
+    double sig;
+    if (u >= 0.0) sig = 1.0 / (1.0 + exp(-u));
+    else { const double eu = exp(u); sig = eu / (1.0 + eu); }
+    double sp;
+    if (u > 30.0) sp = u;
+    else if (u < -30.0) sp = exp(u);
+    else sp = log1p(exp(u));
+    const double E1 = (Vpk / kp) * sp;
+    double gds = 0.0, gm = 0.0;
+    if (E1 > 0.0) {
+        const double Ex = pow(E1, x);
+        const double Exx1 = Ex / E1;
+        const double sp_over_kp = (Vpk != 0.0) ? (E1 / Vpk) : (sp / kp);
+        const double dE1_dVpk = sp_over_kp - Vpk * Vpk * Vgk * sig / (V2 * sqV2);
+        const double dE1_dVgk = Vpk * sig / sqV2;
+        const double x_Exx1_kg1 = x * Exx1 / kg1;
+        gds = x_Exx1_kg1 * dE1_dVpk;
+        gm  = x_Exx1_kg1 * dE1_dVgk;
+    }
+    const double J00 = -FK67_INV_RP - gds;
+    const double J01 = gds + gm;
+    const double J10 = -gds;
+    const double J11 = FK67_INV_RK + gds + gm;
+    const double det = J00 * J11 - J01 * J10;
+    if (fabs(det) < 1e-30) return 0.0;
+    return fabs(gm * (J11 - J01) / det);
+}
+
 // Per-channel, per-stage-role dynamic state: the NR node above plus the stage's own DC-blocking
 // output filter (models the real output coupling capacitor every one of these tube stages has --
 // without it the triode's own large quiescent plate voltage, ~100-200V, would swamp everything
@@ -4398,6 +4458,9 @@ static void fk67_stage_nr_solve(FK67NodeState *st, double vin, double cv_bias, c
 typedef struct {
     FK67NodeState node;
     float dc_x1, dc_y1; // one-pole DC-blocking HPF state: y[n] = x[n]-x[n-1] + R*y[n-1], R ~10Hz
+    float last_signal_gain; // |dVp/dVin| at this call's operating point (fk67_stage_signal_gain) --
+                              // written unconditionally by fk67_stage_process below, cheap for every
+                              // stage role even though only the push-pull arms' GR meter reads it.
 } FK67StageState;
 
 // Precomputed once per distinct TUBE TYPE (not per channel/instance -- every stage using the same
@@ -4440,6 +4503,8 @@ static inline float fk67_stage_process(FK67StageState *st, const FK67StageCoeffs
     const float y = vp_norm - st->dc_x1 + dc_block_coeff * st->dc_y1;
     st->dc_x1 = vp_norm;
     st->dc_y1 = y;
+
+    st->last_signal_gain = (float)fk67_stage_signal_gain(&st->node, vin, cv_bias, tube);
 
     return -coeffs->inv_gain_mag * y;
 }
@@ -4594,6 +4659,10 @@ typedef struct {
     FK67DetectorState detector[2];
 
     bool initialized;
+    float last_gr_db; // worst-case (max across both push-pull arms/channels) current reduction of
+                        // the 6386 gain stage vs. its own cv=0 quiescent gain (coeffs_6386.
+                        // inv_gain_mag) -- see run_fx_fairkid67's own comment. Read back by
+                        // process_fx_chain() for the GR meter.
 } FxFairKid67State;
 
 static void fk67_init(FxFairKid67State *st) {
@@ -4717,6 +4786,14 @@ static void run_fx_fairkid67(FXSlotEngine *engine, const FXSlotParams *params, f
         const float output = fk67_xfmr2_process(&st->xfmr_out[ch], interstage, 1.0f * iron);
         *(ch == 0 ? l : r) = output * output_gain;
     }
+
+    // GR meter: the 6386 push-pull stage is the only one of the 6 stage roles cv_bias ever drives
+    // away from quiescent (see the tube-role table in fk67_init) -- worst case (max, not average)
+    // across both arms/channels, so a single hot channel's compression isn't hidden by an idle one.
+    const float gain_mag = fmaxf(fmaxf(st->arm_a[0].last_signal_gain, st->arm_a[1].last_signal_gain),
+                                  fmaxf(st->arm_b[0].last_signal_gain, st->arm_b[1].last_signal_gain));
+    const float ratio = gain_mag * st->coeffs_6386.inv_gain_mag; // 1.0 at quiescent (cv=0), <1.0 when compressing
+    st->last_gr_db = fmaxf(0.0f, -20.0f * log10f(fmaxf(1e-6f, ratio)));
 }
 
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
@@ -4802,7 +4879,14 @@ static void sync_fx_engine_types(const FXSlotParams fx_params[FX_SLOT_COUNT], FX
 // which SOURCE_COUNT index happens to be processed first. Read-only here; only FX_TYPE_FAIRKID67
 // currently uses it, via an explicit index lookup right after dry_l/dry_r below -- every other
 // effect ignores it completely, same posture as any other per-slot field it doesn't read.
-static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, const float sc_snapshot_l[SOURCE_COUNT], const float sc_snapshot_r[SOURCE_COUNT], float *l, float *r) {
+// gr_db_out[FX_SLOT_COUNT] (required, not NULL-able -- same convention as render_audio_block's own
+// ext_in_peak_out): this call writes gr_db_out[s] for every slot s it owns (fx_params[s].fx_source
+// == source_id), 0.0f for a bypassed/off/non-GR-capable slot, or that slot's own effect state's
+// last_gr_db otherwise. A slot NOT owned by this source_id is left untouched by this call -- since
+// render_audio_block calls this once per source and slots partition cleanly by fx_source, every
+// slot ends up written by exactly the one call that owns it (see render_audio_block's own zeroing
+// of the whole array before its source loop, which covers a source with zero owned slots).
+static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, const float sc_snapshot_l[SOURCE_COUNT], const float sc_snapshot_r[SOURCE_COUNT], float *l, float *r, float gr_db_out[FX_SLOT_COUNT]) {
     float parallel_in_l = *l, parallel_in_r = *r;
     float parallel_sum_l = 0.0f, parallel_sum_r = 0.0f;
     int parallel_branch_count = 0;
@@ -4843,6 +4927,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
         }
 
         float out_l, out_r;
+        gr_db_out[s] = 0.0f; // default: bypassed/off/non-GR-capable -- overwritten below for the 4 GR-capable types
         if (fx_params[s].bypass != 0.0f || type == FX_TYPE_OFF) {
             out_l = dry_l; out_r = dry_r; // pass-through, dry
         } else {
@@ -4860,11 +4945,23 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
 #if HDS_NAM_ENABLED
                 case FX_TYPE_NAM: run_fx_nam(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
 #endif
-                case FX_TYPE_GATE: run_fx_gate(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_GATE:
+                    run_fx_gate(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
+                    if (fx_engine[s].state) gr_db_out[s] = ((FxGateState *)fx_engine[s].state)->last_gr_db;
+                    break;
                 case FX_TYPE_EQ3: run_fx_eq3(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
-                case FX_TYPE_LIMITER: run_fx_limiter(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
-                case FX_TYPE_FETCOMP: run_fx_fetcomp(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
-                case FX_TYPE_FAIRKID67: run_fx_fairkid67(&fx_engine[s], &fx_params[s], &wet_l, &wet_r, sc_l, sc_r); break;
+                case FX_TYPE_LIMITER:
+                    run_fx_limiter(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
+                    if (fx_engine[s].state) gr_db_out[s] = ((FxLimiterState *)fx_engine[s].state)->last_gr_db;
+                    break;
+                case FX_TYPE_FETCOMP:
+                    run_fx_fetcomp(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
+                    if (fx_engine[s].state) gr_db_out[s] = ((FxFetCompState *)fx_engine[s].state)->last_gr_db;
+                    break;
+                case FX_TYPE_FAIRKID67:
+                    run_fx_fairkid67(&fx_engine[s], &fx_params[s], &wet_l, &wet_r, sc_l, sc_r);
+                    if (fx_engine[s].state) gr_db_out[s] = ((FxFairKid67State *)fx_engine[s].state)->last_gr_db;
+                    break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through
@@ -11427,8 +11524,13 @@ static void apply_program_eq(HdsEngineState *engine, int p, const EqBiquadCoeffs
 // the standalone app has no equivalent need (its own Routing tab already sends any Program to any
 // real hardware output pair via out_buffer/output_channels) and always passes NULL here, at zero
 // extra cost beyond one null check per sample.
-static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm, float ext_in_peak_out[EXT_IN_PAIR_COUNT], float *per_program_out) {
+// gr_db_out[FX_SLOT_COUNT] (required, not NULL-able -- same convention as ext_in_peak_out just
+// above): each slot's current gain-reduction reading in dB (0 for a bypassed/off/non-GR-capable
+// slot), zeroed here and refreshed every sample by process_fx_chain() -- so after this call returns,
+// it holds the LAST sample's readings, which is all the ~31Hz status tick (send_osc_status) needs.
+static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm, float ext_in_peak_out[EXT_IN_PAIR_COUNT], float *per_program_out, float gr_db_out[FX_SLOT_COUNT]) {
     float peak = 0.0f;
+    for (int s = 0; s < FX_SLOT_COUNT; s++) gr_db_out[s] = 0.0f;
     // Routing tab's per-ext-in-pair VU meters (see gui_routing_tab_visible's own comment): a true
     // no-op -- not just "computed but ignored" -- whenever the Routing tab isn't on-screen, so
     // this costs nothing for the life of the process unless a player is actually looking at it.
@@ -12498,7 +12600,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // effect to.
         for (int src = 0; src < SOURCE_COUNT; src++) {
             if (!source_has_fx_slots[src]) continue;
-            process_fx_chain(knobs->fx, fx_engine, (int)knobs->fx_source_routing_mode[src], src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src]);
+            process_fx_chain(knobs->fx, fx_engine, (int)knobs->fx_source_routing_mode[src], src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src], gr_db_out);
         }
 
         // CLAP multi-out (see this function's own per_program_out comment) -- captured here,
@@ -13741,6 +13843,10 @@ typedef struct {
     // vs "Ext: Waiting..." instead of leaving a player guessing whether a cable/routing problem is
     // why tempo isn't moving.
     float midi_clock_locked;
+    // Per-FX-slot gain reduction, in dB (0 = no reduction / bypassed / non-GR-capable type) --
+    // see render_audio_block's own gr_db_out comment and process_fx_chain's per-slot GR writes.
+    // Only Gate/Limiter/FetComp(HT-76)/FairKid67(Fairchild 670) ever report nonzero here.
+    float fx_gain_reduction_db[FX_SLOT_COUNT];
 } EngineStatus;
 
 // Sends the GUI-status snapshot as one OSC bundle (one UDP datagram, 8 messages) to the reply
@@ -13766,6 +13872,11 @@ static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
         m = lo_message_new(); lo_message_add_float(m, status->ext_in_peak[p]); lo_bundle_add_message(b, addr, m);
     }
     m = lo_message_new(); lo_message_add_float(m, status->midi_clock_locked); lo_bundle_add_message(b, "/hds/status/midi_clock_locked", m);
+    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+        char addr[40];
+        snprintf(addr, sizeof(addr), "/hds/status/fx_gr/%d", s);
+        m = lo_message_new(); lo_message_add_float(m, status->fx_gain_reduction_db[s]); lo_bundle_add_message(b, addr, m);
+    }
     lo_send_bundle(reply_addr, b);
     lo_bundle_free_recursive(b); // frees the bundle AND every message added to it
 }
@@ -14529,7 +14640,8 @@ int main(int argc, char **argv) {
         struct timespec render_t0, render_t1;
         clock_gettime(CLOCK_MONOTONIC, &render_t0);
         float ext_in_peak[EXT_IN_PAIR_COUNT];
-        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer, current_tempo_bpm, ext_in_peak, NULL);
+        float gr_db[FX_SLOT_COUNT];
+        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer, current_tempo_bpm, ext_in_peak, NULL, gr_db);
         clock_gettime(CLOCK_MONOTONIC, &render_t1);
         double render_ms = (render_t1.tv_sec - render_t0.tv_sec) * 1000.0 + (render_t1.tv_nsec - render_t0.tv_nsec) / 1e6;
         double budget_ms = (block_size / (double)SAMPLE_RATE) * 1000.0;
@@ -14626,6 +14738,7 @@ int main(int argc, char **argv) {
             };
             for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) status.ext_in_peak[p] = ext_in_peak[p];
             status.midi_clock_locked = use_external_clock ? 1.0f : 0.0f;
+            for (int s = 0; s < FX_SLOT_COUNT; s++) status.fx_gain_reduction_db[s] = gr_db[s];
             send_osc_status(osc_reply_addr, &status);
             send_seq_audio_status(&g_streams_state, osc_reply_addr);
             vu_decimator = 0;

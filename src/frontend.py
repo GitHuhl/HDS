@@ -888,6 +888,12 @@ FX_TYPE_METADATA += [
     ]},
 ]
 
+# The 4 FX types whose backend state exposes a real GR (gain reduction) reading -- see
+# process_fx_chain's own gr_db_out comment in backend.c. Looked up by name rather than a hardcoded
+# index (like FX_TYPE_NAM above) since these four are spread across the pre- and post-NAM halves of
+# FX_TYPE_METADATA; used only by _apply_fx_slot_type to show/hide each slot's GR label.
+FX_TYPE_GR_CAPABLE_INDICES = {i for i, e in enumerate(FX_TYPE_METADATA) if e["name"] in ("Gate", "Limiter", "FetComp", "FairKid67")}
+
 # Sentinel shown in the MIDI Input combo for auto-detect mode; encoded on the wire as "auto" --
 # must match the backend's own "auto"/empty-string convention in midi_client_should_autoconnect.
 MIDI_AUTO_LABEL = "Auto (recommended)"
@@ -4755,6 +4761,12 @@ class SynthGui(QWidget):
         # position carries BOTH a knob and a combo (only one shown at a time) so a discrete
         # choice param (see FX_TYPE_METADATA) can present real option text instead of a knob.
         self.fx_param_dials, self.fx_param_combos, self.fx_param_labels, self.fx_param_columns = [], [], [], []
+        # Per-slot GR (gain reduction) dB readout -- see FX_TYPE_GR_CAPABLE_INDICES and
+        # listen_for_status_frames's /hds/status/fx_gr/<slot> handler. Only ever visible for the 4
+        # GR-capable types (_apply_fx_slot_type), otherwise hidden -- this list still has one entry
+        # per slot regardless, same "always constructed, shown conditionally" convention as the
+        # NAM-only Load Model/Load Cab IR buttons above.
+        self.fx_gr_labels = []
 
         for slot_idx in range(FX_SLOT_COUNT):
             slot_box = QGroupBox(f"FX {slot_idx + 1}")
@@ -4836,6 +4848,18 @@ class SynthGui(QWidget):
             mix_col.addWidget(mix_dial, alignment=Qt.AlignmentFlag.AlignCenter)
             slot_lay.addLayout(mix_col)
             self.fx_mix_dials.append(mix_dial)
+
+            gr_col = QVBoxLayout(); gr_col.setSpacing(0)
+            gr_col.addWidget(QLabel("GR"), alignment=Qt.AlignmentFlag.AlignCenter)
+            gr_label = QLabel("--")
+            gr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            gr_label.setStyleSheet("font-size: 9px; font-weight: bold; color: #b58900;")
+            gr_label.setFixedWidth(34)
+            gr_label.setToolTip("Current gain reduction (dB) -- only meaningful for Gate/Limiter/FetComp/FairKid67")
+            gr_label.setVisible(False) # shown only for a GR-capable type -- see _apply_fx_slot_type
+            gr_col.addWidget(gr_label, alignment=Qt.AlignmentFlag.AlignCenter)
+            slot_lay.addLayout(gr_col)
+            self.fx_gr_labels.append(gr_label)
 
             bypass_btn = QPushButton("By")
             bypass_btn.setCheckable(True)
@@ -5667,6 +5691,10 @@ class SynthGui(QWidget):
         is_nam = (type_index == FX_TYPE_NAM)
         self.fx_nam_model_buttons[slot_idx].setVisible(is_nam)
         self.fx_nam_ir_buttons[slot_idx].setVisible(is_nam)
+        is_gr_capable = type_index in FX_TYPE_GR_CAPABLE_INDICES
+        self.fx_gr_labels[slot_idx].setVisible(is_gr_capable)
+        if not is_gr_capable:
+            self.fx_gr_labels[slot_idx].setText("--") # stale reading from a previous type would be misleading otherwise
 
     def _fx_slot_snapshot(self, slot_idx):
         """Captures everything that makes up one FX slot's configuration -- type, all 8 params
@@ -7923,6 +7951,18 @@ class SynthGui(QWidget):
                     src = COMBI_PROGRAM_COUNT + 1 + pair
                     if 0 <= src < len(self.routing_ext_in_vu_meters) and self.routing_ext_in_vu_meters[src] is not None:
                         self.routing_ext_in_vu_meters[src].setValue(int(max(0, min(100, msg.params[0] * 100.0))))
+                elif msg.address.startswith("/hds/status/fx_gr/") and msg.params:
+                    # /hds/status/fx_gr/<slot> -- per-slot GR meter (see FX_TYPE_GR_CAPABLE_INDICES
+                    # and process_fx_chain's own gr_db_out comment in backend.c). Applied directly,
+                    # same "no buffering needed, already the latest value" reasoning as
+                    # ext_in_peak just above; the label itself is only ever visible for a
+                    # GR-capable type (_apply_fx_slot_type), so no visibility check needed here.
+                    try:
+                        slot = int(msg.address.rsplit("/", 1)[1])
+                    except ValueError:
+                        continue
+                    if 0 <= slot < len(self.fx_gr_labels):
+                        self.fx_gr_labels[slot].setText(f"{msg.params[0]:.1f}")
                 elif msg.address == "/hds/status/state_dump_complete":
                     # Sentinel closing out a /hds/request_state reply -- see
                     # send_full_state_dump() in backend.c. Apply everything buffered so far, then

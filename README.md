@@ -1236,6 +1236,29 @@ behind each change, and its own DSP test (compression scaling, external-sidechai
 mode differences, push-pull symmetry, and finiteness under pathological input) for how it was
 verified.
 
+### Per-slot gain reduction (GR) metering
+
+Gate, Limiter, FetComp, and FairKid67 -- the 4 FX types with a real gain-reduction stage -- each
+report their current reduction in dB over OSC as `/hds/status/fx_gr/<slot>` (0 for a bypassed,
+Off, or non-GR-capable slot), sent every status tick (~31Hz) alongside the rest of
+`/hds/status/*`. The frontend shows this as a small "GR" readout next to each FX slot's Mix/Bypass
+controls, visible only while that slot's Type is one of the four above. Computed per effect from
+whatever state that effect already tracks, no extra DSP added purely for metering:
+- **Gate/Limiter**: both already track one applied linear gain multiplier (`gain`, 1.0 = no
+  reduction) -- `-20*log10(gain)`, clamped >=0.
+- **FetComp**: the gain cell's own control voltage (`ctrl_volts`) plugs directly into the same
+  closed-form solve `run_fx_fetcomp()` already uses, since at `ctrl_volts=0` (quiescent) that
+  solve's small-signal gain is exactly 1 -- `20*log10(1 + R5*two_beta*ctrl_volts)`, no separate
+  quiescent probe needed.
+- **FairKid67**: the push-pull output stage (the only one of its 6 triode stages a control voltage
+  ever drives away from quiescent) doesn't have a closed-form gain -- its small-signal gain is
+  found via implicit differentiation of the same Newton-Raphson KCL residuals `fk67_stage_nr_solve()`
+  already zeroes every sample (`dVp/dVin = gm*(J11-J01)/det`, from the same Jacobian terms that
+  solve already computes), then compared against that stage's own cached `cv=0` quiescent gain
+  (found once, at slot activation, via a finite-difference probe -- see the FairKid67 section
+  above) to get a ratio, worst-case (max) across both arms/both channels. One extra model
+  evaluation per stage per sample, no extra Newton iterations.
+
 ### Control protocol: OSC
 
 The backend is controlled entirely over OSC (Open Sound Control), via a
