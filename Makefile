@@ -169,14 +169,16 @@ $(BUILD_DIR) $(NAM_BUILD_DIR) $(ARM64_NAM_BUILD_DIR):
 
 # backend.c/clap_plugin.c stay plain C, compiled by $(CC) exactly as before -- only the FINAL link
 # step (below) needs $(CXX), to pull in libstdc++ for the NAM objects linked alongside them.
-# src/backend.c is listed explicitly (not just $(SRC)/$(CLAP_SRC)) because both source files
-# #include it rather than link against it -- without this, editing backend.c alone wouldn't
-# trigger a rebuild of either object, a real (if previously narrower) gap that matters more now
-# that backend.c and its two includers are three separate files instead of two.
-$(BIN_OBJ): $(SRC) src/backend.c src/nam_bridge.h | $(BUILD_DIR)
+# src/backend.c and src/fx_chain.c are listed explicitly (not just $(SRC)/$(CLAP_SRC)) because
+# every real source file #includes them rather than links against them -- without this, editing
+# either alone wouldn't trigger a rebuild of any object depending on it. src/sequencer.c is the
+# same story but ONLY for $(BIN_OBJ)/$(ARM64_BIN_OBJ): it's #include'd by hds_standalone.c alone
+# (never reachable from a CLAP plugin instance -- see its own header comment), so it's deliberately
+# left off $(CLAP_OBJ)'s own prerequisite list below.
+$(BIN_OBJ): $(SRC) src/backend.c src/fx_chain.c src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -c $(SRC) -o $@
 
-$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/nam_bridge.h | $(BUILD_DIR)
+$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_chain.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
 # Three source directories (NAM/, NAM/wavenet/, src/) flattened into one object directory -- see
@@ -219,7 +221,7 @@ ARM64_BIN_OBJ := $(BUILD_DIR)/hds_standalone-arm64.o
 # hds_standalone.c itself stays plain C, compiled by $(ARM64_CC) exactly like the native
 # $(BIN_OBJ) rule above -- only the FINAL link step needs $(ARM64_CXX), to pull in libstdc++ for
 # the NAM objects linked alongside it, same reasoning as $(BIN)/clap's own rules.
-$(ARM64_BIN_OBJ): $(SRC) src/backend.c src/nam_bridge.h | $(BUILD_DIR)
+$(ARM64_BIN_OBJ): $(SRC) src/backend.c src/fx_chain.c src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
 	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $(SRC) -o $@
 

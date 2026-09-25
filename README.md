@@ -830,21 +830,28 @@ platform, not a second platform.
 
 ### Source layout: backend.c is the shared core, not a standalone entry point
 
-Four files, one architecture: `src/backend.c` is the shared DSP/OSC/state engine (oscillators,
-filters, the OSC control protocol, the sequencer/arpeggiator, sample streaming -- everything that
-doesn't touch a physical device directly and isn't the FX chain's own bulk), and it is never
-compiled on its own. Both real targets pull it in with a plain `#include` (one translation unit per
-binary, this project's existing convention -- see `clap_plugin.c`'s own header comment):
-`src/hds_standalone.c` adds the ALSA/PipeWire audio shim, the ALSA MIDI sequencer client, recording,
-the `--program` JSON loader, the interactive arrow-key CLI, `main()` itself, and (see below) the
-Sequencer transport/lane/MIDI-playback machinery and a handful of other standalone-only helpers, and
-is what `$(BIN)`/`$(ARM64_BIN)` actually compile; `src/clap_plugin.c` adds only what a CLAP host
-needs, since the host owns the actual audio device and hands MIDI in through its own event API;
-`src/fx_chain.c` holds every FX slot's own DSP (`run_fx_*`, `reset_fx_engine`,
-`sync_fx_engine_types`, `process_fx_chain`) -- split out purely for human-manageability as the FX
-section grew past 4000 lines, `#include`d by `backend.c` at the exact position that code used to
-occupy, with `FXSlotParams`/`FXSlotEngine`/the `FX_TYPE_*` enum deliberately left behind in
-`backend.c` proper since the OSC control table indexes into them directly.
+Five files, one architecture: `src/backend.c` is the shared DSP/OSC/state engine (oscillators,
+filters, the OSC control protocol, the arpeggiator, sample streaming -- everything that doesn't
+touch a physical device directly and isn't the FX chain's or the Sequencer engine's own bulk), and
+it is never compiled on its own. Both real targets pull it in with a plain `#include` (one
+translation unit per binary, this project's existing convention -- see `clap_plugin.c`'s own header
+comment): `src/hds_standalone.c` adds the ALSA/PipeWire audio shim, the ALSA MIDI sequencer client,
+recording, the `--program` JSON loader, the interactive arrow-key CLI, `main()` itself, and a
+handful of other standalone-only helpers, and is what `$(BIN)`/`$(ARM64_BIN)` actually compile;
+`src/clap_plugin.c` adds only what a CLAP host needs, since the host owns the actual audio device
+and hands MIDI in through its own event API; `src/fx_chain.c` holds every FX slot's own DSP
+(`run_fx_*`, `reset_fx_engine`, `sync_fx_engine_types`, `process_fx_chain`) -- split out purely for
+human-manageability as the FX section grew past 4000 lines, `#include`d by `backend.c` at the exact
+position that code used to occupy, with `FXSlotParams`/`FXSlotEngine`/the `FX_TYPE_*` enum
+deliberately left behind in `backend.c` proper since the OSC control table indexes into them
+directly; `src/sequencer.c` holds the Sequencer's own transport, audio/MIDI-lane playback, external
+MIDI Clock sync, and song-as-MIDI save/load -- `#include`d by `hds_standalone.c` alone (see
+"Sequencer scope in the CLAP plugin" below for why none of it is reachable from a CLAP instance any
+more), with the Sequencer's own data shapes (`SeqLaneState`/`SeqAudioLane`/`SeqMidiLane`, and the
+transport/`seq_midi` fields on `HdsEngineState`) and two small rendering hooks
+(`seq_record_midi_event`, `render_seq_audio_preview_sample`) staying in `backend.c` proper for the
+same "a CLAP instance still carries its own copy, the OSC table still indexes into it" reasoning as
+the FX split.
 
 This split (`hds_standalone.c` used to just be the tail end of `backend.c`) exists so a host-driven
 target never needs real device code compiled in at all -- confirmed directly, not assumed: `hds.clap`
@@ -888,10 +895,18 @@ entire Sequencer transport/lane/MIDI-playback call chain (`poll_seq_audio_load_r
 `poll_seq_audio_preview_triggers`, `poll_transport_triggers`, `poll_seq_audio_transport_catchup`,
 `advance_transport_playhead`, `seq_playback_midi_events`, plus their own
 `transport_start_fresh`/`transport_reposition_lanes`/`seq_audio_start_transport_playback`/
-`seq_audio_load_wav_from_disk`/`seq_audio_resample_linear`/`seq_audio_loader_thread_main` helpers --
-see "Sequencer scope in the CLAP plugin" below for why none of it is reachable from CLAP any more in
-the first place). Pure code motion throughout, verified the same way as the original split: both
-targets still build with zero warnings and byte-identical DSP output.
+`seq_audio_load_wav_from_disk`/`seq_audio_resample_linear`/`seq_audio_loader_thread_main` helpers).
+Pure code motion throughout, verified the same way as the original split: both targets still build
+with zero warnings and byte-identical DSP output.
+
+That whole Sequencer transport/lane/MIDI-clock-sync/song-save-load call chain has since moved one
+level further, out of `hds_standalone.c` into its own `src/sequencer.c`: once none of it was
+reachable from CLAP any more, it turned out to already sit in two clean, contiguous chunks inside
+`hds_standalone.c`, entirely free of any ALSA/PipeWire dependency -- so it earned a dedicated file
+the same way the FX chain did, for the same human-manageability reason (see "Sequencer scope in the
+CLAP plugin" below for why none of it was reachable from CLAP in the first place, which is what made
+this follow-on split low-risk enough to do the same day). Unlike the FX split, this one didn't touch
+`backend.c` or `clap_plugin.c` at all -- `hds_standalone.c` is the only `#include`r.
 
 ### Sequencer scope in the CLAP plugin
 
