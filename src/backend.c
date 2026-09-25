@@ -13798,6 +13798,330 @@ static void send_seq_audio_status(HdsStreamsState *streams, lo_address reply_add
     lo_bundle_free_recursive(b);
 }
 
+// --- Minimal JSON reader, for --program (see hds_load_program_file() below) ---------------------
+// A real (if small) recursive-descent parser -- objects, arrays, strings with escapes, numbers,
+// true/false/null -- not a hand-tuned scanner for this file's own specific shape. A .hdsprog is
+// user-editable (opened in any text editor) and can carry arbitrary nested metadata (category,
+// sfz_file, future fields) around the two objects this file actually reads, so genuinely skipping
+// an unrecognized value correctly (nested braces, escaped quotes and all) needs real JSON grammar,
+// not a flat key:value scan. Deliberately NOT the vendored third_party/json/json.hpp (nlohmann/
+// json): that is a C++ template header, and pulling it in here would mean a second C++ bridge
+// translation unit purely to parse a handful of flat key/value pairs -- exactly the kind of
+// framework-for-a-simple-job this whole codebase otherwise avoids (see every FX_TYPE_* port's own
+// "stripped off JUCE" comment). This parser is deliberately small and single-purpose instead: it
+// builds a plain tagged-value tree, no schema validation, no writer half (--program only ever
+// reads).
+typedef enum { HDS_JSON_NULL, HDS_JSON_BOOL, HDS_JSON_NUMBER, HDS_JSON_STRING, HDS_JSON_ARRAY, HDS_JSON_OBJECT } HdsJsonType;
+
+typedef struct HdsJsonMember {
+    char *key; // NULL for array elements
+    struct HdsJsonValue *value;
+    struct HdsJsonMember *next;
+} HdsJsonMember;
+
+typedef struct HdsJsonValue {
+    HdsJsonType type;
+    double number;
+    char *string; // HDS_JSON_STRING only, malloc'd
+    bool boolean;
+    HdsJsonMember *first_member; // HDS_JSON_OBJECT/HDS_JSON_ARRAY only
+} HdsJsonValue;
+
+static void hds_json_free(HdsJsonValue *v) {
+    if (!v) return;
+    for (HdsJsonMember *m = v->first_member; m; ) {
+        HdsJsonMember *next = m->next;
+        free(m->key);
+        hds_json_free(m->value);
+        free(m);
+        m = next;
+    }
+    free(v->string);
+    free(v);
+}
+
+static void hds_json_skip_ws(const char **p) {
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') (*p)++;
+}
+
+// Parses one JSON string literal (the opening quote must already be consumed by the caller) into a
+// freshly malloc'd, NUL-terminated C string, decoding the standard backslash escapes (\uXXXX only
+// as far as a plain UTF-8 passthrough of the code point below U+0800 -- every address/value this
+// file actually reads is plain ASCII, e.g. a file path or an OSC address, so this stays deliberately
+// simple rather than a full UTF-16-surrogate-pair-aware decoder). Returns NULL on a malformed/
+// unterminated string.
+static char *hds_json_parse_string_body(const char **p) {
+    size_t cap = 32, len = 0;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    while (**p != '"') {
+        if (**p == '\0') { free(out); return NULL; }
+        char c = **p;
+        if (c == '\\') {
+            (*p)++;
+            switch (**p) {
+                case '"': c = '"'; break;
+                case '\\': c = '\\'; break;
+                case '/': c = '/'; break;
+                case 'b': c = '\b'; break;
+                case 'f': c = '\f'; break;
+                case 'n': c = '\n'; break;
+                case 'r': c = '\r'; break;
+                case 't': c = '\t'; break;
+                case 'u': {
+                    if (!isxdigit((unsigned char)(*p)[1]) || !isxdigit((unsigned char)(*p)[2]) ||
+                        !isxdigit((unsigned char)(*p)[3]) || !isxdigit((unsigned char)(*p)[4])) { free(out); return NULL; }
+                    char hex[5] = { (*p)[1], (*p)[2], (*p)[3], (*p)[4], '\0' };
+                    long code = strtol(hex, NULL, 16);
+                    *p += 4;
+                    c = (code >= 0x20 && code < 0x7f) ? (char)code : '?'; // ASCII passthrough, see comment above
+                    break;
+                }
+                default: free(out); return NULL;
+            }
+        }
+        if (len + 1 >= cap) { cap *= 2; char *grown = realloc(out, cap); if (!grown) { free(out); return NULL; } out = grown; }
+        out[len++] = c;
+        (*p)++;
+    }
+    (*p)++; // closing quote
+    out[len] = '\0';
+    return out;
+}
+
+static HdsJsonValue *hds_json_parse_value(const char **p);
+
+static HdsJsonValue *hds_json_new_value(HdsJsonType type) {
+    HdsJsonValue *v = calloc(1, sizeof(HdsJsonValue));
+    if (v) v->type = type;
+    return v;
+}
+
+static HdsJsonValue *hds_json_parse_object(const char **p) {
+    HdsJsonValue *obj = hds_json_new_value(HDS_JSON_OBJECT);
+    if (!obj) return NULL;
+    (*p)++; // '{'
+    hds_json_skip_ws(p);
+    if (**p == '}') { (*p)++; return obj; }
+    HdsJsonMember **next_slot = &obj->first_member;
+    for (;;) {
+        hds_json_skip_ws(p);
+        if (**p != '"') { hds_json_free(obj); return NULL; }
+        (*p)++;
+        char *key = hds_json_parse_string_body(p);
+        if (!key) { hds_json_free(obj); return NULL; }
+        hds_json_skip_ws(p);
+        if (**p != ':') { free(key); hds_json_free(obj); return NULL; }
+        (*p)++;
+        hds_json_skip_ws(p);
+        HdsJsonValue *val = hds_json_parse_value(p);
+        if (!val) { free(key); hds_json_free(obj); return NULL; }
+        HdsJsonMember *member = calloc(1, sizeof(HdsJsonMember));
+        if (!member) { free(key); hds_json_free(val); hds_json_free(obj); return NULL; }
+        member->key = key;
+        member->value = val;
+        *next_slot = member;
+        next_slot = &member->next;
+        hds_json_skip_ws(p);
+        if (**p == ',') { (*p)++; continue; }
+        if (**p == '}') { (*p)++; break; }
+        hds_json_free(obj);
+        return NULL;
+    }
+    return obj;
+}
+
+static HdsJsonValue *hds_json_parse_array(const char **p) {
+    HdsJsonValue *arr = hds_json_new_value(HDS_JSON_ARRAY);
+    if (!arr) return NULL;
+    (*p)++; // '['
+    hds_json_skip_ws(p);
+    if (**p == ']') { (*p)++; return arr; }
+    HdsJsonMember **next_slot = &arr->first_member;
+    for (;;) {
+        hds_json_skip_ws(p);
+        HdsJsonValue *val = hds_json_parse_value(p);
+        if (!val) { hds_json_free(arr); return NULL; }
+        HdsJsonMember *member = calloc(1, sizeof(HdsJsonMember));
+        if (!member) { hds_json_free(val); hds_json_free(arr); return NULL; }
+        member->value = val;
+        *next_slot = member;
+        next_slot = &member->next;
+        hds_json_skip_ws(p);
+        if (**p == ',') { (*p)++; continue; }
+        if (**p == ']') { (*p)++; break; }
+        hds_json_free(arr);
+        return NULL;
+    }
+    return arr;
+}
+
+static HdsJsonValue *hds_json_parse_value(const char **p) {
+    hds_json_skip_ws(p);
+    switch (**p) {
+        case '{': return hds_json_parse_object(p);
+        case '[': return hds_json_parse_array(p);
+        case '"': {
+            (*p)++;
+            char *s = hds_json_parse_string_body(p);
+            if (!s) return NULL;
+            HdsJsonValue *v = hds_json_new_value(HDS_JSON_STRING);
+            if (!v) { free(s); return NULL; }
+            v->string = s;
+            return v;
+        }
+        case 't':
+            if (strncmp(*p, "true", 4) != 0) return NULL;
+            *p += 4;
+            { HdsJsonValue *v = hds_json_new_value(HDS_JSON_BOOL); if (v) v->boolean = true; return v; }
+        case 'f':
+            if (strncmp(*p, "false", 5) != 0) return NULL;
+            *p += 5;
+            return hds_json_new_value(HDS_JSON_BOOL);
+        case 'n':
+            if (strncmp(*p, "null", 4) != 0) return NULL;
+            *p += 4;
+            return hds_json_new_value(HDS_JSON_NULL);
+        default: {
+            if (**p != '-' && !isdigit((unsigned char)**p)) return NULL;
+            char *end = NULL;
+            double num = strtod(*p, &end);
+            if (end == *p) return NULL;
+            *p = end;
+            HdsJsonValue *v = hds_json_new_value(HDS_JSON_NUMBER);
+            if (v) v->number = num;
+            return v;
+        }
+    }
+}
+
+// Top-level entry point: parses a whole JSON document, requiring the entire (whitespace-trimmed)
+// input to be consumed -- trailing garbage after a syntactically valid value is still a malformed
+// document, not a value to silently truncate to. Returns NULL on any parse failure.
+static HdsJsonValue *hds_json_parse(const char *text) {
+    const char *p = text;
+    HdsJsonValue *root = hds_json_parse_value(&p);
+    if (!root) return NULL;
+    hds_json_skip_ws(&p);
+    if (*p != '\0') { hds_json_free(root); return NULL; }
+    return root;
+}
+
+// Linear scan -- these are small, hand-edited-file-sized objects (a Program's own top-level keys,
+// or its "fields"/"sfz_file" sub-objects), never a hot path, so a hash lookup would be pure
+// overkill (unlike osc_dispatch_table, which really does need O(1) for every incoming OSC message
+// during real-time playback).
+static HdsJsonValue *hds_json_object_get(const HdsJsonValue *obj, const char *key) {
+    if (!obj || obj->type != HDS_JSON_OBJECT) return NULL;
+    for (HdsJsonMember *m = obj->first_member; m; m = m->next) {
+        if (m->key && strcmp(m->key, key) == 0) return m->value;
+    }
+    return NULL;
+}
+
+// --- --program <path.hdsprog>: load a full Program (every field frontend.py's own Program Save
+// writes into "fields", scoped by _is_program_scope_address()) directly from the backend's own
+// local filesystem -- no frontend needs to ever connect, matching --sfz-vcoN's own posture. Reuses
+// osc_dispatch_table (the exact same address->offset map generic_osc_handler() itself reads), so a
+// Program field can never mean something different here than it does live over OSC -- and reuses
+// hds_load_sfz_for_osc() for the "sfz_file" map, the exact same core --sfz-vcoN and
+// /hds/zone/load_sfz both call. A bad/missing/malformed file logs and continues starting, same
+// failure posture as a bad --sfz-vcoN path -- never fatal.
+static void hds_apply_program_fields(SynthSharedControls *knobs, const HdsJsonValue *fields_obj) {
+    int applied = 0, skipped = 0;
+    for (const HdsJsonMember *m = fields_obj->first_member; m; m = m->next) {
+        if (!m->key) continue;
+        const OscDispatchSlot *slot = osc_dispatch_lookup(m->key);
+        if (!slot) {
+            fprintf(stderr, "[program] unrecognized address '%s' ignored\n", m->key);
+            skipped++;
+            continue;
+        }
+        if (slot->kind == OSC_KIND_FLOAT) {
+            if (m->value->type != HDS_JSON_NUMBER) {
+                fprintf(stderr, "[program] '%s' expected a number, skipped\n", m->key);
+                skipped++;
+                continue;
+            }
+            *(float *)((char *)knobs + slot->offset) = (float)m->value->number;
+        } else { // OSC_KIND_STRING
+            if (m->value->type != HDS_JSON_STRING) {
+                fprintf(stderr, "[program] '%s' expected a string, skipped\n", m->key);
+                skipped++;
+                continue;
+            }
+            snprintf((char *)knobs + slot->offset, slot->str_len, "%s", m->value->string);
+        }
+        applied++;
+    }
+    fprintf(stderr, "[program] %d field(s) applied, %d skipped\n", applied, skipped);
+}
+
+// sfz_file is {"<osc_index 0-3>": "<filename>"} -- filenames are relative to the .hdsprog's own
+// directory (exactly where Program Save wrote them, alongside the .hdsprog itself -- see
+// _pick_and_save_program()'s own sfz_map comment in frontend.py), so program_dir (the --program
+// path's own directory, resolved once by the caller) is joined on here.
+static void hds_apply_program_sfz_files(HdsSampleEngine *se, const HdsJsonValue *sfz_obj, const char *program_dir) {
+    for (const HdsJsonMember *m = sfz_obj->first_member; m; m = m->next) {
+        if (!m->key || m->value->type != HDS_JSON_STRING) continue;
+        int osc_index = atoi(m->key);
+        if (osc_index < 0 || osc_index > 3) {
+            fprintf(stderr, "[program] sfz_file key '%s' is not a valid oscillator index (0-3), skipped\n", m->key);
+            continue;
+        }
+        // program_dir and m->value->string can each be up to SAMPLE_PATH_LEN on their own --
+        // sized for both plus the joining '/' with room to spare, not SAMPLE_PATH_LEN itself
+        // (which the compiler correctly flags as too small to guarantee no truncation).
+        char full_path[SAMPLE_PATH_LEN * 2];
+        snprintf(full_path, sizeof(full_path), "%s/%s", program_dir, m->value->string);
+        int n = hds_load_sfz_for_osc(se, osc_index, SINGLE_PROGRAM_SLOT, full_path);
+        fprintf(stderr, "[program] sfz_file[%d] '%s': %d zone(s) queued\n", osc_index, full_path, n);
+    }
+}
+
+static void hds_load_program_file(SynthSharedControls *knobs, HdsSampleEngine *se, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[program] --program '%s': %s\n", path, strerror(errno));
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0) {
+        fclose(f);
+        fprintf(stderr, "[program] --program '%s': empty or unreadable, skipping\n", path);
+        return;
+    }
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) { fclose(f); return; }
+    size_t nread = fread(buf, 1, (size_t)len, f);
+    fclose(f);
+    buf[nread] = '\0';
+
+    HdsJsonValue *root = hds_json_parse(buf);
+    free(buf);
+    if (!root || root->type != HDS_JSON_OBJECT) {
+        fprintf(stderr, "[program] --program '%s': not valid JSON, skipping\n", path);
+        hds_json_free(root);
+        return;
+    }
+
+    char program_dir[SAMPLE_PATH_LEN];
+    snprintf(program_dir, sizeof(program_dir), "%s", path);
+    char *slash = strrchr(program_dir, '/');
+    if (slash) *slash = '\0'; else snprintf(program_dir, sizeof(program_dir), ".");
+
+    const HdsJsonValue *fields = hds_json_object_get(root, "fields");
+    if (fields && fields->type == HDS_JSON_OBJECT) hds_apply_program_fields(knobs, fields);
+
+    const HdsJsonValue *sfz_file = hds_json_object_get(root, "sfz_file");
+    if (sfz_file && sfz_file->type == HDS_JSON_OBJECT) hds_apply_program_sfz_files(se, sfz_file, program_dir);
+
+    hds_json_free(root);
+    fprintf(stderr, "[program] --program '%s': loaded\n", path);
+}
+
 int main(int argc, char **argv) {
     assert_fm_algorithms_acyclic();
     signal(SIGINT, handle_sigint);
@@ -13835,6 +14159,16 @@ int main(int argc, char **argv) {
     // connect for this synth to have playable sample content (see hds_load_sfz_for_osc() above
     // for the shared loading core this and /hds/zone/load_sfz both call).
     const char *cli_sfz_path[4] = { NULL, NULL, NULL, NULL };
+    // --program <path.hdsprog>: load a full Program (see hds_load_program_file()'s own comment)
+    // directly from the backend's own local filesystem at startup -- same "no frontend needs to
+    // ever connect" posture as --sfz-vcoN above.
+    const char *cli_program_path = NULL;
+    // --master-volume <0.0-1.0>: set the master volume once at startup -- independent of
+    // --program (a Program's own saved fields never include master_volume at all, see
+    // _is_program_scope_address()'s own comment in frontend.py, so there is no ordering to get
+    // right between the two flags: nothing about loading a Program can ever touch this value).
+    float cli_master_volume = 0.0f;
+    bool cli_master_volume_set = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--osc-listen-port") == 0 && i + 1 < argc) osc_listen_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--osc-reply-host") == 0 && i + 1 < argc) osc_reply_host = argv[++i];
@@ -13847,6 +14181,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--sfz-vco2") == 0 && i + 1 < argc) cli_sfz_path[1] = argv[++i];
         else if (strcmp(argv[i], "--sfz-vco3") == 0 && i + 1 < argc) cli_sfz_path[2] = argv[++i];
         else if (strcmp(argv[i], "--sfz-vco4") == 0 && i + 1 < argc) cli_sfz_path[3] = argv[++i];
+        else if (strcmp(argv[i], "--program") == 0 && i + 1 < argc) cli_program_path = argv[++i];
+        else if (strcmp(argv[i], "--master-volume") == 0 && i + 1 < argc) { cli_master_volume = (float)atof(argv[++i]); cli_master_volume_set = true; }
     }
 
     if (strcmp(cli_backend, "pipewire") == 0) {
@@ -13957,6 +14293,12 @@ int main(int argc, char **argv) {
         if (!cli_sfz_path[i]) continue;
         int n = hds_load_sfz_for_osc(&g_sample_engine, i, SINGLE_PROGRAM_SLOT, cli_sfz_path[i]);
         fprintf(stderr, "[sfz] --sfz-vco%d '%s': %d zone(s) queued\n", i + 1, cli_sfz_path[i], n);
+    }
+
+    if (cli_program_path) hds_load_program_file(&active_knobs, &g_sample_engine, cli_program_path);
+    if (cli_master_volume_set) {
+        active_knobs.master_volume = cli_master_volume;
+        fprintf(stderr, "[cli] --master-volume %.3f\n", (double)cli_master_volume);
     }
 
     // Output: opened with however many channels query_output_device_channel_count() detects --
