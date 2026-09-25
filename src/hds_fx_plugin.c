@@ -74,6 +74,7 @@
 #include <string.h>
 #include <math.h>
 #include <stddef.h>
+#include <stdarg.h>
 #include "../third_party/clap/include/clap/clap.h" // already pulls in ext/gui.h and ext/timer-support.h
 
 // The handful of plain constants fx_types.h/fx_chain.c need defined before they're #include'd --
@@ -140,13 +141,17 @@ typedef struct {
     float port_input_stereo[HDS_FX_PORT_COUNT];
     // Per-port Output routing (only consulted for a chain TAIL slot, chain_to_next == 0): which
     // port (0..HDS_FX_PORT_COUNT-1) the result is written to -- independent of the chain's own
-    // Input port -- and Mono (identical value written to both L and R of that port, a proper
-    // centered placement) or Stereo (l -> L, r -> R). Indexed by fx_source (which chain/group this
-    // is), same as port_input_stereo above. Defaults to output_channel==the port's own index and
-    // Stereo, i.e. today's obvious behavior (read Port N stereo, write back to Port N stereo)
-    // reproduced exactly until a chain's tail slot changes it.
+    // Input port. Indexed by fx_source (which chain/group this is), same as port_input_stereo
+    // above. ALWAYS writes l -> L, r -> R of that port -- no separate Mono/Stereo choice here (an
+    // earlier revision had one, but every one of the HDS_FX_PORT_COUNT CLAP ports is already a
+    // fixed 2-channel stereo pair, so "Mono" could only ever mean "write the same centered value to
+    // BOTH channels of the chosen port," never "land on one independent physical channel and leave
+    // the other untouched" -- confirmed a real, confirmed-live-tested source of confusion (a
+    // misleadingly labeled "N+N+1" option that didn't combine any ports at all), not a real
+    // per-channel routing capability. See hds_fx_gui_draw.c's own "Dropdowns" section for the full
+    // reasoning. Defaults to output_channel==the port's own index, i.e. today's obvious behavior
+    // (read Port N, write back to Port N) reproduced exactly until a chain's tail slot changes it.
     float port_output_channel[HDS_FX_PORT_COUNT];
-    float port_output_stereo[HDS_FX_PORT_COUNT];
     // Off: this chain's Input reads silence (port_input_off) / this chain's Output goes nowhere
     // (port_output_off), regardless of whatever port/stereo choice is otherwise remembered for it
     // -- a real, separate state from any port number, not a sentinel value squeezed into one. See
@@ -181,10 +186,11 @@ typedef struct {
 // single track just uses pair 0 (IS_MAIN on both sides) and never notices the other 7 exist; a host
 // that wants HDS FX processing several ports at once (e.g. several tracks' sends summed into one
 // plugin instance rather than one instance per track) wires up as many of the rest as it wants.
-// Whether a given port is actually USED as mono or stereo is a per-chain choice made in the GUI
-// (port_input_stereo/port_output_stereo), never baked into the port declaration itself -- see this
-// file's own header comment. An unconnected input port is silence in (see process()'s own null
-// check) -- harmless, exactly the ext-in pattern backend.c's own audio-ports extension established.
+// Whether a given INPUT port is read as mono or stereo is a per-chain choice made in the GUI
+// (port_input_stereo), never baked into the port declaration itself -- see this file's own header
+// comment. Output has no such choice (always that port's own real stereo pair, see
+// port_output_channel's own comment). An unconnected input port is silence in (see process()'s own
+// null check) -- harmless, exactly the ext-in pattern backend.c's own audio-ports extension established.
 // ---------------------------------------------------------------------------------------------
 
 static uint32_t hds_fx_audio_ports_count(const clap_plugin_t *plugin, bool is_input) {
@@ -332,12 +338,200 @@ static void hds_fx_init_pool_defaults(HdsFxPlugin *p) {
     reset_fx_engine(p->fx_engine);
     for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
         p->port_input_stereo[port] = 1.0f;  // default: read the port as real stereo, today's obvious behavior
-        p->port_output_channel[port] = (float)port; // default: write back to the SAME port
-        p->port_output_stereo[port] = 1.0f;
+        p->port_output_channel[port] = (float)port; // default: write back to the SAME port (always its own real stereo pair)
         p->port_input_off[port] = 0.0f;
         p->port_output_off[port] = 0.0f;
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// State extension (DAW project save/reload recall) -- this plugin's very first release shipped
+// with NO clap_plugin_state_t at all (a known, documented gap -- see the README's own "What this
+// first pass deliberately leaves out"), which meant a whole patch silently vanished on every
+// project reload: nothing here was ever a project's own concern, host-side, without one. Real bug,
+// found the same way every other one in this file was -- a live DAW save/reload, not guessed.
+//
+// Same plain-text, versioned, name-free-but-field-ordered format clap_plugin.c's own
+// clap_state_save/clap_state_load use (see that file's own header comment for the full "why text,
+// why versioned" reasoning) -- one S line per pool slot's own numeric fields (sidechain_source on
+// its OWN separate C line, not crammed onto S -- keeps S's own field count fixed regardless of
+// what else a slot ever grows), one P line per port's own routing config, and MP/IP lines only
+// when a slot's NAM path is actually set (a plain trailing %s can't safely hold an empty string,
+// and most slots have no NAM path at all -- cheaper and just as simple to only ever emit the line
+// when there's something to say). Output has no Mono/Stereo flag to save -- see
+// port_output_channel's own comment for why there's no longer any such choice to persist:
+//
+//   HDSFX1                                          -- version line, first
+//   S <slot> <fx_type> <p0>..<p9> <mix> <bypass> <fx_source> <chain_to_next>
+//   C <slot> <sidechain_source>
+//   P <port> <input_stereo> <output_channel> <input_off> <output_off>
+//   MP <slot> <path>                                -- only when nam_model_path[0] != '\0'
+//   IP <slot> <path>                                -- only when nam_ir_path[0] != '\0'
+//
+// MP/IP's own path field is the LAST thing on its line (%[^\n], reads to end-of-line) specifically
+// so a path containing spaces round-trips correctly -- same trick clap_plugin.c's own Z-record
+// file_path field already relies on, for the same reason.
+// ---------------------------------------------------------------------------------------------
+
+#define HDS_FX_STATE_VERSION 1
+
+// Same small growable buffer clap_plugin.c's own HdsStateBuf is (this file is a separate
+// translation unit, never linked with clap_plugin.c, so there's no existing symbol to reuse and no
+// risk of colliding with one) -- see that file's own comment on why the whole payload is built/read
+// in memory rather than streamed field-by-field against the CLAP stream API's own partial-write/
+// partial-read contract.
+typedef struct { char *buf; size_t len; size_t cap; } HdsFxStateBuf;
+
+static void hds_fx_state_buf_reserve(HdsFxStateBuf *b, size_t extra) {
+    if (b->len + extra + 1 <= b->cap) return;
+    size_t new_cap = b->cap ? b->cap * 2 : 4096;
+    while (new_cap < b->len + extra + 1) new_cap *= 2;
+    b->buf = (char *)realloc(b->buf, new_cap);
+    b->cap = new_cap;
+}
+
+static void hds_fx_state_buf_appendf(HdsFxStateBuf *b, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    va_list ap2; va_copy(ap2, ap);
+    int needed = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (needed < 0) { va_end(ap2); return; }
+    hds_fx_state_buf_reserve(b, (size_t)needed);
+    vsnprintf(b->buf + b->len, (size_t)needed + 1, fmt, ap2);
+    va_end(ap2);
+    b->len += (size_t)needed;
+}
+
+static bool hds_fx_state_save(const clap_plugin_t *plugin, const clap_ostream_t *stream) {
+    HdsFxPlugin *p = (HdsFxPlugin *)plugin->plugin_data;
+    HdsFxStateBuf b = {0};
+    hds_fx_state_buf_appendf(&b, "HDSFX%d\n", HDS_FX_STATE_VERSION);
+
+    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+        const FXSlotParams *fx = &p->fx[s];
+        hds_fx_state_buf_appendf(&b, "S %d %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
+            s, (double)fx->fx_type,
+            (double)fx->param[0], (double)fx->param[1], (double)fx->param[2], (double)fx->param[3], (double)fx->param[4],
+            (double)fx->param[5], (double)fx->param[6], (double)fx->param[7], (double)fx->param[8], (double)fx->param[9],
+            (double)fx->mix, (double)fx->bypass, (double)fx->fx_source, (double)fx->chain_to_next);
+        // sidechain_source on its own line kind (state_load()'s own "C" handler reads it) rather
+        // than a 16th field crammed onto the S line above.
+        hds_fx_state_buf_appendf(&b, "C %d %.9g\n", s, (double)fx->sidechain_source);
+        if (fx->nam_model_path[0]) hds_fx_state_buf_appendf(&b, "MP %d %s\n", s, fx->nam_model_path);
+        if (fx->nam_ir_path[0]) hds_fx_state_buf_appendf(&b, "IP %d %s\n", s, fx->nam_ir_path);
+    }
+    for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
+        hds_fx_state_buf_appendf(&b, "P %d %.9g %.9g %.9g %.9g\n", port,
+            (double)p->port_input_stereo[port], (double)p->port_output_channel[port],
+            (double)p->port_input_off[port], (double)p->port_output_off[port]);
+    }
+
+    bool ok = true;
+    size_t written = 0;
+    while (written < b.len) {
+        int64_t n = stream->write(stream, b.buf + written, b.len - written);
+        if (n <= 0) { ok = false; break; }
+        written += (size_t)n;
+    }
+    free(b.buf);
+    return ok;
+}
+
+static bool hds_fx_state_load(const clap_plugin_t *plugin, const clap_istream_t *stream) {
+    HdsFxPlugin *p = (HdsFxPlugin *)plugin->plugin_data;
+
+    HdsFxStateBuf b = {0};
+    char chunk[4096];
+    for (;;) {
+        int64_t n = stream->read(stream, chunk, sizeof(chunk));
+        if (n < 0) { free(b.buf); return false; }
+        if (n == 0) break;
+        hds_fx_state_buf_reserve(&b, (size_t)n);
+        memcpy(b.buf + b.len, chunk, (size_t)n);
+        b.len += (size_t)n;
+    }
+    if (b.len == 0) { free(b.buf); return false; }
+    hds_fx_state_buf_reserve(&b, 1); b.buf[b.len] = '\0';
+
+    char *cursor = b.buf;
+    char *first_newline = strchr(cursor, '\n');
+    if (!first_newline) { free(b.buf); return false; }
+    *first_newline = '\0';
+    int version = 0;
+    if (sscanf(cursor, "HDSFX%d", &version) != 1 || version < 1 || version > HDS_FX_STATE_VERSION) { free(b.buf); return false; }
+    cursor = first_newline + 1;
+
+    // A loaded project's own patch replaces whatever this instance currently has, same "load means
+    // load, not merge" posture clap_state_load() takes for the synth's own Sample Bank zones --
+    // resets every slot to Off/defaults (including freeing any live FXSlotEngine.state) before
+    // applying what the save actually contains, so a field the save doesn't mention (e.g. loading
+    // an older/shorter version) lands on a known default rather than whatever this instance
+    // happened to have lying around already.
+    hds_fx_init_pool_defaults(p);
+
+    int applied = 0, skipped = 0;
+    while (*cursor) {
+        char *line_end = strchr(cursor, '\n');
+        if (line_end) *line_end = '\0';
+
+        if (cursor[0] == 'S' && cursor[1] == ' ') {
+            int s;
+            double fx_type, param[FX_SLOT_PARAM_COUNT], mix, bypass, fx_source, chain_to_next;
+            int n = sscanf(cursor + 2, "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf",
+                &s, &fx_type, &param[0], &param[1], &param[2], &param[3], &param[4],
+                &param[5], &param[6], &param[7], &param[8], &param[9], &mix, &bypass, &fx_source, &chain_to_next);
+            if (n == 16 && s >= 0 && s < FX_SLOT_COUNT) {
+                FXSlotParams *fx = &p->fx[s];
+                fx->fx_type = (float)fx_type;
+                for (int i = 0; i < FX_SLOT_PARAM_COUNT; i++) fx->param[i] = (float)param[i];
+                fx->mix = (float)mix; fx->bypass = (float)bypass;
+                fx->fx_source = (float)fx_source; fx->chain_to_next = (float)chain_to_next;
+                applied++;
+            } else skipped++;
+        } else if (cursor[0] == 'C' && cursor[1] == ' ') {
+            // sidechain_source, on its own line kind rather than crammed onto the already-16-field
+            // S line above -- see hds_fx_state_save()'s own comment for why that line stops short.
+            int s; double sidechain_source;
+            if (sscanf(cursor + 2, "%d %lf", &s, &sidechain_source) == 2 && s >= 0 && s < FX_SLOT_COUNT) {
+                p->fx[s].sidechain_source = (float)sidechain_source; applied++;
+            } else skipped++;
+        } else if (cursor[0] == 'P' && cursor[1] == ' ') {
+            int port; double input_stereo, output_channel, input_off, output_off;
+            if (sscanf(cursor + 2, "%d %lf %lf %lf %lf", &port, &input_stereo, &output_channel, &input_off, &output_off) == 5
+                && port >= 0 && port < HDS_FX_PORT_COUNT) {
+                p->port_input_stereo[port] = (float)input_stereo;
+                p->port_output_channel[port] = (float)output_channel;
+                p->port_input_off[port] = (float)input_off;
+                p->port_output_off[port] = (float)output_off;
+                applied++;
+            } else skipped++;
+        } else if (cursor[0] == 'M' && cursor[1] == 'P' && cursor[2] == ' ') {
+            int s; int chars = 0;
+            if (sscanf(cursor + 3, "%d%n", &s, &chars) == 1 && s >= 0 && s < FX_SLOT_COUNT) {
+                const char *path = cursor + 3 + chars; while (*path == ' ') path++;
+                snprintf(p->fx[s].nam_model_path, SAMPLE_PATH_LEN, "%s", path);
+                applied++;
+            } else skipped++;
+        } else if (cursor[0] == 'I' && cursor[1] == 'P' && cursor[2] == ' ') {
+            int s; int chars = 0;
+            if (sscanf(cursor + 3, "%d%n", &s, &chars) == 1 && s >= 0 && s < FX_SLOT_COUNT) {
+                const char *path = cursor + 3 + chars; while (*path == ' ') path++;
+                snprintf(p->fx[s].nam_ir_path, SAMPLE_PATH_LEN, "%s", path);
+                applied++;
+            } else skipped++;
+        }
+        cursor = line_end ? line_end + 1 : cursor + strlen(cursor);
+    }
+
+    fprintf(stderr, "[hds-fx] state load: %d field(s) applied, %d skipped\n", applied, skipped);
+    free(b.buf);
+    return true;
+}
+
+static const clap_plugin_state_t k_state_ext = {
+    .save = hds_fx_state_save,
+    .load = hds_fx_state_load,
+};
 
 static bool hds_fx_plugin_init(const clap_plugin_t *plugin) { (void)plugin; return true; }
 
@@ -466,14 +660,10 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
             // to the same port), rather than silently dropping unconfigured ports.
             int out_ch = (int)p->port_output_channel[port];
             if (out_ch < 0 || out_ch >= HDS_FX_PORT_COUNT) out_ch = port;
-            if (p->port_output_stereo[port] != 0.0f) {
-                if (out_l[out_ch]) out_l[out_ch][i] += l;
-                if (out_r[out_ch]) out_r[out_ch][i] += r;
-            } else {
-                float centered = 0.5f * (l + r); // proper centered mono-to-stereo placement, never just one ear
-                if (out_l[out_ch]) out_l[out_ch][i] += centered;
-                if (out_r[out_ch]) out_r[out_ch][i] += centered;
-            }
+            // Always that port's own real stereo pair, l -> L, r -> R -- no Mono option here, see
+            // port_output_channel's own comment for why.
+            if (out_l[out_ch]) out_l[out_ch][i] += l;
+            if (out_r[out_ch]) out_r[out_ch][i] += r;
         }
     }
 
@@ -486,6 +676,7 @@ static const void *hds_fx_plugin_get_extension(const clap_plugin_t *plugin, cons
     if (strcmp(id, CLAP_EXT_AUDIO_PORTS) == 0) return &k_audio_ports_ext;
     if (strcmp(id, CLAP_EXT_PARAMS) == 0) return &k_params_ext;
     if (strcmp(id, CLAP_EXT_GUI) == 0) return &k_gui_ext;
+    if (strcmp(id, CLAP_EXT_STATE) == 0) return &k_state_ext;
     // Our own clap_plugin_timer_support_t -- lets the HOST call our on_timer(). Separately, this
     // plugin also calls the host's OWN clap_host_timer_support_t (register_timer/unregister_timer,
     // via p->host->get_extension in hds_fx_gui_x11.c's show()/hide()) to actually request one.

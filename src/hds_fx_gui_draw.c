@@ -452,25 +452,51 @@ static double hds_fx_gui_max_scroll(const HdsFxGuiViewState *vs) {
     return max_scroll > 0.0 ? max_scroll : 0.0;
 }
 
-// "In 3" (mono) or "In 3+4" (stereo) -- same formatter for both Input and Output pills, since both
-// address a port + Mono/Stereo choice the same way (see hds_fx_plugin.c's own header comment).
-static void hds_fx_format_io_pill(char *buf, size_t buflen, const char *prefix, int port, bool stereo) {
-    if (stereo) snprintf(buf, buflen, "%s %d+%d", prefix, port + 1, port + 2);
-    else snprintf(buf, buflen, "%s %d", prefix, port + 1);
+// "In 3" (mono) or "In 3 St" (stereo) -- Input only. There is no port-COMBINING happening here or
+// anywhere else in this file: each of the HDS_FX_PORT_COUNT CLAP ports is already a genuine 2-
+// channel (L+R) stereo pair on its own (see hds_fx_audio_ports_get() in hds_fx_plugin.c), so Mono
+// vs Stereo is purely "read this ONE port's L only, centered" vs "read this one port's L and R for
+// real" -- never "combine two separate ports into one signal". An earlier revision of this GUI
+// formatted the stereo case as "In 3+4", which was flat wrong (it implied combining ports 3 and 4,
+// something no code anywhere ever did) and confirmed as a real, confusing bug from live testing:
+// selecting a labeled "N+N+1" option changed nothing about which second port was touched, because
+// there never was one. Output has no Mono/Stereo choice at all any more (see this file's own
+// "Dropdowns" section for why) so this formatter is Input-only now.
+static void hds_fx_format_input_pill(char *buf, size_t buflen, int port, bool stereo) {
+    if (stereo) snprintf(buf, buflen, "In %d St", port + 1);
+    else snprintf(buf, buflen, "In %d", port + 1);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Dropdowns -- Type (21 options), Input/Output (Off + 8 mono + 7 stereo = 16 each), and Sidechain
-// (Same as Source + 8 = 9) all have too many possible values for click-to-cycle to be usable.
-// Clicking one of these pills opens a real option list instead (see HdsFxGuiViewState.dropdown);
-// clicking an option applies it and closes the list, clicking anywhere else just closes it.
+// Dropdowns -- Type (21 options), Input (Off + 8 mono + 8 stereo = 17), Output (Off + 8 = 9), and
+// Sidechain (Same as Source + 8 = 9) all have too many possible values for click-to-cycle to be
+// usable. Clicking one of these pills opens a real option list instead (see
+// HdsFxGuiViewState.dropdown); clicking an option applies it and closes the list, clicking
+// anywhere else just closes it.
+//
+// Output has NO Mono/Stereo choice, unlike Input -- a real, confirmed bug from live testing, not a
+// design nuance: every one of the HDS_FX_PORT_COUNT CLAP ports is ALREADY a fixed 2-channel (L+R)
+// stereo pair (hds_fx_audio_ports_get() declares channel_count=2 for all of them), so there was
+// never any way to make an OUTPUT selection land on a single independent physical channel without
+// redeclaring the whole port layout as 16 mono ports instead of 8 stereo ones -- a much bigger,
+// riskier change than this plugin's first real release should take on. The earlier "Mono output"
+// choice didn't deliver that anyway: it just wrote the SAME centered value to BOTH channels of the
+// chosen port, which is not "one specified channel" by any reasonable reading, and its "N+N+1"
+// label falsely implied combining two separate ports that never actually happened in the DSP.
+// Given the choice between building real 16-channel mono addressability (a real, separate,
+// scoped follow-up) and a confusing half-measure, Output is simply always the chosen port's own
+// real stereo pair now: pick a port, get exactly that port's L and R, nothing else, ever. Input
+// KEEPS its Mono/Stereo choice (reading one port's L only, centered, vs its real L+R) -- that half
+// of the design was never in question, only its label was wrong (fixed below, see
+// hds_fx_format_input_pill()'s own comment) and its option count had a real off-by-one (previously
+// only 7 stereo options, silently missing port 8 entirely).
 // ---------------------------------------------------------------------------------------------
 
 static int hds_fx_dropdown_option_count(int kind) {
     switch (kind) {
         case HDS_FX_DROPDOWN_TYPE: return HDS_FX_SELECTABLE_TYPE_COUNT;
-        case HDS_FX_DROPDOWN_INPUT:
-        case HDS_FX_DROPDOWN_OUTPUT: return 1 + HDS_FX_PORT_COUNT + (HDS_FX_PORT_COUNT - 1); // Off + mono + stereo
+        case HDS_FX_DROPDOWN_INPUT: return 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT; // Off + 8 mono + 8 stereo
+        case HDS_FX_DROPDOWN_OUTPUT: return 1 + HDS_FX_PORT_COUNT; // Off + 8 (always that port's real stereo pair)
         case HDS_FX_DROPDOWN_SIDECHAIN: return 1 + HDS_FX_PORT_COUNT; // "Same as Source" + 8
         default: return 0;
     }
@@ -482,15 +508,18 @@ static void hds_fx_dropdown_option_label(int kind, int idx, char *buf, size_t bu
         case HDS_FX_DROPDOWN_TYPE:
             snprintf(buf, buflen, "%s", hds_fx_type_name(HDS_FX_SELECTABLE_TYPES[idx]));
             return;
-        case HDS_FX_DROPDOWN_INPUT:
-        case HDS_FX_DROPDOWN_OUTPUT: {
-            const char *prefix = (kind == HDS_FX_DROPDOWN_INPUT) ? "In" : "Out";
+        case HDS_FX_DROPDOWN_INPUT: {
             if (idx == 0) { snprintf(buf, buflen, "Off"); return; }
             int j = idx - 1;
-            if (j < HDS_FX_PORT_COUNT) hds_fx_format_io_pill(buf, buflen, prefix, j, false);
-            else hds_fx_format_io_pill(buf, buflen, prefix, j - HDS_FX_PORT_COUNT, true);
+            bool stereo = j >= HDS_FX_PORT_COUNT;
+            int port = stereo ? (j - HDS_FX_PORT_COUNT) : j;
+            hds_fx_format_input_pill(buf, buflen, port, stereo);
             return;
         }
+        case HDS_FX_DROPDOWN_OUTPUT:
+            if (idx == 0) snprintf(buf, buflen, "Off");
+            else snprintf(buf, buflen, "Out %d", idx); // idx 1..8 -> port idx-1, 1-based display
+            return;
         case HDS_FX_DROPDOWN_SIDECHAIN:
             if (idx == 0) snprintf(buf, buflen, "Same as Source");
             else snprintf(buf, buflen, "SC In %d", idx);
@@ -517,8 +546,7 @@ static int hds_fx_dropdown_current_index(const HdsFxPlugin *p, int kind, int row
             if (p->port_output_off[g] != 0.0f) return 0;
             int ch = (int)p->port_output_channel[g];
             if (ch < 0 || ch >= HDS_FX_PORT_COUNT) ch = g;
-            bool stereo = p->port_output_stereo[g] != 0.0f;
-            return 1 + (stereo ? HDS_FX_PORT_COUNT + ch : ch);
+            return 1 + ch;
         }
         case HDS_FX_DROPDOWN_SIDECHAIN: {
             int sc = (int)p->fx[row].sidechain_source;
@@ -541,8 +569,8 @@ static void hds_fx_dropdown_apply(HdsFxPlugin *p, int kind, int row, int idx) {
             if (port < 0 || port >= HDS_FX_PORT_COUNT) port = 0;
             if (idx == 0) { p->port_input_off[port] = 1.0f; return; }
             int j = idx - 1;
-            int new_port = (j < HDS_FX_PORT_COUNT) ? j : (j - HDS_FX_PORT_COUNT);
             bool new_stereo = j >= HDS_FX_PORT_COUNT;
+            int new_port = new_stereo ? (j - HDS_FX_PORT_COUNT) : j;
             p->fx[row].fx_source = (float)new_port;
             p->port_input_stereo[new_port] = new_stereo ? 1.0f : 0.0f;
             p->port_input_off[new_port] = 0.0f;
@@ -552,11 +580,7 @@ static void hds_fx_dropdown_apply(HdsFxPlugin *p, int kind, int row, int idx) {
             int g = (int)p->fx[row].fx_source;
             if (g < 0 || g >= HDS_FX_PORT_COUNT) g = 0;
             if (idx == 0) { p->port_output_off[g] = 1.0f; return; }
-            int j = idx - 1;
-            int new_ch = (j < HDS_FX_PORT_COUNT) ? j : (j - HDS_FX_PORT_COUNT);
-            bool new_stereo = j >= HDS_FX_PORT_COUNT;
-            p->port_output_channel[g] = (float)new_ch;
-            p->port_output_stereo[g] = new_stereo ? 1.0f : 0.0f;
+            p->port_output_channel[g] = (float)(idx - 1); // always that port's own real stereo pair
             p->port_output_off[g] = 0.0f;
             return;
         }
@@ -708,7 +732,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
             char inbuf[16];
             bool input_off = p->port_input_off[port] != 0.0f;
             if (input_off) snprintf(inbuf, sizeof(inbuf), "Off");
-            else hds_fx_format_io_pill(inbuf, sizeof(inbuf), "In", port, p->port_input_stereo[port] != 0.0f);
+            else hds_fx_format_input_pill(inbuf, sizeof(inbuf), port, p->port_input_stereo[port] != 0.0f);
             hds_fx_draw_pill(cr, L.input_pill.x, L.input_pill.y, L.input_pill.w, L.input_pill.h, inbuf, is_head && !input_off, !is_head);
         }
 
@@ -737,7 +761,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
             } else {
                 int out_ch = (int)p->port_output_channel[port];
                 if (out_ch < 0 || out_ch >= HDS_FX_PORT_COUNT) out_ch = port;
-                hds_fx_format_io_pill(outbuf, sizeof(outbuf), "Out", out_ch, p->port_output_stereo[port] != 0.0f);
+                snprintf(outbuf, sizeof(outbuf), "Out %d", out_ch + 1); // always that port's own real stereo pair -- no Mono/Stereo choice, see the "Dropdowns" section's own comment
             }
             hds_fx_draw_pill(cr, L.output_pill.x, L.output_pill.y, L.output_pill.w, L.output_pill.h, outbuf, is_tail && !output_off, !is_tail);
         }
