@@ -1380,6 +1380,61 @@ trusting Threshold/Ratio to do anything useful). Verified with a standalone test
 tone, Listen mode correctly isolating the high band (near-silent on a pure low-frequency input,
 passing a pure high-frequency input through), and stability under extreme settings.
 
+### HardTune FX slot (real-time pitch correction)
+
+An FX slot (Type: `HardTune`) -- like MultiFilter/DeEsser, an original implementation of a standard,
+decades-old, published technique (YIN pitch detection + PSOLA-style resynthesis), not a clone of any
+specific commercial pitch-correction product (whose exact internals aren't public, and some of whose
+retune-speed/formant-preserving behavior is patented). This is the first FX type whose added latency
+(~14ms) is structural and unconditional: the lookahead/tap-delay buffer runs continuously whenever
+this slot is active, whether or not a pitch is currently being corrected -- there's no way to "engage
+the delay only when correcting" without the buffer already being primed to catch a pitch the instant
+one starts. Same category of trade-off as PeakMax's own lookahead limiter.
+
+Three stages: **(1)** YIN (de Cheveigne & Kawahara, 2002) pitch detection, run every 10ms on a
+mono-summed analysis window; **(2)** the detected pitch is quantized to a target -- either the
+nearest note in a chosen Key/Scale, or (planned, not yet wired) whatever MIDI note is currently
+held -- with two independent smoothing stages: Tracking Speed (smooths the raw detected pitch before
+quantization) and Retune Speed (smooths the final corrected ratio); **(3)** a period-synchronous
+two-tap crossfaded delay-line read applies the correction -- PSOLA's own core resynthesis mechanism,
+without needing explicit pitch-mark placement: a phase accumulator advances at the pitch-shift rate
+and wraps modulo the detected input period, and two read taps 50% of a period apart, each windowed
+by a Hann function of its own phase, crossfade into each other with zero gain ripple at the wrap
+point (a Hann window's value at phase x and at x+50% sum to exactly 1, the standard constant-
+overlap-add property -- no extra normalization needed).
+
+Seven params: **Key** (12 notes) and **Scale** (Chromatic/Major/Minor/Major Pentatonic/Minor
+Pentatonic) for the target grid; **Target Source** (Scale/Key, or MIDI -- planned, currently falls
+back to no correction until a new engine-wide "currently held MIDI note" mechanism is wired in);
+**Amount** (0-100%, blends none..full correction in semitone space); **Retune Speed** (glide time
+into the corrected note -- low is the instant "2006-era" hard-tune snap, higher is a natural,
+musical portamento; defaults moderate, not the extreme snap, so it's usable for a natural
+performance out of the box); **Tracking Speed** (a separate smoothing stage on the raw detected
+pitch, before quantization -- how quickly the detector "believes" a new note started vs. treating a
+fast wobble as noise); and **Voice Range** (Bass/Tenor/Alto/Soprano/Wide -- narrows the detector's
+own search window to the expected fundamental range for that voice type, which measurably reduces
+octave-detection errors, the same real reason commercial pitch correctors offer this, not just a
+cosmetic preset).
+
+**Planned follow-ups, not yet built**: MIDI-note target mode (needs a new engine-wide monophonic
+"currently held note" tracker, reusing this engine's own `MonoNoteStack` convention); MIDI pitch
+bend (using the same pitch-bend-range convention already used elsewhere) and LFO-routable vibrato,
+both applied as a final multiplicative adjustment layered on top of the already-corrected ratio,
+never fed back into the detector or the quantization decision -- so neither one fights the
+correction, and both work identically regardless of whether the target came from Scale/Key or MIDI.
+
+**A real bug found and fixed during testing**: the PSOLA read-position math initially accumulated
+the tap phase at the raw pitch-shift ratio, but since the read position is `write_pos + phase_offset`
+and `write_pos` itself already advances by 1 every sample, this made the effective read speed
+`1 + ratio` instead of `ratio` -- confirmed directly (a 233Hz input targeting 246.94Hz measured at
+241-247Hz depending on test signal, inconsistent with the intended target) and fixed by accumulating
+phase at `(ratio - 1)` instead, plus adding the negative-wraparound case needed for downward
+corrections (only the positive direction was handled before). Verified after the fix: a realistic
+sawtooth (glottal-pulse-like) test signal, autocorrelation-measured with parabolic sub-sample
+interpolation, lands within 0.1Hz of the intended target for both upward and downward corrections;
+latency measured via a tone-burst threshold matches the designed ~14ms exactly; Amount=0 stays
+transparent; silence produces no instability.
+
 ### Per-slot gain reduction (GR) metering
 
 Gate, Limiter, FetComp, FairKid67, PeakMax, OptoComp, and DeEsser -- the 7 FX types with a real gain-reduction stage --

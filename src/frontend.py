@@ -944,6 +944,36 @@ FX_TYPE_METADATA += [
         {"label": "Release", "range": (0, 100), "default": 17},    # 5..300ms, ~55ms
         {"label": "Listen", "type": "choice", "options": ["Off", "On"], "default": 0},
     ]},
+    {"name": "HardTune", "params": [
+        # Real-time pitch correction -- this engine's own original implementation of the standard,
+        # decades-old, published technique (YIN pitch detection + PSOLA-style resynthesis), not a
+        # clone of any specific commercial product. See FX_TYPE_HARDTUNE's own (long) comment in
+        # backend.c for the full design, including why this is the first FX type whose added latency
+        # (~14ms) is structural and unconditional (present whenever the slot is active, whether or
+        # not a pitch is currently being corrected) -- the same category of trade-off as PeakMax's
+        # own lookahead limiter.
+        {"label": "Key", "type": "choice",
+         "options": ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"], "default": 0},
+        {"label": "Scale", "type": "choice",
+         "options": ["Chromatic", "Major", "Minor", "Maj Pentatonic", "Min Pentatonic"], "default": 1},
+        {"label": "Target Source", "type": "choice", "options": ["Scale/Key", "MIDI"], "default": 0},
+        {"label": "Amount", "range": (0, 100), "default": 100},   # 0-100%, blends none..full correction
+        # Retune Speed: glide time from the input's own pitch toward the corrected target -- low =
+        # the instant, "2006-era" hard-tune snap; higher = a natural, musical portamento into the
+        # note. Default here is moderate (NOT the extreme instant snap) so this sounds like tasteful
+        # correction out of the box -- dial toward 0 for the hard-tune character on purpose.
+        {"label": "Retune Speed", "range": (0, 100), "default": 15},
+        # Tracking Speed: a SEPARATE smoothing stage on the RAW detected pitch itself, before
+        # quantization -- how quickly the detector "believes" a new note has started vs. treating a
+        # fast pitch wobble as noise. Distinct from Retune Speed, which smooths the already-quantized
+        # correction. Also defaults moderate for the same reason.
+        {"label": "Tracking Speed", "range": (0, 100), "default": 10},
+        # Voice Range: narrows the pitch detector's own search window to the expected fundamental
+        # range for that voice type -- real, not cosmetic: reduces octave-detection errors (the
+        # detector locking onto a harmonic/subharmonic of the true pitch) and is cheaper to compute.
+        {"label": "Voice Range", "type": "choice",
+         "options": ["Bass", "Tenor", "Alto", "Soprano", "Wide"], "default": 4},
+    ]},
 ]
 
 # The 7 FX types whose backend state exposes a real GR (gain reduction) reading -- see

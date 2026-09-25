@@ -664,6 +664,35 @@ typedef struct {
 // reduction) high band in place of the normal output, so Frequency can be dialed in by ear before
 // trusting Threshold/Ratio to do anything useful).
 #define FX_TYPE_DEESSER 19
+// Real-time hard-tune pitch correction -- like FX_TYPE_MULTIFILTER/FX_TYPE_DEESSER, this is an
+// original implementation of a well-established, published, non-proprietary technique (not a clone
+// of any specific commercial product -- the exact algorithms a specific flagship pitch-correction
+// product uses internally aren't public, and some of its retune-speed/formant-preserving behavior is
+// patented; what's implemented here is the standard, decades-old public technique every open pitch
+// corrector is built from): YIN (de Cheveigne & Kawahara, 2002) for pitch detection, scale/key (or
+// live MIDI note) quantization, and a period-synchronous two-tap crossfaded variable-speed delay-line
+// read for the actual pitch shifting -- PSOLA's own core mechanism, without needing explicit
+// pitch-mark placement (the tap phase IS the pitch mark, by construction). See run_fx_hardtune()'s
+// own (long) comment for the full algorithm. This is the first FX type whose ADDED LATENCY is
+// structural and unconditional: the lookahead/tap-delay buffer runs continuously whenever this slot
+// is active (not bypassed), whether or not a pitch is currently being corrected, exactly like
+// FX_TYPE_PEAKMAX's own lookahead limiter -- there is no way to "engage the delay only when
+// correcting" without the buffer already being primed to catch a pitch the instant one starts.
+// param[0] Key (choice: 12 notes, C..B -- only used when Target Source is Scale/Key), param[1]
+// Scale (choice: Chromatic/Major/Minor/Major Pentatonic/Minor Pentatonic -- ditto), param[2] Target
+// Source (choice: Scale/Key vs. MIDI -- mutually exclusive with Key/Scale; MIDI snaps to whatever
+// note is currently held on any connected MIDI input instead, monophonic last-note-priority, the
+// same convention this engine's own Mono mode already uses via MonoNoteStack), param[3] Amount
+// (0-100%, blends the correction ratio between none and fully-snapped, in log/semitone space),
+// param[4] Retune Speed (glide time from the input's own pitch toward the corrected target -- 0 is
+// the instant "hard-tune"/2006-era snap, higher values are a natural, musical portamento into the
+// note), param[5] Tracking Speed (a SEPARATE smoothing stage on the RAW detected pitch itself,
+// before quantization -- controls how quickly the detector "believes" a new note has started vs.
+// treating a fast pitch wobble as noise; distinct from Retune Speed, which smooths the already-
+// quantized correction), param[6] Voice Range (choice: Bass/Tenor/Alto/Soprano/Wide -- narrows the
+// detector's own min/max Hz search window to the expected range for that voice type, which reduces
+// octave-detection errors, same reason real pitch correctors offer this; not just a cosmetic preset).
+#define FX_TYPE_HARDTUNE 20
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -5521,6 +5550,307 @@ static void run_fx_deesser(FXSlotEngine *engine, const FXSlotParams *params, flo
     }
 }
 
+// --- FX_TYPE_HARDTUNE: see its own #define comment above for the full design and what it is/isn't
+// a clone of. Three stages: (1) YIN pitch detection, run once per HOP on a mono-summed analysis
+// window; (2) scale/key (or MIDI) quantization of the detected pitch to a target ratio, smoothed in
+// two independent stages (Tracking Speed on the raw pitch, Retune Speed on the final ratio); (3) a
+// period-synchronous two-tap crossfaded delay-line read, PSOLA's own core resynthesis mechanism,
+// applied identically to both channels from the one shared detected pitch/ratio (mono detector,
+// same "one shared value, never independent per-channel" posture as every other dynamics effect in
+// this file, for the same reason -- a real vocal source is usually a single pitched voice, not two
+// independently-pitched channels).
+//
+// PSOLA without explicit pitch marks: the classic algorithm places synthesis grains at hand-picked
+// glottal-pulse-aligned "marks." This implementation gets the same period-synchronous effect more
+// simply, without ever detecting individual pulses: a phase accumulator advances by `ratio` (the
+// pitch-shift factor) each sample and wraps modulo `grain_period` (the CURRENT detected input
+// period, in samples) -- two read taps, 50% of a period apart in phase, each windowed by a Hann
+// function of its own phase (0 at wrap, peak at mid-period). Because a Hann window's value at phase
+// x and at phase (x+0.5 mod 1) sum to exactly 1 (the standard 50%-overlap constant-overlap-add
+// property), the two taps crossfade into each other with no gain bump or dip at the wrap point, no
+// extra normalization needed. Each tap reads from a per-channel delay line at a small, BOUNDED
+// offset behind the write pointer (`-DELAY + phase - grain_period/2`, always within
+// `[-DELAY-grain_period/2, -DELAY+grain_period/2]`) -- bounded forever regardless of how long a
+// non-1.0 ratio persists, since `phase` wraps rather than accumulating; DELAY is fixed at this
+// engine's own absolute-lowest-supported-pitch period, comfortably covering every Voice Range
+// preset's own longer periods too.
+//
+// FX_HARDTUNE_MAX_LAG/MIN_LAG bound the compile-time scratch arrays (sized for this engine's own
+// absolute widest search range, 70-1100Hz); the actual per-call search range narrows to whichever
+// Voice Range preset is selected.
+#define FX_HARDTUNE_ABS_MIN_HZ 70.0f
+#define FX_HARDTUNE_ABS_MAX_HZ 1100.0f
+#define FX_HARDTUNE_MIN_LAG 44  // SAMPLE_RATE/1100Hz
+#define FX_HARDTUNE_MAX_LAG 686 // SAMPLE_RATE/70Hz
+#define FX_HARDTUNE_YIN_WINDOW 1400 // > FX_HARDTUNE_MAX_LAG with real margin for the difference function's own overlap sum
+#define FX_HARDTUNE_YIN_HOP 480     // 10ms at 48kHz -- how often pitch is re-detected
+#define FX_HARDTUNE_BUF_SIZE 4096   // power of 2 (cheap masking); comfortably covers YIN_WINDOW + PSOLA's own read-behind depth
+#define FX_HARDTUNE_BUF_MASK (FX_HARDTUNE_BUF_SIZE - 1)
+#define FX_HARDTUNE_PSOLA_DELAY FX_HARDTUNE_MAX_LAG // samples the PSOLA read stays behind the write pointer -- this IS the effect's fixed added latency
+
+// YIN (de Cheveigne & Kawahara, 2002): difference function -> cumulative mean normalized difference
+// function -> absolute-threshold local-minimum search (falling back to the global minimum if no
+// candidate clears the threshold) -> parabolic interpolation for sub-sample period accuracy.
+// *out_confidence is 1 - (the CMNDF value at the chosen lag), i.e. how convincingly periodic the
+// window is -- low for noise/silence/unvoiced consonants, used by the caller as a voiced/unvoiced
+// gate. window_size/min_lag/max_lag are all runtime values (Voice Range's own narrowed search
+// range), bounded by the compile-time FX_HARDTUNE_MAX_LAG-sized scratch arrays below.
+static float hardtune_yin_detect(const float *window, int window_size, int min_lag, int max_lag, float *out_confidence) {
+    static const float THRESHOLD = 0.15f;
+    float d[FX_HARDTUNE_MAX_LAG + 1];
+    float d_prime[FX_HARDTUNE_MAX_LAG + 1];
+    // Defensive clamp -- every real caller guarantees 1 <= min_lag <= max_lag <= FX_HARDTUNE_MAX_LAG
+    // (Voice Range presets always have min_hz < max_hz), but this keeps every d_prime[] index below
+    // provably in-bounds and initialized regardless, rather than relying on that being upheld.
+    if (min_lag < 1) min_lag = 1;
+    if (max_lag < min_lag) max_lag = min_lag;
+
+    d[0] = 0.0f;
+    for (int tau = 1; tau <= max_lag; tau++) {
+        float sum = 0.0f;
+        int n = window_size - tau;
+        for (int i = 0; i < n; i++) {
+            float diff = window[i] - window[i + tau];
+            sum += diff * diff;
+        }
+        d[tau] = sum;
+    }
+
+    d_prime[0] = 1.0f;
+    float running_sum = 0.0f;
+    for (int tau = 1; tau <= max_lag; tau++) {
+        running_sum += d[tau];
+        d_prime[tau] = (running_sum > 1e-9f) ? (d[tau] * (float)tau / running_sum) : 1.0f;
+    }
+
+    int tau_est = min_lag; // always a valid, initialized d_prime[] index by construction (see the clamp above)
+    bool found = false;
+    for (int tau = min_lag; tau <= max_lag; tau++) {
+        if (d_prime[tau] < THRESHOLD) {
+            while (tau + 1 <= max_lag && d_prime[tau + 1] < d_prime[tau]) tau++;
+            tau_est = tau;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        int best = min_lag;
+        for (int tau = min_lag + 1; tau <= max_lag; tau++) {
+            if (d_prime[tau] < d_prime[best]) best = tau;
+        }
+        tau_est = best;
+    }
+
+    float tau_refined = (float)tau_est;
+    if (tau_est > min_lag && tau_est < max_lag) {
+        float s0 = d_prime[tau_est - 1], s1 = d_prime[tau_est], s2 = d_prime[tau_est + 1];
+        float denom = s0 - 2.0f * s1 + s2;
+        if (fabsf(denom) > 1e-9f) {
+            float delta = 0.5f * (s0 - s2) / denom;
+            tau_refined += fmaxf(-1.0f, fminf(1.0f, delta));
+        }
+    }
+
+    *out_confidence = 1.0f - fminf(1.0f, d_prime[tau_est]);
+    return (float)SAMPLE_RATE / fmaxf(1.0f, tau_refined);
+}
+
+// Scale membership tables (1 = in-scale semitone, indexed 0-11 from the root) -- Chromatic accepts
+// everything (Key is meaningless in that mode, matching every real pitch corrector's own behavior).
+static const int8_t HARDTUNE_SCALE_TABLES[5][12] = {
+    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, // Chromatic
+    {1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1}, // Major
+    {1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0}, // Natural Minor
+    {1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0}, // Major Pentatonic
+    {1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0}, // Minor Pentatonic
+};
+
+// Nearest in-scale MIDI note to a (possibly fractional) detected MIDI note number -- searches
+// outward by semitone (0, +1, -1, +2, -2, ...) since every one of the 5 scales above has a member
+// within a handful of semitones of any starting point.
+static float hardtune_snap_to_scale(float midi_note, int key, int scale_idx) {
+    int nearest = (int)floorf(midi_note + 0.5f);
+    for (int offset = 0; offset <= 6; offset++) {
+        int up = nearest + offset;
+        int pc_up = ((up - key) % 12 + 12) % 12;
+        if (HARDTUNE_SCALE_TABLES[scale_idx][pc_up]) return (float)up;
+        if (offset > 0) {
+            int down = nearest - offset;
+            int pc_down = ((down - key) % 12 + 12) % 12;
+            if (HARDTUNE_SCALE_TABLES[scale_idx][pc_down]) return (float)down;
+        }
+    }
+    return (float)nearest; // unreachable for these 5 tables (all have members within +-6 semitones)
+}
+
+// Voice Range presets: (min_hz, max_hz) search windows -- deliberately generous, pragmatic bounds
+// (like the real hardware/software presets this mirrors), not strict vocal-science boundaries.
+static const float HARDTUNE_VOICE_RANGE_HZ[5][2] = {
+    { 70.0f, 350.0f },  // Bass
+    { 90.0f, 500.0f },  // Tenor
+    { 150.0f, 700.0f }, // Alto
+    { 180.0f, 1100.0f },// Soprano
+    { 70.0f, 1000.0f }, // Wide
+};
+
+typedef struct {
+    float buf[2][FX_HARDTUNE_BUF_SIZE]; // [channel][sample], circular via write_pos & MASK
+    uint32_t write_pos;
+
+    float yin_window[FX_HARDTUNE_YIN_WINDOW]; // mono-summed scratch, refilled every hop
+    int hop_counter;
+
+    float tracked_f0;        // Tracking-Speed-smoothed detected pitch, Hz (held during unvoiced gaps)
+    float grain_period;      // current PSOLA grain period in samples, from tracked_f0 (held likewise)
+    bool voiced;
+
+    float hop_target_ratio;  // this hop's correction goal (1.0 = none), before Retune Speed smoothing
+    float target_ratio;      // Retune-Speed-smoothed ratio actually applied, updated every sample
+    float phase;             // 0..grain_period, advances by target_ratio every sample
+
+    bool initialized;
+} FxHardTuneState;
+
+// Reads a small, BOUNDED (see this effect's own top comment) offset behind the write pointer with
+// linear interpolation. Deliberately does NOT convert the absolute (ever-growing) write_pos to a
+// float directly -- past roughly 2^24 samples (~5.8 minutes at 48kHz) that would silently lose
+// precision and introduce read-position jitter. Only the small bounded `rel_offset` (always within
+// a few hundred samples) goes through float math; the actual buffer index stays pure integer/
+// unsigned arithmetic, which wraps correctly (and indefinitely) via 2's-complement modular
+// arithmetic regardless of how long this effect keeps running.
+static float hardtune_read_interp(const float *chan_buf, uint32_t write_pos, float rel_offset) {
+    float floor_offset = floorf(rel_offset);
+    int32_t int_offset = (int32_t)floor_offset;
+    float frac = rel_offset - floor_offset;
+    uint32_t base_idx = (uint32_t)((int32_t)write_pos + int_offset);
+    float s0 = chan_buf[base_idx & FX_HARDTUNE_BUF_MASK];
+    float s1 = chan_buf[(base_idx + 1) & FX_HARDTUNE_BUF_MASK];
+    return s0 + (s1 - s0) * frac;
+}
+
+static void run_fx_hardtune(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxHardTuneState *st = (FxHardTuneState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxHardTuneState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+    if (!st->initialized) {
+        st->tracked_f0 = 200.0f; // arbitrary reasonable starting guess, overwritten by the first real detection
+        st->grain_period = (float)SAMPLE_RATE / st->tracked_f0;
+        st->target_ratio = 1.0f;
+        st->hop_target_ratio = 1.0f;
+        st->phase = 0.0f;
+        st->voiced = false;
+        st->initialized = true;
+    }
+
+    const int key = (int)(fmaxf(0.0f, fminf(1.0f, params->param[0])) * 11.0f + 0.5f);
+    const int scale_idx = (int)(fmaxf(0.0f, fminf(1.0f, params->param[1])) * 4.0f + 0.5f);
+    const bool midi_target = params->param[2] >= 0.5f; // Target Source: Scale/Key (0) vs MIDI (1)
+    const float amount = fmaxf(0.0f, fminf(1.0f, params->param[3]));
+    const float retune_ms = 0.1f + fmaxf(0.0f, fminf(1.0f, params->param[4])) * 199.9f;   // 0.1..200ms
+    const float tracking_ms = 0.1f + fmaxf(0.0f, fminf(1.0f, params->param[5])) * 499.9f; // 0.1..500ms
+    int voice_range_idx = (int)(fmaxf(0.0f, fminf(1.0f, params->param[6])) * 4.0f + 0.5f);
+    if (voice_range_idx < 0) voice_range_idx = 0; else if (voice_range_idx > 4) voice_range_idx = 4;
+    const float range_min_hz = HARDTUNE_VOICE_RANGE_HZ[voice_range_idx][0];
+    const float range_max_hz = HARDTUNE_VOICE_RANGE_HZ[voice_range_idx][1];
+    int min_lag = (int)((float)SAMPLE_RATE / range_max_hz);
+    int max_lag = (int)((float)SAMPLE_RATE / range_min_hz);
+    if (min_lag < FX_HARDTUNE_MIN_LAG) min_lag = FX_HARDTUNE_MIN_LAG;
+    if (max_lag > FX_HARDTUNE_MAX_LAG) max_lag = FX_HARDTUNE_MAX_LAG;
+
+    // Write this sample into both channels' delay lines.
+    uint32_t idx = st->write_pos & FX_HARDTUNE_BUF_MASK;
+    st->buf[0][idx] = *l;
+    st->buf[1][idx] = *r;
+
+    // --- Analysis: YIN once per hop, on a mono-summed window of the most recent YIN_WINDOW samples ---
+    st->hop_counter++;
+    if (st->hop_counter >= FX_HARDTUNE_YIN_HOP) {
+        st->hop_counter = 0;
+        float peak = 0.0f;
+        for (int i = 0; i < FX_HARDTUNE_YIN_WINDOW; i++) {
+            uint32_t src = (uint32_t)((int32_t)st->write_pos - (FX_HARDTUNE_YIN_WINDOW - 1 - i));
+            float mono = 0.5f * (st->buf[0][src & FX_HARDTUNE_BUF_MASK] + st->buf[1][src & FX_HARDTUNE_BUF_MASK]);
+            st->yin_window[i] = mono;
+            peak = fmaxf(peak, fabsf(mono));
+        }
+
+        float confidence = 0.0f;
+        float detected_hz = hardtune_yin_detect(st->yin_window, FX_HARDTUNE_YIN_WINDOW, min_lag, max_lag, &confidence);
+        // Voiced gate: a real level floor (skip near-silence entirely, matching every other effect's
+        // own "nothing meaningful to process" posture) AND YIN's own confidence, AND the result must
+        // actually land inside this call's search range (a sanity check against the parabolic
+        // interpolation nudging a boundary lag estimate just outside it).
+        st->voiced = (peak > 0.003f) && (confidence > 0.5f) && detected_hz >= range_min_hz * 0.98f && detected_hz <= range_max_hz * 1.02f;
+
+        if (st->voiced) {
+            // Tracking Speed: one-pole smoother in log-frequency domain, updated once per hop (this
+            // smoother's own "sample rate" is hops/second, not SAMPLE_RATE -- see its own rate calc).
+            const float tracking_hop_rate_hz = (float)SAMPLE_RATE / (float)FX_HARDTUNE_YIN_HOP;
+            const float tracking_rate = 1.0f - expf(-1.0f / (0.001f * tracking_ms * tracking_hop_rate_hz));
+            float log_tracked = log2f(st->tracked_f0) + (log2f(detected_hz) - log2f(st->tracked_f0)) * tracking_rate;
+            st->tracked_f0 = exp2f(log_tracked);
+            float period = (float)SAMPLE_RATE / st->tracked_f0;
+            st->grain_period = fmaxf((float)min_lag, fminf((float)max_lag, period));
+        }
+        // Unvoiced: hold tracked_f0/grain_period at their last good values (avoids a spurious jump
+        // from noisy detection during a breath/consonant/silence).
+
+        float raw_target_ratio = 1.0f;
+        if (st->voiced) {
+            if (midi_target) {
+                // MIDI target-note mode isn't wired up yet (needs a new engine-wide "currently held
+                // MIDI note" -- see FX_TYPE_HARDTUNE's own #define comment) -- falls back to no
+                // correction (transparent passthrough) rather than guessing, until that lands.
+                raw_target_ratio = 1.0f;
+            } else {
+                float midi = 69.0f + 12.0f * log2f(st->tracked_f0 / 440.0f);
+                float target_midi = hardtune_snap_to_scale(midi, key, scale_idx);
+                raw_target_ratio = exp2f((target_midi - midi) / 12.0f);
+            }
+        }
+        // Amount blends in log/semitone space (perceptually correct interpolation, not linear ratio).
+        st->hop_target_ratio = exp2f(log2f(raw_target_ratio) * amount);
+    }
+
+    // --- Per-sample: Retune Speed glides target_ratio toward this hop's goal ---
+    const float retune_rate = 1.0f - expf(-1.0f / (0.001f * retune_ms * (float)SAMPLE_RATE));
+    float log_cur = log2f(st->target_ratio) + (log2f(st->hop_target_ratio) - log2f(st->target_ratio)) * retune_rate;
+    st->target_ratio = exp2f(log_cur);
+
+    // --- PSOLA resynthesis: two Hann-crossfaded taps, phase wraps mod grain_period (see this
+    // effect's own top comment for why this never drifts unboundedly even under a sustained
+    // non-1.0 ratio) ---
+    // Phase advances by (target_ratio - 1), NOT target_ratio: the actual buffer read position is
+    // write_pos + offset, and write_pos ITSELF already advances by 1 every sample (real time) --
+    // phase only needs to supply the DIFFERENCE from real-time so the read position's own total
+    // rate of advance through the buffer's content comes out to exactly target_ratio (1 from
+    // write_pos's own motion + (target_ratio-1) from phase = target_ratio). At target_ratio=1 this
+    // correctly makes phase never move at all: a fixed offset behind write_pos is already a
+    // transparent, undelayed-in-pitch copy, needing no wrapping/resets whatsoever.
+    st->phase += (st->target_ratio - 1.0f);
+    if (st->phase >= st->grain_period) st->phase -= st->grain_period;
+    if (st->phase < 0.0f) st->phase += st->grain_period; // pitch-DOWN corrections drift phase negative
+
+    const float frac_a = st->phase / st->grain_period;
+    float frac_b = frac_a + 0.5f;
+    if (frac_b >= 1.0f) frac_b -= 1.0f;
+    const float win_a = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * frac_a);
+    const float win_b = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * frac_b);
+
+    const float offset_a = -(float)FX_HARDTUNE_PSOLA_DELAY + (frac_a * st->grain_period - st->grain_period * 0.5f);
+    const float offset_b = -(float)FX_HARDTUNE_PSOLA_DELAY + (frac_b * st->grain_period - st->grain_period * 0.5f);
+
+    *l = hardtune_read_interp(st->buf[0], st->write_pos, offset_a) * win_a
+       + hardtune_read_interp(st->buf[0], st->write_pos, offset_b) * win_b;
+    *r = hardtune_read_interp(st->buf[1], st->write_pos, offset_a) * win_a
+       + hardtune_read_interp(st->buf[1], st->write_pos, offset_b) * win_b;
+
+    st->write_pos++;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -5700,6 +6030,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                     run_fx_deesser(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
                     if (fx_engine[s].state) gr_db_out[s] = ((FxDeEsserState *)fx_engine[s].state)->last_gr_db;
                     break;
+                case FX_TYPE_HARDTUNE: run_fx_hardtune(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through
