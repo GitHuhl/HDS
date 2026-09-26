@@ -3025,3 +3025,45 @@ drag on the Attack dial (`eg[0].a`), a real drag on the ADSR curve's own Sustain
 further EG1 drag live-mirrors onto EG4 without a second click) -- eleven real, passing assertions
 against `SynthSharedControls.programs[SINGLE_PROGRAM_SLOT]`'s own actual fields. The full existing
 regression suite (all 9 prior test binaries, `hds_fx.clap`'s own included) still passes unchanged.
+
+## hds.clap's Filters tab: Chain Mode, 5 filter slots, 3-band EQ (task #100)
+
+Next tab in the ordered list: `src/hds_clap_filters_draw.c` (new) ports frontend.py's own Filters
+tab -- the Chain Mode row (Series/Parallel, a plain binary toggle pill rather than a 2-item
+dropdown, same reasoning as the Slope pill below), 5 stacked `FilterParams` slots (Freq/Res knobs,
+a Slope toggle pill 2-Pole/4-Pole, a Type dropdown Off/LPF/HPF/BPF/Notch), and the post-filter
+`EqBandParams[3]` 3-band EQ (Low Shelf/Mid Peak/High Shelf -- Freq+Gain knobs on every band, plus a
+Q knob on Mid Peak only, exactly matching `compute_eq_band_coeffs()`'s own shelf-vs-peak split in
+`fx_types.h`). Every control reads/writes `SynthSharedControls.programs[SINGLE_PROGRAM_SLOT]`
+directly, same discipline the Play tab already established.
+
+This file reuses the Play tab's own generic knob primitives verbatim -- `HdsPlayKnobDrag`/
+`hds_play_draw_knob()`/`hds_play_knob_hit_test()`/`hds_play_start_knob_drag()` -- rather than
+duplicating them, the same "generic primitive, reused by a later tab file" pattern the Play tab
+itself already used for `hds_fx_gui_draw.c`'s own `hds_fx_draw_knob_arc()`/`hds_fx_rgb()`/
+`hds_fx_draw_pill()`. `hds_play_start_knob_drag()` itself needed a small signature change to make
+this reuse possible (it now takes the `HdsPlayKnobDrag` descriptor directly rather than a whole
+tab's own view state) -- a pure refactor, verified zero behavior change via the full existing
+`test_clap_play.c` suite passing unchanged afterward.
+
+**Scope for this pass**: every control visible WITHOUT a right-click in frontend.py, same
+"Modulate From" deferral reasoning as the Play tab (it needs a real modulator-source list the
+LFOs/Envelopes tabs don't exist to supply yet). Concretely NOT wired up yet: each Cutoff knob's own
+right-click menu (a Key Track preset + an ext-MIDI CC modulation source, on top of "Modulate
+From"), and each Resonance knob's own right-click "Modulate From" menu. `FilterParams.key_track`/
+`cutoff_mod_source_cc` -- the two fields those menus would set -- are untouched by this pass's UI
+entirely, so a patch that already has them set (via the Python GUI, or a save file) keeps that
+value; this native GUI just has no way to change them yet. EQ knobs have no right-click menu in
+frontend.py at all (a band's own 2-3 knobs are constant for the whole audio block, never a
+mod-matrix destination -- see `EqBandParams`' own comment in `fx_types.h`), so nothing is deferred
+there. Combi mode changes nothing about this tab either way (confirmed by reading frontend.py: the
+Filters tab always addresses the plain Program-scoped fields, reused as-is for whichever Program is
+currently being edited in Single-Program mode -- Combi's own per-lane state lives entirely
+elsewhere, in `combi_lane_*`/`seq_lanes[]`, not in `FilterParams`/`EqBandParams`).
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_filters.c`): real clicks/drags
+for the Chain Mode toggle (`filter_chain_mode`), a Freq knob drag and a Res knob drag on Filter 1
+(`filters[0].cutoff`/`res_q`), the Slope toggle (`filters[0].slope_poles`), the Type dropdown (open
++ select HPF, writing `filters[0].filter_type`), and Gain/Q knob drags on the Mid Peak EQ band
+(`eq_bands[1].gain_db`/`q`) -- eight real, passing assertions. The full existing regression suite
+(all 11 prior test binaries) still passes unchanged.

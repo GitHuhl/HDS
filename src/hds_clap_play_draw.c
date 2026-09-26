@@ -375,19 +375,24 @@ static void hds_play_draw_osc_knob(cairo_t *cr, const HdsFxRect *r, float *targe
 
 #define HDS_PLAY_DRAG_PIXELS_FULL_RANGE 150.0
 
-static void hds_play_start_knob_drag(HdsClapPlayViewState *vs, float *target, double lo, double hi, double y) {
+// Generic across every tab that has a click-and-drag knob (not just Play's own oscillator/EG
+// knobs) -- takes the HdsPlayKnobDrag descriptor directly rather than a whole tab's own view
+// state, so a later tab file (e.g. hds_clap_filters_draw.c) can reuse it verbatim against its own
+// view state's own drag field, the same way it already reuses hds_play_draw_knob()/
+// hds_play_knob_hit_test().
+static void hds_play_start_knob_drag(HdsPlayKnobDrag *drag, float *target, double lo, double hi, double y) {
     if (!target) return;
-    vs->knob_drag.target = target;
-    vs->knob_drag.lo = lo; vs->knob_drag.hi = hi;
-    vs->knob_drag.start_y = y;
-    vs->knob_drag.start_val = *target;
+    drag->target = target;
+    drag->lo = lo; drag->hi = hi;
+    drag->start_y = y;
+    drag->start_val = *target;
 }
 
 static bool hds_play_try_osc_knob_click(HdsClapPlayViewState *vs, const HdsFxRect *r, float *target, HdsPlayOscKnobId id, int shape, double x, double y) {
     if (!target || !hds_play_knob_hit_test(r, x, y)) return false;
     double lo, hi; const char *label; (void)label;
     hds_play_osc_knob_info(id, shape, &lo, &hi, &label);
-    hds_play_start_knob_drag(vs, target, lo, hi, y);
+    hds_play_start_knob_drag(&vs->knob_drag, target, lo, hi, y);
     return true;
 }
 
@@ -705,7 +710,7 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
                 if (!dial_show[d]) continue; // a hidden dial's rect is still geometrically valid (see hds_play_compute_eg_layout's own comment) but must never be clickable
                 if (hds_play_knob_hit_test(&L.dial[d], x, y)) {
                     float *target = hds_play_eg_dial_target(&prog->eg[i], d);
-                    hds_play_start_knob_drag(vs, target, HDS_PLAY_EG_LO[d], HDS_PLAY_EG_HI[d], y);
+                    hds_play_start_knob_drag(&vs->knob_drag, target, HDS_PLAY_EG_LO[d], HDS_PLAY_EG_HI[d], y);
                     return true;
                 }
             }

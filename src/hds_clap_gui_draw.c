@@ -74,6 +74,7 @@ typedef struct {
     // since hds_clap_play_draw.c has no equivalent of hds_fx_gui_render()'s single-struct-in
     // calling convention to match.
     HdsClapPlayViewState play_view;
+    HdsClapFiltersViewState filters_view; // same convention as play_view -- see hds_clap_filters_draw.c's own header comment
 } HdsClapGuiViewState;
 
 static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
@@ -85,6 +86,7 @@ static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
     vs->fx_view.window_w = vs->window_w;
     vs->fx_view.window_h = vs->window_h - (int)HDS_CLAP_TAB_BAR_H;
     hds_clap_play_view_state_init(&vs->play_view);
+    hds_clap_filters_view_state_init(&vs->filters_view);
 }
 
 typedef struct { double x, y, w, h; } HdsClapTabRect;
@@ -146,6 +148,9 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
         case HDS_CLAP_TAB_PLAY:
             hds_clap_play_render(cr, p, &vs->play_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
+        case HDS_CLAP_TAB_FILTERS:
+            hds_clap_filters_render(cr, p, &vs->filters_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            break;
         case HDS_CLAP_TAB_MAPPING:
             hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Mapping (Sample Zone editor) -- not available in this GUI yet");
             break;
@@ -173,6 +178,8 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
             return hds_fx_gui_on_button_press(&p->gui_host, &vs->fx_view, x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_PLAY:
             return hds_clap_play_on_button_press(p, &vs->play_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
+        case HDS_CLAP_TAB_FILTERS:
+            return hds_clap_filters_on_button_press(p, &vs->filters_view, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
         default:
             return true;
     }
@@ -181,11 +188,13 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
 static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y) {
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_motion(&p->gui_host, &vs->fx_view, x, y - HDS_CLAP_TAB_BAR_H);
     else if (vs->active_tab == HDS_CLAP_TAB_PLAY) hds_clap_play_on_motion(p, &vs->play_view, vs->window_w, x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_FILTERS) hds_clap_filters_on_motion(&vs->filters_view, x, y - HDS_CLAP_TAB_BAR_H);
 }
 
 static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_button_release(&vs->fx_view);
     else if (vs->active_tab == HDS_CLAP_TAB_PLAY) hds_clap_play_on_button_release(&vs->play_view);
+    else if (vs->active_tab == HDS_CLAP_TAB_FILTERS) hds_clap_filters_on_button_release(&vs->filters_view);
 }
 
 static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int action, char ch) {

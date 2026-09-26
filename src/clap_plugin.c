@@ -175,10 +175,15 @@ typedef struct {
 // own small X11 shell instead of further genericizing hds_fx_gui_x11.c (which stays exactly as
 // hds_fx.clap alone needs it).
 #include "hds_fx_gui_draw.c"
-// hds_clap_play_draw.c comes BEFORE hds_clap_gui_draw.c: it defines HdsClapPlayViewState, which
-// HdsClapGuiViewState (hds_clap_gui_draw.c's own view-state struct) nests exactly the same way it
-// already nests hds_fx_gui_draw.c's own HdsFxGuiViewState for the FX tab.
+// hds_clap_play_draw.c and hds_clap_filters_draw.c come BEFORE hds_clap_gui_draw.c: they define
+// HdsClapPlayViewState/HdsClapFiltersViewState, which HdsClapGuiViewState (hds_clap_gui_draw.c's
+// own view-state struct) nests exactly the same way it already nests hds_fx_gui_draw.c's own
+// HdsFxGuiViewState for the FX tab. hds_clap_filters_draw.c itself comes after hds_clap_play_draw.c
+// since it reuses that file's own generic knob primitives (HdsPlayKnobDrag/hds_play_draw_knob/
+// hds_play_knob_hit_test/hds_play_start_knob_drag) rather than duplicating them -- see its own
+// header comment.
 #include "hds_clap_play_draw.c"
+#include "hds_clap_filters_draw.c"
 #include "hds_clap_gui_draw.c"
 #include "hds_clap_gui_x11.c"
 
