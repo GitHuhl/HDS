@@ -11,6 +11,14 @@
 // plain cairo_translate() plus a shrunk vs.window_h is enough, with zero changes needed to that
 // already-shared, already-tested engine.
 //
+// The Play tab is likewise NOT a new implementation of its own top-level dispatch shape: it's
+// hds_clap_play_draw.c's own hds_clap_play_render()/hds_clap_play_on_*(), called against this
+// instance's own HdsClapPlugin directly (it needs ProgramState/PackEGParams fields no generic
+// HdsFxGuiHost view could expose, unlike the FX tab -- see hds_clap_play_draw.c's own header
+// comment on why it isn't shared with hds_fx.clap at all), through the same cairo_translate()
+// idiom as the FX tab. Single-Program mode only for now -- Combi mode's own separate 8-lane mixer
+// view is real, substantial follow-up work, tracked as its own task.
+//
 // Every OTHER tab is a placeholder for now (a centered "not yet built" label) -- each becomes real
 // content in its own later commit (see the task list this session tracks). Mapping is a
 // PERMANENT placeholder for the time being: explicit product decision, not a stand-in for
@@ -18,7 +26,8 @@
 // otherwise.
 //
 // #include'd by clap_plugin.c after hds_fx_gui_draw.c (needs HdsFxGuiViewState/hds_fx_gui_render/
-// hds_fx_gui_on_*) and after HdsFxGuiHost/HdsClapPlugin are both defined.
+// hds_fx_gui_on_*) and hds_clap_play_draw.c (needs HdsClapPlayViewState), and after
+// HdsFxGuiHost/HdsClapPlugin are both defined.
 
 #define HDS_CLAP_TAB_BAR_H 32.0
 #define HDS_CLAP_GUI_DEFAULT_W 1080
@@ -58,16 +67,24 @@ typedef struct {
     // background fill/clip rect never draws over or under the tab bar -- see this file's own
     // header comment.
     HdsFxGuiViewState fx_view;
+
+    // The Play tab's own view state (hds_clap_play_draw.c) -- unlike fx_view, it doesn't need its
+    // own window_w/window_h copy: every Play-tab function takes this HdsClapGuiViewState's own
+    // window_w/window_h directly as plain parameters (see hds_clap_gui_render()'s own dispatch),
+    // since hds_clap_play_draw.c has no equivalent of hds_fx_gui_render()'s single-struct-in
+    // calling convention to match.
+    HdsClapPlayViewState play_view;
 } HdsClapGuiViewState;
 
 static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
     memset(vs, 0, sizeof(*vs));
     vs->window_w = HDS_CLAP_GUI_DEFAULT_W;
     vs->window_h = HDS_CLAP_GUI_DEFAULT_H;
-    vs->active_tab = HDS_CLAP_TAB_FX; // most useful tab to land on today; will become HDS_CLAP_TAB_PLAY once that tab is real
+    vs->active_tab = HDS_CLAP_TAB_PLAY;
     hds_fx_gui_view_state_init(&vs->fx_view);
     vs->fx_view.window_w = vs->window_w;
     vs->fx_view.window_h = vs->window_h - (int)HDS_CLAP_TAB_BAR_H;
+    hds_clap_play_view_state_init(&vs->play_view);
 }
 
 typedef struct { double x, y, w, h; } HdsClapTabRect;
@@ -126,6 +143,9 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
         case HDS_CLAP_TAB_FX:
             hds_fx_gui_render(cr, &p->gui_host, &vs->fx_view);
             break;
+        case HDS_CLAP_TAB_PLAY:
+            hds_clap_play_render(cr, p, &vs->play_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            break;
         case HDS_CLAP_TAB_MAPPING:
             hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Mapping (Sample Zone editor) -- not available in this GUI yet");
             break;
@@ -151,6 +171,8 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
     switch (vs->active_tab) {
         case HDS_CLAP_TAB_FX:
             return hds_fx_gui_on_button_press(&p->gui_host, &vs->fx_view, x, y - HDS_CLAP_TAB_BAR_H, button);
+        case HDS_CLAP_TAB_PLAY:
+            return hds_clap_play_on_button_press(p, &vs->play_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
         default:
             return true;
     }
@@ -158,10 +180,12 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
 
 static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y) {
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_motion(&p->gui_host, &vs->fx_view, x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_PLAY) hds_clap_play_on_motion(p, &vs->play_view, vs->window_w, x, y - HDS_CLAP_TAB_BAR_H);
 }
 
 static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_button_release(&vs->fx_view);
+    else if (vs->active_tab == HDS_CLAP_TAB_PLAY) hds_clap_play_on_button_release(&vs->play_view);
 }
 
 static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int action, char ch) {

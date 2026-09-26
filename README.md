@@ -2954,3 +2954,74 @@ the tab bar itself switches tabs (Play, then back to FX), and the FX tab's own e
 underneath it, at the correct translated coordinates. `hds_fx.clap`'s full existing test suite
 (including its own real XTest-driven `test_gui_x11`) still passes unchanged after the
 `hds_fx_gui_browser.c` extraction.
+
+## hds.clap's Play tab: 4 oscillator strips + 4 real Amp EGs (task #99)
+
+The next tab in the ordered list: `src/hds_clap_play_draw.c` (new) ports frontend.py's own Play
+tab -- the `QGroupBox("Oscillators")` (4 side-by-side strips: Shape/Pulse-Width-or-Tilt/Curve-
+Drive/Pitch-Offset/Fine/Phase/Pitch/Unison-Width/Unison-Detune/Vol/Mute/Pan, each knob's own
+real-unit range and shape-conditional visibility copied from `backend.c`'s own `ProgramState`, not
+guessed) and the `QGroupBox("Dedicated Amplitude Envelopes")` (4 `ADSRPanel`s: a real interactive
+curve widget, a 7-topology Mode combo, up to 6 topology-dependent dial knobs, the "1->All"/"Sync"
+buttons, a Vel->Amp knob). Every control reads/writes `SynthSharedControls.programs[
+SINGLE_PROGRAM_SLOT]` directly -- this instance's own real backend state, not a GUI-side mirror.
+hds.clap now lands on the Play tab by default (it's the tab a synth's own performer actually wants
+first), not FX.
+
+**Scope for this pass**: Single-Program mode only. Combi mode's own separate 8-lane mixer view
+(Level/Pan fader per lane, a Program-file picker, MIDI channel, key/velocity zone, per-lane
+transpose -- `self.osc_combi_widget` in frontend.py) is real, substantial, separate work with its
+own new infrastructure needs (a Program-file browser, extending `hds_fx_gui_browser.c`'s own
+pattern) -- tracked as its own follow-up task, not silently dropped. The Play tab's own Mode radio
+row isn't built yet either, for the same reason: a toggle to a mode with no view built would be a
+dead control. Two more things deliberately NOT here yet: the `WaveformVisualizer` preview (purely
+decorative, no backend field of its own) and the right-click "Modulate From" context menu on
+Pulse-Width/Phase/Pitch (assigns an LFO/assignable-EG as a knob's modulation source) -- the latter
+genuinely can't be built yet, since it needs a real list of modulator sources and the LFOs/
+Envelopes tabs that would supply that list don't exist in this native GUI yet either (next, in
+order, per this repo's own task list).
+
+**The Amp EG curve widget** (`src/hds_clap_adsr.h`, new) is a from-scratch Cairo port of
+`InteractiveADSREnvelope` (`calculate_geometry`/`paintEvent`/`mousePressEvent`/`mouseMoveEvent`),
+verified node-by-node against the Python source in a standalone prototype BEFORE being wired into
+the real plugin here. `AdsrEnvelopeState` itself is never a second source of truth: it's a
+transient, per-render/per-interaction-call VIEW of the backend's own `PackEGParams`/`eg_mode`
+fields (`hds_clap_adsr_load_from_backend()`/`store_to_backend()` convert milliseconds/percent
+<-> the widget's own seconds/0-1-fraction units), with only `active_node` (which curve handle is
+currently highlighted/dragged) persisted in the GUI's own view state across redraws.
+
+**One deliberate widget-type simplification** versus frontend.py, consistent with this whole
+native GUI's own established interaction language (`hds_fx_gui_draw.c`'s own header comment:
+"Mix/param knobs stay click-and-drag" -- there's no vertical-fader widget anywhere else in this
+GUI): every numeric control here (Vol included, and the 6 Amp-EG time/level dials, which are
+Python `QDial` subclasses with their own log/cubic taper) is the exact same plain click-and-drag
+knob `hds_fx_gui_draw.c`'s own Mix/param knobs already are, dragging LINEARLY over that field's own
+real backend-unit range -- the same convention `hds_fx_type_param_range()`'s own knobs already use
+for every FX param. This changes how many drag-pixels one full sweep takes, never the real value
+range or type. Pitch Offset/Fine Tune (`QSpinBox`es in frontend.py, not `QDial`s) become knobs too,
+for the same one-interaction-model reason.
+
+A real bug this pass's own testing caught before it shipped: every knob rect in this file stores
+its CENTER in `(x,y)` and its radius in `w` (the convention its own drawing code needs, since it
+draws an arc around a center, not a rectangle) -- but the FX tab's own `hds_fx_rect_contains()`
+(reused at first for hit-testing) treats `(x,y,w,h)` as a top-left corner plus width/height, testing
+an entirely different box, one whose top-left corner happens to BE the knob's own center. A test
+clicking exactly at a knob's own stored `(x,y)` still passed by coincidence (that point sits on the
+boundary of both interpretations), until int-truncating a knob center with a fractional part (e.g.
+`472.3` -> `472`) landed the click a hair outside the wrong box and the very first EG-dial-drag
+assertion caught it stone cold. Fixed with a proper `hds_play_knob_hit_test()` (a circle around the
+stored center, not a rectangle from it) used everywhere a knob-style rect is hit-tested. The same
+real bug also caught a second issue: every one of the 6 Amp-EG dial rects is always computed
+regardless of which the current topology actually shows (geometry doesn't depend on `env_type`,
+only visibility does -- see `hds_play_compute_eg_layout()`'s own comment), so hit-testing now
+explicitly re-checks `hds_play_eg_dial_visibility()` too, not just the old `rect.w > 0` guard that
+was never actually false for a hidden dial.
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_play.c`): real clicks/drags for
+the Shape dropdown (open + select, writing `vco1_shape`), a Pan knob drag (`vco1_pan`), the Mute
+toggle (`vco1_mute`), the Amp EG Mode dropdown (open + select AHDSR, writing `eg_mode[0]`), a real
+drag on the Attack dial (`eg[0].a`), a real drag on the ADSR curve's own Sustain node
+(`eg[0].s`), "1->All" (copies EG1's real state onto EG2), and "Sync" (toggling it on, then a
+further EG1 drag live-mirrors onto EG4 without a second click) -- eleven real, passing assertions
+against `SynthSharedControls.programs[SINGLE_PROGRAM_SLOT]`'s own actual fields. The full existing
+regression suite (all 9 prior test binaries, `hds_fx.clap`'s own included) still passes unchanged.

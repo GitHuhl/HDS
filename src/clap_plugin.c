@@ -175,6 +175,10 @@ typedef struct {
 // own small X11 shell instead of further genericizing hds_fx_gui_x11.c (which stays exactly as
 // hds_fx.clap alone needs it).
 #include "hds_fx_gui_draw.c"
+// hds_clap_play_draw.c comes BEFORE hds_clap_gui_draw.c: it defines HdsClapPlayViewState, which
+// HdsClapGuiViewState (hds_clap_gui_draw.c's own view-state struct) nests exactly the same way it
+// already nests hds_fx_gui_draw.c's own HdsFxGuiViewState for the FX tab.
+#include "hds_clap_play_draw.c"
 #include "hds_clap_gui_draw.c"
 #include "hds_clap_gui_x11.c"
 

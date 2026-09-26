@@ -693,13 +693,13 @@ static void hds_fx_draw_pill(cairo_t *cr, double x, double y, double w, double h
 // value_text_override: NULL means fall back to the old blanket "NN%" (used by the Mix knob, which
 // genuinely IS a plain percent -- see hds_fx_gui_render()'s own call). Every param knob instead
 // passes the real unit text from hds_fx_type_param_value_text() -- see that function's own comment.
-static void hds_fx_draw_knob(cairo_t *cr, double cx, double cy, double radius, float value01, bool disabled, double row_y, const char *name_label, const char *value_text_override) {
-    if (name_label && name_label[0]) {
-        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 7.5);
-        hds_fx_rgb(cr, disabled ? 0.38 : 0.70, disabled ? 0.38 : 0.72, disabled ? 0.40 : 0.74);
-        hds_fx_centered_text(cr, cx, row_y + HDS_FX_KNOB_TOP_LABEL_Y_OFFSET, name_label);
-    }
+// Just the knob's own arc/track/tick -- no label, no value text, since those two are anchored
+// differently by each of this arc's two callers (hds_fx_draw_knob below anchors them at fixed
+// offsets from a ROW's own top; hds_play_draw_knob in hds_clap_play_draw.c anchors them relative
+// to the knob's own cy instead, since Play tab's controls aren't laid out in fixed-height rows).
+// Extracted rather than duplicated so both callers' knobs are pixel-identical and any future
+// visual tweak (colors, sweep angle, tick length) never has to be made twice.
+static void hds_fx_draw_knob_arc(cairo_t *cr, double cx, double cy, double radius, float value01, bool disabled) {
     if (value01 < 0.0f) value01 = 0.0f; else if (value01 > 1.0f) value01 = 1.0f;
     double start = M_PI * 0.75, sweep = M_PI * 1.5;
     cairo_new_path(cr);
@@ -727,6 +727,17 @@ static void hds_fx_draw_knob(cairo_t *cr, double cx, double cy, double radius, f
         cairo_stroke(cr);
         cairo_new_path(cr);
     }
+}
+
+static void hds_fx_draw_knob(cairo_t *cr, double cx, double cy, double radius, float value01, bool disabled, double row_y, const char *name_label, const char *value_text_override) {
+    if (name_label && name_label[0]) {
+        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 7.5);
+        hds_fx_rgb(cr, disabled ? 0.38 : 0.70, disabled ? 0.38 : 0.72, disabled ? 0.40 : 0.74);
+        hds_fx_centered_text(cr, cx, row_y + HDS_FX_KNOB_TOP_LABEL_Y_OFFSET, name_label);
+    }
+    if (value01 < 0.0f) value01 = 0.0f; else if (value01 > 1.0f) value01 = 1.0f;
+    hds_fx_draw_knob_arc(cr, cx, cy, radius, value01, disabled);
 
     char value_text[24];
     if (value_text_override) snprintf(value_text, sizeof(value_text), "%s", value_text_override);
