@@ -1061,42 +1061,46 @@ result, an honest tradeoff for a real feature rather than a regression.
 
 Since this plugin has no OSC/frontend.py connection at all (see this file's own header comment),
 NAM's model/cab IR paths are set via the two dedicated pills (see the GUI section below). Clicking
-either pill now first tries to open a real native file picker -- `zenity --file-selection` (falling
-back to `kdialog --getopenfilename` if `zenity` isn't installed) -- launched as a completely separate
-system process via plain `fork()`/`execlp()`, never `waitpid()`-blocked synchronously (the plugin's
-own event pump/timer callback keeps running while the dialog is open; a non-blocking
-`waitpid(pid, &status, WNOHANG)` reaps it once per timer tick, same "never block the audio/UI thread
-for I/O" discipline this codebase already applies to Sequencer lane loading). Neither tool is ever
-linked, embedded, or bundled into `hds_fx.clap` itself -- exactly the same relationship this plugin
-already has with `git` or `ls`: an already-installed system executable it can choose to invoke, never
-code it links against or ships. That keeps `hds_fx.clap`'s own license and distribution completely
-untouched by GTK's or Qt's own terms, whether or not either is even installed. If both `execlp()`
-attempts fail (the child's own fallback exit code, 127, means neither tool exists on this system) --
-or on a system with neither installed at all -- the click falls back automatically to the original
-typed/pasted-path text-entry field (`hds_fx_gui_on_key()` in `hds_fx_gui_draw.c`, `KeyPress` handling
-+ an explicit `XSetInputFocus()` call in `hds_fx_gui_x11.c`, since a reparented/embedded window
-doesn't receive keyboard focus automatically without the full XEmbed protocol -- see that file's own
-comment on why this plugin doesn't implement that yet), pre-filled with the field's current value, so
-the feature never regresses on a system with neither dialog tool present.
+either pill opens an **in-house file browser** drawn with this GUI's own Cairo primitives -- a real
+directory listing (`opendir()`/`readdir()`/`stat()`), not a GTK/Qt widget and not an external process.
 
-**A real bug from a live DAW test, the very first time this shipped**: clicking the Model/IR pill did
-nothing at all -- no native dialog, no fallback text field either. Root cause: the fallback above was
-only ever triggered by the child's exact `_exit(127)` ("neither zenity nor kdialog is even on PATH"),
-but the DAW in question DOES have `zenity` on PATH -- it just fails to actually show a picker from
-inside that host's own process (a sandboxed/restricted environment, a missing display/DBus portal,
-whatever the exact cause) and exits nonzero with no output, exactly like a plain user Cancel would on
-the wire. Every OTHER failure mode looked identical to "the user saw a real dialog and clicked
-Cancel," so it was silently swallowed -- leaving the pill looking completely unresponsive. Fixed with
-a fast-exit heuristic in `hds_fx_gui_poll_file_dialog()`: a REAL human cancelling a REAL picker takes
-at least a couple hundred milliseconds (it has to render, and a person has to look at it and click
-Cancel); a process that fails before ever reaching a display connection typically exits in single-digit
-milliseconds. Any nonzero exit (or exit 127) that comes back in under 800ms with no path-shaped output
-now recovers into the inline text-edit fallback automatically, same as a genuinely-missing tool always
-has -- a slower nonzero exit with nothing printed is still left alone as a real Cancel. Verified with a
-third dialog-subprocess scenario alongside the two from this feature's own first pass: a fake `zenity`
-found on `$PATH` that exits `1` instantly with zero output (exactly what a live DAW test hit) now
-recovers into the inline fallback exactly like a genuinely-absent tool always has, where before this
-fix it left the field completely inert.
+This went through two earlier revisions, both abandoned after real DAW testing:
+
+1. **First pass**: shelled out to `zenity --file-selection` (falling back to `kdialog
+   --getopenfilename`) as a separate system process via `fork()`/`execlp()`, never linked into
+   `hds_fx.clap` itself -- reasonable in principle (no GTK/Qt license ever attaches to this
+   plugin's own binary that way), but a live DAW test found the pill completely unresponsive: the
+   only recognized "neither tool is installed" case was the child's exact `_exit(127)`, but that
+   DAW's own `zenity` WAS on PATH -- it just couldn't actually show a picker from inside that
+   host's own process (sandboxing, a missing display/DBus portal, an unrecognized argument, who
+   knows) and exited nonzero with no output, indistinguishable on the wire from a plain user
+   Cancel. Silently swallowed, leaving the pill looking dead.
+2. **Second pass**: hardened the failure-recovery with a fast-exit heuristic (a real human
+   cancelling a real picker takes at least a couple hundred milliseconds; a process that fails
+   before ever reaching a display connection typically exits in single-digit milliseconds) --
+   verified against three subprocess scenarios (a fake `zenity` that succeeds, one that's simply
+   absent, and one that's present but fails fast with no output) and all three recovered
+   correctly. Reported back to still be unresponsive on the real DAW anyway -- the exact
+   underlying cause on that specific host's process/sandbox was never fully diagnosable
+   remotely, and "keep guessing at zenity/kdialog failure modes we can't reproduce" wasn't
+   converging.
+
+Given that, this final revision drops the external-process dependency entirely. `opendir()`/
+`readdir()`/`stat()` are exactly what any other program on the SAME machine already needs to list a
+directory -- no tool to be missing, sandboxed away, or fail to open a display for, and (unlike
+zenity/kdialog, which don't exist on Windows/macOS at all) the genuinely portable path to this
+plugin's own already-stated future-Windows-port goal: a win32 shim only needs its own
+FindFirstFile/FindNextFile-based version of `hds_fx_gui_browser_refresh()` (the ONE function that
+touches the filesystem, in `hds_fx_gui_x11.c`); every render/hit-test function in the portable
+`hds_fx_gui_draw.c` around `HdsFxBrowser` stays untouched. The browser is a centered modal panel
+(same "click outside to close" posture the Type/Input/Sidechain/Output dropdowns already have):
+directories first then `*.nam`/`*.wav` files (case-insensitive, alphabetical), an Up-one-level row,
+and a path bar that doubles as the old typed/pasted-path entry -- clicking it and typing an exact
+file path and pressing Enter commits it directly (tried as a file first via `stat()`+`S_ISREG`, then
+as a directory to navigate into), so nothing from the original text-entry fallback was lost, just
+folded into one mechanism instead of three layered ones. Never blocks the GUI's own event pump/timer
+callback: `needs_refresh` is set on open/navigate/commit and polled once per timer tick, same
+posture the subprocess approach's own non-blocking `waitpid(..., WNOHANG)` had.
 
 **A second real bug, in the SAME "what does Output actually do" area**: an earlier revision gave
 Output its own Mono/Stereo choice, mirroring Input's -- but every one of the 8 CLAP ports is already
@@ -1316,21 +1320,21 @@ Verified several ways, all exercising the real production code, no host availabl
    from one full drag stroke -- before the fix this could only ever reach `1.0`, 1% of its own range
    -- while an ordinary 0-1 param dragged the identical distance still lands at exactly `1.0`,
    proving the fix didn't accidentally widen every other knob's own range too.
-6. **NAM's native file-dialog (zenity/kdialog) round-trip and its fallback are both real, not just
-   theoretical**: a dedicated Xvfb+XTest harness swaps `$PATH` for a scratch directory containing a
-   fake, instantly-exiting `zenity` shell script (real fork()/pipe()/execlp()/waitpid() plumbing is
-   what's under test here -- driving an actual GTK dialog's own UI is out of scope, that's zenity's
-   own already-tested software), real-clicks the Model pill, confirms a real subprocess was spawned
-   (`file_dialog_pid > 0`) and inline text-edit did NOT open, polls via the actual non-blocking
-   `WNOHANG` reaping loop until it exits, then confirms the fake script's own stdout output landed in
-   `nam_model_path` exactly. A second run points `$PATH` at an empty directory (neither tool
-   reachable), real-clicks the IR pill, and confirms it still attempts to spawn (`file_dialog_pid >
-   0`) before automatically falling back to the original inline text-edit field once both `execlp()`
-   attempts fail, pre-filled from that slot's own current (empty) IR path. A third run (added after a
-   live DAW test found the pill completely unresponsive on a real system) points `$PATH` at a fake
-   `zenity` that exits `1` instantly with no output -- exactly what a real zenity does when it can't
-   actually show a picker from inside that host's own process -- and confirms this ALSO now recovers
-   into the inline fallback, which it did not before the fast-exit heuristic was added.
+6. **NAM's in-house file browser drives a real directory tree, not a mock**: the same Xvfb+XTest
+   harness builds a real scratch directory (`sub/` subdirectory, `amp1.nam`/`amp2.wav`/`readme.txt`,
+   and `sub/nested.nam`), real-clicks the Model pill and confirms the browser opens with a real
+   `opendir()`-backed listing that correctly filters to exactly `sub` (directory) and `amp1.nam`
+   (`*.nam` only -- `amp2.wav`/`readme.txt` excluded). Real-clicks the `sub` row and confirms a real
+   re-listing of its own contents (`nested.nam`); real-clicks Up and confirms it's back to the
+   original two entries; real-clicks `amp1.nam` and confirms its real full path lands in
+   `nam_model_path` exactly, closing the browser. Separately: real-clicks the IR pill's own path
+   bar, clears it with real Backspace keypresses and types `amp2.wav`'s full real path (holding a
+   real Shift key for the path's own uppercase/underscore characters, which a bare keycode
+   press/release types as the wrong, unshifted character on a standard layout) via `XTestFakeKeyEvent`,
+   confirms a real Enter keypress commits that exact path into `nam_ir_path` (tried as a file via
+   `stat()` first, exactly as `hds_fx_gui_browser_refresh()` does); confirms a real Escape keypress on
+   the path bar reverts it without closing the whole browser; confirms a real click on the dimmed
+   backdrop outside the panel closes it without committing anything.
 
 ### Fixing drift: two of HDS FX's own fixes ported back into main HDS
 

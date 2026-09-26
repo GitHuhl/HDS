@@ -423,6 +423,37 @@ static void hds_fx_truncate_pill_text(const char *text, char *buf, size_t buflen
     snprintf(buf, buflen, "\xe2\x80\xa6%s", text + (len - (max_visible - 1)));
 }
 
+// The directory part of a path (everything before the last '/', not including it), or "" if there
+// is no '/' at all -- used to seed the file browser's own starting directory from whatever's
+// already stored in nam_model_path/nam_ir_path (see hds_fx_gui_browser_open()). Pure string math,
+// no filesystem access -- this file stays free of any OS/filesystem call (see this file's own
+// header comment on staying portable to a future Windows GUI); the platform shim
+// (hds_fx_gui_x11.c) is what actually opendir()s whatever this produces, and falls back to a
+// sane default (the user's HOME, or "/") if it doesn't exist or this returns "".
+// A plain bounded strcpy -- used in place of snprintf(dst, n, "%s", src) wherever src's own
+// declared buffer is bigger than dst's (e.g. a joined "dir/name" that could in principle exceed
+// SAMPLE_PATH_LEN for a sufficiently deep/long real path): correctly truncating and NUL-terminating
+// either way, just without tripping GCC's -Wformat-truncation, which can't see that this is an
+// intentional, already-safe cap rather than an overlooked bug.
+static void hds_fx_safe_copy(char *dst, size_t dst_size, const char *src) {
+    size_t len = strlen(src);
+    if (len >= dst_size) len = dst_size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+static void hds_fx_dirname(const char *path, char *out, size_t out_len) {
+    out[0] = '\0';
+    if (!path || !path[0]) return;
+    const char *slash = strrchr(path, '/');
+    if (!slash) return; // no '/' at all -- leave empty, the platform shim's own fallback takes over
+    size_t len = (size_t)(slash - path);
+    if (len == 0) len = 1; // "/foo.nam" -> dirname "/", not ""
+    if (len >= out_len) len = out_len - 1;
+    memcpy(out, path, len);
+    out[len] = '\0';
+}
+
 // ---------------------------------------------------------------------------------------------
 // Chain-link helpers -- a "chain" is any run of consecutive-BY-SOURCE slots joined by
 // Chain-to-Next (see process_fx_chain()'s own Parallel-mode comment in fx_chain.c: the next OWNED
@@ -486,6 +517,57 @@ typedef struct {
     HdsFxRect anchor; // the pill's own rect at the moment it was opened -- positions the list
 } HdsFxDropdown;
 
+// In-house file browser for FX_TYPE_NAM's Model/IR pills -- a real directory listing drawn with
+// this file's own Cairo primitives, not a subprocess (zenity/kdialog) and not a GTK/Qt widget. This
+// replaced an earlier revision that shelled out to zenity/kdialog: that approach depended on
+// whichever dialog tool (if any) happened to be installed and reachable from inside the HOST's own
+// process, and real DAW testing found it silently unresponsive on more than one real system (a
+// tool that's on PATH but can't actually show a picker there for reasons this plugin has no way to
+// diagnose remotely -- sandboxing, a missing display/DBus portal, etc.) even after hardening the
+// failure-recovery heuristics twice. An in-house browser has no external dependency to fail: it's
+// exactly the same opendir()/readdir() any other program on the SAME machine already needs to list
+// a directory, drawn with the exact same Cairo calls every other pixel in this GUI already uses --
+// works identically on every Linux desktop regardless of what's installed, and (unlike zenity/
+// kdialog, which don't exist on Windows/macOS at all) is the genuinely portable path to this file's
+// own already-stated future-Windows-port goal: a win32 platform shim would only need its own
+// FindFirstFile/FindNextFile-based refresh function, this entire struct and every render/hit-test
+// function around it stay untouched.
+//
+// This file (the portable draw file) owns the STATE and all rendering/hit-testing; it never touches
+// the filesystem directly (see this file's own header comment on staying free of any OS call, the
+// same discipline that already kept Xlib/Win32 types out). hds_fx_gui_x11.c's own
+// hds_fx_gui_browser_refresh() is the one place that actually calls opendir()/readdir()/stat() --
+// triggered whenever needs_refresh is set here (opening the browser, navigating into a directory,
+// pressing Up, or committing a typed path) and polled once per timer tick, same "never block the
+// UI thread on a filesystem call from inside a click handler" discipline the old subprocess
+// approach already established (a network filesystem's own realistic latency is exactly the kind
+// of stall a single click shouldn't have to wait through synchronously).
+#define HDS_FX_BROWSER_MAX_ENTRIES 256
+#define HDS_FX_BROWSER_NAME_LEN 256
+
+typedef struct {
+    bool open;
+    int row;   // which pool slot this browser is filling
+    int field; // 0 = Model (*.nam), 1 = IR (*.wav)
+
+    // dir is the authoritative current directory while NOT editing the path bar; WHILE editing
+    // (path_bar_editing) it doubles as the live typed buffer instead (same "one buffer serves both
+    // display and edit" the old edit_buffer used) -- last_valid_dir is what Escape reverts to.
+    char dir[SAMPLE_PATH_LEN];
+    char last_valid_dir[SAMPLE_PATH_LEN];
+    bool path_bar_editing;
+    // Set by Enter on the path bar: the platform shim tries the typed text as an exact FILE path
+    // first (stat()+S_ISREG -- committing it directly, same as clicking a file entry), then falls
+    // back to trying it as a directory (same as clicking a directory entry) if that fails.
+    bool path_bar_commit_attempt;
+    bool needs_refresh; // platform shim sees this, re-lists `dir`, fills entries below, clears it
+
+    char entry_name[HDS_FX_BROWSER_MAX_ENTRIES][HDS_FX_BROWSER_NAME_LEN];
+    bool entry_is_dir[HDS_FX_BROWSER_MAX_ENTRIES];
+    int entry_count;
+    int scroll; // index of the first visible entry row
+} HdsFxBrowser;
+
 typedef struct {
     int window_w, window_h;
     double scroll_offset_px;
@@ -500,18 +582,10 @@ typedef struct {
 
     HdsFxDropdown dropdown;
 
-    // Inline text-edit state -- FX_TYPE_NAM's own Model/IR path fields are the only free-text
-    // inputs anywhere in this GUI (every other value is a knob, a toggle, or a dropdown option),
-    // and there's no file-browser dialog here (this plugin stays a plain Cairo+X11 build, no GTK/Qt
-    // toolkit dependency -- see this file's own header comment) -- so typing/pasting a path
-    // directly is the mechanism. edit_row < 0 means nothing is being edited; edit_field 0 = Model,
-    // 1 = IR. edit_buffer is pre-filled with the slot's CURRENT path when editing starts (see
-    // hds_fx_gui_on_button_press()'s own NAM-pill handling), so backspacing an existing path works
-    // exactly like editing any other text field, not just typing one from scratch. See
-    // hds_fx_gui_on_key()'s own comment for how a real X11 keypress reaches this state.
-    int edit_row;
-    int edit_field;
-    char edit_buffer[SAMPLE_PATH_LEN];
+    // FX_TYPE_NAM's own Model/IR path fields are the only free-text-adjacent inputs anywhere in
+    // this GUI (every other value is a knob, a toggle, or a dropdown option) -- see HdsFxBrowser's
+    // own comment above for how clicking either pill opens this in-house file browser.
+    HdsFxBrowser browser;
 } HdsFxGuiViewState;
 
 static void hds_fx_gui_view_state_init(HdsFxGuiViewState *vs) {
@@ -520,7 +594,6 @@ static void hds_fx_gui_view_state_init(HdsFxGuiViewState *vs) {
     vs->window_h = HDS_FX_GUI_DEFAULT_H;
     vs->hover_row = -1;
     vs->drag_kind = 0;
-    vs->edit_row = -1;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -936,6 +1009,221 @@ static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxPlugin *p, const HdsFxG
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// In-house file browser -- see HdsFxBrowser's own comment for why this replaced the earlier
+// zenity/kdialog subprocess approach. A centered modal panel, same "click outside to close"
+// posture as the dropdowns above, computed fresh from the CURRENT window size every time (not
+// anchored at open time like a dropdown's own small list is), so a window resize while the
+// browser is open never leaves it mis-positioned.
+// ---------------------------------------------------------------------------------------------
+#define HDS_FX_BROWSER_ROW_H 20.0
+#define HDS_FX_BROWSER_TITLE_H 30.0
+#define HDS_FX_BROWSER_PATHBAR_H 22.0
+#define HDS_FX_BROWSER_UP_ROW_H 20.0
+#define HDS_FX_BROWSER_MARGIN 10.0
+
+typedef struct {
+    HdsFxRect panel;
+    HdsFxRect close_btn;
+    HdsFxRect path_bar;
+    HdsFxRect up_row; // only meaningful when show_up
+    bool show_up;
+    HdsFxRect list_area;
+    int visible_rows;
+} HdsFxBrowserLayout;
+
+static void hds_fx_browser_compute_layout(const HdsFxGuiViewState *vs, HdsFxBrowserLayout *out) {
+    double pw = (double)vs->window_w - 80.0;
+    if (pw > 620.0) pw = 620.0;
+    if (pw < 280.0) pw = ((double)vs->window_w > 300.0) ? (double)vs->window_w - 20.0 : 280.0;
+    double ph = (double)vs->window_h - 70.0;
+    if (ph > 520.0) ph = 520.0;
+    if (ph < 220.0) ph = ((double)vs->window_h > 240.0) ? (double)vs->window_h - 20.0 : 220.0;
+    out->panel.x = ((double)vs->window_w - pw) / 2.0;
+    out->panel.y = ((double)vs->window_h - ph) / 2.0;
+    out->panel.w = pw;
+    out->panel.h = ph;
+
+    out->close_btn = (HdsFxRect){out->panel.x + out->panel.w - 26, out->panel.y + 6, 20, 20};
+    out->path_bar = (HdsFxRect){out->panel.x + HDS_FX_BROWSER_MARGIN, out->panel.y + HDS_FX_BROWSER_TITLE_H,
+                                 out->panel.w - 2 * HDS_FX_BROWSER_MARGIN, HDS_FX_BROWSER_PATHBAR_H};
+    double list_top = out->path_bar.y + out->path_bar.h + 4.0;
+    out->show_up = (strcmp(vs->browser.dir, "/") != 0);
+    if (out->show_up) {
+        out->up_row = (HdsFxRect){out->panel.x + HDS_FX_BROWSER_MARGIN, list_top,
+                                   out->panel.w - 2 * HDS_FX_BROWSER_MARGIN, HDS_FX_BROWSER_UP_ROW_H};
+        list_top += HDS_FX_BROWSER_UP_ROW_H;
+    } else {
+        out->up_row = (HdsFxRect){0, 0, 0, 0};
+    }
+    double list_bottom = out->panel.y + out->panel.h - HDS_FX_BROWSER_MARGIN;
+    out->list_area = (HdsFxRect){out->panel.x + HDS_FX_BROWSER_MARGIN, list_top,
+                                  out->panel.w - 2 * HDS_FX_BROWSER_MARGIN, list_bottom - list_top};
+    out->visible_rows = (int)(out->list_area.h / HDS_FX_BROWSER_ROW_H);
+    if (out->visible_rows < 1) out->visible_rows = 1;
+}
+
+// Opens the browser for FX_TYPE_NAM slot `row`'s Model (field 0) or IR (field 1) pill -- called
+// from hds_fx_gui_on_button_press() in place of the old inline-edit-open code. Seeds the starting
+// directory from whatever path is already stored (hds_fx_dirname()); needs_refresh tells the
+// platform shim (hds_fx_gui_x11.c) to actually list it on the very next poll, which happens before
+// this same tick's own redraw (see hds_fx_gui_on_timer()'s own ordering) -- so the very click that
+// opens the browser also sees a populated listing immediately, never one empty frame first.
+static void hds_fx_gui_browser_open(HdsFxPlugin *p, HdsFxGuiViewState *vs, int row, int field) {
+    HdsFxBrowser *b = &vs->browser;
+    memset(b, 0, sizeof(*b));
+    b->open = true;
+    b->row = row;
+    b->field = field;
+    const char *cur = (field == 0) ? p->fx[row].nam_model_path : p->fx[row].nam_ir_path;
+    hds_fx_dirname(cur, b->dir, sizeof(b->dir));
+    b->needs_refresh = true;
+}
+
+static void hds_fx_gui_browser_close(HdsFxGuiViewState *vs) { vs->browser.open = false; }
+
+// Handles every click while the browser is open -- called EXCLUSIVELY (see
+// hds_fx_gui_on_button_press()'s own ordering, same "one modal owns every click" posture the
+// dropdown check above already has). Always returns true (consumed): a click anywhere while the
+// browser is open is never "let it fall through to whatever's underneath."
+static bool hds_fx_gui_browser_on_click(HdsFxPlugin *p, HdsFxGuiViewState *vs, double x, double y) {
+    HdsFxBrowser *b = &vs->browser;
+    HdsFxBrowserLayout L;
+    hds_fx_browser_compute_layout(vs, &L);
+
+    if (!hds_fx_rect_contains(&L.panel, x, y)) { hds_fx_gui_browser_close(vs); return true; }
+    if (hds_fx_rect_contains(&L.close_btn, x, y)) { hds_fx_gui_browser_close(vs); return true; }
+    if (hds_fx_rect_contains(&L.path_bar, x, y)) { b->path_bar_editing = true; return true; }
+
+    // Any other click while the path bar was mid-edit abandons that edit (reverts to the last
+    // directory that actually listed successfully) -- same "a click elsewhere ends the current
+    // transient text edit" posture the old inline editor had, just without committing it (only
+    // Enter commits a typed path here -- see hds_fx_gui_on_key()).
+    if (b->path_bar_editing) {
+        b->path_bar_editing = false;
+        snprintf(b->dir, sizeof(b->dir), "%s", b->last_valid_dir);
+    }
+
+    if (L.show_up && hds_fx_rect_contains(&L.up_row, x, y)) {
+        char parent[SAMPLE_PATH_LEN];
+        hds_fx_dirname(b->dir, parent, sizeof(parent));
+        snprintf(b->dir, sizeof(b->dir), "%s", parent[0] ? parent : "/");
+        b->needs_refresh = true;
+        return true;
+    }
+
+    if (hds_fx_rect_contains(&L.list_area, x, y)) {
+        int visible_idx = (int)((y - L.list_area.y) / HDS_FX_BROWSER_ROW_H);
+        int idx = b->scroll + visible_idx;
+        if (idx >= 0 && idx < b->entry_count) {
+            char full[SAMPLE_PATH_LEN + HDS_FX_BROWSER_NAME_LEN + 2];
+            if (strcmp(b->dir, "/") == 0) snprintf(full, sizeof(full), "/%s", b->entry_name[idx]);
+            else snprintf(full, sizeof(full), "%s/%s", b->dir, b->entry_name[idx]);
+            if (b->entry_is_dir[idx]) {
+                hds_fx_safe_copy(b->dir, sizeof(b->dir), full);
+                b->needs_refresh = true;
+            } else {
+                char *dst = (b->field == 0) ? p->fx[b->row].nam_model_path : p->fx[b->row].nam_ir_path;
+                hds_fx_safe_copy(dst, SAMPLE_PATH_LEN, full);
+                hds_fx_gui_browser_close(vs);
+            }
+        }
+        return true;
+    }
+    return true; // clicked somewhere inside the panel but not on any live control -- still consumed
+}
+
+static void hds_fx_gui_render_browser(cairo_t *cr, const HdsFxGuiViewState *vs) {
+    const HdsFxBrowser *b = &vs->browser;
+    if (!b->open) return;
+    HdsFxBrowserLayout L;
+    hds_fx_browser_compute_layout(vs, &L);
+
+    hds_fx_rgba(cr, 0, 0, 0, 0.55); // dim backdrop -- click on it closes the browser
+    cairo_new_path(cr);
+    cairo_rectangle(cr, 0, 0, vs->window_w, vs->window_h);
+    cairo_fill(cr);
+
+    hds_fx_rgb(cr, 0.13, 0.13, 0.16);
+    hds_fx_rounded_rect(cr, L.panel.x, L.panel.y, L.panel.w, L.panel.h, 6);
+    cairo_fill(cr);
+    hds_fx_rgba(cr, 1, 1, 1, 0.18);
+    cairo_new_path(cr);
+    cairo_set_line_width(cr, 1.0);
+    hds_fx_rounded_rect(cr, L.panel.x + 0.5, L.panel.y + 0.5, L.panel.w - 1, L.panel.h - 1, 6);
+    cairo_stroke(cr);
+
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 12);
+    hds_fx_rgb(cr, 0.9, 0.9, 0.92);
+    hds_fx_left_text(cr, L.panel.x + HDS_FX_BROWSER_MARGIN, L.panel.y + 20,
+                      b->field == 0 ? "Select NAM Model (*.nam)" : "Select Cab IR (*.wav)");
+
+    hds_fx_rgb(cr, 0.22, 0.22, 0.26);
+    hds_fx_rounded_rect(cr, L.close_btn.x, L.close_btn.y, L.close_btn.w, L.close_btn.h, 3);
+    cairo_fill(cr);
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 11);
+    hds_fx_rgb(cr, 0.75, 0.75, 0.78);
+    hds_fx_centered_text(cr, L.close_btn.x + L.close_btn.w / 2, L.close_btn.y + L.close_btn.h / 2 + 4, "X");
+
+    // Path bar -- `dir` doubles as the live typed buffer while path_bar_editing (see HdsFxBrowser's
+    // own comment), with a trailing cursor "_" exactly like the old inline path editor drew.
+    hds_fx_rgb(cr, b->path_bar_editing ? 0.16 : 0.10, b->path_bar_editing ? 0.20 : 0.10, b->path_bar_editing ? 0.22 : 0.12);
+    cairo_new_path(cr);
+    cairo_rectangle(cr, L.path_bar.x, L.path_bar.y, L.path_bar.w, L.path_bar.h);
+    cairo_fill(cr);
+    hds_fx_rgba(cr, 1, 1, 1, 0.15);
+    cairo_new_path(cr);
+    cairo_set_line_width(cr, 1.0);
+    cairo_rectangle(cr, L.path_bar.x + 0.5, L.path_bar.y + 0.5, L.path_bar.w - 1, L.path_bar.h - 1);
+    cairo_stroke(cr);
+    char path_disp[SAMPLE_PATH_LEN + 2];
+    snprintf(path_disp, sizeof(path_disp), b->path_bar_editing ? "%s_" : "%s", b->dir);
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 9.5);
+    hds_fx_rgb(cr, 0.85, 0.88, 0.90);
+    hds_fx_left_text(cr, L.path_bar.x + 6, L.path_bar.y + L.path_bar.h / 2 + 3.5, path_disp);
+
+    if (L.show_up) {
+        hds_fx_rgb(cr, 0.17, 0.17, 0.20);
+        cairo_new_path(cr);
+        cairo_rectangle(cr, L.up_row.x, L.up_row.y, L.up_row.w, L.up_row.h);
+        cairo_fill(cr);
+        hds_fx_rgb(cr, 0.78, 0.80, 0.82);
+        hds_fx_left_text(cr, L.up_row.x + 6, L.up_row.y + L.up_row.h / 2 + 3.5, ".. (up one level)");
+    }
+
+    cairo_save(cr);
+    cairo_new_path(cr);
+    cairo_rectangle(cr, L.list_area.x, L.list_area.y, L.list_area.w, L.list_area.h);
+    cairo_clip(cr);
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 9.5);
+    if (b->entry_count == 0) {
+        hds_fx_rgb(cr, 0.5, 0.5, 0.53);
+        hds_fx_left_text(cr, L.list_area.x + 4, L.list_area.y + 14, "(empty, or this directory can't be read)");
+    }
+    for (int i = 0; i < b->entry_count; i++) {
+        int visible_idx = i - b->scroll;
+        if (visible_idx < 0 || visible_idx >= L.visible_rows) continue;
+        double ry = L.list_area.y + visible_idx * HDS_FX_BROWSER_ROW_H;
+        if (b->entry_is_dir[i]) {
+            // Directories shown as "name/" in a distinct color -- a trailing slash rather than a
+            // glyph/icon prefix, since a plain ASCII "/" is guaranteed to render on every font this
+            // GUI could ever be running under (an icon glyph is not).
+            char buf[HDS_FX_BROWSER_NAME_LEN + 2];
+            snprintf(buf, sizeof(buf), "%s/", b->entry_name[i]);
+            hds_fx_rgb(cr, 0.55, 0.75, 0.95);
+            hds_fx_left_text(cr, L.list_area.x + 4, ry + HDS_FX_BROWSER_ROW_H / 2 + 3.5, buf);
+        } else {
+            hds_fx_rgb(cr, 0.82, 0.84, 0.86);
+            hds_fx_left_text(cr, L.list_area.x + 4, ry + HDS_FX_BROWSER_ROW_H / 2 + 3.5, b->entry_name[i]);
+        }
+    }
+    cairo_restore(cr);
+}
+
 static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewState *vs) {
     int width = vs->window_w, height = vs->window_h;
 
@@ -1039,30 +1327,19 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
         }
 
         // NAM's own Model/IR path pills -- see HdsFxRowLayout's own comment on nam_model_pill/
-        // nam_ir_pill for why these reuse otherwise-blank knob columns. Shows the live edit buffer
-        // (with a text cursor) while that specific field is being typed into, otherwise the
-        // loaded path's basename or "(none)" -- clicking either pill starts editing (see
-        // hds_fx_gui_on_button_press()'s own NAM handling).
+        // nam_ir_pill for why these reuse otherwise-blank knob columns. Shows the loaded path's
+        // basename or "(none)" -- clicking either pill opens the in-house file browser (see
+        // hds_fx_gui_on_button_press()'s own NAM handling and HdsFxBrowser's own comment).
         if (hds_fx_type_uses_nam_paths(fx_type)) {
-            bool editing_model = (vs->edit_row == s && vs->edit_field == 0);
-            bool editing_ir = (vs->edit_row == s && vs->edit_field == 1);
+            bool browsing_model = (vs->browser.open && vs->browser.row == s && vs->browser.field == 0);
+            bool browsing_ir = (vs->browser.open && vs->browser.row == s && vs->browser.field == 1);
             char trunc[24], model_buf[32], ir_buf[32];
-            if (editing_model) {
-                hds_fx_truncate_pill_text(vs->edit_buffer, trunc, sizeof(trunc), 15);
-                snprintf(model_buf, sizeof(model_buf), "%s_", trunc);
-            } else {
-                hds_fx_truncate_pill_text(slot->nam_model_path[0] ? hds_fx_basename(slot->nam_model_path) : "(none)", trunc, sizeof(trunc), 15);
-                snprintf(model_buf, sizeof(model_buf), "M: %s", trunc);
-            }
-            if (editing_ir) {
-                hds_fx_truncate_pill_text(vs->edit_buffer, trunc, sizeof(trunc), 15);
-                snprintf(ir_buf, sizeof(ir_buf), "%s_", trunc);
-            } else {
-                hds_fx_truncate_pill_text(slot->nam_ir_path[0] ? hds_fx_basename(slot->nam_ir_path) : "(none)", trunc, sizeof(trunc), 15);
-                snprintf(ir_buf, sizeof(ir_buf), "IR: %s", trunc);
-            }
-            hds_fx_draw_pill(cr, L.nam_model_pill.x, L.nam_model_pill.y, L.nam_model_pill.w, L.nam_model_pill.h, model_buf, editing_model || slot->nam_model_path[0], false);
-            hds_fx_draw_pill(cr, L.nam_ir_pill.x, L.nam_ir_pill.y, L.nam_ir_pill.w, L.nam_ir_pill.h, ir_buf, editing_ir || slot->nam_ir_path[0], false);
+            hds_fx_truncate_pill_text(slot->nam_model_path[0] ? hds_fx_basename(slot->nam_model_path) : "(none)", trunc, sizeof(trunc), 15);
+            snprintf(model_buf, sizeof(model_buf), "M: %s", trunc);
+            hds_fx_truncate_pill_text(slot->nam_ir_path[0] ? hds_fx_basename(slot->nam_ir_path) : "(none)", trunc, sizeof(trunc), 15);
+            snprintf(ir_buf, sizeof(ir_buf), "IR: %s", trunc);
+            hds_fx_draw_pill(cr, L.nam_model_pill.x, L.nam_model_pill.y, L.nam_model_pill.w, L.nam_model_pill.h, model_buf, browsing_model || slot->nam_model_path[0], false);
+            hds_fx_draw_pill(cr, L.nam_ir_pill.x, L.nam_ir_pill.y, L.nam_ir_pill.w, L.nam_ir_pill.h, ir_buf, browsing_ir || slot->nam_ir_path[0], false);
         }
 
         // Output pill: only live on a chain TAIL -- a slot still chaining forward doesn't decide
@@ -1134,7 +1411,8 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
         cairo_new_path(cr);
     }
 
-    hds_fx_gui_render_dropdown(cr, p, vs); // last -- on top of everything else, unclipped by the list's own scroll region
+    hds_fx_gui_render_dropdown(cr, p, vs); // on top of everything else, unclipped by the list's own scroll region
+    hds_fx_gui_render_browser(cr, vs); // last of all -- the browser is modal, so it draws over a dropdown too (never both open at once in practice, but this ordering is correct either way)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1159,29 +1437,23 @@ static void hds_fx_swap_slots(HdsFxPlugin *p, int a, int b) {
 }
 
 
-// Returns true if the click was consumed. If a dropdown is currently open, this ONLY interacts
-// with it (selecting an option if the click landed inside it, closing it either way) -- a click
-// can never both close one dropdown and immediately act on whatever's underneath it. Otherwise:
-// Type/Input/Sidechain/Output pills OPEN their own dropdown (see the "Dropdowns" section above)
-// rather than mutating anything directly; bypass/chain/up/down toggle immediately; a knob starts a
-// drag tracked in *vs instead.
-// Commits whatever NAM Model/IR field is currently being typed into (if any) -- writes
-// edit_buffer into the real FXSlotParams field and closes the editor. Called unconditionally at
-// the top of every hds_fx_gui_on_button_press(), same "any click ends the current transient UI
-// state" posture the dropdown-close-on-outside-click logic just below already has: clicking
-// elsewhere while editing SAVES what was typed (like tabbing out of any normal text field) rather
-// than silently discarding it, then the click's own normal hit-test proceeds -- so clicking a
-// DIFFERENT NAM pill commits the old one and immediately opens the new one, in one motion.
-static void hds_fx_gui_commit_edit(HdsFxPlugin *p, HdsFxGuiViewState *vs) {
-    if (vs->edit_row < 0) return;
-    char *dst = (vs->edit_field == 0) ? p->fx[vs->edit_row].nam_model_path : p->fx[vs->edit_row].nam_ir_path;
-    snprintf(dst, SAMPLE_PATH_LEN, "%s", vs->edit_buffer);
-    vs->edit_row = -1;
-}
-
+// Returns true if the click was consumed. If the file browser is open, this ONLY interacts with
+// it (see hds_fx_gui_browser_on_click()'s own comment) -- checked before the dropdown state below,
+// since the browser is the more modal of the two (though in practice they can never both be open
+// at once: nothing that opens one is reachable while the other is showing). Otherwise, if a
+// dropdown is open, this ONLY interacts with it (selecting an option if the click landed inside
+// it, closing it either way) -- a click can never both close one dropdown and immediately act on
+// whatever's underneath it. Otherwise: Type/Input/Sidechain/Output pills OPEN their own dropdown
+// (see the "Dropdowns" section above) rather than mutating anything directly; a NAM Model/IR pill
+// opens the file browser (see HdsFxBrowser's own comment); bypass/chain/up/down toggle
+// immediately; a knob starts a drag tracked in *vs instead.
 static bool hds_fx_gui_on_button_press(HdsFxPlugin *p, HdsFxGuiViewState *vs, double x, double y, int button) {
     int width = vs->window_w;
-    hds_fx_gui_commit_edit(p, vs);
+
+    if (vs->browser.open) {
+        if (button == 1) return hds_fx_gui_browser_on_click(p, vs, x, y);
+        return true; // right-click etc. while the browser is open -- still fully consumed
+    }
 
     if (vs->dropdown.kind != HDS_FX_DROPDOWN_NONE) {
         int count = hds_fx_dropdown_option_count(vs->dropdown.kind);
@@ -1219,16 +1491,8 @@ static bool hds_fx_gui_on_button_press(HdsFxPlugin *p, HdsFxGuiViewState *vs, do
         return true;
     }
     if (hds_fx_type_uses_nam_paths((int)p->fx[row].fx_type)) {
-        if (hds_fx_rect_contains(&L.nam_model_pill, x, y)) {
-            vs->edit_row = row; vs->edit_field = 0;
-            snprintf(vs->edit_buffer, sizeof(vs->edit_buffer), "%s", p->fx[row].nam_model_path);
-            return true;
-        }
-        if (hds_fx_rect_contains(&L.nam_ir_pill, x, y)) {
-            vs->edit_row = row; vs->edit_field = 1;
-            snprintf(vs->edit_buffer, sizeof(vs->edit_buffer), "%s", p->fx[row].nam_ir_path);
-            return true;
-        }
+        if (hds_fx_rect_contains(&L.nam_model_pill, x, y)) { hds_fx_gui_browser_open(p, vs, row, 0); return true; }
+        if (hds_fx_rect_contains(&L.nam_ir_pill, x, y)) { hds_fx_gui_browser_open(p, vs, row, 1); return true; }
     }
     if (hds_fx_slot_is_chain_tail(p, row) && hds_fx_rect_contains(&L.output_pill, x, y)) {
         vs->dropdown.kind = HDS_FX_DROPDOWN_OUTPUT; vs->dropdown.row = row; vs->dropdown.anchor = L.output_pill;
@@ -1291,35 +1555,41 @@ static void hds_fx_gui_on_button_release(HdsFxGuiViewState *vs) { vs->drag_kind 
 // Named key actions the platform shim (hds_fx_gui_x11.c) translates a real X11 KeyPress into --
 // keeps this file free of any X11 type, the same "zero windowing references" discipline this
 // file's own header comment already holds every other piece of drawing/hit-test logic to. A no-op
-// whenever nothing is being edited (vs->edit_row < 0) -- this GUI has exactly one thing keyboard
-// input can ever reach, FX_TYPE_NAM's own Model/IR path fields (see hds_fx_gui_on_button_press()'s
-// own NAM handling for how editing starts), so there's no focus model to manage beyond that.
+// unless the file browser's own path bar is being typed into (see HdsFxBrowser's own
+// path_bar_editing field) -- this GUI has exactly one thing keyboard input can ever reach.
 #define HDS_FX_KEY_CHAR 0      // a printable character in `ch`
 #define HDS_FX_KEY_BACKSPACE 1
-#define HDS_FX_KEY_ENTER 2     // commits edit_buffer into the real field, same as hds_fx_gui_commit_edit()
-#define HDS_FX_KEY_ESCAPE 3    // discards edit_buffer, leaving the field's real value untouched
+#define HDS_FX_KEY_ENTER 2     // tries the typed text as an exact file first, then as a directory
+#define HDS_FX_KEY_ESCAPE 3    // discards the typed text, reverting to the last dir that listed OK
 
 static void hds_fx_gui_on_key(HdsFxPlugin *p, HdsFxGuiViewState *vs, int action, char ch) {
-    if (vs->edit_row < 0) return;
-    size_t len = strlen(vs->edit_buffer);
+    (void)p; // no longer needed here -- a committed path bar entry is applied by the platform
+             // shim's own hds_fx_gui_browser_refresh() (see path_bar_commit_attempt's own comment),
+             // not directly from this keystroke handler.
+    HdsFxBrowser *b = &vs->browser;
+    if (!b->open || !b->path_bar_editing) return;
+    size_t len = strlen(b->dir);
     switch (action) {
         case HDS_FX_KEY_CHAR:
             // Printable ASCII only (0x20..0x7e) -- a file path never needs anything outside that
             // range, and this sidesteps ever having to reason about multi-byte UTF-8 XLookupString
             // can hand back for a real IME/dead-key sequence.
-            if (ch >= 0x20 && ch < 0x7f && len + 1 < sizeof(vs->edit_buffer)) {
-                vs->edit_buffer[len] = ch;
-                vs->edit_buffer[len + 1] = '\0';
+            if (ch >= 0x20 && ch < 0x7f && len + 1 < sizeof(b->dir)) {
+                b->dir[len] = ch;
+                b->dir[len + 1] = '\0';
             }
             return;
         case HDS_FX_KEY_BACKSPACE:
-            if (len > 0) vs->edit_buffer[len - 1] = '\0';
+            if (len > 0) b->dir[len - 1] = '\0';
             return;
         case HDS_FX_KEY_ENTER:
-            hds_fx_gui_commit_edit(p, vs);
+            b->path_bar_editing = false;
+            b->path_bar_commit_attempt = true;
+            b->needs_refresh = true;
             return;
         case HDS_FX_KEY_ESCAPE:
-            vs->edit_row = -1; // discard -- do NOT call hds_fx_gui_commit_edit()
+            b->path_bar_editing = false;
+            snprintf(b->dir, sizeof(b->dir), "%s", b->last_valid_dir);
             return;
         default:
             return;
@@ -1328,6 +1598,16 @@ static void hds_fx_gui_on_key(HdsFxPlugin *p, HdsFxGuiViewState *vs, int action,
 
 // delta: +1 (wheel up / X11 Button4) or -1 (wheel down / X11 Button5).
 static void hds_fx_gui_on_scroll(HdsFxGuiViewState *vs, int delta) {
+    if (vs->browser.open) {
+        HdsFxBrowserLayout L;
+        hds_fx_browser_compute_layout(vs, &L);
+        vs->browser.scroll -= delta;
+        int max_start = vs->browser.entry_count - L.visible_rows;
+        if (max_start < 0) max_start = 0;
+        if (vs->browser.scroll < 0) vs->browser.scroll = 0;
+        if (vs->browser.scroll > max_start) vs->browser.scroll = max_start;
+        return;
+    }
     vs->scroll_offset_px -= delta * (HDS_FX_GUI_ROW_H * 3.0);
     double max_scroll = hds_fx_gui_max_scroll(vs);
     if (vs->scroll_offset_px < 0.0) vs->scroll_offset_px = 0.0;
