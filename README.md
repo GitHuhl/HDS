@@ -3121,3 +3121,44 @@ Destination dropdown's own internal scroll landing on and selecting target 95 ("
 `dest_target`), and a whole-list scroll that lands a subsequent click on the correct row (LFO 16)
 at its new, scrolled screen position. The full existing regression suite (all 13 prior test
 binaries, `hds_fx.clap`'s own included) still passes unchanged.
+
+## hds.clap's Envelopes tab: the 6 assignable EGs (task #107)
+
+Next tab in the ordered list: `src/hds_clap_envelopes_draw.c` (new) ports frontend.py's own
+Envelopes tab -- 6 full-width ADSR panels stacked vertically (unlike the Play tab's 4 Amp EGs,
+which sit side by side), one per assignable EG (`eg[4..9]`/`eg_mode[4..9]` -- the exact same
+`PackEGParams`/topology system, and literally the same `hds_clap_adsr.h` curve widget, the Amp EGs
+already use). Each panel's own title row carries an Intensity knob (`eg_intensity[6]`, **signed**
+-1.0..1.0, unlike an Amp EG's hard-wired unipolar amplitude multiply -- an assignable EG can target
+pitch/pan/filter cutoff/anything else, so Intensity doubles as both depth and polarity) and a
+Destination pill (`eg_dest_target[6]`) reusing the exact same 100-entry `matrix_shared_routes` list
+the LFOs tab's own Destination combo just implemented -- `hds_lfo_dest_label()`/
+`hds_lfo_dest_selectable()` are called here verbatim, not re-transcribed.
+
+Confirmed via research (matching frontend.py's `_populate_modulate_from_menu`) that assignable EGs
+are pure modulation SOURCES with no destination identity of their own: "EG 1".."EG 6" can appear as
+a source in some other knob's (not-yet-built) "Modulate From" menu, but there is no "EG 1 ..." style
+entry in `matrix_shared_routes` itself for anything else to target -- unlike LFOs, which do get
+"LFO N Rate/Dp/Phase" targets. Six panels don't fit at once (same situation the LFOs tab's 16 rows
+already solved), so this tab reuses that same whole-list vertical scroll convention, plus its own
+independent scroll for the Destination dropdown's own popup (a second, per-tab copy of the small
+scroll-state/geometry LFOs already established, since the two tabs' dropdowns are genuinely
+separate view states -- the 100-entry list/label/selectability logic itself is shared, not
+duplicated).
+
+**Scope for this pass**: same "everything visible without a right-click" cut as every prior tab.
+The Intensity knob has no right-click menu in frontend.py at all (confirmed by reading every
+`setContextMenuCallback` site), so nothing is deferred there specifically; the only deferred piece
+is the same one deferred everywhere else (each Destination-targetable knob's own "Modulate From"
+menu isn't wired up on ANY tab yet). The 🎲 "Randomize" button isn't ported either -- a pure GUI
+convenience with no backend field of its own. Confirmed Combi mode changes nothing about this tab
+(same plain Program-scoped `/hds/eg_mod/...`/`/hds/eg/...` fields as every other tab).
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_envelopes.c`, 7 passing
+assertions): the Mode dropdown (open + select AHDSR, writing `eg_mode[4]`), an Intensity knob drag
+(dragged DOWN from its own default max of 1.0, since dragging further up is correctly a clamped
+no-op -- `eg_intensity[0]`), the Destination dropdown (open + select "Osc 1 Amp", writing
+`eg_dest_target[0]`), a real drag on the ADSR curve's own Sustain node (`eg[4].s`), a real drag on
+the Attack dial (`eg[4].a`), and a whole-list scroll that lands a subsequent click on the correct
+panel (EG 3) at its new, scrolled screen position. The full existing regression suite (all 14 prior
+test binaries, `hds_fx.clap`'s own included) still passes unchanged.
