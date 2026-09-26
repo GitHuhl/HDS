@@ -78,6 +78,7 @@ typedef struct {
     HdsClapLfosViewState lfos_view;       // same convention -- see hds_clap_lfos_draw.c's own header comment
     HdsClapEnvelopesViewState envelopes_view; // same convention -- see hds_clap_envelopes_draw.c's own header comment
     HdsClapRoutingViewState routing_view;     // same convention -- see hds_clap_routing_draw.c's own header comment
+    HdsClapDevicesViewState devices_view;      // same convention -- see hds_clap_devices_draw.c's own header comment
 } HdsClapGuiViewState;
 
 static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
@@ -93,6 +94,7 @@ static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
     hds_clap_lfos_view_state_init(&vs->lfos_view);
     hds_clap_envelopes_view_state_init(&vs->envelopes_view);
     hds_clap_routing_view_state_init(&vs->routing_view);
+    hds_clap_devices_view_state_init(&vs->devices_view);
 }
 
 typedef struct { double x, y, w, h; } HdsClapTabRect;
@@ -172,6 +174,9 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
         case HDS_CLAP_TAB_ROUTING:
             hds_clap_routing_render(cr, p, &vs->routing_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
+        case HDS_CLAP_TAB_DEVICES:
+            hds_clap_devices_render(cr, p, &vs->devices_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            break;
         case HDS_CLAP_TAB_MAPPING:
             hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Mapping (Sample Zone editor) -- not available in this GUI yet");
             break;
@@ -207,6 +212,8 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
             return hds_clap_envelopes_on_button_press(p, &vs->envelopes_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_ROUTING:
             return hds_clap_routing_on_button_press(p, &vs->routing_view, x, y - HDS_CLAP_TAB_BAR_H, button);
+        case HDS_CLAP_TAB_DEVICES:
+            return hds_clap_devices_on_button_press(p, &vs->devices_view, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
         default:
             return true;
     }
@@ -219,6 +226,7 @@ static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_motion(&vs->lfos_view, x, y - HDS_CLAP_TAB_BAR_H);
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_motion(p, &vs->envelopes_view, vs->window_w, x, y - HDS_CLAP_TAB_BAR_H);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_motion(&vs->routing_view, x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_motion(&vs->devices_view, x, y - HDS_CLAP_TAB_BAR_H);
 }
 
 static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
@@ -228,6 +236,7 @@ static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_button_release(&vs->lfos_view);
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_button_release(&vs->envelopes_view);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_button_release(&vs->routing_view);
+    else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_button_release(&vs->devices_view);
 }
 
 static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int action, char ch) {

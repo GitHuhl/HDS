@@ -203,6 +203,7 @@ typedef struct {
 // re-transcribing them -- see its own header comment.
 #include "hds_clap_envelopes_draw.c"
 #include "hds_clap_routing_draw.c"
+#include "hds_clap_devices_draw.c"
 #include "hds_clap_gui_draw.c"
 #include "hds_clap_gui_x11.c"
 

@@ -3203,3 +3203,32 @@ toggle itself), Main Out toggles on Combi Mix (defaults off) and Program 1 (defa
 toggle, a real Gain knob drag, the Stereo toggle, and that `HdsClapPlugin.ext_in_peak` is genuine
 persistent per-instance storage the render function reads directly. The full existing regression
 suite (all 15 prior test binaries, `hds_fx.clap`'s own included) still passes unchanged.
+
+## hds.clap's Devices tab: reduced to a "Performance" panel (task #102)
+
+Last tab in the ordered list: `src/hds_clap_devices_draw.c` (new). frontend.py's own Devices tab is
+really an "Audio/Devices" tab -- ALSA output/input device pickers, a MIDI device picker, Latency
+(ALSA buffer depth), plus Polyphony (`active_voice_limit`) and Block Size (`block_size_frames`).
+Every one of the device/latency pickers is a standalone-app-only concept a CLAP host already owns
+for its own plugins (device selection, buffer size, MIDI routing) -- none of it belongs in an
+in-process CLAP GUI at all. This is a **permanent, deliberate reduction**, not a "not yet built"
+deferral like every other tab's own scope note: only the two fields that are real
+`SynthSharedControls` state affecting this engine's own internal behavior regardless of host
+(voice-stealing ceiling, render-chunking) survive, under a renamed "Performance" header.
+
+- **Polyphony**: a free-drag knob over `active_voice_limit`'s real `[1,256]` range (default 32),
+  reusing `hds_play_draw_knob()`/`hds_play_knob_hit_test()`/`hds_play_start_knob_drag()` verbatim
+  from the Play tab file (same generic-primitive-reuse pattern every tab file after Play has used).
+- **Block Size**: a fixed preset dropdown (32/64/128/256/512/1024 samples, matching frontend.py's
+  own `_BLOCK_SIZE_PRESETS`) rather than a free-drag knob -- a small fixed preset set is exactly the
+  kind of control this GUI already renders as a dropdown pill elsewhere (Type/Slope/Waveform/Mode),
+  unlike Polyphony's genuinely free integer range.
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_devices.c`, 4 passing
+assertions): a real drag-up on the Polyphony knob increases `active_voice_limit` past its default
+32; a real click on the Block Size pill opens its preset dropdown; a real click on the "512
+samples" row writes `block_size_frames` (128 -> 512) and closes the dropdown. The full existing
+regression suite (all 16 prior test binaries, `hds_fx.clap`'s own included) still passes unchanged.
+
+This completes every tab in the originally-ordered arc (FX, Play, Filters, LFOs, Envelopes,
+Routing, Devices) that `hds.clap`'s native embedded GUI set out to cover.
