@@ -6,9 +6,15 @@
 // new file with this same shape (HWND + Win32 message pump + cairo_win32_surface_create(), see
 // hds_fx_gui_draw.c's own header comment) calling the exact same draw file, untouched.
 //
-// #include'd by hds_fx_plugin.c right after hds_fx_gui_draw.c (needs HdsFxGuiViewState/
-// hds_fx_gui_render/hds_fx_gui_on_*, all defined there) and after HdsFxPlugin itself (this file
-// reads p->host to talk to the CLAP host's own timer-support extension).
+// #include'd right after hds_fx_gui_draw.c (needs HdsFxGuiViewState/hds_fx_gui_render/
+// hds_fx_gui_on_*, all defined there). The includer must ALSO define two small accessors before
+// this #include (hds_fx_plugin.c's own copies, right after HdsFxPlugin itself, are the reference
+// example):
+//   static HdsFxGuiHost *hds_fx_gui_host_of(const clap_plugin_t *plugin);
+//   static const clap_host_t *hds_fx_gui_clap_host_of(const clap_plugin_t *plugin);
+// This is the one seam that lets this same platform shim serve any host with an FX_SLOT_COUNT pool
+// (hds_fx.clap's own flat HdsFxPlugin, or hds.clap's own plugin struct nesting its pool inside a
+// much bigger SynthSharedControls) without this file knowing that host's own struct layout at all.
 //
 // XEmbed: this is the minimal client-side handshake (github.com/free-audio/clap's own gui.h points
 // at the spec, freedesktop's xembed-spec) that's sufficient for every mainstream Linux host tested
@@ -39,7 +45,7 @@
 #include <stdlib.h>   // getenv/qsort
 
 typedef struct {
-    HdsFxPlugin *plugin;
+    HdsFxGuiHost *plugin; // the real, persistent view -- see hds_fx_gui_host_of()'s own comment
     Display *display;
     int screen;
     Window win;
@@ -71,9 +77,9 @@ static void hds_fx_gui_resize_backbuffer(HdsFxGuiWindow *w) {
     w->backbuffer_cr = cairo_create(w->backbuffer);
 }
 
-static const clap_host_timer_support_t *hds_fx_gui_host_timers(HdsFxPlugin *p) {
-    if (!p->host || !p->host->get_extension) return NULL;
-    return (const clap_host_timer_support_t *)p->host->get_extension(p->host, CLAP_EXT_TIMER_SUPPORT);
+static const clap_host_timer_support_t *hds_fx_gui_host_timers(const clap_host_t *host) {
+    if (!host || !host->get_extension) return NULL;
+    return (const clap_host_timer_support_t *)host->get_extension(host, CLAP_EXT_TIMER_SUPPORT);
 }
 
 // _XEMBED_INFO: {version, flags} -- version 0 (the spec's own baseline), flags bit 0 =
@@ -253,8 +259,8 @@ static void hds_fx_gui_pump_events(HdsFxGuiWindow *w) {
 }
 
 static void hds_fx_gui_on_timer(const clap_plugin_t *plugin, clap_id timer_id) {
-    HdsFxPlugin *p = (HdsFxPlugin *)plugin->plugin_data;
-    HdsFxGuiWindow *w = (HdsFxGuiWindow *)p->gui_window;
+    HdsFxGuiHost *host = hds_fx_gui_host_of(plugin);
+    HdsFxGuiWindow *w = (HdsFxGuiWindow *)host->gui_window;
     if (!w || timer_id != w->timer_id) return;
     hds_fx_gui_pump_events(w);
     hds_fx_gui_browser_refresh(w);
@@ -276,13 +282,13 @@ static bool hds_fx_gui_get_preferred_api(const clap_plugin_t *plugin, const char
 }
 
 static bool hds_fx_gui_create(const clap_plugin_t *plugin, const char *api, bool is_floating) {
-    HdsFxPlugin *p = (HdsFxPlugin *)plugin->plugin_data;
+    HdsFxGuiHost *host = hds_fx_gui_host_of(plugin);
     if (is_floating || strcmp(api, CLAP_WINDOW_API_X11) != 0) return false;
-    if (p->gui_window) return true; // already created -- idempotent, matches other plugins' own posture
+    if (host->gui_window) return true; // already created -- idempotent, matches other plugins' own posture
 
     HdsFxGuiWindow *w = (HdsFxGuiWindow *)calloc(1, sizeof(HdsFxGuiWindow));
     if (!w) return false;
-    w->plugin = p;
+    w->plugin = host;
     w->display = XOpenDisplay(NULL);
     if (!w->display) { fprintf(stderr, "[hds-fx] gui create: XOpenDisplay failed (no X11 display available)\n"); free(w); return false; }
     w->screen = DefaultScreen(w->display);
@@ -308,16 +314,17 @@ static bool hds_fx_gui_create(const clap_plugin_t *plugin, const char *api, bool
     w->cr = cairo_create(w->surface);
     hds_fx_gui_resize_backbuffer(w);
 
-    p->gui_window = w;
+    host->gui_window = w;
     return true;
 }
 
-static void hds_fx_gui_destroy_internal(HdsFxPlugin *p) {
-    HdsFxGuiWindow *w = (HdsFxGuiWindow *)p->gui_window;
+static void hds_fx_gui_destroy_internal(const clap_plugin_t *plugin) {
+    HdsFxGuiHost *host = hds_fx_gui_host_of(plugin);
+    HdsFxGuiWindow *w = (HdsFxGuiWindow *)host->gui_window;
     if (!w) return;
     if (w->timer_registered) {
-        const clap_host_timer_support_t *timers = hds_fx_gui_host_timers(p);
-        if (timers) timers->unregister_timer(p->host, w->timer_id);
+        const clap_host_timer_support_t *timers = hds_fx_gui_host_timers(hds_fx_gui_clap_host_of(plugin));
+        if (timers) timers->unregister_timer(hds_fx_gui_clap_host_of(plugin), w->timer_id);
     }
     if (w->backbuffer_cr) cairo_destroy(w->backbuffer_cr);
     if (w->backbuffer) cairo_surface_destroy(w->backbuffer);
@@ -325,17 +332,17 @@ static void hds_fx_gui_destroy_internal(HdsFxPlugin *p) {
     if (w->surface) cairo_surface_destroy(w->surface);
     if (w->display) { XDestroyWindow(w->display, w->win); XCloseDisplay(w->display); }
     free(w);
-    p->gui_window = NULL;
+    host->gui_window = NULL;
 }
 
 static void hds_fx_gui_destroy(const clap_plugin_t *plugin) {
-    hds_fx_gui_destroy_internal((HdsFxPlugin *)plugin->plugin_data);
+    hds_fx_gui_destroy_internal(plugin);
 }
 
 static bool hds_fx_gui_set_scale(const clap_plugin_t *plugin, double scale) { (void)plugin; (void)scale; return false; }
 
 static bool hds_fx_gui_get_size(const clap_plugin_t *plugin, uint32_t *width, uint32_t *height) {
-    HdsFxGuiWindow *w = (HdsFxGuiWindow *)((HdsFxPlugin *)plugin->plugin_data)->gui_window;
+    HdsFxGuiWindow *w = (HdsFxGuiWindow *)hds_fx_gui_host_of(plugin)->gui_window;
     if (!w) return false;
     *width = (uint32_t)w->view.window_w;
     *height = (uint32_t)w->view.window_h;
@@ -362,7 +369,7 @@ static bool hds_fx_gui_adjust_size(const clap_plugin_t *plugin, uint32_t *width,
 }
 
 static bool hds_fx_gui_set_size(const clap_plugin_t *plugin, uint32_t width, uint32_t height) {
-    HdsFxGuiWindow *w = (HdsFxGuiWindow *)((HdsFxPlugin *)plugin->plugin_data)->gui_window;
+    HdsFxGuiWindow *w = (HdsFxGuiWindow *)hds_fx_gui_host_of(plugin)->gui_window;
     if (!w) return false;
     hds_fx_gui_on_resize(&w->view, (int)width, (int)height);
     XResizeWindow(w->display, w->win, (unsigned int)w->view.window_w, (unsigned int)w->view.window_h);
@@ -372,7 +379,7 @@ static bool hds_fx_gui_set_size(const clap_plugin_t *plugin, uint32_t width, uin
 }
 
 static bool hds_fx_gui_set_parent(const clap_plugin_t *plugin, const clap_window_t *window) {
-    HdsFxGuiWindow *w = (HdsFxGuiWindow *)((HdsFxPlugin *)plugin->plugin_data)->gui_window;
+    HdsFxGuiWindow *w = (HdsFxGuiWindow *)hds_fx_gui_host_of(plugin)->gui_window;
     if (!w || strcmp(window->api, CLAP_WINDOW_API_X11) != 0) return false;
     XReparentWindow(w->display, w->win, (Window)window->x11, 0, 0);
     w->parented = true;
@@ -384,15 +391,15 @@ static bool hds_fx_gui_set_transient(const clap_plugin_t *plugin, const clap_win
 static void hds_fx_gui_suggest_title(const clap_plugin_t *plugin, const char *title) { (void)plugin; (void)title; }
 
 static bool hds_fx_gui_show(const clap_plugin_t *plugin) {
-    HdsFxPlugin *p = (HdsFxPlugin *)plugin->plugin_data;
-    HdsFxGuiWindow *w = (HdsFxGuiWindow *)p->gui_window;
+    HdsFxGuiWindow *w = (HdsFxGuiWindow *)hds_fx_gui_host_of(plugin)->gui_window;
     if (!w) return false;
     XMapWindow(w->display, w->win);
     XFlush(w->display);
     w->visible = true;
     if (!w->timer_registered) {
-        const clap_host_timer_support_t *timers = hds_fx_gui_host_timers(p);
-        if (timers && timers->register_timer(p->host, 33, &w->timer_id)) w->timer_registered = true;
+        const clap_host_t *chost = hds_fx_gui_clap_host_of(plugin);
+        const clap_host_timer_support_t *timers = hds_fx_gui_host_timers(chost);
+        if (timers && timers->register_timer(chost, 33, &w->timer_id)) w->timer_registered = true;
         else fprintf(stderr, "[hds-fx] gui show: host has no timer-support extension -- GUI will not repaint or receive input\n");
     }
     hds_fx_gui_redraw(w);
@@ -400,15 +407,15 @@ static bool hds_fx_gui_show(const clap_plugin_t *plugin) {
 }
 
 static bool hds_fx_gui_hide(const clap_plugin_t *plugin) {
-    HdsFxPlugin *p = (HdsFxPlugin *)plugin->plugin_data;
-    HdsFxGuiWindow *w = (HdsFxGuiWindow *)p->gui_window;
+    HdsFxGuiWindow *w = (HdsFxGuiWindow *)hds_fx_gui_host_of(plugin)->gui_window;
     if (!w) return false;
     XUnmapWindow(w->display, w->win);
     XFlush(w->display);
     w->visible = false;
     if (w->timer_registered) {
-        const clap_host_timer_support_t *timers = hds_fx_gui_host_timers(p);
-        if (timers) timers->unregister_timer(p->host, w->timer_id);
+        const clap_host_t *chost = hds_fx_gui_clap_host_of(plugin);
+        const clap_host_timer_support_t *timers = hds_fx_gui_host_timers(chost);
+        if (timers) timers->unregister_timer(chost, w->timer_id);
         w->timer_registered = false;
     }
     return true;

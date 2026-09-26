@@ -6,8 +6,12 @@
 // all three -- see hds_fx_gui_x11.c's own header comment for the platform shim that owns the
 // window/event pump and calls into this file every frame.
 //
-// #include'd by hds_fx_plugin.c AFTER HdsFxPlugin is defined (this file reads/writes it directly,
-// no separate "view model" copy) and after fx_types.h/fx_chain.c (needs FXSlotParams/FX_TYPE_*).
+// #include'd by any host with an FX_SLOT_COUNT pool AFTER fx_types.h/fx_chain.c (needs
+// FXSlotParams/FX_TYPE_*) and hds_fx_gui_host.h (needs HdsFxGuiHost -- see that header's own
+// comment). Every function here reads/writes a HdsFxGuiHost directly, no separate "view model"
+// copy -- but HdsFxGuiHost is itself just a handful of pointers INTO whatever real host struct
+// (HdsFxPlugin for hds_fx.clap, or hds.clap's own plugin struct) actually owns the arrays, so this
+// same engine serves any such host unchanged.
 //
 // Layout model: modeled directly on the Standalone FX tab's own per-slot row (see frontend.py's own
 // FX_TAB construction, ~line 4919 onward) rather than a from-scratch paradigm -- ONE flat,
@@ -484,21 +488,21 @@ static void hds_fx_dirname(const char *path, char *out, size_t out_len) {
 
 // The nearest EARLIER slot sharing this slot's own fx_source (the slot chain_to_next chains FROM,
 // if any), or -1 if this is that source's own first slot in the pool.
-static int hds_fx_prev_same_source_slot(const HdsFxPlugin *p, int slot) {
+static int hds_fx_prev_same_source_slot(const HdsFxGuiHost *p, int slot) {
     int src = (int)p->fx[slot].fx_source;
     for (int i = slot - 1; i >= 0; i--) if ((int)p->fx[i].fx_source == src) return i;
     return -1;
 }
 
 // True if this slot starts its own chain (nothing chains INTO it) -- its own Input pill is live.
-static bool hds_fx_slot_is_chain_head(const HdsFxPlugin *p, int slot) {
+static bool hds_fx_slot_is_chain_head(const HdsFxGuiHost *p, int slot) {
     int prev = hds_fx_prev_same_source_slot(p, slot);
     return prev < 0 || p->fx[prev].chain_to_next == 0.0f;
 }
 
 // True if this slot is the TAIL of its own chain (chains nowhere further) -- its own Output pill is
 // live. Simply "not chaining forward"; every slot is exactly one of {chains forward} or {is a tail}.
-static bool hds_fx_slot_is_chain_tail(const HdsFxPlugin *p, int slot) {
+static bool hds_fx_slot_is_chain_tail(const HdsFxGuiHost *p, int slot) {
     return p->fx[slot].chain_to_next == 0.0f;
 }
 
@@ -509,13 +513,14 @@ static bool hds_fx_slot_is_chain_tail(const HdsFxPlugin *p, int slot) {
 // configuration into the position the link actually depends on -- disallowed outright rather than
 // attempting a more surgical (and more bug-prone) partial allowance. See hds_fx_plugin.c's own
 // header comment.
-static bool hds_fx_slot_participates_in_chain(const HdsFxPlugin *p, int slot) {
+static bool hds_fx_slot_participates_in_chain(const HdsFxGuiHost *p, int slot) {
     return !hds_fx_slot_is_chain_head(p, slot) || !hds_fx_slot_is_chain_tail(p, slot);
 }
 
 // ---------------------------------------------------------------------------------------------
 // Interaction/view state -- purely which row is hovered/dragged and how far the list is scrolled;
-// nothing here is audio state (that's HdsFxPlugin's own fx[]/fx_engine[]) and nothing here is
+// nothing here is audio state (that's HdsFxGuiHost's own fx[], viewing whatever real host owns it)
+// and nothing here is
 // platform state (that's HdsFxGuiWindow in hds_fx_gui_x11.c). Owned by the platform shim, passed by
 // pointer into every function below.
 // ---------------------------------------------------------------------------------------------
@@ -911,7 +916,7 @@ static void hds_fx_dropdown_option_label(int kind, int idx, char *buf, size_t bu
 }
 
 // Which option index is this slot's CURRENT value -- drives the highlighted row in the open list.
-static int hds_fx_dropdown_current_index(const HdsFxPlugin *p, int kind, int row) {
+static int hds_fx_dropdown_current_index(const HdsFxGuiHost *p, int kind, int row) {
     switch (kind) {
         case HDS_FX_DROPDOWN_TYPE:
             return hds_fx_selectable_type_index((int)p->fx[row].fx_type);
@@ -941,7 +946,7 @@ static int hds_fx_dropdown_current_index(const HdsFxPlugin *p, int kind, int row
 // Applies option `idx` to `row`. Input/Output's "Off" (idx 0) deliberately leaves fx_source/
 // port_output_channel untouched -- Off is "this chain reads/writes silence right now", not a
 // different port choice, so switching away from Off later returns to whatever port was last set.
-static void hds_fx_dropdown_apply(HdsFxPlugin *p, int kind, int row, int idx) {
+static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
     switch (kind) {
         case HDS_FX_DROPDOWN_TYPE:
             p->fx[row].fx_type = (float)HDS_FX_SELECTABLE_TYPES[idx];
@@ -1003,7 +1008,7 @@ static void hds_fx_dropdown_option_rect(const HdsFxDropdown *dd, int window_h, i
     *out = (HdsFxRect){bg.x, bg.y + idx * HDS_FX_DROPDOWN_ROW_H, bg.w, HDS_FX_DROPDOWN_ROW_H};
 }
 
-static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewState *vs) {
+static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewState *vs) {
     if (vs->dropdown.kind == HDS_FX_DROPDOWN_NONE) return;
     const HdsFxDropdown *dd = &vs->dropdown;
     int count = hds_fx_dropdown_option_count(dd->kind);
@@ -1099,7 +1104,7 @@ static void hds_fx_browser_compute_layout(const HdsFxGuiViewState *vs, HdsFxBrow
 // platform shim (hds_fx_gui_x11.c) to actually list it on the very next poll, which happens before
 // this same tick's own redraw (see hds_fx_gui_on_timer()'s own ordering) -- so the very click that
 // opens the browser also sees a populated listing immediately, never one empty frame first.
-static void hds_fx_gui_browser_open(HdsFxPlugin *p, HdsFxGuiViewState *vs, int row, int field) {
+static void hds_fx_gui_browser_open(HdsFxGuiHost *p, HdsFxGuiViewState *vs, int row, int field) {
     HdsFxBrowser *b = &vs->browser;
     memset(b, 0, sizeof(*b));
     b->open = true;
@@ -1116,7 +1121,7 @@ static void hds_fx_gui_browser_close(HdsFxGuiViewState *vs) { vs->browser.open =
 // hds_fx_gui_on_button_press()'s own ordering, same "one modal owns every click" posture the
 // dropdown check above already has). Always returns true (consumed): a click anywhere while the
 // browser is open is never "let it fall through to whatever's underneath."
-static bool hds_fx_gui_browser_on_click(HdsFxPlugin *p, HdsFxGuiViewState *vs, double x, double y) {
+static bool hds_fx_gui_browser_on_click(HdsFxGuiHost *p, HdsFxGuiViewState *vs, double x, double y) {
     HdsFxBrowser *b = &vs->browser;
     HdsFxBrowserLayout L;
     hds_fx_browser_compute_layout(vs, &L);
@@ -1254,7 +1259,7 @@ static void hds_fx_gui_render_browser(cairo_t *cr, const HdsFxGuiViewState *vs) 
     cairo_restore(cr);
 }
 
-static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewState *vs) {
+static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewState *vs) {
     int width = vs->window_w, height = vs->window_h;
 
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
@@ -1325,12 +1330,18 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
         // just inherits the running signal from whatever chains into it. "Off" (silence in,
         // instead of any physical port) is its own selectable state, independent of which port
         // number is stored -- see hds_fx_dropdown_apply()'s own comment.
-        {
+        if (p->port_input_stereo) {
             char inbuf[16];
             bool input_off = p->port_input_off[port] != 0.0f;
             if (input_off) snprintf(inbuf, sizeof(inbuf), "Off");
             else hds_fx_format_input_pill(inbuf, sizeof(inbuf), port, p->port_input_stereo[port] != 0.0f);
             hds_fx_draw_pill(cr, L.input_pill.x, L.input_pill.y, L.input_pill.w, L.input_pill.h, inbuf, is_head && !input_off, !is_head);
+        } else {
+            // This host has no flat N-port Input concept at all (see HdsFxGuiHost's own header
+            // comment) -- its own header/row code draws whatever Input concept it DOES have
+            // (hds.clap's own Source combo) separately; this file just leaves the space blank
+            // rather than assume a port model that doesn't apply.
+            hds_fx_draw_pill(cr, L.input_pill.x, L.input_pill.y, L.input_pill.w, L.input_pill.h, "\xe2\x80\x94", false, true);
         }
 
         if (uses_sc) {
@@ -1378,7 +1389,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
         // Output pill: only live on a chain TAIL -- a slot still chaining forward doesn't decide
         // where anything lands yet, the tail of its own chain does. "Off" (result goes nowhere)
         // is its own selectable state, independent of which port number is stored.
-        {
+        if (p->port_output_channel) {
             bool output_off = p->port_output_off[port] != 0.0f;
             char outbuf[16];
             if (output_off) {
@@ -1389,6 +1400,10 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
                 snprintf(outbuf, sizeof(outbuf), "Out %d", out_ch + 1); // always that port's own real stereo pair -- no Mono/Stereo choice, see the "Dropdowns" section's own comment
             }
             hds_fx_draw_pill(cr, L.output_pill.x, L.output_pill.y, L.output_pill.w, L.output_pill.h, outbuf, is_tail && !output_off, !is_tail);
+        } else {
+            // No flat N-port Output concept for this host either -- see the Input pill's own
+            // comment just above (same reasoning, mirrored).
+            hds_fx_draw_pill(cr, L.output_pill.x, L.output_pill.y, L.output_pill.w, L.output_pill.h, "\xe2\x80\x94", false, true);
         }
 
         hds_fx_draw_knob(cr, L.mix_knob.x, L.mix_knob.y, L.mix_knob.w, slot->mix / 100.0f, false, y, NULL, NULL);
@@ -1449,7 +1464,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
 }
 
 // ---------------------------------------------------------------------------------------------
-// Interaction -- mutates HdsFxPlugin/HdsFxGuiViewState directly; no host/CLAP types referenced
+// Interaction -- mutates HdsFxGuiHost/HdsFxGuiViewState directly; no CLAP types referenced
 // anywhere in this file. hds_fx_swap_slots (Up/Down reorder) lives here since it's this file's own
 // buttons that call it -- see its own comment for why it only swaps FXSlotParams and never touches
 // FXSlotEngine.
@@ -1462,7 +1477,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
 // reset an ordinary Type change already goes through -- there is nothing reorder-specific to do.
 // The caller (hds_fx_gui_on_button_press) is responsible for checking
 // hds_fx_slot_participates_in_chain() first -- this function itself has no chain awareness.
-static void hds_fx_swap_slots(HdsFxPlugin *p, int a, int b) {
+static void hds_fx_swap_slots(HdsFxGuiHost *p, int a, int b) {
     if (a < 0 || b < 0 || a >= FX_SLOT_COUNT || b >= FX_SLOT_COUNT || a == b) return;
     FXSlotParams tmp = p->fx[a];
     p->fx[a] = p->fx[b];
@@ -1480,7 +1495,7 @@ static void hds_fx_swap_slots(HdsFxPlugin *p, int a, int b) {
 // (see the "Dropdowns" section above) rather than mutating anything directly; a NAM Model/IR pill
 // opens the file browser (see HdsFxBrowser's own comment); bypass/chain/up/down toggle
 // immediately; a knob starts a drag tracked in *vs instead.
-static bool hds_fx_gui_on_button_press(HdsFxPlugin *p, HdsFxGuiViewState *vs, double x, double y, int button) {
+static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, double x, double y, int button) {
     int width = vs->window_w;
 
     if (vs->browser.open) {
@@ -1515,7 +1530,7 @@ static bool hds_fx_gui_on_button_press(HdsFxPlugin *p, HdsFxGuiViewState *vs, do
         vs->dropdown.kind = HDS_FX_DROPDOWN_TYPE; vs->dropdown.row = row; vs->dropdown.anchor = L.type_pill;
         return true;
     }
-    if (hds_fx_slot_is_chain_head(p, row) && hds_fx_rect_contains(&L.input_pill, x, y)) {
+    if (p->port_input_stereo && hds_fx_slot_is_chain_head(p, row) && hds_fx_rect_contains(&L.input_pill, x, y)) {
         vs->dropdown.kind = HDS_FX_DROPDOWN_INPUT; vs->dropdown.row = row; vs->dropdown.anchor = L.input_pill;
         return true;
     }
@@ -1527,7 +1542,7 @@ static bool hds_fx_gui_on_button_press(HdsFxPlugin *p, HdsFxGuiViewState *vs, do
         if (hds_fx_rect_contains(&L.nam_model_pill, x, y)) { hds_fx_gui_browser_open(p, vs, row, 0); return true; }
         if (hds_fx_rect_contains(&L.nam_ir_pill, x, y)) { hds_fx_gui_browser_open(p, vs, row, 1); return true; }
     }
-    if (hds_fx_slot_is_chain_tail(p, row) && hds_fx_rect_contains(&L.output_pill, x, y)) {
+    if (p->port_output_channel && hds_fx_slot_is_chain_tail(p, row) && hds_fx_rect_contains(&L.output_pill, x, y)) {
         vs->dropdown.kind = HDS_FX_DROPDOWN_OUTPUT; vs->dropdown.row = row; vs->dropdown.anchor = L.output_pill;
         return true;
     }
@@ -1556,7 +1571,7 @@ static bool hds_fx_gui_on_button_press(HdsFxPlugin *p, HdsFxGuiViewState *vs, do
 
 #define HDS_FX_DRAG_PIXELS_FULL_RANGE 150.0
 
-static void hds_fx_gui_on_motion(HdsFxPlugin *p, HdsFxGuiViewState *vs, double x, double y) {
+static void hds_fx_gui_on_motion(HdsFxGuiHost *p, HdsFxGuiViewState *vs, double x, double y) {
     if (y >= HDS_FX_GUI_HEADER_H) {
         int row = (int)((y - HDS_FX_GUI_HEADER_H + vs->scroll_offset_px) / HDS_FX_GUI_ROW_H);
         vs->hover_row = (row >= 0 && row < FX_SLOT_COUNT) ? row : -1;
@@ -1595,7 +1610,7 @@ static void hds_fx_gui_on_button_release(HdsFxGuiViewState *vs) { vs->drag_kind 
 #define HDS_FX_KEY_ENTER 2     // tries the typed text as an exact file first, then as a directory
 #define HDS_FX_KEY_ESCAPE 3    // discards the typed text, reverting to the last dir that listed OK
 
-static void hds_fx_gui_on_key(HdsFxPlugin *p, HdsFxGuiViewState *vs, int action, char ch) {
+static void hds_fx_gui_on_key(HdsFxGuiHost *p, HdsFxGuiViewState *vs, int action, char ch) {
     (void)p; // no longer needed here -- a committed path bar entry is applied by the platform
              // shim's own hds_fx_gui_browser_refresh() (see path_bar_commit_attempt's own comment),
              // not directly from this keystroke handler.

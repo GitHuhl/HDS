@@ -236,8 +236,8 @@ FORCE:
 $(BIN_OBJ): $(SRC) src/backend.c src/fx_types.h src/fx_chain.c src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -c $(SRC) -o $@
 
-$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
+$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.c src/hds_fx_gui_x11.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(HDS_FX_CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
 $(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.c src/hds_fx_gui_draw.c src/hds_fx_gui_x11.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(HDS_FX_CFLAGS) -fPIC -I$(CLAP_INC) -c $(HDS_FX_SRC) -o $@
@@ -257,7 +257,7 @@ $(BIN): $(BIN_OBJ) $(NAM_OBJS)
 	$(CXX) -o $@ $(BIN_OBJ) $(NAM_OBJS) $(LDLIBS) $(PIPEWIRE_LDLIBS)
 
 clap: $(CLAP_OBJ) $(NAM_OBJS)
-	$(CXX) -shared -o $(CLAP_BIN) $(CLAP_OBJ) $(NAM_OBJS) $(LDLIBS)
+	$(CXX) -shared -o $(CLAP_BIN) $(CLAP_OBJ) $(NAM_OBJS) $(LDLIBS) $(shell pkg-config --libs cairo x11)
 
 hds-fx: $(HDS_FX_OBJ) $(NAM_OBJS)
 	$(CXX) -shared -o $(HDS_FX_BIN) $(HDS_FX_OBJ) $(NAM_OBJS) $(HDS_FX_LDLIBS)

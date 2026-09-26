@@ -128,6 +128,7 @@
 // HardTune's actual pitch correction is unaffected.
 #include "fx_types.h"
 #include "fx_chain.c"
+#include "hds_fx_gui_host.h" // HdsFxGuiHost -- see its own header comment; HdsFxPlugin embeds one below
 
 // ---------------------------------------------------------------------------------------------
 // Plugin instance
@@ -183,13 +184,27 @@ typedef struct {
     // clap_plugin.c already uses for HDS_CLAP_PARAMS) -- one entry per exposed param.
     double param_shadow[FX_SLOT_COUNT];
 
-    // Opaque HdsFxGuiWindow* (defined in hds_fx_gui_x11.c, #include'd below) -- NULL whenever no GUI
-    // is open. Deliberately typed void* here rather than forward-declaring the real struct: this
-    // file's own HdsFxPlugin definition has no business knowing X11/Cairo types at all, only the
-    // platform-specific GUI file does -- see hds_fx_gui_draw.c's own header comment on why the
-    // draw/layout code and the platform window code are two separate files in the first place.
-    void *gui_window;
+    // The view hds_fx_gui_draw.c/hds_fx_gui_x11.c actually operate on -- see HdsFxGuiHost's own
+    // header comment. Populated once, right after the arrays above exist (hds_fx_gui_host_of()'s
+    // own call site), with pointers into THIS struct's own fx[]/port_*[] arrays -- never a copy.
+    // gui_window (inside gui_host) replaces what used to be this struct's own separate `void
+    // *gui_window` field -- one real, persistent HdsFxGuiHost per plugin instance, not two places
+    // that could theoretically drift apart.
+    HdsFxGuiHost gui_host;
 } HdsFxPlugin;
+
+// Every real host with an FX_SLOT_COUNT pool provides these two accessors before #include'ing
+// hds_fx_gui_x11.c -- see that file's own header comment. Trivial for this one (a single flat
+// HdsFxPlugin owns everything directly), but this is the one seam that lets the exact same
+// hds_fx_gui_x11.c/hds_fx_gui_draw.c serve a structurally different host (e.g. hds.clap's own
+// plugin struct, which nests its FX pool inside a much bigger SynthSharedControls) without
+// touching either file.
+static HdsFxGuiHost *hds_fx_gui_host_of(const clap_plugin_t *plugin) {
+    return &((HdsFxPlugin *)plugin->plugin_data)->gui_host;
+}
+static const clap_host_t *hds_fx_gui_clap_host_of(const clap_plugin_t *plugin) {
+    return ((HdsFxPlugin *)plugin->plugin_data)->host;
+}
 
 // hds_fx_gui_draw.c: pure Cairo, platform-agnostic layout/drawing/hit-testing (needs HdsFxPlugin,
 // just defined above, plus FXSlotParams/FX_TYPE_*/FX_SLOT_COUNT, all already in scope from
@@ -557,7 +572,7 @@ static void hds_fx_plugin_destroy(const clap_plugin_t *plugin) {
     HdsFxPlugin *p = (HdsFxPlugin *)plugin->plugin_data;
     // Defensive: a well-behaved host always calls clap_plugin_gui->destroy() before this, but
     // clean up an open X11 window/Display here too rather than leak it if one doesn't.
-    hds_fx_gui_destroy_internal(p);
+    hds_fx_gui_destroy_internal(plugin);
     free(p);
 }
 
@@ -745,6 +760,16 @@ static const clap_plugin_t *hds_fx_factory_create_plugin(const clap_plugin_facto
     p->host = host;
     hds_fx_init_pool_defaults(p);
     for (uint32_t i = 0; i < HDS_FX_PARAM_COUNT; i++) p->param_shadow[i] = 100.0; // matches mix's own default above
+
+    // Wire the HdsFxGuiHost view onto this instance's own real arrays -- see HdsFxGuiHost's own
+    // header comment. gui_window starts NULL (calloc already guarantees this; explicit here only
+    // for readability, matching how every other flag/pointer above is left to calloc's zero-init).
+    p->gui_host.fx = p->fx;
+    p->gui_host.port_input_stereo = p->port_input_stereo;
+    p->gui_host.port_output_channel = p->port_output_channel;
+    p->gui_host.port_input_off = p->port_input_off;
+    p->gui_host.port_output_off = p->port_output_off;
+    p->gui_host.gui_window = NULL;
 
     p->plugin.desc = &k_descriptor;
     p->plugin.plugin_data = p;

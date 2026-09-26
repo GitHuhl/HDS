@@ -29,6 +29,25 @@
 #include "backend.c"
 #undef main
 
+// hds_fx_gui_draw.c's own HDS_FX_PORT_COUNT (hds_fx_plugin.c's own flat "8 real stereo ports"
+// constant) is used to clamp/size the Input/Output dropdown machinery it shares with every host --
+// dead code for THIS host (its port_input_stereo/port_output_channel are NULL, see HdsFxGuiHost's
+// own header comment, so HDS_FX_DROPDOWN_INPUT/OUTPUT can never actually open here), but it still
+// needs to compile. SOURCE_COUNT (backend.c) is the nearest analogous "how many things could feed
+// a slot" count for this host, so it's reused here rather than inventing an unused magic number.
+#define HDS_FX_PORT_COUNT SOURCE_COUNT
+
+// HdsFxGuiHost -- see its own header comment. HdsClapPlugin (below) embeds one, pointed at this
+// instance's own knobs.fx[] -- the same shared rendering/interaction engine hds_fx.clap's own
+// HdsFxPlugin already uses (hds_fx_gui_draw.c/hds_fx_gui_x11.c, #include'd further down), reused
+// here rather than duplicated. port_input_stereo/port_output_channel/port_input_off/
+// port_output_off all stay NULL for this host: hds.clap has no flat N-port Input/Output concept at
+// all (a slot's Input is which SOURCE feeds it -- a Program, the Combi Mix bus, or an ext-in pair,
+// see fx_source/SOURCE_COUNT in backend.c -- not a port), so this plugin's own FX tab draws its own
+// Source-combo header instead of hds_fx_gui_draw.c's port-pill one; see that file's own gating on
+// these fields being NULL.
+#include "hds_fx_gui_host.h"
+
 // ---------------------------------------------------------------------------------------------
 // build_osc_dispatch_table() builds a process-wide static table and calls exit(1) on a duplicate
 // insert -- calling it more than once per process would hit that path. It only needs to run once
@@ -129,7 +148,25 @@ typedef struct {
     // that FX type.
     HdsFxUploadContext fx_upload_ctx;
 #endif
+
+    // The view hds_fx_gui_draw.c/hds_fx_gui_x11.c actually operate on -- see HdsFxGuiHost's own
+    // header comment and this file's own comment on the #include just above. Populated once, in
+    // clap_factory_create_plugin(), with a pointer into THIS instance's own knobs.fx[].
+    HdsFxGuiHost gui_host;
 } HdsClapPlugin;
+
+// Every real host with an FX_SLOT_COUNT pool provides these two accessors before #include'ing
+// hds_fx_gui_x11.c -- see that file's own header comment (hds_fx_plugin.c's own copies, right
+// after HdsFxPlugin itself, are the reference example this mirrors).
+static HdsFxGuiHost *hds_fx_gui_host_of(const clap_plugin_t *plugin) {
+    return &((HdsClapPlugin *)plugin->plugin_data)->gui_host;
+}
+static const clap_host_t *hds_fx_gui_clap_host_of(const clap_plugin_t *plugin) {
+    return ((HdsClapPlugin *)plugin->plugin_data)->host;
+}
+
+#include "hds_fx_gui_draw.c"
+#include "hds_fx_gui_x11.c"
 
 // ---------------------------------------------------------------------------------------------
 // audio-ports extension. Outputs: port 0 is the main stereo mix (today's only output, unchanged --
@@ -715,6 +752,10 @@ static bool clap_plugin_init(const clap_plugin_t *plugin) {
 
 static void clap_plugin_destroy(const clap_plugin_t *plugin) {
     HdsClapPlugin *p = (HdsClapPlugin *)plugin->plugin_data;
+    // Defensive: a well-behaved host always calls clap_plugin_gui->destroy() before this, but
+    // clean up an open X11 window/Display here too rather than leak it if one doesn't -- same
+    // posture hds_fx_plugin_destroy() already takes.
+    hds_fx_gui_destroy_internal(plugin);
     free(p);
 }
 
@@ -1148,7 +1189,9 @@ static const void *clap_plugin_get_extension(const clap_plugin_t *plugin, const 
     if (strcmp(id, CLAP_EXT_NOTE_PORTS) == 0) return &k_note_ports_ext;
     if (strcmp(id, CLAP_EXT_STATE) == 0) return &k_state_ext;
     if (strcmp(id, CLAP_EXT_PARAMS) == 0) return &k_params_ext;
-    return NULL; // NULL for everything else (including params) is spec-compliant -- hosts must tolerate it
+    if (strcmp(id, CLAP_EXT_GUI) == 0) return &k_gui_ext;
+    if (strcmp(id, CLAP_EXT_TIMER_SUPPORT) == 0) return &k_timer_support_ext;
+    return NULL; // NULL for everything else is spec-compliant -- hosts must tolerate it
 }
 
 static void clap_plugin_on_main_thread(const clap_plugin_t *plugin) { (void)plugin; }
@@ -1196,6 +1239,11 @@ static const clap_plugin_t *clap_factory_create_plugin(const clap_plugin_factory
     p->sample_engine.slots = &p->sample_slot_state;
     p->sample_engine.streams = &p->streams_state;
     p->sample_engine.pending = &p->pending_load_state;
+
+    // Wire the HdsFxGuiHost view onto this instance's own real fx[] -- see HdsFxGuiHost's own
+    // header comment and this file's own comment on the struct. The four port_* pointers stay
+    // NULL (calloc already guarantees this): hds.clap has no flat N-port Input/Output concept.
+    p->gui_host.fx = p->knobs.fx;
 
     p->plugin.desc = &k_descriptor;
     p->plugin.plugin_data = p;

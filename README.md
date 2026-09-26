@@ -2799,3 +2799,82 @@ CLAP state file (no `owner_program` field on its `Z` lines) still loads
 correctly -- `clap_state_load()` branches on the saved version and
 defaults every zone from an old save to `SINGLE_PROGRAM_SLOT`, which
 matches how those zones actually behaved before this change existed.
+
+## hds.clap gets its own native embedded GUI (Phase 1: the FX tab)
+
+`hds.clap` (the full synth) had NO GUI extension at all before this --
+purely headless/OSC, entirely dependent on `frontend.py` for any visual
+control surface. `hds_fx.clap` (the standalone FX-only plugin) already
+had a real, proven, in-house Cairo/X11 embedded GUI (see "HDS FX: real
+X11-embedded CLAP GUI" above) for its own flat 32-slot pool. The goal
+here: give `hds.clap` a real native GUI too, starting with its own FX
+bus (`SynthSharedControls.fx[FX_SLOT_COUNT]` -- physically the same
+shared-pool model `hds_fx.clap` already uses), by REUSING that proven
+rendering/interaction engine rather than duplicating roughly 2000 lines
+of Type/params/mix/bypass/reorder/NAM-browser code into a second copy --
+the same "one shared engine, several real hosts" posture this codebase
+already applies to the DSP side (`fx_types.h`/`fx_chain.c`).
+
+**The seam: `HdsFxGuiHost`** (new, `src/hds_fx_gui_host.h`) -- a small
+struct of raw pointers (`fx`, four optional per-port routing arrays,
+`gui_window`) that `hds_fx_gui_draw.c`/`hds_fx_gui_x11.c` now operate on
+instead of `HdsFxPlugin` directly. Every field name is unchanged from
+`HdsFxPlugin`'s own former fields, so every existing call site's syntax
+(`p->fx[slot]`, `p->port_input_stereo[port]`, ...) stayed textually
+identical -- only the TYPE of `p` changed, from "the whole concrete
+plugin struct" to "a view into whichever real struct owns these arrays."
+`HdsFxPlugin` itself now embeds one (`gui_host`), populated once at
+creation with pointers into its own real `fx[]`/`port_*[]` arrays --
+`gui_window` moved from being `HdsFxPlugin`'s own separate field into
+living inside `gui_host` instead, so there is exactly one real, living
+copy of it, never two that could drift apart. Two tiny per-host
+accessors (`hds_fx_gui_host_of()`/`hds_fx_gui_clap_host_of()`, defined
+once by whichever `.c` file `#include`s `hds_fx_gui_x11.c`) are the only
+place that still knows the concrete host struct's real layout; the
+shared engine itself never does.
+
+**Zero behavior change for `hds_fx.clap`**, not just claimed --
+verified: full clean rebuild with zero warnings, then its entire
+existing test suite (`test_nam`, `test_nam_channel_mismatch`,
+`test_state_and_output`, `test_param_units`, `test_off_state`,
+`test_shared_pool`, `test_dilution_fix`, and the real XTest-driven
+`test_gui_x11` -- genuine server-level clicks/drags/keystrokes into a
+real embedded window) all passed unchanged. The three scratch test
+files that called the refactored functions directly (poking internals,
+not the product itself) needed one mechanical one-line fix each
+(`p` -> `&p->gui_host`) to keep compiling against the new parameter
+type -- expected for any internal signature change, not a behavior
+regression.
+
+**`clap_plugin.c` (hds.clap) now registers a real `CLAP_EXT_GUI` +
+`CLAP_EXT_TIMER_SUPPORT`**, `#include`ing the exact same
+`hds_fx_gui_draw.c`/`hds_fx_gui_x11.c` `hds_fx.clap` uses, with its own
+`HdsClapPlugin.gui_host.fx` pointed at `knobs.fx` (its own real FX bus)
+and every per-port routing pointer left `NULL`: hds.clap has no flat
+N-port Input/Output concept at all (a slot's Input is which SOURCE feeds
+it -- a Combi Program, the Combi Mix bus, or an ext-in pair, see
+`SOURCE_COUNT`/`source_routing` -- not a port number), so its own Input/
+Output header is a different design (a Source combo, matching
+`frontend.py`'s own existing `SOURCE_NAMES`), not yet built. Until it is,
+`hds_fx_gui_draw.c`'s own Input/Output pill code (drawing AND the click-
+to-open-dropdown handling) is gated on `port_input_stereo`/
+`port_output_channel` being non-`NULL`, drawing a plain disabled `\xe2\x80\x94`
+placeholder and staying inert to clicks for any host that leaves them
+`NULL` -- exactly `hds.clap`, today; exactly `hds_fx.clap`'s own
+previous behavior, unchanged, everywhere else, since its own pointers
+are never `NULL`. The Makefile's `$(CLAP_OBJ)` compile rule and `clap:`
+link rule now also pull in Cairo/X11 (`$(HDS_FX_CFLAGS)`, `pkg-config
+--libs cairo x11`), which `hds.clap` never needed before.
+
+Verified end-to-end with a real XTest-driven test
+(`test_clap_gui.c`, mirroring `hds_fx.clap`'s own `test_gui_x11.c`
+pattern exactly): a real `clap_plugin_gui_t` `create()`/`set_parent()`/
+`show()` sequence, `XQueryTree`-confirmed real XEmbed reparenting into a
+fake host window, a genuine XTest-injected click opening the Type
+dropdown on hds.clap's own pool slot 0, a second real click on a dropdown
+option writing into `SynthSharedControls.fx[0].fx_type` -- THIS
+instance's own real backend state, not a copy -- and a confirmed-inert
+Input pill (no dropdown opens, since `port_input_stereo` is `NULL` for
+this host). Still to come: the real Source-combo Input header (a second,
+separate page for the many-to-many output-routing grid, matching
+`frontend.py`'s own separate Routing tab, is its own later phase).
