@@ -194,12 +194,36 @@ ARM64_BIN := synth_engine-arm64
 # $ORIGIN-relative, i.e. "next to me".
 ARM64_LIBDIR := arm64-libs
 
-.PHONY: all run-backend run-frontend clean clap hds-fx arm64
+.PHONY: all run-backend run-frontend clean clap hds-fx arm64 FORCE
 
 all: $(BIN)
 
 $(BUILD_DIR) $(NAM_BUILD_DIR) $(ARM64_NAM_BUILD_DIR):
 	mkdir -p $@
+
+# Make's own dependency tracking is purely file-mtime-based -- it has no idea NAM_CXXFLAGS even
+# exists, let alone that it changed, so editing NAM_CXXFLAGS alone (e.g. adding a -D flag) leaves
+# every already-built build/nam/*.o completely undisturbed: none of their .cpp sources changed, so
+# a plain `make hds-fx`/`make clap`/`make` silently RELINKS the OLD objects, built under the OLD
+# flags, against whatever DID get recompiled. This is not hypothetical: it is exactly how the
+# NAM_SAMPLE float/double ABI mismatch fix (see NAM_CXXFLAGS's own comment on -DNAM_SAMPLE_FLOAT)
+# could silently fail to actually take effect for anyone who ran a plain rebuild instead of `make
+# clean` first -- same crash, same symptoms, with the "fixed" commit already checked out.
+# NAM_FLAGS_STAMP/ARM64_NAM_FLAGS_STAMP close that gap: a small file holding the exact flags string
+# last used to build that directory's objects, rewritten (touching its mtime) only when the string
+# actually differs from before -- so the three pattern rules below, which list it as a real
+# prerequisite, transparently rebuild every NAM object whenever NAM_CXXFLAGS itself changes, with
+# zero cost (no rewrite, no rebuild) on any ordinary build where it hasn't.
+NAM_FLAGS_STAMP := $(NAM_BUILD_DIR)/.cxxflags.stamp
+ARM64_NAM_FLAGS_STAMP := $(ARM64_NAM_BUILD_DIR)/.cxxflags.stamp
+
+$(NAM_FLAGS_STAMP): FORCE | $(NAM_BUILD_DIR)
+	@if [ ! -f $@ ] || [ "$$(cat $@ 2>/dev/null)" != '$(NAM_CXXFLAGS)' ]; then echo '$(NAM_CXXFLAGS)' > $@; fi
+
+$(ARM64_NAM_FLAGS_STAMP): FORCE | $(ARM64_NAM_BUILD_DIR)
+	@if [ ! -f $@ ] || [ "$$(cat $@ 2>/dev/null)" != '$(NAM_CXXFLAGS)' ]; then echo '$(NAM_CXXFLAGS)' > $@; fi
+
+FORCE:
 
 # backend.c/clap_plugin.c stay plain C, compiled by $(CC) exactly as before -- only the FINAL link
 # step (below) needs $(CXX), to pull in libstdc++ for the NAM objects linked alongside them.
@@ -220,13 +244,13 @@ $(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.c src/hds_fx_gui_draw.c
 
 # Three source directories (NAM/, NAM/wavenet/, src/) flattened into one object directory -- see
 # NAM_OBJS's own comment on why this is safe (no basename collisions).
-$(NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/%.cpp | $(NAM_BUILD_DIR)
+$(NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/%.cpp $(NAM_FLAGS_STAMP) | $(NAM_BUILD_DIR)
 	$(CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
-$(NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp | $(NAM_BUILD_DIR)
+$(NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp $(NAM_FLAGS_STAMP) | $(NAM_BUILD_DIR)
 	$(CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
-$(NAM_BUILD_DIR)/%.o: src/%.cpp | $(NAM_BUILD_DIR)
+$(NAM_BUILD_DIR)/%.o: src/%.cpp $(NAM_FLAGS_STAMP) | $(NAM_BUILD_DIR)
 	$(CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
 $(BIN): $(BIN_OBJ) $(NAM_OBJS)
@@ -246,13 +270,13 @@ hds-fx: $(HDS_FX_OBJ) $(NAM_OBJS)
 # -- see that definition's own comment for why.)
 ARM64_NAM_OBJS := $(addprefix $(ARM64_NAM_BUILD_DIR)/,$(notdir $(NAM_SRCS:.cpp=.o)))
 
-$(ARM64_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/%.cpp | $(ARM64_NAM_BUILD_DIR)
+$(ARM64_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/%.cpp $(ARM64_NAM_FLAGS_STAMP) | $(ARM64_NAM_BUILD_DIR)
 	$(ARM64_CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
-$(ARM64_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp | $(ARM64_NAM_BUILD_DIR)
+$(ARM64_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp $(ARM64_NAM_FLAGS_STAMP) | $(ARM64_NAM_BUILD_DIR)
 	$(ARM64_CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
-$(ARM64_NAM_BUILD_DIR)/%.o: src/%.cpp | $(ARM64_NAM_BUILD_DIR)
+$(ARM64_NAM_BUILD_DIR)/%.o: src/%.cpp $(ARM64_NAM_FLAGS_STAMP) | $(ARM64_NAM_BUILD_DIR)
 	$(ARM64_CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
 ARM64_INTERP := /lib/ld-linux-aarch64.so.1

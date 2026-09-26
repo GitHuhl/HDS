@@ -1758,6 +1758,31 @@ the same stress run that used to crash now runs millions of samples with sane, s
 ASan report; the full existing NAM test suite (including the stereo-WAV-as-model refusal test above)
 still passes unchanged.
 
+**A third bug, found because the SAME real crash kept happening to the SAME real user even after the
+fix directly above landed and they rebuilt from that exact commit.** Not a new DSP bug at all -- the
+fix itself never actually took effect for them, and the reason is a real gap in the Makefile, not
+user error: Make's own dependency tracking is purely file-mtime-based, with zero awareness that
+`NAM_CXXFLAGS` (a plain Make variable, not a file) even exists. Editing it -- exactly what the fix
+above did, adding `-DNAM_SAMPLE_FLOAT` -- leaves every already-built `build/nam/*.o` completely
+undisturbed, since none of their `.cpp` sources changed: an ordinary rebuild (`make hds-fx` again,
+without `make clean` first -- the obviously-correct thing to do after pulling a source change, and
+exactly what happened here) silently RELINKS the old, still-`double`-ABI objects, and the crash
+persists unchanged, looking exactly like the fix never happened. Confirmed directly, not guessed:
+built once under the old flags (no `make clean`, matching a real user's workflow), then restored the
+fixed `NAM_CXXFLAGS` and ran `make hds-fx` again with no clean -- the object files came out byte-for-
+byte identical, still crashing. Fixed properly rather than just telling people to remember `make
+clean`: `NAM_FLAGS_STAMP`/`ARM64_NAM_FLAGS_STAMP` are small stamp files, one per NAM build directory,
+holding the exact `NAM_CXXFLAGS` string last used to build the objects there, rewritten (touching
+their mtime) only when that string actually differs from what's on disk. Every NAM object pattern
+rule (all three native, all three arm64) now lists its directory's stamp file as a real prerequisite,
+so changing `NAM_CXXFLAGS` at all -- this fix, or any future one -- transparently forces a full NAM
+object rebuild on the very next plain `make`, no `make clean` required, at zero cost (no stamp
+rewrite, no rebuild) on every other ordinary build where the flags haven't moved. Re-verified the
+exact failure mode directly: rebuilt once under deliberately-reverted (pre-fix) flags, restored the
+real fixed flags, ran a plain `make hds-fx` with no clean -- confirmed via each object file's own
+checksum that every one of them actually recompiled this time, and confirmed the resulting
+`hds_fx.clap`'s own NAM objects pass the same real-model stress test clean.
+
 **Now wired into the `make arm64` cross-build too**: there never was a real "no C++ cross-compiler"
 problem, only a missing Makefile recipe -- `shell.nix`'s `aarch64.stdenv.cc` already installs a full
 `aarch64-unknown-linux-gnu-g++` alongside its own `-gcc`, it just went unused. `make arm64` now
