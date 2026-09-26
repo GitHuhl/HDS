@@ -3232,3 +3232,83 @@ regression suite (all 16 prior test binaries, `hds_fx.clap`'s own included) stil
 
 This completes every tab in the originally-ordered arc (FX, Play, Filters, LFOs, Envelopes,
 Routing, Devices) that `hds.clap`'s native embedded GUI set out to cover.
+
+## hds.clap's Play tab gets a real Combi mode: the 8-lane mixer view (task #106)
+
+A genuine follow-up, not part of the original ordered arc: `backend.c`'s own render loop has
+supported real Combi mode (`performance_mode == 1`: up to `COMBI_PROGRAM_COUNT` (8) independently-
+synthesizing Programs -- `programs[0..7]` -- sharing one voice pool, mixed via each lane's own
+`seq_lanes[p].volume/pan`) since well before this native GUI existed, but nothing in this GUI could
+ever reach it: `hds_clap_play_draw.c`'s own `hds_play_program()` always addresses
+`programs[SINGLE_PROGRAM_SLOT]`, and there was no way to even flip `performance_mode` away from 0.
+
+**Mode toggle**: a small "Single"/"Combi" pill pair, drawn at the very top of the Play tab
+(`hds_clap_play_draw.c`'s own `hds_clap_play_mode_toggle_rects()`), reads/writes
+`p->knobs.performance_mode` directly (0/1 only -- Sequencer mode, value 2, is deliberately never
+reachable from this native GUI: see task #83's own comment on why `clap_plugin.c`'s `process()`
+never runs Sequencer-mode transport/lane playback at all). The toggle itself is drawn/hit-tested by
+`hds_clap_gui_draw.c`'s own `HDS_CLAP_TAB_PLAY` dispatch, not by either sub-view's own file --
+switching modes means dispatching to a COMPLETELY different tab file
+(`hds_clap_play_draw.c` vs the new `hds_clap_combi_draw.c`), and `hds_clap_gui_draw.c` is the one
+place both are visible (it's `#include`'d after both). It's drawn AFTER whichever sub-view just
+rendered, not before: both `hds_clap_play_render()`/`hds_clap_combi_render()` start by flood-
+filling the entire tab-content rect as their own background (the same convention every tab in this
+GUI already follows), which would otherwise immediately paint over the pills -- a real, if
+short-lived, bug this session's own screenshot review caught before ever reaching a test.
+
+**`hds_clap_combi_draw.c` (new)**: the 8-lane mixer view itself, matching frontend.py's own
+`self.osc_combi_widget` mixer-strip legend exactly -- "#", "Level", "Pan", "Program", "MIDI Ch" --
+one column-strip per lane. Level/Pan are plain click-and-drag knobs (reusing
+`hds_play_draw_knob()`/`hds_play_knob_hit_test()`/`hds_play_start_knob_drag()` verbatim from the
+Play tab file, same generic-primitive-reuse pattern every tab file after Play has used) over
+`seq_lanes[p].volume` (`[0,100]`, default 80) and `seq_lanes[p].pan` (`[-1,1]`, default 0) --
+picking either up in Combi mode makes an already-populated lane audible immediately, since
+`backend.c`'s own render loop already does the real mixing unconditionally. MIDI Ch is a 17-entry
+dropdown (Omni + channels 1-16) over `combi_lane_midi_channel[p]`.
+
+**Program picker, and a real scope decision**: frontend.py's own per-lane Program picker is a flat
+`QComboBox` over every `~/HDS_Programs/<name>/<name>.hdsprog`, populated by
+`_refresh_combi_program_combos()` -- not a nested-folder file browser, since every real Program
+lives flat under that one root. This GUI's own Program pill matches that shape (a plain sorted
+dropdown, re-scanned fresh on every open) rather than generalizing `hds_fx_gui_browser.c`'s own
+directory-navigating browser (built for `.nam`/`.wav` models, which can live anywhere) for a job
+that never needs navigation at all -- far simpler, and a better match for the reference UI.
+`hds_scan_programs_folder()` (the directory scan itself) was relocated from `hds_standalone.c` into
+`backend.c`, alongside the whole minimal JSON reader (`HdsJsonValue`/`hds_json_parse`/
+`hds_json_object_get`/`hds_json_free`, also relocated there) -- both are genuinely shared between
+`hds_standalone.c`'s own `--program`/arrow-key-cycling code and this new picker. Picking an entry
+calls two new, CLAP-only functions living in `hds_clap_combi_draw.c` itself (not `backend.c`, since
+`hds_standalone.c` would otherwise carry a function it can never call -- an always-"defined but not
+used" warning this session deliberately avoided by placement, not suppression):
+`hds_load_program_file_to_combi_lane()` reads and parses the file, and
+`hds_apply_program_fields_to_combi_lane()` applies its `"fields"` object onto Combi lane `lane_idx`
+by rewriting each address's leading `/hds` to `/hds/combi/{lane_idx}` and resolving it through
+`osc_dispatch_table` (mirroring frontend.py's own `_apply_program_fields_to_combi_lane()`, which
+does the identical rewrite over a live OSC bundle) -- no OSC round-trip needed here, since the GUI
+and the audio thread already share `p->knobs` in-process.
+
+**Deliberately out of scope for this pass** (real, separate follow-up work, not "the 8-lane mixer
+view" this task asked for): Key/Velocity zone (keyboard split/velocity switch), per-lane Transpose,
+Save Combi/Load Combi (a whole separate `.hdscombi` file format referencing lanes by name), and the
+"Edit" button (frontend.py's own jump into Single Program mode to edit a lane's Program -- this
+native GUI's own Single Program view already IS the live editing surface, just for a different
+slot, so the button would be closer to a lane-swap than an edit shortcut here). A picked Program's
+own `sfz_file` map (its sampled-oscillator zones) is also deliberately not applied -- this native
+GUI has no Mapping tab yet (task #104, on hold at the user's own request) -- so a Combi lane loaded
+here gets every synthesis field but keeps whatever sample zones it already had; a picked name is
+cached as a GUI-side label only (matching frontend.py's own `combi_lane_program_choice`), never
+part of a saved patch/session. The Program dropdown itself is capped at 24 entries with no
+scrolling -- a deliberate v1 scale limit, comfortably covering real-world use without a second
+scrollable-list mechanism.
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_combi.c`, 7 passing assertions,
+including a real filesystem fixture under a throwaway `$HOME` so it never touches the invoking
+user's own `~/HDS_Programs`): the Mode toggle flips `performance_mode` both directions; a real
+drag-up on lane 1's Level knob increases `seq_lanes[0].volume` past its default 80; a real drag on
+lane 2's Pan knob writes `seq_lanes[1].pan`; a real click through the MIDI Ch dropdown writes
+`combi_lane_midi_channel[2]` (Omni -> Ch 5); and picking a real `TestProg.hdsprog` fixture from the
+Program dropdown genuinely scans the directory, loads its real `/hds/vco1/shape`/`/hds/vco1/vol`
+fields onto `programs[3]` and only `programs[3]` (every other lane and
+`programs[SINGLE_PROGRAM_SLOT]` stay untouched), and updates the lane's own GUI label. The full
+existing regression suite (all 17 prior test binaries, `hds_fx.clap`'s own included) still passes
+unchanged.

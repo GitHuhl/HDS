@@ -142,7 +142,23 @@ static void hds_clap_play_view_state_init(HdsClapPlayViewState *vs) {
 #define HDS_PLAY_KNOB_STRIDE 40.0 // vertical space one knob (label+arc+value) reserves
 #define HDS_PLAY_PILL_H 16.0
 #define HDS_PLAY_CHECK_H 13.0
-#define HDS_PLAY_CONTENT_TOP 30.0 // below this file's own "Oscillators"/"Amp EGs" section labels
+// 46.0, not 30.0: leaves an 8px-margin, 16px-tall strip at the very top of the tab for the Mode
+// toggle (Single/Combi, see hds_clap_play_mode_toggle_rects()/hds_clap_gui_draw.c's own
+// HDS_CLAP_TAB_PLAY dispatch, which draws/hit-tests it and switches to hds_clap_combi_draw.c's own
+// 8-lane mixer view when Combi is selected) above every oscillator/EG section header.
+#define HDS_PLAY_CONTENT_TOP 46.0 // below this file's own "Oscillators"/"Amp EGs" section labels
+
+// Single/Combi Mode toggle -- drawn/hit-tested by hds_clap_gui_draw.c's own HDS_CLAP_TAB_PLAY
+// dispatch (not this file's own render/press functions), since switching to Combi mode means
+// dispatching to a COMPLETELY different tab file (hds_clap_combi_draw.c) instead of this one, and
+// hds_clap_gui_draw.c is the one place both are visible (it's #include'd after both). Reads/writes
+// p->knobs.performance_mode directly (0=Single, 1=Combi) -- Sequencer (2) is deliberately never
+// reachable from this native GUI (see clap_plugin.c's own task #83 comment: this plugin's
+// process() never runs Sequencer-mode transport/lane playback at all).
+static void hds_clap_play_mode_toggle_rects(HdsFxRect *single_r, HdsFxRect *combi_r) {
+    *single_r = (HdsFxRect){HDS_PLAY_MARGIN, 4.0, 70.0, 16.0};
+    *combi_r  = (HdsFxRect){HDS_PLAY_MARGIN + 74.0, 4.0, 70.0, 16.0};
+}
 
 typedef struct {
     HdsFxRect shape_pill;

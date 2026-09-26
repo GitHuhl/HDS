@@ -195,6 +195,7 @@ typedef struct {
 // hds_play_knob_hit_test/hds_play_start_knob_drag) rather than duplicating them -- see its own
 // header comment.
 #include "hds_clap_play_draw.c"
+#include "hds_clap_combi_draw.c"
 #include "hds_clap_filters_draw.c"
 #include "hds_clap_lfos_draw.c"
 // hds_clap_envelopes_draw.c comes after hds_clap_lfos_draw.c: it reuses that file's own
