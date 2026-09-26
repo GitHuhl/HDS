@@ -57,16 +57,17 @@
 #define HDS_FX_KNOB_CY_OFFSET 27.0
 #define HDS_FX_KNOB_VALUE_Y_OFFSET 47.0
 
-// Selectable types for the GUI's own Type pill cycling -- every FX_TYPE_* except FX_TYPE_NAM, which
-// this plugin compiles out entirely (HDS_NAM_ENABLED 0, see hds_fx_plugin.c's own header comment):
-// letting the pill land on it would silently do nothing (fx_chain.c's own dispatch switch has no
-// case for it here), which is worse than just not offering it until NAM is wired up for real.
+// Selectable types for the GUI's own Type dropdown -- every real FX_TYPE_*. FX_TYPE_NAM is now
+// included (it used to be excluded here specifically because HDS_NAM_ENABLED was 0 in
+// hds_fx_plugin.c, which would have let the dropdown land on a type fx_chain.c's own dispatch
+// switch couldn't actually run -- see that file's own header comment for why it's wired up for
+// real now, model/cab-IR loading included).
 static const int HDS_FX_SELECTABLE_TYPES[] = {
     FX_TYPE_OFF, FX_TYPE_ENSEMBLE, FX_TYPE_CREAMCOAT, FX_TYPE_DENSITY3, FX_TYPE_STEREOCHORUS,
     FX_TYPE_STEREODOUBLER, FX_TYPE_TAPEDELAY2, FX_TYPE_POINTYGUITAR, FX_TYPE_GUITARCONDITIONER,
-    FX_TYPE_CABS2, FX_TYPE_GATE, FX_TYPE_EQ3, FX_TYPE_LIMITER, FX_TYPE_FETCOMP, FX_TYPE_FAIRKID67,
-    FX_TYPE_PEAKMAX, FX_TYPE_MULTIFILTER, FX_TYPE_OPTOCOMP, FX_TYPE_DEESSER, FX_TYPE_HARDTUNE,
-    FX_TYPE_FDNVERB,
+    FX_TYPE_CABS2, FX_TYPE_NAM, FX_TYPE_GATE, FX_TYPE_EQ3, FX_TYPE_LIMITER, FX_TYPE_FETCOMP,
+    FX_TYPE_FAIRKID67, FX_TYPE_PEAKMAX, FX_TYPE_MULTIFILTER, FX_TYPE_OPTOCOMP, FX_TYPE_DEESSER,
+    FX_TYPE_HARDTUNE, FX_TYPE_FDNVERB,
 };
 #define HDS_FX_SELECTABLE_TYPE_COUNT (int)(sizeof(HDS_FX_SELECTABLE_TYPES) / sizeof(HDS_FX_SELECTABLE_TYPES[0]))
 
@@ -87,7 +88,7 @@ static const char *hds_fx_type_name(int fx_type) {
         case FX_TYPE_POINTYGUITAR: return "PointyGuitar";
         case FX_TYPE_GUITARCONDITIONER: return "GuitarCond";
         case FX_TYPE_CABS2: return "Cabs2";
-        case FX_TYPE_NAM: return "NAM (disabled)";
+        case FX_TYPE_NAM: return "NAM";
         case FX_TYPE_GATE: return "Gate";
         case FX_TYPE_EQ3: return "EQ3";
         case FX_TYPE_LIMITER: return "Limiter";
@@ -131,6 +132,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
     static const char *const tapedelay2[] = {"Time", "Regen", "Freq", "Reso", "Flutr", "Dry/Wet", "PingPn"};
     static const char *const pointyguitar[] = {"Drive", "Presnc", "High", "Mid", "Low", "Sub", "HSpkr", "LSpkr", "Gate", "Outpt"};
     static const char *const cabs2[] = {"Lowpas", "Hipass"};
+    static const char *const nam[] = {"InGain", "OutGan", "Cab"};
     static const char *const gate[] = {"Thresh", "Attack", "Releas", "Range"};
     static const char *const eq3[] = {"LoFreq", "LoGain", "MidFrq", "MidGan", "MidQ", "HiFreq", "HiGain"};
     static const char *const limiter[] = {"Ceil", "InGain", "Releas"};
@@ -154,6 +156,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
         case FX_TYPE_TAPEDELAY2: table = tapedelay2; count = 7; break;
         case FX_TYPE_POINTYGUITAR: table = pointyguitar; count = 10; break;
         case FX_TYPE_CABS2: table = cabs2; count = 2; break;
+        case FX_TYPE_NAM: table = nam; count = 3; break;
         case FX_TYPE_GATE: table = gate; count = 4; break;
         case FX_TYPE_EQ3: table = eq3; count = 7; break;
         case FX_TYPE_LIMITER: table = limiter; count = 3; break;
@@ -176,6 +179,32 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
 // shift by type, keeping draw and hit-test trivially in sync) but is greyed out and inert on every
 // other type, directly fixing "sidechain shouldn't be an option on stuff like reverb."
 static bool hds_fx_type_uses_sidechain(int fx_type) { return fx_type == FX_TYPE_FAIRKID67; }
+
+// FX_TYPE_NAM only -- gates whether nam_model_pill/nam_ir_pill (see HdsFxRowLayout's own comment)
+// are drawn/clickable on a given row, same "always-present rect, only sometimes meaningful"
+// pattern hds_fx_type_uses_sidechain() already established.
+static bool hds_fx_type_uses_nam_paths(int fx_type) { return fx_type == FX_TYPE_NAM; }
+
+// The part of a path after the last '/', or the whole path if there's no '/' -- for a compact
+// pill label; the full path still lives in FXSlotParams.nam_model_path/nam_ir_path and is what
+// actually gets saved/loaded, this is purely a display truncation.
+static const char *hds_fx_basename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+// hds_fx_draw_pill() never clips its own text to its own rect (see that function's own body --
+// every OTHER label in this GUI is already short enough by construction that this never mattered),
+// but a real filename easily overflows nam_model_pill/nam_ir_pill's ~84px of usable width and would
+// bleed into neighboring columns. Truncates from the FRONT with a leading ellipsis, keeping the
+// END of the string -- for a loaded path that's usually the actual filename past its directory, and
+// while actively typing (hds_fx_gui_on_key()) it's exactly where the cursor and newest keystrokes
+// are, so the visible text scrolls the way any real text field's viewport would.
+static void hds_fx_truncate_pill_text(const char *text, char *buf, size_t buflen, size_t max_visible) {
+    size_t len = strlen(text);
+    if (len <= max_visible) { snprintf(buf, buflen, "%s", text); return; }
+    snprintf(buf, buflen, "\xe2\x80\xa6%s", text + (len - (max_visible - 1)));
+}
 
 // ---------------------------------------------------------------------------------------------
 // Chain-link helpers -- a "chain" is any run of consecutive-BY-SOURCE slots joined by
@@ -253,6 +282,19 @@ typedef struct {
     float drag_start_value;
 
     HdsFxDropdown dropdown;
+
+    // Inline text-edit state -- FX_TYPE_NAM's own Model/IR path fields are the only free-text
+    // inputs anywhere in this GUI (every other value is a knob, a toggle, or a dropdown option),
+    // and there's no file-browser dialog here (this plugin stays a plain Cairo+X11 build, no GTK/Qt
+    // toolkit dependency -- see this file's own header comment) -- so typing/pasting a path
+    // directly is the mechanism. edit_row < 0 means nothing is being edited; edit_field 0 = Model,
+    // 1 = IR. edit_buffer is pre-filled with the slot's CURRENT path when editing starts (see
+    // hds_fx_gui_on_button_press()'s own NAM-pill handling), so backspacing an existing path works
+    // exactly like editing any other text field, not just typing one from scratch. See
+    // hds_fx_gui_on_key()'s own comment for how a real X11 keypress reaches this state.
+    int edit_row;
+    int edit_field;
+    char edit_buffer[SAMPLE_PATH_LEN];
 } HdsFxGuiViewState;
 
 static void hds_fx_gui_view_state_init(HdsFxGuiViewState *vs) {
@@ -261,6 +303,7 @@ static void hds_fx_gui_view_state_init(HdsFxGuiViewState *vs) {
     vs->window_h = HDS_FX_GUI_DEFAULT_H;
     vs->hover_row = -1;
     vs->drag_kind = 0;
+    vs->edit_row = -1;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -378,6 +421,16 @@ typedef struct {
     HdsFxRect input_pill;
     HdsFxRect sidechain_pill;
     HdsFxRect param_knob[FX_SLOT_PARAM_COUNT];
+    // FX_TYPE_NAM only ever uses param_knob[0..2] (Input/Output Gain, Cab Enable -- see
+    // hds_fx_type_param_count()) -- columns 3-8 are otherwise blank real estate for that type, so
+    // NAM's own Model/IR path fields reuse them as two wide clickable pills rather than adding any
+    // new row width. Computed directly alongside param_knob[] in hds_fx_gui_compute_row_layout()
+    // from the same running `x`, not back-derived from already-computed knob centers, so draw and
+    // hit-test share one single source of truth the same way every other control here does. Rects
+    // exist unconditionally on every row (same "always present, only sometimes meaningful" pattern
+    // sidechain_pill already uses) -- only relevant when hds_fx_type_uses_nam_paths() is true.
+    HdsFxRect nam_model_pill;
+    HdsFxRect nam_ir_pill;
     HdsFxRect output_pill;
     HdsFxRect mix_knob;
     HdsFxRect bypass_btn;
@@ -412,6 +465,11 @@ static void hds_fx_gui_compute_row_layout(int width, double y, HdsFxRowLayout *o
     for (int i = 0; i < FX_SLOT_PARAM_COUNT; i++) {
         out->param_knob[i] = (HdsFxRect){x + i * HDS_FX_PARAM_STRIDE + HDS_FX_PARAM_STRIDE / 2, y + HDS_FX_KNOB_CY_OFFSET, HDS_FX_GUI_KNOB_R, HDS_FX_GUI_KNOB_R};
     }
+    // Columns 3,4,5 and 6,7,8 -- see this struct's own comment on nam_model_pill/nam_ir_pill for
+    // why these specific columns (NAM's own 3 real knobs stop at column 2; column 9 is left as
+    // ordinary trailing gap, same spacing every other type already has before the Output pill).
+    out->nam_model_pill = (HdsFxRect){x + 3 * HDS_FX_PARAM_STRIDE, y + 4, 3 * HDS_FX_PARAM_STRIDE - HDS_FX_GAP, HDS_FX_GUI_ROW_H - 8};
+    out->nam_ir_pill = (HdsFxRect){x + 6 * HDS_FX_PARAM_STRIDE, y + 4, 3 * HDS_FX_PARAM_STRIDE - HDS_FX_GAP, HDS_FX_GUI_ROW_H - 8};
     x += FX_SLOT_PARAM_COUNT * HDS_FX_PARAM_STRIDE + HDS_FX_GAP;
     out->output_pill = (HdsFxRect){x, y + 4, HDS_FX_IO_PILL_W, HDS_FX_GUI_ROW_H - 8};
     x += HDS_FX_IO_PILL_W + HDS_FX_GAP;
@@ -750,6 +808,33 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
             hds_fx_draw_knob(cr, L.param_knob[i].x, L.param_knob[i].y, L.param_knob[i].w, slot->param[i], false, y, hds_fx_type_param_label(fx_type, i));
         }
 
+        // NAM's own Model/IR path pills -- see HdsFxRowLayout's own comment on nam_model_pill/
+        // nam_ir_pill for why these reuse otherwise-blank knob columns. Shows the live edit buffer
+        // (with a text cursor) while that specific field is being typed into, otherwise the
+        // loaded path's basename or "(none)" -- clicking either pill starts editing (see
+        // hds_fx_gui_on_button_press()'s own NAM handling).
+        if (hds_fx_type_uses_nam_paths(fx_type)) {
+            bool editing_model = (vs->edit_row == s && vs->edit_field == 0);
+            bool editing_ir = (vs->edit_row == s && vs->edit_field == 1);
+            char trunc[24], model_buf[32], ir_buf[32];
+            if (editing_model) {
+                hds_fx_truncate_pill_text(vs->edit_buffer, trunc, sizeof(trunc), 15);
+                snprintf(model_buf, sizeof(model_buf), "%s_", trunc);
+            } else {
+                hds_fx_truncate_pill_text(slot->nam_model_path[0] ? hds_fx_basename(slot->nam_model_path) : "(none)", trunc, sizeof(trunc), 15);
+                snprintf(model_buf, sizeof(model_buf), "M: %s", trunc);
+            }
+            if (editing_ir) {
+                hds_fx_truncate_pill_text(vs->edit_buffer, trunc, sizeof(trunc), 15);
+                snprintf(ir_buf, sizeof(ir_buf), "%s_", trunc);
+            } else {
+                hds_fx_truncate_pill_text(slot->nam_ir_path[0] ? hds_fx_basename(slot->nam_ir_path) : "(none)", trunc, sizeof(trunc), 15);
+                snprintf(ir_buf, sizeof(ir_buf), "IR: %s", trunc);
+            }
+            hds_fx_draw_pill(cr, L.nam_model_pill.x, L.nam_model_pill.y, L.nam_model_pill.w, L.nam_model_pill.h, model_buf, editing_model || slot->nam_model_path[0], false);
+            hds_fx_draw_pill(cr, L.nam_ir_pill.x, L.nam_ir_pill.y, L.nam_ir_pill.w, L.nam_ir_pill.h, ir_buf, editing_ir || slot->nam_ir_path[0], false);
+        }
+
         // Output pill: only live on a chain TAIL -- a slot still chaining forward doesn't decide
         // where anything lands yet, the tail of its own chain does. "Off" (result goes nowhere)
         // is its own selectable state, independent of which port number is stored.
@@ -850,8 +935,23 @@ static void hds_fx_swap_slots(HdsFxPlugin *p, int a, int b) {
 // Type/Input/Sidechain/Output pills OPEN their own dropdown (see the "Dropdowns" section above)
 // rather than mutating anything directly; bypass/chain/up/down toggle immediately; a knob starts a
 // drag tracked in *vs instead.
+// Commits whatever NAM Model/IR field is currently being typed into (if any) -- writes
+// edit_buffer into the real FXSlotParams field and closes the editor. Called unconditionally at
+// the top of every hds_fx_gui_on_button_press(), same "any click ends the current transient UI
+// state" posture the dropdown-close-on-outside-click logic just below already has: clicking
+// elsewhere while editing SAVES what was typed (like tabbing out of any normal text field) rather
+// than silently discarding it, then the click's own normal hit-test proceeds -- so clicking a
+// DIFFERENT NAM pill commits the old one and immediately opens the new one, in one motion.
+static void hds_fx_gui_commit_edit(HdsFxPlugin *p, HdsFxGuiViewState *vs) {
+    if (vs->edit_row < 0) return;
+    char *dst = (vs->edit_field == 0) ? p->fx[vs->edit_row].nam_model_path : p->fx[vs->edit_row].nam_ir_path;
+    snprintf(dst, SAMPLE_PATH_LEN, "%s", vs->edit_buffer);
+    vs->edit_row = -1;
+}
+
 static bool hds_fx_gui_on_button_press(HdsFxPlugin *p, HdsFxGuiViewState *vs, double x, double y, int button) {
     int width = vs->window_w;
+    hds_fx_gui_commit_edit(p, vs);
 
     if (vs->dropdown.kind != HDS_FX_DROPDOWN_NONE) {
         int count = hds_fx_dropdown_option_count(vs->dropdown.kind);
@@ -887,6 +987,18 @@ static bool hds_fx_gui_on_button_press(HdsFxPlugin *p, HdsFxGuiViewState *vs, do
     if (hds_fx_type_uses_sidechain((int)p->fx[row].fx_type) && hds_fx_rect_contains(&L.sidechain_pill, x, y)) {
         vs->dropdown.kind = HDS_FX_DROPDOWN_SIDECHAIN; vs->dropdown.row = row; vs->dropdown.anchor = L.sidechain_pill;
         return true;
+    }
+    if (hds_fx_type_uses_nam_paths((int)p->fx[row].fx_type)) {
+        if (hds_fx_rect_contains(&L.nam_model_pill, x, y)) {
+            vs->edit_row = row; vs->edit_field = 0;
+            snprintf(vs->edit_buffer, sizeof(vs->edit_buffer), "%s", p->fx[row].nam_model_path);
+            return true;
+        }
+        if (hds_fx_rect_contains(&L.nam_ir_pill, x, y)) {
+            vs->edit_row = row; vs->edit_field = 1;
+            snprintf(vs->edit_buffer, sizeof(vs->edit_buffer), "%s", p->fx[row].nam_ir_path);
+            return true;
+        }
     }
     if (hds_fx_slot_is_chain_tail(p, row) && hds_fx_rect_contains(&L.output_pill, x, y)) {
         vs->dropdown.kind = HDS_FX_DROPDOWN_OUTPUT; vs->dropdown.row = row; vs->dropdown.anchor = L.output_pill;
@@ -940,6 +1052,44 @@ static void hds_fx_gui_on_motion(HdsFxPlugin *p, HdsFxGuiViewState *vs, double x
 }
 
 static void hds_fx_gui_on_button_release(HdsFxGuiViewState *vs) { vs->drag_kind = 0; }
+
+// Named key actions the platform shim (hds_fx_gui_x11.c) translates a real X11 KeyPress into --
+// keeps this file free of any X11 type, the same "zero windowing references" discipline this
+// file's own header comment already holds every other piece of drawing/hit-test logic to. A no-op
+// whenever nothing is being edited (vs->edit_row < 0) -- this GUI has exactly one thing keyboard
+// input can ever reach, FX_TYPE_NAM's own Model/IR path fields (see hds_fx_gui_on_button_press()'s
+// own NAM handling for how editing starts), so there's no focus model to manage beyond that.
+#define HDS_FX_KEY_CHAR 0      // a printable character in `ch`
+#define HDS_FX_KEY_BACKSPACE 1
+#define HDS_FX_KEY_ENTER 2     // commits edit_buffer into the real field, same as hds_fx_gui_commit_edit()
+#define HDS_FX_KEY_ESCAPE 3    // discards edit_buffer, leaving the field's real value untouched
+
+static void hds_fx_gui_on_key(HdsFxPlugin *p, HdsFxGuiViewState *vs, int action, char ch) {
+    if (vs->edit_row < 0) return;
+    size_t len = strlen(vs->edit_buffer);
+    switch (action) {
+        case HDS_FX_KEY_CHAR:
+            // Printable ASCII only (0x20..0x7e) -- a file path never needs anything outside that
+            // range, and this sidesteps ever having to reason about multi-byte UTF-8 XLookupString
+            // can hand back for a real IME/dead-key sequence.
+            if (ch >= 0x20 && ch < 0x7f && len + 1 < sizeof(vs->edit_buffer)) {
+                vs->edit_buffer[len] = ch;
+                vs->edit_buffer[len + 1] = '\0';
+            }
+            return;
+        case HDS_FX_KEY_BACKSPACE:
+            if (len > 0) vs->edit_buffer[len - 1] = '\0';
+            return;
+        case HDS_FX_KEY_ENTER:
+            hds_fx_gui_commit_edit(p, vs);
+            return;
+        case HDS_FX_KEY_ESCAPE:
+            vs->edit_row = -1; // discard -- do NOT call hds_fx_gui_commit_edit()
+            return;
+        default:
+            return;
+    }
+}
 
 // delta: +1 (wheel up / X11 Button4) or -1 (wheel down / X11 Button5).
 static void hds_fx_gui_on_scroll(HdsFxGuiViewState *vs, int delta) {

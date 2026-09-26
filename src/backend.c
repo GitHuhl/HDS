@@ -7254,6 +7254,16 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
     // paid regardless of patch complexity). See process_fx_chain()'s own comment for how the two
     // pieces fit together now.
     sync_fx_engine_types(knobs->fx, fx_engine);
+#if HDS_NAM_ENABLED
+    // Same "once per block, right after sync_fx_engine_types" precondition as that call itself --
+    // see poll_fx_nam_requests()'s own comment in fx_chain.c. Hoisted up here (rather than each
+    // caller polling separately, the way hds_standalone.c's own main loop used to) so BOTH
+    // hds_standalone.c and clap_plugin.c get working NAM model/cab-IR loading for free, the same
+    // way they already share every other piece of render_audio_block -- this was the actual fix
+    // for the CLAP-plugin-side gap fx_nam_reload_model/fx_nam_reload_ir's own comment used to
+    // document as a known, unaddressed limitation.
+    poll_fx_nam_requests(knobs->fx, fx_engine);
+#endif
     bool source_has_fx_slots[SOURCE_COUNT] = {false};
     for (int s = 0; s < FX_SLOT_COUNT; s++) {
         int src = (int)knobs->fx[s].fx_source;

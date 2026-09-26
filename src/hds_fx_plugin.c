@@ -13,19 +13,26 @@
 // A slot's param layout is the same FXSlotParams struct either way, so it's already
 // interchangeable between the synth's embedded FX bus and this plugin.
 //
-// NAM (FX_TYPE_NAM) is deliberately disabled in this first pass (HDS_NAM_ENABLED 0 below, which
-// compiles every NAM code path out of fx_chain.c entirely) -- it needs the small C++ bridge
-// (nam_bridge.h/.cpp over the vendored NeuralAmpModelerCore) clap_plugin.c also links against, and
-// pulling that in is a real, separate, scoped follow-up once the rest of this plugin is proven, not
-// something to bundle into a from-scratch first version.
+// NAM (FX_TYPE_NAM) is enabled (HDS_NAM_ENABLED 1 below) and genuinely works here: it needs the
+// small C++ bridge (nam_bridge.h/.cpp over the vendored NeuralAmpModelerCore) clap_plugin.c also
+// links against -- see the Makefile's own hds-fx target for how NAM_OBJS get pulled into this
+// plugin's own link step. This plugin's first pass shipped with NAM compiled out entirely, deferred
+// as a scoped follow-up -- turned out that follow-up needed more than just flipping the flag: model/
+// cab-IR (re)loading (poll_fx_nam_requests()/fx_nam_reload_model()/fx_nam_reload_ir(), all in
+// fx_chain.c) had been living in hds_standalone.c, never called from ANY CLAP plugin's process() at
+// all, which meant hds.clap's own FX_TYPE_NAM slots couldn't load a model either -- a real,
+// confirmed bug, not a hypothetical one. Fixed by moving those three functions back into fx_chain.c
+// (genuinely shared now) and having every FX-bus-running translation unit call
+// poll_fx_nam_requests() itself once per block -- see hds_fx_plugin_process()'s own call, and
+// backend.c's render_audio_block for the equivalent shared fix on the synth's own side.
 //
 // HardTune's (FX_TYPE_HARDTUNE) live-MIDI vibrato control reads four small globals
 // (g_hardtune_held_note/g_hardtune_bend_semitones/g_hardtune_modwheel/g_hardtune_channel_pressure)
 // that backend.c's own MIDI dispatch normally feeds -- this plugin declares them too (see just
 // below fx_chain.c needs them to compile) but never writes them, since this plugin has no note-port
 // and never sees MIDI performance data. HardTune's pitch-correction itself works exactly as normal;
-// only its OPTIONAL vibrato-from-CC/pitch-bend feature is inert here, same "harmless, not wired up
-// yet" posture as NAM above -- a real MIDI input port (for CC/pitch-bend modulation of FX params
+// only its OPTIONAL vibrato-from-CC/pitch-bend feature is inert here, same "harmless, not wired up"
+// posture NAM used to have -- a real MIDI input port (for CC/pitch-bend modulation of FX params
 // generally, not just HardTune's vibrato) is a natural, separate future addition.
 //
 // Multi-instance safety comes for free: process_fx_chain()/sync_fx_engine_types()/reset_fx_engine()
@@ -75,6 +82,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdarg.h>
+#include <errno.h> // needed by fx_chain.c's own seq_audio_load_wav_from_disk() (strerror(errno))
 #include "../third_party/clap/include/clap/clap.h" // already pulls in ext/gui.h and ext/timer-support.h
 
 // The handful of plain constants fx_types.h/fx_chain.c need defined before they're #include'd --
@@ -101,7 +109,17 @@
 // sidechain_source's own numbering (see fx_types.h) -- one flat id space throughout.
 #define HDS_FX_PORT_COUNT 8
 #define SOURCE_COUNT HDS_FX_PORT_COUNT
-#define HDS_NAM_ENABLED 0
+// NAM was deliberately disabled in this plugin's first pass (see this file's own header comment,
+// now stale on that point) until fx_chain.c's own poll_fx_nam_requests()/fx_nam_reload_model()/
+// fx_nam_reload_ir() actually worked from ANY CLAP plugin context -- they didn't (a real,
+// confirmed gap: they lived in hds_standalone.c, never called from clap_plugin.c's process()
+// either, so hds.clap's own FX_TYPE_NAM slots could never load a model). Now that they're back in
+// the genuinely shared fx_chain.c and this plugin calls poll_fx_nam_requests() itself every block
+// (see hds_fx_plugin_process()'s own call), NAM works here for real -- same nam_bridge.h C++ shim
+// clap_plugin.c already links, the one piece of C++ in an otherwise pure-C build (see the
+// Makefile's own hds-fx target for how NAM_OBJS get linked in).
+#define HDS_NAM_ENABLED 1
+#include "nam_bridge.h" // extern "C" shim over NeuralAmpModelerCore -- see that header's own comment
 
 // fx_chain.c's own g_hardtune_held_note/g_hardtune_bend_semitones/g_hardtune_modwheel/
 // g_hardtune_channel_pressure globals (declared there, not here -- see this file's own header
@@ -598,6 +616,14 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
     // synced to its current fx_type once per block, before any per-sample dispatch. One call now
     // (not once per port) -- there's only one pool.
     sync_fx_engine_types(p->fx, p->fx_engine);
+#if HDS_NAM_ENABLED
+    // Same "once per block, right after sync_fx_engine_types" precondition as that call itself --
+    // see poll_fx_nam_requests()'s own comment in fx_chain.c. This plugin has no separate
+    // standalone-style main loop to poll from the way hds_standalone.c does, so process() itself is
+    // the one place per block this can run -- the equivalent shared call for the synth's own side
+    // lives in backend.c's render_audio_block instead.
+    poll_fx_nam_requests(p->fx, p->fx_engine);
+#endif
     // gr_db_scratch zeroed once per block, then refreshed by whichever port's call owns each slot
     // this sample -- same convention as backend.c's own gr_db_out (see render_audio_block).
     for (int s = 0; s < FX_SLOT_COUNT; s++) p->gr_db_scratch[s] = 0.0f;

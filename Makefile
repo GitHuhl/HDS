@@ -105,16 +105,17 @@ CLAP_SRC := src/clap_plugin.c
 # --- HDS FX: standalone, synth-free CLAP effects plugin (make hds-fx) ---
 # Produces hds_fx.clap. Unlike $(CLAP_BIN) above, this does NOT #include backend.c at all -- see
 # src/hds_fx_plugin.c's own header comment for why (no OSC/networking, no synth, just src/fx_types.h
-# + src/fx_chain.c, the same FX DSP backend.c's own embedded FX bus already runs). NAM
-# (FX_TYPE_NAM) is compiled out entirely here (HDS_NAM_ENABLED 0 in hds_fx_plugin.c itself), so
-# this is the one real target in this Makefile that needs neither $(CXX) nor any NAM_OBJS -- a
-# plain $(CC) link, pure C, no liblo/-llo either. It DOES need Cairo + X11 now (src/hds_fx_gui_x11.c
-# -- the real embedded GUI, see that file's own header comment): both are pulled in via pkg-config
-# rather than hardcoded flags, same posture as the PipeWire auto-detection above.
+# + src/fx_chain.c, the same FX DSP backend.c's own embedded FX bus already runs). NAM (FX_TYPE_NAM)
+# IS enabled here (HDS_NAM_ENABLED 1 in hds_fx_plugin.c itself, same nam_bridge.h/.cpp C++ bridge
+# $(CLAP_BIN) already links), so this target needs the same $(NAM_INC)/$(NAM_OBJS)/$(CXX) final-
+# link treatment $(BIN)/$(CLAP_BIN) already get below, not a plain $(CC) link. It ALSO needs Cairo +
+# X11 (src/hds_fx_gui_x11.c -- the real embedded GUI, see that file's own header comment): both are
+# pulled in via pkg-config rather than hardcoded flags, same posture as the PipeWire auto-detection
+# above.
 HDS_FX_SRC := src/hds_fx_plugin.c
 HDS_FX_BIN := hds_fx.clap
 HDS_FX_OBJ := $(BUILD_DIR)/hds_fx_plugin.o
-HDS_FX_CFLAGS := $(shell pkg-config --cflags cairo x11)
+HDS_FX_CFLAGS := $(shell pkg-config --cflags cairo x11) $(NAM_INC)
 HDS_FX_LDLIBS := $(shell pkg-config --libs cairo x11) -lm
 
 # --- Raspberry Pi 5 / aarch64 Linux cross-build (make arm64) ---
@@ -196,7 +197,7 @@ $(BIN_OBJ): $(SRC) src/backend.c src/fx_types.h src/fx_chain.c src/sequencer.c s
 $(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
-$(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.c src/hds_fx_gui_draw.c src/hds_fx_gui_x11.c | $(BUILD_DIR)
+$(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.c src/hds_fx_gui_draw.c src/hds_fx_gui_x11.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(HDS_FX_CFLAGS) -fPIC -I$(CLAP_INC) -c $(HDS_FX_SRC) -o $@
 
 # Three source directories (NAM/, NAM/wavenet/, src/) flattened into one object directory -- see
@@ -216,8 +217,8 @@ $(BIN): $(BIN_OBJ) $(NAM_OBJS)
 clap: $(CLAP_OBJ) $(NAM_OBJS)
 	$(CXX) -shared -o $(CLAP_BIN) $(CLAP_OBJ) $(NAM_OBJS) $(LDLIBS)
 
-hds-fx: $(HDS_FX_OBJ)
-	$(CC) -shared -o $(HDS_FX_BIN) $(HDS_FX_OBJ) $(HDS_FX_LDLIBS)
+hds-fx: $(HDS_FX_OBJ) $(NAM_OBJS)
+	$(CXX) -shared -o $(HDS_FX_BIN) $(HDS_FX_OBJ) $(NAM_OBJS) $(HDS_FX_LDLIBS)
 
 # arm64's own NAM object set: SEPARATE .o files from $(NAM_OBJS) above (wrong ISA to reuse, even
 # though the flags are identical -- NAM_CXXFLAGS needs nothing arm64-specific since NAM_INC is just

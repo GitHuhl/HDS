@@ -107,98 +107,13 @@ static void transport_start_fresh(HdsStreamsState *streams, HdsEngineState *engi
 }
 
 
-// Reads an entire WAV file into a newly malloc'd interleaved float buffer. Deliberately separate
-// from load_sample_slot() above (which only caches a short pre-roll and hands the rest to
-// on-demand disk streaming) -- an audio lane's whole clip lives in RAM at once, so this is a
-// plain one-shot full-file decode, run only on seq_audio_loader_thread_main's own thread. Keeps
-// every channel present in the file (unlike the sampler's mono/stereo-only pre-roll) since a
-// lane's own future mixdown, not this loader, should decide how to handle >2 channels. Returns
-// NULL on any failure (out_frames/out_channels/out_sample_rate left at 0).
-static float *seq_audio_load_wav_from_disk(const char *path, int *out_frames, int *out_channels, int *out_sample_rate) {
-    *out_frames = 0; *out_channels = 0; *out_sample_rate = 0;
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "[seq-audio] failed to open '%s': %s\n", path, strerror(errno)); return NULL; }
-
-    char chunk_id[4];
-    fseek(f, 12, SEEK_SET);
-    if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
-    while (strncmp(chunk_id, "fmt ", 4) != 0) {
-        unsigned int chunk_size;
-        if (fread(&chunk_size, 4, 1, f) != 1) { fclose(f); return NULL; }
-        fseek(f, chunk_size, SEEK_CUR);
-        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
-    }
-
-    unsigned int subchunk1_size; unsigned short audio_format, num_channels;
-    unsigned int sample_rate, byte_rate; unsigned short block_align, bits_per_sample;
-    if (fread(&subchunk1_size, 4, 1, f) != 1) { fclose(f); return NULL; }
-    if (fread(&audio_format, 2, 1, f) != 1) { fclose(f); return NULL; }
-    if (fread(&num_channels, 2, 1, f) != 1) { fclose(f); return NULL; }
-    if (fread(&sample_rate, 4, 1, f) != 1) { fclose(f); return NULL; }
-    if (fread(&byte_rate, 4, 1, f) != 1) { fclose(f); return NULL; }
-    if (fread(&block_align, 2, 1, f) != 1) { fclose(f); return NULL; }
-    if (fread(&bits_per_sample, 2, 1, f) != 1) { fclose(f); return NULL; }
-    (void)byte_rate; (void)block_align;
-
-    if (audio_format != 1 && audio_format != 3) {
-        fprintf(stderr, "[seq-audio] '%s': unsupported WAV format tag %u (need 1=PCM or 3=float)\n", path, audio_format);
-        fclose(f); return NULL;
-    }
-    if (audio_format == 1 && bits_per_sample != 16 && bits_per_sample != 24 && bits_per_sample != 32) {
-        fprintf(stderr, "[seq-audio] '%s': unsupported %u-bit PCM\n", path, bits_per_sample);
-        fclose(f); return NULL;
-    }
-    if (audio_format == 3 && bits_per_sample != 32) {
-        fprintf(stderr, "[seq-audio] '%s': float WAV must be 32-bit\n", path);
-        fclose(f); return NULL;
-    }
-    if (num_channels == 0) { fclose(f); return NULL; }
-    if (subchunk1_size > 16) fseek(f, subchunk1_size - 16, SEEK_CUR);
-
-    if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
-    while (strncmp(chunk_id, "data", 4) != 0) {
-        unsigned int chunk_size;
-        if (fread(&chunk_size, 4, 1, f) != 1) { fclose(f); return NULL; }
-        fseek(f, chunk_size, SEEK_CUR);
-        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
-    }
-    unsigned int data_size;
-    if (fread(&data_size, 4, 1, f) != 1) { fclose(f); return NULL; }
-
-    int bytes_per_sample = bits_per_sample / 8;
-    unsigned int total_frames = data_size / (unsigned int)(num_channels * bytes_per_sample);
-    if (total_frames == 0) { fclose(f); return NULL; }
-
-    float *pcm = malloc((size_t)total_frames * num_channels * sizeof(float));
-    if (!pcm) { fprintf(stderr, "[seq-audio] '%s': out of memory (%u frames x %u ch)\n", path, total_frames, num_channels); fclose(f); return NULL; }
-
-    for (unsigned int i = 0; i < total_frames * num_channels; i++) {
-        float sample = 0.0f;
-        bool ok = true;
-        if (audio_format == 1) {
-            if (bits_per_sample == 16) {
-                short raw16;
-                if (fread(&raw16, 2, 1, f) != 1) ok = false; else sample = (float)raw16 / 32768.0f;
-            } else if (bits_per_sample == 24) {
-                unsigned char b24[3];
-                if (fread(b24, 1, 3, f) != 3) ok = false;
-                else { int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); sample = (float)v / 2147483648.0f; }
-            } else {
-                int raw32;
-                if (fread(&raw32, 4, 1, f) != 1) ok = false; else sample = (float)raw32 / 2147483648.0f;
-            }
-        } else {
-            if (fread(&sample, 4, 1, f) != 1) ok = false;
-        }
-        if (!ok) { fprintf(stderr, "[seq-audio] '%s': truncated read at sample %u\n", path, i); free(pcm); fclose(f); return NULL; }
-        pcm[i] = sample;
-    }
-    fclose(f);
-    *out_frames = (int)total_frames;
-    *out_channels = (int)num_channels;
-    *out_sample_rate = (int)sample_rate;
-    return pcm;
-}
+// seq_audio_load_wav_from_disk() itself moved to fx_chain.c (see that file's own comment on why:
+// FX_TYPE_NAM's cab IR loader needs the exact same WAV decoder, and fx_chain.c is genuinely shared
+// across every translation unit -- backend.c, hds_fx_plugin.c, and (via backend.c) this file's own
+// includer hds_standalone.c -- while this file (sequencer.c) is standalone-only, never linked into
+// either CLAP plugin. Still available here under the same name (fx_chain.c is #include'd by
+// backend.c, itself #include'd by hds_standalone.c BEFORE this file, so it's in scope by the time
+// this line runs) -- pure code motion, no behavior change, no new cross-file symbol.
 
 // Linear-interpolation sample-rate conversion. Runs once, only on this (non-realtime) loader
 // thread, so a plain single-pass linear resample is more than adequate -- nothing here needs to

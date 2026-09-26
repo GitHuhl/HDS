@@ -1757,6 +1757,106 @@ static void run_fx_cabs2(FXSlotEngine *engine, const FXSlotParams *params, float
     *r = inputSampleR;
 }
 
+// Reads an entire WAV file into a newly malloc'd interleaved float buffer. Moved here (from
+// sequencer.c, its original home) because it now has TWO independent callers that don't share a
+// translation unit: sequencer.c's own audio lanes (standalone-only, via hds_standalone.c) and
+// FX_TYPE_NAM's cab IR loader just below (needed in every translation unit that runs the FX bus at
+// all, including both CLAP plugins) -- fx_chain.c is the one file already #include'd by all three
+// (backend.c, hence hds_standalone.c and clap_plugin.c, plus hds_fx_plugin.c directly), so this is
+// where a function two of them need independently of each other has to live. Deliberately OUTSIDE
+// the `#if HDS_NAM_ENABLED` guard just below -- sequencer.c's own use of it has nothing to do with
+// NAM at all, so it must stay available even in a hypothetical build with NAM compiled out.
+// Deliberately separate from load_sample_slot() (which only caches a short pre-roll and hands the
+// rest to on-demand disk streaming) -- an audio lane's whole clip lives in RAM at once, so this is
+// a plain one-shot full-file decode. Keeps every channel present in the file (unlike the sampler's
+// mono/stereo-only pre-roll) since the caller, not this loader, should decide how to handle >2
+// channels. Returns NULL on any failure (out_frames/out_channels/out_sample_rate left at 0).
+static float *seq_audio_load_wav_from_disk(const char *path, int *out_frames, int *out_channels, int *out_sample_rate) {
+    *out_frames = 0; *out_channels = 0; *out_sample_rate = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[seq-audio] failed to open '%s': %s\n", path, strerror(errno)); return NULL; }
+
+    char chunk_id[4];
+    fseek(f, 12, SEEK_SET);
+    if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    while (strncmp(chunk_id, "fmt ", 4) != 0) {
+        unsigned int chunk_size;
+        if (fread(&chunk_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+        fseek(f, chunk_size, SEEK_CUR);
+        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    }
+
+    unsigned int subchunk1_size; unsigned short audio_format, num_channels;
+    unsigned int sample_rate, byte_rate; unsigned short block_align, bits_per_sample;
+    if (fread(&subchunk1_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&audio_format, 2, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&num_channels, 2, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&sample_rate, 4, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&byte_rate, 4, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&block_align, 2, 1, f) != 1) { fclose(f); return NULL; }
+    if (fread(&bits_per_sample, 2, 1, f) != 1) { fclose(f); return NULL; }
+    (void)byte_rate; (void)block_align;
+
+    if (audio_format != 1 && audio_format != 3) {
+        fprintf(stderr, "[seq-audio] '%s': unsupported WAV format tag %u (need 1=PCM or 3=float)\n", path, audio_format);
+        fclose(f); return NULL;
+    }
+    if (audio_format == 1 && bits_per_sample != 16 && bits_per_sample != 24 && bits_per_sample != 32) {
+        fprintf(stderr, "[seq-audio] '%s': unsupported %u-bit PCM\n", path, bits_per_sample);
+        fclose(f); return NULL;
+    }
+    if (audio_format == 3 && bits_per_sample != 32) {
+        fprintf(stderr, "[seq-audio] '%s': float WAV must be 32-bit\n", path);
+        fclose(f); return NULL;
+    }
+    if (num_channels == 0) { fclose(f); return NULL; }
+    if (subchunk1_size > 16) fseek(f, subchunk1_size - 16, SEEK_CUR);
+
+    if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    while (strncmp(chunk_id, "data", 4) != 0) {
+        unsigned int chunk_size;
+        if (fread(&chunk_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+        fseek(f, chunk_size, SEEK_CUR);
+        if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return NULL; }
+    }
+    unsigned int data_size;
+    if (fread(&data_size, 4, 1, f) != 1) { fclose(f); return NULL; }
+
+    int bytes_per_sample = bits_per_sample / 8;
+    unsigned int total_frames = data_size / (unsigned int)(num_channels * bytes_per_sample);
+    if (total_frames == 0) { fclose(f); return NULL; }
+
+    float *pcm = malloc((size_t)total_frames * num_channels * sizeof(float));
+    if (!pcm) { fprintf(stderr, "[seq-audio] '%s': out of memory (%u frames x %u ch)\n", path, total_frames, num_channels); fclose(f); return NULL; }
+
+    for (unsigned int i = 0; i < total_frames * num_channels; i++) {
+        float sample = 0.0f;
+        bool ok = true;
+        if (audio_format == 1) {
+            if (bits_per_sample == 16) {
+                short raw16;
+                if (fread(&raw16, 2, 1, f) != 1) ok = false; else sample = (float)raw16 / 32768.0f;
+            } else if (bits_per_sample == 24) {
+                unsigned char b24[3];
+                if (fread(b24, 1, 3, f) != 3) ok = false;
+                else { int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); sample = (float)v / 2147483648.0f; }
+            } else {
+                int raw32;
+                if (fread(&raw32, 4, 1, f) != 1) ok = false; else sample = (float)raw32 / 2147483648.0f;
+            }
+        } else {
+            if (fread(&sample, 4, 1, f) != 1) ok = false;
+        }
+        if (!ok) { fprintf(stderr, "[seq-audio] '%s': truncated read at sample %u\n", path, i); free(pcm); fclose(f); return NULL; }
+        pcm[i] = sample;
+    }
+    fclose(f);
+    *out_frames = (int)total_frames;
+    *out_channels = (int)num_channels;
+    *out_sample_rate = (int)sample_rate;
+    return pcm;
+}
+
 #if HDS_NAM_ENABLED
 // --- FX_TYPE_NAM: Neural Amp Modeler (NeuralAmpModelerCore, MIT license) --- see FX_TYPE_NAM's
 // own comment above for the param map and why this needed a small C++ bridge (nam_bridge.h/.cpp)
@@ -1767,11 +1867,11 @@ static void run_fx_cabs2(FXSlotEngine *engine, const FXSlotParams *params, float
 // iirAngle arrays above, PointyGuitar's own per-channel bands) never share state either.
 //
 // Cab IR convolution is plain C, not more C++: NeuralAmpModelerCore's own wav.h only exposes a raw
-// decode helper (load_wav_ir), not a ready convolution engine, and this file already has a working
-// WAV decoder (seq_audio_load_wav_from_disk, used by Sequencer audio lanes) -- reusing it here
-// avoids a second file-format dependency for the one new thing actually needed: the convolution
-// loop itself, a plain per-sample ring-buffer dot product like every other hand-rolled effect in
-// this file.
+// decode helper (load_wav_ir), not a ready convolution engine, and this file's own
+// seq_audio_load_wav_from_disk() just above already decodes WAVs -- reusing it here avoids a
+// second file-format dependency for the one new thing actually needed: the convolution loop
+// itself, a plain per-sample ring-buffer dot product like every other hand-rolled effect in this
+// file.
 typedef struct {
     void *model_l, *model_r;                 // bridge-owned nam::DSP*, NULL until a model is loaded
     char loaded_model_path[SAMPLE_PATH_LEN];   // "" if none -- compared against fx.nam_model_path
@@ -1822,6 +1922,107 @@ static void fx_nam_free_state(FxNamState *st) {
     hds_nam_destroy(st->model_l);
     hds_nam_destroy(st->model_r);
     fx_nam_free_ir(st);
+}
+
+// fx_nam_reload_model/fx_nam_reload_ir/poll_fx_nam_requests -- genuinely shared now, not just
+// backend.c's own concern: originally lived in hds_standalone.c (moved there under the mistaken
+// assumption that ONLY the standalone binary would ever poll for a path change), which meant a
+// CLAP plugin's own FX_TYPE_NAM slots could load a model file at all -- neither hds.clap
+// (clap_plugin.c never called poll_fx_nam_requests()) nor a plugin like HDS FX could ever have
+// working NAM support, a real, confirmed gap, not a hypothetical one. Moved back here, right next
+// to run_fx_nam()/FxNamState/fx_nam_free_state above (their only real home), so every translation
+// unit that runs the FX bus -- backend.c (hds_standalone.c/clap_plugin.c) AND hds_fx_plugin.c
+// directly -- gets working NAM for free by calling poll_fx_nam_requests() once per block, the same
+// way they already all share process_fx_chain()/sync_fx_engine_types(). Takes a plain
+// `FXSlotParams fx[FX_SLOT_COUNT]` array directly (not a SynthSharedControls*, which only backend.c
+// has) -- the same convention sync_fx_engine_types()/process_fx_chain() already use, precisely so
+// hds_fx_plugin.c's own flat pool (no wrapping struct at all) can call it identically.
+static void fx_nam_reload_model(FxNamState *st, const char *path) {
+    hds_nam_destroy(st->model_l); st->model_l = NULL;
+    hds_nam_destroy(st->model_r); st->model_r = NULL;
+    snprintf(st->loaded_model_path, SAMPLE_PATH_LEN, "%s", path);
+    st->model_load_failed = false;
+    if (path[0] == '\0') return; // cleared -- leave both NULL, run_fx_nam() then passes dry
+    // num_frames=1 is this call's own real usage pattern (see run_fx_nam()), but Reset() still
+    // wants a genuine max-block-size hint for any internal buffer sizing the model does up front.
+    st->model_l = hds_nam_create(path, (double)SAMPLE_RATE, 1);
+    st->model_r = hds_nam_create(path, (double)SAMPLE_RATE, 1);
+    if (!st->model_l || !st->model_r) {
+        fprintf(stderr, "[nam] failed to load model '%s'\n", path);
+        hds_nam_destroy(st->model_l); st->model_l = NULL;
+        hds_nam_destroy(st->model_r); st->model_r = NULL;
+        st->model_load_failed = true;
+    }
+}
+
+static void fx_nam_reload_ir(FxNamState *st, const char *path) {
+    fx_nam_free_ir(st);
+    snprintf(st->loaded_ir_path, SAMPLE_PATH_LEN, "%s", path);
+    st->ir_load_failed = false;
+    if (path[0] == '\0') return; // cleared -- leave NULL, run_fx_nam() then skips the cab stage
+
+    int frames = 0, channels = 0, sample_rate = 0;
+    float *pcm = seq_audio_load_wav_from_disk(path, &frames, &channels, &sample_rate);
+    if (!pcm || frames <= 0) { st->ir_load_failed = true; free(pcm); return; }
+
+    int taps = frames;
+    bool truncated = false;
+    if (taps > FX_NAM_IR_MAX_TAPS) { taps = FX_NAM_IR_MAX_TAPS; truncated = true; }
+
+    st->ir_l = malloc(sizeof(float) * (size_t)taps);
+    bool stereo = channels >= 2;
+    st->ir_r = stereo ? malloc(sizeof(float) * (size_t)taps) : st->ir_l;
+    if (!st->ir_l || (stereo && !st->ir_r)) {
+        fx_nam_free_ir(st); st->ir_load_failed = true; free(pcm); return;
+    }
+    for (int i = 0; i < taps; i++) {
+        st->ir_l[i] = pcm[(size_t)i * channels];
+        if (stereo) st->ir_r[i] = pcm[(size_t)i * channels + 1];
+    }
+    free(pcm);
+
+    st->ir_taps = taps;
+    // Always two independent rings, even for a mono IR -- see the struct's own comment on why
+    // ir_hist_l/ir_hist_r must never alias the way ir_l/ir_r (read-only coefficients) safely can.
+    st->ir_hist_l = calloc((size_t)taps, sizeof(float));
+    st->ir_hist_r = calloc((size_t)taps, sizeof(float));
+    st->ir_hist_pos_l = 0; st->ir_hist_pos_r = 0;
+    if (!st->ir_hist_l || !st->ir_hist_r) { fx_nam_free_ir(st); st->ir_load_failed = true; return; }
+
+    if (truncated) fprintf(stderr, "[nam] cab IR '%s' truncated to %d taps (was %d)\n", path, taps, frames);
+    if (sample_rate != 0 && sample_rate != SAMPLE_RATE) {
+        fprintf(stderr, "[nam] cab IR '%s' is %d Hz, engine runs at %d Hz -- loaded as-is, uncorrected\n", path, sample_rate, SAMPLE_RATE);
+    }
+}
+
+// Same "once-per-block change detection" shape as poll_seq_audio_load_requests() (hds_standalone.c,
+// standalone-only -- Sequencer audio lanes are a real, separate, already-documented CLAP gap, this
+// one just got fixed). Notices when an FX slot's nam_model_path/nam_ir_path differs from what that
+// slot's own state already has loaded, and (re)loads it. Runs the load SYNCHRONOUSLY on whatever
+// thread calls it (this plugin's own audio/main thread, same one process() itself runs on for both
+// CLAP plugins) rather than spawning a loader thread: a .nam model file is a small, bounded
+// JSON+weights blob (nothing like a whole song-length audio recording), and a cab IR is capped at
+// FX_NAM_IR_MAX_TAPS frames -- both comfortably finish within one block's worth of stall.
+//
+// Only meaningful once a slot's own engine state actually exists as an FxNamState -- gated on
+// active_type == FX_TYPE_NAM, which sync_fx_engine_types() (the caller's own responsibility to run
+// first, same block -- see e.g. hds_fx_plugin_process()'s own call order) guarantees is current for
+// any type change already applied by the time this runs; a slot switched to FX_TYPE_NAM within the
+// SAME block this runs simply picks up its load on the next block instead, same one-block grace
+// every other live-knob check in a per-block poll like this already has.
+static void poll_fx_nam_requests(const FXSlotParams fx[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT]) {
+    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+        if (fx_engine[s].active_type != FX_TYPE_NAM || !fx_engine[s].state) continue;
+        FxNamState *st = (FxNamState *)fx_engine[s].state;
+        const char *want_model = fx[s].nam_model_path;
+        if (strncmp(want_model, st->loaded_model_path, SAMPLE_PATH_LEN) != 0) {
+            fx_nam_reload_model(st, want_model);
+        }
+        const char *want_ir = fx[s].nam_ir_path;
+        if (strncmp(want_ir, st->loaded_ir_path, SAMPLE_PATH_LEN) != 0) {
+            fx_nam_reload_ir(st, want_ir);
+        }
+    }
 }
 
 // One tap of the direct-form FIR: writes this sample into the ring, then walks it oldest-to-newest

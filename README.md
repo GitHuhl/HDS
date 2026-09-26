@@ -969,16 +969,16 @@ byte-for-byte interchangeable between the synth's embedded FX and this plugin.
 whatever the DAW routes in, with no "bus" concept anywhere (Reaper doesn't have one, and neither does
 this plugin). 8 real stereo CLAP ports each way (`HDS_FX_PORT_COUNT`) -- the same physical shape as
 any normal stereo insert effect's ports, not 16 raw mono ports and not a mixer-strip's worth of
-always-simultaneous buses. What's explicit rather than assumed is how a port gets USED: each slot's
-own Input picks which of the 8 ports feeds its chain AND whether that chain treats the port as Mono
-(only L is read, centered to `dry_l == dry_r` before any FX runs) or Stereo (L and R both read as a
-real stereo signal) -- live only on a chain HEAD (`hds_fx_slot_is_chain_head()`; a slot fed by the
-previous slot's own Chain-to-Next has no Input of its own, it just inherits the running signal).
-Once a slot's own Chain-to-Next is off (it's a chain TAIL, or a standalone single-slot chain), its
-own Output -- independent of its Input, same Mono/Stereo choice -- says which port the result lands
-on and how: Mono writes the identical value to BOTH L and R of the chosen port (a proper centered
-placement, never stuck in one ear), Stereo writes `l` to L and `r` to R. A chain reading Port 3 can
-perfectly well come back out on Port 7.
+always-simultaneous buses. What's explicit rather than assumed is how a port's INPUT gets read: each
+slot's own Input picks which of the 8 ports feeds its chain AND whether that chain treats the port as
+Mono (only L is read, centered to `dry_l == dry_r` before any FX runs) or Stereo (L and R both read as
+a real stereo signal) -- live only on a chain HEAD (`hds_fx_slot_is_chain_head()`; a slot fed by the
+previous slot's own Chain-to-Next has no Input of its own, it just inherits the running signal). Once
+a slot's own Chain-to-Next is off (it's a chain TAIL, or a standalone single-slot chain), its own
+Output -- independent of its Input -- says which port the result lands on: `l` to that port's own L,
+`r` to its own R, always, full stop. A chain reading Port 3 can perfectly well come back out on
+Port 7. Output has NO Mono/Stereo choice of its own (an earlier revision did -- see this file's own
+"A second real bug" paragraph further down for why that was removed, not just simplified away).
 
 **Chain-to-Next always works, full stop, on every slot, unconditionally -- there is no separate
 Series/Parallel mode to gate it.** An earlier draft copied the synth's own per-source
@@ -1026,12 +1026,6 @@ state save/load + `frontend.py`'s own Ext In config UI), not bundled into this p
 
 **What this first pass deliberately leaves out**, each a real, separate, scoped follow-up rather
 than an oversight:
-- **NAM (`FX_TYPE_NAM`) is compiled out entirely** (`HDS_NAM_ENABLED 0` in hds_fx_plugin.c) -- it
-  needs the small C++ bridge (`nam_bridge.h`/`.cpp` over the vendored NeuralAmpModelerCore)
-  `clap_plugin.c` also links against; pulling that in (and its C++ toolchain requirement) is
-  deferred until the rest of this plugin is proven. `hds-fx`'s own build is otherwise pure C, no
-  `$(CXX)` needed at all (Cairo + X11 for the real GUI, see below, are both plain C libraries linked
-  via pkg-config), which is also why `hds_fx.clap` is ~110KB versus `hds.clap`'s ~1.5MB.
 - **HardTune's (`FX_TYPE_HARDTUNE`) live-MIDI vibrato control is inert.** It reads four small
   globals (`g_hardtune_held_note`/`g_hardtune_bend_semitones`/`g_hardtune_modwheel`/
   `g_hardtune_channel_pressure`) that backend.c's own MIDI dispatch normally feeds; this plugin has
@@ -1047,9 +1041,55 @@ than an oversight:
   Output/Chain-to-Next are meant to be driven by this plugin's own native GUI instead (see below) --
   writing directly into the plugin's per-instance struct, the same plain unsynchronized
   main-thread-writes/audio-thread-reads float race `clap_plugin.c`'s own `p->knobs` already accepts.
-- **No `state` extension (DAW project save/load) yet.** A real, known gap for an "experiment" build,
-  not silently swept under anything -- a host that doesn't get state persistence for this plugin
-  will say so.
+
+**NAM (`FX_TYPE_NAM`) is enabled and genuinely works** -- this plugin's first pass shipped with it
+compiled out entirely (`HDS_NAM_ENABLED 0`), deferred as a scoped follow-up. Turning it on properly
+surfaced a real, confirmed bug, not just a flag flip: `poll_fx_nam_requests()`/
+`fx_nam_reload_model()`/`fx_nam_reload_ir()` -- the only things that ever actually load a `.nam`
+model or cab IR off disk -- had been living in `hds_standalone.c`, never called from ANY CLAP
+plugin's `process()` at all. That meant `hds.clap`'s own `FX_TYPE_NAM` slots could never load a
+model either, a pre-existing gap this work exposed and fixed for both plugins at once, not
+something new to HDS FX. Fixed by moving those three functions back into the genuinely shared
+`fx_chain.c` (along with `seq_audio_load_wav_from_disk()`, the WAV decoder cab IR loading depends
+on, also relocated there from `sequencer.c` for the same reason) and having every FX-bus-running
+translation unit call `poll_fx_nam_requests()` itself once per block -- `hds_fx_plugin_process()`
+directly (no separate main loop to poll from, unlike the standalone binary), and `backend.c`'s own
+`render_audio_block` for both `synth_engine` and `hds.clap` at once. `hds-fx` now links the same
+`nam_bridge.h`/`.cpp` C++ shim and `NAM_OBJS` `hds.clap` already does (`$(CXX)` final link, same as
+that target) -- no longer a pure-C build, `hds_fx.clap` grew from ~110KB to ~1.3MB as a direct
+result, an honest tradeoff for a real feature rather than a regression.
+
+Since this plugin has no OSC/frontend.py connection at all (see this file's own header comment) and
+deliberately stays a plain Cairo+X11 build with no GTK/Qt file-picker dependency, NAM's model/cab IR
+paths are set by typing or pasting directly into two dedicated pills (see the GUI section below) --
+real X11 keyboard input, added specifically for this (`hds_fx_gui_on_key()` in `hds_fx_gui_draw.c`,
+`KeyPress` handling + an explicit `XSetInputFocus()` call in `hds_fx_gui_x11.c`, since a reparented/
+embedded window doesn't receive keyboard focus automatically without the full XEmbed protocol -- see
+that file's own comment on why this plugin doesn't implement that yet).
+
+**A second real bug, in the SAME "what does Output actually do" area**: an earlier revision gave
+Output its own Mono/Stereo choice, mirroring Input's -- but every one of the 8 CLAP ports is already
+a fixed 2-channel (L+R) stereo pair, so "Mono" there could only ever mean "write the same centered
+value to BOTH channels of the chosen port," never "land on one independent physical channel and leave
+the other alone." Worse, the stereo option's own label ("Out 2+3") implied COMBINING two separate
+ports into one signal, which no code anywhere ever did -- confirmed live: selecting "2+3" landed on
+port 2 alone, port 3 got nothing at all, exactly the "doesn't work as expected" a real DAW test
+reported. Output is now always exactly the chosen port's own real stereo pair (`l` -> L, `r` -> R),
+full stop -- no Mono option, no fake pairing, verified with a dedicated test proving zero cross-talk
+to any other port. Input keeps its real Mono/Stereo choice (that part was never in question) with the
+same "N+N+1" mislabeling fixed (no combining implied there either -- it's "read this one port's L
+only" vs "read its real L+R") and a genuine off-by-one corrected (its own stereo option list was
+silently missing port 8 entirely).
+
+**State save/load (DAW project recall) now exists.** This plugin's first pass shipped with no
+`clap_plugin_state_t` at all -- a documented, known gap -- which meant a whole patch silently
+vanished on every project reload, confirmed directly by a real save/reload in a DAW. Added
+`save()`/`load()` in the same plain-text, versioned, field-ordered format `clap_plugin.c`'s own state
+extension already uses: every slot's params, `sidechain_source`, NAM model/IR paths (space-safe), and
+every port's routing config round-trip exactly, verified with a dedicated test against a real
+`clap_ostream_t`/`clap_istream_t` -- which caught a real bug in its own first draft along the way:
+`sidechain_source` was being read back on load but was never actually being written on save (an
+empty no-op call sitting where the real line belonged).
 
 **A real bug this surfaced, found from a live DAW test, not guessed**: a slot sharing its port with
 several idle default `Off` slots (HDS FX's own normal starting state -- every never-configured slot
@@ -1079,7 +1119,16 @@ does NOT reallocate that slot's `FXSlotEngine.state` (verified by comparing the 
 before/after -- only a `fx_type` change may ever do that) -- the actual architectural fix the
 shared-pool rearchitecture exists for; unconnected ports don't crash; the audio-ports extension
 reports 8 correctly-named/flagged stereo ports each way; the params extension reports all 32 Mix
-params with correct default values and round-trips a value write.
+params with correct default values and round-trips a value write; a real `process()` call against a
+`FX_TYPE_NAM` slot genuinely attempts a model load every block (not silently skipped -- confirmed via
+`FxNamState.loaded_model_path` actually tracking the attempted path, the exact thing that was
+broken before the `poll_fx_nam_requests()` fix above), fails safely to exact dry passthrough on a bad
+path, and applies real, correct dB gain trim math around the absent model; Output routes a real
+signal to exactly the port it was told to and leaves every other port an untouched exact-passthrough
+copy of its own distinct input, proven with a different tone fed to each of the 8 ports at once so any
+cross-talk would be unmistakable; the state extension round-trips a full, distinctive patch
+(including NAM paths containing spaces) byte-for-byte through a real `clap_ostream_t`/`clap_istream_t`
+pair into a completely separate plugin instance.
 
 #### Native embedded GUI: `src/hds_fx_gui_draw.c` + `src/hds_fx_gui_x11.c`
 
@@ -1104,20 +1153,23 @@ per-port grid of any kind, and (after the I/O model above landed) no global mode
 A column-header strip (TYPE/IN/SC/PARAMS/OUT/MIX/BY/CH) sits above the list, reading its own
 x-positions off the exact same row-layout function every row itself uses so a header can never
 drift out of alignment with its column. Every row:
-- a **Type** pill -- clicking it opens a real dropdown listing all 20 selectable types (skips
-  `FX_TYPE_NAM`, which this plugin compiles out, so the list can never offer a silently-inert
-  selection), current type highlighted; clicking an option applies it and closes the list, clicking
-  anywhere else just closes it. Click-to-cycle (the original design) was dropped after direct
-  feedback that stepping through 20 types one click at a time was unusable;
-- an **Input** pill ("In 3" mono / "In 3+4" stereo / **"Off"**), live only on a chain HEAD
+- a **Type** pill -- clicking it opens a real dropdown listing all 21 selectable types, including
+  `FX_TYPE_NAM` now that it's genuinely wired up (see this file's own "NAM is enabled" paragraph
+  above -- an earlier revision excluded it here specifically because selecting it would have
+  silently done nothing), current type highlighted; clicking an option applies it and closes the
+  list, clicking anywhere else just closes it. Click-to-cycle (the original design) was dropped
+  after direct feedback that stepping through 20+ types one click at a time was unusable;
+- an **Input** pill ("In 3" mono / "In 3 St" stereo / **"Off"**), live only on a chain HEAD
   (`hds_fx_slot_is_chain_head()`) -- greyed out on a slot that's just inheriting a chain's running
-  signal, since it has no Input of its own to set. Same dropdown treatment as Type (16 options: Off
-  + 8 mono ports + 7 stereo pairs) rather than cycling. **Off is a real, separate state
-  (`port_input_off[]`), not a sentinel squeezed into the port number** -- selecting it forces that
-  port's audio to silence for every chain reading it, but deliberately leaves the remembered
-  port/Mono-Stereo choice untouched, so switching back to a real port later resumes exactly where it
-  was rather than forgetting it. Added directly in response to feedback that there was no way to say
-  "this chain has no input" short of routing it to an unused port and hoping nothing else used it;
+  signal, since it has no Input of its own to set. Same dropdown treatment as Type (17 options: Off
+  + 8 mono ports + 8 stereo -- an earlier revision's stereo option count was off by one, silently
+  missing port 8 entirely). **Stereo here means reading that ONE port's real L+R, never combining
+  two separate ports** -- an earlier label ("In 3+4") wrongly implied the latter, confirmed as a
+  real, live-tested source of confusion since no code anywhere ever combined ports at all. **Off is
+  a real, separate state (`port_input_off[]`), not a sentinel squeezed into the port number** --
+  selecting it forces that port's audio to silence for every chain reading it, but deliberately
+  leaves the remembered port/Mono-Stereo choice untouched, so switching back to a real port later
+  resumes exactly where it was rather than forgetting it;
 - a **Sidechain** pill, only ever live for `FX_TYPE_FAIRKID67` (the one type that actually reads
   it) -- greyed out and inert on every other type, directly fixing early feedback that sidechain
   looked selectable on effects that don't use it. Same dropdown treatment (9 options: "Same as
@@ -1126,11 +1178,22 @@ drift out of alignment with its column. Every row:
   "Attack" -- `hds_fx_type_param_label()`, ported straight from each `FX_TYPE_*`'s own doc comment
   in fx_types.h, never invented) and its current value as a "NN%" readout directly below -- label,
   knob, and value are all pinned at fixed offsets from the row's own top, so the whole group is
-  guaranteed to stay inside that one row's own bounds, never bleeding into a neighbor;
-- an **Output** pill ("Out 7" / "Out 7+8" / **"Off"**, same dropdown treatment and independent
-  `port_output_off[]` state as Input, described above), live only on a chain TAIL
-  (`hds_fx_slot_is_chain_tail()` -- i.e. `chain_to_next == 0`) -- a slot still chaining forward
-  doesn't decide where anything lands yet;
+  guaranteed to stay inside that one row's own bounds, never bleeding into a neighbor. `FX_TYPE_NAM`
+  only uses 3 of these 10 (Input/Output Gain, Cab Enable) -- the otherwise-blank remaining columns
+  (3-8) instead show two wide "Model"/"IR" pills (`nam_model_pill`/`nam_ir_pill`, same "computed
+  once alongside the real knobs, draw and hit-test share one source of truth" discipline every other
+  control here already follows) for typing/pasting a `.nam` model or cab IR path directly -- this
+  plugin has no OSC/frontend.py connection at all and stays a plain Cairo+X11 build (no GTK/Qt file
+  dialog dependency), so real X11 keyboard input (added specifically for this -- see
+  `hds_fx_gui_on_key()`) is the mechanism: click a pill to start typing (pre-filled with its current
+  path so editing an existing one works like any text field), Enter commits, Escape discards,
+  clicking elsewhere commits (like tabbing out of a normal form field) rather than silently losing
+  what was typed;
+- an **Output** pill ("Out 7" / **"Off"**, independent `port_output_off[]` state, live only on a
+  chain TAIL (`hds_fx_slot_is_chain_tail()` -- i.e. `chain_to_next == 0`) -- a slot still chaining
+  forward doesn't decide where anything lands yet. **Output has NO Mono/Stereo choice of its own**
+  (an earlier revision did, and it was genuinely broken -- see this file's own "A second real bug"
+  paragraph above): always exactly that port's own real stereo pair, `l` -> L, `r` -> R;
 - a **Mix** knob (same value-readout treatment, no separate top label -- the MIX column header
   already identifies it);
 - a **Bypass** toggle;
@@ -1142,7 +1205,7 @@ drift out of alignment with its column. Every row:
   their live DSP state, e.g. a delay's buffered tail, across the swap) -- both arrows disabled
   outright on a slot that participates in a chain link, per `hds_fx_slot_participates_in_chain()`.
 
-Verified two ways, both exercising the real production code, no host available in this sandbox:
+Verified several ways, all exercising the real production code, no host available in this sandbox:
 1. **Visual**: `hds_fx_gui_render()` -- the exact function the X11 shim calls every frame -- rendered
    directly into a `cairo_image_surface` (the same technique the earlier design mockups used, now
    applied to the shipping code instead of a throwaway copy) and saved to PNG for visual review,
@@ -1179,6 +1242,15 @@ Verified two ways, both exercising the real production code, no host available i
    runs every block (the accumulation into that port's output is skipped, not the processing itself);
    `fx_source`/`port_output_channel` are provably untouched by either, and un-Offing the Input
    immediately restores the exact same real signal.
+4. **NAM's Model/IR text fields take real keyboard input, not just a direct struct write**: the same
+   Xvfb+XTest harness above sets a slot to `FX_TYPE_NAM`, clicks the Model pill (confirmed:
+   `HdsFxGuiViewState.edit_row`/`edit_field` enter edit mode, pre-filled from the slot's current
+   path), injects a real X11 `KeyPress` per character of a test path (via `XTestFakeKeyEvent`, not a
+   function call, going through the actual `hds_fx_gui_pump_events()` -> `hds_fx_gui_on_key()` path
+   this feature added), confirms the live edit buffer matches what was typed before anything commits,
+   then injects a real `Return` keypress and confirms it lands in `nam_model_path` exactly -- and
+   separately, that a real `Escape` keypress on the IR field discards the typed text instead of
+   committing it, leaving `nam_ir_path` untouched.
 
 ### Command-line flags
 

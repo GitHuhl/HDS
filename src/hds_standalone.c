@@ -17,11 +17,13 @@
 //
 // Also moved here, in a later pass (see the "Standalone-only backend logic" comment further
 // down, right before process_midi_input): g_sample_engine itself (its 3 constituent globals --
-// g_sample_slot_state, g_streams_state, g_pending_load_state -- did NOT move, see below),
-// poll_fx_nam_requests, the MIDI Clock/Start/Continue/Stop transport handlers, and the Scala
-// tuning / song-as-MIDI OSC handlers. This closed out a real, if harmless, cascade of
-// -Wunused-function/-Wunused-variable warnings the CLAP build used to show for all of it (none of
-// it is reachable from clap_plugin.c).
+// g_sample_slot_state, g_streams_state, g_pending_load_state -- did NOT move, see below), the MIDI
+// Clock/Start/Continue/Stop transport handlers, and the Scala tuning / song-as-MIDI OSC handlers.
+// This closed out a real, if harmless, cascade of -Wunused-function/-Wunused-variable warnings the
+// CLAP build used to show for all of it (none of it is reachable from clap_plugin.c).
+// poll_fx_nam_requests() itself later moved a SECOND time, back into the genuinely shared
+// fx_chain.c -- see that call's own comment right where render_audio_block calls it in backend.c
+// for why "standalone-only" turned out to be the wrong call for that one specifically.
 //
 // g_sample_slot_state/g_streams_state/g_pending_load_state themselves stay declared in backend.c
 // (NOT moved, unlike the g_sample_engine wrapper that points at all three): render_audio_block's
@@ -189,8 +191,9 @@ static void midi_autoconnect_scan(snd_seq_t *seq, int our_port, const char *midi
 // src/sequencer.c (see that file's own header comment): once none of it was reachable from CLAP
 // any more, it turned out to already sit in two clean, contiguous chunks in THIS file, entirely
 // free of any ALSA/PipeWire dependency, so it earned a dedicated file the same way the FX chain
-// did. #include'd here, immediately below, so fx_nam_reload_ir() further down (which reuses its
-// seq_audio_load_wav_from_disk() to decode a cab IR file) has it already defined.
+// did. #include'd here, immediately below -- sequencer.c's own audio-lane loader calls
+// seq_audio_load_wav_from_disk(), which now lives in fx_chain.c (already #include'd via backend.c
+// above, so it's in scope here regardless -- see that function's own comment for why it moved).
 #include "sequencer.c"
 
 // g_sample_slot_state/g_pending_load_state: the standalone-only global instances of the two
@@ -217,105 +220,12 @@ static HdsPendingLoadState g_pending_load_state;
 static HdsSampleEngine g_sample_engine = { &g_sample_slot_state, &g_streams_state, &g_pending_load_state };
 
 
-#if HDS_NAM_ENABLED
-// fx_nam_reload_model/fx_nam_reload_ir: moved here from fx_chain.c alongside poll_fx_nam_requests
-// just below, their only caller -- FxNamState itself, fx_nam_free_ir/fx_nam_free_state (which
-// sync_fx_engine_types() in the shared core still calls directly), and run_fx_nam() all stay in
-// fx_chain.c. NOTE: as a direct result, a CLAP plugin instance's FX_TYPE_NAM slots can never
-// actually load a model or cab IR -- poll_fx_nam_requests (the only thing that ever calls these)
-// was already standalone-only before this move (never called from clap_plugin.c's process()), so
-// this was a pre-existing gap this refactor exposed rather than introduced, same shape as the
-// already-documented Sequencer-audio-lane-in-CLAP issue above. A real, separate, scoped follow-up.
-static void fx_nam_reload_model(FxNamState *st, const char *path) {
-    hds_nam_destroy(st->model_l); st->model_l = NULL;
-    hds_nam_destroy(st->model_r); st->model_r = NULL;
-    snprintf(st->loaded_model_path, SAMPLE_PATH_LEN, "%s", path);
-    st->model_load_failed = false;
-    if (path[0] == '\0') return; // cleared -- leave both NULL, run_fx_nam() then passes dry
-    // num_frames=1 is this call's own real usage pattern (see run_fx_nam()), but Reset() still
-    // wants a genuine max-block-size hint for any internal buffer sizing the model does up front.
-    st->model_l = hds_nam_create(path, (double)SAMPLE_RATE, 1);
-    st->model_r = hds_nam_create(path, (double)SAMPLE_RATE, 1);
-    if (!st->model_l || !st->model_r) {
-        fprintf(stderr, "[nam] failed to load model '%s'\n", path);
-        hds_nam_destroy(st->model_l); st->model_l = NULL;
-        hds_nam_destroy(st->model_r); st->model_r = NULL;
-        st->model_load_failed = true;
-    }
-}
-
-static void fx_nam_reload_ir(FxNamState *st, const char *path) {
-    fx_nam_free_ir(st);
-    snprintf(st->loaded_ir_path, SAMPLE_PATH_LEN, "%s", path);
-    st->ir_load_failed = false;
-    if (path[0] == '\0') return; // cleared -- leave NULL, run_fx_nam() then skips the cab stage
-
-    int frames = 0, channels = 0, sample_rate = 0;
-    float *pcm = seq_audio_load_wav_from_disk(path, &frames, &channels, &sample_rate);
-    if (!pcm || frames <= 0) { st->ir_load_failed = true; free(pcm); return; }
-
-    int taps = frames;
-    bool truncated = false;
-    if (taps > FX_NAM_IR_MAX_TAPS) { taps = FX_NAM_IR_MAX_TAPS; truncated = true; }
-
-    st->ir_l = malloc(sizeof(float) * (size_t)taps);
-    bool stereo = channels >= 2;
-    st->ir_r = stereo ? malloc(sizeof(float) * (size_t)taps) : st->ir_l;
-    if (!st->ir_l || (stereo && !st->ir_r)) {
-        fx_nam_free_ir(st); st->ir_load_failed = true; free(pcm); return;
-    }
-    for (int i = 0; i < taps; i++) {
-        st->ir_l[i] = pcm[(size_t)i * channels];
-        if (stereo) st->ir_r[i] = pcm[(size_t)i * channels + 1];
-    }
-    free(pcm);
-
-    st->ir_taps = taps;
-    // Always two independent rings, even for a mono IR -- see the struct's own comment on why
-    // ir_hist_l/ir_hist_r must never alias the way ir_l/ir_r (read-only coefficients) safely can.
-    st->ir_hist_l = calloc((size_t)taps, sizeof(float));
-    st->ir_hist_r = calloc((size_t)taps, sizeof(float));
-    st->ir_hist_pos_l = 0; st->ir_hist_pos_r = 0;
-    if (!st->ir_hist_l || !st->ir_hist_r) { fx_nam_free_ir(st); st->ir_load_failed = true; return; }
-
-    if (truncated) fprintf(stderr, "[nam] cab IR '%s' truncated to %d taps (was %d)\n", path, taps, frames);
-    if (sample_rate != 0 && sample_rate != SAMPLE_RATE) {
-        fprintf(stderr, "[nam] cab IR '%s' is %d Hz, engine runs at %d Hz -- loaded as-is, uncorrected\n", path, sample_rate, SAMPLE_RATE);
-    }
-}
-
-// Same "once-per-block change detection" shape as poll_seq_audio_load_requests() just above --
-// notices when an FX slot's nam_model_path/nam_ir_path differs from what that slot's own state
-// already has loaded, and (re)loads it. Unlike Sequencer audio lanes, this runs the load
-// SYNCHRONOUSLY on this thread (the same one OSC dispatch and audio rendering both run on -- see
-// this file's own single-threaded-main-loop design) rather than spawning a loader thread: a .nam
-// model file is a small, bounded JSON+weights blob (nothing like a whole song-length audio
-// recording), and a cab IR is capped at FX_NAM_IR_MAX_TAPS frames -- both comfortably finish within
-// one block's worth of stall, the same bet load_sample_slot() already makes for a sample zone's WAV
-// header + pre-roll. A real streaming thread would be the right call for something unboundedly
-// large; neither of these is.
-//
-// Only meaningful once a slot's own engine state actually exists as an FxNamState -- gated on
-// active_type == FX_TYPE_NAM, which sync_fx_engine_types() (called once per block from
-// render_audio_block, before this in the same iteration -- see main()'s own loop) guarantees is
-// current for any type change already applied by the time this runs; a slot switched to
-// FX_TYPE_NAM within the SAME block this runs simply picks up its load on the next block instead,
-// same one-block grace every other live-knob check in this loop already has.
-static void poll_fx_nam_requests(FXSlotEngine fx_engine[FX_SLOT_COUNT], const SynthSharedControls *knobs) {
-    for (int s = 0; s < FX_SLOT_COUNT; s++) {
-        if (fx_engine[s].active_type != FX_TYPE_NAM || !fx_engine[s].state) continue;
-        FxNamState *st = (FxNamState *)fx_engine[s].state;
-        const char *want_model = knobs->fx[s].nam_model_path;
-        if (strncmp(want_model, st->loaded_model_path, SAMPLE_PATH_LEN) != 0) {
-            fx_nam_reload_model(st, want_model);
-        }
-        const char *want_ir = knobs->fx[s].nam_ir_path;
-        if (strncmp(want_ir, st->loaded_ir_path, SAMPLE_PATH_LEN) != 0) {
-            fx_nam_reload_ir(st, want_ir);
-        }
-    }
-}
-#endif // HDS_NAM_ENABLED
+// fx_nam_reload_model/fx_nam_reload_ir/poll_fx_nam_requests moved BACK to fx_chain.c (see that
+// file's own comment on why): they'd been pulled out here under the mistaken assumption that only
+// the standalone binary would ever need to poll for a NAM path change, which silently meant NO CLAP
+// plugin's FX_TYPE_NAM slots could ever actually load a model -- a real, confirmed bug this move
+// fixes for both hds.clap and HDS FX at once, not a hypothetical one. Still called from this file's
+// own main loop below, just like before.
 
 
 // Parses one .scl pitch line into a ratio. Returns false (leaving *out_ratio untouched) if the
@@ -2314,9 +2224,10 @@ int main(int argc, char **argv) {
         while (lo_server_recv_noblock(osc_server, 0) > 0) {}
         poll_stdin_control(&active_knobs, &g_sample_engine); // arrow keys: Up/Down = master volume, Left/Right = Program cycle -- see its own comment
         poll_seq_audio_load_requests(&g_streams_state, &active_knobs); // spawns a loader thread if a lane's audio_path changed
-#if HDS_NAM_ENABLED
-        poll_fx_nam_requests(g_engine.fx_engine, &active_knobs); // (re)loads a slot's .nam model/cab IR if its path changed
-#endif
+        // poll_fx_nam_requests() itself now runs once per block from inside render_audio_block
+        // (backend.c), right after sync_fx_engine_types() -- see that call site's own comment --
+        // rather than being polled separately here, so it stays in sync with the exact same
+        // "once per block" cadence for both this binary and clap_plugin.c alike.
         poll_seq_audio_preview_triggers(&g_streams_state, &active_knobs); // starts one-shot playback if a lane's Preview button was clicked
 
         // Programmable tempo: resolved once per block from the Tempo knob/tempo-map (see

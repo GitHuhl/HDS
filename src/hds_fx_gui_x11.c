@@ -30,6 +30,8 @@
 // Bitwig, and most others all implement it).
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#include <X11/Xutil.h> // XLookupString -- see hds_fx_gui_pump_events()'s own KeyPress case
+#include <X11/keysym.h> // XK_BackSpace/XK_Return/XK_KP_Enter/XK_Escape
 #include <cairo/cairo-xlib.h>
 
 typedef struct {
@@ -98,7 +100,18 @@ static void hds_fx_gui_pump_events(HdsFxGuiWindow *w) {
             case ButtonPress:
                 if (ev.xbutton.button == 4) hds_fx_gui_on_scroll(&w->view, 1);
                 else if (ev.xbutton.button == 5) hds_fx_gui_on_scroll(&w->view, -1);
-                else hds_fx_gui_on_button_press(w->plugin, &w->view, (double)ev.xbutton.x, (double)ev.xbutton.y, ev.xbutton.button == 3 ? 3 : 1);
+                else {
+                    // Claim keyboard focus on every real click, not just when a NAM path field is
+                    // hit -- a reparented (XEmbed-lite) child window doesn't receive KeyPress events
+                    // just because it selected for them; the X server delivers keys to whichever
+                    // window currently HAS input focus, and a host embedding us has no reason to
+                    // hand that over on its own (the full two-way XEmbed protocol, which would make
+                    // this automatic, is this file's own documented, separate follow-up). Harmless
+                    // to call unconditionally: this is the only window in the process that ever
+                    // wants keyboard input in the first place.
+                    XSetInputFocus(w->display, w->win, RevertToParent, CurrentTime);
+                    hds_fx_gui_on_button_press(w->plugin, &w->view, (double)ev.xbutton.x, (double)ev.xbutton.y, ev.xbutton.button == 3 ? 3 : 1);
+                }
                 break;
             case ButtonRelease:
                 if (ev.xbutton.button != 4 && ev.xbutton.button != 5) hds_fx_gui_on_button_release(&w->view);
@@ -113,6 +126,21 @@ static void hds_fx_gui_pump_events(HdsFxGuiWindow *w) {
                     hds_fx_gui_resize_backbuffer(w);
                 }
                 break;
+            case KeyPress: {
+                // The only thing keyboard input can ever reach in this GUI is FX_TYPE_NAM's own
+                // Model/IR path text fields (see hds_fx_gui_on_key()'s own comment) -- no other
+                // control here takes typed input at all, so there's no broader keyboard-focus/
+                // navigation model to build, just this one translation from a real X11 KeyPress to
+                // the platform-agnostic action hds_fx_gui_draw.c itself understands.
+                char text[8];
+                KeySym keysym = NoSymbol;
+                int n = XLookupString(&ev.xkey, text, sizeof(text) - 1, &keysym, NULL);
+                if (keysym == XK_BackSpace) hds_fx_gui_on_key(w->plugin, &w->view, HDS_FX_KEY_BACKSPACE, 0);
+                else if (keysym == XK_Return || keysym == XK_KP_Enter) hds_fx_gui_on_key(w->plugin, &w->view, HDS_FX_KEY_ENTER, 0);
+                else if (keysym == XK_Escape) hds_fx_gui_on_key(w->plugin, &w->view, HDS_FX_KEY_ESCAPE, 0);
+                else if (n > 0) hds_fx_gui_on_key(w->plugin, &w->view, HDS_FX_KEY_CHAR, text[0]);
+                break;
+            }
             default: break;
         }
     }
@@ -160,7 +188,7 @@ static bool hds_fx_gui_create(const clap_plugin_t *plugin, const char *api, bool
     w->win = XCreateSimpleWindow(w->display, RootWindow(w->display, w->screen), 0, 0,
                                   (unsigned int)w->view.window_w, (unsigned int)w->view.window_h, 0,
                                   BlackPixel(w->display, w->screen), BlackPixel(w->display, w->screen));
-    XSelectInput(w->display, w->win, ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
+    XSelectInput(w->display, w->win, ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | StructureNotifyMask | KeyPressMask);
     // Without this, the X server auto-clears the window to its background pixel on its own (a
     // resize, an Expose from the window manager, ...) independently of our own ~30Hz redraw --
     // a second, compounding source of visible flicker beyond the multi-primitive-direct-to-window
