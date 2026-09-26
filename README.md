@@ -3162,3 +3162,44 @@ no-op -- `eg_intensity[0]`), the Destination dropdown (open + select "Osc 1 Amp"
 the Attack dial (`eg[4].a`), and a whole-list scroll that lands a subsequent click on the correct
 panel (EG 3) at its new, scrolled screen position. The full existing regression suite (all 14 prior
 test binaries, `hds_fx.clap`'s own included) still passes unchanged.
+
+## hds.clap's Routing tab: 17 sources -> Main Out, plus a revived VU meter (task #108)
+
+Next tab in the ordered list: `src/hds_clap_routing_draw.c` (new) ports frontend.py's own Routing
+tab -- one row per real Source (the same 17, `hds_clap_source_label()`, already shared with the FX
+tab's own Source combo), with a Main Out toggle on every row, and Enable/Gain/Stereo controls plus
+a live VU meter on the 8 Ext In rows only (Programs/Combi Mix are "always live" in this engine, so
+they get no Enable of their own here -- matches frontend.py exactly).
+
+**A real scope decision, put to the user before writing any layout code**: frontend.py's own
+Routing tab is an 8-column matrix (`source_routing[src].enable[0..7]`, one column per hardware
+output pair). Reading `clap_plugin.c`'s own `process()` found that it always calls
+`render_audio_block()` with `output_channels` hardcoded to 2 -- so only `enable[0]` ("Out 1"/Main
+Out) ever reaches this plugin's actual audio output; `enable[1..7]` still compute internally (the
+routing-matrix summing loop runs unconditionally over the full `OUTPUT_PAIR_MAX`) but their result
+is discarded before reaching any CLAP port. Porting the full 8-column grid as-is would ship 7
+columns that visibly do nothing in this host. Given three options (collapse to the one working
+column; show all 8 with columns 2-8 visibly disabled; or extend the plugin to actually expose more
+output pairs, a real architecture change), the user chose the first: **one Main Out toggle per
+source**. Columns 2-8's own state is never touched by this GUI (not zeroed, not read) -- a saved
+patch or a future architecture change that actually wires up more outputs loses nothing.
+
+**Also revived the ext-in VU meters**, which were otherwise fully dead in `hds.clap`: `backend.c`'s
+own `gui_routing_tab_visible` gate (a perf optimization -- ext-in peak metering only runs while a
+player is actually looking at the Routing tab) was never set from any CLAP control surface, since a
+CLAP instance has no OSC-driven Routing tab of its own to report visibility from -- `clap_plugin.c`
+itself used to say so directly in a comment. Fixed cheaply since this native GUI's Routing tab lives
+in-process already: `hds_clap_gui_render()` now sets `p->knobs.gui_routing_tab_visible` on every
+redraw based on whether Routing is the active tab (mirrors frontend.py's own
+`_on_main_tab_changed()`), and a new persistent `HdsClapPlugin.ext_in_peak[EXT_IN_PAIR_COUNT]`
+field (replacing a process()-local scratch array that used to just discard the values
+`render_audio_block()` wrote into it) is read directly by the meter's own draw code -- no OSC
+round-trip needed, since the GUI and the audio thread share this same struct already.
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_routing.c`, 7 passing
+assertions): confirms `gui_routing_tab_visible` actually goes live on tab switch (not just the
+toggle itself), Main Out toggles on Combi Mix (defaults off) and Program 1 (defaults on, matching
+`init_default_controls`'s own asymmetric-by-source-type defaults exactly), Ext In 1's Enable
+toggle, a real Gain knob drag, the Stereo toggle, and that `HdsClapPlugin.ext_in_peak` is genuine
+persistent per-instance storage the render function reads directly. The full existing regression
+suite (all 15 prior test binaries, `hds_fx.clap`'s own included) still passes unchanged.

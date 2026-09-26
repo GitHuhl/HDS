@@ -125,6 +125,18 @@ typedef struct {
     // actually connected; see this file's own process() for how.
     float ext_in_render_buf[BUFFER_SIZE * EXT_IN_PAIR_COUNT * 2];
 
+    // Routing tab's own per-ext-in-pair VU meters (see gui_routing_tab_visible's own comment in
+    // backend.c): a persistent, per-instance peak-hold, updated every process() call by
+    // render_audio_block()'s own ext_in_peak_out parameter (see clap_plugin_process()'s own call
+    // site) and read directly by hds_clap_routing_draw.c's own render function -- this instance's
+    // own real GUI lives in-process (no OSC round-trip, see hds_clap_gui_draw.c's own header
+    // comment), so it can just read this struct field straight off the audio thread's last-written
+    // value instead of needing the standalone app's own /hds/status/ext_in_peak/<pair> OSC poll.
+    // gui_routing_tab_visible itself is set/cleared by hds_clap_gui_render() -- see that function's
+    // own comment -- so this only actually updates (stays non-zero) while the Routing tab is the
+    // active tab, matching the standalone app's own perf-gating intent exactly.
+    float ext_in_peak[EXT_IN_PAIR_COUNT];
+
     // CLAP params extension (see HDS_CLAP_PARAMS/hds_clap_push_changed_params further down) --
     // one shadow value per exposed param, used purely to detect an OSC/GUI-driven change so it
     // can be echoed to the host as an output event. Sized/initialized once the table itself is
@@ -190,6 +202,7 @@ typedef struct {
 // HDS_LFO_DEST_LIST_MAX_H (the shared 100-entry matrix_shared_routes list) rather than
 // re-transcribing them -- see its own header comment.
 #include "hds_clap_envelopes_draw.c"
+#include "hds_clap_routing_draw.c"
 #include "hds_clap_gui_draw.c"
 #include "hds_clap_gui_x11.c"
 
@@ -1138,10 +1151,10 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         // instance's render clobber another's mid-flight, a real cross-instance data race this
         // multi-instance pass exists to eliminate, not reintroduce.
         float chunk_buffer[BUFFER_SIZE * 2];
-        // No Routing tab exists for a CLAP plugin instance's own OSC control surface to report
-        // visibility for (see gui_routing_tab_visible's own comment) -- ext_in_peak_scratch is
-        // therefore always all-zero (gui_routing_tab_visible defaults to 0) and simply discarded.
-        float ext_in_peak_scratch[EXT_IN_PAIR_COUNT];
+        // This instance's own persistent VU-peak storage (see HdsClapPlugin.ext_in_peak's own
+        // comment) -- real and read by the Routing tab's own render function, unlike the
+        // standalone app's OSC-only control surface, which has no Routing tab of its own to
+        // report gui_routing_tab_visible for.
         // Interleave this chunk's worth of whichever ext-in ports the host actually connected into
         // p->ext_in_render_buf (pair p at channels [2p, 2p+1], exactly what render_audio_block's
         // own ext_in_buffer/ext_in_channels parameters expect -- see that struct field's own
@@ -1160,7 +1173,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         }
         float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases,
                                          any_ext_in_connected ? p->ext_in_render_buf : NULL, any_ext_in_connected ? EXT_IN_PAIR_COUNT * 2 : 0,
-                                         2, &p->midi_live, chunk_buffer, current_tempo_bpm, ext_in_peak_scratch,
+                                         2, &p->midi_live, chunk_buffer, current_tempo_bpm, p->ext_in_peak,
                                          any_prog_out_connected ? p->per_program_render_buf : NULL, gr_db_scratch);
         if (peak > block_peak) block_peak = peak;
 

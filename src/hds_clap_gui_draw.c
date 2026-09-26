@@ -77,6 +77,7 @@ typedef struct {
     HdsClapFiltersViewState filters_view; // same convention as play_view -- see hds_clap_filters_draw.c's own header comment
     HdsClapLfosViewState lfos_view;       // same convention -- see hds_clap_lfos_draw.c's own header comment
     HdsClapEnvelopesViewState envelopes_view; // same convention -- see hds_clap_envelopes_draw.c's own header comment
+    HdsClapRoutingViewState routing_view;     // same convention -- see hds_clap_routing_draw.c's own header comment
 } HdsClapGuiViewState;
 
 static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
@@ -91,6 +92,7 @@ static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
     hds_clap_filters_view_state_init(&vs->filters_view);
     hds_clap_lfos_view_state_init(&vs->lfos_view);
     hds_clap_envelopes_view_state_init(&vs->envelopes_view);
+    hds_clap_routing_view_state_init(&vs->routing_view);
 }
 
 typedef struct { double x, y, w, h; } HdsClapTabRect;
@@ -114,6 +116,12 @@ static void hds_clap_gui_render_placeholder(cairo_t *cr, double w, double h, con
 }
 
 static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewState *vs) {
+    // Gates the Routing tab's own ext-in VU meters (see HdsClapPlugin.ext_in_peak's own comment) --
+    // mirrors frontend.py's own _on_main_tab_changed(), which sends /hds/gui/routing_tab_visible
+    // whenever the Routing tab becomes/stops being the active tab. Cheap and always correct to just
+    // set this on every redraw rather than hooking the tab-bar's own click handler specifically.
+    p->knobs.gui_routing_tab_visible = (vs->active_tab == HDS_CLAP_TAB_ROUTING) ? 1.0f : 0.0f;
+
     // Tab bar itself.
     hds_fx_rgb(cr, 0.14, 0.14, 0.17);
     cairo_rectangle(cr, 0, 0, vs->window_w, HDS_CLAP_TAB_BAR_H);
@@ -161,6 +169,9 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
         case HDS_CLAP_TAB_ENVELOPES:
             hds_clap_envelopes_render(cr, p, &vs->envelopes_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
+        case HDS_CLAP_TAB_ROUTING:
+            hds_clap_routing_render(cr, p, &vs->routing_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            break;
         case HDS_CLAP_TAB_MAPPING:
             hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Mapping (Sample Zone editor) -- not available in this GUI yet");
             break;
@@ -194,6 +205,8 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
             return hds_clap_lfos_on_button_press(p, &vs->lfos_view, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_ENVELOPES:
             return hds_clap_envelopes_on_button_press(p, &vs->envelopes_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
+        case HDS_CLAP_TAB_ROUTING:
+            return hds_clap_routing_on_button_press(p, &vs->routing_view, x, y - HDS_CLAP_TAB_BAR_H, button);
         default:
             return true;
     }
@@ -205,6 +218,7 @@ static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     else if (vs->active_tab == HDS_CLAP_TAB_FILTERS) hds_clap_filters_on_motion(&vs->filters_view, x, y - HDS_CLAP_TAB_BAR_H);
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_motion(&vs->lfos_view, x, y - HDS_CLAP_TAB_BAR_H);
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_motion(p, &vs->envelopes_view, vs->window_w, x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_motion(&vs->routing_view, x, y - HDS_CLAP_TAB_BAR_H);
 }
 
 static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
@@ -213,6 +227,7 @@ static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
     else if (vs->active_tab == HDS_CLAP_TAB_FILTERS) hds_clap_filters_on_button_release(&vs->filters_view);
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_button_release(&vs->lfos_view);
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_button_release(&vs->envelopes_view);
+    else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_button_release(&vs->routing_view);
 }
 
 static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int action, char ch) {
