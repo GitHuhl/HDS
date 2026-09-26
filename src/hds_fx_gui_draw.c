@@ -174,6 +174,223 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
     return table[idx];
 }
 
+// Real per-param VALUE ranges/units, extracted directly from each run_fx_*()'s own formula in
+// fx_chain.c (not guessed) -- a knob's raw `slot->param[i]` was blanket-displayed as "NN%" and
+// blanket-dragged as a plain 0.0-1.0 fraction regardless of what the DSP actually did with it,
+// which was wrong two different ways at once, confirmed from a live DAW test:
+//   1. Cosmetic: half these params are really dB/ms/Hz/a named discrete choice (e.g. FetComp's
+//      Ratio is a genuine 5-way switch -- 4:1/8:1/12:1/20:1/All -- ratio_idx = (int)(p*4+0.5f),
+//      never anything in between), not a continuous percentage -- see hds_fx_type_param_value_text()
+//      just below for the full, per-effect breakdown.
+//   2. Functional, and worse: FX_TYPE_MULTIFILTER's own Reso param (idx 2) is read by the DSP as
+//      `clamp(param[2], 0.0f, 100.0f)` -- ALREADY a 0-100 value, the one param in this entire file
+//      that isn't a plain 0.0-1.0 fraction -- while this GUI's drag code (hds_fx_gui_on_motion())
+//      clamped every param uniformly to [0,1]. That capped the Reso knob at 1% of its own real
+//      range, functionally inert (the DSP's own resonance formula, `2*(1 - reso/100)`, barely moves
+//      off its minimum for any value this GUI could ever have produced). This function is the one
+//      source of truth for a param's real STORAGE range now -- hds_fx_gui_on_motion()'s own drag
+//      clamp and hds_fx_gui_render()'s own knob-arc normalization both call it, so the two can never
+//      disagree about what "full turn" means for this one param again.
+static void hds_fx_type_param_range(int fx_type, int idx, float *lo, float *hi) {
+    *lo = 0.0f; *hi = 1.0f;
+    if (fx_type == FX_TYPE_MULTIFILTER && idx == 2) { *lo = 0.0f; *hi = 100.0f; }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Real per-param VALUE TEXT -- replaces the old blanket "NN%" every knob used to show regardless
+// of what it actually controlled. `frac` is always a plain 0.0-1.0 fraction of the param's own
+// full travel (already normalized against hds_fx_type_param_range() by the caller -- see
+// hds_fx_gui_render()'s own knob-drawing loop), matching exactly what each run_fx_*() function's
+// own formula computes from its raw param[idx] (or, for MULTIFILTER's Reso, from param[idx]/100 --
+// same fraction-of-travel either way). Every formula below is copied verbatim from its own
+// run_fx_*() -- see fx_chain.c for the authoritative source; anything without a clean physical unit
+// in the DSP itself (a proprietary internal coefficient/curve with no dB/ms/Hz conversion anywhere
+// in the code -- Ensemble, CreamCoat's Regen/DeRez/PreDly, StereoChorus, StereoDoubler's Detune,
+// TapeDelay2's Time/Freq/Reso/Flutter, PointyGuitar's Drive/tone knobs/HSpkr/LSpkr/Gate/Outpt,
+// Cabs2, Density3's Densty/HiPass) is left as a plain percent -- inventing a unit conversion the
+// DSP itself never computes would show a confident-looking but FALSE number, worse than "NN%".
+// ---------------------------------------------------------------------------------------------
+
+static void hds_fx_fmt_percent(float frac, char *buf, size_t n) {
+    snprintf(buf, n, "%d%%", (int)(frac * 100.0f + 0.5f));
+}
+static void hds_fx_fmt_db(float frac, float lo, float hi, char *buf, size_t n) {
+    snprintf(buf, n, "%+.1fdB", lo + frac * (hi - lo));
+}
+static void hds_fx_fmt_ms(float frac, float lo, float hi, char *buf, size_t n) {
+    float ms = lo + frac * (hi - lo);
+    if (ms < 10.0f) snprintf(buf, n, "%.2fms", ms); else snprintf(buf, n, "%.0fms", ms);
+}
+static void hds_fx_fmt_us(float frac, float lo, float hi, char *buf, size_t n) {
+    snprintf(buf, n, "%.0f\xc2\xb5s", lo + frac * (hi - lo)); // "us" -- UTF-8 micro sign, µs
+}
+// Log-taper Hz (matches fx_eq3_fraction_to_hz()/DeEsser's own `lo * powf(hi/lo, frac)` shape
+// exactly -- both EQ3/MultiFilter's 20Hz-20kHz mapping and DeEsser's 1kHz-16kHz one use this same
+// formula, just different lo/hi).
+static void hds_fx_fmt_hz_log(float frac, float lo_hz, float hi_hz, char *buf, size_t n) {
+    float hz = lo_hz * powf(hi_hz / lo_hz, frac);
+    if (hz >= 1000.0f) snprintf(buf, n, "%.2fkHz", hz / 1000.0f); else snprintf(buf, n, "%.0fHz", hz);
+}
+static void hds_fx_fmt_hz_linear(float frac, float lo_hz, float hi_hz, char *buf, size_t n) {
+    float hz = lo_hz + frac * (hi_hz - lo_hz);
+    snprintf(buf, n, "%.1fHz", hz);
+}
+static void hds_fx_fmt_sec_log(float frac, float lo_s, float hi_s, char *buf, size_t n) {
+    snprintf(buf, n, "%.2fs", lo_s * powf(hi_s / lo_s, frac));
+}
+static void hds_fx_fmt_semitones(float frac, float lo, float hi, char *buf, size_t n) {
+    snprintf(buf, n, "%.2fst", lo + frac * (hi - lo));
+}
+static void hds_fx_fmt_ratio(float frac, float lo, float hi, char *buf, size_t n) {
+    snprintf(buf, n, "%.1f:1", lo + frac * (hi - lo));
+}
+static void hds_fx_fmt_plain(float frac, float lo, float hi, const char *suffix, char *buf, size_t n) {
+    snprintf(buf, n, "%.2f%s", lo + frac * (hi - lo), suffix);
+}
+// Reproduces `(int)(frac * (count-1) + 0.5f)` clamped 0..count-1 -- the EXACT stepped-index
+// formula every ratio-stepped param in fx_chain.c uses (FetComp's Ratio, PeakMax's Release/
+// Quantize/Dither/Shaping, HardTune's Key/Scale/Voice/VibSrc, MultiFilter's Type/Slope, FairKid67's
+// TimeCn/Link) -- so the label shown here is always the exact option that slot's own DSP is
+// currently running, never a different one a slightly different rounding rule might imply.
+static void hds_fx_fmt_stepped(float frac, const char *const *labels, int count, char *buf, size_t n) {
+    int idx = (int)(frac * (float)(count - 1) + 0.5f);
+    if (idx < 0) idx = 0; else if (idx >= count) idx = count - 1;
+    snprintf(buf, n, "%s", labels[idx]);
+}
+static void hds_fx_fmt_onoff(float frac, const char *off_label, const char *on_label, bool on_when_low, char *buf, size_t n) {
+    bool is_on = on_when_low ? (frac < 0.5f) : (frac >= 0.5f);
+    snprintf(buf, n, "%s", is_on ? on_label : off_label);
+}
+
+static void hds_fx_type_param_value_text(int fx_type, int idx, float frac, char *buf, size_t buflen) {
+    static const char *const creamcoat_select[] = {
+        "P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","P11","P12","P13","P14","P15","P16","P17"
+    };
+    static const char *const pingpong[] = {"Off", "Ping-Pong"};
+    static const char *const fetcomp_ratio[] = {"4:1", "8:1", "12:1", "20:1", "All"};
+    static const char *const fetcomp_limit[] = {"ChrOnly", "Limit"}; // on_when_low -- see call site
+    static const char *const fk67_timing[] = {"P1", "P2", "P3", "P4", "P5", "P6"};
+    static const char *const fk67_link[] = {"Indep", "LnkMax", "LnkAvg", "Mid-Sd"};
+    static const char *const peakmax_release[] = {"0.01ms", "0.1ms", "1ms", "10ms", "100ms", "1000ms"};
+    static const char *const peakmax_quant[] = {"16-bit", "18-bit", "20-bit", "22-bit", "24-bit"};
+    static const char *const peakmax_dither[] = {"None", "Type 1", "Type 2"};
+    static const char *const peakmax_shape[] = {"None", "Modrt", "Normal", "Ultra"};
+    static const char *const multifilter_type[] = {"LoPass", "HiPass", "BndPas", "Notch"};
+    static const char *const multifilter_slope[] = {"6", "12", "18", "24", "30", "36", "42", "48", "60", "72", "84", "96"};
+    static const char *const hardtune_key[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+    static const char *const hardtune_scale[] = {"Chroma", "Major", "Minor", "MajPnt", "MinPnt"};
+    static const char *const hardtune_target[] = {"SclKey", "MIDI"};
+    static const char *const hardtune_voice[] = {"Bass", "Tenor", "Alto", "Soprano", "Wide"};
+    static const char *const hardtune_vibsrc[] = {"None", "ModWhl", "AfterT"};
+
+    switch (fx_type) {
+        case FX_TYPE_NAM:
+            if (idx == 0) { hds_fx_fmt_db(frac, -20.0f, 20.0f, buf, buflen); return; } // Input Gain
+            if (idx == 1) { hds_fx_fmt_db(frac, -20.0f, 20.0f, buf, buflen); return; } // Output Gain
+            if (idx == 2) { hds_fx_fmt_onoff(frac, "Off", "On", false, buf, buflen); return; } // Cab Enable
+            break;
+        case FX_TYPE_GATE:
+            if (idx == 0) { hds_fx_fmt_db(frac, -60.0f, 0.0f, buf, buflen); return; }
+            if (idx == 1) { hds_fx_fmt_ms(frac, 0.1f, 20.0f, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_ms(frac, 5.0f, 500.0f, buf, buflen); return; }
+            if (idx == 3) { hds_fx_fmt_db(frac, -80.0f, 0.0f, buf, buflen); return; }
+            break;
+        case FX_TYPE_EQ3:
+            if (idx == 0 || idx == 2 || idx == 5) { hds_fx_fmt_hz_log(frac, 20.0f, 20000.0f, buf, buflen); return; }
+            if (idx == 1 || idx == 3 || idx == 6) { hds_fx_fmt_db(frac, -18.0f, 18.0f, buf, buflen); return; }
+            if (idx == 4) { hds_fx_fmt_plain(frac, 0.1f, 10.0f, " Q", buf, buflen); return; }
+            break;
+        case FX_TYPE_LIMITER:
+            if (idx == 0) { hds_fx_fmt_db(frac, -20.0f, 0.0f, buf, buflen); return; }
+            if (idx == 1) { hds_fx_fmt_db(frac, 0.0f, 24.0f, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_ms(frac, 10.0f, 500.0f, buf, buflen); return; }
+            break;
+        case FX_TYPE_FETCOMP:
+            if (idx == 0) { hds_fx_fmt_db(frac, -20.0f, 40.0f, buf, buflen); return; }
+            if (idx == 1) { hds_fx_fmt_db(frac, -20.0f, 20.0f, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_stepped(frac, fetcomp_ratio, 5, buf, buflen); return; }
+            if (idx == 3) { hds_fx_fmt_us(frac, 20.0f, 800.0f, buf, buflen); return; } // microseconds, NOT ms -- see this section's own header comment
+            if (idx == 4) { hds_fx_fmt_ms(frac, 50.0f, 1100.0f, buf, buflen); return; }
+            if (idx == 5) { hds_fx_fmt_onoff(frac, fetcomp_limit[0], fetcomp_limit[1], true, buf, buflen); return; } // on("Limit") when frac<0.5
+            if (idx == 6) { hds_fx_fmt_plain(frac, 0.0f, 0.5f, "", buf, buflen); return; }
+            if (idx == 7) { hds_fx_fmt_percent(frac, buf, buflen); return; }
+            break;
+        case FX_TYPE_FAIRKID67:
+            if (idx == 0) { hds_fx_fmt_db(frac, -20.0f, 40.0f, buf, buflen); return; }
+            if (idx == 1) { hds_fx_fmt_db(frac, -20.0f, 20.0f, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_plain(frac, 0.0f, 5.0f, "V", buf, buflen); return; }
+            if (idx == 3) { hds_fx_fmt_stepped(frac, fk67_timing, 6, buf, buflen); return; }
+            if (idx == 4) { hds_fx_fmt_stepped(frac, fk67_link, 4, buf, buflen); return; }
+            if (idx == 5) { hds_fx_fmt_plain(frac, 0.0f, 2.0f, "V", buf, buflen); return; }
+            if (idx == 6) { hds_fx_fmt_plain(frac, 0.5f, 3.0f, "x", buf, buflen); return; }
+            if (idx == 7) { hds_fx_fmt_plain(frac, 0.0f, 2.0f, "x", buf, buflen); return; }
+            break;
+        case FX_TYPE_PEAKMAX:
+            if (idx == 0) { hds_fx_fmt_db(frac, -30.0f, 0.0f, buf, buflen); return; }
+            if (idx == 1) { hds_fx_fmt_db(frac, -30.0f, 0.0f, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_onoff(frac, "Off", "On", false, buf, buflen); return; }
+            if (idx == 3) { hds_fx_fmt_stepped(frac, peakmax_release, 6, buf, buflen); return; }
+            if (idx == 4) { hds_fx_fmt_stepped(frac, peakmax_quant, 5, buf, buflen); return; }
+            if (idx == 5) { hds_fx_fmt_stepped(frac, peakmax_dither, 3, buf, buflen); return; }
+            if (idx == 6) { hds_fx_fmt_stepped(frac, peakmax_shape, 4, buf, buflen); return; }
+            break;
+        case FX_TYPE_MULTIFILTER:
+            if (idx == 0) { hds_fx_fmt_stepped(frac, multifilter_type, 4, buf, buflen); return; }
+            if (idx == 1) {
+                float hz = 20.0f * powf(1000.0f, frac);
+                if (hz < 40.0f) hz = 40.0f; else if (hz > 18000.0f) hz = 18000.0f;
+                if (hz >= 1000.0f) snprintf(buf, buflen, "%.2fkHz", hz / 1000.0f); else snprintf(buf, buflen, "%.0fHz", hz);
+                return;
+            }
+            if (idx == 2) { hds_fx_fmt_percent(frac, buf, buflen); return; } // already normalized against hds_fx_type_param_range()'s own 0-100 range by the caller
+            if (idx == 3) { char lbl[8]; hds_fx_fmt_stepped(frac, multifilter_slope, 12, lbl, sizeof(lbl)); snprintf(buf, buflen, "%sdB/o", lbl); return; }
+            break;
+        case FX_TYPE_OPTOCOMP:
+            if (idx == 0) { hds_fx_fmt_db(frac, -60.0f, 0.0f, buf, buflen); return; }
+            if (idx == 1) { hds_fx_fmt_ratio(frac, 1.0f, 20.0f, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_ms(frac, 0.1f, 100.0f, buf, buflen); return; }
+            if (idx == 3) { hds_fx_fmt_ms(frac, 100.0f, 1000.0f, buf, buflen); return; }
+            if (idx == 4) { hds_fx_fmt_db(frac, -12.0f, 12.0f, buf, buflen); return; }
+            break;
+        case FX_TYPE_DEESSER:
+            if (idx == 0) { hds_fx_fmt_hz_log(frac, 1000.0f, 16000.0f, buf, buflen); return; }
+            if (idx == 1) { hds_fx_fmt_db(frac, -40.0f, 0.0f, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_ratio(frac, 1.0f, 20.0f, buf, buflen); return; }
+            if (idx == 3) { hds_fx_fmt_ms(frac, 0.1f, 20.0f, buf, buflen); return; }
+            if (idx == 4) { hds_fx_fmt_ms(frac, 5.0f, 300.0f, buf, buflen); return; }
+            if (idx == 5) { hds_fx_fmt_onoff(frac, "Off", "On", false, buf, buflen); return; }
+            break;
+        case FX_TYPE_HARDTUNE:
+            if (idx == 0) { hds_fx_fmt_stepped(frac, hardtune_key, 12, buf, buflen); return; }
+            if (idx == 1) { hds_fx_fmt_stepped(frac, hardtune_scale, 5, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_stepped(frac, hardtune_target, 2, buf, buflen); return; }
+            if (idx == 3) { hds_fx_fmt_percent(frac, buf, buflen); return; }
+            if (idx == 4) { hds_fx_fmt_ms(frac, 0.1f, 200.0f, buf, buflen); return; }
+            if (idx == 5) { hds_fx_fmt_ms(frac, 0.1f, 500.0f, buf, buflen); return; }
+            if (idx == 6) { hds_fx_fmt_stepped(frac, hardtune_voice, 5, buf, buflen); return; }
+            if (idx == 7) { hds_fx_fmt_hz_linear(frac, 0.1f, 10.0f, buf, buflen); return; }
+            if (idx == 8) { hds_fx_fmt_semitones(frac, 0.0f, 1.5f, buf, buflen); return; }
+            if (idx == 9) { hds_fx_fmt_stepped(frac, hardtune_vibsrc, 3, buf, buflen); return; }
+            break;
+        case FX_TYPE_FDNVERB:
+            if (idx == 0) { hds_fx_fmt_sec_log(frac, 0.3f, 12.0f, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_ms(frac, 0.0f, 250.0f, buf, buflen); return; }
+            if (idx == 5) { hds_fx_fmt_hz_linear(frac, 0.1f, 10.0f, buf, buflen); return; }
+            if (idx == 9) { hds_fx_fmt_onoff(frac, "Off", "On", false, buf, buflen); return; }
+            // idx 1,3,4,6,7,8 (Size/Damp/Diffus/ModDp/ERLvl/ERDcy) are all genuine 0-100% fractions
+            // with no further unit conversion in run_fx_fdnverb() -- fall through to plain percent.
+            break;
+        case FX_TYPE_TAPEDELAY2:
+            if (idx == 6) { hds_fx_fmt_stepped(frac, pingpong, 2, buf, buflen); return; }
+            break; // idx 0-5 are all proprietary internal coefficients -- see this section's own header comment
+        case FX_TYPE_CREAMCOAT:
+            if (idx == 0) { hds_fx_fmt_stepped(frac, creamcoat_select, 17, buf, buflen); return; }
+            break; // idx 1-4 are all proprietary internal coefficients
+        default: break;
+    }
+    hds_fx_fmt_percent(frac, buf, buflen);
+}
+
 // Only FX_TYPE_FAIRKID67 actually reads sidechain_source (see its own comment in fx_types.h) -- the
 // Sidechain pill stays visible on every row for layout consistency (a row's own x-positions never
 // shift by type, keeping draw and hit-test trivially in sync) but is greyed out and inert on every
@@ -364,7 +581,10 @@ static void hds_fx_draw_pill(cairo_t *cr, double x, double y, double w, double h
 // every row lines up identically regardless of position, and the whole label+knob+value group is
 // guaranteed to land inside this one row's own bounds -- never bleeding into the row above or
 // below. row_y is the row's own top (not the knob's cy) so the caller doesn't have to re-derive it.
-static void hds_fx_draw_knob(cairo_t *cr, double cx, double cy, double radius, float value01, bool disabled, double row_y, const char *name_label) {
+// value_text_override: NULL means fall back to the old blanket "NN%" (used by the Mix knob, which
+// genuinely IS a plain percent -- see hds_fx_gui_render()'s own call). Every param knob instead
+// passes the real unit text from hds_fx_type_param_value_text() -- see that function's own comment.
+static void hds_fx_draw_knob(cairo_t *cr, double cx, double cy, double radius, float value01, bool disabled, double row_y, const char *name_label, const char *value_text_override) {
     if (name_label && name_label[0]) {
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 7.5);
@@ -399,8 +619,9 @@ static void hds_fx_draw_knob(cairo_t *cr, double cx, double cy, double radius, f
         cairo_new_path(cr);
     }
 
-    char value_text[8];
-    snprintf(value_text, sizeof(value_text), "%d%%", (int)(value01 * 100.0f + 0.5f));
+    char value_text[24];
+    if (value_text_override) snprintf(value_text, sizeof(value_text), "%s", value_text_override);
+    else snprintf(value_text, sizeof(value_text), "%d%%", (int)(value01 * 100.0f + 0.5f));
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 7.5);
     hds_fx_rgb(cr, disabled ? 0.38 : 0.62, disabled ? 0.38 : 0.62, disabled ? 0.40 : 0.65);
@@ -805,7 +1026,16 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
         }
 
         for (int i = 0; i < param_count; i++) {
-            hds_fx_draw_knob(cr, L.param_knob[i].x, L.param_knob[i].y, L.param_knob[i].w, slot->param[i], false, y, hds_fx_type_param_label(fx_type, i));
+            // Normalize against this param's own real STORAGE range (see
+            // hds_fx_type_param_range()'s own comment -- every param is 0.0-1.0 except
+            // FX_TYPE_MULTIFILTER's Reso, which is 0-100) before either drawing the knob's arc or
+            // computing its value text, so both always agree on what "full turn" means.
+            float lo, hi; hds_fx_type_param_range(fx_type, i, &lo, &hi);
+            float frac = (hi > lo) ? (slot->param[i] - lo) / (hi - lo) : 0.0f;
+            if (frac < 0.0f) frac = 0.0f; else if (frac > 1.0f) frac = 1.0f;
+            char value_text[24];
+            hds_fx_type_param_value_text(fx_type, i, frac, value_text, sizeof(value_text));
+            hds_fx_draw_knob(cr, L.param_knob[i].x, L.param_knob[i].y, L.param_knob[i].w, frac, false, y, hds_fx_type_param_label(fx_type, i), value_text);
         }
 
         // NAM's own Model/IR path pills -- see HdsFxRowLayout's own comment on nam_model_pill/
@@ -851,7 +1081,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
             hds_fx_draw_pill(cr, L.output_pill.x, L.output_pill.y, L.output_pill.w, L.output_pill.h, outbuf, is_tail && !output_off, !is_tail);
         }
 
-        hds_fx_draw_knob(cr, L.mix_knob.x, L.mix_knob.y, L.mix_knob.w, slot->mix / 100.0f, false, y, NULL);
+        hds_fx_draw_knob(cr, L.mix_knob.x, L.mix_knob.y, L.mix_knob.w, slot->mix / 100.0f, false, y, NULL, NULL);
 
         bool bypassed = slot->bypass != 0.0f;
         hds_fx_rounded_rect(cr, L.bypass_btn.x, L.bypass_btn.y, L.bypass_btn.w, L.bypass_btn.h, 3);
@@ -1045,8 +1275,13 @@ static void hds_fx_gui_on_motion(HdsFxPlugin *p, HdsFxGuiViewState *vs, double x
         if (v < 0.0f) v = 0.0f; else if (v > 100.0f) v = 100.0f;
         p->fx[vs->drag_row].mix = v;
     } else if (vs->drag_kind == 2) {
-        float v = vs->drag_start_value + (float)(delta / HDS_FX_DRAG_PIXELS_FULL_RANGE);
-        if (v < 0.0f) v = 0.0f; else if (v > 1.0f) v = 1.0f;
+        // Range-aware: FX_TYPE_MULTIFILTER's Reso (idx 2) is stored 0-100, not the plain 0.0-1.0
+        // every other param uses -- see hds_fx_type_param_range()'s own comment on the real bug
+        // this fixes (that knob used to be clampable to only 1% of its own real range). A full
+        // HDS_FX_DRAG_PIXELS_FULL_RANGE drag always spans the param's own full lo..hi either way.
+        float lo, hi; hds_fx_type_param_range((int)p->fx[vs->drag_row].fx_type, vs->drag_param_index, &lo, &hi);
+        float v = vs->drag_start_value + (float)(delta / HDS_FX_DRAG_PIXELS_FULL_RANGE) * (hi - lo);
+        if (v < lo) v = lo; else if (v > hi) v = hi;
         p->fx[vs->drag_row].param[vs->drag_param_index] = v;
     }
 }

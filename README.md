@@ -1176,7 +1176,29 @@ drift out of alignment with its column. Every row:
   Source" + 8 sidechain inputs);
 - up to 10 **param knobs**, each with its own real, short label directly above it (e.g. "Thresh",
   "Attack" -- `hds_fx_type_param_label()`, ported straight from each `FX_TYPE_*`'s own doc comment
-  in fx_types.h, never invented) and its current value as a "NN%" readout directly below -- label,
+  in fx_types.h, never invented) and its current value shown directly below in its OWN real unit --
+  `hds_fx_type_param_value_text()` reproduces each `run_fx_*()`'s exact formula (Gate's Threshold
+  as real dB, Attack as real ms, FetComp's Ratio as the genuine 5-way stepped switch it actually is
+  -- `4:1`/`8:1`/`12:1`/`20:1`/`All`, never a value in between -- FetComp's own Attack correctly in
+  microseconds rather than ms, EQ3/DeEsser's frequencies as real Hz/kHz on their own log tapers,
+  HardTune's Key/Scale/Voice as their real named choices, and so on for every param in every type).
+  A blanket "NN%" used to be shown on every single knob regardless of what it actually controlled --
+  real, confirmed carelessness from a live test, not a style choice: half of these params are
+  genuinely stepped/discrete or a completely different unit, and showing a smooth-looking percentage
+  for a value that only actually takes 5 real positions (or is measured in dB/ms/Hz) was flatly
+  wrong, not just imprecise. A param with no clean physical unit anywhere in its own DSP (a
+  proprietary internal coefficient/curve -- Ensemble, CreamCoat's Regen/DeRez/PreDly, StereoChorus,
+  TapeDelay2's Time/Freq/Reso/Flutter, PointyGuitar's tone knobs, Cabs2, Density3's Densty/HiPass)
+  deliberately stays a plain percent -- inventing a dB/Hz conversion the DSP itself never computes
+  would show a confident-looking but FALSE number, worse than "NN%".
+  This same audit also caught a second, more severe bug along the way: `FX_TYPE_MULTIFILTER`'s own
+  Reso param (idx 2) is read by `run_fx_multifilter()` as `clamp(param[2], 0.0f, 100.0f)` -- already
+  a 0-100 value, the one param in this entire codebase that isn't a plain 0.0-1.0 fraction -- while
+  the GUI's own knob-drag code clamped every param uniformly to `[0,1]`, capping that ONE knob at 1%
+  of its own real range and leaving it functionally inert no matter how far it was dragged.
+  `hds_fx_type_param_range()` is now the one place a param's real storage range comes from (default
+  `[0,1]`, this one exception `[0,100]`), consulted by both the drag code and the knob-arc/value-text
+  rendering so they can never disagree about what "full turn" means again. Label,
   knob, and value are all pinned at fixed offsets from the row's own top, so the whole group is
   guaranteed to stay inside that one row's own bounds, never bleeding into a neighbor. `FX_TYPE_NAM`
   only uses 3 of these 10 (Input/Output Gain, Cab Enable) -- the otherwise-blank remaining columns
@@ -1251,6 +1273,18 @@ Verified several ways, all exercising the real production code, no host availabl
    then injects a real `Return` keypress and confirms it lands in `nam_model_path` exactly -- and
    separately, that a real `Escape` keypress on the IR field discards the typed text instead of
    committing it, leaving `nam_ir_path` untouched.
+5. **Every param's value text matches its own DSP formula exactly, and the range bug is genuinely
+   fixed**: `hds_fx_type_param_value_text()` is called directly with known fractions and checked
+   against hand-computed expected strings for one param from every unit category (Gate's Threshold
+   in dB, Attack in ms, NAM's own bipolar 0.5-centered dB, EQ3's log-taper Hz, FetComp's genuinely
+   5-way-stepped Ratio -- confirmed it snaps to exactly one of `4:1`/`8:1`/`12:1`/`20:1`/`All`, never
+   an invented in-between value -- FetComp's Attack correctly in microseconds, and a proprietary-
+   curve param staying an honest plain percent rather than an invented unit). Separately, a real
+   drag through the actual `hds_fx_gui_on_motion()` code (not just calling the range function in
+   isolation) confirms `FX_TYPE_MULTIFILTER`'s Reso knob now reaches deep into its real 0-100 range
+   from one full drag stroke -- before the fix this could only ever reach `1.0`, 1% of its own range
+   -- while an ordinary 0-1 param dragged the identical distance still lands at exactly `1.0`,
+   proving the fix didn't accidentally widen every other knob's own range too.
 
 ### Command-line flags
 
