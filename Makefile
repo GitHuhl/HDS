@@ -255,7 +255,7 @@ FORCE:
 $(BIN_OBJ): $(SRC) src/backend.c src/fx_types.h src/fx_chain.c src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -c $(SRC) -o $@
 
-$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_x11.c | $(BUILD_DIR)
+$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_x11.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(HDS_FX_CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
 $(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.c src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_fx_gui_x11.c src/nam_bridge.h | $(BUILD_DIR)

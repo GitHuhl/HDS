@@ -184,6 +184,7 @@ typedef struct {
 // header comment.
 #include "hds_clap_play_draw.c"
 #include "hds_clap_filters_draw.c"
+#include "hds_clap_lfos_draw.c"
 #include "hds_clap_gui_draw.c"
 #include "hds_clap_gui_x11.c"
 

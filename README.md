@@ -3067,3 +3067,57 @@ for the Chain Mode toggle (`filter_chain_mode`), a Freq knob drag and a Res knob
 + select HPF, writing `filters[0].filter_type`), and Gain/Q knob drags on the Mid Peak EQ band
 (`eq_bands[1].gain_db`/`q`) -- eight real, passing assertions. The full existing regression suite
 (all 11 prior test binaries) still passes unchanged.
+
+## hds.clap's LFOs tab: all 16 PackLfoParams rows + the real 100-entry Destination combo (task #101)
+
+Next tab in the ordered list: `src/hds_clap_lfos_draw.c` (new) ports frontend.py's own LFOs tab --
+a single scrollable list of all 16 `PackLfoParams` rows (Waveform, Curve/Drive, Rate, Tempo-Sync
+division, Depth, Phase, Key Sync, Per-Key mode + Key/Vel Track, and the Destination combo). Unlike
+Play/Filters, the Destination combo itself is fully in scope for this pass -- it's the ordinary,
+always-visible way an LFO routes its own output, not a right-click extra, so this is where
+`matrix_shared_routes` (the same 100-entry mod-matrix target list the upcoming Envelopes tab's own
+assignable EGs will share) gets its first real, working implementation:
+`hds_lfo_dest_label()`/`hds_lfo_dest_selectable()` build/gate the exact same 100 targets (0=None,
+1-47 fixed oscillator/LFO/filter/mixer destinations, 48-83 patterned LFO 5-16 Rate/Depth/Phase,
+90-99 patterned Filter 1-5 Freq/Res, with indices 8-13/84-89 shown as inert "--" placeholders --
+retired slots from a pre-simplification design that a saved patch might still reference).
+
+16 rows with 11 controls apiece doesn't fit in the window at once (`HDS_LFO_ROW_H`=52 x 16 +
+header comes to ~856px against ~636px of usable height), so this tab is the first to need real
+vertical scrolling outside the FX tab's own row list -- `HdsClapLfosViewState.scroll_offset_px`,
+mouse-wheel-driven, same clamped-to-content convention `HdsFxGuiViewState`'s own scroll already
+uses. The Destination dropdown itself ALSO needs its own internal scroll (100 entries is far
+taller than any reasonable popup) -- capped to `HDS_LFO_DEST_LIST_MAX_H` (320px) with its own
+`dest_scroll_px`, reset to 0 every time a new one opens, scrolled by the mouse wheel while that
+specific dropdown is open (checked first in `hds_clap_lfos_on_scroll()`, before the whole-list
+scroll it falls through to otherwise).
+
+Reuses the same generic knob primitives every tab since Play has reused (`HdsPlayKnobDrag`/
+`hds_play_draw_knob()`/`hds_play_knob_hit_test()`/`hds_play_start_knob_drag()`), same "generic
+primitive, reused by a later tab file" pattern. The Rate knob is drawn/hit-tested `disabled`
+whenever `tempo_sync_division != 0` (matches frontend.py's own `dial.setEnabled(idx==0)`) -- its
+own value-text swaps to the division's name instead of a stale Hz reading, and a click on it while
+synced is correctly inert (verified explicitly in the test below). Key Track/Vel Track knobs are
+drawn/hit-tested only while `per_key_mode != 0` (matches the Key/Vel Track box's own
+show-on-PK-checked visibility). The LFO waveform enum (Tri/Sine/RevSaw/Sq/Off/Saw, indices 0-5,
+`lookup_lfo_waveform()`'s own ordering) is kept deliberately separate from the oscillators' own
+`WaveType` enum -- same value space collision Play tab's own header comment already warned about
+avoiding.
+
+**Scope for this pass**: same "everything visible without a right-click" cut as Play/Filters. Each
+Rate/Depth/Phase knob's own right-click "Modulate From" menu (lets one LFO/EG modulate another
+LFO's own Rate/Depth/Phase) and Depth's own separate right-click "Modulation Source (CC)" menu
+(`mod_source_cc`, a live-MIDI multiplicative scale) aren't wired up yet -- both fields those menus
+would set stay untouched by this pass's UI, same "don't reset what the Python GUI already set"
+posture as Filters' own deferred fields. Confirmed Combi mode changes nothing about this tab either
+(always the plain Program-scoped `/hds/lfo/...` fields, same posture as Filters).
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_lfos.c`, 11 passing assertions):
+the Waveform dropdown (open + select Sine, writing `wave_type`), a Rate knob drag (`rate_hz`), a
+Depth knob drag (`mod_depth`), the Tempo Sync dropdown (open + select 1/8, writing
+`tempo_sync_division`) followed by confirming the Rate knob is now genuinely inert, the PK toggle
+(`per_key_mode`) followed by a Key Track knob drag (`key_track`, only reachable once PK is on), the
+Destination dropdown's own internal scroll landing on and selecting target 95 ("Filter 3 Res",
+`dest_target`), and a whole-list scroll that lands a subsequent click on the correct row (LFO 16)
+at its new, scrolled screen position. The full existing regression suite (all 13 prior test
+binaries, `hds_fx.clap`'s own included) still passes unchanged.
