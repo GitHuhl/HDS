@@ -36,6 +36,7 @@
 #include <unistd.h>   // fork/pipe/dup2/close/read/execlp -- see hds_fx_gui_try_open_file_dialog()
 #include <sys/wait.h> // waitpid/WIFEXITED/WEXITSTATUS/WNOHANG -- see hds_fx_gui_poll_file_dialog()
 #include <fcntl.h>    // open() for /dev/null (redirecting the dialog subprocess's own stderr)
+#include <time.h>     // clock_gettime(CLOCK_MONOTONIC) -- see hds_fx_gui_poll_file_dialog()'s own comment on the fast-fail heuristic
 
 typedef struct {
     HdsFxPlugin *plugin;
@@ -68,6 +69,7 @@ typedef struct {
     int file_dialog_read_fd;  // pipe read end the child's stdout was redirected to; -1 when unused
     int file_dialog_row;
     int file_dialog_field;    // 0 = Model, 1 = IR -- matches HDS_FX_KEY_*'s own edit_field convention
+    struct timespec file_dialog_spawn_ts; // CLOCK_MONOTONIC at fork() -- see poll's own fast-fail heuristic
 } HdsFxGuiWindow;
 
 // (Re)creates the backbuffer at the window's own current size -- called on create() and on every
@@ -130,8 +132,9 @@ static void hds_fx_gui_try_open_file_dialog(HdsFxGuiWindow *w, int row, int fiel
         // to see). Tries zenity first, then kdialog -- execlp() only returns if THAT SPECIFIC binary
         // couldn't be found/run, so falling through to the next line is exactly "try the next tool",
         // and reaching the final _exit(127) means neither exists on this system at all -- the parent
-        // (see hds_fx_gui_poll_file_dialog()) recognizes that exact exit code as "no tool available"
-        // and falls back to the inline text-edit field automatically.
+        // (see hds_fx_gui_poll_file_dialog()) recognizes that exact exit code, AND any other fast,
+        // pathless failure (a tool that exists but couldn't actually show a picker), as reasons to
+        // fall back to the inline text-edit field automatically.
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
@@ -157,12 +160,33 @@ static void hds_fx_gui_try_open_file_dialog(HdsFxGuiWindow *w, int row, int fiel
     w->file_dialog_read_fd = pipefd[0];
     w->file_dialog_row = row;
     w->file_dialog_field = field;
+    clock_gettime(CLOCK_MONOTONIC, &w->file_dialog_spawn_ts);
     w->view.edit_row = -1;
 }
 
 // Reaps a pending dialog subprocess once it has actually exited -- a no-op (returns immediately)
 // while it's still open, called every timer tick alongside the ordinary event pump so this never
 // needs its own separate polling loop.
+// A real *.nam/*.wav path a dialog printed always contains at least one '.' and one '/' -- used
+// below to tell "the dialog genuinely ran and the user cancelled" apart from "the dialog printed
+// nothing because it never actually managed to show a picker at all" (see this function's own
+// fast-fail comment). Deliberately loose (this only ever gates a UX fallback decision, never
+// anything committed to nam_model_path/nam_ir_path itself).
+static bool hds_fx_looks_like_a_path(const char *s, ssize_t n) {
+    if (n <= 0) return false;
+    bool has_slash = false;
+    for (ssize_t i = 0; i < n; i++) if (s[i] == '/') { has_slash = true; break; }
+    return has_slash;
+}
+
+static void hds_fx_gui_fallback_to_inline_edit(HdsFxGuiWindow *w) {
+    HdsFxPlugin *p = w->plugin;
+    const char *cur = (w->file_dialog_field == 0) ? p->fx[w->file_dialog_row].nam_model_path : p->fx[w->file_dialog_row].nam_ir_path;
+    w->view.edit_row = w->file_dialog_row;
+    w->view.edit_field = w->file_dialog_field;
+    snprintf(w->view.edit_buffer, sizeof(w->view.edit_buffer), "%s", cur);
+}
+
 static void hds_fx_gui_poll_file_dialog(HdsFxGuiWindow *w) {
     if (w->file_dialog_pid <= 0) return;
     int status = 0;
@@ -175,28 +199,44 @@ static void hds_fx_gui_poll_file_dialog(HdsFxGuiWindow *w) {
     w->file_dialog_read_fd = -1;
     w->file_dialog_pid = 0;
 
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
-        // Neither zenity nor kdialog exists on this system -- fall back to exactly the same inline
-        // text-edit field a direct pill click opens, pre-filled from whatever's already there, so
-        // the feature this replaces never actually regresses on a system without either tool.
-        HdsFxPlugin *p = w->plugin;
-        const char *cur = (w->file_dialog_field == 0) ? p->fx[w->file_dialog_row].nam_model_path : p->fx[w->file_dialog_row].nam_ir_path;
-        w->view.edit_row = w->file_dialog_row;
-        w->view.edit_field = w->file_dialog_field;
-        snprintf(w->view.edit_buffer, sizeof(w->view.edit_buffer), "%s", cur);
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed_ms = (now.tv_sec - w->file_dialog_spawn_ts.tv_sec) * 1000.0
+                       + (now.tv_nsec - w->file_dialog_spawn_ts.tv_nsec) / 1e6;
+
+    bool got_path = hds_fx_looks_like_a_path(buf, n);
+    bool exited_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    // Exit 127 (neither zenity nor kdialog is even on PATH) is the case this was originally built
+    // for. But a real DAW-hosted test turned up a second, equally real failure mode this didn't
+    // cover at all: a tool that IS on PATH but fails to actually show a picker for some other
+    // reason entirely -- crashes, can't reach the X/Wayland display from inside the host's own
+    // process/sandbox, a DBus/portal service it depends on is missing, an argument this exact
+    // build doesn't recognize, etc. -- exits nonzero just like a plain user Cancel would, except
+    // the user never saw ANY window at all, so silently leaving the field untouched (this
+    // function's original behavior for "n<=0") looked indistinguishable from the whole feature
+    // just doing nothing. There is no exit code that universally means "I never actually opened a
+    // window" -- but a REAL human cancelling a REAL picker takes at least a couple hundred
+    // milliseconds (it has to render, and a person has to look at it and click Cancel); a process
+    // that errors out before ever managing to open a display connection typically exits in single-
+    // digit milliseconds. So: any failure (nonzero exit, or exited without printing anything
+    // resembling a real path) that came back suspiciously fast is treated as "this attempt never
+    // actually reached the user" and recovers into the inline text-edit fallback automatically,
+    // exactly like exit 127 always has -- guaranteeing a click on the Model/IR pill always leaves
+    // the user with SOME way to set a path, never a silent no-op. A slower nonzero exit with no
+    // path printed is left alone as a genuine Cancel (same posture as Escape in the inline
+    // fallback): the user demonstrably saw a real dialog and chose not to pick anything.
+    if (!got_path && (!exited_ok || elapsed_ms < 800.0)) {
+        hds_fx_gui_fallback_to_inline_edit(w);
         return;
     }
 
-    if (n > 0) {
+    if (got_path) {
         buf[n] = '\0';
         char *nl = strchr(buf, '\n'); if (nl) *nl = '\0'; // both tools print a trailing newline
-        if (buf[0] != '\0') {
-            char *dst = (w->file_dialog_field == 0) ? w->plugin->fx[w->file_dialog_row].nam_model_path : w->plugin->fx[w->file_dialog_row].nam_ir_path;
-            snprintf(dst, SAMPLE_PATH_LEN, "%s", buf);
-        }
-        // n<=0 (Cancel was clicked, or the dialog was closed without choosing anything) leaves the
-        // field exactly as it was -- same posture as Escape in the inline text-edit fallback.
+        char *dst = (w->file_dialog_field == 0) ? w->plugin->fx[w->file_dialog_row].nam_model_path : w->plugin->fx[w->file_dialog_row].nam_ir_path;
+        snprintf(dst, SAMPLE_PATH_LEN, "%s", buf);
     }
+    // Otherwise: a slow exit with nothing resembling a path -- a genuine Cancel after the user saw
+    // a real dialog. Leave the field exactly as it was.
 }
 
 static void hds_fx_gui_redraw(HdsFxGuiWindow *w) {

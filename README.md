@@ -1079,6 +1079,25 @@ doesn't receive keyboard focus automatically without the full XEmbed protocol --
 comment on why this plugin doesn't implement that yet), pre-filled with the field's current value, so
 the feature never regresses on a system with neither dialog tool present.
 
+**A real bug from a live DAW test, the very first time this shipped**: clicking the Model/IR pill did
+nothing at all -- no native dialog, no fallback text field either. Root cause: the fallback above was
+only ever triggered by the child's exact `_exit(127)` ("neither zenity nor kdialog is even on PATH"),
+but the DAW in question DOES have `zenity` on PATH -- it just fails to actually show a picker from
+inside that host's own process (a sandboxed/restricted environment, a missing display/DBus portal,
+whatever the exact cause) and exits nonzero with no output, exactly like a plain user Cancel would on
+the wire. Every OTHER failure mode looked identical to "the user saw a real dialog and clicked
+Cancel," so it was silently swallowed -- leaving the pill looking completely unresponsive. Fixed with
+a fast-exit heuristic in `hds_fx_gui_poll_file_dialog()`: a REAL human cancelling a REAL picker takes
+at least a couple hundred milliseconds (it has to render, and a person has to look at it and click
+Cancel); a process that fails before ever reaching a display connection typically exits in single-digit
+milliseconds. Any nonzero exit (or exit 127) that comes back in under 800ms with no path-shaped output
+now recovers into the inline text-edit fallback automatically, same as a genuinely-missing tool always
+has -- a slower nonzero exit with nothing printed is still left alone as a real Cancel. Verified with a
+third dialog-subprocess scenario alongside the two from this feature's own first pass: a fake `zenity`
+found on `$PATH` that exits `1` instantly with zero output (exactly what a live DAW test hit) now
+recovers into the inline fallback exactly like a genuinely-absent tool always has, where before this
+fix it left the field completely inert.
+
 **A second real bug, in the SAME "what does Output actually do" area**: an earlier revision gave
 Output its own Mono/Stereo choice, mirroring Input's -- but every one of the 8 CLAP ports is already
 a fixed 2-channel (L+R) stereo pair, so "Mono" there could only ever mean "write the same centered
@@ -1307,7 +1326,11 @@ Verified several ways, all exercising the real production code, no host availabl
    `nam_model_path` exactly. A second run points `$PATH` at an empty directory (neither tool
    reachable), real-clicks the IR pill, and confirms it still attempts to spawn (`file_dialog_pid >
    0`) before automatically falling back to the original inline text-edit field once both `execlp()`
-   attempts fail, pre-filled from that slot's own current (empty) IR path.
+   attempts fail, pre-filled from that slot's own current (empty) IR path. A third run (added after a
+   live DAW test found the pill completely unresponsive on a real system) points `$PATH` at a fake
+   `zenity` that exits `1` instantly with no output -- exactly what a real zenity does when it can't
+   actually show a picker from inside that host's own process -- and confirms this ALSO now recovers
+   into the inline fallback, which it did not before the fast-exit heuristic was added.
 
 ### Command-line flags
 
