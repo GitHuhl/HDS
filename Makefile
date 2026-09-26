@@ -68,7 +68,25 @@ NAM_INC := -I$(NAM_DIR) -I$(NAM_DIR)/Dependencies/nlohmann -I$(EIGEN_DIR)
 # runs correctly in a plain executable too (most distros build PIE executables by default anyway),
 # so there is no correctness cost to always compiling it this way, only the ability to reuse one
 # object set for both targets instead of building everything twice.
-NAM_CXXFLAGS := -O2 -std=c++20 -fPIC $(NAM_INC)
+#
+# -DNAM_SAMPLE_FLOAT here is load-bearing, not cosmetic: NAM_SAMPLE (dsp.h) is `double` unless this
+# is defined, and every real DSP class's actual compiled `process(NAM_SAMPLE**, ...)` signature --
+# WaveNet::process, ContainerModel::process, the Conv1D/RingBuffer internals, all of it -- lives in
+# the OTHER 16 files below, none of which ever defined this themselves. src/nam_bridge.cpp used to
+# be the ONLY translation unit that flipped NAM_SAMPLE to `float` (a local #define before its NAM
+# includes), which affects nothing outside that one .cpp -- so nam_bridge.cpp called through the
+# vtable believing every process() took `float**`, while the actual compiled code on the other side
+# of that same call (container.cpp/wavenet/model.cpp/etc., built with this flag absent) took
+# `double**`. Pointers themselves are the same width either way, so this silently linked and ran:
+# every real sample write then read/wrote 8 bytes through a pointer backed by only 4 real bytes,
+# quietly corrupting whatever memory sat next to it on every single call. A confirmed, real crash --
+# a live DAW session hit "Stack smashing detected" after loading a genuine multi-submodel .nam file
+# (see nam_bridge.cpp's own comment, and README.md's own bug narrative) -- traced with ASan straight
+# to this: a stack-buffer-overflow READ of 8 bytes out of a 4-byte float local, inside
+# WaveNet::_set_condition_array(). Defining it here, once, for every NAM_SRCS file (nam_bridge.cpp's
+# own copy is now redundant but harmless) is the actual fix: one real, consistent NAM_SAMPLE=float
+# across the whole vendored library, matching what nam_bridge.cpp always assumed on its own side.
+NAM_CXXFLAGS := -O2 -std=c++20 -fPIC -DNAM_SAMPLE_FLOAT $(NAM_INC)
 NAM_SRCS := \
 	$(NAM_DIR)/NAM/activations.cpp \
 	$(NAM_DIR)/NAM/container.cpp \

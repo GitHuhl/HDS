@@ -1723,6 +1723,41 @@ refused (`model_load_failed`, both channel instances left `NULL`), confirmed the
 dry passthrough, and confirmed it stays stable (no delayed corruption) across several more real
 process() blocks afterward.
 
+**A second, much bigger real crash, from a real user's real Mesa Boogie Dual Rectifier `.nam` file
+that the fix above did NOT cover** (that file's channel counts were genuinely 1-in/1-out at every
+level -- a `SlimmableContainer` of two plain WaveNet submodels -- so the refusal above never
+triggered, and it kept crashing). Root cause was a silent ABI mismatch across this project's OWN
+build, not a NAM library bug: `NAM_SAMPLE` (`dsp.h`) is `double` unless `NAM_SAMPLE_FLOAT` is
+defined, and `nam_bridge.cpp` had ALWAYS been the only translation unit that defined it (a local
+`#define` above its own NAM includes) -- affecting nothing outside that one file. Every other
+`NAM_SRCS` file (`container.cpp`, `wavenet/model.cpp`, `conv1d.cpp`, `ring_buffer.cpp`, ...) compiled
+with the Makefile's own `NAM_CXXFLAGS`, which never passed that flag, so their real, already-compiled
+`process()` overrides all took `NAM_SAMPLE** == double**`. `nam_bridge.cpp` called through that same
+(virtual) `process()` believing it took `float**`. Pointers are the same width regardless of what
+they point to, so this linked and ran without any error -- but every real sample thereafter read/
+wrote 8 bytes (a `double`) through a pointer actually backed by a real 4-byte `float` local (e.g. the
+single sample `hds_nam_process()`'s own one-element channel array points at, or `run_fx_nam()`'s own
+per-sample `sl`/`sr` locals in `fx_chain.c`), silently corrupting whatever memory sat next to it, on
+every single sample of every model ever loaded, the entire time NAM support has existed in this
+project. It didn't reliably crash small/quick tests (the corruption's blast radius depends on stack
+layout, so it can land on padding, a dead local, or the next real frame at random) -- confirmed
+directly: a 2000-sample single-channel smoke test never crashed, but a stereo (L+R instance),
+several-million-sample stress run reliably did, several seconds in, with the model's own output
+visibly gone to nonsense (`-36893488147419103232.0`, suspiciously exactly `-2^65`) well before the
+actual `__stack_chk_fail` abort. Confirmed to the exact byte with AddressSanitizer (recompiling the
+vendored library into a throwaway scratch build with `-fsanitize=address`, never touching the real
+`build/` tree): a stack-buffer-overflow *READ of size 8* inside
+`WaveNet::_set_condition_array(double**, int)`, landing squarely inside a real 4-byte `float` local
+one stack frame up. Fixed at the actual root: `NAM_CXXFLAGS` in the Makefile now carries
+`-DNAM_SAMPLE_FLOAT` itself, so every one of the 17 `NAM_SRCS` files (this project's own
+`nam_bridge.cpp` included) compiles against one single, consistent `NAM_SAMPLE = float` -- the ODR
+violation is gone, not papered over. `nam_bridge.cpp`'s own original local `#define` is now guarded
+(`#ifndef`) rather than removed outright, so the file still compiles correctly completely on its own
+(e.g. an ad hoc single-file test build) even without the Makefile's flag. Re-verified after the fix:
+the same stress run that used to crash now runs millions of samples with sane, stable output and no
+ASan report; the full existing NAM test suite (including the stereo-WAV-as-model refusal test above)
+still passes unchanged.
+
 **Now wired into the `make arm64` cross-build too**: there never was a real "no C++ cross-compiler"
 problem, only a missing Makefile recipe -- `shell.nix`'s `aarch64.stdenv.cc` already installs a full
 `aarch64-unknown-linux-gnu-g++` alongside its own `-gcc`, it just went unused. `make arm64` now

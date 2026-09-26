@@ -9,7 +9,26 @@
 // but every signal in backend.c's own audio path is `float` -- defining this makes NAM_SAMPLE
 // `float` too, matching HDS's own pipeline exactly with no per-sample cast at the boundary. This is
 // NAM's own officially-supported real-time build configuration, not a HDS-specific hack.
-#define NAM_SAMPLE_FLOAT
+//
+// Now REDUNDANT with (but harmless alongside) the Makefile's own -DNAM_SAMPLE_FLOAT on
+// $(NAM_CXXFLAGS) -- kept here so this file still builds correctly on its own (e.g. this session's
+// own ad hoc test compiles) even without that flag. It used to be the ONLY place this was defined,
+// which was itself a real, confirmed bug: every other NAM_SRCS file (container.cpp,
+// wavenet/model.cpp, conv1d.cpp, ...) compiled with the default NAM_SAMPLE=double, so their real,
+// already-compiled process()/etc. functions all took `double**` -- while this file, and only this
+// file, called through those same (virtual) functions believing they took `float**`. That link
+// succeeded (pointers are the same width regardless), so every real call quietly read/wrote 8 bytes
+// through a pointer backed by only a 4-byte float local on the CALLER's stack (ours, e.g.
+// hds_nam_process()'s own `chans`/the caller's per-sample float in fx_chain.c's run_fx_nam()) --
+// silent stack corruption on every single sample, confirmed with ASan as a stack-buffer-overflow
+// inside WaveNet::_set_condition_array() reading 8 bytes out of a real 4-byte float. See the
+// Makefile's own comment on NAM_CXXFLAGS for the full story; the real fix is there, not here.
+// #ifndef guard: the Makefile already passes this on the command line for every NAM_SRCS file
+// (this one included) -- the guard just avoids a harmless but noisy "macro redefined" warning
+// while still leaving this file safe to compile standalone (outside the Makefile) on its own.
+#ifndef NAM_SAMPLE_FLOAT
+  #define NAM_SAMPLE_FLOAT
+#endif
 
 #include "nam_bridge.h"
 #include "NAM/dsp.h"
