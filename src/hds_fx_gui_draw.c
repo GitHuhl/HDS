@@ -532,6 +532,7 @@ static bool hds_fx_slot_participates_in_chain(const HdsFxGuiHost *p, int slot) {
 #define HDS_FX_DROPDOWN_INPUT 2
 #define HDS_FX_DROPDOWN_SIDECHAIN 3
 #define HDS_FX_DROPDOWN_OUTPUT 4
+#define HDS_FX_DROPDOWN_SOURCE 5 // the Source-combo Input header for a host with no port model -- see HdsFxGuiHost's own comment
 
 typedef struct { double x, y, w, h; } HdsFxRect;
 
@@ -879,18 +880,20 @@ static void hds_fx_format_input_pill(char *buf, size_t buflen, int port, bool st
 // only 7 stereo options, silently missing port 8 entirely).
 // ---------------------------------------------------------------------------------------------
 
-static int hds_fx_dropdown_option_count(int kind) {
+static int hds_fx_dropdown_option_count(const HdsFxGuiHost *p, int kind) {
     switch (kind) {
         case HDS_FX_DROPDOWN_TYPE: return HDS_FX_SELECTABLE_TYPE_COUNT;
         case HDS_FX_DROPDOWN_INPUT: return 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT; // Off + 8 mono + 8 stereo
         case HDS_FX_DROPDOWN_OUTPUT: return 1 + HDS_FX_PORT_COUNT; // Off + 8 (always that port's real stereo pair)
         case HDS_FX_DROPDOWN_SIDECHAIN: return 1 + HDS_FX_PORT_COUNT; // "Same as Source" + 8
+        case HDS_FX_DROPDOWN_SOURCE: return p->source_count; // no Off/Mono/Stereo suboptions -- matches frontend.py's own plain Source combo
         default: return 0;
     }
 }
 
-// Pure text for option `idx` -- doesn't need plugin state, just which list and which row within it.
-static void hds_fx_dropdown_option_label(int kind, int idx, char *buf, size_t buflen) {
+// Pure text for option `idx` -- doesn't need plugin state (except SOURCE, which is host-defined
+// and has no other concept to fall back on), just which list and which row within it.
+static void hds_fx_dropdown_option_label(const HdsFxGuiHost *p, int kind, int idx, char *buf, size_t buflen) {
     switch (kind) {
         case HDS_FX_DROPDOWN_TYPE:
             snprintf(buf, buflen, "%s", hds_fx_type_name(HDS_FX_SELECTABLE_TYPES[idx]));
@@ -910,6 +913,9 @@ static void hds_fx_dropdown_option_label(int kind, int idx, char *buf, size_t bu
         case HDS_FX_DROPDOWN_SIDECHAIN:
             if (idx == 0) snprintf(buf, buflen, "Same as Source");
             else snprintf(buf, buflen, "SC In %d", idx);
+            return;
+        case HDS_FX_DROPDOWN_SOURCE:
+            p->source_label(idx, buf, buflen);
             return;
         default: buf[0] = 0; return;
     }
@@ -938,6 +944,10 @@ static int hds_fx_dropdown_current_index(const HdsFxGuiHost *p, int kind, int ro
         case HDS_FX_DROPDOWN_SIDECHAIN: {
             int sc = (int)p->fx[row].sidechain_source;
             return (sc < 0 || sc >= HDS_FX_PORT_COUNT) ? 0 : sc + 1;
+        }
+        case HDS_FX_DROPDOWN_SOURCE: {
+            int s = (int)p->fx[row].fx_source;
+            return (s < 0 || s >= p->source_count) ? 0 : s;
         }
         default: return -1;
     }
@@ -974,6 +984,9 @@ static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
         case HDS_FX_DROPDOWN_SIDECHAIN:
             p->fx[row].sidechain_source = (idx == 0) ? -1.0f : (float)(idx - 1);
             return;
+        case HDS_FX_DROPDOWN_SOURCE:
+            p->fx[row].fx_source = (float)idx;
+            return;
         default: return;
     }
 }
@@ -984,6 +997,7 @@ static double hds_fx_dropdown_width(int kind) {
     switch (kind) {
         case HDS_FX_DROPDOWN_TYPE: return 130.0;
         case HDS_FX_DROPDOWN_SIDECHAIN: return 110.0;
+        case HDS_FX_DROPDOWN_SOURCE: return 120.0; // "Program 8"/"Ext In 8"/"Combi Mix" -- widest names in the list
         default: return 90.0; // Input/Output
     }
 }
@@ -992,8 +1006,8 @@ static double hds_fx_dropdown_width(int kind) {
 // the list would otherwise run off the window's own bottom edge. Same geometry
 // hds_fx_dropdown_option_rect() below builds each individual option row from, so draw and
 // hit-test can never disagree about where anything is.
-static void hds_fx_dropdown_bg_rect(const HdsFxDropdown *dd, int window_h, HdsFxRect *out) {
-    int count = hds_fx_dropdown_option_count(dd->kind);
+static void hds_fx_dropdown_bg_rect(const HdsFxGuiHost *p, const HdsFxDropdown *dd, int window_h, HdsFxRect *out) {
+    int count = hds_fx_dropdown_option_count(p, dd->kind);
     double w = hds_fx_dropdown_width(dd->kind);
     double list_h = count * HDS_FX_DROPDOWN_ROW_H;
     double below_y = dd->anchor.y + dd->anchor.h + 2.0;
@@ -1002,20 +1016,20 @@ static void hds_fx_dropdown_bg_rect(const HdsFxDropdown *dd, int window_h, HdsFx
     *out = (HdsFxRect){dd->anchor.x, y0, w, list_h};
 }
 
-static void hds_fx_dropdown_option_rect(const HdsFxDropdown *dd, int window_h, int idx, HdsFxRect *out) {
+static void hds_fx_dropdown_option_rect(const HdsFxGuiHost *p, const HdsFxDropdown *dd, int window_h, int idx, HdsFxRect *out) {
     HdsFxRect bg;
-    hds_fx_dropdown_bg_rect(dd, window_h, &bg);
+    hds_fx_dropdown_bg_rect(p, dd, window_h, &bg);
     *out = (HdsFxRect){bg.x, bg.y + idx * HDS_FX_DROPDOWN_ROW_H, bg.w, HDS_FX_DROPDOWN_ROW_H};
 }
 
 static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewState *vs) {
     if (vs->dropdown.kind == HDS_FX_DROPDOWN_NONE) return;
     const HdsFxDropdown *dd = &vs->dropdown;
-    int count = hds_fx_dropdown_option_count(dd->kind);
+    int count = hds_fx_dropdown_option_count(p, dd->kind);
     int current = hds_fx_dropdown_current_index(p, dd->kind, dd->row);
 
     HdsFxRect bg;
-    hds_fx_dropdown_bg_rect(dd, vs->window_h, &bg);
+    hds_fx_dropdown_bg_rect(p, dd, vs->window_h, &bg);
     hds_fx_rgb(cr, 0.13, 0.13, 0.16);
     cairo_new_path(cr);
     cairo_rectangle(cr, bg.x, bg.y, bg.w, bg.h);
@@ -1030,7 +1044,7 @@ static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFx
     cairo_set_font_size(cr, 9.5);
     for (int i = 0; i < count; i++) {
         HdsFxRect r;
-        hds_fx_dropdown_option_rect(dd, vs->window_h, i, &r);
+        hds_fx_dropdown_option_rect(p, dd, vs->window_h, i, &r);
         if (i == current) {
             hds_fx_rgb(cr, 0.22, 0.32, 0.36);
             cairo_new_path(cr);
@@ -1038,7 +1052,7 @@ static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFx
             cairo_fill(cr);
         }
         char label[24];
-        hds_fx_dropdown_option_label(dd->kind, i, label, sizeof(label));
+        hds_fx_dropdown_option_label(p, dd->kind, i, label, sizeof(label));
         hds_fx_rgb(cr, i == current ? 0.92 : 0.78, i == current ? 0.95 : 0.78, i == current ? 0.92 : 0.81);
         hds_fx_left_text(cr, r.x + 6, r.y + r.h / 2 + 3.5, label);
     }
@@ -1336,11 +1350,20 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
             if (input_off) snprintf(inbuf, sizeof(inbuf), "Off");
             else hds_fx_format_input_pill(inbuf, sizeof(inbuf), port, p->port_input_stereo[port] != 0.0f);
             hds_fx_draw_pill(cr, L.input_pill.x, L.input_pill.y, L.input_pill.w, L.input_pill.h, inbuf, is_head && !input_off, !is_head);
+        } else if (p->source_count > 0) {
+            // The OTHER Input header shape: a Source combo (Program/Combi Mix/Ext In), reusing the
+            // exact same fx_source field and the exact same chain-head gating a port-model host
+            // uses for its own Input pill -- see HdsFxGuiHost's own comment on source_count/
+            // source_label. `port` here is already fx_source clamped against HDS_FX_PORT_COUNT,
+            // which a Source-combo host #defines to its own real source count before including
+            // this file (see clap_plugin.c's own comment), so it's already the right index.
+            char srcbuf[24];
+            p->source_label(port, srcbuf, sizeof(srcbuf));
+            hds_fx_draw_pill(cr, L.input_pill.x, L.input_pill.y, L.input_pill.w, L.input_pill.h, srcbuf, is_head, !is_head);
         } else {
-            // This host has no flat N-port Input concept at all (see HdsFxGuiHost's own header
-            // comment) -- its own header/row code draws whatever Input concept it DOES have
-            // (hds.clap's own Source combo) separately; this file just leaves the space blank
-            // rather than assume a port model that doesn't apply.
+            // This host has neither an N-port Input concept nor a Source combo -- leaves the space
+            // blank rather than assume a model that doesn't apply (currently unreached: both real
+            // hosts set one or the other).
             hds_fx_draw_pill(cr, L.input_pill.x, L.input_pill.y, L.input_pill.w, L.input_pill.h, "\xe2\x80\x94", false, true);
         }
 
@@ -1504,10 +1527,10 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
     }
 
     if (vs->dropdown.kind != HDS_FX_DROPDOWN_NONE) {
-        int count = hds_fx_dropdown_option_count(vs->dropdown.kind);
+        int count = hds_fx_dropdown_option_count(p, vs->dropdown.kind);
         for (int i = 0; i < count; i++) {
             HdsFxRect r;
-            hds_fx_dropdown_option_rect(&vs->dropdown, vs->window_h, i, &r);
+            hds_fx_dropdown_option_rect(p, &vs->dropdown, vs->window_h, i, &r);
             if (hds_fx_rect_contains(&r, x, y)) {
                 if (button == 1) hds_fx_dropdown_apply(p, vs->dropdown.kind, vs->dropdown.row, i);
                 vs->dropdown.kind = HDS_FX_DROPDOWN_NONE;
@@ -1532,6 +1555,10 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
     }
     if (p->port_input_stereo && hds_fx_slot_is_chain_head(p, row) && hds_fx_rect_contains(&L.input_pill, x, y)) {
         vs->dropdown.kind = HDS_FX_DROPDOWN_INPUT; vs->dropdown.row = row; vs->dropdown.anchor = L.input_pill;
+        return true;
+    }
+    if (!p->port_input_stereo && p->source_count > 0 && hds_fx_slot_is_chain_head(p, row) && hds_fx_rect_contains(&L.input_pill, x, y)) {
+        vs->dropdown.kind = HDS_FX_DROPDOWN_SOURCE; vs->dropdown.row = row; vs->dropdown.anchor = L.input_pill;
         return true;
     }
     if (hds_fx_type_uses_sidechain((int)p->fx[row].fx_type) && hds_fx_rect_contains(&L.sidechain_pill, x, y)) {

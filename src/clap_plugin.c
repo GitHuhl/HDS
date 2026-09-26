@@ -43,10 +43,20 @@
 // here rather than duplicated. port_input_stereo/port_output_channel/port_input_off/
 // port_output_off all stay NULL for this host: hds.clap has no flat N-port Input/Output concept at
 // all (a slot's Input is which SOURCE feeds it -- a Program, the Combi Mix bus, or an ext-in pair,
-// see fx_source/SOURCE_COUNT in backend.c -- not a port), so this plugin's own FX tab draws its own
-// Source-combo header instead of hds_fx_gui_draw.c's port-pill one; see that file's own gating on
-// these fields being NULL.
+// see fx_source/SOURCE_COUNT in backend.c -- not a port). Instead it sets source_count/source_label
+// (below), which draws its own Source-combo Input header via hds_fx_gui_draw.c's own SOURCE
+// dropdown kind -- see that file's own gating on port_input_stereo being NULL vs. source_count > 0.
 #include "hds_fx_gui_host.h"
+
+// hds_clap_source_label: text for Source index `idx`, exactly matching frontend.py's own
+// SOURCE_NAMES construction (Program 1..COMBI_PROGRAM_COUNT, then Combi Mix, then Ext In
+// 1..EXT_IN_PAIR_COUNT) so a slot's Source combo and a DAW host's own port names (see
+// clap_audio_ports_get() below) name the same thing identically.
+static void hds_clap_source_label(int idx, char *buf, size_t buflen) {
+    if (idx < COMBI_PROGRAM_COUNT) snprintf(buf, buflen, "Program %d", idx + 1);
+    else if (idx == COMBI_PROGRAM_COUNT) snprintf(buf, buflen, "Combi Mix");
+    else snprintf(buf, buflen, "Ext In %d", idx - COMBI_PROGRAM_COUNT);
+}
 
 // ---------------------------------------------------------------------------------------------
 // build_osc_dispatch_table() builds a process-wide static table and calls exit(1) on a duplicate
@@ -1244,6 +1254,8 @@ static const clap_plugin_t *clap_factory_create_plugin(const clap_plugin_factory
     // header comment and this file's own comment on the struct. The four port_* pointers stay
     // NULL (calloc already guarantees this): hds.clap has no flat N-port Input/Output concept.
     p->gui_host.fx = p->knobs.fx;
+    p->gui_host.source_count = SOURCE_COUNT;
+    p->gui_host.source_label = hds_clap_source_label;
 
     p->plugin.desc = &k_descriptor;
     p->plugin.plugin_data = p;
