@@ -525,15 +525,16 @@ typedef struct {
     // reproduces today's exact behavior (every slot processing the one shared Program mix) when
     // no ext-in sources are in use.
     float fx_source;
-    // Chain To Next (0/1, default 0): only meaningful when this slot's source is running in
-    // Parallel mode (fx_source_routing_mode[source]==1) -- when set, the NEXT owned slot (this
-    // source's own next slot in array order, not necessarily the physically-adjacent one) is fed
-    // THIS slot's own output instead of starting a fresh parallel branch from the shared dry
-    // input, continuing the same branch in series. Lets several slots be chained in series while
-    // that whole chain still runs as ONE branch alongside a source's other parallel slots/chains
-    // -- e.g. two independent 3-slot serial chains summed together. Ignored entirely in Series
-    // mode (every slot there is already chained unconditionally) and on the last slot in the
-    // array (there is no "next" to chain into). See process_fx_chain()'s own comment.
+    // Chain To Next (0/1, default 0) -- every caller always runs process_fx_chain() in Parallel
+    // mode (no separate Series/Parallel toggle exists anymore, see that function's own comment):
+    // when set, the NEXT owned slot (this source's own next slot in array order, not necessarily
+    // the physically-adjacent one) is fed THIS slot's own output instead of starting a fresh
+    // parallel branch from the shared dry input, continuing the same branch in series. Lets
+    // several slots be chained in series while that whole chain still runs as ONE branch alongside
+    // a source's other parallel slots/chains -- e.g. two independent 3-slot serial chains summed
+    // together, or every slot on a source chained to reproduce a single, plain serial chain.
+    // Meaningless on the last slot in the array (there is no "next" to chain into). See
+    // process_fx_chain()'s own comment.
     float chain_to_next;
     // Sidechain Source (default -1 = "Same as Source" -- keys off this slot's OWN dry input,
     // reproducing ordinary non-external-sidechain compression, e.g. FX_TYPE_FAIRKID67's real

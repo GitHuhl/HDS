@@ -4467,9 +4467,13 @@ static void run_fx_fdnverb(FXSlotEngine *engine, const FXSlotParams *params, flo
 // changed" block below. Until effects are ported in, every fx_type other than Off is unreached
 // and simply passes the dry signal through unchanged, same as Off.
 //
-// routing_mode selects how source_id's OWN assigned slots combine (see fx_source_routing_mode's
-// comment on SynthSharedControls): 0 = Series, each of this source's slots fed the previous one's
-// output (in physical slot-array order -- a slot not assigned to this source is simply skipped,
+// routing_mode selects how source_id's OWN assigned slots combine. Both of this file's callers
+// (backend.c's render_audio_block, hds_fx_plugin.c's process()) always pass 1 (Parallel) --
+// neither exposes a way to pick Series anymore (chain_to_next fully expresses what Series used to
+// mean, see its own comment on FXSlotParams in fx_types.h), so mode 0 below is effectively dead
+// code, kept only because this function's signature still accepts it: 0 = Series, each of this
+// source's slots fed the previous one's output (in physical slot-array order -- a slot not
+// assigned to this source is simply skipped,
 // so Series order among a source's own slots is still exactly array order), *l/*r updated in
 // place after every owned slot. FXSlotParams.chain_to_next is entirely IGNORED in this mode --
 // every slot is already chained unconditionally, so there's nothing left for it to express.

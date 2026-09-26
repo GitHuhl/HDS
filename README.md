@@ -1332,6 +1332,61 @@ Verified several ways, all exercising the real production code, no host availabl
    actually show a picker from inside that host's own process -- and confirms this ALSO now recovers
    into the inline fallback, which it did not before the fast-exit heuristic was added.
 
+### Fixing drift: two of HDS FX's own fixes ported back into main HDS
+
+Building HDS FX as a from-scratch, minimal multi-FX surfaced two places where the main synth's own
+FX bus had accumulated complexity HDS FX never needed, or was missing a real fix HDS FX already
+had. Both are ported back here, matching HDS FX exactly.
+
+**Ext-in pairs now have an explicit Mono/Stereo choice, mirroring HDS FX's own port_input_stereo.**
+Before this, whether an ext-in pair (`EXT_IN_PAIR_COUNT` independently-routable stereo sources, see
+`SynthSharedControls.ext_in_enable/gain`) was treated as mono or stereo was only ever an IMPLICIT
+fallback of the connected device's own channel count (`render_audio_block`'s own "if this pair's
+second channel doesn't exist, duplicate the first into both L/R"). There was no way to explicitly
+say "this pair is genuinely one mono source" when the device DOES provide a second channel that
+shouldn't be summed in as that pair's own R -- e.g. channel `2p+1` carrying some unrelated second
+mic/line. A new `ext_in_stereo[EXT_IN_PAIR_COUNT]` field (default 1.0/Stereo, preserving today's
+exact behavior) is set via a "Stereo" checkbox next to each pair's Enable/Gain on the Routing tab
+(new `/hds/ext_in/%d/stereo` OSC address, picked up automatically by CLAP state save/load and
+`request_state` the same way every other `OSC_ARRAY` entry is, no extra plumbing needed). Mono
+(unchecked) always centers channel `2p` alone to both L/R of that pair's bus, regardless of what
+channel `2p+1` carries.
+
+**The per-source Series/Parallel "FX bus routing mode" toggle is gone, matching HDS FX's own fix**
+(`hds_fx_plugin.c`'s own header comment: "this plugin just always calls `process_fx_chain()` in
+Parallel mode and the redundant mode switch is gone entirely"). `process_fx_chain()` (`fx_chain.c`,
+genuinely shared by both `backend.c` and `hds_fx_plugin.c`) has always accepted a `routing_mode`
+parameter, but Parallel mode's own existing semantics already reproduce plain Series byte-for-byte
+once every slot in a chain has its own `chain_to_next` set (the branch-averaging divisor collapses
+to 1, no attenuation) -- so the separate mode was never doing anything a per-slot `chain_to_next`
+couldn't already express, just with an extra, redundant switch a user could set inconsistently with
+their own `chain_to_next` choices. Removed `fx_source_routing_mode[SOURCE_COUNT]` from
+`SynthSharedControls` entirely (along with its `/hds/fx_routing/%d/mode` OSC address and the FX
+tab's own per-source Series/Parallel button grid) -- `backend.c`'s own call site now hardcodes `1`
+(Parallel), the exact literal `hds_fx_plugin.c` already used. `routing_mode`'s Series code path
+still exists in the shared `fx_chain.c` (neither caller can reach it anymore, kept only because the
+function's own signature still accepts the parameter) -- dead code, not a behavior change for
+either plugin.
+
+**No migration for existing saved state.** Every source defaulted to Series before this change, so
+an existing multi-slot FX chain on a source, saved in an old `.hdsprog` file or a DAW's own CLAP
+project state, will now run through Parallel with whatever `chain_to_next` it already has stored
+(default off on every slot) -- splitting what used to be one serial chain into independent parallel
+branches, an audible change for anyone with an existing multi-effect chain on one source. This is a
+deliberate, explicit choice (no patches worth preserving through the transition) rather than an
+oversight -- an old save's `/hds/fx_routing/%d/mode` lines are simply unrecognized addresses now,
+silently ignored the same way any other deprecated OSC address already is.
+
+Verified: a full clean rebuild of all three targets (`synth_engine`, `hds.clap`, `hds_fx.clap`) with
+zero warnings, confirming `process_fx_chain()`'s own shared logic (already covered by HDS FX's own
+`test_dilution_fix`/`test_shared_pool`/`test_param_units` suite, since it's the identical function)
+is unaffected by the call-site literal change. The `ext_in_stereo` dispatch itself is a small,
+direct three-line conditional read alongside logic already covered by that same shared function's
+own tests -- verified by direct code review rather than a new dedicated harness, since exercising
+`render_audio_block()` end-to-end needs a full synth engine instance (voices, LFO phase arrays, MIDI
+live state) that HDS FX's own much smaller, self-contained CLAP plugin was specifically built to
+avoid needing.
+
 ### Command-line flags
 
 Every flag `./synth_engine` and `python3 src/frontend.py` accept, in one place -- each one is also

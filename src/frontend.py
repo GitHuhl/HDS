@@ -2553,9 +2553,7 @@ class ZoneInspectorPanel(QWidget):
 # Save/Load) vs. "the rig" (device selection, recording, routing/ext-in, hardware performance
 # tuning, and Combi/Sequencer's own session-level stacking state -- none of which belong inside
 # a single self-contained patch file). See the plan's own field-scope section for the reasoning
-# behind each exclusion. One exception that isn't a plain prefix rule: /hds/fx_routing/%d/mode is
-# per-SOURCE (0=Program, 1-8=ext-in pairs) -- index 0 is genuinely patch content (the Program's
-# own FX Series/Parallel choice), the rest are rig-level.
+# behind each exclusion.
 _PROGRAM_SCOPE_EXCLUDED_PREFIXES = ("/hds/device/", "/hds/record/", "/hds/routing/", "/hds/ext_in/", "/hds/audio/",
                                     # combi_lane_midi_channel/key_lo/key_hi/vel_lo/vel_hi (the
                                     # only /hds/combi/ addresses transmit_knob_packet's own
@@ -2582,8 +2580,6 @@ def _is_program_scope_address(addr):
         return False
     if addr.startswith("/hds/fx/") and addr.endswith("/source"):
         return False
-    if addr.startswith("/hds/fx_routing/"):
-        return addr == "/hds/fx_routing/0/mode"
     return True
 
 class SynthGui(QWidget):
@@ -4846,34 +4842,14 @@ class SynthGui(QWidget):
 
         fx_outer_lay.addLayout(fx_header_row)
 
-        # Series/Parallel is now a per-source choice (each source's OWN assigned slots run in
-        # Series or Parallel independently of every other source) rather than one tab-wide
-        # switch -- see fx_source_routing_mode[SOURCE_COUNT] in backend.c. One small toggle per
-        # source, laid out in a compact grid since there are SOURCE_COUNT (17) of them (8 Combi
-        # Programs + Combi Mix + 8 ext-in pairs).
-        routing_box = QGroupBox("FX Routing Mode (per source)")
-        routing_box.setStyleSheet("QGroupBox { font-size: 9px; font-weight: bold; }")
-        routing_grid = QGridLayout(routing_box)
-        routing_grid.setSpacing(3)
-        self.fx_source_routing_btns = []
-        routing_cols = 3
-        for src in range(SOURCE_COUNT):
-            btn = QPushButton(f"{SOURCE_NAMES[src]}: Series")
-            btn.setCheckable(True)
-            btn.setFixedSize(140, 20)
-            btn.setStyleSheet("font-size: 9px;")
-            btn.setToolTip(
-                "Series: this source's own assigned slots run in array order, each fed the\n"
-                "previous one's output.\n"
-                "Parallel: this source's own assigned slots all fed the same input independently,\n"
-                "summed and averaged."
-            )
-            btn.toggled.connect(
-                lambda checked, s=src, b=btn: b.setText(f"{SOURCE_NAMES[s]}: {'Parallel' if checked else 'Series'}")
-            )
-            routing_grid.addWidget(btn, src // routing_cols, src % routing_cols)
-            self.fx_source_routing_btns.append(btn)
-        fx_outer_lay.addWidget(routing_box)
+        # No separate Series/Parallel routing-mode switch: every source's own assigned slots
+        # always run through process_fx_chain() in Parallel mode, and a slot's own Chain-to-Next
+        # checkbox (below, per FX slot) fully expresses what Series used to mean -- chaining every
+        # slot in a source's chain to the next collapses Parallel's branch-averaging to a single
+        # branch (divisor 1), reproducing plain Series exactly. This mirrors HDS FX's own fix
+        # (see hds_fx_plugin.c's header comment: "the redundant mode switch is gone entirely") --
+        # the shared process_fx_chain() in fx_chain.c never needed two real modes at this call
+        # site, just one that Chain-to-Next can already express fully.
 
         fx_scroll = QScrollArea()
         fx_scroll.setWidgetResizable(True)
@@ -5118,19 +5094,20 @@ class SynthGui(QWidget):
         self.routing_grid.setSpacing(4)
         self.routing_grid.setContentsMargins(4, 4, 4, 4)
 
-        # Column layout: 0=Source label, 1=Enable, 2=Gain, 3..3+OUTPUT_PAIR_MAX-1 = one checkbox
-        # per output pair. Header row (row 0) is built once; the "Out N" column headers are
-        # created for every possible pair up to OUTPUT_PAIR_MAX and shown/hidden by
+        # Column layout: 0=Source label, 1=Enable, 2=Gain, 3=Stereo, 4..4+OUTPUT_PAIR_MAX-1 = one
+        # checkbox per output pair. Header row (row 0) is built once; the "Out N" column headers
+        # are created for every possible pair up to OUTPUT_PAIR_MAX and shown/hidden by
         # _rebuild_routing_output_columns() as detected_output_channels changes live.
         self.routing_grid.addWidget(QLabel("<b>Source</b>"), 0, 0)
         self.routing_grid.addWidget(QLabel("<b>Enable</b>"), 0, 1)
         self.routing_grid.addWidget(QLabel("<b>Gain</b>"), 0, 2)
+        self.routing_grid.addWidget(QLabel("<b>Stereo</b>"), 0, 3)
         self.routing_output_col_headers = []
         for p in range(OUTPUT_PAIR_MAX):
             hdr = QLabel(f"Out {p + 1}")
             hdr.setStyleSheet("font-size: 9px;")
             hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.routing_grid.addWidget(hdr, 0, 3 + p)
+            self.routing_grid.addWidget(hdr, 0, 4 + p)
             self.routing_output_col_headers.append(hdr)
         # One more column after the output-pair checkboxes: a per-Ext-In-pair VU meter (there's
         # plenty of spare horizontal space in each row already). Only ext-in pairs are real audio
@@ -5138,10 +5115,11 @@ class SynthGui(QWidget):
         # captured, and already have their own VU meter on the Output strip. Metering itself is
         # only ever computed backend-side while this tab is actually on-screen (see
         # gui_routing_tab_visible/_on_main_tab_changed) -- a true no-op the rest of the time.
-        self.routing_grid.addWidget(QLabel("<b>VU</b>"), 0, 3 + OUTPUT_PAIR_MAX)
+        self.routing_grid.addWidget(QLabel("<b>VU</b>"), 0, 4 + OUTPUT_PAIR_MAX)
 
         self.routing_ext_in_enable_cbs = []
         self.routing_ext_in_gain_dials = []
+        self.routing_ext_in_stereo_cbs = []
         self.routing_ext_in_vu_meters = []
         self.routing_output_pair_cbs = []  # [source_idx][pair_idx] -> QCheckBox
         for src in range(SOURCE_COUNT):
@@ -5149,11 +5127,13 @@ class SynthGui(QWidget):
             self.routing_grid.addWidget(QLabel(SOURCE_NAMES[src]), row, 0)
             if src < COMBI_PROGRAM_COUNT + 1:
                 # A Program (0..COMBI_PROGRAM_COUNT-1) or the Combi Mix bus (COMBI_PROGRAM_COUNT)
-                # has no enable/gain of its own here -- Programs are always live (master_volume
-                # lives on the main page, and each oscillator has its own Vol knob); only their
-                # output routing is configured on this tab.
+                # has no enable/gain/stereo of its own here -- Programs are always live
+                # (master_volume lives on the main page, and each oscillator has its own Vol
+                # knob) and are already genuine stereo throughout; only their output routing is
+                # configured on this tab.
                 self.routing_ext_in_enable_cbs.append(None)
                 self.routing_ext_in_gain_dials.append(None)
+                self.routing_ext_in_stereo_cbs.append(None)
                 self.routing_ext_in_vu_meters.append(None)
             else:
                 enable_cb = QCheckBox()
@@ -5169,6 +5149,21 @@ class SynthGui(QWidget):
                 self.routing_grid.addWidget(gain_dial, row, 2)
                 self.routing_ext_in_gain_dials.append(gain_dial)
 
+                # Explicit Mono/Stereo choice (checked = Stereo, this pair's own default -- see
+                # ext_in_stereo on SynthSharedControls in backend.c). Before this checkbox
+                # existed, a pair's mono-ness was only ever an IMPLICIT fallback of the capture
+                # device's own channel count -- there was no way to say "treat this pair as one
+                # mono source" when the device genuinely does provide a second channel that
+                # shouldn't be summed in as this pair's own R.
+                stereo_cb = QCheckBox()
+                stereo_cb.setChecked(True)
+                stereo_cb.setToolTip(
+                    f"{SOURCE_NAMES[src]}: read both channels as a real stereo pair (checked, "
+                    f"default) or always center just the first channel to L+R (unchecked)"
+                )
+                self.routing_grid.addWidget(stereo_cb, row, 3, alignment=Qt.AlignmentFlag.AlignCenter)
+                self.routing_ext_in_stereo_cbs.append(stereo_cb)
+
                 vu_meter = QProgressBar()
                 vu_meter.setRange(0, 100); vu_meter.setValue(0); vu_meter.setTextVisible(False)
                 vu_meter.setFixedSize(70, 14)
@@ -5176,14 +5171,14 @@ class SynthGui(QWidget):
                     QProgressBar { border: 1px solid #444; background: #222; }
                     QProgressBar::chunk { background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0f0, stop:0.7 #ff0, stop:1 #f00); }
                 """)
-                self.routing_grid.addWidget(vu_meter, row, 3 + OUTPUT_PAIR_MAX)
+                self.routing_grid.addWidget(vu_meter, row, 4 + OUTPUT_PAIR_MAX)
                 self.routing_ext_in_vu_meters.append(vu_meter)
 
             pair_cbs = []
             for p in range(OUTPUT_PAIR_MAX):
                 pair_cb = QCheckBox()
                 pair_cb.setToolTip(f"Route {SOURCE_NAMES[src]} to output pair {p + 1}")
-                self.routing_grid.addWidget(pair_cb, row, 3 + p, alignment=Qt.AlignmentFlag.AlignCenter)
+                self.routing_grid.addWidget(pair_cb, row, 4 + p, alignment=Qt.AlignmentFlag.AlignCenter)
                 pair_cbs.append(pair_cb)
             self.routing_output_pair_cbs.append(pair_cbs)
 
@@ -6924,13 +6919,12 @@ class SynthGui(QWidget):
 
         FIXED (second pass): an address-by-address audit of every OSC address
         transmit_knob_packet() ever sends against everything the apply-functions below actually
-        restore turned up the SAME bug class in three more places transmit_knob_packet() sends
-        unconditionally: each FX slot's own source routing (/hds/fx/{i}/source) and each source's
-        own Series/Parallel FX routing mode (/hds/fx_routing/{i}/mode) -- both deliberately
+        restore turned up the SAME bug class in one more place transmit_knob_packet() sends
+        unconditionally: each FX slot's own source routing (/hds/fx/{i}/source) -- deliberately
         excluded from _apply_program_fields_fx()'s own Program-Load behavior (correctly -- a
-        Program shouldn't dictate session routing), but with nothing else restoring them for the
+        Program shouldn't dictate session routing), but with nothing else restoring it for the
         reconnect case either, so reconnecting silently reset any ext-in FX routing back to
-        Program/Series. _apply_fx_routing_fields() closes that gap the same way
+        Program. _apply_fx_source_fields() closes that gap the same way
         _apply_seq_and_combi_fields() closed the Sequencer/Combi one. Programmable tempo markers
         (/hds/tempo/marker_count, /hds/tempo/marker/{i}/time|bpm, e.g. from importing a Standard
         MIDI File) and microtuning (/hds/tuning/enable|reference_note|reference_freq) were a
@@ -6959,17 +6953,15 @@ class SynthGui(QWidget):
             self.transpose_dial.setValue(int(round(fields["/hds/transpose_semitones"])))
             self.transpose_dial.blockSignals(False)
         self._apply_seq_and_combi_fields(fields)
-        self._apply_fx_routing_fields(fields)
+        self._apply_fx_source_fields(fields)
         self._apply_program_fields(fields)
 
-    def _apply_fx_routing_fields(self, fields):
-        """Restores each FX slot's own source assignment and each source's own Series/Parallel
-        routing mode -- both sent unconditionally by transmit_knob_packet() but deliberately
-        excluded from _apply_program_fields_fx()'s Program-Load behavior (session routing, not
-        patch content -- see _is_program_scope_address()'s own comment on the one exception,
-        /hds/fx_routing/0/mode). Nothing else restores these for the reconnect case, so without
-        this they silently reset to Program/Series on every reconnect -- see
-        _apply_full_state_fields()'s own comment."""
+    def _apply_fx_source_fields(self, fields):
+        """Restores each FX slot's own source assignment -- sent unconditionally by
+        transmit_knob_packet() but deliberately excluded from _apply_program_fields_fx()'s
+        Program-Load behavior (session routing, not patch content). Nothing else restores this
+        for the reconnect case, so without this it silently resets to Program on every reconnect
+        -- see _apply_full_state_fields()'s own comment."""
         for slot_idx in range(FX_SLOT_COUNT):
             addr = f"/hds/fx/{slot_idx}/source"
             if addr in fields:
@@ -6982,11 +6974,6 @@ class SynthGui(QWidget):
                 sc_combo.blockSignals(True)
                 sc_combo.setCurrentIndex(int(round(fields[sc_addr])) + 1)
                 sc_combo.blockSignals(False)
-        for src in range(SOURCE_COUNT):
-            addr = f"/hds/fx_routing/{src}/mode"
-            if addr in fields:
-                btn = self.fx_source_routing_btns[src]
-                btn.blockSignals(True); btn.setChecked(fields[addr] != 0.0); btn.blockSignals(False)
 
     def _apply_seq_and_combi_fields(self, fields):
         """Restores performance_mode plus every field transmit_knob_packet() sends
@@ -8539,6 +8526,7 @@ class SynthGui(QWidget):
             src = COMBI_PROGRAM_COUNT + 1 + p
             add_f(f"/hds/ext_in/{p}/enable", 1.0 if self.routing_ext_in_enable_cbs[src].isChecked() else 0.0)
             add_f(f"/hds/ext_in/{p}/gain", self.routing_ext_in_gain_dials[src].value() / 100.0)
+            add_f(f"/hds/ext_in/{p}/stereo", 1.0 if self.routing_ext_in_stereo_cbs[src].isChecked() else 0.0)
 
         # Multi-output hardware routing: which output pair(s) each source feeds (Routing tab).
         for src in range(SOURCE_COUNT):
@@ -8570,10 +8558,6 @@ class SynthGui(QWidget):
             add_f(f"/hds/fx/{slot_idx}/mix", self.fx_mix_dials[slot_idx].value())
             add_f(f"/hds/fx/{slot_idx}/bypass", 1.0 if self.fx_bypass_buttons[slot_idx].isChecked() else 0.0)
             add_f(f"/hds/fx/{slot_idx}/chain_to_next", 1.0 if self.fx_chain_to_next_buttons[slot_idx].isChecked() else 0.0)
-
-        # FX Bus routing: 0 = Series, 1 = Parallel -- now per-source (see SOURCE_COUNT).
-        for src in range(SOURCE_COUNT):
-            add_f(f"/hds/fx_routing/{src}/mode", 1.0 if self.fx_source_routing_btns[src].isChecked() else 0.0)
 
         # Pitch Bend range, up/down, semitones
         add_f("/hds/pb/range_up", self.pb_range_up_spin.value())
@@ -8970,8 +8954,6 @@ def runtime_connect_and_bind(gui):
         gui.fx_mix_dials[slot_idx].valueChanged.connect(gui.transmit_knob_packet)
         gui.fx_bypass_buttons[slot_idx].toggled.connect(gui.transmit_knob_packet)
         gui.fx_chain_to_next_buttons[slot_idx].toggled.connect(gui.transmit_knob_packet)
-    for btn in gui.fx_source_routing_btns:
-        btn.toggled.connect(gui.transmit_knob_packet)
 
     # Routing tab: per-pair ext-in enable/gain + the source x output-pair grid. Only ext-in
     # sources (ids COMBI_PROGRAM_COUNT+1..SOURCE_COUNT-1) have enable/gain widgets -- Programs
@@ -8979,6 +8961,7 @@ def runtime_connect_and_bind(gui):
     for src in range(COMBI_PROGRAM_COUNT + 1, SOURCE_COUNT):
         gui.routing_ext_in_enable_cbs[src].toggled.connect(gui.transmit_knob_packet)
         gui.routing_ext_in_gain_dials[src].valueChanged.connect(gui.transmit_knob_packet)
+        gui.routing_ext_in_stereo_cbs[src].toggled.connect(gui.transmit_knob_packet)
     for src in range(SOURCE_COUNT):
         for p in range(OUTPUT_PAIR_MAX):
             gui.routing_output_pair_cbs[src][p].toggled.connect(gui.transmit_knob_packet)

@@ -528,7 +528,7 @@ typedef struct {
 // actually reads via combi_mode_active (identity 0..7 in Combi mode, always SINGLE_PROGRAM_SLOT
 // outside it) -- see that function's own comments at each resolution point.
 //
-// FX slots (fx[]/fx_source_routing_mode/source_routing below), ext-in, and every other rig/
+// FX slots (fx[]/source_routing below), ext-in, and every other rig/
 // session-level field deliberately stay flat on SynthSharedControls, NOT in this struct -- those
 // are shared, physical-insert-like resources any Program (or the whole Combi stack) can be routed
 // into via fx_source, not part of any one patch. This is a small, deliberate refinement to
@@ -822,6 +822,18 @@ typedef struct {
     // as an already-stereo L/R pair and passed through as-is rather than re-panned from mono.
     float ext_in_enable[EXT_IN_PAIR_COUNT];
     float ext_in_gain[EXT_IN_PAIR_COUNT];
+    // Explicit per-pair Mono/Stereo choice (default: Stereo, 1.0), mirroring HDS FX's own
+    // port_input_stereo fix (see hds_fx_plugin.c's header comment, "The synth's own ext-in pairs
+    // don't have this Mono/Stereo choice yet"). Before this field existed, a pair's mono-ness was
+    // only ever an IMPLICIT fallback of the capture device's own channel count (see
+    // render_audio_block's own comment: "if this pair's second channel doesn't exist... duplicate
+    // the first into both L/R") -- there was no way to explicitly treat a pair as Mono when the
+    // device genuinely does provide both channels (e.g. channel 2p+1 carries some unrelated
+    // second mic/line this pair should never sum in as "R"). Stereo (1.0, default) keeps today's
+    // exact behavior (read L/R, degrading to mono-duplicate only if the device is short a
+    // channel); Mono (0.0) always reads channel 2p alone and centers it to both L/R of this pair's
+    // bus, regardless of whether channel 2p+1 exists or what it carries.
+    float ext_in_stereo[EXT_IN_PAIR_COUNT];
 
     // Routing tab visibility (sent by the frontend on every QTabWidget.currentChanged, see
     // frontend.py's own comment) -- gates render_audio_block's per-ext-in-pair peak metering
@@ -837,10 +849,14 @@ typedef struct {
     // function's dispatch switch; until then every slot is a pass-through (see FX_TYPE_OFF).
     FXSlotParams fx[FX_SLOT_COUNT];
 
-    // FX Bus routing, per source: 0 = Series (that source's slots run in array order, each fed
-    // the previous one's output), 1 = Parallel (every one of that source's slots fed the SAME
-    // pre-FX input independently, their outputs summed and averaged -- see process_fx_chain()).
-    float fx_source_routing_mode[SOURCE_COUNT];
+    // No separate per-source Series/Parallel routing-mode field: process_fx_chain() is always
+    // called in Parallel mode (see its own call site in render_audio_block), and a slot's own
+    // chain_to_next fully expresses what Series used to mean -- chaining every slot in a source's
+    // chain to the next collapses Parallel's branch-averaging to a single branch (divisor 1),
+    // reproducing plain Series exactly. Mirrors HDS FX's own fix (see hds_fx_plugin.c's header
+    // comment: "the redundant mode switch is gone entirely") -- the shared process_fx_chain() in
+    // fx_chain.c never needed two real modes at this call site, just the one chain_to_next can
+    // already express fully.
 
     // Multi-output hardware routing: which physical output pair(s) each source's final signal
     // (its dry bus if it owns no FX slots, or the result of its own Series/Parallel chain above)
@@ -2410,6 +2426,7 @@ static const OscParamEntry OSC_PARAMS[] = {
 
     OSC_ARRAY("/hds/ext_in/%d/enable", ext_in_enable, EXT_IN_PAIR_COUNT),
     OSC_ARRAY("/hds/ext_in/%d/gain", ext_in_gain, EXT_IN_PAIR_COUNT),
+    OSC_ARRAY("/hds/ext_in/%d/stereo", ext_in_stereo, EXT_IN_PAIR_COUNT),
     OSC_SCALAR("/hds/gui/routing_tab_visible", gui_routing_tab_visible),
 
     // --- FX Bus (fx[FX_SLOT_COUNT], FXSlotParams) ---
@@ -2429,7 +2446,6 @@ static const OscParamEntry OSC_PARAMS[] = {
     // state restore replaying this same field. See that function's own comment.
     OSC_STRING_SUBARRAY("/hds/fx/%d/nam_model_path", fx, FXSlotParams, nam_model_path, FX_SLOT_COUNT, SAMPLE_PATH_LEN),
     OSC_STRING_SUBARRAY("/hds/fx/%d/nam_ir_path", fx, FXSlotParams, nam_ir_path, FX_SLOT_COUNT, SAMPLE_PATH_LEN),
-    OSC_ARRAY("/hds/fx_routing/%d/mode", fx_source_routing_mode, SOURCE_COUNT),
 
     // --- Multi-output hardware routing: which output pair(s) each source lands on ---
     OSC_NESTED("/hds/routing/%d/out/%d", source_routing, SourceRouting, enable, SOURCE_COUNT, OUTPUT_PAIR_MAX),
@@ -3195,7 +3211,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     // the moment ext_in_enable goes live (e.g. right after this engine (re)starts, before the
     // frontend's own dial -- which also always inits to 0 -- has sent its first packet). The
     // user always has to bring this up manually.
-    for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) { knobs->ext_in_enable[p] = 0.0f; knobs->ext_in_gain[p] = 0.0f; }
+    for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) { knobs->ext_in_enable[p] = 0.0f; knobs->ext_in_gain[p] = 0.0f; knobs->ext_in_stereo[p] = 1.0f; }
     knobs->gui_routing_tab_visible = 0.0f;
     for (int f = 0; f < FX_SLOT_COUNT; f++) {
         knobs->fx[f].fx_type = FX_TYPE_OFF;
@@ -3209,12 +3225,10 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->fx[f].nam_ir_path[0] = '\0';
     }
     // Routing defaults: only the Program is routed anywhere (to output pair 0, i.e. today's only
-    // output pair), every ext-in pair unrouted, every source's own FX chain in Series -- this
-    // combination reproduces today's exact single-output-pair, Program-only behavior bit-for-bit
-    // in Single Program mode (Programs 1-7 never claim a voice outside Combi mode, so routing
-    // them anywhere is a harmless no-op there).
+    // output pair), every ext-in pair unrouted -- this combination reproduces today's exact
+    // single-output-pair, Program-only behavior bit-for-bit in Single Program mode (Programs 1-7
+    // never claim a voice outside Combi mode, so routing them anywhere is a harmless no-op there).
     for (int s = 0; s < SOURCE_COUNT; s++) {
-        knobs->fx_source_routing_mode[s] = 0.0f; // Series
         for (int o = 0; o < OUTPUT_PAIR_MAX; o++) knobs->source_routing[s].enable[o] = 0.0f;
     }
     // Every Combi Program (source ids 0..COMBI_PROGRAM_COUNT-1) defaults to output pair 0, not
@@ -8164,12 +8178,19 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             bus_l[src] = 0.0f;
             bus_r[src] = 0.0f;
             if (knobs->ext_in_enable[p] != 0.0f && 2 * p < ext_in_channels) {
-                // If this pair's second channel doesn't exist (e.g. a mono capture device, or an
-                // odd channel count's last pair), duplicate the first into both L/R -- matches
-                // this engine's existing mono-capture-device convention exactly (see the old
-                // single-pair tap this generalizes, which did the same thing for channels 0/1).
                 float l = ext_in_buffer[i * ext_in_channels + 2 * p];
-                float r = (2 * p + 1 < ext_in_channels) ? ext_in_buffer[i * ext_in_channels + 2 * p + 1] : l;
+                // Stereo (default, ext_in_stereo != 0): read the real R channel when the device
+                // provides one, degrading to mono-duplicate only if it doesn't (e.g. a mono
+                // capture device, or an odd channel count's last pair) -- matches this engine's
+                // original implicit convention exactly (see the old single-pair tap this
+                // generalizes, which did the same thing for channels 0/1). Mono (explicit,
+                // ext_in_stereo == 0): always center channel 2p alone to both L/R, even when the
+                // device does provide a channel 2p+1 -- lets a user say "this pair is genuinely
+                // one mono source" instead of that choice being made implicitly by hardware
+                // channel count alone (see this field's own comment on SynthSharedControls).
+                float r = (knobs->ext_in_stereo[p] != 0.0f && 2 * p + 1 < ext_in_channels)
+                              ? ext_in_buffer[i * ext_in_channels + 2 * p + 1]
+                              : l;
                 bus_l[src] = l * knobs->ext_in_gain[p];
                 bus_r[src] = r * knobs->ext_in_gain[p];
                 if (meter_ext_in) {
@@ -8198,7 +8219,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // effect to.
         for (int src = 0; src < SOURCE_COUNT; src++) {
             if (!source_has_fx_slots[src]) continue;
-            process_fx_chain(knobs->fx, fx_engine, (int)knobs->fx_source_routing_mode[src], src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src], gr_db_out);
+            process_fx_chain(knobs->fx, fx_engine, /* always Parallel, matches HDS FX */ 1, src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src], gr_db_out);
         }
 
         // CLAP multi-out (see this function's own per_program_out comment) -- captured here,
