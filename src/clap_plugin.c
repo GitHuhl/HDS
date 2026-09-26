@@ -149,24 +149,24 @@ typedef struct {
     HdsFxUploadContext fx_upload_ctx;
 #endif
 
-    // The view hds_fx_gui_draw.c/hds_fx_gui_x11.c actually operate on -- see HdsFxGuiHost's own
-    // header comment and this file's own comment on the #include just above. Populated once, in
-    // clap_factory_create_plugin(), with a pointer into THIS instance's own knobs.fx[].
+    // The view hds_fx_gui_draw.c's FX-tab engine actually operates on -- see HdsFxGuiHost's own
+    // header comment. Populated once, in clap_factory_create_plugin(), with a pointer into THIS
+    // instance's own knobs.fx[].
     HdsFxGuiHost gui_host;
+    // Opaque HdsClapGuiWindow* (hds_clap_gui_x11.c) -- NULL whenever no GUI is open. This plugin's
+    // own window is a whole-plugin concept (a tab bar dispatching across several tabs), not an
+    // FX-tab-specific one, so it lives here rather than inside gui_host.
+    void *gui_window;
 } HdsClapPlugin;
 
-// Every real host with an FX_SLOT_COUNT pool provides these two accessors before #include'ing
-// hds_fx_gui_x11.c -- see that file's own header comment (hds_fx_plugin.c's own copies, right
-// after HdsFxPlugin itself, are the reference example this mirrors).
-static HdsFxGuiHost *hds_fx_gui_host_of(const clap_plugin_t *plugin) {
-    return &((HdsClapPlugin *)plugin->plugin_data)->gui_host;
-}
-static const clap_host_t *hds_fx_gui_clap_host_of(const clap_plugin_t *plugin) {
-    return ((HdsClapPlugin *)plugin->plugin_data)->host;
-}
-
+// hds_clap_gui_draw.c: hds.clap's own top-level GUI (tab bar + per-tab dispatch, the FX tab
+// reusing hds_fx_gui_draw.c's own engine directly against gui_host above). hds_clap_gui_x11.c:
+// this plugin's own platform shim -- see each file's own header comment for why hds.clap gets its
+// own small X11 shell instead of further genericizing hds_fx_gui_x11.c (which stays exactly as
+// hds_fx.clap alone needs it).
 #include "hds_fx_gui_draw.c"
-#include "hds_fx_gui_x11.c"
+#include "hds_clap_gui_draw.c"
+#include "hds_clap_gui_x11.c"
 
 // ---------------------------------------------------------------------------------------------
 // audio-ports extension. Outputs: port 0 is the main stereo mix (today's only output, unchanged --
@@ -755,7 +755,7 @@ static void clap_plugin_destroy(const clap_plugin_t *plugin) {
     // Defensive: a well-behaved host always calls clap_plugin_gui->destroy() before this, but
     // clean up an open X11 window/Display here too rather than leak it if one doesn't -- same
     // posture hds_fx_plugin_destroy() already takes.
-    hds_fx_gui_destroy_internal(plugin);
+    hds_clap_gui_destroy_internal(plugin);
     free(p);
 }
 

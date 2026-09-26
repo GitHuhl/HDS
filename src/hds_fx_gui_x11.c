@@ -39,10 +39,9 @@
 #include <X11/Xutil.h> // XLookupString -- see hds_fx_gui_pump_events()'s own KeyPress case
 #include <X11/keysym.h> // XK_BackSpace/XK_Return/XK_KP_Enter/XK_Escape
 #include <cairo/cairo-xlib.h>
-#include <dirent.h>   // opendir/readdir/closedir -- see hds_fx_gui_browser_refresh()
-#include <sys/stat.h> // stat/S_ISDIR/S_ISREG -- see hds_fx_gui_browser_refresh()
-#include <strings.h>  // strcasecmp -- case-insensitive *.nam/*.wav filtering and sorting
-#include <stdlib.h>   // getenv/qsort
+#include <stdlib.h>   // calloc/free
+
+#include "hds_fx_gui_browser.c" // hds_fx_gui_browser_refresh() -- see that file's own header comment
 
 typedef struct {
     HdsFxGuiHost *plugin; // the real, persistent view -- see hds_fx_gui_host_of()'s own comment
@@ -92,107 +91,9 @@ static void hds_fx_gui_set_xembed_info(Display *dpy, Window win) {
     XChangeProperty(dpy, win, xembed_info, xembed_info, 32, PropModeReplace, (unsigned char *)data, 2);
 }
 
-// ---------------------------------------------------------------------------------------------
-// In-house file browser directory listing for FX_TYPE_NAM's Model/IR pills -- see HdsFxBrowser's
-// own comment in hds_fx_gui_draw.c for why this replaced an earlier zenity/kdialog subprocess
-// approach (real DAW testing found that approach unresponsive on more than one real host, even
-// after two rounds of hardening its failure-recovery heuristics). This is the ONE place that
-// actually touches the filesystem (opendir/readdir/stat) -- hds_fx_gui_draw.c only ever reads the
-// plain-data results this fills in, keeping it free of any OS call, same discipline that already
-// kept Xlib types out of that file. A future Windows port only needs its own FindFirstFile/
-// FindNextFile-based version of this ONE function; every render/hit-test function around
-// HdsFxBrowser stays untouched.
-// ---------------------------------------------------------------------------------------------
-typedef struct { char name[HDS_FX_BROWSER_NAME_LEN]; bool is_dir; } HdsFxBrowserSortEntry;
-
-static int hds_fx_browser_sort_cmp(const void *a, const void *b) {
-    const HdsFxBrowserSortEntry *ea = (const HdsFxBrowserSortEntry *)a;
-    const HdsFxBrowserSortEntry *eb = (const HdsFxBrowserSortEntry *)b;
-    if (ea->is_dir != eb->is_dir) return ea->is_dir ? -1 : 1; // directories before files
-    return strcasecmp(ea->name, eb->name);
-}
-
-// Case-insensitive "does this filename end in this extension" check -- the ONE place this
-// decision is made, shared by the directory listing below AND the path bar's own commit-attempt
-// (see hds_fx_gui_browser_refresh()'s own comment on path_bar_commit_attempt): without this, the
-// listing was already filtered to only ever show a *.nam/*.wav file, but typing or pasting an
-// exact path into the path bar and pressing Enter bypassed that filter entirely -- any existing
-// regular file, any extension (or none), got accepted as if it had been a real pick from the
-// list. Requiring the same extension match there too means the path bar can never be used to load
-// something the browser itself would never have shown in the first place.
-static bool hds_fx_path_has_ext(const char *name, const char *ext) {
-    size_t nlen = strlen(name), elen = strlen(ext);
-    return nlen >= elen && strcasecmp(name + nlen - elen, ext) == 0;
-}
-
-// Called every timer tick (a no-op unless needs_refresh is set -- opening the browser, navigating
-// into a directory or Up, or committing a typed path all set it, see hds_fx_gui_draw.c's own
-// browser functions). Never blocks the UI thread on anything slow (a real directory read is fast
-// on local disk, but this same non-blocking-poll shape is what would let a future version move the
-// actual I/O to a worker thread for a slow/network path without touching any caller).
-static void hds_fx_gui_browser_refresh(HdsFxGuiWindow *w) {
-    HdsFxBrowser *b = &w->view.browser;
-    if (!b->open || !b->needs_refresh) return;
-    b->needs_refresh = false;
-
-    // Enter was pressed on the path bar: try the typed text as an exact FILE path first (same
-    // effect as clicking a file entry), before ever trying it as a directory to list. Requires the
-    // same extension match the listing itself already enforces (hds_fx_path_has_ext()'s own
-    // comment) -- an existing regular file with the WRONG extension (or none) is deliberately left
-    // to fall through to the directory-listing attempt below, which will then simply fail to
-    // opendir() it and fall back to home/"/", same as any other bad typed path.
-    if (b->path_bar_commit_attempt) {
-        b->path_bar_commit_attempt = false;
-        const char *ext = (b->field == 0) ? ".nam" : ".wav";
-        struct stat st;
-        if (hds_fx_path_has_ext(b->dir, ext) && stat(b->dir, &st) == 0 && S_ISREG(st.st_mode)) {
-            char *dst = (b->field == 0) ? w->plugin->fx[b->row].nam_model_path : w->plugin->fx[b->row].nam_ir_path;
-            snprintf(dst, SAMPLE_PATH_LEN, "%s", b->dir);
-            b->open = false;
-            return;
-        }
-    }
-
-    DIR *d = b->dir[0] ? opendir(b->dir) : NULL;
-    if (!d) {
-        // The requested directory doesn't exist/isn't readable (or was never set at all, e.g. the
-        // very first open with no existing path to derive one from) -- fall back to a sane
-        // default rather than showing a dead end with no way to navigate anywhere.
-        const char *home = getenv("HOME");
-        if (home && (d = opendir(home))) snprintf(b->dir, sizeof(b->dir), "%s", home);
-        else if ((d = opendir("/"))) snprintf(b->dir, sizeof(b->dir), "/");
-    }
-    b->entry_count = 0;
-    b->scroll = 0;
-    if (!d) return; // nothing listable at all -- the path bar and Close are still available
-
-    const char *ext = (b->field == 0) ? ".nam" : ".wav";
-    HdsFxBrowserSortEntry sort_buf[HDS_FX_BROWSER_MAX_ENTRIES];
-    int n = 0;
-    struct dirent *de;
-    while (n < HDS_FX_BROWSER_MAX_ENTRIES && (de = readdir(d)) != NULL) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (de->d_name[0] == '.') continue; // skip hidden entries
-        char full[SAMPLE_PATH_LEN + HDS_FX_BROWSER_NAME_LEN + 2];
-        if (strcmp(b->dir, "/") == 0) snprintf(full, sizeof(full), "/%s", de->d_name);
-        else snprintf(full, sizeof(full), "%s/%s", b->dir, de->d_name);
-        struct stat st;
-        if (stat(full, &st) != 0) continue; // e.g. a broken symlink -- just skip it
-        bool is_dir = S_ISDIR(st.st_mode);
-        if (!is_dir && !hds_fx_path_has_ext(de->d_name, ext)) continue; // filtered out
-        snprintf(sort_buf[n].name, sizeof(sort_buf[n].name), "%s", de->d_name);
-        sort_buf[n].is_dir = is_dir;
-        n++;
-    }
-    closedir(d);
-    qsort(sort_buf, (size_t)n, sizeof(sort_buf[0]), hds_fx_browser_sort_cmp);
-    for (int i = 0; i < n; i++) {
-        hds_fx_safe_copy(b->entry_name[i], sizeof(b->entry_name[i]), sort_buf[i].name);
-        b->entry_is_dir[i] = sort_buf[i].is_dir;
-    }
-    b->entry_count = n;
-    snprintf(b->last_valid_dir, sizeof(b->last_valid_dir), "%s", b->dir);
-}
+// In-house file browser directory listing (opendir/readdir/stat) for FX_TYPE_NAM's Model/IR pills
+// -- now its own file, hds_fx_gui_browser.c (#include'd below), specifically so hds_clap_gui_x11.c
+// can reuse hds_fx_gui_browser_refresh() verbatim too -- see that file's own header comment.
 
 static void hds_fx_gui_redraw(HdsFxGuiWindow *w) {
     if (!w->cr || !w->backbuffer_cr) return;
@@ -263,7 +164,7 @@ static void hds_fx_gui_on_timer(const clap_plugin_t *plugin, clap_id timer_id) {
     HdsFxGuiWindow *w = (HdsFxGuiWindow *)host->gui_window;
     if (!w || timer_id != w->timer_id) return;
     hds_fx_gui_pump_events(w);
-    hds_fx_gui_browser_refresh(w);
+    hds_fx_gui_browser_refresh(w->plugin, &w->view.browser);
     hds_fx_gui_redraw(w);
 }
 

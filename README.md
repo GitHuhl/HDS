@@ -2878,3 +2878,48 @@ Input pill (no dropdown opens, since `port_input_stereo` is `NULL` for
 this host). Still to come: the real Source-combo Input header (a second,
 separate page for the many-to-many output-routing grid, matching
 `frontend.py`'s own separate Routing tab, is its own later phase).
+
+## hds.clap's native GUI grows a real tab bar (Phase 1 continued)
+
+Following straight on from the FX-tab milestone above: hds.clap's window now has a real tab bar
+matching `frontend.py`'s own `QTabWidget` order, with per-tab dispatch -- new files
+`hds_clap_gui_draw.c` (platform-agnostic: tab bar + dispatch) and `hds_clap_gui_x11.c` (this
+plugin's own small X11/XEmbed/event-pump shell), `#include`'d by `clap_plugin.c` alongside the
+already-shared `hds_fx_gui_draw.c`.
+
+**Deliberately a NEW, separate platform shell, not a further-genericized `hds_fx_gui_x11.c`**: this
+plugin's own window fundamentally dispatches across several tabs (a concept `hds_fx.clap`'s own
+window will never need), and this project's own current scope is finishing what already exists with
+minimal changes, not building a deeper shared-host abstraction on spec. The one piece of real,
+nontrivial logic in the platform layer -- the NAM Model/IR file browser's actual directory listing
+(`opendir`/`readdir`/`stat`) -- IS still shared, not duplicated: pulled out of `hds_fx_gui_x11.c`
+into its own file, `hds_fx_gui_browser.c`, `#include`'d by both platform shells.
+
+**The FX tab itself is unchanged**: `hds_clap_gui_render()` draws the tab bar, then for the FX tab
+calls `hds_fx_gui_render()` verbatim (a plain `cairo_translate()` past the bar, and a nested
+`HdsFxGuiViewState` whose own `window_h` is kept shrunk by the tab bar's height) -- zero changes to
+that already-shared, already-tested engine. Every other tab renders a plain centered placeholder for
+now, each becoming real content in its own later commit -- except:
+
+- **Mapping**: a permanent placeholder by explicit product decision (the Sample Zone editor is out
+  of scope for now, not merely unbuilt yet).
+- **Recording and Sequencer don't exist as tabs at all** -- removed outright, not even shown as a
+  placeholder. Both are confirmed, by reading the actual code, to be 100% standalone-only: the
+  Recording tab's `WavRecorder`/`record_enable`-driven writer thread lives only in
+  `hds_standalone.c`, never called from `clap_plugin_process()`; the Sequencer tab's transport/lane/
+  MIDI-playback workflow is deliberately unreachable from a CLAP instance already (see
+  `clap_plugin_process()`'s own comment: a DAW host already owns sequencing/MIDI/transport for its
+  plugins, per prior explicit product direction). Every control on either tab would be a dead knob
+  in a CLAP host, so neither belongs in this GUI at all.
+- **Devices** becomes a much smaller "Performance" panel once it's built: only Polyphony
+  (`active_voice_limit`) and Block Size (`block_size_frames`) carry over (both real
+  `SynthSharedControls` fields affecting internal voice-stealing/render-chunking regardless of
+  host); the ALSA output/input device pickers, the MIDI device picker, and Latency (ALSA buffer
+  depth) are all standalone-only concepts a CLAP host owns instead, and won't be ported.
+
+Verified end-to-end with a real XTest-driven test (updated `test_clap_gui.c`): a genuine click on
+the tab bar itself switches tabs (Play, then back to FX), and the FX tab's own existing interaction
+(Type dropdown open + option click, writing into `SynthSharedControls.fx[0].fx_type`) still works
+underneath it, at the correct translated coordinates. `hds_fx.clap`'s full existing test suite
+(including its own real XTest-driven `test_gui_x11`) still passes unchanged after the
+`hds_fx_gui_browser.c` extraction.

@@ -1,0 +1,183 @@
+// hds_clap_gui_draw.c: hds.clap's own top-level GUI shell -- a tab bar (mirroring frontend.py's
+// QTabWidget order exactly: Play, Filters, LFOs, Envelopes, FX, Routing, Devices, Recording,
+// Mapping, Sequencer) plus per-tab dispatch. Platform-agnostic like hds_fx_gui_draw.c itself (plain
+// cairo_t*, no Xlib) -- hds_clap_gui_x11.c is this file's own platform shim, same split for the
+// same reason.
+//
+// The FX tab is NOT a new implementation: it's hds_fx_gui_draw.c's own hds_fx_gui_render()/
+// hds_fx_gui_on_*(), called verbatim against this instance's own HdsFxGuiHost (see clap_plugin.c's
+// own comment on gui_host), just drawn/hit-tested through a vertical offset (below this file's own
+// tab bar) via a small nested HdsFxGuiViewState -- see hds_clap_gui_render()'s own comment on why a
+// plain cairo_translate() plus a shrunk vs.window_h is enough, with zero changes needed to that
+// already-shared, already-tested engine.
+//
+// Every OTHER tab is a placeholder for now (a centered "not yet built" label) -- each becomes real
+// content in its own later commit (see the task list this session tracks). Mapping is a
+// PERMANENT placeholder for the time being: explicit product decision, not a stand-in for
+// unfinished work -- the Sample Zone editor/mapping grid is deliberately out of scope until told
+// otherwise.
+//
+// #include'd by clap_plugin.c after hds_fx_gui_draw.c (needs HdsFxGuiViewState/hds_fx_gui_render/
+// hds_fx_gui_on_*) and after HdsFxGuiHost/HdsClapPlugin are both defined.
+
+#define HDS_CLAP_TAB_BAR_H 32.0
+#define HDS_CLAP_GUI_DEFAULT_W 1080
+#define HDS_CLAP_GUI_DEFAULT_H 700
+#define HDS_CLAP_GUI_MIN_W 700
+#define HDS_CLAP_GUI_MIN_H 400
+
+typedef enum {
+    HDS_CLAP_TAB_PLAY = 0,
+    HDS_CLAP_TAB_FILTERS,
+    HDS_CLAP_TAB_LFOS,
+    HDS_CLAP_TAB_ENVELOPES,
+    HDS_CLAP_TAB_FX,
+    HDS_CLAP_TAB_ROUTING,
+    HDS_CLAP_TAB_DEVICES,
+    HDS_CLAP_TAB_MAPPING,
+    HDS_CLAP_TAB_COUNT
+} HdsClapTab;
+
+// Order and labels match frontend.py's own addTab() call sequence (self.tab_widget.addTab calls,
+// ~line 5564 onward) -- see this file's own header comment -- MINUS Recording and Sequencer,
+// which don't exist here at all (not even as a placeholder tab): both are 100% standalone-only
+// (WavRecorder/the record_enable writer thread, and the Sequencer transport/lane/MIDI-playback
+// workflow respectively -- see clap_plugin_process()'s own comment on the latter), per explicit
+// product direction -- a DAW host already owns both recording and sequencing for its plugins.
+static const char *const HDS_CLAP_TAB_LABELS[HDS_CLAP_TAB_COUNT] = {
+    "Play", "Filters", "LFOs", "Envelopes", "FX", "Routing", "Devices", "Mapping",
+};
+
+typedef struct {
+    int window_w, window_h;
+    HdsClapTab active_tab;
+
+    // The FX tab's own view state -- a genuine, nested HdsFxGuiViewState (same type
+    // hds_fx.clap's own single-tab window uses directly), kept in sync with a SHRUNK window_h
+    // (real window_h minus the tab bar) by hds_clap_gui_on_resize() so hds_fx_gui_render()'s own
+    // background fill/clip rect never draws over or under the tab bar -- see this file's own
+    // header comment.
+    HdsFxGuiViewState fx_view;
+} HdsClapGuiViewState;
+
+static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
+    memset(vs, 0, sizeof(*vs));
+    vs->window_w = HDS_CLAP_GUI_DEFAULT_W;
+    vs->window_h = HDS_CLAP_GUI_DEFAULT_H;
+    vs->active_tab = HDS_CLAP_TAB_FX; // most useful tab to land on today; will become HDS_CLAP_TAB_PLAY once that tab is real
+    hds_fx_gui_view_state_init(&vs->fx_view);
+    vs->fx_view.window_w = vs->window_w;
+    vs->fx_view.window_h = vs->window_h - (int)HDS_CLAP_TAB_BAR_H;
+}
+
+typedef struct { double x, y, w, h; } HdsClapTabRect;
+
+static void hds_clap_gui_tab_rect(int window_w, int tab_index, HdsClapTabRect *out) {
+    double tab_w = (double)window_w / (double)HDS_CLAP_TAB_COUNT;
+    out->x = tab_index * tab_w;
+    out->y = 0;
+    out->w = tab_w;
+    out->h = HDS_CLAP_TAB_BAR_H;
+}
+
+static void hds_clap_gui_render_placeholder(cairo_t *cr, double w, double h, const char *label) {
+    hds_fx_rgb(cr, 0.10, 0.10, 0.12);
+    cairo_rectangle(cr, 0, 0, w, h);
+    cairo_fill(cr);
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 13);
+    hds_fx_rgb(cr, 0.45, 0.45, 0.48);
+    hds_fx_centered_text(cr, w / 2, h / 2, label);
+}
+
+static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewState *vs) {
+    // Tab bar itself.
+    hds_fx_rgb(cr, 0.14, 0.14, 0.17);
+    cairo_rectangle(cr, 0, 0, vs->window_w, HDS_CLAP_TAB_BAR_H);
+    cairo_fill(cr);
+    for (int i = 0; i < HDS_CLAP_TAB_COUNT; i++) {
+        HdsClapTabRect r;
+        hds_clap_gui_tab_rect(vs->window_w, i, &r);
+        bool active = (i == (int)vs->active_tab);
+        if (active) {
+            hds_fx_rgb(cr, 0.10, 0.10, 0.12);
+            cairo_rectangle(cr, r.x, r.y, r.w, r.h);
+            cairo_fill(cr);
+            hds_fx_rgb(cr, 0.95, 0.55, 0.15);
+            cairo_rectangle(cr, r.x, r.y + r.h - 2, r.w, 2);
+            cairo_fill(cr);
+        }
+        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, active ? CAIRO_FONT_WEIGHT_BOLD : CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 10);
+        hds_fx_rgb(cr, active ? 0.92 : 0.6, active ? 0.92 : 0.6, active ? 0.95 : 0.63);
+        hds_fx_centered_text(cr, r.x + r.w / 2, r.y + r.h / 2 + 3.5, HDS_CLAP_TAB_LABELS[i]);
+    }
+
+    // Active tab's own content, drawn below the bar. The FX tab reuses hds_fx_gui_render()
+    // verbatim: cairo_translate() shifts its own (0,0)-relative drawing down past the bar, and
+    // vs->fx_view.window_h (kept shrunk by hds_clap_gui_on_resize()) makes its own background
+    // fill/clip rect stop exactly at the real window's bottom edge -- no change needed to that
+    // file at all.
+    cairo_save(cr);
+    cairo_rectangle(cr, 0, HDS_CLAP_TAB_BAR_H, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+    cairo_clip(cr);
+    cairo_translate(cr, 0, HDS_CLAP_TAB_BAR_H);
+    switch (vs->active_tab) {
+        case HDS_CLAP_TAB_FX:
+            hds_fx_gui_render(cr, &p->gui_host, &vs->fx_view);
+            break;
+        case HDS_CLAP_TAB_MAPPING:
+            hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Mapping (Sample Zone editor) -- not available in this GUI yet");
+            break;
+        default:
+            hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Coming soon");
+            break;
+    }
+    cairo_restore(cr);
+}
+
+static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int button) {
+    if (y < HDS_CLAP_TAB_BAR_H) {
+        for (int i = 0; i < HDS_CLAP_TAB_COUNT; i++) {
+            HdsClapTabRect r;
+            hds_clap_gui_tab_rect(vs->window_w, i, &r);
+            if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {
+                vs->active_tab = (HdsClapTab)i;
+                return true;
+            }
+        }
+        return true; // still consumed -- clicking empty bar space is a no-op, not a click-through
+    }
+    switch (vs->active_tab) {
+        case HDS_CLAP_TAB_FX:
+            return hds_fx_gui_on_button_press(&p->gui_host, &vs->fx_view, x, y - HDS_CLAP_TAB_BAR_H, button);
+        default:
+            return true;
+    }
+}
+
+static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y) {
+    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_motion(&p->gui_host, &vs->fx_view, x, y - HDS_CLAP_TAB_BAR_H);
+}
+
+static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
+    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_button_release(&vs->fx_view);
+}
+
+static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int action, char ch) {
+    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_key(&p->gui_host, &vs->fx_view, action, ch);
+}
+
+static void hds_clap_gui_on_scroll(HdsClapGuiViewState *vs, double x, double y, int delta) {
+    if (y < HDS_CLAP_TAB_BAR_H) return;
+    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_scroll(&vs->fx_view, delta);
+    (void)x;
+}
+
+static void hds_clap_gui_on_resize(HdsClapGuiViewState *vs, int w, int h) {
+    if (w < HDS_CLAP_GUI_MIN_W) w = HDS_CLAP_GUI_MIN_W;
+    if (h < HDS_CLAP_GUI_MIN_H) h = HDS_CLAP_GUI_MIN_H;
+    vs->window_w = w;
+    vs->window_h = h;
+    hds_fx_gui_on_resize(&vs->fx_view, w, h - (int)HDS_CLAP_TAB_BAR_H);
+}
