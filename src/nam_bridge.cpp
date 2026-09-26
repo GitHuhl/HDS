@@ -23,6 +23,22 @@ extern "C" void *hds_nam_create(const char *path, double sample_rate, int max_bl
         std::unique_ptr<nam::DSP> dsp = nam::get_dsp(std::filesystem::path(path));
         if (!dsp) return nullptr;
         dsp->Reset(sample_rate, max_block_size);
+        // hds_nam_process() below hands the model exactly ONE float in / ONE float out per
+        // channel object (this bridge always runs two separate mono model instances, one per
+        // stereo channel -- see FxNamState's own comment in fx_chain.c) -- it can only ever be
+        // safe for a model whose own NumInputChannels()/NumOutputChannels() are genuinely 1/1.
+        // Most real guitar-amp .nam files are (WaveNet's own a2_fast.cpp asserts this at load
+        // time for its architecture already), but get_dsp() also accepts OTHER real, valid
+        // configurations this bridge was never built for -- a raw multi-channel .wav loaded as a
+        // "Linear" model (get_dsp.cpp's own out_channels-from-the-file path) is a real, confirmed
+        // case: a stereo IR-as-model produces out_channels==2, and the fixed 1-element channel
+        // array hds_nam_process() builds below would then read a garbage second pointer and write
+        // through it -- a real stack-smashing crash a live DAW test hit. Refuse anything that
+        // isn't 1-in/1-out here, at the one place that already knows both numbers, exactly like
+        // any other unsupported/corrupt file: a clean "failed to load," never a wild pointer.
+        if (dsp->NumInputChannels() != 1 || dsp->NumOutputChannels() != 1) {
+            return nullptr;
+        }
         return dsp.release();
     } catch (...) {
         // Bad path, corrupt JSON, unrecognized architecture -- any of these throws inside
@@ -35,6 +51,8 @@ extern "C" void *hds_nam_create(const char *path, double sample_rate, int max_bl
 extern "C" void hds_nam_process(void *model, float *inout, int num_frames) {
     if (!model || !inout || num_frames <= 0) return;
     nam::DSP *dsp = static_cast<nam::DSP *>(model);
+    // Safe ONLY because hds_nam_create() above already refused any model that isn't genuinely
+    // 1 input channel / 1 output channel -- never assume that from this function alone.
     NAM_SAMPLE *chans[1] = { inout };
     dsp->process(chans, chans, num_frames);
 }

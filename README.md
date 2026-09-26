@@ -1669,6 +1669,33 @@ already used by Sequencer audio lanes) into a hand-rolled direct-form FIR (cappe
 ~85ms at 48kHz -- comfortably covers real guitar cab IRs, which decay within tens of milliseconds)
 rather than pulling in a second file-format dependency for the one thing actually needed.
 
+**A real "Stack smashing detected" crash from a live DAW test, the first time a model was actually
+loaded for real.** Every previous NAM test in this suite only ever exercised a NONEXISTENT model
+path (a genuinely useful test on its own -- proving a failed load stays a silent, safe dry
+passthrough -- but never actually running `hds_nam_process()` against a real, successfully-loaded
+model). Root cause, found by reading NeuralAmpModelerCore itself, not guessed: `hds_nam_process()`
+(`nam_bridge.cpp`) always built a fixed ONE-element channel-pointer array for both input and output,
+assuming every loaded model is exactly 1 input channel / 1 output channel -- true for a normal
+WaveNet amp model, but NAM's own `get_dsp()` *also* accepts a completely different, equally real
+case: a `.wav` file path loaded as a "Linear" model whose own `out_channels` is taken directly from
+that WAV file's real channel count. A genuinely-existing STEREO file ending up as a model path (an
+IR-as-model export, or simply picked by mistake) produces a real DSP object reporting
+`NumOutputChannels() == 2`; the base class's own default `process()` then writes to a second output
+channel our bridge never allocated a real pointer for, reading garbage off the stack and writing
+through it -- exactly what smashed the stack in the real crash. Fixed in `hds_nam_create()`: refuse
+(return `nullptr`, same as any other unsupported/corrupt file) any model whose own
+`NumInputChannels()`/`NumOutputChannels()` aren't genuinely 1/1, before ever handing it to
+`hds_nam_process()` -- converts what used to be a wild pointer write into the same clean "failed to
+load" dry-passthrough path a bad `.nam` file already takes safely. This bridge is shared verbatim by
+`hds.clap` too (both `synth_engine`/`hds.clap` and `hds_fx.clap` link the exact same
+`nam_bridge.cpp`), so the fix protects both plugins' own `FX_TYPE_NAM` slots at once, not just HDS
+FX's. Verified with a dedicated test that builds a REAL, valid stereo 16-bit PCM WAV file on disk,
+points a live NAM slot's own model path at it, and drives it through a real `plugin->process()` call
+-- reproducing the exact crash scenario end-to-end: confirmed no crash, confirmed the model is
+refused (`model_load_failed`, both channel instances left `NULL`), confirmed the slot stays exact
+dry passthrough, and confirmed it stays stable (no delayed corruption) across several more real
+process() blocks afterward.
+
 **Now wired into the `make arm64` cross-build too**: there never was a real "no C++ cross-compiler"
 problem, only a missing Makefile recipe -- `shell.nix`'s `aarch64.stdenv.cc` already installs a full
 `aarch64-unknown-linux-gnu-g++` alongside its own `-gcc`, it just went unused. `make arm64` now
