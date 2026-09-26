@@ -1059,13 +1059,25 @@ directly (no separate main loop to poll from, unlike the standalone binary), and
 that target) -- no longer a pure-C build, `hds_fx.clap` grew from ~110KB to ~1.3MB as a direct
 result, an honest tradeoff for a real feature rather than a regression.
 
-Since this plugin has no OSC/frontend.py connection at all (see this file's own header comment) and
-deliberately stays a plain Cairo+X11 build with no GTK/Qt file-picker dependency, NAM's model/cab IR
-paths are set by typing or pasting directly into two dedicated pills (see the GUI section below) --
-real X11 keyboard input, added specifically for this (`hds_fx_gui_on_key()` in `hds_fx_gui_draw.c`,
-`KeyPress` handling + an explicit `XSetInputFocus()` call in `hds_fx_gui_x11.c`, since a reparented/
-embedded window doesn't receive keyboard focus automatically without the full XEmbed protocol -- see
-that file's own comment on why this plugin doesn't implement that yet).
+Since this plugin has no OSC/frontend.py connection at all (see this file's own header comment),
+NAM's model/cab IR paths are set via the two dedicated pills (see the GUI section below). Clicking
+either pill now first tries to open a real native file picker -- `zenity --file-selection` (falling
+back to `kdialog --getopenfilename` if `zenity` isn't installed) -- launched as a completely separate
+system process via plain `fork()`/`execlp()`, never `waitpid()`-blocked synchronously (the plugin's
+own event pump/timer callback keeps running while the dialog is open; a non-blocking
+`waitpid(pid, &status, WNOHANG)` reaps it once per timer tick, same "never block the audio/UI thread
+for I/O" discipline this codebase already applies to Sequencer lane loading). Neither tool is ever
+linked, embedded, or bundled into `hds_fx.clap` itself -- exactly the same relationship this plugin
+already has with `git` or `ls`: an already-installed system executable it can choose to invoke, never
+code it links against or ships. That keeps `hds_fx.clap`'s own license and distribution completely
+untouched by GTK's or Qt's own terms, whether or not either is even installed. If both `execlp()`
+attempts fail (the child's own fallback exit code, 127, means neither tool exists on this system) --
+or on a system with neither installed at all -- the click falls back automatically to the original
+typed/pasted-path text-entry field (`hds_fx_gui_on_key()` in `hds_fx_gui_draw.c`, `KeyPress` handling
++ an explicit `XSetInputFocus()` call in `hds_fx_gui_x11.c`, since a reparented/embedded window
+doesn't receive keyboard focus automatically without the full XEmbed protocol -- see that file's own
+comment on why this plugin doesn't implement that yet), pre-filled with the field's current value, so
+the feature never regresses on a system with neither dialog tool present.
 
 **A second real bug, in the SAME "what does Output actually do" area**: an earlier revision gave
 Output its own Mono/Stereo choice, mirroring Input's -- but every one of the 8 CLAP ports is already
@@ -1285,6 +1297,17 @@ Verified several ways, all exercising the real production code, no host availabl
    from one full drag stroke -- before the fix this could only ever reach `1.0`, 1% of its own range
    -- while an ordinary 0-1 param dragged the identical distance still lands at exactly `1.0`,
    proving the fix didn't accidentally widen every other knob's own range too.
+6. **NAM's native file-dialog (zenity/kdialog) round-trip and its fallback are both real, not just
+   theoretical**: a dedicated Xvfb+XTest harness swaps `$PATH` for a scratch directory containing a
+   fake, instantly-exiting `zenity` shell script (real fork()/pipe()/execlp()/waitpid() plumbing is
+   what's under test here -- driving an actual GTK dialog's own UI is out of scope, that's zenity's
+   own already-tested software), real-clicks the Model pill, confirms a real subprocess was spawned
+   (`file_dialog_pid > 0`) and inline text-edit did NOT open, polls via the actual non-blocking
+   `WNOHANG` reaping loop until it exits, then confirms the fake script's own stdout output landed in
+   `nam_model_path` exactly. A second run points `$PATH` at an empty directory (neither tool
+   reachable), real-clicks the IR pill, and confirms it still attempts to spawn (`file_dialog_pid >
+   0`) before automatically falling back to the original inline text-edit field once both `execlp()`
+   attempts fail, pre-filled from that slot's own current (empty) IR path.
 
 ### Command-line flags
 

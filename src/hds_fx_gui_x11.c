@@ -33,6 +33,9 @@
 #include <X11/Xutil.h> // XLookupString -- see hds_fx_gui_pump_events()'s own KeyPress case
 #include <X11/keysym.h> // XK_BackSpace/XK_Return/XK_KP_Enter/XK_Escape
 #include <cairo/cairo-xlib.h>
+#include <unistd.h>   // fork/pipe/dup2/close/read/execlp -- see hds_fx_gui_try_open_file_dialog()
+#include <sys/wait.h> // waitpid/WIFEXITED/WEXITSTATUS/WNOHANG -- see hds_fx_gui_poll_file_dialog()
+#include <fcntl.h>    // open() for /dev/null (redirecting the dialog subprocess's own stderr)
 
 typedef struct {
     HdsFxPlugin *plugin;
@@ -55,6 +58,16 @@ typedef struct {
     clap_id timer_id;
     bool timer_registered;
     bool visible;
+
+    // A pending native file-dialog subprocess (zenity/kdialog) for FX_TYPE_NAM's Model/IR pills --
+    // see hds_fx_gui_try_open_file_dialog()'s own comment for why this exists (a real OS file
+    // browser, not just typed/pasted text) and hds_fx_gui_poll_file_dialog() for how it's reaped
+    // without ever blocking this window's own event pump while the dialog is open.
+    // file_dialog_pid == 0 means no dialog is currently pending.
+    pid_t file_dialog_pid;
+    int file_dialog_read_fd;  // pipe read end the child's stdout was redirected to; -1 when unused
+    int file_dialog_row;
+    int file_dialog_field;    // 0 = Model, 1 = IR -- matches HDS_FX_KEY_*'s own edit_field convention
 } HdsFxGuiWindow;
 
 // (Re)creates the backbuffer at the window's own current size -- called on create() and on every
@@ -80,6 +93,110 @@ static void hds_fx_gui_set_xembed_info(Display *dpy, Window win) {
     Atom xembed_info = XInternAtom(dpy, "_XEMBED_INFO", False);
     unsigned long data[2] = {0, 1}; // version 0, XEMBED_MAPPED
     XChangeProperty(dpy, win, xembed_info, xembed_info, 32, PropModeReplace, (unsigned char *)data, 2);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Native file dialog for FX_TYPE_NAM's Model/IR pills -- a real OS file browser, not just the
+// typed/pasted path entry hds_fx_gui_on_key() provides (that stays as the fallback when neither
+// tool below is installed, see hds_fx_gui_poll_file_dialog()'s own comment). This plugin links
+// neither GTK nor Qt (see this file's own header comment on staying a plain Cairo+X11 build with
+// zero toolkit dependency) -- zenity/kdialog are launched as ordinary SEPARATE executables via
+// plain fork()/execlp(), the same relationship any shell script calling `git` or `ls` has with
+// them. Whether either is actually installed is entirely up to the user's own distro/desktop
+// environment (GNOME ships zenity, KDE ships kdialog) -- this plugin never bundles, links, or
+// redistributes either one, so neither's own license terms (GTK's LGPL, Qt's LGPL/commercial dual
+// license) ever attach to this plugin's own binary or distribution.
+//
+// Deliberately non-blocking: forking and then synchronously waitpid()-ing for the dialog to close
+// would freeze this window's own event pump (and this timer callback, which the CLAP host expects
+// to return promptly) for however long the user takes to pick a file -- seconds, or however long
+// they leave the dialog open. Instead the child's pid and its own stdout (redirected to a pipe) are
+// stashed on the HdsFxGuiWindow, and hds_fx_gui_poll_file_dialog() -- called every timer tick,
+// right alongside the ordinary event pump -- reaps it via a non-blocking waitpid(..., WNOHANG) once
+// it actually exits, exactly like Sequencer audio lanes' own loader-thread convention never blocks
+// the audio/UI path for disk I/O either.
+static void hds_fx_gui_try_open_file_dialog(HdsFxGuiWindow *w, int row, int field) {
+    if (w->file_dialog_pid > 0) return; // one at a time -- a second click while one's already open is a no-op
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return; // give up silently; the inline text-edit fallback stays active
+
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return; }
+
+    if (pid == 0) {
+        // Child: stdout -> the pipe (so the parent can read back whatever path was chosen), stderr
+        // -> /dev/null (neither tool's own diagnostic chatter is anything this plugin's user needs
+        // to see). Tries zenity first, then kdialog -- execlp() only returns if THAT SPECIFIC binary
+        // couldn't be found/run, so falling through to the next line is exactly "try the next tool",
+        // and reaching the final _exit(127) means neither exists on this system at all -- the parent
+        // (see hds_fx_gui_poll_file_dialog()) recognizes that exact exit code as "no tool available"
+        // and falls back to the inline text-edit field automatically.
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+
+        if (field == 0) {
+            execlp("zenity", "zenity", "--file-selection", "--title=Select NAM Model", "--file-filter=*.nam", (char *)NULL);
+            execlp("kdialog", "kdialog", "--getopenfilename", ".", "*.nam|NAM Model Files (*.nam)", (char *)NULL);
+        } else {
+            execlp("zenity", "zenity", "--file-selection", "--title=Select Cab IR (WAV)", "--file-filter=*.wav", (char *)NULL);
+            execlp("kdialog", "kdialog", "--getopenfilename", ".", "*.wav|Cab IR Files (*.wav)", (char *)NULL);
+        }
+        _exit(127); // neither tool exists on this system
+    }
+
+    // Parent: stash the pid/pipe and let hds_fx_gui_poll_file_dialog() take it from here. Cancel
+    // the inline text-edit mode hds_fx_gui_on_button_press() already entered for this same click --
+    // see hds_fx_gui_poll_file_dialog()'s own comment for how it comes back automatically if the
+    // dialog subprocess turns out not to exist at all.
+    close(pipefd[1]);
+    w->file_dialog_pid = pid;
+    w->file_dialog_read_fd = pipefd[0];
+    w->file_dialog_row = row;
+    w->file_dialog_field = field;
+    w->view.edit_row = -1;
+}
+
+// Reaps a pending dialog subprocess once it has actually exited -- a no-op (returns immediately)
+// while it's still open, called every timer tick alongside the ordinary event pump so this never
+// needs its own separate polling loop.
+static void hds_fx_gui_poll_file_dialog(HdsFxGuiWindow *w) {
+    if (w->file_dialog_pid <= 0) return;
+    int status = 0;
+    pid_t r = waitpid(w->file_dialog_pid, &status, WNOHANG);
+    if (r == 0) return; // still open -- try again next tick
+
+    char buf[SAMPLE_PATH_LEN];
+    ssize_t n = read(w->file_dialog_read_fd, buf, sizeof(buf) - 1);
+    close(w->file_dialog_read_fd);
+    w->file_dialog_read_fd = -1;
+    w->file_dialog_pid = 0;
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+        // Neither zenity nor kdialog exists on this system -- fall back to exactly the same inline
+        // text-edit field a direct pill click opens, pre-filled from whatever's already there, so
+        // the feature this replaces never actually regresses on a system without either tool.
+        HdsFxPlugin *p = w->plugin;
+        const char *cur = (w->file_dialog_field == 0) ? p->fx[w->file_dialog_row].nam_model_path : p->fx[w->file_dialog_row].nam_ir_path;
+        w->view.edit_row = w->file_dialog_row;
+        w->view.edit_field = w->file_dialog_field;
+        snprintf(w->view.edit_buffer, sizeof(w->view.edit_buffer), "%s", cur);
+        return;
+    }
+
+    if (n > 0) {
+        buf[n] = '\0';
+        char *nl = strchr(buf, '\n'); if (nl) *nl = '\0'; // both tools print a trailing newline
+        if (buf[0] != '\0') {
+            char *dst = (w->file_dialog_field == 0) ? w->plugin->fx[w->file_dialog_row].nam_model_path : w->plugin->fx[w->file_dialog_row].nam_ir_path;
+            snprintf(dst, SAMPLE_PATH_LEN, "%s", buf);
+        }
+        // n<=0 (Cancel was clicked, or the dialog was closed without choosing anything) leaves the
+        // field exactly as it was -- same posture as Escape in the inline text-edit fallback.
+    }
 }
 
 static void hds_fx_gui_redraw(HdsFxGuiWindow *w) {
@@ -110,7 +227,16 @@ static void hds_fx_gui_pump_events(HdsFxGuiWindow *w) {
                     // to call unconditionally: this is the only window in the process that ever
                     // wants keyboard input in the first place.
                     XSetInputFocus(w->display, w->win, RevertToParent, CurrentTime);
+                    int edit_row_before = w->view.edit_row;
                     hds_fx_gui_on_button_press(w->plugin, &w->view, (double)ev.xbutton.x, (double)ev.xbutton.y, ev.xbutton.button == 3 ? 3 : 1);
+                    // edit_row going from "not editing" to "editing" means THIS click just opened
+                    // the inline text-edit fallback for a NAM Model/IR pill -- try to upgrade it to
+                    // a real file dialog (see hds_fx_gui_try_open_file_dialog()'s own comment); if
+                    // neither zenity nor kdialog exists, hds_fx_gui_poll_file_dialog() reopens this
+                    // exact same inline fallback automatically on the next tick.
+                    if (edit_row_before < 0 && w->view.edit_row >= 0) {
+                        hds_fx_gui_try_open_file_dialog(w, w->view.edit_row, w->view.edit_field);
+                    }
                 }
                 break;
             case ButtonRelease:
@@ -151,6 +277,7 @@ static void hds_fx_gui_on_timer(const clap_plugin_t *plugin, clap_id timer_id) {
     HdsFxGuiWindow *w = (HdsFxGuiWindow *)p->gui_window;
     if (!w || timer_id != w->timer_id) return;
     hds_fx_gui_pump_events(w);
+    hds_fx_gui_poll_file_dialog(w);
     hds_fx_gui_redraw(w);
 }
 
@@ -184,6 +311,8 @@ static bool hds_fx_gui_create(const clap_plugin_t *plugin, const char *api, bool
     w->timer_registered = false;
     w->visible = false;
     w->parented = false;
+    w->file_dialog_pid = 0;
+    w->file_dialog_read_fd = -1;
 
     w->win = XCreateSimpleWindow(w->display, RootWindow(w->display, w->screen), 0, 0,
                                   (unsigned int)w->view.window_w, (unsigned int)w->view.window_h, 0,
@@ -211,6 +340,15 @@ static void hds_fx_gui_destroy_internal(HdsFxPlugin *p) {
     if (w->timer_registered) {
         const clap_host_timer_support_t *timers = hds_fx_gui_host_timers(p);
         if (timers) timers->unregister_timer(p->host, w->timer_id);
+    }
+    if (w->file_dialog_pid > 0) {
+        // The GUI is closing with a dialog subprocess still open (the user hasn't picked a file or
+        // hit Cancel yet) -- we deliberately do NOT waitpid() here, since that would block destroy()
+        // for however long the dialog stays open. Just close our own read end so we don't leak that
+        // fd; the orphaned child is reparented to init and reaped normally on its own exit, same as
+        // any other abandoned child process -- it becomes a harmless zombie entry at worst until
+        // this plugin's own host process eventually exits, never a hang or a crash here.
+        close(w->file_dialog_read_fd);
     }
     if (w->backbuffer_cr) cairo_destroy(w->backbuffer_cr);
     if (w->backbuffer) cairo_surface_destroy(w->backbuffer);
