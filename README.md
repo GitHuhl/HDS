@@ -1102,6 +1102,33 @@ folded into one mechanism instead of three layered ones. Never blocks the GUI's 
 callback: `needs_refresh` is set on open/navigate/commit and polled once per timer tick, same
 posture the subprocess approach's own non-blocking `waitpid(..., WNOHANG)` had.
 
+**A real bug from actually loading a real, long-named model**: once a real `.nam` file was loaded
+(a real DAW test with a genuinely descriptive filename, not this session's own short placeholder
+paths), the Model/IR pill's own text visibly overflowed its pill and bled into neighboring columns
+-- `hds_fx_draw_pill()` never clipped its own text to its own rect at all, and the pill label's
+truncation was a fixed 15-character guess, nowhere near tight enough for a real filename at this
+font's actual rendered width. Fixed two ways: `hds_fx_draw_pill()` now clips to its own rect
+unconditionally (`cairo_save`/`cairo_rectangle`/`cairo_clip`/`cairo_restore` around the text draw)
+as a cheap, universal safety net for every pill in this GUI, not just the NAM ones; and the NAM
+pill label itself (`hds_fx_pill_label_fit()`) now truncates by actually MEASURING the real string
+with `cairo_text_extents()` against the pill's own real width, shrinking from the front (keeping the
+tail + a leading ellipsis) until it genuinely fits, rather than guessing a character count that
+happens to work for short test paths and nothing else. Still shows only the filename
+(`hds_fx_basename()`), never the full path -- the full path stays in `nam_model_path`/`nam_ir_path`
+(visible in the file browser's own path bar, or a saved state) for anyone who needs it. Verified by
+rendering the actual GUI with the real, long filename from a real DAW-hosted `.nam` file loaded into
+a slot and inspecting the rendered pixels directly (`cairo_surface_write_to_png()` on the same
+backbuffer the real window blits from) -- confirmed the label now stays fully inside its own pill.
+
+**The path bar's own typed/pasted-path commit used to bypass the browser's own extension filter.**
+The directory listing itself only ever shows `*.nam` (Model) or `*.wav` (IR) files -- but typing or
+pasting an exact path into the path bar and pressing Enter accepted ANY existing regular file
+regardless of extension, since that commit path only ever checked `stat()`+`S_ISREG`. Fixed by
+requiring the same case-insensitive extension match the listing already enforces
+(`hds_fx_path_has_ext()`, now the one shared place this decision is made) before a typed path is
+ever accepted as a file selection -- a path with the wrong extension (or none) now falls through to
+the directory-listing attempt instead, exactly like any other bad typed path.
+
 **A second real bug, in the SAME "what does Output actually do" area**: an earlier revision gave
 Output its own Mono/Stereo choice, mirroring Input's -- but every one of the 8 CLAP ports is already
 a fixed 2-channel (L+R) stereo pair, so "Mono" there could only ever mean "write the same centered

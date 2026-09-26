@@ -106,6 +106,19 @@ static int hds_fx_browser_sort_cmp(const void *a, const void *b) {
     return strcasecmp(ea->name, eb->name);
 }
 
+// Case-insensitive "does this filename end in this extension" check -- the ONE place this
+// decision is made, shared by the directory listing below AND the path bar's own commit-attempt
+// (see hds_fx_gui_browser_refresh()'s own comment on path_bar_commit_attempt): without this, the
+// listing was already filtered to only ever show a *.nam/*.wav file, but typing or pasting an
+// exact path into the path bar and pressing Enter bypassed that filter entirely -- any existing
+// regular file, any extension (or none), got accepted as if it had been a real pick from the
+// list. Requiring the same extension match there too means the path bar can never be used to load
+// something the browser itself would never have shown in the first place.
+static bool hds_fx_path_has_ext(const char *name, const char *ext) {
+    size_t nlen = strlen(name), elen = strlen(ext);
+    return nlen >= elen && strcasecmp(name + nlen - elen, ext) == 0;
+}
+
 // Called every timer tick (a no-op unless needs_refresh is set -- opening the browser, navigating
 // into a directory or Up, or committing a typed path all set it, see hds_fx_gui_draw.c's own
 // browser functions). Never blocks the UI thread on anything slow (a real directory read is fast
@@ -117,11 +130,16 @@ static void hds_fx_gui_browser_refresh(HdsFxGuiWindow *w) {
     b->needs_refresh = false;
 
     // Enter was pressed on the path bar: try the typed text as an exact FILE path first (same
-    // effect as clicking a file entry), before ever trying it as a directory to list.
+    // effect as clicking a file entry), before ever trying it as a directory to list. Requires the
+    // same extension match the listing itself already enforces (hds_fx_path_has_ext()'s own
+    // comment) -- an existing regular file with the WRONG extension (or none) is deliberately left
+    // to fall through to the directory-listing attempt below, which will then simply fail to
+    // opendir() it and fall back to home/"/", same as any other bad typed path.
     if (b->path_bar_commit_attempt) {
         b->path_bar_commit_attempt = false;
+        const char *ext = (b->field == 0) ? ".nam" : ".wav";
         struct stat st;
-        if (stat(b->dir, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (hds_fx_path_has_ext(b->dir, ext) && stat(b->dir, &st) == 0 && S_ISREG(st.st_mode)) {
             char *dst = (b->field == 0) ? w->plugin->fx[b->row].nam_model_path : w->plugin->fx[b->row].nam_ir_path;
             snprintf(dst, SAMPLE_PATH_LEN, "%s", b->dir);
             b->open = false;
@@ -143,7 +161,6 @@ static void hds_fx_gui_browser_refresh(HdsFxGuiWindow *w) {
     if (!d) return; // nothing listable at all -- the path bar and Close are still available
 
     const char *ext = (b->field == 0) ? ".nam" : ".wav";
-    size_t ext_len = strlen(ext);
     HdsFxBrowserSortEntry sort_buf[HDS_FX_BROWSER_MAX_ENTRIES];
     int n = 0;
     struct dirent *de;
@@ -156,10 +173,7 @@ static void hds_fx_gui_browser_refresh(HdsFxGuiWindow *w) {
         struct stat st;
         if (stat(full, &st) != 0) continue; // e.g. a broken symlink -- just skip it
         bool is_dir = S_ISDIR(st.st_mode);
-        if (!is_dir) {
-            size_t nlen = strlen(de->d_name);
-            if (nlen < ext_len || strcasecmp(de->d_name + nlen - ext_len, ext) != 0) continue; // filtered out
-        }
+        if (!is_dir && !hds_fx_path_has_ext(de->d_name, ext)) continue; // filtered out
         snprintf(sort_buf[n].name, sizeof(sort_buf[n].name), "%s", de->d_name);
         sort_buf[n].is_dir = is_dir;
         n++;

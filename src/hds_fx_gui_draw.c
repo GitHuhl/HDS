@@ -417,10 +417,29 @@ static const char *hds_fx_basename(const char *path) {
 // END of the string -- for a loaded path that's usually the actual filename past its directory, and
 // while actively typing (hds_fx_gui_on_key()) it's exactly where the cursor and newest keystrokes
 // are, so the visible text scrolls the way any real text field's viewport would.
-static void hds_fx_truncate_pill_text(const char *text, char *buf, size_t buflen, size_t max_visible) {
-    size_t len = strlen(text);
-    if (len <= max_visible) { snprintf(buf, buflen, "%s", text); return; }
-    snprintf(buf, buflen, "\xe2\x80\xa6%s", text + (len - (max_visible - 1)));
+// Builds "<prefix><value>" (e.g. "M: some_amp.nam"), truncating VALUE from the front (keeping the
+// tail, prefixed with a leading ellipsis once truncated) until the
+// REAL, MEASURED width of the whole label actually fits max_width_px at hds_fx_draw_pill()'s own
+// font (9.5pt sans-serif) -- a real, reported bug: a fixed character-count guess (this function's
+// own earlier revision) was nowhere near tight enough for a real, long, descriptive .nam filename,
+// which rendered wider than the pill and (since hds_fx_draw_pill() didn't clip either, now fixed
+// separately) visibly bled into neighboring columns. Measuring the ACTUAL string cairo will draw,
+// including the prefix, is the only way to guarantee this fits regardless of filename or font
+// metrics -- called once per pill per frame, cheap enough at this GUI's own row counts.
+static void hds_fx_pill_label_fit(cairo_t *cr, const char *prefix, const char *value, char *buf, size_t buflen, double max_width_px) {
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 9.5);
+    size_t len = strlen(value);
+    snprintf(buf, buflen, "%s%s", prefix, value);
+    cairo_text_extents_t ext;
+    cairo_text_extents(cr, buf, &ext);
+    if (ext.width <= max_width_px || len == 0) return;
+    for (size_t keep = len - 1; keep > 0; keep--) {
+        snprintf(buf, buflen, "%s\xe2\x80\xa6%s", prefix, value + (len - keep));
+        cairo_text_extents(cr, buf, &ext);
+        if (ext.width <= max_width_px) return;
+    }
+    snprintf(buf, buflen, "%s\xe2\x80\xa6", prefix); // not even one tail character fits -- prefix + ellipsis only
 }
 
 // The directory part of a path (everything before the last '/', not including it), or "" if there
@@ -642,7 +661,18 @@ static void hds_fx_draw_pill(cairo_t *cr, double x, double y, double w, double h
     cairo_set_font_size(cr, 9.5);
     if (disabled) hds_fx_rgb(cr, 0.42, 0.42, 0.45);
     else hds_fx_rgb(cr, 0.85, 0.90, 0.90);
+    // Clipped to the pill's own rect: every caller is expected to pass text short enough to fit
+    // (see e.g. hds_fx_truncate_pill_text_to_width()'s own comment for the NAM Model/IR pills,
+    // whose real filenames are the one label in this GUI long enough to actually need that care),
+    // but this is a cheap, universal safety net so a label that's STILL too wide (an unusually
+    // long word this GUI's own truncation didn't anticipate, a future caller that forgets to
+    // truncate at all, ...) bleeds nowhere -- it's clipped away, never smeared over a neighboring
+    // column the way an uncapped `cairo_show_text()` already did in a real, reported case.
+    cairo_save(cr);
+    cairo_rectangle(cr, x, y, w, h);
+    cairo_clip(cr);
     hds_fx_centered_text(cr, x + w / 2, y + h / 2 + 3.5, text);
+    cairo_restore(cr);
 }
 
 // A small knob: an optional short NAME label above it (what this pot actually does -- e.g.
@@ -1333,11 +1363,14 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxPlugin *p, const HdsFxGuiViewSta
         if (hds_fx_type_uses_nam_paths(fx_type)) {
             bool browsing_model = (vs->browser.open && vs->browser.row == s && vs->browser.field == 0);
             bool browsing_ir = (vs->browser.open && vs->browser.row == s && vs->browser.field == 1);
-            char trunc[24], model_buf[32], ir_buf[32];
-            hds_fx_truncate_pill_text(slot->nam_model_path[0] ? hds_fx_basename(slot->nam_model_path) : "(none)", trunc, sizeof(trunc), 15);
-            snprintf(model_buf, sizeof(model_buf), "M: %s", trunc);
-            hds_fx_truncate_pill_text(slot->nam_ir_path[0] ? hds_fx_basename(slot->nam_ir_path) : "(none)", trunc, sizeof(trunc), 15);
-            snprintf(ir_buf, sizeof(ir_buf), "IR: %s", trunc);
+            char model_buf[64], ir_buf[64];
+            // Just the filename (hds_fx_basename()), never the full path -- the pill has room for
+            // a name, not a path, and the full path still lives in nam_model_path/nam_ir_path
+            // (visible in the file browser's own path bar, or a save file) for anyone who needs it.
+            hds_fx_pill_label_fit(cr, "M: ", slot->nam_model_path[0] ? hds_fx_basename(slot->nam_model_path) : "(none)",
+                                   model_buf, sizeof(model_buf), L.nam_model_pill.w - 8.0);
+            hds_fx_pill_label_fit(cr, "IR: ", slot->nam_ir_path[0] ? hds_fx_basename(slot->nam_ir_path) : "(none)",
+                                   ir_buf, sizeof(ir_buf), L.nam_ir_pill.w - 8.0);
             hds_fx_draw_pill(cr, L.nam_model_pill.x, L.nam_model_pill.y, L.nam_model_pill.w, L.nam_model_pill.h, model_buf, browsing_model || slot->nam_model_path[0], false);
             hds_fx_draw_pill(cr, L.nam_ir_pill.x, L.nam_ir_pill.y, L.nam_ir_pill.w, L.nam_ir_pill.h, ir_buf, browsing_ir || slot->nam_ir_path[0], false);
         }
