@@ -2853,18 +2853,18 @@ regression.
 and every per-port routing pointer left `NULL`: hds.clap has no flat
 N-port Input/Output concept at all (a slot's Input is which SOURCE feeds
 it -- a Combi Program, the Combi Mix bus, or an ext-in pair, see
-`SOURCE_COUNT`/`source_routing` -- not a port number), so its own Input/
-Output header is a different design (a Source combo, matching
-`frontend.py`'s own existing `SOURCE_NAMES`), not yet built. Until it is,
-`hds_fx_gui_draw.c`'s own Input/Output pill code (drawing AND the click-
-to-open-dropdown handling) is gated on `port_input_stereo`/
+`SOURCE_COUNT`/`source_routing` -- not a port number), so its own Input
+header is a different design: a Source combo, matching `frontend.py`'s
+own existing `SOURCE_NAMES` (see the Source-combo milestone further down
+for how this was wired up). `hds_fx_gui_draw.c`'s own Output pill code
+(drawing AND the click-to-open-dropdown handling) stays gated on
 `port_output_channel` being non-`NULL`, drawing a plain disabled `\xe2\x80\x94`
-placeholder and staying inert to clicks for any host that leaves them
-`NULL` -- exactly `hds.clap`, today; exactly `hds_fx.clap`'s own
-previous behavior, unchanged, everywhere else, since its own pointers
-are never `NULL`. The Makefile's `$(CLAP_OBJ)` compile rule and `clap:`
-link rule now also pull in Cairo/X11 (`$(HDS_FX_CFLAGS)`, `pkg-config
---libs cairo x11`), which `hds.clap` never needed before.
+placeholder and staying inert to clicks -- hds.clap has no Output-side
+concept yet, unlike Input; `hds_fx.clap`'s own previous behavior stays
+unchanged everywhere, since its own pointers are never `NULL`. The
+Makefile's `$(CLAP_OBJ)` compile rule and `clap:` link rule now also pull
+in Cairo/X11 (`$(HDS_FX_CFLAGS)`, `pkg-config --libs cairo x11`), which
+`hds.clap` never needed before.
 
 Verified end-to-end with a real XTest-driven test
 (`test_clap_gui.c`, mirroring `hds_fx.clap`'s own `test_gui_x11.c`
@@ -2875,9 +2875,40 @@ dropdown on hds.clap's own pool slot 0, a second real click on a dropdown
 option writing into `SynthSharedControls.fx[0].fx_type` -- THIS
 instance's own real backend state, not a copy -- and a confirmed-inert
 Input pill (no dropdown opens, since `port_input_stereo` is `NULL` for
-this host). Still to come: the real Source-combo Input header (a second,
+this host, before the Source combo below existed). Still to come: a
 separate page for the many-to-many output-routing grid, matching
-`frontend.py`'s own separate Routing tab, is its own later phase).
+`frontend.py`'s own separate Routing tab, is its own later phase.
+
+## hds.clap's FX tab gets its real Source-combo Input header
+
+The one piece the FX-tab milestone above deliberately left for later: a
+real click on the Input pill now opens a genuine Source combo (Program
+1..8, Combi Mix, Ext In 1..8 -- `hds_clap_source_label()` in
+`clap_plugin.c` matches `frontend.py`'s own `SOURCE_NAMES` construction
+exactly) instead of the disabled placeholder. This reuses the exact same
+`fx_source` field and the exact same chain-head gating (`hds_fx_slot_is_
+chain_head()`) `hds_fx.clap`'s own port-model Input pill already uses --
+only the head of a chain shows/edits its own Source, a continuation slot
+inherits the running signal, precisely mirroring the port-model case.
+
+`hds_fx_gui_draw.c` gained a new `HDS_FX_DROPDOWN_SOURCE` kind, gated by
+two new `HdsFxGuiHost` fields: `source_count` (0 for a port-model host
+like `hds_fx.clap`, which leaves this new code path dead exactly like its
+existing `HDS_FX_PORT_COUNT` redefinition already does) and `source_label`
+(a pure `void (*)(int idx, char *buf, size_t buflen)` function pointer --
+no host state needed, since Source names are a pure function of index).
+`hds_fx_dropdown_option_count()`/`hds_fx_dropdown_bg_rect()`/
+`hds_fx_dropdown_option_rect()` all gained a host-pointer parameter, since
+option count is now host-defined data (`source_count`) rather than a
+compile-time constant every other dropdown kind still uses.
+
+Verified via the full existing regression suite (zero behavior change to
+`hds_fx.clap`'s own Input/Output dropdowns -- the port-model path is
+untouched code, just re-parameterized) plus new end-to-end assertions in
+`test_clap_gui.c`: a real XTest click opens the Source combo (confirmed
+`SOURCE_COUNT`=17 options), and a second real click on the "Ext In 1"
+option writes the real `SynthSharedControls.fx[0].fx_source` -- this
+instance's own actual backend state, not a copy.
 
 ## hds.clap's native GUI grows a real tab bar (Phase 1 continued)
 
