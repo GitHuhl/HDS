@@ -211,7 +211,11 @@ static const clap_host_t *hds_fx_gui_clap_host_of(const clap_plugin_t *plugin) {
 // fx_types.h/this file's own defines). hds_fx_gui_x11.c: the X11/XEmbed/event-pump shim, needs
 // everything hds_fx_gui_draw.c defines (HdsFxGuiViewState, hds_fx_gui_render, hds_fx_gui_on_*).
 #include "hds_fx_gui_draw.c"
+#ifdef _WIN32
+#include "hds_fx_gui_win32.c"
+#else
 #include "hds_fx_gui_x11.c"
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // audio-ports extension: HDS_FX_PORT_COUNT real stereo inputs, HDS_FX_PORT_COUNT real stereo

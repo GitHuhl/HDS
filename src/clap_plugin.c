@@ -206,7 +206,11 @@ typedef struct {
 #include "hds_clap_routing_draw.c"
 #include "hds_clap_devices_draw.c"
 #include "hds_clap_gui_draw.c"
+#ifdef _WIN32
+#include "hds_clap_gui_win32.c"
+#else
 #include "hds_clap_gui_x11.c"
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // audio-ports extension. Outputs: port 0 is the main stereo mix (today's only output, unchanged --

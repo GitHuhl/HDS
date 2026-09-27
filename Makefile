@@ -61,6 +61,9 @@ NAM_BUILD_DIR := $(BUILD_DIR)/nam
 # arm64-nam target entirely (confirmed directly: `make -n arm64` failed with "No rule to make
 # target 'build/arm64-nam/activations.o'" until this moved up here).
 ARM64_NAM_BUILD_DIR := $(BUILD_DIR)/arm64-nam
+# Same up-front-definition reasoning as ARM64_NAM_BUILD_DIR just above -- referenced by the shared
+# directory-creation rule below.
+WIN_NAM_BUILD_DIR := $(BUILD_DIR)/win-nam
 NAM_INC := -I$(NAM_DIR) -I$(NAM_DIR)/Dependencies/nlohmann -I$(EIGEN_DIR)
 # -fPIC unconditionally, not just for the `clap` target's shared-object link: these objects are
 # shared between $(BIN) (a plain executable) and $(CLAP_BIN) (a shared object, which REQUIRES
@@ -213,11 +216,11 @@ ARM64_BIN := synth_engine-arm64
 # $ORIGIN-relative, i.e. "next to me".
 ARM64_LIBDIR := arm64-libs
 
-.PHONY: all run-backend run-frontend clean clap hds-fx arm64 FORCE
+.PHONY: all run-backend run-frontend clean clean-windows clap hds-fx arm64 clap-windows hds-fx-windows FORCE
 
 all: $(BIN)
 
-$(BUILD_DIR) $(NAM_BUILD_DIR) $(ARM64_NAM_BUILD_DIR):
+$(BUILD_DIR) $(NAM_BUILD_DIR) $(ARM64_NAM_BUILD_DIR) $(WIN_NAM_BUILD_DIR):
 	mkdir -p $@
 
 # Make's own dependency tracking is purely file-mtime-based -- it has no idea NAM_CXXFLAGS even
@@ -235,8 +238,12 @@ $(BUILD_DIR) $(NAM_BUILD_DIR) $(ARM64_NAM_BUILD_DIR):
 # zero cost (no rewrite, no rebuild) on any ordinary build where it hasn't.
 NAM_FLAGS_STAMP := $(NAM_BUILD_DIR)/.cxxflags.stamp
 ARM64_NAM_FLAGS_STAMP := $(ARM64_NAM_BUILD_DIR)/.cxxflags.stamp
+WIN_NAM_FLAGS_STAMP := $(WIN_NAM_BUILD_DIR)/.cxxflags.stamp
 
 $(NAM_FLAGS_STAMP): FORCE | $(NAM_BUILD_DIR)
+	@if [ ! -f $@ ] || [ "$$(cat $@ 2>/dev/null)" != '$(NAM_CXXFLAGS)' ]; then echo '$(NAM_CXXFLAGS)' > $@; fi
+
+$(WIN_NAM_FLAGS_STAMP): FORCE | $(WIN_NAM_BUILD_DIR)
 	@if [ ! -f $@ ] || [ "$$(cat $@ 2>/dev/null)" != '$(NAM_CXXFLAGS)' ]; then echo '$(NAM_CXXFLAGS)' > $@; fi
 
 $(ARM64_NAM_FLAGS_STAMP): FORCE | $(ARM64_NAM_BUILD_DIR)
@@ -314,6 +321,93 @@ arm64: $(ARM64_BIN_OBJ) $(ARM64_NAM_OBJS)
 	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
 	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_BIN)
 
+# --- Windows CLAP plugins (cross-built from Linux, both hds.clap and hds_fx.clap) ---
+# Produces hds-windows.clap and hds_fx-windows.clap: real PE32+ DLLs exporting clap_entry (the
+# CLAP_EXPORT macro in third_party/clap/include/clap/private/macros.h already emits
+# __attribute__((dllexport)) under _WIN32 automatically -- nothing to change there). Same source
+# files as the Linux targets (clap_plugin.c/hds_fx_plugin.c), each including their own
+# #ifdef _WIN32 platform-shim swap (hds_clap_gui_win32.c/hds_fx_gui_win32.c in place of the X11
+# ones -- see either file's own header comment) -- so this section is purely new toolchain/link
+# plumbing, no third source-file variant of either plugin.
+#
+# What's cross-built into $(WIN_DEPS) (third_party/win64-deps/, NOT checked into git -- see
+# tools/build_windows_deps.sh) and why:
+#   - Cairo + pixman: no mingw-w64 package exists anywhere for either (checked apt, and upstream
+#     ships no Windows cross build) -- built from source via meson. Cairo is configured with
+#     -Dpng=disabled -Dfreetype=disabled -Dfontconfig=disabled -Dxlib=disabled -Dxcb=disabled: on
+#     host_machine.system()=='windows' it auto-enables CAIRO_HAS_WIN32_SURFACE and
+#     CAIRO_HAS_WIN32_FONT (native GDI fonts, gdi32/msimg32 only -- both ship with mingw-w64's own
+#     import libraries) -- so freetype/fontconfig/libpng are never needed at all: nothing in this
+#     GUI's own production code (hds_clap_gui_draw.c/hds_fx_gui_draw.c/either platform shim) ever
+#     calls cairo_surface_write_to_png either, only this repo's own Linux-only screenshot test
+#     scaffolding does. pixman is cairo's own genuinely-required low-level compositing dependency
+#     -- no way around building it.
+#   - liblo: cross-built via its own configure/make (autoreconf -fiv first -- ships only
+#     configure.ac, needs autoconf/automake/libtool/gettext to generate a real ./configure).
+#     Detects winsock2 automatically and links -lws2_32 -liphlpapi on its own.
+#   - zlib: NOT built from source -- Ubuntu's own libz-mingw-w64-dev package already provides it
+#     (apt-get install libz-mingw-w64-dev), the one real mingw-w64-cross-built dependency that
+#     exists pre-packaged.
+#
+# WIN_CC/WIN_CXX default to the standard mingw-w64 (POSIX threading model -- required for real
+# pthread_create/pthread_join support, since backend.c's own sample_disk_thread uses it; the
+# win32-threading-model variant mingw-w64 also ships silently lacks a real pthread implementation)
+# cross-compiler names `nix-shell`/apt both put on PATH once mingw-w64/g++-mingw-w64-x86-64 are
+# installed -- see shell.nix's own Windows section for exactly what it adds.
+#
+# -static (not just -shared, which the final .clap link ALSO needs -- both together is a real,
+# correct mingw combination): statically links libgcc/libstdc++/libwinpthread INTO the DLL itself.
+# Without it, the DLL depends on libwinpthread-1.dll/libstdc++-6.dll/libgcc_s_seh-1.dll at load
+# time -- confirmed directly (a plain non-static test binary refused to start under Wine with
+# "Library libwinpthread-1.dll ... not found") -- none of which a real DAW's own installation
+# ships, so a real end user's Windows machine would refuse to load the plugin at all without
+# separately shipping those three DLLs alongside it. Static linking avoids that entirely: the
+# resulting .clap file is fully self-contained.
+WIN_CC ?= x86_64-w64-mingw32-gcc
+WIN_CXX ?= x86_64-w64-mingw32-g++
+WIN_DEPS := third_party/win64-deps
+# -DCAIRO_WIN32_STATIC_BUILD: cairo.h's own cairo_public macro defaults to __declspec(dllimport)
+# under _WIN32 unless this is defined -- correct for consuming cairo as a real system DLL, wrong
+# for our own statically-linked libcairo.a (produced every symbol as a plain, non-imported
+# definition), and without it the linker looks for __imp_cairo_* import-thunk symbols that were
+# never generated at all (confirmed directly: this is exactly the undefined-reference error a first
+# link attempt without this flag produces).
+WIN_CFLAGS := -O2 -Wall -Wextra -std=gnu11 -DCAIRO_WIN32_STATIC_BUILD -I$(WIN_DEPS)/include -I$(WIN_DEPS)/include/cairo -I$(WIN_DEPS)/include/lo -I$(CLAP_INC) $(NAM_INC)
+WIN_LDFLAGS := -static -L$(WIN_DEPS)/lib
+WIN_LDLIBS := -lcairo -lpixman-1 -llo -lgdi32 -lmsimg32 -luser32 -lws2_32 -liphlpapi -lm -lpthread
+
+WIN_CLAP_BIN := hds-windows.clap
+WIN_CLAP_OBJ := $(BUILD_DIR)/clap_plugin-win.o
+WIN_HDS_FX_BIN := hds_fx-windows.clap
+WIN_HDS_FX_OBJ := $(BUILD_DIR)/hds_fx_plugin-win.o
+
+$(WIN_CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_win32.c | $(BUILD_DIR)
+	$(WIN_CC) $(WIN_CFLAGS) -c $(CLAP_SRC) -o $@
+
+$(WIN_HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.c src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_fx_gui_win32.c src/nam_bridge.h | $(BUILD_DIR)
+	$(WIN_CC) $(WIN_CFLAGS) -c $(HDS_FX_SRC) -o $@
+
+# Windows' own NAM object set: SEPARATE .o files from $(NAM_OBJS)/$(ARM64_NAM_OBJS) (wrong ABI/ISA
+# to reuse -- PE32+ vs ELF, plus the mingw name-mangling target), same NAM_CXXFLAGS otherwise
+# (architecture/OS-independent: just header search paths and the NAM_SAMPLE_FLOAT/visibility
+# fixes -- see NAM_CXXFLAGS's own comment).
+WIN_NAM_OBJS := $(addprefix $(WIN_NAM_BUILD_DIR)/,$(notdir $(NAM_SRCS:.cpp=.o)))
+
+$(WIN_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/%.cpp $(WIN_NAM_FLAGS_STAMP) | $(WIN_NAM_BUILD_DIR)
+	$(WIN_CXX) $(NAM_CXXFLAGS) -c $< -o $@
+
+$(WIN_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp $(WIN_NAM_FLAGS_STAMP) | $(WIN_NAM_BUILD_DIR)
+	$(WIN_CXX) $(NAM_CXXFLAGS) -c $< -o $@
+
+$(WIN_NAM_BUILD_DIR)/%.o: src/%.cpp $(WIN_NAM_FLAGS_STAMP) | $(WIN_NAM_BUILD_DIR)
+	$(WIN_CXX) $(NAM_CXXFLAGS) -c $< -o $@
+
+clap-windows: $(WIN_CLAP_OBJ) $(WIN_NAM_OBJS)
+	$(WIN_CXX) -shared $(WIN_LDFLAGS) -o $(WIN_CLAP_BIN) $(WIN_CLAP_OBJ) $(WIN_NAM_OBJS) $(WIN_LDLIBS)
+
+hds-fx-windows: $(WIN_HDS_FX_OBJ) $(WIN_NAM_OBJS)
+	$(WIN_CXX) -shared $(WIN_LDFLAGS) -o $(WIN_HDS_FX_BIN) $(WIN_HDS_FX_OBJ) $(WIN_NAM_OBJS) $(WIN_LDLIBS)
+
 run-backend: $(BIN)
 	./$(BIN)
 
@@ -323,3 +417,6 @@ run-frontend:
 clean:
 	rm -f $(BIN) $(CLAP_BIN) $(HDS_FX_BIN) $(ARM64_BIN)
 	rm -rf $(ARM64_LIBDIR) $(BUILD_DIR)
+
+clean-windows:
+	rm -f $(WIN_CLAP_BIN) $(WIN_HDS_FX_BIN)
