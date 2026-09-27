@@ -824,11 +824,30 @@ entry -- see `shell.nix`'s own header comment for exactly what each target needs
 `make`/`make clap`/`make hds-fx`** -- there is no "build outside nix-shell" path, and none should
 ever be suggested again.
 
-Linux is the only supported platform -- there is no Windows build of any kind (standalone or
-CLAP), and none is planned: this project will not maintain a second *platform* audio backend
-(WASAPI) alongside ALSA. ALSA remains the default and always-available backend either way; the
-PipeWire backend described below is an additional, opt-in way to talk to audio on the *same*
-platform, not a second platform.
+Linux is the only supported platform for the **standalone** backend (`synth_engine`): this project
+will not maintain a second *platform* audio backend (WASAPI) alongside ALSA. ALSA remains the
+default and always-available backend either way; the PipeWire backend described below is an
+additional, opt-in way to talk to audio on the *same* platform, not a second platform.
+
+**The two CLAP plugins are different**: `hds.clap`/`hds_fx.clap` never touch audio/MIDI device
+code at all (a CLAP host owns that, supplying buffers/note-events instead), so the WASAPI-vs-ALSA
+concern above never applied to them -- and now that this native GUI has its own Win32 windowing
+shim too (see `src/hds_clap_gui_win32.c`/`hds_fx_gui_win32.c`'s own header comments), both plugins
+have a real Windows CLAP build again: `make clap-windows` -> `hds-windows.clap`, `make
+hds-fx-windows` -> `hds_fx-windows.clap`, both cross-built from Linux via mingw-w64. Run
+`tools/build_windows_deps.sh` once per checkout first (cross-builds Cairo's own real dependency,
+pixman, plus liblo, into `third_party/win64-deps/` -- not checked into git; see that script's own
+header comment for exactly why no other dependency needs building from source: Cairo's own
+Win32-native GDI surface/font backends need only `gdi32`/`msimg32`, both bundled with mingw-w64
+already). Verified end-to-end under Wine (`wine` + a virtual X display): a real cross-compiled test
+harness `LoadLibrary`s each actual built DLL, calls its real `clap_entry`, creates a plugin
+instance, creates a real Win32 window via `CLAP_EXT_GUI`, embeds it into a real host window via
+`SetParent`, and drives real `WndProc` message dispatch (`WM_LBUTTONDOWN`/`WM_LBUTTONUP` via
+`SendMessage`, not `SendInput` -- see that harness's own comment on why: `SendInput` depends on
+window focus/position on a real screen, fragile under a headless Wine desktop with no window
+manager, whereas `SendMessage` still drives the exact same production `WndProc` code through the
+OS's own message-dispatch machinery) -- both plugins render their real native GUI correctly and
+tear down cleanly, with zero crashes.
 
 ### Source layout: backend.c is the shared core, not a standalone entry point
 
@@ -3312,3 +3331,143 @@ fields onto `programs[3]` and only `programs[3]` (every other lane and
 `programs[SINGLE_PROGRAM_SLOT]` stay untouched), and updates the lane's own GUI label. The full
 existing regression suite (all 17 prior test binaries, `hds_fx.clap`'s own included) still passes
 unchanged.
+
+## Windows CLAP plugins, resurrected: `hds-windows.clap` / `hds_fx-windows.clap`
+
+A genuine reversal of an earlier, explicit decision, not a small follow-up: this project dropped
+Windows support entirely a while back (see git history around "Drop Windows support entirely"),
+reasoning that a second *platform* audio backend (WASAPI alongside ALSA) wasn't worth the ongoing
+maintenance cost. That reasoning is sound and still applies to the **standalone** backend -- it
+does NOT apply to the CLAP plugins, which never touched audio/MIDI device code at all (a CLAP host
+owns that, supplying buffers/note-events instead). A Windows CLAP build even briefly existed once
+before, headless (no native GUI existed for either plugin back then) -- it was removed as a direct
+consequence of dropping the standalone build, along with the mingw-w64 toolchain and
+`tools/build_windows_deps.sh` that supported it, not because the CLAP-specific reasoning changed.
+Everything Windows-related was fully deleted (confirmed directly: no `WIN_*` Makefile variables,
+no `tools/` directory, no `_WIN32`/mingw references anywhere in `src/`) -- resurrecting it meant
+starting the whole toolchain/dependency story over, now with a real native GUI (this whole
+session's own multi-tab Xlib/Cairo work) to port too.
+
+**Scope decision, put to the user before starting**: given the size of what changed since the old
+build (the NAM/Eigen C++ bridge and the full native GUI both postdate it), rebuild headless again,
+or build full GUI parity? The user chose full GUI parity -- everything below reflects that.
+
+### Dependency stack: only pixman actually needs building from source
+
+No mingw-w64 package for Cairo exists anywhere (checked apt; upstream ships no Windows cross build
+either) -- but Cairo's own `meson.build` auto-enables `CAIRO_HAS_WIN32_SURFACE`/
+`CAIRO_HAS_WIN32_FONT` unconditionally when `host_machine.system() == 'windows'`, using only
+`gdi32`/`msimg32` (both bundled with mingw-w64's own import libraries). Configured with
+`-Dpng=disabled -Dfreetype=disabled -Dfontconfig=disabled -Dxlib=disabled -Dxcb=disabled`: nothing
+in this GUI's own production code (`hds_clap_gui_draw.c`/`hds_fx_gui_draw.c`/either new Win32
+platform shim) ever calls `cairo_surface_write_to_png` either, only this repo's own Linux-only
+screenshot test scaffolding does. That leaves exactly one real dependency to cross-build from
+source: **pixman** (cairo's own low-level compositing library, no way around it) -- plus liblo
+(OSC), which just needed `autoreconf` regenerating its `configure` script (ships only
+`configure.ac`) and detected `winsock2` on its own. zlib is the one dependency that's genuinely
+pre-packaged (`libz-mingw-w64-dev` on Ubuntu/Debian) -- no source build needed at all.
+
+**A real bug found and fixed along the way**: pixman's own `meson.build` forces
+`-DPIXMAN_API=__declspec(dllexport)` unconditionally whenever the compiler supports the attribute
+-- regardless of `--default-library=static` -- so a plain static build still baked a `.drectve`
+`-export:symbolname` linker directive into every object file (confirmed directly via `objdump -s -j
+.drectve` on a built `.o`), which the final DLL link then re-exported as if pixman itself were the
+shared library: ~150 unrelated `pixman_*` symbols leaking into `hds-windows.clap`'s own export
+table alongside the one real export it should have (`clap_entry`). Harmless on Windows specifically
+(PE imports are resolved per-DLL-by-name at load time, unlike the ELF flat-namespace symbol
+interposition that made the analogous NAM/Eigen export leak a real, confirmed cross-plugin crash on
+Linux -- see this repo's own `NAM_CXXFLAGS` comment) -- but still worth suppressing for the same
+reason `-fvisibility=hidden` was applied there: no reason for a private, statically-linked
+implementation detail to be DLL-exported at all. Fixed with a one-line patch to pixman's own
+`meson.build` (`... and get_option('default_library') != 'static'`), reapplied automatically by
+`tools/build_windows_deps.sh` every time it fetches a fresh pixman source tree (pixman's own source
+lives under `third_party/win64-deps/src/`, not checked into git, so the patch has to be
+scripted, not just made once by hand). Both Windows DLLs now export exactly one symbol --
+`clap_entry` -- confirmed directly via `objdump -p`.
+
+**Two small POSIX-portability gaps** surfaced compiling `backend.c` for real under mingw (both only
+reachable through the native SFZ parser): mingw-w64's own `limits.h` only defines `NAME_MAX` under
+an `#ifdef _POSIX_` this codebase never sets (a portable `#ifndef NAME_MAX #define NAME_MAX 255
+#endif` fallback fixes it, matching the value mingw would provide anyway), and mingw-w64 ships no
+`realpath()` at all (Windows has no direct equivalent) -- `GetFullPathNameA()` gives the same "one
+canonical absolute path string" property `sfz_parse_file_recursive()`'s own `#include`-cycle guard
+actually needs, just without `realpath()`'s own symlink resolution (a real, accepted Windows-only
+gap: a cycle through two different symlinks to the same file won't be caught there). Both guarded
+by `#ifdef _WIN32` in `backend.c` itself -- zero effect on the Linux build, confirmed by the full
+existing regression suite (all 17 prior test binaries) still passing unchanged afterward.
+
+### `hds_clap_gui_win32.c` / `hds_fx_gui_win32.c`: new Win32 platform shims
+
+Xlib is Linux-only, but `hds_clap_gui_draw.c`/`hds_fx_gui_draw.c` (every drawing/layout/hit-test
+decision) were already plain `cairo_t*`, portable by design from the very first X11 shim's own
+header comment ("a future Windows port is a new file with this same shape... calling the exact same
+draw file, untouched") -- confirmed true: neither draw file needed a single change. The new files
+mirror `hds_clap_gui_x11.c`/`hds_fx_gui_x11.c`'s own shape exactly, with real Win32 mechanics in
+place of X11/XEmbed:
+
+- **Embedding**: no XEmbed-equivalent handshake needed at all -- create an ordinary hidden
+  top-level window (`WS_OVERLAPPEDWINDOW`, parent `NULL`) at `create()` time (mirroring X11's own
+  "root-window child, reparented later" two-step), then in `set_parent()`, flip the style to
+  `WS_CHILD` and call `SetParent()` once the host hands over its own `HWND`.
+- **Rendering**: no persistent on-screen Cairo surface at all (X11 keeps one for the window's whole
+  lifetime) -- a `cairo_win32_surface_create(HDC)` is created fresh each repaint, wrapping a
+  `GetDC()`'d device context, and destroyed again right after that one blit. The same off-screen
+  `CAIRO_FORMAT_ARGB32` backbuffer image surface every tab already rendered into on Linux is
+  untouched -- only how it gets blitted onto the real window differs.
+- **Events**: the same `clap_host_timer_support_t` contract (~30Hz `register_timer`), draining this
+  window's own queued messages with `PeekMessageW(..., PM_REMOVE)` (filtered to just this `HWND`,
+  never blocking) before each repaint -- the direct Win32 analog of `XPending()`/`XNextEvent()`.
+  `WM_LBUTTONDOWN`/`WM_RBUTTONDOWN` map to this GUI's own button 1/3 convention exactly;
+  `WM_MOUSEWHEEL`'s own lParam is in *screen* coordinates (unlike every other Win32 mouse message
+  here), so `hds_clap_gui_win32.c`'s own handler runs it through `ScreenToClient()` first -- a real
+  bug caught by comparing against the X11 handler's own already-client-relative coordinates, not by
+  a failing test (no way to XTest-equivalent-inject a Windows scroll wheel from this sandbox).
+- **A real, if short-lived, layout bug** the very first screenshot review caught: `WM_ERASEBKGND`
+  returns 1 (telling Windows this GUI paints its own background, avoiding a default-erase flash)
+  and `WM_PAINT` is deliberately minimal (`BeginPaint`/`EndPaint` just validates the update region --
+  the periodic timer tick, not `WM_PAINT` itself, is what actually repaints, matching how the X11
+  shim already treats `Expose` -- selected but never specially handled, relying on the same timer).
+
+`hds_fx_gui_browser.c` (the in-house NAM Model/IR file browser's `opendir`/`readdir`/`stat`
+directory listing) is reused **verbatim** on Windows too -- mingw-w64 ships a real portable
+`dirent.h`/`sys/stat.h`, so this file needed zero platform-specific code either.
+
+### Verification: real cross-compilation AND a real Wine runtime test, not just "it compiles"
+
+This sandbox has no actual Windows machine, but it does have a real `mingw-w64` toolchain
+(installed via apt, not simulated) and real `wine`/`wine64` -- so this was verified two ways, not
+one:
+
+1. **Cross-compiled for real**: `make clap-windows`/`make hds-fx-windows` produce real PE32+ DLLs
+   (confirmed via `file`), each exporting exactly `clap_entry` (confirmed via `objdump -p`).
+2. **Runtime-verified under Wine**: a throwaway cross-compiled test harness (kept in scratch, not
+   committed -- matching this whole session's own "XTest-driven tests live in scratch" convention)
+   `LoadLibrary`s each real built DLL, calls its real `clap_entry`, walks the real
+   `clap_plugin_factory_t` to find and create a real plugin instance, creates a real Win32 window
+   via `CLAP_EXT_GUI`, embeds it into a real host `HWND` via `SetParent`, confirms the plugin
+   registered a real timer via `CLAP_EXT_TIMER_SUPPORT`, drives a real `WM_LBUTTONDOWN`/`WM_LBUTTONUP`
+   through the actual `WndProc`, and tears everything down cleanly (`gui->hide`/`gui->destroy`/
+   `plugin->destroy`/`clap_entry->deinit`) -- run under `wine` against a virtual X display (Xvfb),
+   the only way to runtime-verify a Windows binary from this Linux sandbox. Both plugins passed
+   every step with zero crashes, and a screenshot taken mid-run (via `import -window root` against
+   the same Xvfb display Wine's own X11 driver rendered into) confirms both render their real
+   native GUI correctly -- pixel-identical in content to the Linux screenshots, since it's the exact
+   same draw code.
+
+### Building it yourself
+
+```sh
+# once per checkout (cross-builds pixman + Cairo + liblo into third_party/win64-deps/, not
+# checked into git):
+./tools/build_windows_deps.sh
+
+make clap-windows      # -> hds-windows.clap
+make hds-fx-windows    # -> hds_fx-windows.clap
+```
+
+`nix-shell` at the repo root now provides the mingw-w64 toolchain + meson/ninja/autotools this
+needs too (see `shell.nix`'s own Windows section) -- not independently re-verified against this
+port's own pinned nixpkgs revision from inside this sandbox (no Nix available here; this port's own
+real cross-build/link/Wine-runtime verification used a plain apt-get mingw-w64 install instead, the
+same disclosed-gap posture `shell.nix`'s own `ARM64_BUNDLE_LIBS` comment already uses for its own
+unverified paths).

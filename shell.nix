@@ -9,11 +9,23 @@
 ##
 ##   make arm64            -> synth_engine-arm64    (aarch64 Linux, e.g. Raspberry Pi 5)
 ##
-## Scope note: Windows support has been dropped entirely (standalone synth_engine.exe was already
-## gone; the Windows CLAP cross-build followed it -- this project will never target Windows again,
-## given the real, ongoing cost of maintaining a second audio backend, WASAPI vs. ALSA). The
-## ImGui/GLFW touch client (hds_pi_touch) is also gone -- the Pi target is backend-only now
-## (synth_engine-arm64, no GUI client for that target). See git history if either is ever revived.
+##   make clap-windows     -> hds-windows.clap      (Windows CLAP plugin, cross-built from Linux --
+##   make hds-fx-windows   -> hds_fx-windows.clap    see the Makefile's own "Windows CLAP plugins"
+##                                                    section; run tools/build_windows_deps.sh once
+##                                                    first to cross-build Cairo/pixman/liblo into
+##                                                    third_party/win64-deps/)
+##
+## Scope note: the STANDALONE Windows build (synth_engine.exe, a second full audio/MIDI platform
+## backend -- WASAPI alongside ALSA) is still dropped for good and never coming back -- that's a
+## real, ongoing maintenance cost this project won't take on. The Windows CLAP plugins above are a
+## DIFFERENT thing entirely, resurrected in a later pass: clap_plugin.c/hds_fx_plugin.c never touch
+## audio/MIDI device code at all (a CLAP host owns that, supplying buffers/note-events instead --
+## see clap_plugin.c's own header comment), so cross-building them needed no WASAPI/WinMM code and
+## never did even the first time a Windows CLAP build existed, before this project's native
+## Xlib/Cairo GUI existed to need porting too (see src/hds_clap_gui_win32.c/hds_fx_gui_win32.c's own
+## header comments for that GUI-porting story). The ImGui/GLFW touch client (hds_pi_touch) is gone
+## for good too -- the Pi target is backend-only now (synth_engine-arm64, no GUI client for that
+## target). See git history if that one's ever revived.
 ## WavPack recording support is disabled for now too (commented out via HDS_WAVPACK_ENABLED in
 ## src/backend.c, not deleted) -- pkgs.wavpack/aarch64.wavpack are left in buildInputs below since
 ## re-enabling it needs nothing from this file to change, only that one flag flipped back.
@@ -46,6 +58,20 @@ let
   # already exists as a real nixpkgs package for aarch64-linux, straight from cache.nixos.org
   # (seconds, no local build).
   aarch64 = pkgs.pkgsCross.aarch64-multiplatform;
+
+  # pkgsCross.mingwW64: a real x86_64-w64-mingw32 cross toolchain, for `make clap-windows`/
+  # `make hds-fx-windows`. NOT independently re-verified against this specific pinned nixpkgs-24.05
+  # revision from inside THIS port's own dev environment (no Nix available here -- same disclosed
+  # gap as aarch64.stdenv.cc.cc.lib's own comment below); this port's own actual cross-build/
+  # link/runtime verification (a real Wine-run GUI click-test, not just "it compiles") used a plain
+  # apt-get mingw-w64 install instead, documented in tools/build_windows_deps.sh's own header
+  # comment. nixpkgs' own mingwW64 toolchain is expected to need the same one thing that apt's own
+  # dual gcc-mingw-w64-x86-64-{posix,win32} packages need picking between: confirm
+  # `mingw.stdenv.cc.cc.expand-response-params`-adjacent pthread support actually links a real
+  # pthread_create/pthread_join (backend.c's own sample_disk_thread needs it) the first time this
+  # target is built for real via nix-shell, the same way ARM64_BUNDLE_LIBS's own comment already
+  # asks for its own paths.
+  mingw = pkgs.pkgsCross.mingwW64;
 in
 pkgs.mkShell {
   buildInputs = [
@@ -105,6 +131,31 @@ pkgs.mkShell {
                      # Makefile's own comment for the full story -- a wrong/missing interpreter is
                      # what actually stops the binary from starting at all, not just a missing
                      # RPATH entry).
+
+    # --- Windows CLAP plugins (make clap-windows / make hds-fx-windows) ---
+    # mingw.stdenv.cc puts x86_64-w64-mingw32-gcc/-g++/-ar/-windres on PATH (the exact names both
+    # the Makefile's WIN_CC/WIN_CXX defaults and tools/build_windows_deps.sh's own cross-file
+    # expect). No mingw-w64-cross-built Cairo package exists anywhere (checked; upstream ships none
+    # either) -- meson/ninja/the autotools chain below are what
+    # tools/build_windows_deps.sh uses to cross-build Cairo's own real dependency (pixman) and
+    # liblo from source into third_party/win64-deps/ (run that script once per checkout; see its
+    # own header comment for exactly what it builds and why). zlib is the one real dependency that
+    # doesn't need this -- Ubuntu's own libz-mingw-w64-dev package covers it directly outside Nix;
+    # nixpkgs' own mingwW64 cross zlib would work identically if this shell is the only environment
+    # ever used, but the deps script's own apt-based path was what this port's own real
+    # cross-build/link/Wine-runtime verification actually used, so it's documented as the primary
+    # route rather than assumed interchangeable without re-checking.
+    mingw.stdenv.cc
+    pkgs.meson
+    pkgs.ninja
+    pkgs.autoconf
+    pkgs.automake
+    pkgs.libtool
+    pkgs.gettext   # autopoint (liblo's own ./configure needs regenerating -- see
+                     # tools/build_windows_deps.sh's own liblo step) lives in this package
+    pkgs.wine64     # optional, for actually running/click-testing a built .clap under Wine +a
+                     # virtual X display locally, the same way this port's own verification did --
+                     # never required just to CROSS-COMPILE the plugin.
   ];
 
   shellHook = ''
@@ -116,6 +167,11 @@ pkgs.mkShell {
     echo "  make clap       -> ./hds.clap"
     echo "  make hds-fx     -> ./hds_fx.clap    (standalone multi-FX CLAP plugin, real embedded GUI)"
     echo "  make arm64      -> synth_engine-arm64 (aarch64 Linux backend, e.g. Raspberry Pi 5)"
+    echo
+    echo "  Windows CLAP plugins (cross-built from Linux): run tools/build_windows_deps.sh ONCE"
+    echo "  per checkout first (cross-builds Cairo/pixman/liblo into third_party/win64-deps/), then:"
+    echo "    make clap-windows    -> hds-windows.clap"
+    echo "    make hds-fx-windows  -> hds_fx-windows.clap"
     echo
 
     # Cross-built aarch64 libraries live under content-addressed Nix store paths -- export their
