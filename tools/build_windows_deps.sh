@@ -116,6 +116,24 @@ hds_fetch_and_extract() {
     fi
 }
 
+# meson's cross sanity check compiles a trivial test program and runs it through this exe_wrapper
+# to confirm the toolchain actually produces runnable binaries. The wine binary's own name differs
+# by packaging: apt's `wine`+`wine64` combo only ever exposes a `wine` command on PATH (its own
+# `/usr/bin/wine` dispatches to the right 32/64-bit backend internally; there is no separate
+# `wine64` executable on PATH at all -- confirmed directly, `command -v wine64` finds nothing here
+# even with the wine64 package installed), while nixpkgs' pkgs.wine64 (a 64-bit-only build, no wine32
+# support) has `mainProgram = "wine64"` and exposes ONLY `wine64`, no plain `wine` (confirmed against
+# nixpkgs' own pkgs/applications/emulators/wine/packages.nix) -- so a cross-file hardcoding either
+# name breaks the other packaging. This is exactly the real nix-shell failure reported ("Executables
+# created by c compiler x86_64-w64-mingw32-gcc are not runnable" -- meson silently can't find/run its
+# exe_wrapper at all). Detect whichever is actually on PATH instead of hardcoding one.
+WINE_WRAPPER="$(command -v wine64 2>/dev/null || command -v wine 2>/dev/null || true)"
+if [ -z "$WINE_WRAPPER" ]; then
+    echo "No 'wine64' or 'wine' found on PATH -- meson's cross-compile sanity check needs one to run" >&2
+    echo "a trivial test executable. Install wine64 (apt) or add pkgs.wine64 to shell.nix's buildInputs." >&2
+    exit 1
+fi
+
 CROSS_FILE="$DEPS/mingw-w64-cross.ini"
 cat > "$CROSS_FILE" << EOF
 [binaries]
@@ -125,7 +143,7 @@ ar = 'x86_64-w64-mingw32-ar'
 strip = 'x86_64-w64-mingw32-strip'
 pkg-config = 'x86_64-w64-mingw32-pkg-config'
 windres = 'x86_64-w64-mingw32-windres'
-exe_wrapper = 'wine'
+exe_wrapper = '$WINE_WRAPPER'
 
 [host_machine]
 system = 'windows'
