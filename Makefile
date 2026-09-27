@@ -386,23 +386,22 @@ WIN_PTHREAD_LDLIBS ?= -lpthread
 # "mcf" gcc threading model, a completely different thing from the -lpthread/winpthreads story above
 # (that one is about backend.c's own explicit pthread_create/pthread_join calls; this one is the
 # compiler's own runtime requiring a library apt's posix-threaded gcc never needs at all, since it
-# doesn't use the mcf threading model). Same shape as WIN_PTHREAD_LDLIBS: shell.nix supplies the real
-# path via windows.mcfgthreads, this stays a no-op default for the apt case. Unlike winpthread,
-# nixpkgs' own mcfgthread derivation ships ONLY libmcfgthread.dll.a (an import library) + the actual
-# runtime libmcfgthread-1.dll -- no true static libmcfgthread.a at all (confirmed directly: `find` on
-# the real store path lists exactly those two files and a .la, nothing else) -- so under this
-# Makefile's own blanket `-static` (WIN_LDFLAGS below), plain `-lmcfgthread` can never resolve no
-# matter how many `-L` dirs point at it, since `-static` makes ld refuse anything but a genuine .a.
-# shell.nix's own value for this variable brackets just this one `-l` with `-Wl,-Bdynamic ...
-# -Wl,-Bstatic` to force dynamic linking for mcfgthread specifically while everything else in this
-# build stays static -- see WIN_EXTRA_RUNTIME_DLLS below for shipping the resulting DLL dependency
-# alongside the built .clap.
-WIN_EXTRA_LDLIBS ?=
-# A companion DLL the dynamically-linked mcfgthread above needs at runtime (Windows' default DLL
-# search order checks the loading module's own directory first, so dropping it next to the .clap is
-# sufficient -- no installer/PATH changes needed). Empty/no-op for the apt case, which links
-# mcfgthread-free entirely (posix-threaded gcc never needs it) and stays a genuinely
+# doesn't use the mcf threading model). nixpkgs' own mcfgthread derivation ships ONLY
+# libmcfgthread.dll.a (an import library) + the actual runtime libmcfgthread-1.dll -- no true static
+# libmcfgthread.a at all, and unlike a plain missing static lib, this isn't a packaging gap: upstream
+# mcfgthread's own Makefile.am gives it a custom linker entry point
+# (-Wl,--entry,__MCF_dll_startup@@Z, -nostdlib, freestanding) that fully replaces normal CRT startup
+# -- it is BY DESIGN only ever loadable as its own standalone DLL, statically merging its objects into
+# another DLL would never invoke that startup logic and silently corrupt its own init/cleanup (a real
+# correctness bug, confirmed by reading mcfgthread's own upstream source, not assumed). So
+# WIN_EXTRA_LDLIBS/WIN_EXTRA_RUNTIME_DLLS below are a genuine, irreducible exception, not a
+# workaround to later remove: shell.nix supplies mcfgthread's real -L/-l here (needs no
+# -Wl,-Bdynamic/-Bstatic bracket at all -- see WIN_LDFLAGS's own comment on why this Makefile no
+# longer uses a blanket -static, which is what made bracketing necessary in an earlier version of
+# this file), and WIN_EXTRA_RUNTIME_DLLS copies the resulting DLL dependency next to the built .clap.
+# Both stay empty/default (a no-op) for the apt case, which needs neither and stays a genuinely
 # single-file-self-contained .clap.
+WIN_EXTRA_LDLIBS ?=
 WIN_EXTRA_RUNTIME_DLLS ?=
 # -DCAIRO_WIN32_STATIC_BUILD: cairo.h's own cairo_public macro defaults to __declspec(dllimport)
 # under _WIN32 unless this is defined -- correct for consuming cairo as a real system DLL, wrong
@@ -411,8 +410,29 @@ WIN_EXTRA_RUNTIME_DLLS ?=
 # never generated at all (confirmed directly: this is exactly the undefined-reference error a first
 # link attempt without this flag produces).
 WIN_CFLAGS := -O2 -Wall -Wextra -std=gnu11 -DCAIRO_WIN32_STATIC_BUILD -I$(WIN_DEPS)/include -I$(WIN_DEPS)/include/cairo -I$(WIN_DEPS)/include/lo -I$(CLAP_INC) $(NAM_INC) $(WIN_EXTRA_CFLAGS)
-WIN_LDFLAGS := -static -L$(WIN_DEPS)/lib
-WIN_LDLIBS := -lcairo -lpixman-1 -llo -lgdi32 -lmsimg32 -luser32 -lws2_32 -liphlpapi -lm $(WIN_PTHREAD_LDLIBS) $(WIN_EXTRA_LDLIBS)
+# No blanket -static: on nixpkgs' own mingw cross gcc it forces plain -Bstatic across the ENTIRE
+# link, including gcc's own automatically-appended default-library tail (which mentions -lmcfgthread
+# TWICE more on top of our own explicit one below, un-interruptible by anything on our own command
+# line) -- confirmed directly, by hand, against nixpkgs' own real toolchain (not apt's): under a
+# blanket -static, mcfgthread's import library is unreachable no matter how it's bracketed, because
+# every one of ld's -Bstatic/-Bdynamic mode changes on our own command line is undone again by the
+# time gcc's own tail is reached, and a plain, unbracketed -lmcfgthread there always resolves in
+# whatever mode was last set. Dropping the blanket flag instead and reaching for the SPECIFIC,
+# dedicated tools each static-linking goal actually needs works cleanly with no such conflict:
+# -static-libgcc/-static-libstdc++ substitute direct paths to the real static libgcc.a/libstdc++.a
+# (immune to -Bstatic/-Bdynamic entirely, unlike a plain -lstdc++ -- confirmed: without a
+# competing blanket -static, these actually take effect, where they silently didn't when -static was
+# also present), and an explicit -Wl,-Bstatic/-Wl,-Bdynamic bracket around JUST
+# $(WIN_PTHREAD_LDLIBS) forces winpthread specifically static. mcfgthread itself is then linked with
+# no bracket at all, naturally resolving via its import library under ld's own default (dynamic)
+# mode -- exactly what it needs anyway. Verified end-to-end against a real nix-shell (not guessed):
+# the resulting DLL only imports from libmcfgthread-1.dll plus the same unavoidable Windows system
+# DLLs (KERNEL32/USER32/GDI32/msvcrt/WS2_32/IPHLPAPI) any Windows program needs regardless of how
+# it's linked -- no libstdc++-6.dll, no libwinpthread-1.dll. cairo/pixman/liblo are unaffected by
+# dropping the blanket flag: tools/build_windows_deps.sh builds them with no shared-library variant
+# at all, so there is no competing dynamic candidate for ld to prefer either way.
+WIN_LDFLAGS := -static-libgcc -static-libstdc++ -L$(WIN_DEPS)/lib
+WIN_LDLIBS := -lcairo -lpixman-1 -llo -lgdi32 -lmsimg32 -luser32 -lws2_32 -liphlpapi -lm -Wl,-Bstatic $(WIN_PTHREAD_LDLIBS) -Wl,-Bdynamic $(WIN_EXTRA_LDLIBS)
 
 WIN_CLAP_BIN := hds-windows.clap
 WIN_CLAP_OBJ := $(BUILD_DIR)/clap_plugin-win.o

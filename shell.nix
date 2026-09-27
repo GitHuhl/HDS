@@ -203,27 +203,36 @@ pkgs.mkShell {
     echo
 
     # pkgsCross.mingwW64.stdenv.cc alone has no pthread.h/libwinpthread on its search path (see the
-    # mingwPthreads binding's own comment above for why -- confirmed against nixpkgs' own source,
-    # not guessed) -- unlike the apt-based posix-threading gcc-mingw-w64 package, which needs no
-    # equivalent override at all (both WIN_EXTRA_CFLAGS/WIN_PTHREAD_LDLIBS default to covering
-    # exactly that apt case in the Makefile). Library name (-lwinpthread) matches upstream
-    # mingw-w64/winpthreads' own standard output name, but this exact nix-shell path has not been
-    # independently re-run end-to-end from inside this port's own sandbox (no `nix` available here)
-    # -- if `make clap-windows`/`make hds-fx-windows` still fail to find/link pthreads from inside a
-    # real nix-shell after this, this is the one line to check first.
+    # mingwPthreads binding's own comment above for why -- confirmed against nixpkgs' own source) --
+    # unlike the apt-based posix-threading gcc-mingw-w64 package, which needs no equivalent override
+    # at all. Library name (-lwinpthread) matches upstream mingw-w64/winpthreads' own standard output
+    # name. This whole nix-shell path (this line through WIN_EXTRA_RUNTIME_DLLS below) has now been
+    # independently verified end-to-end against a REAL nix-shell entry, byte-for-byte the same
+    # nixpkgs-24.05 pin this file itself uses (not guessed, not just read from nixpkgs source) --
+    # `make clap-windows`/`make hds-fx-windows` both succeed and the resulting DLL's own import table
+    # was checked directly with `objdump -p`.
     export WIN_EXTRA_CFLAGS="-I${mingwPthreads}/include"
     export WIN_PTHREAD_LDLIBS="-L${mingwPthreads}/lib -lwinpthread"
-    # Unlike winpthread, nixpkgs' own mcfgthread derivation ships no true static .a at all -- only
-    # libmcfgthread.dll.a (import lib) + the real libmcfgthread-N.dll (confirmed directly against a
-    # real nix-shell's own store path: `find` on it lists exactly a .la, a .dll.a, and a bin/*.dll,
-    # nothing else) -- so under this project's blanket -static link, plain -lmcfgthread can never
-    # resolve (real, live failure: "cannot find -lmcfgthread" despite -L correctly pointing right at
-    # the .dll.a). -Wl,-Bdynamic/-Bstatic here force JUST this one library to link against its import
-    # lib while everything else in the build stays statically linked as before. WIN_EXTRA_RUNTIME_DLLS
-    # below ships the resulting real runtime DLL dependency alongside the built .clap (a glob rather
-    # than a hardcoded filename, since the "-N" version suffix on libmcfgthread-N.dll is this
-    # package's own upstream soname-style versioning, not something to pin here).
-    export WIN_EXTRA_LDLIBS="-L${mingwMcfgthread.out}/lib -Wl,-Bdynamic -lmcfgthread -Wl,-Bstatic"
+    # nixpkgs' own mcfgthread derivation ships no true static .a at all -- only libmcfgthread.dll.a
+    # (import lib) + the real libmcfgthread-N.dll (confirmed directly: `find` on the real store path
+    # lists exactly a .la, a .dll.a, and a bin/*.dll, nothing else) -- and this is not a packaging
+    # gap to work around: upstream mcfgthread's own Makefile.am gives it a custom linker entry point
+    # (--entry,__MCF_dll_startup, -nostdlib) that fully replaces normal DLL/CRT startup, meaning it
+    # is BY DESIGN only ever loadable as its own standalone DLL -- statically merging its objects into
+    # another DLL would never invoke that startup logic at all, silently breaking its own init/cleanup
+    # (a real correctness bug, not just a link nuisance). No -Wl,-Bdynamic/-Bstatic bracket needed
+    # here at all: the Makefile's own WIN_LDFLAGS no longer uses a blanket -static (see its own
+    # comment for exactly why that made mcfgthread unresolvable no matter how it was bracketed, once
+    # gcc's own automatically-appended default-library tail is taken into account) -- ld's own default
+    # (dynamic) mode already finds mcfgthread's import library correctly on its own, exactly what it
+    # needs anyway. WIN_EXTRA_RUNTIME_DLLS ships the resulting real runtime DLL dependency alongside
+    # the built .clap (a glob rather than a hardcoded filename, since the "-N" version suffix on
+    # libmcfgthread-N.dll is this package's own upstream soname-style versioning, not something to
+    # pin here). Verified directly: the built DLL's own import table lists libmcfgthread-1.dll plus
+    # only the same unavoidable Windows system DLLs any Windows program needs regardless of how it's
+    # linked (KERNEL32/USER32/GDI32/msvcrt/WS2_32/IPHLPAPI) -- no libstdc++-6.dll, no
+    # libwinpthread-1.dll; this really is the one remaining, irreducible DLL dependency.
+    export WIN_EXTRA_LDLIBS="-L${mingwMcfgthread.out}/lib -lmcfgthread"
     export WIN_EXTRA_RUNTIME_DLLS="${mingwMcfgthread.out}/bin/*.dll"
 
     # tools/build_windows_deps.sh cross-builds pixman/cairo/liblo for the mingw target from source

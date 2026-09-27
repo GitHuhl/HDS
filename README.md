@@ -3507,14 +3507,38 @@ instead of guessing:
   risk class, pre-emptively).
 - nixpkgs builds its mingw cross gcc/g++ with the "mcf" threading model (not posix/win32), so it
   unconditionally requires `-lmcfgthread` at link time regardless of whether the code uses threads at
-  all -- a separate thing entirely from the `pthread_create`/winpthreads story above. Worse, nixpkgs'
-  own `windows.mcfgthreads` derivation ships no true static `.a`, only an import library
-  (`libmcfgthread.dll.a`) plus the real runtime `libmcfgthread-N.dll` (confirmed directly against a
-  real store path), so this project's blanket `-static` link can never resolve a plain `-lmcfgthread`
-  no matter the `-L` path. `shell.nix` now brackets just this one library with
-  `-Wl,-Bdynamic ... -Wl,-Bstatic` (forcing dynamic linking for it alone) and exports
-  `WIN_EXTRA_RUNTIME_DLLS` so the Makefile copies the resulting DLL dependency next to the built
-  `.clap`. **This means a nix-shell-built `hds-windows.clap`/`hds_fx-windows.clap` is not a single
-  self-contained file the way the apt-built one is** -- it needs `libmcfgthread-N.dll` alongside it
-  (Windows' default DLL search order checks the loading module's own directory first, so dropping it
-  in the same folder as the `.clap` is sufficient).
+  all -- a separate thing entirely from the `pthread_create`/winpthreads story above. Its own
+  `windows.mcfgthreads` derivation ships no true static `.a`, only an import library
+  (`libmcfgthread.dll.a`) plus the real runtime `libmcfgthread-N.dll`. This isn't a packaging gap to
+  work around: upstream mcfgthread's own `Makefile.am` gives it a custom linker entry point
+  (`-Wl,--entry,__MCF_dll_startup`, `-nostdlib`) that fully replaces normal DLL/CRT startup, meaning
+  it is *by design* only ever loadable as its own standalone DLL -- statically merging its objects
+  into another DLL would never invoke that startup logic at all, silently breaking its own
+  init/cleanup (a real correctness bug, not just a link nuisance, confirmed by reading mcfgthread's
+  own upstream source rather than assumed).
+
+  The Makefile's `WIN_LDFLAGS` no longer uses a blanket `-static` at all: on nixpkgs' toolchain that
+  flag forces `-Bstatic` across gcc's own automatically-appended default-library tail too, which
+  mentions `-lmcfgthread` twice more beyond this project's own explicit one, uninterruptible by
+  anything on the command line -- confirmed directly, by hand, against a real nix-shell, that no
+  amount of `-Wl,-Bdynamic`/`-Wl,-Bstatic` bracketing around just the one explicit mention can fix
+  that. Reaching for the specific, dedicated tool each static-linking goal actually needs instead
+  works cleanly: `-static-libgcc -static-libstdc++` substitute direct paths to the real static
+  `libgcc.a`/`libstdc++.a` (immune to `-Bstatic`/`-Bdynamic` entirely -- confirmed these silently had
+  no effect while a blanket `-static` was also present, but work correctly once it's removed), and an
+  explicit `-Wl,-Bstatic`/`-Wl,-Bdynamic` bracket around just `$(WIN_PTHREAD_LDLIBS)` forces
+  winpthread specifically static. mcfgthread itself needs no bracket at all: it links via its import
+  library under ld's own default (dynamic) mode, exactly what it needs anyway.
+
+  Verified directly against a real nix-shell (not guessed): the resulting DLL's own import table
+  (`objdump -p`) lists `libmcfgthread-1.dll` plus only the same unavoidable Windows system DLLs any
+  Windows program needs regardless of how it's linked (`KERNEL32`/`USER32`/`GDI32`/`msvcrt`/`WS2_32`/
+  `IPHLPAPI`) -- no `libstdc++-6.dll`, no `libwinpthread-1.dll`. `WIN_EXTRA_RUNTIME_DLLS` copies the
+  one remaining, irreducible DLL dependency (`libmcfgthread-N.dll`) next to the built `.clap`
+  automatically (Windows' default DLL search order checks the loading module's own directory first,
+  so this needs no installer or `PATH` change). **This means a nix-shell-built
+  `hds-windows.clap`/`hds_fx-windows.clap` is not a single self-contained file the way the apt-built
+  one is** -- it needs `libmcfgthread-N.dll` alongside it, and there is no way to avoid that short of
+  overriding nixpkgs' own `threadsCrossFor` to build gcc itself with the `posix` threading model
+  instead of `mcf` (nixpkgs' own comment in `all-packages.nix` names `posix`/`win32` as the other
+  valid values) -- a full one-time gcc rebuild, not attempted here.
