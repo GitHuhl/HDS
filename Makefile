@@ -366,15 +366,29 @@ arm64: $(ARM64_BIN_OBJ) $(ARM64_NAM_OBJS)
 WIN_CC ?= x86_64-w64-mingw32-gcc
 WIN_CXX ?= x86_64-w64-mingw32-g++
 WIN_DEPS := third_party/win64-deps
+# apt's own gcc-mingw-w64-x86-64-posix package bundles a real pthread.h/libpthread.a straight into
+# its own cross sysroot (/usr/x86_64-w64-mingw32/{include,lib}), already on the default search path
+# with nothing extra needed here. nixpkgs' pkgsCross.mingwW64 does NOT: it splits winpthreads into
+# its own separate derivation (windows.mingw_w64_pthreads, confirmed directly against nixpkgs' own
+# pkgs/os-specific/windows/mingw-w64/pthreads.nix/default.nix -- NOT the same thing as nixpkgs' own
+# `windows.pthreads`, which is the unrelated, legacy pthreads-win32/pthread-w32 project and won't
+# match mingw-w64's own ABI), which the base mingw cross stdenv.cc never searches on its own --
+# confirmed directly: `#include <pthread.h>` in backend.c fails outright under a plain
+# `pkgsCross.mingwW64.stdenv.cc` with no extra include path. WIN_EXTRA_CFLAGS/WIN_PTHREAD_LDLIBS
+# exist so shell.nix's own Windows section (see there for the exact nixpkgs paths/library name)
+# can supply exactly that gap without this Makefile hardcoding a Nix store path itself; both stay
+# empty/default (a no-op) for the apt case, which needs nothing extra.
+WIN_EXTRA_CFLAGS ?=
+WIN_PTHREAD_LDLIBS ?= -lpthread
 # -DCAIRO_WIN32_STATIC_BUILD: cairo.h's own cairo_public macro defaults to __declspec(dllimport)
 # under _WIN32 unless this is defined -- correct for consuming cairo as a real system DLL, wrong
 # for our own statically-linked libcairo.a (produced every symbol as a plain, non-imported
 # definition), and without it the linker looks for __imp_cairo_* import-thunk symbols that were
 # never generated at all (confirmed directly: this is exactly the undefined-reference error a first
 # link attempt without this flag produces).
-WIN_CFLAGS := -O2 -Wall -Wextra -std=gnu11 -DCAIRO_WIN32_STATIC_BUILD -I$(WIN_DEPS)/include -I$(WIN_DEPS)/include/cairo -I$(WIN_DEPS)/include/lo -I$(CLAP_INC) $(NAM_INC)
+WIN_CFLAGS := -O2 -Wall -Wextra -std=gnu11 -DCAIRO_WIN32_STATIC_BUILD -I$(WIN_DEPS)/include -I$(WIN_DEPS)/include/cairo -I$(WIN_DEPS)/include/lo -I$(CLAP_INC) $(NAM_INC) $(WIN_EXTRA_CFLAGS)
 WIN_LDFLAGS := -static -L$(WIN_DEPS)/lib
-WIN_LDLIBS := -lcairo -lpixman-1 -llo -lgdi32 -lmsimg32 -luser32 -lws2_32 -liphlpapi -lm -lpthread
+WIN_LDLIBS := -lcairo -lpixman-1 -llo -lgdi32 -lmsimg32 -luser32 -lws2_32 -liphlpapi -lm $(WIN_PTHREAD_LDLIBS)
 
 WIN_CLAP_BIN := hds-windows.clap
 WIN_CLAP_OBJ := $(BUILD_DIR)/clap_plugin-win.o

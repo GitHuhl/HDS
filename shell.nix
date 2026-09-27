@@ -60,17 +60,26 @@ let
   aarch64 = pkgs.pkgsCross.aarch64-multiplatform;
 
   # pkgsCross.mingwW64: a real x86_64-w64-mingw32 cross toolchain, for `make clap-windows`/
-  # `make hds-fx-windows`. NOT independently re-verified against this specific pinned nixpkgs-24.05
-  # revision from inside THIS port's own dev environment (no Nix available here -- same disclosed
-  # gap as aarch64.stdenv.cc.cc.lib's own comment below); this port's own actual cross-build/
-  # link/runtime verification (a real Wine-run GUI click-test, not just "it compiles") used a plain
-  # apt-get mingw-w64 install instead, documented in tools/build_windows_deps.sh's own header
-  # comment. nixpkgs' own mingwW64 toolchain is expected to need the same one thing that apt's own
-  # dual gcc-mingw-w64-x86-64-{posix,win32} packages need picking between: confirm
-  # `mingw.stdenv.cc.cc.expand-response-params`-adjacent pthread support actually links a real
-  # pthread_create/pthread_join (backend.c's own sample_disk_thread needs it) the first time this
-  # target is built for real via nix-shell, the same way ARM64_BUNDLE_LIBS's own comment already
-  # asks for its own paths.
+  # `make hds-fx-windows`. This port's own actual cross-build/link/runtime verification (a real
+  # Wine-run GUI click-test, not just "it compiles") used a plain apt-get mingw-w64 install instead
+  # (documented in tools/build_windows_deps.sh's own header comment) -- the gap that leaves in THIS
+  # file specifically was real, not hypothetical: a first real nix-shell build hit `pthread.h: No
+  # such file or directory` compiling backend.c, because (confirmed directly against nixpkgs' own
+  # pkgs/os-specific/windows/mingw-w64/{pthreads,default}.nix source, not guessed) nixpkgs splits
+  # winpthreads into its own separate derivation, `windows.mingw_w64_pthreads`, that
+  # `pkgsCross.mingwW64.stdenv.cc` never searches on its own -- unlike apt's own
+  # gcc-mingw-w64-x86-64-posix package, which bundles a real pthread.h/libpthread.a straight into
+  # its own cross sysroot with nothing extra needed. (`windows.pthreads` -- note, singular, no
+  # `mingw_w64_` prefix -- is a DIFFERENT, unrelated legacy package, the old pthreads-win32/
+  # pthread-w32 project; it does not match mingw-w64's own ABI and must not be used here.) Fixed
+  # below via WIN_EXTRA_CFLAGS/WIN_PTHREAD_LDLIBS (see the Makefile's own comment on why those two
+  # exist as an overridable seam rather than a hardcoded Nix store path baked into the Makefile
+  # itself) -- still not independently re-verified end-to-end from inside this port's own dev
+  # environment (no Nix available here to actually run `nix-shell` and try it), so if the exact
+  # library name below (`-lwinpthread`, matching upstream mingw-w64/winpthreads' own standard
+  # output name) turns out not to match what this derivation actually produces, that's the one
+  # line to fix.
+  mingwPthreads = pkgs.pkgsCross.mingwW64.windows.mingw_w64_pthreads;
   mingw = pkgs.pkgsCross.mingwW64;
 in
 pkgs.mkShell {
@@ -146,6 +155,10 @@ pkgs.mkShell {
     # cross-build/link/Wine-runtime verification actually used, so it's documented as the primary
     # route rather than assumed interchangeable without re-checking.
     mingw.stdenv.cc
+    mingwPthreads   # pthread.h/libwinpthread -- NOT part of mingw.stdenv.cc itself (see this
+                     # binding's own comment above); backend.c needs a real pthread_create/
+                     # pthread_join, unlike the apt-based posix-threading gcc variant which bundles
+                     # this straight into its own sysroot.
     pkgs.meson
     pkgs.ninja
     pkgs.autoconf
@@ -173,6 +186,18 @@ pkgs.mkShell {
     echo "    make clap-windows    -> hds-windows.clap"
     echo "    make hds-fx-windows  -> hds_fx-windows.clap"
     echo
+
+    # pkgsCross.mingwW64.stdenv.cc alone has no pthread.h/libwinpthread on its search path (see the
+    # mingwPthreads binding's own comment above for why -- confirmed against nixpkgs' own source,
+    # not guessed) -- unlike the apt-based posix-threading gcc-mingw-w64 package, which needs no
+    # equivalent override at all (both WIN_EXTRA_CFLAGS/WIN_PTHREAD_LDLIBS default to covering
+    # exactly that apt case in the Makefile). Library name (-lwinpthread) matches upstream
+    # mingw-w64/winpthreads' own standard output name, but this exact nix-shell path has not been
+    # independently re-run end-to-end from inside this port's own sandbox (no `nix` available here)
+    # -- if `make clap-windows`/`make hds-fx-windows` still fail to find/link pthreads from inside a
+    # real nix-shell after this, this is the one line to check first.
+    export WIN_EXTRA_CFLAGS="-I${mingwPthreads}/include"
+    export WIN_PTHREAD_LDLIBS="-L${mingwPthreads}/lib -lwinpthread"
 
     # Cross-built aarch64 libraries live under content-addressed Nix store paths -- export their
     # include/lib paths here so the Makefile's ARM64_CFLAGS/ARM64_LDFLAGS can find them. ARM64_CC
