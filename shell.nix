@@ -167,13 +167,21 @@ pkgs.mkShell {
     # cross-build/link/Wine-runtime verification actually used, so it's documented as the primary
     # route rather than assumed interchangeable without re-checking.
     mingw.stdenv.cc
-    mingwPthreads   # pthread.h/libwinpthread -- NOT part of mingw.stdenv.cc itself (see this
-                     # binding's own comment above); backend.c needs a real pthread_create/
-                     # pthread_join, unlike the apt-based posix-threading gcc variant which bundles
-                     # this straight into its own sysroot.
-    mingwMcfgthread  # libmcfgthread -- see this binding's own comment above; mingw.stdenv.cc's own
-                     # gcc/g++ unconditionally needs this at link time regardless of whether the
-                     # program itself uses threads at all.
+    # mingwPthreads/mingwMcfgthread are DELIBERATELY NOT listed here -- a real, live regression
+    # confirmed directly: simply listing a plain library/header package (as opposed to
+    # mingw.stdenv.cc, a cross-compiler wrapper package) in buildInputs makes nixpkgs' own generic
+    # setup hooks auto-inject its /include into NIX_CFLAGS_COMPILE for EVERY compiler invocation in
+    # this whole shell, not just the mingw cross target -- including plain native `make clap`/`make`,
+    # which then picked up mingwPthreads' own Windows-targeted pthread.h (which itself
+    # `#include`s <process.h>, a Windows-only header) instead of glibc's real one, breaking the
+    # native Linux build entirely ("fatal error: process.h: No such file or directory" compiling
+    # backend.c with plain `gcc`, no mingw cross compiler involved at all). Both packages are still
+    # fully available via the `${mingwPthreads}`/`${mingwMcfgthread.out}` interpolations in the
+    # shellHook below regardless of buildInputs membership (a Nix string interpolation forces/
+    # resolves a derivation on its own, independent of whether it's ALSO listed here) -- WIN_EXTRA_
+    # CFLAGS/WIN_PTHREAD_LDLIBS/WIN_EXTRA_LDLIBS already pass their exact include/lib paths
+    # explicitly, so the mingw cross-build needs nothing else from them also being visible
+    # ambiently.
     pkgs.meson
     pkgs.ninja
     pkgs.autoconf
