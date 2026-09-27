@@ -86,7 +86,26 @@ NAM_INC := -I$(NAM_DIR) -I$(NAM_DIR)/Dependencies/nlohmann -I$(EIGEN_DIR)
 # WaveNet::_set_condition_array(). Defining it here, once, for every NAM_SRCS file (nam_bridge.cpp's
 # own copy is now redundant but harmless) is the actual fix: one real, consistent NAM_SAMPLE=float
 # across the whole vendored library, matching what nam_bridge.cpp always assumed on its own side.
-NAM_CXXFLAGS := -O2 -std=c++20 -fPIC -DNAM_SAMPLE_FLOAT $(NAM_INC)
+#
+# -fvisibility=hidden -fvisibility-inlines-hidden: load-bearing, not an optimization. Without this,
+# every one of NeuralAmpModelerCore's hundreds of C++ symbols (nam::DSP, nam::get_dsp, the whole
+# ConfigParserRegistry singleton, ...) gets DEFAULT visibility -- exported into the DYNAMIC symbol
+# table of whichever .so links these objects. hds.clap and hds_fx.clap BOTH statically link the
+# exact same 17 NAM object files into their own separate .so, so both used to export IDENTICAL
+# symbol names into the process-wide dynamic symbol table. A DAW that loads both plugins into one
+# process (a real, required use case -- running several instances of both together) can then have
+# the dynamic linker bind one plugin's calls to the OTHER plugin's copy of that same symbol (classic
+# ELF symbol interposition) -- confirmed directly: `nm -D` on both .clap files showed the exact same
+# `nam::ConfigParserRegistry::instance()` guard variable and every other nam:: symbol exported
+# identically from each. Since that registry holds real, mutable, stateful data (not just code),
+# this could corrupt model loading across the two plugins or double-free it at unload -- a real,
+# confirmed DAW crash from loading both together. Hiding these means each .so keeps its own,
+# genuinely independent copy of the whole NAM library; nothing outside a .so ever needed to call
+# these directly anyway (nam_bridge.cpp's own extern "C" bridge functions, the only things a C file
+# calls, aren't affected -- hidden visibility only hides a symbol from OTHER .so's, never from code
+# in the SAME .so), and each plugin's own required export (clap_entry) lives in a plain C file this
+# flag never touches, so it stays fully visible exactly as CLAP hosts require.
+NAM_CXXFLAGS := -O2 -std=c++20 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -DNAM_SAMPLE_FLOAT $(NAM_INC)
 NAM_SRCS := \
 	$(NAM_DIR)/NAM/activations.cpp \
 	$(NAM_DIR)/NAM/container.cpp \
@@ -236,7 +255,7 @@ FORCE:
 $(BIN_OBJ): $(SRC) src/backend.c src/fx_types.h src/fx_chain.c src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -c $(SRC) -o $@
 
-$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_gui_draw.c src/hds_clap_gui_x11.c | $(BUILD_DIR)
+$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_x11.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(HDS_FX_CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
 $(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.c src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_fx_gui_x11.c src/nam_bridge.h | $(BUILD_DIR)

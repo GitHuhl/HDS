@@ -43,10 +43,20 @@
 // here rather than duplicated. port_input_stereo/port_output_channel/port_input_off/
 // port_output_off all stay NULL for this host: hds.clap has no flat N-port Input/Output concept at
 // all (a slot's Input is which SOURCE feeds it -- a Program, the Combi Mix bus, or an ext-in pair,
-// see fx_source/SOURCE_COUNT in backend.c -- not a port), so this plugin's own FX tab draws its own
-// Source-combo header instead of hds_fx_gui_draw.c's port-pill one; see that file's own gating on
-// these fields being NULL.
+// see fx_source/SOURCE_COUNT in backend.c -- not a port). Instead it sets source_count/source_label
+// (below), which draws its own Source-combo Input header via hds_fx_gui_draw.c's own SOURCE
+// dropdown kind -- see that file's own gating on port_input_stereo being NULL vs. source_count > 0.
 #include "hds_fx_gui_host.h"
+
+// hds_clap_source_label: text for Source index `idx`, exactly matching frontend.py's own
+// SOURCE_NAMES construction (Program 1..COMBI_PROGRAM_COUNT, then Combi Mix, then Ext In
+// 1..EXT_IN_PAIR_COUNT) so a slot's Source combo and a DAW host's own port names (see
+// clap_audio_ports_get() below) name the same thing identically.
+static void hds_clap_source_label(int idx, char *buf, size_t buflen) {
+    if (idx < COMBI_PROGRAM_COUNT) snprintf(buf, buflen, "Program %d", idx + 1);
+    else if (idx == COMBI_PROGRAM_COUNT) snprintf(buf, buflen, "Combi Mix");
+    else snprintf(buf, buflen, "Ext In %d", idx - COMBI_PROGRAM_COUNT);
+}
 
 // ---------------------------------------------------------------------------------------------
 // build_osc_dispatch_table() builds a process-wide static table and calls exit(1) on a duplicate
@@ -115,6 +125,18 @@ typedef struct {
     // actually connected; see this file's own process() for how.
     float ext_in_render_buf[BUFFER_SIZE * EXT_IN_PAIR_COUNT * 2];
 
+    // Routing tab's own per-ext-in-pair VU meters (see gui_routing_tab_visible's own comment in
+    // backend.c): a persistent, per-instance peak-hold, updated every process() call by
+    // render_audio_block()'s own ext_in_peak_out parameter (see clap_plugin_process()'s own call
+    // site) and read directly by hds_clap_routing_draw.c's own render function -- this instance's
+    // own real GUI lives in-process (no OSC round-trip, see hds_clap_gui_draw.c's own header
+    // comment), so it can just read this struct field straight off the audio thread's last-written
+    // value instead of needing the standalone app's own /hds/status/ext_in_peak/<pair> OSC poll.
+    // gui_routing_tab_visible itself is set/cleared by hds_clap_gui_render() -- see that function's
+    // own comment -- so this only actually updates (stays non-zero) while the Routing tab is the
+    // active tab, matching the standalone app's own perf-gating intent exactly.
+    float ext_in_peak[EXT_IN_PAIR_COUNT];
+
     // CLAP params extension (see HDS_CLAP_PARAMS/hds_clap_push_changed_params further down) --
     // one shadow value per exposed param, used purely to detect an OSC/GUI-driven change so it
     // can be echoed to the host as an output event. Sized/initialized once the table itself is
@@ -165,6 +187,24 @@ typedef struct {
 // own small X11 shell instead of further genericizing hds_fx_gui_x11.c (which stays exactly as
 // hds_fx.clap alone needs it).
 #include "hds_fx_gui_draw.c"
+// hds_clap_play_draw.c and hds_clap_filters_draw.c come BEFORE hds_clap_gui_draw.c: they define
+// HdsClapPlayViewState/HdsClapFiltersViewState, which HdsClapGuiViewState (hds_clap_gui_draw.c's
+// own view-state struct) nests exactly the same way it already nests hds_fx_gui_draw.c's own
+// HdsFxGuiViewState for the FX tab. hds_clap_filters_draw.c itself comes after hds_clap_play_draw.c
+// since it reuses that file's own generic knob primitives (HdsPlayKnobDrag/hds_play_draw_knob/
+// hds_play_knob_hit_test/hds_play_start_knob_drag) rather than duplicating them -- see its own
+// header comment.
+#include "hds_clap_play_draw.c"
+#include "hds_clap_combi_draw.c"
+#include "hds_clap_filters_draw.c"
+#include "hds_clap_lfos_draw.c"
+// hds_clap_envelopes_draw.c comes after hds_clap_lfos_draw.c: it reuses that file's own
+// hds_lfo_dest_label()/hds_lfo_dest_selectable()/HDS_LFO_DEST_COUNT/HDS_LFO_DEST_LIST_ROW_H/
+// HDS_LFO_DEST_LIST_MAX_H (the shared 100-entry matrix_shared_routes list) rather than
+// re-transcribing them -- see its own header comment.
+#include "hds_clap_envelopes_draw.c"
+#include "hds_clap_routing_draw.c"
+#include "hds_clap_devices_draw.c"
 #include "hds_clap_gui_draw.c"
 #include "hds_clap_gui_x11.c"
 
@@ -1113,10 +1153,10 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         // instance's render clobber another's mid-flight, a real cross-instance data race this
         // multi-instance pass exists to eliminate, not reintroduce.
         float chunk_buffer[BUFFER_SIZE * 2];
-        // No Routing tab exists for a CLAP plugin instance's own OSC control surface to report
-        // visibility for (see gui_routing_tab_visible's own comment) -- ext_in_peak_scratch is
-        // therefore always all-zero (gui_routing_tab_visible defaults to 0) and simply discarded.
-        float ext_in_peak_scratch[EXT_IN_PAIR_COUNT];
+        // This instance's own persistent VU-peak storage (see HdsClapPlugin.ext_in_peak's own
+        // comment) -- real and read by the Routing tab's own render function, unlike the
+        // standalone app's OSC-only control surface, which has no Routing tab of its own to
+        // report gui_routing_tab_visible for.
         // Interleave this chunk's worth of whichever ext-in ports the host actually connected into
         // p->ext_in_render_buf (pair p at channels [2p, 2p+1], exactly what render_audio_block's
         // own ext_in_buffer/ext_in_channels parameters expect -- see that struct field's own
@@ -1135,7 +1175,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         }
         float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases,
                                          any_ext_in_connected ? p->ext_in_render_buf : NULL, any_ext_in_connected ? EXT_IN_PAIR_COUNT * 2 : 0,
-                                         2, &p->midi_live, chunk_buffer, current_tempo_bpm, ext_in_peak_scratch,
+                                         2, &p->midi_live, chunk_buffer, current_tempo_bpm, p->ext_in_peak,
                                          any_prog_out_connected ? p->per_program_render_buf : NULL, gr_db_scratch);
         if (peak > block_peak) block_peak = peak;
 
@@ -1244,6 +1284,8 @@ static const clap_plugin_t *clap_factory_create_plugin(const clap_plugin_factory
     // header comment and this file's own comment on the struct. The four port_* pointers stay
     // NULL (calloc already guarantees this): hds.clap has no flat N-port Input/Output concept.
     p->gui_host.fx = p->knobs.fx;
+    p->gui_host.source_count = SOURCE_COUNT;
+    p->gui_host.source_label = hds_clap_source_label;
 
     p->plugin.desc = &k_descriptor;
     p->plugin.plugin_data = p;

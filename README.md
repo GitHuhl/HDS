@@ -2853,18 +2853,18 @@ regression.
 and every per-port routing pointer left `NULL`: hds.clap has no flat
 N-port Input/Output concept at all (a slot's Input is which SOURCE feeds
 it -- a Combi Program, the Combi Mix bus, or an ext-in pair, see
-`SOURCE_COUNT`/`source_routing` -- not a port number), so its own Input/
-Output header is a different design (a Source combo, matching
-`frontend.py`'s own existing `SOURCE_NAMES`), not yet built. Until it is,
-`hds_fx_gui_draw.c`'s own Input/Output pill code (drawing AND the click-
-to-open-dropdown handling) is gated on `port_input_stereo`/
+`SOURCE_COUNT`/`source_routing` -- not a port number), so its own Input
+header is a different design: a Source combo, matching `frontend.py`'s
+own existing `SOURCE_NAMES` (see the Source-combo milestone further down
+for how this was wired up). `hds_fx_gui_draw.c`'s own Output pill code
+(drawing AND the click-to-open-dropdown handling) stays gated on
 `port_output_channel` being non-`NULL`, drawing a plain disabled `\xe2\x80\x94`
-placeholder and staying inert to clicks for any host that leaves them
-`NULL` -- exactly `hds.clap`, today; exactly `hds_fx.clap`'s own
-previous behavior, unchanged, everywhere else, since its own pointers
-are never `NULL`. The Makefile's `$(CLAP_OBJ)` compile rule and `clap:`
-link rule now also pull in Cairo/X11 (`$(HDS_FX_CFLAGS)`, `pkg-config
---libs cairo x11`), which `hds.clap` never needed before.
+placeholder and staying inert to clicks -- hds.clap has no Output-side
+concept yet, unlike Input; `hds_fx.clap`'s own previous behavior stays
+unchanged everywhere, since its own pointers are never `NULL`. The
+Makefile's `$(CLAP_OBJ)` compile rule and `clap:` link rule now also pull
+in Cairo/X11 (`$(HDS_FX_CFLAGS)`, `pkg-config --libs cairo x11`), which
+`hds.clap` never needed before.
 
 Verified end-to-end with a real XTest-driven test
 (`test_clap_gui.c`, mirroring `hds_fx.clap`'s own `test_gui_x11.c`
@@ -2875,9 +2875,40 @@ dropdown on hds.clap's own pool slot 0, a second real click on a dropdown
 option writing into `SynthSharedControls.fx[0].fx_type` -- THIS
 instance's own real backend state, not a copy -- and a confirmed-inert
 Input pill (no dropdown opens, since `port_input_stereo` is `NULL` for
-this host). Still to come: the real Source-combo Input header (a second,
+this host, before the Source combo below existed). Still to come: a
 separate page for the many-to-many output-routing grid, matching
-`frontend.py`'s own separate Routing tab, is its own later phase).
+`frontend.py`'s own separate Routing tab, is its own later phase.
+
+## hds.clap's FX tab gets its real Source-combo Input header
+
+The one piece the FX-tab milestone above deliberately left for later: a
+real click on the Input pill now opens a genuine Source combo (Program
+1..8, Combi Mix, Ext In 1..8 -- `hds_clap_source_label()` in
+`clap_plugin.c` matches `frontend.py`'s own `SOURCE_NAMES` construction
+exactly) instead of the disabled placeholder. This reuses the exact same
+`fx_source` field and the exact same chain-head gating (`hds_fx_slot_is_
+chain_head()`) `hds_fx.clap`'s own port-model Input pill already uses --
+only the head of a chain shows/edits its own Source, a continuation slot
+inherits the running signal, precisely mirroring the port-model case.
+
+`hds_fx_gui_draw.c` gained a new `HDS_FX_DROPDOWN_SOURCE` kind, gated by
+two new `HdsFxGuiHost` fields: `source_count` (0 for a port-model host
+like `hds_fx.clap`, which leaves this new code path dead exactly like its
+existing `HDS_FX_PORT_COUNT` redefinition already does) and `source_label`
+(a pure `void (*)(int idx, char *buf, size_t buflen)` function pointer --
+no host state needed, since Source names are a pure function of index).
+`hds_fx_dropdown_option_count()`/`hds_fx_dropdown_bg_rect()`/
+`hds_fx_dropdown_option_rect()` all gained a host-pointer parameter, since
+option count is now host-defined data (`source_count`) rather than a
+compile-time constant every other dropdown kind still uses.
+
+Verified via the full existing regression suite (zero behavior change to
+`hds_fx.clap`'s own Input/Output dropdowns -- the port-model path is
+untouched code, just re-parameterized) plus new end-to-end assertions in
+`test_clap_gui.c`: a real XTest click opens the Source combo (confirmed
+`SOURCE_COUNT`=17 options), and a second real click on the "Ext In 1"
+option writes the real `SynthSharedControls.fx[0].fx_source` -- this
+instance's own actual backend state, not a copy.
 
 ## hds.clap's native GUI grows a real tab bar (Phase 1 continued)
 
@@ -2923,3 +2954,361 @@ the tab bar itself switches tabs (Play, then back to FX), and the FX tab's own e
 underneath it, at the correct translated coordinates. `hds_fx.clap`'s full existing test suite
 (including its own real XTest-driven `test_gui_x11`) still passes unchanged after the
 `hds_fx_gui_browser.c` extraction.
+
+## hds.clap's Play tab: 4 oscillator strips + 4 real Amp EGs (task #99)
+
+The next tab in the ordered list: `src/hds_clap_play_draw.c` (new) ports frontend.py's own Play
+tab -- the `QGroupBox("Oscillators")` (4 side-by-side strips: Shape/Pulse-Width-or-Tilt/Curve-
+Drive/Pitch-Offset/Fine/Phase/Pitch/Unison-Width/Unison-Detune/Vol/Mute/Pan, each knob's own
+real-unit range and shape-conditional visibility copied from `backend.c`'s own `ProgramState`, not
+guessed) and the `QGroupBox("Dedicated Amplitude Envelopes")` (4 `ADSRPanel`s: a real interactive
+curve widget, a 7-topology Mode combo, up to 6 topology-dependent dial knobs, the "1->All"/"Sync"
+buttons, a Vel->Amp knob). Every control reads/writes `SynthSharedControls.programs[
+SINGLE_PROGRAM_SLOT]` directly -- this instance's own real backend state, not a GUI-side mirror.
+hds.clap now lands on the Play tab by default (it's the tab a synth's own performer actually wants
+first), not FX.
+
+**Scope for this pass**: Single-Program mode only. Combi mode's own separate 8-lane mixer view
+(Level/Pan fader per lane, a Program-file picker, MIDI channel, key/velocity zone, per-lane
+transpose -- `self.osc_combi_widget` in frontend.py) is real, substantial, separate work with its
+own new infrastructure needs (a Program-file browser, extending `hds_fx_gui_browser.c`'s own
+pattern) -- tracked as its own follow-up task, not silently dropped. The Play tab's own Mode radio
+row isn't built yet either, for the same reason: a toggle to a mode with no view built would be a
+dead control. Two more things deliberately NOT here yet: the `WaveformVisualizer` preview (purely
+decorative, no backend field of its own) and the right-click "Modulate From" context menu on
+Pulse-Width/Phase/Pitch (assigns an LFO/assignable-EG as a knob's modulation source) -- the latter
+genuinely can't be built yet, since it needs a real list of modulator sources and the LFOs/
+Envelopes tabs that would supply that list don't exist in this native GUI yet either (next, in
+order, per this repo's own task list).
+
+**The Amp EG curve widget** (`src/hds_clap_adsr.h`, new) is a from-scratch Cairo port of
+`InteractiveADSREnvelope` (`calculate_geometry`/`paintEvent`/`mousePressEvent`/`mouseMoveEvent`),
+verified node-by-node against the Python source in a standalone prototype BEFORE being wired into
+the real plugin here. `AdsrEnvelopeState` itself is never a second source of truth: it's a
+transient, per-render/per-interaction-call VIEW of the backend's own `PackEGParams`/`eg_mode`
+fields (`hds_clap_adsr_load_from_backend()`/`store_to_backend()` convert milliseconds/percent
+<-> the widget's own seconds/0-1-fraction units), with only `active_node` (which curve handle is
+currently highlighted/dragged) persisted in the GUI's own view state across redraws.
+
+**One deliberate widget-type simplification** versus frontend.py, consistent with this whole
+native GUI's own established interaction language (`hds_fx_gui_draw.c`'s own header comment:
+"Mix/param knobs stay click-and-drag" -- there's no vertical-fader widget anywhere else in this
+GUI): every numeric control here (Vol included, and the 6 Amp-EG time/level dials, which are
+Python `QDial` subclasses with their own log/cubic taper) is the exact same plain click-and-drag
+knob `hds_fx_gui_draw.c`'s own Mix/param knobs already are, dragging LINEARLY over that field's own
+real backend-unit range -- the same convention `hds_fx_type_param_range()`'s own knobs already use
+for every FX param. This changes how many drag-pixels one full sweep takes, never the real value
+range or type. Pitch Offset/Fine Tune (`QSpinBox`es in frontend.py, not `QDial`s) become knobs too,
+for the same one-interaction-model reason.
+
+A real bug this pass's own testing caught before it shipped: every knob rect in this file stores
+its CENTER in `(x,y)` and its radius in `w` (the convention its own drawing code needs, since it
+draws an arc around a center, not a rectangle) -- but the FX tab's own `hds_fx_rect_contains()`
+(reused at first for hit-testing) treats `(x,y,w,h)` as a top-left corner plus width/height, testing
+an entirely different box, one whose top-left corner happens to BE the knob's own center. A test
+clicking exactly at a knob's own stored `(x,y)` still passed by coincidence (that point sits on the
+boundary of both interpretations), until int-truncating a knob center with a fractional part (e.g.
+`472.3` -> `472`) landed the click a hair outside the wrong box and the very first EG-dial-drag
+assertion caught it stone cold. Fixed with a proper `hds_play_knob_hit_test()` (a circle around the
+stored center, not a rectangle from it) used everywhere a knob-style rect is hit-tested. The same
+real bug also caught a second issue: every one of the 6 Amp-EG dial rects is always computed
+regardless of which the current topology actually shows (geometry doesn't depend on `env_type`,
+only visibility does -- see `hds_play_compute_eg_layout()`'s own comment), so hit-testing now
+explicitly re-checks `hds_play_eg_dial_visibility()` too, not just the old `rect.w > 0` guard that
+was never actually false for a hidden dial.
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_play.c`): real clicks/drags for
+the Shape dropdown (open + select, writing `vco1_shape`), a Pan knob drag (`vco1_pan`), the Mute
+toggle (`vco1_mute`), the Amp EG Mode dropdown (open + select AHDSR, writing `eg_mode[0]`), a real
+drag on the Attack dial (`eg[0].a`), a real drag on the ADSR curve's own Sustain node
+(`eg[0].s`), "1->All" (copies EG1's real state onto EG2), and "Sync" (toggling it on, then a
+further EG1 drag live-mirrors onto EG4 without a second click) -- eleven real, passing assertions
+against `SynthSharedControls.programs[SINGLE_PROGRAM_SLOT]`'s own actual fields. The full existing
+regression suite (all 9 prior test binaries, `hds_fx.clap`'s own included) still passes unchanged.
+
+## hds.clap's Filters tab: Chain Mode, 5 filter slots, 3-band EQ (task #100)
+
+Next tab in the ordered list: `src/hds_clap_filters_draw.c` (new) ports frontend.py's own Filters
+tab -- the Chain Mode row (Series/Parallel, a plain binary toggle pill rather than a 2-item
+dropdown, same reasoning as the Slope pill below), 5 stacked `FilterParams` slots (Freq/Res knobs,
+a Slope toggle pill 2-Pole/4-Pole, a Type dropdown Off/LPF/HPF/BPF/Notch), and the post-filter
+`EqBandParams[3]` 3-band EQ (Low Shelf/Mid Peak/High Shelf -- Freq+Gain knobs on every band, plus a
+Q knob on Mid Peak only, exactly matching `compute_eq_band_coeffs()`'s own shelf-vs-peak split in
+`fx_types.h`). Every control reads/writes `SynthSharedControls.programs[SINGLE_PROGRAM_SLOT]`
+directly, same discipline the Play tab already established.
+
+This file reuses the Play tab's own generic knob primitives verbatim -- `HdsPlayKnobDrag`/
+`hds_play_draw_knob()`/`hds_play_knob_hit_test()`/`hds_play_start_knob_drag()` -- rather than
+duplicating them, the same "generic primitive, reused by a later tab file" pattern the Play tab
+itself already used for `hds_fx_gui_draw.c`'s own `hds_fx_draw_knob_arc()`/`hds_fx_rgb()`/
+`hds_fx_draw_pill()`. `hds_play_start_knob_drag()` itself needed a small signature change to make
+this reuse possible (it now takes the `HdsPlayKnobDrag` descriptor directly rather than a whole
+tab's own view state) -- a pure refactor, verified zero behavior change via the full existing
+`test_clap_play.c` suite passing unchanged afterward.
+
+**Scope for this pass**: every control visible WITHOUT a right-click in frontend.py, same
+"Modulate From" deferral reasoning as the Play tab (it needs a real modulator-source list the
+LFOs/Envelopes tabs don't exist to supply yet). Concretely NOT wired up yet: each Cutoff knob's own
+right-click menu (a Key Track preset + an ext-MIDI CC modulation source, on top of "Modulate
+From"), and each Resonance knob's own right-click "Modulate From" menu. `FilterParams.key_track`/
+`cutoff_mod_source_cc` -- the two fields those menus would set -- are untouched by this pass's UI
+entirely, so a patch that already has them set (via the Python GUI, or a save file) keeps that
+value; this native GUI just has no way to change them yet. EQ knobs have no right-click menu in
+frontend.py at all (a band's own 2-3 knobs are constant for the whole audio block, never a
+mod-matrix destination -- see `EqBandParams`' own comment in `fx_types.h`), so nothing is deferred
+there. Combi mode changes nothing about this tab either way (confirmed by reading frontend.py: the
+Filters tab always addresses the plain Program-scoped fields, reused as-is for whichever Program is
+currently being edited in Single-Program mode -- Combi's own per-lane state lives entirely
+elsewhere, in `combi_lane_*`/`seq_lanes[]`, not in `FilterParams`/`EqBandParams`).
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_filters.c`): real clicks/drags
+for the Chain Mode toggle (`filter_chain_mode`), a Freq knob drag and a Res knob drag on Filter 1
+(`filters[0].cutoff`/`res_q`), the Slope toggle (`filters[0].slope_poles`), the Type dropdown (open
++ select HPF, writing `filters[0].filter_type`), and Gain/Q knob drags on the Mid Peak EQ band
+(`eq_bands[1].gain_db`/`q`) -- eight real, passing assertions. The full existing regression suite
+(all 11 prior test binaries) still passes unchanged.
+
+## hds.clap's LFOs tab: all 16 PackLfoParams rows + the real 100-entry Destination combo (task #101)
+
+Next tab in the ordered list: `src/hds_clap_lfos_draw.c` (new) ports frontend.py's own LFOs tab --
+a single scrollable list of all 16 `PackLfoParams` rows (Waveform, Curve/Drive, Rate, Tempo-Sync
+division, Depth, Phase, Key Sync, Per-Key mode + Key/Vel Track, and the Destination combo). Unlike
+Play/Filters, the Destination combo itself is fully in scope for this pass -- it's the ordinary,
+always-visible way an LFO routes its own output, not a right-click extra, so this is where
+`matrix_shared_routes` (the same 100-entry mod-matrix target list the upcoming Envelopes tab's own
+assignable EGs will share) gets its first real, working implementation:
+`hds_lfo_dest_label()`/`hds_lfo_dest_selectable()` build/gate the exact same 100 targets (0=None,
+1-47 fixed oscillator/LFO/filter/mixer destinations, 48-83 patterned LFO 5-16 Rate/Depth/Phase,
+90-99 patterned Filter 1-5 Freq/Res, with indices 8-13/84-89 shown as inert "--" placeholders --
+retired slots from a pre-simplification design that a saved patch might still reference).
+
+16 rows with 11 controls apiece doesn't fit in the window at once (`HDS_LFO_ROW_H`=52 x 16 +
+header comes to ~856px against ~636px of usable height), so this tab is the first to need real
+vertical scrolling outside the FX tab's own row list -- `HdsClapLfosViewState.scroll_offset_px`,
+mouse-wheel-driven, same clamped-to-content convention `HdsFxGuiViewState`'s own scroll already
+uses. The Destination dropdown itself ALSO needs its own internal scroll (100 entries is far
+taller than any reasonable popup) -- capped to `HDS_LFO_DEST_LIST_MAX_H` (320px) with its own
+`dest_scroll_px`, reset to 0 every time a new one opens, scrolled by the mouse wheel while that
+specific dropdown is open (checked first in `hds_clap_lfos_on_scroll()`, before the whole-list
+scroll it falls through to otherwise).
+
+Reuses the same generic knob primitives every tab since Play has reused (`HdsPlayKnobDrag`/
+`hds_play_draw_knob()`/`hds_play_knob_hit_test()`/`hds_play_start_knob_drag()`), same "generic
+primitive, reused by a later tab file" pattern. The Rate knob is drawn/hit-tested `disabled`
+whenever `tempo_sync_division != 0` (matches frontend.py's own `dial.setEnabled(idx==0)`) -- its
+own value-text swaps to the division's name instead of a stale Hz reading, and a click on it while
+synced is correctly inert (verified explicitly in the test below). Key Track/Vel Track knobs are
+drawn/hit-tested only while `per_key_mode != 0` (matches the Key/Vel Track box's own
+show-on-PK-checked visibility). The LFO waveform enum (Tri/Sine/RevSaw/Sq/Off/Saw, indices 0-5,
+`lookup_lfo_waveform()`'s own ordering) is kept deliberately separate from the oscillators' own
+`WaveType` enum -- same value space collision Play tab's own header comment already warned about
+avoiding.
+
+**Scope for this pass**: same "everything visible without a right-click" cut as Play/Filters. Each
+Rate/Depth/Phase knob's own right-click "Modulate From" menu (lets one LFO/EG modulate another
+LFO's own Rate/Depth/Phase) and Depth's own separate right-click "Modulation Source (CC)" menu
+(`mod_source_cc`, a live-MIDI multiplicative scale) aren't wired up yet -- both fields those menus
+would set stay untouched by this pass's UI, same "don't reset what the Python GUI already set"
+posture as Filters' own deferred fields. Confirmed Combi mode changes nothing about this tab either
+(always the plain Program-scoped `/hds/lfo/...` fields, same posture as Filters).
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_lfos.c`, 11 passing assertions):
+the Waveform dropdown (open + select Sine, writing `wave_type`), a Rate knob drag (`rate_hz`), a
+Depth knob drag (`mod_depth`), the Tempo Sync dropdown (open + select 1/8, writing
+`tempo_sync_division`) followed by confirming the Rate knob is now genuinely inert, the PK toggle
+(`per_key_mode`) followed by a Key Track knob drag (`key_track`, only reachable once PK is on), the
+Destination dropdown's own internal scroll landing on and selecting target 95 ("Filter 3 Res",
+`dest_target`), and a whole-list scroll that lands a subsequent click on the correct row (LFO 16)
+at its new, scrolled screen position. The full existing regression suite (all 13 prior test
+binaries, `hds_fx.clap`'s own included) still passes unchanged.
+
+## hds.clap's Envelopes tab: the 6 assignable EGs (task #107)
+
+Next tab in the ordered list: `src/hds_clap_envelopes_draw.c` (new) ports frontend.py's own
+Envelopes tab -- 6 full-width ADSR panels stacked vertically (unlike the Play tab's 4 Amp EGs,
+which sit side by side), one per assignable EG (`eg[4..9]`/`eg_mode[4..9]` -- the exact same
+`PackEGParams`/topology system, and literally the same `hds_clap_adsr.h` curve widget, the Amp EGs
+already use). Each panel's own title row carries an Intensity knob (`eg_intensity[6]`, **signed**
+-1.0..1.0, unlike an Amp EG's hard-wired unipolar amplitude multiply -- an assignable EG can target
+pitch/pan/filter cutoff/anything else, so Intensity doubles as both depth and polarity) and a
+Destination pill (`eg_dest_target[6]`) reusing the exact same 100-entry `matrix_shared_routes` list
+the LFOs tab's own Destination combo just implemented -- `hds_lfo_dest_label()`/
+`hds_lfo_dest_selectable()` are called here verbatim, not re-transcribed.
+
+Confirmed via research (matching frontend.py's `_populate_modulate_from_menu`) that assignable EGs
+are pure modulation SOURCES with no destination identity of their own: "EG 1".."EG 6" can appear as
+a source in some other knob's (not-yet-built) "Modulate From" menu, but there is no "EG 1 ..." style
+entry in `matrix_shared_routes` itself for anything else to target -- unlike LFOs, which do get
+"LFO N Rate/Dp/Phase" targets. Six panels don't fit at once (same situation the LFOs tab's 16 rows
+already solved), so this tab reuses that same whole-list vertical scroll convention, plus its own
+independent scroll for the Destination dropdown's own popup (a second, per-tab copy of the small
+scroll-state/geometry LFOs already established, since the two tabs' dropdowns are genuinely
+separate view states -- the 100-entry list/label/selectability logic itself is shared, not
+duplicated).
+
+**Scope for this pass**: same "everything visible without a right-click" cut as every prior tab.
+The Intensity knob has no right-click menu in frontend.py at all (confirmed by reading every
+`setContextMenuCallback` site), so nothing is deferred there specifically; the only deferred piece
+is the same one deferred everywhere else (each Destination-targetable knob's own "Modulate From"
+menu isn't wired up on ANY tab yet). The 🎲 "Randomize" button isn't ported either -- a pure GUI
+convenience with no backend field of its own. Confirmed Combi mode changes nothing about this tab
+(same plain Program-scoped `/hds/eg_mod/...`/`/hds/eg/...` fields as every other tab).
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_envelopes.c`, 7 passing
+assertions): the Mode dropdown (open + select AHDSR, writing `eg_mode[4]`), an Intensity knob drag
+(dragged DOWN from its own default max of 1.0, since dragging further up is correctly a clamped
+no-op -- `eg_intensity[0]`), the Destination dropdown (open + select "Osc 1 Amp", writing
+`eg_dest_target[0]`), a real drag on the ADSR curve's own Sustain node (`eg[4].s`), a real drag on
+the Attack dial (`eg[4].a`), and a whole-list scroll that lands a subsequent click on the correct
+panel (EG 3) at its new, scrolled screen position. The full existing regression suite (all 14 prior
+test binaries, `hds_fx.clap`'s own included) still passes unchanged.
+
+## hds.clap's Routing tab: 17 sources -> Main Out, plus a revived VU meter (task #108)
+
+Next tab in the ordered list: `src/hds_clap_routing_draw.c` (new) ports frontend.py's own Routing
+tab -- one row per real Source (the same 17, `hds_clap_source_label()`, already shared with the FX
+tab's own Source combo), with a Main Out toggle on every row, and Enable/Gain/Stereo controls plus
+a live VU meter on the 8 Ext In rows only (Programs/Combi Mix are "always live" in this engine, so
+they get no Enable of their own here -- matches frontend.py exactly).
+
+**A real scope decision, put to the user before writing any layout code**: frontend.py's own
+Routing tab is an 8-column matrix (`source_routing[src].enable[0..7]`, one column per hardware
+output pair). Reading `clap_plugin.c`'s own `process()` found that it always calls
+`render_audio_block()` with `output_channels` hardcoded to 2 -- so only `enable[0]` ("Out 1"/Main
+Out) ever reaches this plugin's actual audio output; `enable[1..7]` still compute internally (the
+routing-matrix summing loop runs unconditionally over the full `OUTPUT_PAIR_MAX`) but their result
+is discarded before reaching any CLAP port. Porting the full 8-column grid as-is would ship 7
+columns that visibly do nothing in this host. Given three options (collapse to the one working
+column; show all 8 with columns 2-8 visibly disabled; or extend the plugin to actually expose more
+output pairs, a real architecture change), the user chose the first: **one Main Out toggle per
+source**. Columns 2-8's own state is never touched by this GUI (not zeroed, not read) -- a saved
+patch or a future architecture change that actually wires up more outputs loses nothing.
+
+**Also revived the ext-in VU meters**, which were otherwise fully dead in `hds.clap`: `backend.c`'s
+own `gui_routing_tab_visible` gate (a perf optimization -- ext-in peak metering only runs while a
+player is actually looking at the Routing tab) was never set from any CLAP control surface, since a
+CLAP instance has no OSC-driven Routing tab of its own to report visibility from -- `clap_plugin.c`
+itself used to say so directly in a comment. Fixed cheaply since this native GUI's Routing tab lives
+in-process already: `hds_clap_gui_render()` now sets `p->knobs.gui_routing_tab_visible` on every
+redraw based on whether Routing is the active tab (mirrors frontend.py's own
+`_on_main_tab_changed()`), and a new persistent `HdsClapPlugin.ext_in_peak[EXT_IN_PAIR_COUNT]`
+field (replacing a process()-local scratch array that used to just discard the values
+`render_audio_block()` wrote into it) is read directly by the meter's own draw code -- no OSC
+round-trip needed, since the GUI and the audio thread share this same struct already.
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_routing.c`, 7 passing
+assertions): confirms `gui_routing_tab_visible` actually goes live on tab switch (not just the
+toggle itself), Main Out toggles on Combi Mix (defaults off) and Program 1 (defaults on, matching
+`init_default_controls`'s own asymmetric-by-source-type defaults exactly), Ext In 1's Enable
+toggle, a real Gain knob drag, the Stereo toggle, and that `HdsClapPlugin.ext_in_peak` is genuine
+persistent per-instance storage the render function reads directly. The full existing regression
+suite (all 15 prior test binaries, `hds_fx.clap`'s own included) still passes unchanged.
+
+## hds.clap's Devices tab: reduced to a "Performance" panel (task #102)
+
+Last tab in the ordered list: `src/hds_clap_devices_draw.c` (new). frontend.py's own Devices tab is
+really an "Audio/Devices" tab -- ALSA output/input device pickers, a MIDI device picker, Latency
+(ALSA buffer depth), plus Polyphony (`active_voice_limit`) and Block Size (`block_size_frames`).
+Every one of the device/latency pickers is a standalone-app-only concept a CLAP host already owns
+for its own plugins (device selection, buffer size, MIDI routing) -- none of it belongs in an
+in-process CLAP GUI at all. This is a **permanent, deliberate reduction**, not a "not yet built"
+deferral like every other tab's own scope note: only the two fields that are real
+`SynthSharedControls` state affecting this engine's own internal behavior regardless of host
+(voice-stealing ceiling, render-chunking) survive, under a renamed "Performance" header.
+
+- **Polyphony**: a free-drag knob over `active_voice_limit`'s real `[1,256]` range (default 32),
+  reusing `hds_play_draw_knob()`/`hds_play_knob_hit_test()`/`hds_play_start_knob_drag()` verbatim
+  from the Play tab file (same generic-primitive-reuse pattern every tab file after Play has used).
+- **Block Size**: a fixed preset dropdown (32/64/128/256/512/1024 samples, matching frontend.py's
+  own `_BLOCK_SIZE_PRESETS`) rather than a free-drag knob -- a small fixed preset set is exactly the
+  kind of control this GUI already renders as a dropdown pill elsewhere (Type/Slope/Waveform/Mode),
+  unlike Polyphony's genuinely free integer range.
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_devices.c`, 4 passing
+assertions): a real drag-up on the Polyphony knob increases `active_voice_limit` past its default
+32; a real click on the Block Size pill opens its preset dropdown; a real click on the "512
+samples" row writes `block_size_frames` (128 -> 512) and closes the dropdown. The full existing
+regression suite (all 16 prior test binaries, `hds_fx.clap`'s own included) still passes unchanged.
+
+This completes every tab in the originally-ordered arc (FX, Play, Filters, LFOs, Envelopes,
+Routing, Devices) that `hds.clap`'s native embedded GUI set out to cover.
+
+## hds.clap's Play tab gets a real Combi mode: the 8-lane mixer view (task #106)
+
+A genuine follow-up, not part of the original ordered arc: `backend.c`'s own render loop has
+supported real Combi mode (`performance_mode == 1`: up to `COMBI_PROGRAM_COUNT` (8) independently-
+synthesizing Programs -- `programs[0..7]` -- sharing one voice pool, mixed via each lane's own
+`seq_lanes[p].volume/pan`) since well before this native GUI existed, but nothing in this GUI could
+ever reach it: `hds_clap_play_draw.c`'s own `hds_play_program()` always addresses
+`programs[SINGLE_PROGRAM_SLOT]`, and there was no way to even flip `performance_mode` away from 0.
+
+**Mode toggle**: a small "Single"/"Combi" pill pair, drawn at the very top of the Play tab
+(`hds_clap_play_draw.c`'s own `hds_clap_play_mode_toggle_rects()`), reads/writes
+`p->knobs.performance_mode` directly (0/1 only -- Sequencer mode, value 2, is deliberately never
+reachable from this native GUI: see task #83's own comment on why `clap_plugin.c`'s `process()`
+never runs Sequencer-mode transport/lane playback at all). The toggle itself is drawn/hit-tested by
+`hds_clap_gui_draw.c`'s own `HDS_CLAP_TAB_PLAY` dispatch, not by either sub-view's own file --
+switching modes means dispatching to a COMPLETELY different tab file
+(`hds_clap_play_draw.c` vs the new `hds_clap_combi_draw.c`), and `hds_clap_gui_draw.c` is the one
+place both are visible (it's `#include`'d after both). It's drawn AFTER whichever sub-view just
+rendered, not before: both `hds_clap_play_render()`/`hds_clap_combi_render()` start by flood-
+filling the entire tab-content rect as their own background (the same convention every tab in this
+GUI already follows), which would otherwise immediately paint over the pills -- a real, if
+short-lived, bug this session's own screenshot review caught before ever reaching a test.
+
+**`hds_clap_combi_draw.c` (new)**: the 8-lane mixer view itself, matching frontend.py's own
+`self.osc_combi_widget` mixer-strip legend exactly -- "#", "Level", "Pan", "Program", "MIDI Ch" --
+one column-strip per lane. Level/Pan are plain click-and-drag knobs (reusing
+`hds_play_draw_knob()`/`hds_play_knob_hit_test()`/`hds_play_start_knob_drag()` verbatim from the
+Play tab file, same generic-primitive-reuse pattern every tab file after Play has used) over
+`seq_lanes[p].volume` (`[0,100]`, default 80) and `seq_lanes[p].pan` (`[-1,1]`, default 0) --
+picking either up in Combi mode makes an already-populated lane audible immediately, since
+`backend.c`'s own render loop already does the real mixing unconditionally. MIDI Ch is a 17-entry
+dropdown (Omni + channels 1-16) over `combi_lane_midi_channel[p]`.
+
+**Program picker, and a real scope decision**: frontend.py's own per-lane Program picker is a flat
+`QComboBox` over every `~/HDS_Programs/<name>/<name>.hdsprog`, populated by
+`_refresh_combi_program_combos()` -- not a nested-folder file browser, since every real Program
+lives flat under that one root. This GUI's own Program pill matches that shape (a plain sorted
+dropdown, re-scanned fresh on every open) rather than generalizing `hds_fx_gui_browser.c`'s own
+directory-navigating browser (built for `.nam`/`.wav` models, which can live anywhere) for a job
+that never needs navigation at all -- far simpler, and a better match for the reference UI.
+`hds_scan_programs_folder()` (the directory scan itself) was relocated from `hds_standalone.c` into
+`backend.c`, alongside the whole minimal JSON reader (`HdsJsonValue`/`hds_json_parse`/
+`hds_json_object_get`/`hds_json_free`, also relocated there) -- both are genuinely shared between
+`hds_standalone.c`'s own `--program`/arrow-key-cycling code and this new picker. Picking an entry
+calls two new, CLAP-only functions living in `hds_clap_combi_draw.c` itself (not `backend.c`, since
+`hds_standalone.c` would otherwise carry a function it can never call -- an always-"defined but not
+used" warning this session deliberately avoided by placement, not suppression):
+`hds_load_program_file_to_combi_lane()` reads and parses the file, and
+`hds_apply_program_fields_to_combi_lane()` applies its `"fields"` object onto Combi lane `lane_idx`
+by rewriting each address's leading `/hds` to `/hds/combi/{lane_idx}` and resolving it through
+`osc_dispatch_table` (mirroring frontend.py's own `_apply_program_fields_to_combi_lane()`, which
+does the identical rewrite over a live OSC bundle) -- no OSC round-trip needed here, since the GUI
+and the audio thread already share `p->knobs` in-process.
+
+**Deliberately out of scope for this pass** (real, separate follow-up work, not "the 8-lane mixer
+view" this task asked for): Key/Velocity zone (keyboard split/velocity switch), per-lane Transpose,
+Save Combi/Load Combi (a whole separate `.hdscombi` file format referencing lanes by name), and the
+"Edit" button (frontend.py's own jump into Single Program mode to edit a lane's Program -- this
+native GUI's own Single Program view already IS the live editing surface, just for a different
+slot, so the button would be closer to a lane-swap than an edit shortcut here). A picked Program's
+own `sfz_file` map (its sampled-oscillator zones) is also deliberately not applied -- this native
+GUI has no Mapping tab yet (task #104, on hold at the user's own request) -- so a Combi lane loaded
+here gets every synthesis field but keeps whatever sample zones it already had; a picked name is
+cached as a GUI-side label only (matching frontend.py's own `combi_lane_program_choice`), never
+part of a saved patch/session. The Program dropdown itself is capped at 24 entries with no
+scrolling -- a deliberate v1 scale limit, comfortably covering real-world use without a second
+scrollable-list mechanism.
+
+Verified end-to-end with a new real XTest-driven test (`test_clap_combi.c`, 7 passing assertions,
+including a real filesystem fixture under a throwaway `$HOME` so it never touches the invoking
+user's own `~/HDS_Programs`): the Mode toggle flips `performance_mode` both directions; a real
+drag-up on lane 1's Level knob increases `seq_lanes[0].volume` past its default 80; a real drag on
+lane 2's Pan knob writes `seq_lanes[1].pan`; a real click through the MIDI Ch dropdown writes
+`combi_lane_midi_channel[2]` (Omni -> Ch 5); and picking a real `TestProg.hdsprog` fixture from the
+Program dropdown genuinely scans the directory, loads its real `/hds/vco1/shape`/`/hds/vco1/vol`
+fields onto `programs[3]` and only `programs[3]` (every other lane and
+`programs[SINGLE_PROGRAM_SLOT]` stay untouched), and updates the lane's own GUI label. The full
+existing regression suite (all 17 prior test binaries, `hds_fx.clap`'s own included) still passes
+unchanged.

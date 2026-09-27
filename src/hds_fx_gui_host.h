@@ -23,4 +23,13 @@ typedef struct {
     float *port_input_off;          // [N ports], or NULL
     float *port_output_off;         // [N ports], or NULL
     void *gui_window;               // opaque HdsFxGuiWindow*, owned by hds_fx_gui_x11.c -- NULL until gui->create()
+
+    // The OTHER shape an Input header can take: a host with no flat N-port routing concept at all
+    // (hds.clap) instead has a Source combo -- Program N/Combi Mix/Ext In N -- reusing the SAME
+    // fx_source field a port-model host uses for its own port index (see fx_types.h's own comment
+    // on fx_source), just interpreted as a source-bus index instead. source_count == 0 means this
+    // host has neither concept (matches the port_input_stereo == NULL fallback -- draws the inert
+    // "--" placeholder); a host that sets source_count > 0 must also set source_label.
+    int source_count;
+    void (*source_label)(int idx, char *buf, size_t buflen); // pure function of idx, no host state needed
 } HdsFxGuiHost;
