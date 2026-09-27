@@ -1,9 +1,12 @@
 // hds_clap_play_draw.c: hds.clap's own Play tab -- the 4 oscillator strips (Shape/Pulse-Width-or-
 // Tilt/Curve-Drive/Pitch-Offset/Fine/Phase/Pitch/Unison/Vol/Mute/Pan) plus their 4 dedicated Amp
-// EGs, matching frontend.py's own Play tab layout (see the Osc-tab research this port is based
-// on: frontend.py's "Oscillators" group box + "Dedicated Amplitude Envelopes" group box, both
-// inside tab_play). Platform-agnostic like hds_fx_gui_draw.c itself (plain cairo_t*, no Xlib) --
-// #include'd by clap_plugin.c after hds_clap_gui_draw.c and hds_clap_adsr.h.
+// EGs, stacked BELOW the oscillator strips (one EG per column, directly under its own oscillator)
+// rather than frontend.py's own side-by-side "Oscillators" group box + "Dedicated Amplitude
+// Envelopes" group box -- a deliberate native-GUI layout departure, not a port of that arrangement
+// (frontend.py's own two-group-box layout is still the reference for every CONTROL this file
+// draws, just not for where the EG panels sit on screen). Platform-agnostic like hds_fx_gui_draw.c
+// itself (plain cairo_t*, no Xlib) -- #include'd by clap_plugin.c after hds_clap_gui_draw.c and
+// hds_clap_adsr.h.
 //
 // SCOPE for this first pass (task #99): Single-Program mode only -- every control here reads/
 // writes p->knobs.programs[SINGLE_PROGRAM_SLOT] directly. Combi mode's own separate 8-lane mixer
@@ -475,11 +478,34 @@ static void hds_play_render_dropdown(cairo_t *cr, HdsClapPlayViewState *vs, doub
 // ---------------------------------------------------------------------------------------------
 // Render -- one oscillator strip's worth of controls, then one Amp EG panel's worth. Both loop
 // over the same 4 indices; kept as two separate loops (not one interleaved loop) purely because
-// the oscillator region and the Amp EG region sit in two different X ranges, matching frontend.py's
-// own two separate group boxes.
+// the EG region's own top_y depends on the TALLEST oscillator column (varies by shape -- see
+// hds_play_osc_region_bottom_y()), which isn't known until all 4 oscillator layouts have been
+// computed. Each EG panel sits directly below its own same-numbered oscillator column (same x,
+// same width), not off to the side.
 // ---------------------------------------------------------------------------------------------
 #define HDS_PLAY_OSC_GAP 4.0
-#define HDS_PLAY_REGION_GAP 16.0
+#define HDS_PLAY_REGION_GAP 16.0 // vertical gap between the oscillator region and the EG region below it
+
+static double hds_play_osc_col_x(int osc) { return HDS_PLAY_MARGIN + osc * (HDS_PLAY_OSC_COL_W + HDS_PLAY_OSC_GAP); }
+
+// Tallest of the 4 oscillator columns' own col_bottom_y (varies by shape -- e.g. Unison Saw shows
+// two extra knobs no other shape does) -- the EG region below must start at the SAME y for all 4
+// columns regardless of which oscillator happens to be tallest, so this takes the max rather than
+// each column's own bottom.
+static double hds_play_osc_region_bottom_y(ProgramState *prog) {
+    double max_bottom = 0.0;
+    for (int osc = 0; osc < 4; osc++) {
+        HdsPlayOscFields f; hds_play_osc_fields(prog, osc, &f);
+        HdsPlayOscLayout L;
+        hds_play_compute_osc_layout(osc, (int)*f.shape, hds_play_osc_col_x(osc), HDS_PLAY_CONTENT_TOP, &L);
+        if (L.col_bottom_y > max_bottom) max_bottom = L.col_bottom_y;
+    }
+    return max_bottom;
+}
+
+static double hds_play_eg_top_y(ProgramState *prog) {
+    return hds_play_osc_region_bottom_y(prog) + HDS_PLAY_REGION_GAP;
+}
 
 static void hds_play_render_osc_strip(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewState *vs, int osc, double col_x) {
     ProgramState *prog = hds_play_program(p);
@@ -519,14 +545,14 @@ static void hds_play_render_osc_strip(cairo_t *cr, HdsClapPlugin *p, HdsClapPlay
     hds_play_draw_osc_knob(cr, &L.pan_knob, f.pan, HDS_PLAY_KNOB_PAN, shape);
 }
 
-static void hds_play_render_eg_panel(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewState *vs, int eg_index, double col_x, double col_w) {
+static void hds_play_render_eg_panel(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewState *vs, int eg_index, double col_x, double col_w, double top_y) {
     ProgramState *prog = hds_play_program(p);
     PackEGParams *eg = &prog->eg[eg_index];
     int env_type = (int)prog->eg_mode[eg_index];
     if (env_type < 0 || env_type >= HDS_PLAY_EGMODE_COUNT) env_type = 0;
 
     HdsPlayEgLayout L;
-    hds_play_compute_eg_layout(eg_index, col_x, col_w, HDS_PLAY_CONTENT_TOP, &L);
+    hds_play_compute_eg_layout(eg_index, col_x, col_w, top_y, &L);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 9.0);
@@ -582,24 +608,19 @@ static void hds_clap_play_render(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewS
         hds_play_render_osc_strip(cr, p, vs, i, col_x);
         col_x += HDS_PLAY_OSC_COL_W + HDS_PLAY_OSC_GAP;
     }
-    col_x += HDS_PLAY_REGION_GAP - HDS_PLAY_OSC_GAP;
 
-    double eg_region_w = window_w - col_x - HDS_PLAY_MARGIN;
-    double eg_col_w = (eg_region_w - 3.0 * HDS_PLAY_OSC_GAP) / 4.0;
-    double eg_x = col_x;
+    ProgramState *prog = hds_play_program(p);
+    double eg_top_y = hds_play_eg_top_y(prog);
     for (int i = 0; i < 4; i++) {
-        hds_play_render_eg_panel(cr, p, vs, i, eg_x, eg_col_w);
-        eg_x += eg_col_w + HDS_PLAY_OSC_GAP;
+        hds_play_render_eg_panel(cr, p, vs, i, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, eg_top_y);
     }
 
     // Whichever dropdown (if any) is open draws LAST, on top of everything else -- same "open
     // list always wins the top paint layer" rule the FX tab's own dropdown already follows.
     if (vs->dropdown_kind == HDS_PLAY_DROPDOWN_SHAPE) {
-        ProgramState *prog = hds_play_program(p);
         HdsPlayOscFields f; hds_play_osc_fields(prog, vs->dropdown_index, &f);
         hds_play_render_dropdown(cr, vs, window_h, (int)*f.shape);
     } else if (vs->dropdown_kind == HDS_PLAY_DROPDOWN_EGMODE) {
-        ProgramState *prog = hds_play_program(p);
         hds_play_render_dropdown(cr, vs, window_h, (int)prog->eg_mode[vs->dropdown_index]);
     }
 }
@@ -616,16 +637,6 @@ static void hds_play_copy_eg0_to_all(ProgramState *prog) {
         prog->eg[i] = prog->eg[0];
         prog->eg_mode[i] = prog->eg_mode[0];
     }
-}
-
-static double hds_play_osc_col_x(int osc) { return HDS_PLAY_MARGIN + osc * (HDS_PLAY_OSC_COL_W + HDS_PLAY_OSC_GAP); }
-
-static double hds_play_eg_region_x(void) {
-    return HDS_PLAY_MARGIN + 4.0 * HDS_PLAY_OSC_COL_W + 3.0 * HDS_PLAY_OSC_GAP + HDS_PLAY_REGION_GAP;
-}
-static double hds_play_eg_col_w(double window_w) {
-    double eg_region_w = window_w - hds_play_eg_region_x() - HDS_PLAY_MARGIN;
-    return (eg_region_w - 3.0 * HDS_PLAY_OSC_GAP) / 4.0;
 }
 
 static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState *vs, double window_w, double window_h, double x, double y, int button) {
@@ -685,11 +696,11 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
         if (hds_play_try_osc_knob_click(vs, &L.pan_knob, f.pan, HDS_PLAY_KNOB_PAN, shape, x, y)) return true;
     }
 
-    double eg_x = hds_play_eg_region_x();
-    double eg_w = hds_play_eg_col_w(window_w);
+    (void)window_w;
+    double eg_top_y = hds_play_eg_top_y(prog);
     for (int i = 0; i < 4; i++) {
         HdsPlayEgLayout L;
-        hds_play_compute_eg_layout(i, eg_x, eg_w, HDS_PLAY_CONTENT_TOP, &L);
+        hds_play_compute_eg_layout(i, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, eg_top_y, &L);
         bool disabled = (i > 0 && vs->amp_eg_live_sync);
 
         if (i == 0) {
@@ -731,7 +742,6 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
                 }
             }
         }
-        eg_x += eg_w + HDS_PLAY_OSC_GAP;
     }
 
     (void)button;
@@ -760,11 +770,8 @@ static void hds_clap_play_on_motion(HdsClapPlugin *p, HdsClapPlayViewState *vs, 
     if (vs->adsr_drag_eg >= 0) {
         int i = vs->adsr_drag_eg;
         int env_type = (int)prog->eg_mode[i];
-        double eg_x = hds_play_eg_region_x();
-        double eg_w = hds_play_eg_col_w(window_w);
-        for (int k = 0; k < i; k++) eg_x += eg_w + HDS_PLAY_OSC_GAP;
         HdsPlayEgLayout L;
-        hds_play_compute_eg_layout(i, eg_x, eg_w, HDS_PLAY_CONTENT_TOP, &L);
+        hds_play_compute_eg_layout(i, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, hds_play_eg_top_y(prog), &L);
         AdsrEnvelopeState adsr;
         hds_clap_adsr_load_from_backend(&adsr, &prog->eg[i], env_type);
         adsr.active_node = vs->adsr_active_node[i];

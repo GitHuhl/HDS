@@ -3045,7 +3045,55 @@ further EG1 drag live-mirrors onto EG4 without a second click) -- eleven real, p
 against `SynthSharedControls.programs[SINGLE_PROGRAM_SLOT]`'s own actual fields. The full existing
 regression suite (all 9 prior test binaries, `hds_fx.clap`'s own included) still passes unchanged.
 
-## hds.clap's Filters tab: Chain Mode, 5 filter slots, 3-band EQ (task #100)
+**Later layout change**: the 4 Amp EG panels now sit directly BELOW their own same-numbered
+oscillator column (same x, same width) instead of off to the side in their own region to the
+right -- a requested layout tweak, not a control change (every field/range/behavior above is
+unaffected). `hds_play_osc_region_bottom_y()` takes the max `col_bottom_y` across all 4 oscillator
+columns (varies by shape -- e.g. Unison Saw shows two knobs no other shape does) so all 4 EG panels
+start at the same y regardless of which oscillator happens to be tallest; render, hit-testing, and
+ADSR-curve dragging all go through the same `hds_play_osc_col_x()`/`hds_play_eg_top_y()` helpers so
+they can never disagree about where a panel actually is. Verified by a clean rebuild (no warnings)
+and by hand-checking the worst-case height budget fits the existing 700px-tall default window (tab
+bar 32px + tallest oscillator column ~306px + 16px gap + EG panel ~192px, ~546px used of 668px
+available) -- not re-verified with a rendered screenshot in this sandbox (an X11 test harness
+built for this hit an unrelated timer-id/host-registration snag debugging a blank capture; abandoned
+in favor of the compile+arithmetic check above rather than sinking more time into the harness
+itself).
+
+## hds.clap's "Global" tab: Voice/Sync/PB/Tuning/Sustain/FM/Glide/Tempo/Metronome/Arp
+
+Ports frontend.py's own always-visible "Global Configurations" sidebar (`src/hds_clap_global_draw.c`,
+new) into its own tab -- this GUI's shell has no permanent-sidebar concept the way frontend.py's own
+`QScrollArea`-wrapped left column does (see `hds_clap_gui_draw.c`'s own tab-label comment), so it
+becomes a peer of the Devices tab instead, right after it. Every control reads/writes
+`p->knobs.programs[SINGLE_PROGRAM_SLOT]` (Program-scoped: Voice Mode, Hard Sync, Pitch Bend Range,
+Sustain Polarity, FM Algorithm + 8 depths, Glide Time/Random, Tempo, Arpeggiator) or `p->knobs`
+directly (session-level, matching frontend.py's own `_is_program_scope_address` exclusions exactly:
+Transpose, Microtuning Enable/Ref Note/Ref Freq, Metronome) -- in-process, no OSC round trip or
+`transmit_knob_packet()`-style bundling to replicate at all, unlike the standalone frontend's own
+architecture.
+
+**Deliberately not ported** (a disclosed scope boundary, not an oversight -- see the new file's own
+header comment for the full reasoning on each):
+- Program Load/Save and "Load Scale (.scl)": all three are file-path operations frontend.py
+  implements via Qt file dialogs; this GUI has no equivalent widget (`hds_fx_gui_browser.c`'s own
+  file browser lists an existing directory for picking a NAM model/IR, not for typing a save
+  filename+category) -- real follow-up work.
+- Instance Switcher: a standalone-app-only concept (retargeting which separate backend *process*
+  the OSC client talks to) -- this plugin has no separate backend process to switch to at all.
+- The live tempo readout label: frontend.py keeps a second read-only label in sync with the
+  backend's own resolved tempo via a status-frame round trip (can diverge once tempo markers are
+  authored); in this in-process plugin the `tempo_bpm` field IS what the audio engine reads every
+  block, so a second "live" readout would always just equal the knob -- nothing to build.
+- Arp Octave Range/Rate/Hold: real, working, already-Program-scoped backend fields with no widget
+  in frontend.py's own Global panel either -- a pre-existing gap in the Python reference, not
+  something this port introduces or fixes.
+
+Verified by a clean rebuild (no warnings) of `hds.clap`, `hds_fx.clap` (untouched -- this tab is
+Play-tab-adjacent state no FX-only plugin has), and `synth_engine` (untouched -- no backend.c/
+DSP-layer changes at all, purely a new native-GUI view reading/writing existing fields the audio
+engine already read). Not re-verified with a rendered screenshot in this sandbox, same disclosed
+gap as the Amp EG relayout above.
 
 Next tab in the ordered list: `src/hds_clap_filters_draw.c` (new) ports frontend.py's own Filters
 tab -- the Chain Mode row (Series/Parallel, a plain binary toggle pill rather than a 2-item

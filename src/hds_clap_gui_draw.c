@@ -43,6 +43,7 @@ typedef enum {
     HDS_CLAP_TAB_FX,
     HDS_CLAP_TAB_ROUTING,
     HDS_CLAP_TAB_DEVICES,
+    HDS_CLAP_TAB_GLOBAL,
     HDS_CLAP_TAB_MAPPING,
     HDS_CLAP_TAB_COUNT
 } HdsClapTab;
@@ -53,8 +54,13 @@ typedef enum {
 // (WavRecorder/the record_enable writer thread, and the Sequencer transport/lane/MIDI-playback
 // workflow respectively -- see clap_plugin_process()'s own comment on the latter), per explicit
 // product direction -- a DAW host already owns both recording and sequencing for its plugins.
+// "Global" has no equivalent QTabWidget entry in frontend.py at all -- it was an always-visible
+// sidebar there (see hds_clap_global_draw.c's own header comment), promoted to its own tab here
+// since this GUI's shell has no sidebar concept; placed right after Devices (the only other
+// "settings, not signal processing" tab) rather than at the very end next to the Mapping
+// placeholder, so it reads as a peer of Devices rather than an afterthought.
 static const char *const HDS_CLAP_TAB_LABELS[HDS_CLAP_TAB_COUNT] = {
-    "Play", "Filters", "LFOs", "Envelopes", "FX", "Routing", "Devices", "Mapping",
+    "Play", "Filters", "LFOs", "Envelopes", "FX", "Routing", "Devices", "Global", "Mapping",
 };
 
 typedef struct {
@@ -80,6 +86,7 @@ typedef struct {
     HdsClapEnvelopesViewState envelopes_view; // same convention -- see hds_clap_envelopes_draw.c's own header comment
     HdsClapRoutingViewState routing_view;     // same convention -- see hds_clap_routing_draw.c's own header comment
     HdsClapDevicesViewState devices_view;      // same convention -- see hds_clap_devices_draw.c's own header comment
+    HdsClapGlobalViewState global_view;        // same convention -- see hds_clap_global_draw.c's own header comment
 } HdsClapGuiViewState;
 
 static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
@@ -97,6 +104,7 @@ static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
     hds_clap_envelopes_view_state_init(&vs->envelopes_view);
     hds_clap_routing_view_state_init(&vs->routing_view);
     hds_clap_devices_view_state_init(&vs->devices_view);
+    hds_clap_global_view_state_init(&vs->global_view);
 }
 
 typedef struct { double x, y, w, h; } HdsClapTabRect;
@@ -192,6 +200,9 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
         case HDS_CLAP_TAB_DEVICES:
             hds_clap_devices_render(cr, p, &vs->devices_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
+        case HDS_CLAP_TAB_GLOBAL:
+            hds_clap_global_render(cr, p, &vs->global_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            break;
         case HDS_CLAP_TAB_MAPPING:
             hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Mapping (Sample Zone editor) -- not available in this GUI yet");
             break;
@@ -237,6 +248,8 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
             return hds_clap_routing_on_button_press(p, &vs->routing_view, x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_DEVICES:
             return hds_clap_devices_on_button_press(p, &vs->devices_view, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
+        case HDS_CLAP_TAB_GLOBAL:
+            return hds_clap_global_on_button_press(p, &vs->global_view, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
         default:
             return true;
     }
@@ -253,6 +266,7 @@ static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_motion(p, &vs->envelopes_view, vs->window_w, x, y - HDS_CLAP_TAB_BAR_H);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_motion(&vs->routing_view, x, y - HDS_CLAP_TAB_BAR_H);
     else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_motion(&vs->devices_view, x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_GLOBAL) hds_clap_global_on_motion(&vs->global_view, x, y - HDS_CLAP_TAB_BAR_H);
 }
 
 static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
@@ -263,6 +277,7 @@ static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_button_release(&vs->envelopes_view);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_button_release(&vs->routing_view);
     else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_button_release(&vs->devices_view);
+    else if (vs->active_tab == HDS_CLAP_TAB_GLOBAL) hds_clap_global_on_button_release(&vs->global_view);
 }
 
 static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int action, char ch) {

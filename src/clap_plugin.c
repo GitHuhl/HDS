@@ -205,6 +205,7 @@ typedef struct {
 #include "hds_clap_envelopes_draw.c"
 #include "hds_clap_routing_draw.c"
 #include "hds_clap_devices_draw.c"
+#include "hds_clap_global_draw.c"
 #include "hds_clap_gui_draw.c"
 #ifdef _WIN32
 #include "hds_clap_gui_win32.c"
