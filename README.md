@@ -3466,22 +3466,55 @@ make hds-fx-windows    # -> hds_fx-windows.clap
 ```
 
 `nix-shell` at the repo root also provides everything this needs (see `shell.nix`'s own Windows
-section): the mingw-w64 toolchain, meson/ninja/autotools, AND two real, live nix-shell-specific gaps
-this port's own apt-based verification never exercised, both since fixed:
+section): the mingw-w64 toolchain, meson/ninja/autotools, AND a real string of nix-shell-specific
+gaps this port's own apt-based verification never exercised (apt's mingw-w64 packaging is simply a
+different, more monolithic bundle than nixpkgs' own more granular cross packages) -- all found from
+a real user's own `nix-shell` build reports, one at a time, not reproduced in this sandbox (no Nix
+available here to run `nix-shell` directly), each fixed by reading nixpkgs' own source directly
+instead of guessing:
 
 - `pkgsCross.mingwW64.stdenv.cc` alone has no `pthread.h`/`libwinpthread` on its search path (unlike
   apt's posix-threading mingw-w64 package, which bundles it straight into its own cross sysroot) --
   confirmed against nixpkgs' own source (`windows.mingw_w64_pthreads` is a separate derivation the
-  base cross stdenv never searches). `shell.nix`'s `shellHook` now exports
+  base cross stdenv never searches). `shell.nix`'s `shellHook` exports
   `WIN_EXTRA_CFLAGS`/`WIN_PTHREAD_LDLIBS` pointing at it; the Makefile's own `WIN_CFLAGS`/`WIN_LDLIBS`
   consume them (a no-op on the apt path, which needs neither).
 - `tools/build_windows_deps.sh`'s original source-fetch step called `apt-get source`, which does not
   exist at all on a NixOS/nix-shell host -- silently producing no pixman/cairo source tree at all
-  under `set -e`. `shell.nix`'s `shellHook` now also exports `HDS_WIN_{PIXMAN,CAIRO,LIBLO}_SRC`,
-  each pointing at the exact tarball nixpkgs' own ordinary (non-cross) package for that library
-  already fetches via `fetchurl`; the script uses those directly when set, falling back to
-  `apt-get source` otherwise.
-
-Both were caught from a real `nix-shell` build report, not found in this sandbox (no Nix available
-here to run `nix-shell` directly) -- fixed by reading nixpkgs' own source directly instead of
-guessing.
+  under `set -e`. `shell.nix`'s `shellHook` also exports `HDS_WIN_{PIXMAN,CAIRO,LIBLO}_SRC`, each
+  pointing at the exact tarball nixpkgs' own ordinary (non-cross) package for that library already
+  fetches via `fetchurl`; the script uses those directly when set, falling back to `apt-get source`
+  otherwise.
+- The script's own `#!/bin/bash` shebang doesn't work on NixOS (no `/bin` hierarchy at all there),
+  and its generated pkg-config wrapper hardcoded `/usr/local/bin` (root-only, and a non-root
+  `nix-shell` user has no write access there). Fixed to `#!/usr/bin/env bash` and a wrapper living
+  under `third_party/win64-deps/bin` instead, prepended to `PATH`.
+- meson's mingw cross-file hardcoded `exe_wrapper = 'wine'` for its own compiler sanity check, but
+  nixpkgs' `pkgs.wine64` (a 64-bit-only build) exposes only a `wine64` binary, never `wine` (confirmed
+  against nixpkgs' own `packages.nix`: `mainProgram = "wine64"`) -- apt's combo is the opposite,
+  exposing only `wine`. The script now detects whichever is actually on `PATH` at run time.
+- Wine's own long-lived `wineserver` daemon is keyed to a shared `$HOME/.wine` prefix by default; a
+  system/apt Wine and nix-shell's `pkgs.wine64` are different builds that both defaulted to it,
+  and whichever started the daemon first left every other wine build hitting a client/server
+  protocol version mismatch. The script now sets its own dedicated `WINEPREFIX` under
+  `third_party/win64-deps/`, immune to any other Wine install on the machine.
+- Cairo's own `meson_options.txt` defaults its `glib` option (which gates `cairo-gobject`) to
+  `auto`; nix-shell's environment happens to expose glib's `.pc` file via pkg-config (apt's sandbox
+  simply doesn't have `glib-dev` installed, which is the only reason this was never caught there),
+  so meson auto-enabled gobject support and compiled `cairo-gobject-enums.c` against the *native*
+  Linux glib headers with the *cross* mingw compiler. Now explicitly `-Dglib=disabled` (plus
+  `-Dspectre=disabled -Dsymbol-lookup=disabled`, the same "auto quietly finds a host-native lib"
+  risk class, pre-emptively).
+- nixpkgs builds its mingw cross gcc/g++ with the "mcf" threading model (not posix/win32), so it
+  unconditionally requires `-lmcfgthread` at link time regardless of whether the code uses threads at
+  all -- a separate thing entirely from the `pthread_create`/winpthreads story above. Worse, nixpkgs'
+  own `windows.mcfgthreads` derivation ships no true static `.a`, only an import library
+  (`libmcfgthread.dll.a`) plus the real runtime `libmcfgthread-N.dll` (confirmed directly against a
+  real store path), so this project's blanket `-static` link can never resolve a plain `-lmcfgthread`
+  no matter the `-L` path. `shell.nix` now brackets just this one library with
+  `-Wl,-Bdynamic ... -Wl,-Bstatic` (forcing dynamic linking for it alone) and exports
+  `WIN_EXTRA_RUNTIME_DLLS` so the Makefile copies the resulting DLL dependency next to the built
+  `.clap`. **This means a nix-shell-built `hds-windows.clap`/`hds_fx-windows.clap` is not a single
+  self-contained file the way the apt-built one is** -- it needs `libmcfgthread-N.dll` alongside it
+  (Windows' default DLL search order checks the loading module's own directory first, so dropping it
+  in the same folder as the `.clap` is sufficient).

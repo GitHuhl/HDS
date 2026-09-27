@@ -387,8 +387,23 @@ WIN_PTHREAD_LDLIBS ?= -lpthread
 # (that one is about backend.c's own explicit pthread_create/pthread_join calls; this one is the
 # compiler's own runtime requiring a library apt's posix-threaded gcc never needs at all, since it
 # doesn't use the mcf threading model). Same shape as WIN_PTHREAD_LDLIBS: shell.nix supplies the real
-# path via windows.mcfgthreads, this stays a no-op default for the apt case.
+# path via windows.mcfgthreads, this stays a no-op default for the apt case. Unlike winpthread,
+# nixpkgs' own mcfgthread derivation ships ONLY libmcfgthread.dll.a (an import library) + the actual
+# runtime libmcfgthread-1.dll -- no true static libmcfgthread.a at all (confirmed directly: `find` on
+# the real store path lists exactly those two files and a .la, nothing else) -- so under this
+# Makefile's own blanket `-static` (WIN_LDFLAGS below), plain `-lmcfgthread` can never resolve no
+# matter how many `-L` dirs point at it, since `-static` makes ld refuse anything but a genuine .a.
+# shell.nix's own value for this variable brackets just this one `-l` with `-Wl,-Bdynamic ...
+# -Wl,-Bstatic` to force dynamic linking for mcfgthread specifically while everything else in this
+# build stays static -- see WIN_EXTRA_RUNTIME_DLLS below for shipping the resulting DLL dependency
+# alongside the built .clap.
 WIN_EXTRA_LDLIBS ?=
+# A companion DLL the dynamically-linked mcfgthread above needs at runtime (Windows' default DLL
+# search order checks the loading module's own directory first, so dropping it next to the .clap is
+# sufficient -- no installer/PATH changes needed). Empty/no-op for the apt case, which links
+# mcfgthread-free entirely (posix-threaded gcc never needs it) and stays a genuinely
+# single-file-self-contained .clap.
+WIN_EXTRA_RUNTIME_DLLS ?=
 # -DCAIRO_WIN32_STATIC_BUILD: cairo.h's own cairo_public macro defaults to __declspec(dllimport)
 # under _WIN32 unless this is defined -- correct for consuming cairo as a real system DLL, wrong
 # for our own statically-linked libcairo.a (produced every symbol as a plain, non-imported
@@ -427,9 +442,11 @@ $(WIN_NAM_BUILD_DIR)/%.o: src/%.cpp $(WIN_NAM_FLAGS_STAMP) | $(WIN_NAM_BUILD_DIR
 
 clap-windows: $(WIN_CLAP_OBJ) $(WIN_NAM_OBJS)
 	$(WIN_CXX) -shared $(WIN_LDFLAGS) -o $(WIN_CLAP_BIN) $(WIN_CLAP_OBJ) $(WIN_NAM_OBJS) $(WIN_LDLIBS)
+	@if [ -n "$(WIN_EXTRA_RUNTIME_DLLS)" ]; then cp -f $(WIN_EXTRA_RUNTIME_DLLS) .; fi
 
 hds-fx-windows: $(WIN_HDS_FX_OBJ) $(WIN_NAM_OBJS)
 	$(WIN_CXX) -shared $(WIN_LDFLAGS) -o $(WIN_HDS_FX_BIN) $(WIN_HDS_FX_OBJ) $(WIN_NAM_OBJS) $(WIN_LDLIBS)
+	@if [ -n "$(WIN_EXTRA_RUNTIME_DLLS)" ]; then cp -f $(WIN_EXTRA_RUNTIME_DLLS) .; fi
 
 run-backend: $(BIN)
 	./$(BIN)

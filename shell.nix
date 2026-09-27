@@ -213,7 +213,18 @@ pkgs.mkShell {
     # real nix-shell after this, this is the one line to check first.
     export WIN_EXTRA_CFLAGS="-I${mingwPthreads}/include"
     export WIN_PTHREAD_LDLIBS="-L${mingwPthreads}/lib -lwinpthread"
-    export WIN_EXTRA_LDLIBS="-L${mingwMcfgthread.out}/lib -lmcfgthread"
+    # Unlike winpthread, nixpkgs' own mcfgthread derivation ships no true static .a at all -- only
+    # libmcfgthread.dll.a (import lib) + the real libmcfgthread-N.dll (confirmed directly against a
+    # real nix-shell's own store path: `find` on it lists exactly a .la, a .dll.a, and a bin/*.dll,
+    # nothing else) -- so under this project's blanket -static link, plain -lmcfgthread can never
+    # resolve (real, live failure: "cannot find -lmcfgthread" despite -L correctly pointing right at
+    # the .dll.a). -Wl,-Bdynamic/-Bstatic here force JUST this one library to link against its import
+    # lib while everything else in the build stays statically linked as before. WIN_EXTRA_RUNTIME_DLLS
+    # below ships the resulting real runtime DLL dependency alongside the built .clap (a glob rather
+    # than a hardcoded filename, since the "-N" version suffix on libmcfgthread-N.dll is this
+    # package's own upstream soname-style versioning, not something to pin here).
+    export WIN_EXTRA_LDLIBS="-L${mingwMcfgthread.out}/lib -Wl,-Bdynamic -lmcfgthread -Wl,-Bstatic"
+    export WIN_EXTRA_RUNTIME_DLLS="${mingwMcfgthread.out}/bin/*.dll"
 
     # tools/build_windows_deps.sh cross-builds pixman/cairo/liblo for the mingw target from source
     # (no such mingw-w64 packages exist anywhere -- see that script's own header comment), and needs
