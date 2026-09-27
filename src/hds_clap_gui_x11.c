@@ -180,10 +180,12 @@ static bool hds_clap_gui_set_scale(const clap_plugin_t *plugin, double scale) { 
 
 static bool hds_clap_gui_get_size(const clap_plugin_t *plugin, uint32_t *width, uint32_t *height) {
     HdsClapGuiWindow *w = (HdsClapGuiWindow *)((HdsClapPlugin *)plugin->plugin_data)->gui_window;
-    if (!w) return false;
-    *width = (uint32_t)w->view.window_w;
-    *height = (uint32_t)w->view.window_h;
-    return true;
+    // Always write a sane value, even before create() -- a host that queries get_size() ahead of
+    // creating the window (to reserve layout space) and doesn't check the boolean return strictly
+    // would otherwise read *width/*height uninitialized from its own stack.
+    *width = (uint32_t)(w ? w->view.window_w : HDS_CLAP_GUI_DEFAULT_W);
+    *height = (uint32_t)(w ? w->view.window_h : HDS_CLAP_GUI_DEFAULT_H);
+    return w != NULL;
 }
 
 static bool hds_clap_gui_can_resize(const clap_plugin_t *plugin) { (void)plugin; return true; }

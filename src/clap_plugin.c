@@ -65,8 +65,27 @@ static void hds_clap_source_label(int idx, char *buf, size_t buflen) {
 // maps OSC address strings to struct-member byte offsets, which is identical for every instance,
 // since SynthSharedControls's own layout doesn't vary per instance), so it's built once here
 // rather than per-instance.
+//
+// pthread_once, not a plain "if (!ready) { build(); ready = true; }" bool guard: the CLAP spec
+// requires plugin.init() to be called on the main thread, but real-world hosts don't all honor
+// that strictly for the "load several plugin instances while scanning a big library" case --
+// several are documented/known to scan candidate plugins in parallel across worker threads for
+// speed. A plain bool guard is a classic unsynchronized race under that: two threads can both
+// observe "not ready yet" before either sets the flag, and both call build_osc_dispatch_table()
+// concurrently, tearing the SAME global osc_dispatch_table[] apart mid-insert (a half-written slot
+// one thread reads while the other is still writing it) -- this can trip the function's own
+// "duplicate address" fatal check spuriously (exit(1), taking the whole host process down with
+// it) or leave the table silently holding torn/incorrect offsets for the rest of the process's
+// life. pthread_once() is the standard, correct primitive for exactly this "run this
+// initializer exactly once, safe under concurrent first-callers" case -- every concurrent caller
+// blocks until the one that actually won the race has finished, none of them proceed with a
+// half-built table.
 // ---------------------------------------------------------------------------------------------
-static bool g_osc_dispatch_table_ready = false;
+static pthread_once_t g_osc_dispatch_once = PTHREAD_ONCE_INIT;
+static void hds_clap_build_osc_dispatch_table_once(void) {
+    assert_fm_algorithms_acyclic(); // same startup self-check main() runs before anything else
+    build_osc_dispatch_table();
+}
 
 // Default embedded OSC ports -- distinct from the standalone app's 9000/9001 (see this file's own
 // header comment). A plugin has no argv (hosts don't pass command-line flags), so these are the
@@ -602,7 +621,7 @@ static bool clap_state_save(const clap_plugin_t *plugin, const clap_ostream_t *s
     state_buf_appendf(&b, "HDS%d\n", HDS_CLAP_STATE_VERSION);
 
     // Every concrete knob address, straight from the already-built dispatch table (built once at
-    // plugin.init(), guaranteed populated -- see g_osc_dispatch_table_ready) -- avoids
+    // plugin.init(), guaranteed populated -- see g_osc_dispatch_once) -- avoids
     // re-deriving the same OSC_PARAMS[] index-expansion logic build_osc_dispatch_table() already
     // owns, and guarantees this walks the EXACT same address space generic_osc_handler() does.
     for (int i = 0; i < OSC_DISPATCH_TABLE_SIZE; i++) {
@@ -784,14 +803,10 @@ static const clap_plugin_state_t k_state_ext = {
 
 static bool clap_plugin_init(const clap_plugin_t *plugin) {
     (void)plugin;
-    // Built once ever per process -- see g_osc_dispatch_table_ready's own comment. Safe to call
-    // from plugin.init() (main-thread, per the CLAP spec) even if a host creates several
-    // instances (e.g. while scanning) before ever activating one.
-    if (!g_osc_dispatch_table_ready) {
-        assert_fm_algorithms_acyclic(); // same startup self-check main() runs before anything else
-        build_osc_dispatch_table();
-        g_osc_dispatch_table_ready = true;
-    }
+    // Built once ever per process, safe under concurrent callers -- see
+    // hds_clap_build_osc_dispatch_table_once()'s own comment on why this is pthread_once rather
+    // than a plain bool guard.
+    pthread_once(&g_osc_dispatch_once, hds_clap_build_osc_dispatch_table_once);
     return true;
 }
 
