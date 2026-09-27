@@ -197,13 +197,24 @@ if [ ! -f "$DEPS/lib/libpixman-1.a" ]; then
     ninja -C "$BUILD/pixman" install
 fi
 
-# --- Cairo: configured with png/freetype/fontconfig/xlib/xcb/quartz all disabled -- on
-# host_machine.system()=='windows' cairo's own meson.build auto-enables CAIRO_HAS_WIN32_SURFACE and
-# CAIRO_HAS_WIN32_FONT unconditionally (native GDI surface + fonts, needing only gdi32/msimg32,
-# both bundled with mingw-w64's own import libraries) -- so freetype/fontconfig/libpng are never
-# needed at all: nothing in this GUI's own production code (hds_clap_gui_draw.c/
-# hds_fx_gui_draw.c/either Win32 platform shim) ever calls cairo_surface_write_to_png either, only
-# this repo's own Linux-only screenshot test scaffolding does.
+# --- Cairo: configured with png/freetype/fontconfig/xlib/xcb/quartz/glib/spectre/symbol-lookup all
+# disabled -- on host_machine.system()=='windows' cairo's own meson.build auto-enables
+# CAIRO_HAS_WIN32_SURFACE and CAIRO_HAS_WIN32_FONT unconditionally (native GDI surface + fonts,
+# needing only gdi32/msimg32, both bundled with mingw-w64's own import libraries) -- so
+# freetype/fontconfig/libpng are never needed at all: nothing in this GUI's own production code
+# (hds_clap_gui_draw.c/hds_fx_gui_draw.c/either Win32 platform shim) ever calls
+# cairo_surface_write_to_png either, only this repo's own Linux-only screenshot test scaffolding
+# does. -Dglib=disabled is NOT optional the way the others are just tidy-ups: cairo's own
+# meson_options.txt defaults `glib` (which gates CAIRO_HAS_GOBJECT_FUNCTIONS, i.e. cairo-gobject) to
+# 'auto', and unlike every other 'auto' feature here, an environment where glib's own .pc happens to
+# be pkg-config-visible does NOT mean a working mingw-cross glib exists -- it silently picked up
+# nix-shell's own NATIVE x86_64-linux glib-dev headers (real, live failure: a `g_once_init_leave`
+# static assertion on `sizeof (gpointer)` failed compiling cairo-gobject-enums.c with the mingw cross
+# compiler against those native headers) -- apt's own sandbox never hit this only because no
+# glib-dev happens to be installed there, not because the underlying bug doesn't exist. `spectre`/
+# `symbol-lookup` are also still 'auto' upstream and share the same latent "auto-detects a
+# host-native library via pkg-config/find_library instead of a real cross one" risk, disabled here
+# pre-emptively for the same reason, not because either has actually been observed to misfire yet.
 if [ ! -f "$DEPS/lib/libcairo.a" ]; then
     echo "== Building cairo =="
     hds_fetch_and_extract cairo HDS_WIN_CAIRO_SRC
@@ -212,7 +223,8 @@ if [ ! -f "$DEPS/lib/libcairo.a" ]; then
     (cd "$CAIRO_DIR" && meson setup "$BUILD/cairo" --cross-file "$CROSS_FILE" --prefix="$DEPS" \
         --default-library=static \
         -Dpng=disabled -Dzlib=disabled -Dxlib=disabled -Dxcb=disabled -Dtee=disabled -Dtests=disabled \
-        -Dfontconfig=disabled -Dfreetype=disabled -Dquartz=disabled -Ddwrite=disabled)
+        -Dfontconfig=disabled -Dfreetype=disabled -Dquartz=disabled -Ddwrite=disabled \
+        -Dglib=disabled -Dspectre=disabled -Dsymbol-lookup=disabled)
     ninja -C "$BUILD/cairo"
     ninja -C "$BUILD/cairo" install
 fi
