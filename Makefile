@@ -380,6 +380,15 @@ WIN_DEPS := third_party/win64-deps
 # empty/default (a no-op) for the apt case, which needs nothing extra.
 WIN_EXTRA_CFLAGS ?=
 WIN_PTHREAD_LDLIBS ?= -lpthread
+# nixpkgs' pkgsCross.mingwW64 gcc/g++ also unconditionally bakes a `-lmcfgthread` reference into its
+# own link spec (confirmed directly: visible as a `-plugin-opt=-pass-through=-lmcfgthread` in its
+# own collect2 invocation, regardless of whether the program even uses threads) -- nixpkgs' own
+# "mcf" gcc threading model, a completely different thing from the -lpthread/winpthreads story above
+# (that one is about backend.c's own explicit pthread_create/pthread_join calls; this one is the
+# compiler's own runtime requiring a library apt's posix-threaded gcc never needs at all, since it
+# doesn't use the mcf threading model). Same shape as WIN_PTHREAD_LDLIBS: shell.nix supplies the real
+# path via windows.mcfgthreads, this stays a no-op default for the apt case.
+WIN_EXTRA_LDLIBS ?=
 # -DCAIRO_WIN32_STATIC_BUILD: cairo.h's own cairo_public macro defaults to __declspec(dllimport)
 # under _WIN32 unless this is defined -- correct for consuming cairo as a real system DLL, wrong
 # for our own statically-linked libcairo.a (produced every symbol as a plain, non-imported
@@ -388,7 +397,7 @@ WIN_PTHREAD_LDLIBS ?= -lpthread
 # link attempt without this flag produces).
 WIN_CFLAGS := -O2 -Wall -Wextra -std=gnu11 -DCAIRO_WIN32_STATIC_BUILD -I$(WIN_DEPS)/include -I$(WIN_DEPS)/include/cairo -I$(WIN_DEPS)/include/lo -I$(CLAP_INC) $(NAM_INC) $(WIN_EXTRA_CFLAGS)
 WIN_LDFLAGS := -static -L$(WIN_DEPS)/lib
-WIN_LDLIBS := -lcairo -lpixman-1 -llo -lgdi32 -lmsimg32 -luser32 -lws2_32 -liphlpapi -lm $(WIN_PTHREAD_LDLIBS)
+WIN_LDLIBS := -lcairo -lpixman-1 -llo -lgdi32 -lmsimg32 -luser32 -lws2_32 -liphlpapi -lm $(WIN_PTHREAD_LDLIBS) $(WIN_EXTRA_LDLIBS)
 
 WIN_CLAP_BIN := hds-windows.clap
 WIN_CLAP_OBJ := $(BUILD_DIR)/clap_plugin-win.o

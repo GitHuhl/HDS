@@ -80,6 +80,18 @@ let
   # output name) turns out not to match what this derivation actually produces, that's the one
   # line to fix.
   mingwPthreads = pkgs.pkgsCross.mingwW64.windows.mingw_w64_pthreads;
+  # nixpkgs' own mingw cross gcc/g++ (mingw.stdenv.cc below) unconditionally bakes a `-lmcfgthread`
+  # reference into its own link spec regardless of whether the program even uses threads (confirmed
+  # directly: visible as `-plugin-opt=-pass-through=-lmcfgthread` in its own collect2 invocation) --
+  # a real, live link failure ("cannot find -lmcfgthread") once pthread.h/cairo.h/wine were all fixed
+  # and the build got as far as the actual final link step. This is nixpkgs' own "mcf" gcc threading
+  # model, a completely different thing from mingwPthreads/winpthreads above (that one is backend.c's
+  # own explicit pthread_create/pthread_join calls; this one is the compiler's own runtime, needed
+  # even for a program with zero threading code) -- confirmed against nixpkgs' own
+  # pkgs/os-specific/windows/{default,mcfgthreads/default}.nix (windows.mcfgthreads, "out"+"dev"
+  # outputs). apt's own posix-threaded gcc never needs this at all, since it doesn't use the mcf
+  # threading model in the first place.
+  mingwMcfgthread = pkgs.pkgsCross.mingwW64.windows.mcfgthreads;
   mingw = pkgs.pkgsCross.mingwW64;
 in
 pkgs.mkShell {
@@ -159,6 +171,9 @@ pkgs.mkShell {
                      # binding's own comment above); backend.c needs a real pthread_create/
                      # pthread_join, unlike the apt-based posix-threading gcc variant which bundles
                      # this straight into its own sysroot.
+    mingwMcfgthread  # libmcfgthread -- see this binding's own comment above; mingw.stdenv.cc's own
+                     # gcc/g++ unconditionally needs this at link time regardless of whether the
+                     # program itself uses threads at all.
     pkgs.meson
     pkgs.ninja
     pkgs.autoconf
@@ -198,6 +213,7 @@ pkgs.mkShell {
     # real nix-shell after this, this is the one line to check first.
     export WIN_EXTRA_CFLAGS="-I${mingwPthreads}/include"
     export WIN_PTHREAD_LDLIBS="-L${mingwPthreads}/lib -lwinpthread"
+    export WIN_EXTRA_LDLIBS="-L${mingwMcfgthread.out}/lib -lmcfgthread"
 
     # tools/build_windows_deps.sh cross-builds pixman/cairo/liblo for the mingw target from source
     # (no such mingw-w64 packages exist anywhere -- see that script's own header comment), and needs
