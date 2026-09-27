@@ -9,15 +9,21 @@
 # anywhere (checked apt; upstream ships no Windows cross build either) -- see this script's own
 # Cairo step for exactly why freetype/fontconfig/libpng are never needed at all on this target.
 #
-# Prerequisites (installed via apt, not by this script): mingw-w64, g++-mingw-w64-x86-64,
-# gcc-mingw-w64-x86-64 (posix threading model -- see this script's own toolchain-check step for why),
-# libz-mingw-w64-dev, meson, ninja-build, autoconf, automake, libtoolize, gettext, autopoint,
-# pkg-config. Also needs a `deb-src` entry enabled (Ubuntu's default sources.list ships none) so
-# `apt-get source pixman`/`cairo`/`liblo` below can fetch upstream's own source packages -- add one
-# for archive.ubuntu.com pointing at the running release's suites if `apt-get source` fails with
-# "You must put some 'deb-src' URIs in your sources.list". `nix-shell` at the repo root provides all
-# of the apt prerequisites above (see shell.nix's own Windows
-# section) -- run this script from inside it.
+# Prerequisites, either of:
+#   - `nix-shell` at the repo root (see shell.nix's own Windows section): provides the whole
+#     toolchain (mingw cross gcc/g++, meson, ninja, autoconf/automake/libtool/gettext, pkg-config)
+#     AND exports HDS_WIN_{PIXMAN,CAIRO,LIBLO}_SRC pointing at nixpkgs' own already-fetched upstream
+#     source tarballs for these three packages -- this script's own hds_fetch_and_extract() uses
+#     those directly instead of apt-get, which does not exist at all on a NixOS/nix-shell host (a
+#     real nix-shell run confirmed this: without this route, pixman/cairo were silently never built
+#     at all, since `apt-get source` failing aborted this whole script under `set -e`).
+#   - apt, installed manually: mingw-w64, g++-mingw-w64-x86-64, gcc-mingw-w64-x86-64 (posix
+#     threading model -- see this script's own toolchain-check step for why), libz-mingw-w64-dev,
+#     meson, ninja-build, autoconf, automake, libtoolize, gettext, autopoint, pkg-config. Also needs
+#     a `deb-src` entry enabled (Ubuntu's default sources.list ships none) so `apt-get source
+#     pixman`/`cairo`/`liblo` below can fetch upstream's own source packages -- add one for
+#     archive.ubuntu.com pointing at the running release's suites if `apt-get source` fails with
+#     "You must put some 'deb-src' URIs in your sources.list".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,21 +63,52 @@ EOF
     chmod +x "$PKG_CONFIG_WRAPPER"
 fi
 
-# Fetches an Ubuntu source package via apt (needs deb-src enabled -- see the README/session notes
-# on adding one for archive.ubuntu.com if `apt-get source` fails with "You must put some 'deb-src'
-# URIs in your sources.list") and extracts it, WITHOUT pinning an exact version: Ubuntu's own
-# packaged version drifts release to release, and pinning one that doesn't exist errors out
-# ("Unable to find a source package") -- this fetches whatever's current and returns the real
-# extracted directory name (which may not match this script's own *_VERSION constants above; those
-# are only used for the final .a existence check, not for locating source).
+# Fetches upstream source for $1 (pixman/cairo/liblo) and extracts it into $SRC, via one of two
+# routes:
+#
+#   1. Inside `nix-shell` (the officially supported dev environment, see shell.nix): shell.nix's
+#      own shellHook exports HDS_WIN_{PIXMAN,CAIRO,LIBLO}_SRC, each pointing at the exact Nix store
+#      tarball nixpkgs' OWN ordinary (non-cross) pixman/cairo/liblo package already fetches via
+#      fetchurl -- i.e. an already-hash-pinned, already-correct upstream URL that nixpkgs itself
+#      verified, needing zero URL-guessing here. This is REQUIRED on a NixOS/nix-shell host: `apt-get`
+#      does not exist there at all. Confirmed as the real, live failure mode (not hypothetical): a
+#      real nix-shell run hit `cairo.h: No such file or directory` because the old apt-get-only
+#      version of this function silently produced no source tree at all on that host (apt-get
+#      missing -> the pipeline failed -> `set -e` aborted the *script*, not just this function, so
+#      pixman/cairo were simply never built and third_party/win64-deps/include/cairo never existed).
+#   2. On an apt-based host (Ubuntu/Debian, no HDS_WIN_*_SRC set): the original `apt-get source`
+#      route, unchanged -- needs deb-src enabled (see this script's own header comment on adding one
+#      for archive.ubuntu.com if `apt-get source` fails with "You must put some 'deb-src' URIs in
+#      your sources.list"). WITHOUT pinning an exact version: Ubuntu's own packaged version drifts
+#      release to release, and pinning one that doesn't exist errors out ("Unable to find a source
+#      package") -- this fetches whatever's current.
+#
+# Either way, the extracted directory is later located via `ls -d "$SRC"/$pkg-*/` (pixman-X.Y.Z/,
+# cairo-X.Y.Z/, liblo-X.Y/) -- both routes produce exactly that naming, since nixpkgs' own fetchurl
+# tarballs for all three unpack to the plain upstream "$pname-$version/" layout, same as Ubuntu's.
 hds_fetch_and_extract() {
     local pkg="$1"
-    if ! ls "$SRC/$pkg"_*.dsc >/dev/null 2>&1; then
-        (cd "$SRC" && apt-get source --download-only "$pkg" 2>&1 | tail -15)
+    local nix_src_var="$2"   # e.g. HDS_WIN_PIXMAN_SRC -- unset outside this repo's own nix-shell
+    if ls -d "$SRC/$pkg"-*/ >/dev/null 2>&1; then
+        return 0   # already extracted from a previous run
     fi
-    local dsc
-    dsc="$(ls "$SRC/$pkg"_*.dsc | head -1)"
-    (cd "$SRC" && dpkg-source -x "$(basename "$dsc")" 2>&1 | tail -10)
+    local nix_src="${!nix_src_var:-}"
+    if [ -n "$nix_src" ]; then
+        echo "Extracting $pkg from nix-shell-provided source: $nix_src"
+        tar xf "$nix_src" -C "$SRC"
+    elif command -v apt-get >/dev/null 2>&1; then
+        if ! ls "$SRC/$pkg"_*.dsc >/dev/null 2>&1; then
+            (cd "$SRC" && apt-get source --download-only "$pkg" 2>&1 | tail -15)
+        fi
+        local dsc
+        dsc="$(ls "$SRC/$pkg"_*.dsc | head -1)"
+        (cd "$SRC" && dpkg-source -x "$(basename "$dsc")" 2>&1 | tail -10)
+    else
+        echo "Cannot fetch $pkg source: no apt-get on PATH and \$$nix_src_var is not set." >&2
+        echo "Run this from inside 'nix-shell' at the repo root (shell.nix exports \$$nix_src_var)," >&2
+        echo "or on an apt-based system with deb-src enabled." >&2
+        exit 1
+    fi
 }
 
 CROSS_FILE="$DEPS/mingw-w64-cross.ini"
@@ -103,7 +140,7 @@ EOF
 # package exists, built from source via meson (pixman dropped autotools around 0.40).
 if [ ! -f "$DEPS/lib/libpixman-1.a" ]; then
     echo "== Building pixman =="
-    hds_fetch_and_extract pixman
+    hds_fetch_and_extract pixman HDS_WIN_PIXMAN_SRC
     PIXMAN_DIR="$(ls -d "$SRC"/pixman-*/ | head -1)"
     # Upstream pixman's own meson.build forces -DPIXMAN_API=__declspec(dllexport) unconditionally
     # whenever the compiler supports the attribute -- regardless of --default-library=static -- so
@@ -134,7 +171,7 @@ fi
 # this repo's own Linux-only screenshot test scaffolding does.
 if [ ! -f "$DEPS/lib/libcairo.a" ]; then
     echo "== Building cairo =="
-    hds_fetch_and_extract cairo
+    hds_fetch_and_extract cairo HDS_WIN_CAIRO_SRC
     CAIRO_DIR="$(ls -d "$SRC"/cairo-*/ | head -1)"
     rm -rf "$BUILD/cairo"
     (cd "$CAIRO_DIR" && meson setup "$BUILD/cairo" --cross-file "$CROSS_FILE" --prefix="$DEPS" \
@@ -152,7 +189,7 @@ fi
 # workarounds for an older toolchain combination that no longer apply).
 if [ ! -f "$DEPS/lib/liblo.a" ]; then
     echo "== Building liblo =="
-    hds_fetch_and_extract liblo
+    hds_fetch_and_extract liblo HDS_WIN_LIBLO_SRC
     LIBLO_DIR="$(ls -d "$SRC"/liblo-*/ | head -1)"
     (cd "$LIBLO_DIR" && autoreconf -fiv)
     (cd "$LIBLO_DIR" && PKG_CONFIG="$PKG_CONFIG_WRAPPER" ./configure \

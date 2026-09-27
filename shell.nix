@@ -199,6 +199,18 @@ pkgs.mkShell {
     export WIN_EXTRA_CFLAGS="-I${mingwPthreads}/include"
     export WIN_PTHREAD_LDLIBS="-L${mingwPthreads}/lib -lwinpthread"
 
+    # tools/build_windows_deps.sh cross-builds pixman/cairo/liblo for the mingw target from source
+    # (no such mingw-w64 packages exist anywhere -- see that script's own header comment), and needs
+    # real upstream source tarballs to do it. Its original apt-get-source-based fetch route does not
+    # work at all on this (or any NixOS/nix-shell) host -- there is no apt-get here. These three
+    # point that script straight at the exact tarballs nixpkgs' own ordinary (non-cross) pixman/
+    # cairo/liblo packages already fetch via fetchurl -- an already-hash-pinned, already-correct
+    # upstream URL/version nixpkgs itself verified, so this needs no URL-guessing of its own and
+    # tracks whatever pixman/cairo/liblo version this nixpkgs revision already carries.
+    export HDS_WIN_PIXMAN_SRC="${pkgs.pixman.src}"
+    export HDS_WIN_CAIRO_SRC="${pkgs.cairo.src}"
+    export HDS_WIN_LIBLO_SRC="${pkgs.liblo.src}"
+
     # Cross-built aarch64 libraries live under content-addressed Nix store paths -- export their
     # include/lib paths here so the Makefile's ARM64_CFLAGS/ARM64_LDFLAGS can find them. ARM64_CC
     # is NOT exported here -- aarch64.stdenv.cc's prefixed binary name

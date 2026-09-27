@@ -3465,9 +3465,23 @@ make clap-windows      # -> hds-windows.clap
 make hds-fx-windows    # -> hds_fx-windows.clap
 ```
 
-`nix-shell` at the repo root now provides the mingw-w64 toolchain + meson/ninja/autotools this
-needs too (see `shell.nix`'s own Windows section) -- not independently re-verified against this
-port's own pinned nixpkgs revision from inside this sandbox (no Nix available here; this port's own
-real cross-build/link/Wine-runtime verification used a plain apt-get mingw-w64 install instead, the
-same disclosed-gap posture `shell.nix`'s own `ARM64_BUNDLE_LIBS` comment already uses for its own
-unverified paths).
+`nix-shell` at the repo root also provides everything this needs (see `shell.nix`'s own Windows
+section): the mingw-w64 toolchain, meson/ninja/autotools, AND two real, live nix-shell-specific gaps
+this port's own apt-based verification never exercised, both since fixed:
+
+- `pkgsCross.mingwW64.stdenv.cc` alone has no `pthread.h`/`libwinpthread` on its search path (unlike
+  apt's posix-threading mingw-w64 package, which bundles it straight into its own cross sysroot) --
+  confirmed against nixpkgs' own source (`windows.mingw_w64_pthreads` is a separate derivation the
+  base cross stdenv never searches). `shell.nix`'s `shellHook` now exports
+  `WIN_EXTRA_CFLAGS`/`WIN_PTHREAD_LDLIBS` pointing at it; the Makefile's own `WIN_CFLAGS`/`WIN_LDLIBS`
+  consume them (a no-op on the apt path, which needs neither).
+- `tools/build_windows_deps.sh`'s original source-fetch step called `apt-get source`, which does not
+  exist at all on a NixOS/nix-shell host -- silently producing no pixman/cairo source tree at all
+  under `set -e`. `shell.nix`'s `shellHook` now also exports `HDS_WIN_{PIXMAN,CAIRO,LIBLO}_SRC`,
+  each pointing at the exact tarball nixpkgs' own ordinary (non-cross) package for that library
+  already fetches via `fetchurl`; the script uses those directly when set, falling back to
+  `apt-get source` otherwise.
+
+Both were caught from a real `nix-shell` build report, not found in this sandbox (no Nix available
+here to run `nix-shell` directly) -- fixed by reading nixpkgs' own source directly instead of
+guessing.
