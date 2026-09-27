@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tools/build_windows_deps.sh: builds every third-party dependency the Windows CLAP targets
 # (`make clap-windows`/`make hds-fx-windows`, see the Makefile's own "Windows CLAP plugins" section)
 # need, into third_party/win64-deps/ -- NOT checked into git (rerun this after a clean checkout, or
@@ -46,22 +46,27 @@ echo "NOTE: if pthread_create/pthread_join misbehave later, run:"
 echo "  update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix"
 echo "  update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix"
 
-mkdir -p "$SRC" "$DEPS/lib" "$DEPS/include"
+mkdir -p "$SRC" "$DEPS/lib" "$DEPS/include" "$DEPS/bin"
 
 # A tiny pkg-config wrapper scoped to ONLY this cross sysroot + our own installed deps -- meson/
 # liblo's own configure both look for "x86_64-w64-mingw32-pkg-config" by convention (the standard
 # mingw-w64 autotools/meson cross naming scheme), which doesn't exist as a real binary anywhere.
-PKG_CONFIG_WRAPPER=/usr/local/bin/x86_64-w64-mingw32-pkg-config
+# Lives under $DEPS/bin (this script's own tree, always writable) rather than /usr/local/bin -- a
+# regular, non-root nix-shell user has no write access there at all, and this script must never need
+# sudo. meson's cross-file below references it by bare name (not a full path), so it also needs to
+# be resolvable via PATH -- handled by prepending $DEPS/bin to PATH right after writing it.
+PKG_CONFIG_WRAPPER="$DEPS/bin/x86_64-w64-mingw32-pkg-config"
 if [ ! -x "$PKG_CONFIG_WRAPPER" ]; then
     echo "== Installing $PKG_CONFIG_WRAPPER =="
     cat > "$PKG_CONFIG_WRAPPER" << EOF
-#!/bin/bash
+#!/usr/bin/env bash
 export PKG_CONFIG_LIBDIR=/usr/x86_64-w64-mingw32/lib/pkgconfig:$DEPS/lib/pkgconfig
 export PKG_CONFIG_PATH=
 exec pkg-config "\$@"
 EOF
     chmod +x "$PKG_CONFIG_WRAPPER"
 fi
+export PATH="$DEPS/bin:$PATH"
 
 # Fetches upstream source for $1 (pixman/cairo/liblo) and extracts it into $SRC, via one of two
 # routes:
