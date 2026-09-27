@@ -31,6 +31,18 @@ DEPS="$ROOT/third_party/win64-deps"
 SRC="$DEPS/src"
 BUILD="$DEPS/build"
 
+# meson's cross sanity check below runs a trivial compiled test binary through wine -- give it its
+# own dedicated WINEPREFIX rather than the default shared one ($HOME/.wine). A real, live failure
+# confirmed why this matters: a system/apt-installed Wine and the nix-shell-provided pkgs.wine64 are
+# DIFFERENT builds that both defaulted to the same prefix, and wine's own wineserver daemon is a
+# long-lived background process keyed to that prefix's IPC socket -- whichever wine version started
+# it first "wins", and every other wine build talking to that same stale wineserver then fails with
+# "wine client error:0: version mismatch" (the client/server protocol version is build-specific and
+# does not itself negotiate). A prefix scoped under this script's own tree sidesteps the whole
+# failure mode -- it can never collide with any other Wine installation/session on the machine.
+export WINEPREFIX="$DEPS/wineprefix"
+mkdir -p "$WINEPREFIX"
+
 echo "== Checking toolchain =="
 for tool in x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++ meson ninja autoreconf pkg-config; do
     command -v "$tool" >/dev/null 2>&1 || { echo "missing: $tool -- see this script's own header comment for what to apt-get install" >&2; exit 1; }
