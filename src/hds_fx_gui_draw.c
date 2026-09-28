@@ -1462,7 +1462,13 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         cairo_new_path(cr);
         cairo_set_font_size(cr, 9);
         hds_fx_rgb(cr, chain_on ? 0.9 : (chain_available ? 0.5 : 0.3), chain_on ? 0.95 : (chain_available ? 0.5 : 0.3), chain_on ? 0.9 : (chain_available ? 0.53 : 0.32));
-        hds_fx_centered_text(cr, L.chain_btn.x + L.chain_btn.w / 2, L.chain_btn.y + L.chain_btn.h / 2 + 3, "\xe2\x86\x92");
+        // Plain ASCII, not the UTF-8 arrow/triangle glyphs this used to draw: cairo's "toy" text API
+        // (cairo_show_text via hds_fx_centered_text) picks ONE font via fontconfig and does no
+        // per-glyph fallback the way a real text-layout engine (Pango, HarfBuzz) would -- if that
+        // resolved "sans-serif" font happens to lack a given Unicode glyph on some system, it simply
+        // doesn't render anything for it, with no substitution. ASCII always has a glyph in any font
+        // this API could plausibly resolve to.
+        hds_fx_centered_text(cr, L.chain_btn.x + L.chain_btn.w / 2, L.chain_btn.y + L.chain_btn.h / 2 + 3, "->");
 
         // Up/Down: disabled at the pool's own edges AND on any slot touching a chain link (either
         // end) -- see hds_fx_slot_participates_in_chain()'s own comment for why swapping a chained
@@ -1471,9 +1477,9 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         bool can_up = s > 0 && !chained, can_down = s < FX_SLOT_COUNT - 1 && !chained;
         hds_fx_rgb(cr, can_up ? 0.65 : 0.28, can_up ? 0.65 : 0.28, can_up ? 0.68 : 0.30);
         cairo_set_font_size(cr, 8);
-        hds_fx_centered_text(cr, L.up_btn.x + L.up_btn.w / 2, L.up_btn.y + L.up_btn.h / 2 + 3, "\xe2\x96\xb2");
+        hds_fx_centered_text(cr, L.up_btn.x + L.up_btn.w / 2, L.up_btn.y + L.up_btn.h / 2 + 3, "^"); // was the UTF-8 triangle glyph -- see the chain-arrow's own comment just above on why
         hds_fx_rgb(cr, can_down ? 0.65 : 0.28, can_down ? 0.65 : 0.28, can_down ? 0.68 : 0.30);
-        hds_fx_centered_text(cr, L.down_btn.x + L.down_btn.w / 2, L.down_btn.y + L.down_btn.h / 2 + 3, "\xe2\x96\xbc");
+        hds_fx_centered_text(cr, L.down_btn.x + L.down_btn.w / 2, L.down_btn.y + L.down_btn.h / 2 + 3, "v");
     }
 
     cairo_restore(cr);

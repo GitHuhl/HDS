@@ -587,7 +587,7 @@ static void hds_play_render_eg_panel(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayV
 
     bool disabled = (eg_index > 0 && vs->amp_eg_live_sync);
     if (eg_index == 0) {
-        hds_fx_draw_pill(cr, L.sync_all_btn.x, L.sync_all_btn.y, L.sync_all_btn.w, L.sync_all_btn.h, "1\xe2\x86\x92""All", false, false);
+        hds_fx_draw_pill(cr, L.sync_all_btn.x, L.sync_all_btn.y, L.sync_all_btn.w, L.sync_all_btn.h, "1->All", false, false); // plain ASCII, not the UTF-8 arrow -- see hds_clap_global_draw.c's own comment on why
         hds_fx_draw_pill(cr, L.sync_live_btn.x, L.sync_live_btn.y, L.sync_live_btn.w, L.sync_live_btn.h, "Sync", vs->amp_eg_live_sync, false);
     } else {
         ProgramState *prog2 = hds_play_program(p);

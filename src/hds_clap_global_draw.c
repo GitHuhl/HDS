@@ -70,13 +70,16 @@ static void hds_clap_global_view_state_init(HdsClapGlobalViewState *vs) { memset
 static const char *const HDS_GLOBAL_HARDSYNC_NAMES[3] = {"Off", "Parallel", "Serial"};
 static const char *const HDS_GLOBAL_ARPSTYLE_NAMES[6] = {"Up", "Down", "Up/Down", "Down/Up", "Random", "As Played"};
 #define HDS_GLOBAL_FMALGO_COUNT 12
-// "\xe2\x86\x92" is a UTF-8 right-arrow ("->"); split as its own string literal (adjacent literals
-// concatenate) wherever a digit immediately follows -- C's hex escape otherwise keeps consuming
-// hex digits (e.g. `\x921` parses as the single out-of-range escape `\x921`, not `\x92` then `1`).
+// Plain ASCII "->", not the UTF-8 right-arrow glyph (U+2192) this used to draw: cairo's "toy" text
+// API (cairo_show_text via hds_fx_left_text/hds_play_draw_knob's own value-text rendering) picks
+// ONE font via fontconfig and does no per-glyph fallback the way a real text-layout engine (Pango,
+// HarfBuzz) would -- if that resolved "sans-serif" font happens to lack a given Unicode glyph on
+// some system, it simply doesn't render anything for it, with no substitution. ASCII always has a
+// glyph in any font this API could plausibly resolve to.
 static const char *const HDS_GLOBAL_FMALGO_NAMES[HDS_GLOBAL_FMALGO_COUNT] = {
-    "0: Classic", "1: 3-Op Chain", "2: 4-Op Chain", "3: Dual Serial", "4: 3,4" "\xe2\x86\x92" "1",
-    "5: 3" "\xe2\x86\x92" "1,2", "6: 1,3" "\xe2\x86\x92" "2", "7: 4" "\xe2\x86\x92" "1", "8: Dual Indep",
-    "9: 1" "\xe2\x86\x92" "3" "\xe2\x86\x92" "4", "10: Star", "11: Independent",
+    "0: Classic", "1: 3-Op Chain", "2: 4-Op Chain", "3: Dual Serial", "4: 3,4->1",
+    "5: 3->1,2", "6: 1,3->2", "7: 4->1", "8: Dual Indep",
+    "9: 1->3->4", "10: Star", "11: Independent",
 };
 
 // 8 FM depth fields in a fixed order (matches frontend.py's own fm_depth_dials dict order, see
@@ -85,8 +88,8 @@ static const char *const HDS_GLOBAL_FMALGO_NAMES[HDS_GLOBAL_FMALGO_COUNT] = {
 // topology" convention as hds_clap_play_draw.c's own HDS_PLAY_EG_FIELD_ORDER).
 #define HDS_GLOBAL_FM_DEPTH_COUNT 8
 static const char *const HDS_GLOBAL_FM_DEPTH_LABELS[HDS_GLOBAL_FM_DEPTH_COUNT] = {
-    "2" "\xe2\x86\x92" "1", "3" "\xe2\x86\x92" "1", "3" "\xe2\x86\x92" "2", "4" "\xe2\x86\x92" "1",
-    "4" "\xe2\x86\x92" "3", "1" "\xe2\x86\x92" "2", "3" "\xe2\x86\x92" "4", "1" "\xe2\x86\x92" "3",
+    "2->1", "3->1", "3->2", "4->1",
+    "4->3", "1->2", "3->4", "1->3",
 };
 static void hds_global_fm_depth_visibility(int algo, bool *show /* [8] */) {
     for (int i = 0; i < HDS_GLOBAL_FM_DEPTH_COUNT; i++) show[i] = false;
