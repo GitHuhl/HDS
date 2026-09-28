@@ -48,16 +48,6 @@
 // dropdown kind -- see that file's own gating on port_input_stereo being NULL vs. source_count > 0.
 #include "hds_fx_gui_host.h"
 
-// hds_clap_source_label: text for Source index `idx`, exactly matching frontend.py's own
-// SOURCE_NAMES construction (Program 1..COMBI_PROGRAM_COUNT, then Combi Mix, then Ext In
-// 1..EXT_IN_PAIR_COUNT) so a slot's Source combo and a DAW host's own port names (see
-// clap_audio_ports_get() below) name the same thing identically.
-static void hds_clap_source_label(int idx, char *buf, size_t buflen) {
-    if (idx < COMBI_PROGRAM_COUNT) snprintf(buf, buflen, "Program %d", idx + 1);
-    else if (idx == COMBI_PROGRAM_COUNT) snprintf(buf, buflen, "Combi Mix");
-    else snprintf(buf, buflen, "Ext In %d", idx - COMBI_PROGRAM_COUNT);
-}
-
 // ---------------------------------------------------------------------------------------------
 // build_osc_dispatch_table() builds a process-wide static table and calls exit(1) on a duplicate
 // insert -- calling it more than once per process would hit that path. It only needs to run once
@@ -97,108 +87,7 @@ static void hds_clap_build_osc_dispatch_table_once(void) {
 #define CLAP_OSC_REPLY_PORT_BASE 9011
 #define CLAP_OSC_PORT_RETRY_COUNT 32 // how many (listen, reply) port pairs to try before giving up
 
-// ---------------------------------------------------------------------------------------------
-// Plugin instance
-// ---------------------------------------------------------------------------------------------
-// Multi-instance refactor: every piece of process-wide state the engine's call graph reaches
-// (the sample-streaming tiers, the Sequencer/transport tier) is now a field of this struct instead
-// of a file-scope global -- see HdsSampleSlotState/HdsStreamsState/HdsPendingLoadState/
-// HdsEngineState's own comments in backend.c for why each is its own separately-declared tier.
-// sample_engine is the small bundle of pointers into the three sample-streaming tiers that the
-// engine's own functions take as a single parameter (see HdsSampleEngine's comment) -- it's set up
-// once in clap_factory_create_plugin() right after this struct is allocated, since its pointer
-// members depend on this instance's own address.
-// ---------------------------------------------------------------------------------------------
-
-typedef struct {
-    clap_plugin_t plugin;
-    const clap_host_t *host;
-
-    SynthSharedControls knobs;
-    SynthVoice voices[MAX_VOICES];
-    MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1];
-    float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
-    MidiLiveState midi_live;
-
-    HdsSampleSlotState sample_slot_state;
-    HdsStreamsState streams_state;
-    HdsPendingLoadState pending_load_state;
-    HdsEngineState engine;
-    HdsSampleEngine sample_engine;
-
-    // CLAP multi-out: one extra stereo audio-port per Combi Program (see clap_audio_ports_get()),
-    // alongside the existing main stereo mix. A per-instance field, not a process()-local stack
-    // array (BUFFER_SIZE * COMBI_PROGRAM_COUNT * 2 floats = 64KB) -- a real-time audio callback's
-    // own stack is a scarcer, less predictable resource than this struct's already-heap/static-
-    // lifetime allocation, and this buffer needs no more per-call isolation than chunk_buffer's
-    // own comment already requires (per-instance is enough; concurrent instances already don't
-    // share this struct).
-    float per_program_render_buf[BUFFER_SIZE * COMBI_PROGRAM_COUNT * 2];
-
-    // CLAP audio input (see clap_audio_ports_get()): one interleaved scratch buffer, same
-    // per-instance-field reasoning as per_program_render_buf just above (a real-time callback's
-    // own stack is scarcer than this struct's lifetime, and two instances must never share one
-    // buffer). Holds up to EXT_IN_PAIR_COUNT stereo pairs interleaved exactly the way
-    // render_audio_block's own ext_in_buffer parameter already expects (pair p at channels
-    // [2p, 2p+1]) -- built fresh each process() call from whichever CLAP input ports the host
-    // actually connected; see this file's own process() for how.
-    float ext_in_render_buf[BUFFER_SIZE * EXT_IN_PAIR_COUNT * 2];
-
-    // Routing tab's own per-ext-in-pair VU meters (see gui_routing_tab_visible's own comment in
-    // backend.c): a persistent, per-instance peak-hold, updated every process() call by
-    // render_audio_block()'s own ext_in_peak_out parameter (see clap_plugin_process()'s own call
-    // site) and read directly by hds_clap_routing_draw.c's own render function -- this instance's
-    // own real GUI lives in-process (no OSC round-trip, see hds_clap_gui_draw.c's own header
-    // comment), so it can just read this struct field straight off the audio thread's last-written
-    // value instead of needing the standalone app's own /hds/status/ext_in_peak/<pair> OSC poll.
-    // gui_routing_tab_visible itself is set/cleared by hds_clap_gui_render() -- see that function's
-    // own comment -- so this only actually updates (stays non-zero) while the Routing tab is the
-    // active tab, matching the standalone app's own perf-gating intent exactly.
-    float ext_in_peak[EXT_IN_PAIR_COUNT];
-
-    // CLAP params extension (see HDS_CLAP_PARAMS/hds_clap_push_changed_params further down) --
-    // one shadow value per exposed param, used purely to detect an OSC/GUI-driven change so it
-    // can be echoed to the host as an output event. Sized/initialized once the table itself is
-    // known to exist (clap_factory_create_plugin sets every entry to that param's default_value).
-    double clap_param_shadow[64]; // >= HDS_CLAP_PARAM_COUNT; a plain fixed size since the table is a compile-time constant and this is just a shadow cache, not wire-visible
-
-    int vu_decimator;
-
-    lo_server osc_server;
-    lo_address osc_reply_addr;
-    bool osc_ready; // true once activate() successfully opened the OSC server this session
-    int osc_listen_port, osc_reply_port; // the actual bound pair, once osc_ready (see the bind-retry in activate())
-
-    // "/hds/request_state" support -- see HdsStateRequestContext's own comment in backend.c. Lets
-    // a frontend that just connected to THIS instance's OSC port pull its current live state
-    // instead of blindly pushing GUI defaults over a DAW-restored patch. Replies go directly to
-    // whoever asked (lo_message_get_source), not a stored address -- these context structs just
-    // carry what each handler needs to actually DO the request, not where to reply.
-    HdsStateRequestContext state_request_ctx;
-    // "/hds/song/import_smf" support -- see HdsSmfImportContext's own comment in backend.c.
-    HdsSmfImportContext smf_import_ctx;
-    // "/hds/song/import_smf_track" support (per-lane "Load MIDI...").
-    HdsSmfTrackImportContext smf_import_track_ctx;
-    // "/hds/subscribe" support (Instance Switcher) -- see HdsSubscribeContext/subscribe_handler's
-    // own comment in backend.c. target points directly at THIS instance's own osc_reply_addr field
-    // just above, which send_osc_status()/the status-push call site in process() already read from.
-    HdsSubscribeContext subscribe_ctx;
-#if HDS_NAM_ENABLED
-    // FX slot NAM model/cab IR upload support -- see HdsFxUploadContext/fx_upload_begin_handler's
-    // own comment in backend.c. Gated like the rest of NAM support since it exists purely to feed
-    // that FX type.
-    HdsFxUploadContext fx_upload_ctx;
-#endif
-
-    // The view hds_fx_gui_draw.c's FX-tab engine actually operates on -- see HdsFxGuiHost's own
-    // header comment. Populated once, in clap_factory_create_plugin(), with a pointer into THIS
-    // instance's own knobs.fx[].
-    HdsFxGuiHost gui_host;
-    // Opaque HdsClapGuiWindow* (hds_clap_gui_x11.c) -- NULL whenever no GUI is open. This plugin's
-    // own window is a whole-plugin concept (a tab bar dispatching across several tabs), not an
-    // FX-tab-specific one, so it lives here rather than inside gui_host.
-    void *gui_window;
-} HdsClapPlugin;
+#include "hds_engine_instance.h"
 
 // hds_clap_gui_draw.c: hds.clap's own top-level GUI (tab bar + per-tab dispatch, the FX tab
 // reusing hds_fx_gui_draw.c's own engine directly against gui_host above). hds_clap_gui_x11.c:

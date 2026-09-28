@@ -230,7 +230,14 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
             hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Coming soon");
             break;
     }
-    cairo_restore(cr);
+    cairo_restore(cr); // closes the inner cairo_save() at this function's own line ~187 (the active-tab clip/translate)
+    cairo_restore(cr); // closes the OUTER cairo_save() at this function's own line ~157 (the sidebar-width translate) --
+                        // without this second restore, cr's CTM (this is the persistent backbuffer context, reused
+                        // every redraw, not recreated per frame -- see hds_clap_gui_x11.c's own hds_clap_gui_redraw())
+                        // stays translated by +HDS_CLAP_GLOBAL_SIDEBAR_W after every single call, so the NEXT redraw's
+                        // "untranslated" sidebar draw lands further right than the last, and un-cleared pixels from
+                        // every previous frame's offset are left behind underneath -- this is exactly what produced
+                        // the "panel repeating itself" symptom (a new copy marching rightward every ~33ms).
 }
 
 static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int button) {
