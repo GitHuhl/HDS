@@ -44,7 +44,7 @@
 // QScrollArea (setMaximumWidth(276), its content capped at 260) exactly: a permanent, constant-
 // width column, not a panel that grows/shrinks with the rest of the window. hds_clap_gui_draw.c
 // reads this same constant to know where the tab bar/content region starts.
-#define HDS_CLAP_GLOBAL_SIDEBAR_W 260.0
+#define HDS_CLAP_GLOBAL_SIDEBAR_W 280.0
 
 #define HDS_GLOBAL_DROPDOWN_NONE 0
 #define HDS_GLOBAL_DROPDOWN_HARDSYNC 1
@@ -60,12 +60,12 @@ typedef struct {
 
 static void hds_clap_global_view_state_init(HdsClapGlobalViewState *vs) { memset(vs, 0, sizeof(*vs)); }
 
-#define HDS_GLOBAL_MARGIN 10.0
-#define HDS_GLOBAL_CONTENT_TOP 10.0
-#define HDS_GLOBAL_KNOB_R 9.0
-#define HDS_GLOBAL_PILL_H 16.0
-#define HDS_GLOBAL_KNOB_ROW_H 40.0   // one label+knob+value-readout stride, same convention as hds_clap_play_draw.c's own HDS_PLAY_KNOB_STRIDE
-#define HDS_GLOBAL_SECTION_GAP 14.0  // vertical gap between one section and the next
+#define HDS_GLOBAL_MARGIN 12.0
+#define HDS_GLOBAL_CONTENT_TOP 12.0
+#define HDS_GLOBAL_KNOB_R 10.0
+#define HDS_GLOBAL_PILL_H 18.0
+#define HDS_GLOBAL_KNOB_ROW_H 46.0   // one label+knob+value-readout stride, same convention as hds_clap_play_draw.c's own HDS_PLAY_KNOB_STRIDE
+#define HDS_GLOBAL_SECTION_GAP 18.0  // vertical gap between one section and the next
 
 static const char *const HDS_GLOBAL_HARDSYNC_NAMES[3] = {"Off", "Parallel", "Serial"};
 static const char *const HDS_GLOBAL_ARPSTYLE_NAMES[6] = {"Up", "Down", "Up/Down", "Down/Up", "Random", "As Played"};
@@ -244,7 +244,7 @@ static void hds_clap_global_compute_layout(int fm_algo, double scroll_offset_px,
 
 static void hds_global_section_label(cairo_t *cr, double x, double y, const char *text) {
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.55, 0.55, 0.58);
     hds_fx_left_text(cr, x, y, text);
 }
@@ -363,7 +363,7 @@ static void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalV
         cairo_new_path(cr); cairo_set_line_width(cr, 1.0);
         cairo_rectangle(cr, bg.x + 0.5, bg.y + 0.5, bg.w - 1, bg.h - 1); cairo_stroke(cr);
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 9.0);
+        cairo_set_font_size(cr, 10.0);
         int current = vs->dropdown_kind == HDS_GLOBAL_DROPDOWN_HARDSYNC ? hardsync
                      : vs->dropdown_kind == HDS_GLOBAL_DROPDOWN_FMALGO ? algo : arp_style;
         for (int i = 0; i < count; i++) {

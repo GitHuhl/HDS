@@ -56,11 +56,11 @@ static void hds_clap_envelopes_view_state_init(HdsClapEnvelopesViewState *vs) {
 // ---------------------------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------------------------
-#define HDS_ENV_MARGIN 8.0
-#define HDS_ENV_HEADER_H 24.0
-#define HDS_ENV_TITLE_ROW_H 40.0
-#define HDS_ENV_CURVE_H 130.0
-#define HDS_ENV_KNOB_R 9.0
+#define HDS_ENV_MARGIN 10.0
+#define HDS_ENV_HEADER_H 28.0
+#define HDS_ENV_TITLE_ROW_H 46.0
+#define HDS_ENV_CURVE_H 145.0
+#define HDS_ENV_KNOB_R 10.0
 #define HDS_ENV_PANEL_H (HDS_ENV_TITLE_ROW_H + HDS_ENV_CURVE_H + 6.0 + 16.0 + 44.0 + 10.0)
 
 typedef struct {
@@ -125,7 +125,7 @@ static void hds_clap_env_render_dest_dropdown(cairo_t *cr, HdsClapEnvelopesViewS
     cairo_rectangle(cr, bg.x, bg.y, bg.w, bg.h);
     cairo_clip(cr);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 8.5);
+    cairo_set_font_size(cr, 9.5);
     int first = (int)(vs->dest_scroll_px / HDS_LFO_DEST_LIST_ROW_H);
     for (int i = first; i < HDS_LFO_DEST_COUNT; i++) {
         double ry = bg.y + i * HDS_LFO_DEST_LIST_ROW_H - vs->dest_scroll_px;
@@ -155,7 +155,7 @@ static void hds_clap_envelopes_render(cairo_t *cr, HdsClapPlugin *p, HdsClapEnve
     double panel_w = window_w - 2.0 * HDS_ENV_MARGIN;
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.6, 0.6, 0.63);
     hds_fx_left_text(cr, HDS_ENV_MARGIN, HDS_ENV_HEADER_H - 8.0, "Assignable Envelopes");
 
@@ -174,7 +174,7 @@ static void hds_clap_envelopes_render(cairo_t *cr, HdsClapPlugin *p, HdsClapEnve
         if (L.title.y + HDS_ENV_PANEL_H < HDS_ENV_HEADER_H || L.title.y > window_h) continue;
 
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-        cairo_set_font_size(cr, 9.0);
+        cairo_set_font_size(cr, 10.0);
         hds_fx_rgb(cr, 0.55, 0.55, 0.58);
         char title[10]; snprintf(title, sizeof(title), "EG %d", e + 1);
         hds_fx_left_text(cr, L.title.x, L.title.y + 24.0, title);
@@ -231,7 +231,7 @@ static void hds_clap_envelopes_render(cairo_t *cr, HdsClapPlugin *p, HdsClapEnve
         cairo_new_path(cr); cairo_set_line_width(cr, 1.0);
         cairo_rectangle(cr, bg.x + 0.5, bg.y + 0.5, bg.w - 1, bg.h - 1); cairo_stroke(cr);
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 9.0);
+        cairo_set_font_size(cr, 10.0);
         int current = (int)prog->eg_mode[eg_idx];
         for (int i = 0; i < count; i++) {
             HdsFxRect r = {bg.x, bg.y + i * 16.0, bg.w, 16.0};

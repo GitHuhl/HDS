@@ -28,10 +28,10 @@ typedef struct {
 
 static void hds_clap_routing_view_state_init(HdsClapRoutingViewState *vs) { memset(vs, 0, sizeof(*vs)); }
 
-#define HDS_ROUTING_MARGIN 8.0
-#define HDS_ROUTING_HEADER_H 24.0
-#define HDS_ROUTING_ROW_H 34.0
-#define HDS_ROUTING_KNOB_R 9.0
+#define HDS_ROUTING_MARGIN 10.0
+#define HDS_ROUTING_HEADER_H 28.0
+#define HDS_ROUTING_ROW_H 38.0
+#define HDS_ROUTING_KNOB_R 10.0
 
 typedef struct {
     HdsFxRect name_area, enable_pill, gain_knob, stereo_pill, mainout_pill, vu_bar;
@@ -58,7 +58,7 @@ static void hds_clap_routing_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRoutin
     cairo_fill(cr);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 8.0);
+    cairo_set_font_size(cr, 9.0);
     hds_fx_rgb(cr, 0.5, 0.5, 0.53);
     hds_fx_left_text(cr, HDS_ROUTING_MARGIN, HDS_ROUTING_HEADER_H - 10.0, "Source");
     hds_fx_left_text(cr, 126.0, HDS_ROUTING_HEADER_H - 10.0, "Enable");
@@ -68,7 +68,7 @@ static void hds_clap_routing_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRoutin
     hds_fx_left_text(cr, 380.0, HDS_ROUTING_HEADER_H - 10.0, "VU (Ext In)");
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     for (int src = 0; src < SOURCE_COUNT; src++) {
         HdsRoutingRowLayout L;
         hds_clap_routing_compute_row_layout(src, &L);

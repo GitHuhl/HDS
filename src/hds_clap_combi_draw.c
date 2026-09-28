@@ -119,12 +119,12 @@ static void hds_load_program_file_to_combi_lane(SynthSharedControls *knobs, cons
 #define HDS_COMBI_PROGRAM_NAME_LEN 64
 #define HDS_COMBI_PROGRAM_LIST_MAX 24 // see this file's own header comment on why no scroll
 
-#define HDS_COMBI_MARGIN 8.0
-#define HDS_COMBI_LANE_W 124.0
-#define HDS_COMBI_LANE_GAP 4.0
-#define HDS_COMBI_KNOB_R 9.0
-#define HDS_COMBI_PILL_H 14.0
-#define HDS_COMBI_DD_ROW_H 14.0
+#define HDS_COMBI_MARGIN 10.0
+#define HDS_COMBI_LANE_W 140.0
+#define HDS_COMBI_LANE_GAP 6.0
+#define HDS_COMBI_KNOB_R 10.0
+#define HDS_COMBI_PILL_H 16.0
+#define HDS_COMBI_DD_ROW_H 16.0
 
 typedef struct {
     int dropdown_kind;   // HDS_COMBI_DROPDOWN_*
@@ -195,7 +195,7 @@ static void hds_clap_combi_render(cairo_t *cr, HdsClapPlugin *p, HdsClapCombiVie
     cairo_fill(cr);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 8.5);
+    cairo_set_font_size(cr, 9.5);
     for (int lane = 0; lane < COMBI_PROGRAM_COUNT; lane++) {
         HdsCombiLaneLayout L;
         hds_combi_compute_lane_layout(lane, HDS_PLAY_CONTENT_TOP, &L);
@@ -203,7 +203,7 @@ static void hds_clap_combi_render(cairo_t *cr, HdsClapPlugin *p, HdsClapCombiVie
 
         char lane_num[4]; snprintf(lane_num, sizeof(lane_num), "%02d", lane + 1);
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-        cairo_set_font_size(cr, 8.5);
+        cairo_set_font_size(cr, 9.5);
         hds_fx_rgb(cr, 0.80, 0.82, 0.85);
         hds_fx_centered_text(cr, cx, HDS_PLAY_CONTENT_TOP + 2.0, lane_num);
 
@@ -233,7 +233,7 @@ static void hds_clap_combi_render(cairo_t *cr, HdsClapPlugin *p, HdsClapCombiVie
         HdsFxRect bg;
         hds_combi_render_dropdown_chrome(cr, &vs->dropdown_anchor, list_h, window_h, &bg);
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 8.5);
+        cairo_set_font_size(cr, 9.5);
         if (n == 0) {
             hds_fx_rgb(cr, 0.55, 0.55, 0.58);
             hds_fx_left_text(cr, bg.x + 5, bg.y + HDS_COMBI_DD_ROW_H / 2 + 3.0, "(no saved Programs)");
@@ -249,7 +249,7 @@ static void hds_clap_combi_render(cairo_t *cr, HdsClapPlugin *p, HdsClapCombiVie
         HdsFxRect bg;
         hds_combi_render_dropdown_chrome(cr, &vs->dropdown_anchor, list_h, window_h, &bg);
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 8.5);
+        cairo_set_font_size(cr, 9.5);
         int current_ch = (int)p->knobs.combi_lane_midi_channel[vs->dropdown_lane];
         for (int i = 0; i < 17; i++) {
             double ry = bg.y + i * HDS_COMBI_DD_ROW_H;

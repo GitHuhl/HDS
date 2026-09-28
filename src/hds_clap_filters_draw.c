@@ -44,10 +44,10 @@ static void hds_clap_filters_view_state_init(HdsClapFiltersViewState *vs) {
 // ---------------------------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------------------------
-#define HDS_FILT_MARGIN 8.0
-#define HDS_FILT_CONTENT_TOP 30.0
-#define HDS_FILT_ROW_H 52.0
-#define HDS_FILT_KNOB_R 9.0
+#define HDS_FILT_MARGIN 10.0
+#define HDS_FILT_CONTENT_TOP 34.0
+#define HDS_FILT_ROW_H 58.0
+#define HDS_FILT_KNOB_R 10.0
 
 typedef struct {
     HdsFxRect chain_mode_pill;
@@ -74,11 +74,11 @@ typedef struct {
     HdsFxRect freq_knob, gain_knob, q_knob; // q_knob is empty ({0,0,0,0}) for Low/High Shelf (band != 1)
 } HdsEqBandLayout;
 
-#define HDS_FILT_EQ_BAND_W 170.0
+#define HDS_FILT_EQ_BAND_W 190.0
 
 static void hds_clap_filters_compute_eq_layout(int band, double col_x, double top_y, HdsEqBandLayout *out) {
     memset(out, 0, sizeof(*out));
-    double y = top_y + 20.0; // room for the band's own name label above
+    double y = top_y + 26.0; // room for the band's own name label above (bumped alongside this file's own font-size increase)
     out->freq_knob = (HdsFxRect){col_x + 26.0, y + HDS_FILT_KNOB_R + 9.0, HDS_FILT_KNOB_R, HDS_FILT_KNOB_R};
     out->gain_knob = (HdsFxRect){col_x + 78.0, y + HDS_FILT_KNOB_R + 9.0, HDS_FILT_KNOB_R, HDS_FILT_KNOB_R};
     if (band == 1) out->q_knob = (HdsFxRect){col_x + 130.0, y + HDS_FILT_KNOB_R + 9.0, HDS_FILT_KNOB_R, HDS_FILT_KNOB_R};
@@ -103,7 +103,7 @@ static void hds_clap_filters_render_dropdown(cairo_t *cr, HdsClapFiltersViewStat
     cairo_new_path(cr); cairo_set_line_width(cr, 1.0);
     cairo_rectangle(cr, bg.x + 0.5, bg.y + 0.5, bg.w - 1, bg.h - 1); cairo_stroke(cr);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     for (int i = 0; i < count; i++) {
         HdsFxRect r = {bg.x, bg.y + i * 16.0, bg.w, 16.0};
         if (i == current) {
@@ -124,7 +124,7 @@ static void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFilter
     ProgramState *prog = hds_play_program(p);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.6, 0.6, 0.63);
     hds_fx_left_text(cr, HDS_FILT_MARGIN, HDS_FILT_CONTENT_TOP + 12.0, "Chain Mode:");
 
@@ -136,7 +136,7 @@ static void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFilter
 
     double rows_top = HDS_FILT_CONTENT_TOP + 30.0;
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 8.5);
+    cairo_set_font_size(cr, 9.5);
     for (int i = 0; i < 5; i++) {
         FilterParams *filt = &prog->filters[i];
         HdsFiltRowLayout L;
@@ -167,7 +167,7 @@ static void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFilter
 
     double eq_top = hds_clap_filters_eq_top_y();
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.6, 0.6, 0.63);
     hds_fx_left_text(cr, HDS_FILT_MARGIN, eq_top + 2.0, "3-Band EQ (post-filter)");
 
@@ -179,7 +179,7 @@ static void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFilter
         hds_clap_filters_compute_eq_layout(b, col_x, eq_top, &L);
 
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 8.5);
+        cairo_set_font_size(cr, 9.5);
         hds_fx_rgb(cr, 0.55, 0.55, 0.58);
         hds_fx_left_text(cr, col_x, eq_top + 16.0, band_names[b]);
 

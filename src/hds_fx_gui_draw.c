@@ -39,19 +39,19 @@
 // ---------------------------------------------------------------------------------------------
 // Layout constants
 // ---------------------------------------------------------------------------------------------
-#define HDS_FX_GUI_DEFAULT_W 1080
-#define HDS_FX_GUI_DEFAULT_H 700
-#define HDS_FX_GUI_MIN_W 700
-#define HDS_FX_GUI_MIN_H 360
+#define HDS_FX_GUI_DEFAULT_W 1150
+#define HDS_FX_GUI_DEFAULT_H 760
+#define HDS_FX_GUI_MIN_W 740
+#define HDS_FX_GUI_MIN_H 380
 // Tall enough to fit, all strictly inside this one row's own bounds: a short label naming what the
 // knob actually does, the knob itself, and its current value -- see hds_fx_draw_knob's own comment
 // for why a bare unlabeled pot was wrong twice over (no name AND no visible value).
-#define HDS_FX_GUI_ROW_H 56.0
+#define HDS_FX_GUI_ROW_H 62.0
 // Title row + a column-header strip naming every column (see hds_fx_gui_render's own header-row
 // drawing) -- a flat list with no per-group-box titles like the Standalone's own QGroupBoxes needs
 // this or a column is just an unlabeled row of controls.
-#define HDS_FX_GUI_HEADER_H 56.0
-#define HDS_FX_GUI_KNOB_R 9.0
+#define HDS_FX_GUI_HEADER_H 62.0
+#define HDS_FX_GUI_KNOB_R 10.0
 // Vertical offsets of a row's own knob label/center/value, all measured from the row's own top --
 // fixed constants (not row_h/2-derived) so hds_fx_gui_compute_row_layout and the label/value draw
 // calls in hds_fx_draw_knob can never drift apart. 47 + text descent still clears comfortably
@@ -432,7 +432,7 @@ static const char *hds_fx_basename(const char *path) {
 // metrics -- called once per pill per frame, cheap enough at this GUI's own row counts.
 static void hds_fx_pill_label_fit(cairo_t *cr, const char *prefix, const char *value, char *buf, size_t buflen, double max_width_px) {
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 9.5);
+    cairo_set_font_size(cr, 10.5);
     size_t len = strlen(value);
     snprintf(buf, buflen, "%s%s", prefix, value);
     cairo_text_extents_t ext;
@@ -664,7 +664,7 @@ static void hds_fx_draw_pill(cairo_t *cr, double x, double y, double w, double h
     cairo_fill(cr);
     cairo_new_path(cr);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 9.5);
+    cairo_set_font_size(cr, 10.5);
     if (disabled) hds_fx_rgb(cr, 0.42, 0.42, 0.45);
     else hds_fx_rgb(cr, 0.85, 0.90, 0.90);
     // Clipped to the pill's own rect: every caller is expected to pass text short enough to fit
@@ -732,7 +732,7 @@ static void hds_fx_draw_knob_arc(cairo_t *cr, double cx, double cy, double radiu
 static void hds_fx_draw_knob(cairo_t *cr, double cx, double cy, double radius, float value01, bool disabled, double row_y, const char *name_label, const char *value_text_override) {
     if (name_label && name_label[0]) {
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 7.5);
+        cairo_set_font_size(cr, 8.5);
         hds_fx_rgb(cr, disabled ? 0.38 : 0.70, disabled ? 0.38 : 0.72, disabled ? 0.40 : 0.74);
         hds_fx_centered_text(cr, cx, row_y + HDS_FX_KNOB_TOP_LABEL_Y_OFFSET, name_label);
     }
@@ -743,7 +743,7 @@ static void hds_fx_draw_knob(cairo_t *cr, double cx, double cy, double radius, f
     if (value_text_override) snprintf(value_text, sizeof(value_text), "%s", value_text_override);
     else snprintf(value_text, sizeof(value_text), "%d%%", (int)(value01 * 100.0f + 0.5f));
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 7.5);
+    cairo_set_font_size(cr, 8.5);
     hds_fx_rgb(cr, disabled ? 0.38 : 0.62, disabled ? 0.38 : 0.62, disabled ? 0.40 : 0.65);
     hds_fx_centered_text(cr, cx, row_y + HDS_FX_KNOB_VALUE_Y_OFFSET, value_text);
 }
@@ -780,17 +780,17 @@ typedef struct {
     HdsFxRect down_btn;
 } HdsFxRowLayout;
 
-#define HDS_FX_ROW_MARGIN 8.0
-#define HDS_FX_NUM_W 20.0
-#define HDS_FX_TYPE_W 116.0
-#define HDS_FX_IO_PILL_W 70.0
-#define HDS_FX_SIDECHAIN_W 62.0
-#define HDS_FX_PARAM_STRIDE 30.0
-#define HDS_FX_MIX_W 30.0
-#define HDS_FX_BYPASS_W 22.0
-#define HDS_FX_CHAIN_W 18.0
-#define HDS_FX_UPDOWN_W 16.0
-#define HDS_FX_GAP 6.0
+#define HDS_FX_ROW_MARGIN 10.0
+#define HDS_FX_NUM_W 22.0
+#define HDS_FX_TYPE_W 128.0
+#define HDS_FX_IO_PILL_W 78.0
+#define HDS_FX_SIDECHAIN_W 68.0
+#define HDS_FX_PARAM_STRIDE 34.0
+#define HDS_FX_MIX_W 34.0
+#define HDS_FX_BYPASS_W 24.0
+#define HDS_FX_CHAIN_W 20.0
+#define HDS_FX_UPDOWN_W 18.0
+#define HDS_FX_GAP 8.0
 
 static void hds_fx_gui_compute_row_layout(int width, double y, HdsFxRowLayout *out) {
     memset(out, 0, sizeof(*out));
@@ -1002,7 +1002,7 @@ static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
     }
 }
 
-#define HDS_FX_DROPDOWN_ROW_H 20.0
+#define HDS_FX_DROPDOWN_ROW_H 22.0
 
 static double hds_fx_dropdown_width(int kind) {
     switch (kind) {
@@ -1052,7 +1052,7 @@ static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFx
     cairo_stroke(cr);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 9.5);
+    cairo_set_font_size(cr, 10.5);
     for (int i = 0; i < count; i++) {
         HdsFxRect r;
         hds_fx_dropdown_option_rect(p, dd, vs->window_h, i, &r);
@@ -1076,11 +1076,11 @@ static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFx
 // anchored at open time like a dropdown's own small list is), so a window resize while the
 // browser is open never leaves it mis-positioned.
 // ---------------------------------------------------------------------------------------------
-#define HDS_FX_BROWSER_ROW_H 20.0
-#define HDS_FX_BROWSER_TITLE_H 30.0
-#define HDS_FX_BROWSER_PATHBAR_H 22.0
-#define HDS_FX_BROWSER_UP_ROW_H 20.0
-#define HDS_FX_BROWSER_MARGIN 10.0
+#define HDS_FX_BROWSER_ROW_H 22.0
+#define HDS_FX_BROWSER_TITLE_H 34.0
+#define HDS_FX_BROWSER_PATHBAR_H 24.0
+#define HDS_FX_BROWSER_UP_ROW_H 22.0
+#define HDS_FX_BROWSER_MARGIN 12.0
 
 typedef struct {
     HdsFxRect panel;
@@ -1214,7 +1214,7 @@ static void hds_fx_gui_render_browser(cairo_t *cr, const HdsFxGuiViewState *vs) 
     cairo_stroke(cr);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 12);
+    cairo_set_font_size(cr, 13);
     hds_fx_rgb(cr, 0.9, 0.9, 0.92);
     hds_fx_left_text(cr, L.panel.x + HDS_FX_BROWSER_MARGIN, L.panel.y + 20,
                       b->field == 0 ? "Select NAM Model (*.nam)" : "Select Cab IR (*.wav)");
@@ -1223,7 +1223,7 @@ static void hds_fx_gui_render_browser(cairo_t *cr, const HdsFxGuiViewState *vs) 
     hds_fx_rounded_rect(cr, L.close_btn.x, L.close_btn.y, L.close_btn.w, L.close_btn.h, 3);
     cairo_fill(cr);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 11);
+    cairo_set_font_size(cr, 12);
     hds_fx_rgb(cr, 0.75, 0.75, 0.78);
     hds_fx_centered_text(cr, L.close_btn.x + L.close_btn.w / 2, L.close_btn.y + L.close_btn.h / 2 + 4, "X");
 
@@ -1241,7 +1241,7 @@ static void hds_fx_gui_render_browser(cairo_t *cr, const HdsFxGuiViewState *vs) 
     char path_disp[SAMPLE_PATH_LEN + 2];
     snprintf(path_disp, sizeof(path_disp), b->path_bar_editing ? "%s_" : "%s", b->dir);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 9.5);
+    cairo_set_font_size(cr, 10.5);
     hds_fx_rgb(cr, 0.85, 0.88, 0.90);
     hds_fx_left_text(cr, L.path_bar.x + 6, L.path_bar.y + L.path_bar.h / 2 + 3.5, path_disp);
 
@@ -1259,7 +1259,7 @@ static void hds_fx_gui_render_browser(cairo_t *cr, const HdsFxGuiViewState *vs) 
     cairo_rectangle(cr, L.list_area.x, L.list_area.y, L.list_area.w, L.list_area.h);
     cairo_clip(cr);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 9.5);
+    cairo_set_font_size(cr, 10.5);
     if (b->entry_count == 0) {
         hds_fx_rgb(cr, 0.5, 0.5, 0.53);
         hds_fx_left_text(cr, L.list_area.x + 4, L.list_area.y + 14, "(empty, or this directory can't be read)");
@@ -1292,11 +1292,11 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
 
     // Title
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 16);
+    cairo_set_font_size(cr, 18);
     hds_fx_rgb(cr, 0.95, 0.55, 0.15);
     hds_fx_left_text(cr, HDS_FX_ROW_MARGIN, 22, "HDS FX");
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 10);
+    cairo_set_font_size(cr, 11);
     hds_fx_rgb(cr, 0.5, 0.5, 0.53);
     hds_fx_left_text(cr, 90, 21, "8 stereo ports \xc2\xb7 32 shared FX slots \xc2\xb7 each chain picks its own Input/Output, Mono or Stereo");
 
@@ -1307,7 +1307,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         HdsFxRowLayout ref;
         hds_fx_gui_compute_row_layout(width, 0, &ref);
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-        cairo_set_font_size(cr, 8);
+        cairo_set_font_size(cr, 9);
         hds_fx_rgb(cr, 0.5, 0.5, 0.53);
         hds_fx_centered_text(cr, ref.type_pill.x + ref.type_pill.w / 2, HDS_FX_COLUMN_HEADER_Y, "TYPE");
         hds_fx_centered_text(cr, ref.input_pill.x + ref.input_pill.w / 2, HDS_FX_COLUMN_HEADER_Y, "IN");
@@ -1344,7 +1344,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         if (s == vs->hover_row) { hds_fx_rgba(cr, 1, 1, 1, 0.03); cairo_new_path(cr); cairo_rectangle(cr, L.row.x, L.row.y, L.row.w, L.row.h); cairo_fill(cr); cairo_new_path(cr); }
 
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 9);
+        cairo_set_font_size(cr, 10);
         hds_fx_rgb(cr, 0.42, 0.42, 0.45);
         char numbuf[8]; snprintf(numbuf, sizeof(numbuf), "%02d", s + 1);
         hds_fx_left_text(cr, HDS_FX_ROW_MARGIN, y + HDS_FX_GUI_ROW_H / 2 + 3, numbuf);
@@ -1447,7 +1447,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         hds_fx_rgb(cr, bypassed ? 0.72 : 0.20, bypassed ? 0.45 : 0.20, bypassed ? 0.18 : 0.23);
         cairo_fill(cr);
         cairo_new_path(cr);
-        cairo_set_font_size(cr, 8);
+        cairo_set_font_size(cr, 9);
         hds_fx_rgb(cr, bypassed ? 0.05 : 0.6, bypassed ? 0.05 : 0.6, bypassed ? 0.05 : 0.63);
         hds_fx_centered_text(cr, L.bypass_btn.x + L.bypass_btn.w / 2, L.bypass_btn.y + L.bypass_btn.h / 2 + 3, "By");
 
@@ -1460,7 +1460,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         else hds_fx_rgb(cr, 0.20, 0.20, 0.23);
         cairo_fill(cr);
         cairo_new_path(cr);
-        cairo_set_font_size(cr, 9);
+        cairo_set_font_size(cr, 10);
         hds_fx_rgb(cr, chain_on ? 0.9 : (chain_available ? 0.5 : 0.3), chain_on ? 0.95 : (chain_available ? 0.5 : 0.3), chain_on ? 0.9 : (chain_available ? 0.53 : 0.32));
         // Plain ASCII, not the UTF-8 arrow/triangle glyphs this used to draw: cairo's "toy" text API
         // (cairo_show_text via hds_fx_centered_text) picks ONE font via fontconfig and does no
@@ -1476,7 +1476,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         bool chained = hds_fx_slot_participates_in_chain(p, s);
         bool can_up = s > 0 && !chained, can_down = s < FX_SLOT_COUNT - 1 && !chained;
         hds_fx_rgb(cr, can_up ? 0.65 : 0.28, can_up ? 0.65 : 0.28, can_up ? 0.68 : 0.30);
-        cairo_set_font_size(cr, 8);
+        cairo_set_font_size(cr, 9);
         hds_fx_centered_text(cr, L.up_btn.x + L.up_btn.w / 2, L.up_btn.y + L.up_btn.h / 2 + 3, "^"); // was the UTF-8 triangle glyph -- see the chain-arrow's own comment just above on why
         hds_fx_rgb(cr, can_down ? 0.65 : 0.28, can_down ? 0.65 : 0.28, can_down ? 0.68 : 0.30);
         hds_fx_centered_text(cr, L.down_btn.x + L.down_btn.w / 2, L.down_btn.y + L.down_btn.h / 2 + 3, "v");

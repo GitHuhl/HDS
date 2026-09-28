@@ -139,20 +139,20 @@ static void hds_clap_play_view_state_init(HdsClapPlayViewState *vs) {
 // interaction so they can never disagree, same discipline hds_fx_gui_draw.c's own
 // hds_fx_gui_compute_row_layout() already established.
 // ---------------------------------------------------------------------------------------------
-#define HDS_PLAY_MARGIN 8.0
+#define HDS_PLAY_MARGIN 10.0
 // 130, not the original 92: each Amp EG panel below shares this same column width (see
 // hds_play_osc_col_x()/hds_play_render_eg_panel()'s own call site), and the widest topologies
 // (DADSR/AHDSR) show 5 dials at once -- 92px left them scrunched together with overlapping labels.
-#define HDS_PLAY_OSC_COL_W 130.0
-#define HDS_PLAY_KNOB_R 9.0
-#define HDS_PLAY_KNOB_STRIDE 40.0 // vertical space one knob (label+arc+value) reserves
-#define HDS_PLAY_PILL_H 16.0
-#define HDS_PLAY_CHECK_H 13.0
+#define HDS_PLAY_OSC_COL_W 145.0
+#define HDS_PLAY_KNOB_R 10.0
+#define HDS_PLAY_KNOB_STRIDE 46.0 // vertical space one knob (label+arc+value) reserves
+#define HDS_PLAY_PILL_H 18.0
+#define HDS_PLAY_CHECK_H 15.0
 // 46.0, not 30.0: leaves an 8px-margin, 16px-tall strip at the very top of the tab for the Mode
 // toggle (Single/Combi, see hds_clap_play_mode_toggle_rects()/hds_clap_gui_draw.c's own
 // HDS_CLAP_TAB_PLAY dispatch, which draws/hit-tests it and switches to hds_clap_combi_draw.c's own
 // 8-lane mixer view when Combi is selected) above every oscillator/EG section header.
-#define HDS_PLAY_CONTENT_TOP 46.0 // below this file's own "Oscillators"/"Amp EGs" section labels
+#define HDS_PLAY_CONTENT_TOP 52.0 // below this file's own "Oscillators"/"Amp EGs" section labels
 
 // Single/Combi Mode toggle -- drawn/hit-tested by hds_clap_gui_draw.c's own HDS_CLAP_TAB_PLAY
 // dispatch (not this file's own render/press functions), since switching to Combi mode means
@@ -242,7 +242,7 @@ typedef struct {
     HdsFxRect dial[6];        // Dly, Hld, A, Dec, S, R -- only the topology-relevant ones are ever drawn/hit
 } HdsPlayEgLayout;
 
-#define HDS_PLAY_EG_CURVE_H 110.0
+#define HDS_PLAY_EG_CURVE_H 125.0
 
 // Field indices into HDS_PLAY_DIAL_LABELS/HDS_PLAY_EG_LO/HI/hds_play_eg_dial_target's own switch.
 #define HDS_PLAY_EG_FIELD_D   0
@@ -282,14 +282,24 @@ static int hds_play_eg_dial_count(int env_type) {
 
 static void hds_play_compute_eg_layout(int eg_index, int env_type, double col_x, double col_w, double top_y, HdsPlayEgLayout *out) {
     memset(out, 0, sizeof(*out));
-    out->title = (HdsFxRect){col_x, top_y, col_w, 18.0};
+    out->title = (HdsFxRect){col_x, top_y, col_w, 20.0};
+    // Sync-All/Sync-Live (Osc 1's EG only -- see this struct's own field comments) live on the
+    // title row itself, flush right: two small pill buttons fit there comfortably. The Velocity
+    // knob is a DIFFERENT thing every one of the 4 EGs has (this synth's real vco{1-4}_vel_to_amp
+    // backend fields, all wired identically -- see frontend.py's own vco1_vel_to_amp, which is
+    // never special-cased away for Osc 1 either), so it gets its own row below the title, on EVERY
+    // column -- previously Osc 1's title row had no room left for both the two Sync buttons AND a
+    // third knob, which silently dropped that knob (and, with it, any way to see or adjust Osc 1's
+    // own velocity-to-amp amount) instead of finding it a row of its own. Giving all 4 columns the
+    // same extra row keeps every column's curve/dial content aligned at the same y regardless of
+    // eg_index, exactly like hds_play_eg_top_y() already keeps them aligned across all 4 at all.
     if (eg_index == 0) {
-        out->sync_all_btn = (HdsFxRect){col_x + col_w - 66.0, top_y + 1.0, 30.0, 16.0};
-        out->sync_live_btn = (HdsFxRect){col_x + col_w - 33.0, top_y + 1.0, 30.0, 16.0};
-    } else {
-        out->vel_to_amp_knob = (HdsFxRect){col_x + col_w - 16.0, top_y + HDS_PLAY_KNOB_R + 1.0, HDS_PLAY_KNOB_R, HDS_PLAY_KNOB_R};
+        out->sync_all_btn = (HdsFxRect){col_x + col_w - 72.0, top_y + 2.0, 36.0, 16.0}; // 36 wide, not 30 -- "1->All" was clipping to "1->Al" at this file's own bumped label font size
+        out->sync_live_btn = (HdsFxRect){col_x + col_w - 35.0, top_y + 2.0, 35.0, 16.0};
     }
-    double y = top_y + 20.0;
+    double vel_row_y = top_y + 28.0; // clear of the sync buttons' own bottom edge (top_y+18) above, plus room for the Vel label's own ascender
+    out->vel_to_amp_knob = (HdsFxRect){col_x + col_w - 16.0, vel_row_y + HDS_PLAY_KNOB_R + 7.0, HDS_PLAY_KNOB_R, HDS_PLAY_KNOB_R};
+    double y = vel_row_y + HDS_PLAY_KNOB_STRIDE;
     out->curve = (HdsFxRect){col_x, y, col_w, HDS_PLAY_EG_CURVE_H};
     y += HDS_PLAY_EG_CURVE_H + 6.0;
     out->mode_pill = (HdsFxRect){col_x, y, 70.0, HDS_PLAY_PILL_H};
@@ -370,14 +380,14 @@ static void hds_play_osc_knob_value_text(HdsPlayOscKnobId id, double val, char *
 static void hds_play_draw_knob(cairo_t *cr, double cx, double cy, double radius, float value01, bool disabled, const char *label, const char *value_text) {
     if (label && label[0]) {
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 7.0);
+        cairo_set_font_size(cr, 8.0);
         hds_fx_rgb(cr, disabled ? 0.38 : 0.70, disabled ? 0.38 : 0.72, disabled ? 0.40 : 0.74);
         hds_fx_centered_text(cr, cx, cy - radius - 6.0, label);
     }
     hds_fx_draw_knob_arc(cr, cx, cy, radius, value01, disabled);
     if (value_text && value_text[0]) {
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 7.0);
+        cairo_set_font_size(cr, 8.0);
         hds_fx_rgb(cr, disabled ? 0.38 : 0.62, disabled ? 0.38 : 0.62, disabled ? 0.40 : 0.65);
         hds_fx_centered_text(cr, cx, cy + radius + 9.0, value_text);
     }
@@ -446,7 +456,7 @@ static bool hds_play_try_osc_knob_click(HdsClapPlayViewState *vs, const HdsFxRec
 // this file's own small version rather than sharing that one directly: the option sets, and what
 // dropdown_index means (an oscillator vs. an Amp EG), are entirely different domains here.
 // ---------------------------------------------------------------------------------------------
-#define HDS_PLAY_DROPDOWN_ROW_H 16.0
+#define HDS_PLAY_DROPDOWN_ROW_H 18.0
 
 static int hds_play_dropdown_option_count(int kind) {
     if (kind == HDS_PLAY_DROPDOWN_SHAPE) return HDS_PLAY_SHAPE_COUNT;
@@ -487,7 +497,7 @@ static void hds_play_render_dropdown(cairo_t *cr, HdsClapPlayViewState *vs, doub
     cairo_rectangle(cr, bg.x + 0.5, bg.y + 0.5, bg.w - 1, bg.h - 1); cairo_stroke(cr);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     for (int i = 0; i < count; i++) {
         HdsFxRect r;
         hds_play_dropdown_option_rect(&vs->dropdown_anchor, vs->dropdown_kind, window_h, i, &r);
@@ -508,8 +518,8 @@ static void hds_play_render_dropdown(cairo_t *cr, HdsClapPlayViewState *vs, doub
 // computed. Each EG panel sits directly below its own same-numbered oscillator column (same x,
 // same width), not off to the side.
 // ---------------------------------------------------------------------------------------------
-#define HDS_PLAY_OSC_GAP 14.0 // widened from the original 4 -- clearer separation between strips
-#define HDS_PLAY_REGION_GAP 16.0 // vertical gap between the oscillator region and the EG region below it
+#define HDS_PLAY_OSC_GAP 18.0 // widened for breathing room between strips
+#define HDS_PLAY_REGION_GAP 20.0 // vertical gap between the oscillator region and the EG region below it
 
 static double hds_play_osc_col_x(int osc) { return HDS_PLAY_MARGIN + osc * (HDS_PLAY_OSC_COL_W + HDS_PLAY_OSC_GAP); }
 
@@ -542,7 +552,7 @@ static void hds_play_render_osc_strip(cairo_t *cr, HdsClapPlugin *p, HdsClapPlay
 
     char num[4]; snprintf(num, sizeof(num), "%d", osc + 1);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.55, 0.55, 0.58);
     char hdr[16]; snprintf(hdr, sizeof(hdr), "Osc %s", num);
     hds_fx_left_text(cr, col_x, HDS_PLAY_CONTENT_TOP - 8.0, hdr);
@@ -580,16 +590,23 @@ static void hds_play_render_eg_panel(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayV
     hds_play_compute_eg_layout(eg_index, env_type, col_x, col_w, top_y, &L);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.55, 0.55, 0.58);
-    char title[24]; snprintf(title, sizeof(title), "Osc %d Amp EG", eg_index + 1);
+    // "Amp EG N", not "Osc N Amp EG" -- this column already sits directly beneath that oscillator's
+    // own "Osc N" strip, so repeating the number's own "Osc" prefix here just burns horizontal room
+    // this header row also needs for the Sync buttons (eg_index 0) and every EG's own Vel knob row.
+    char title[24]; snprintf(title, sizeof(title), "Amp EG %d", eg_index + 1);
     hds_fx_left_text(cr, L.title.x, L.title.y + 12.0, title);
 
     bool disabled = (eg_index > 0 && vs->amp_eg_live_sync);
     if (eg_index == 0) {
         hds_fx_draw_pill(cr, L.sync_all_btn.x, L.sync_all_btn.y, L.sync_all_btn.w, L.sync_all_btn.h, "1->All", false, false); // plain ASCII, not the UTF-8 arrow -- see hds_clap_global_draw.c's own comment on why
         hds_fx_draw_pill(cr, L.sync_live_btn.x, L.sync_live_btn.y, L.sync_live_btn.w, L.sync_live_btn.h, "Sync", vs->amp_eg_live_sync, false);
-    } else {
+    }
+    // Every one of the 4 EGs has its own real vco{1-4}_vel_to_amp backend field (see this file's
+    // own hds_play_compute_eg_layout() comment on why Osc 1 is not special-cased out of this) --
+    // drawn on its own row now for all 4, not just eg_index > 0.
+    {
         ProgramState *prog2 = hds_play_program(p);
         HdsPlayOscFields f; hds_play_osc_fields(prog2, eg_index, &f);
         hds_play_draw_osc_knob(cr, &L.vel_to_amp_knob, f.vel_to_amp, HDS_PLAY_KNOB_VEL_TO_AMP, 0);
@@ -738,7 +755,11 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
                 if (button == 1) { vs->amp_eg_live_sync = !vs->amp_eg_live_sync; if (vs->amp_eg_live_sync) hds_play_copy_eg0_to_all(prog); }
                 return true;
             }
-        } else if (!disabled) {
+        }
+        // Every EG's own Velocity knob is clickable now, i == 0 included (disabled is always false
+        // there -- see this loop's own `disabled` line just above) -- see hds_play_render_eg_panel()'s
+        // own comment on why Osc 1 is not special-cased out of this control at all.
+        if (!disabled) {
             HdsPlayOscFields f; hds_play_osc_fields(prog, i, &f);
             if (hds_play_try_osc_knob_click(vs, &L.vel_to_amp_knob, f.vel_to_amp, HDS_PLAY_KNOB_VEL_TO_AMP, 0, x, y)) return true;
         }

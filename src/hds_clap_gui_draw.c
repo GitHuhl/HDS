@@ -39,14 +39,14 @@
 // hds_fx_gui_on_*) and hds_clap_play_draw.c (needs HdsClapPlayViewState), and after
 // HdsFxGuiHost/HdsClapPlugin are both defined.
 
-#define HDS_CLAP_TAB_BAR_H 32.0
+#define HDS_CLAP_TAB_BAR_H 36.0
 // 1080 (every tab's own original effective width) + HDS_CLAP_GLOBAL_SIDEBAR_W (260, the sidebar
 // added alongside it) -- so no existing tab's own layout math needed to change to make room for
 // the sidebar; it's purely additional space to its left. See this file's own header comment.
-#define HDS_CLAP_GUI_DEFAULT_W (1080 + (int)HDS_CLAP_GLOBAL_SIDEBAR_W)
-#define HDS_CLAP_GUI_DEFAULT_H 700
-#define HDS_CLAP_GUI_MIN_W (700 + (int)HDS_CLAP_GLOBAL_SIDEBAR_W)
-#define HDS_CLAP_GUI_MIN_H 400
+#define HDS_CLAP_GUI_DEFAULT_W (1150 + (int)HDS_CLAP_GLOBAL_SIDEBAR_W)
+#define HDS_CLAP_GUI_DEFAULT_H 760
+#define HDS_CLAP_GUI_MIN_W (740 + (int)HDS_CLAP_GLOBAL_SIDEBAR_W)
+#define HDS_CLAP_GUI_MIN_H 420
 
 typedef enum {
     HDS_CLAP_TAB_PLAY = 0,
@@ -133,7 +133,7 @@ static void hds_clap_gui_render_placeholder(cairo_t *cr, double w, double h, con
     cairo_rectangle(cr, 0, 0, w, h);
     cairo_fill(cr);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 13);
+    cairo_set_font_size(cr, 14.5);
     hds_fx_rgb(cr, 0.45, 0.45, 0.48);
     hds_fx_centered_text(cr, w / 2, h / 2, label);
 }
@@ -174,7 +174,7 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
             cairo_fill(cr);
         }
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, active ? CAIRO_FONT_WEIGHT_BOLD : CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 10);
+        cairo_set_font_size(cr, 11);
         hds_fx_rgb(cr, active ? 0.92 : 0.6, active ? 0.92 : 0.6, active ? 0.95 : 0.63);
         hds_fx_centered_text(cr, r.x + r.w / 2, r.y + r.h / 2 + 3.5, HDS_CLAP_TAB_LABELS[i]);
     }

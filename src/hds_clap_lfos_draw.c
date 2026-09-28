@@ -108,11 +108,11 @@ static void hds_clap_lfos_view_state_init(HdsClapLfosViewState *vs) {
 // ---------------------------------------------------------------------------------------------
 // Layout -- one row, all controls left to right. Reused verbatim by render and hit-testing.
 // ---------------------------------------------------------------------------------------------
-#define HDS_LFO_MARGIN 8.0
-#define HDS_LFO_HEADER_H 24.0
-#define HDS_LFO_ROW_H 52.0
-#define HDS_LFO_KNOB_R 9.0
-#define HDS_LFO_GAP 6.0
+#define HDS_LFO_MARGIN 10.0
+#define HDS_LFO_HEADER_H 28.0
+#define HDS_LFO_ROW_H 58.0
+#define HDS_LFO_KNOB_R 10.0
+#define HDS_LFO_GAP 8.0
 
 typedef struct {
     HdsFxRect row;
@@ -156,7 +156,7 @@ static void hds_clap_lfos_render_short_dropdown(cairo_t *cr, const HdsFxRect *an
     cairo_new_path(cr); cairo_set_line_width(cr, 1.0);
     cairo_rectangle(cr, bg.x + 0.5, bg.y + 0.5, bg.w - 1, bg.h - 1); cairo_stroke(cr);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     for (int i = 0; i < count; i++) {
         HdsFxRect r = {bg.x, bg.y + i * 16.0, bg.w, 16.0};
         if (i == current) {
@@ -168,8 +168,8 @@ static void hds_clap_lfos_render_short_dropdown(cairo_t *cr, const HdsFxRect *an
     }
 }
 
-#define HDS_LFO_DEST_LIST_ROW_H 15.0
-#define HDS_LFO_DEST_LIST_MAX_H 320.0
+#define HDS_LFO_DEST_LIST_ROW_H 17.0
+#define HDS_LFO_DEST_LIST_MAX_H 340.0
 
 static void hds_clap_lfos_dest_list_rect(const HdsFxRect *anchor, double window_h, HdsFxRect *out) {
     double list_h = HDS_LFO_DEST_LIST_MAX_H;
@@ -199,7 +199,7 @@ static void hds_clap_lfos_render_dest_dropdown(cairo_t *cr, HdsClapLfosViewState
     cairo_rectangle(cr, bg.x, bg.y, bg.w, bg.h);
     cairo_clip(cr);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 8.5);
+    cairo_set_font_size(cr, 9.5);
     int first = (int)(vs->dest_scroll_px / HDS_LFO_DEST_LIST_ROW_H);
     for (int i = first; i < HDS_LFO_DEST_COUNT; i++) {
         double ry = bg.y + i * HDS_LFO_DEST_LIST_ROW_H - vs->dest_scroll_px;
@@ -225,7 +225,7 @@ static void hds_clap_lfos_render(cairo_t *cr, HdsClapPlugin *p, HdsClapLfosViewS
     ProgramState *prog = hds_play_program(p);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.6, 0.6, 0.63);
     hds_fx_left_text(cr, HDS_LFO_MARGIN, HDS_LFO_HEADER_H - 8.0, "Assignable LFOs");
 
@@ -240,7 +240,7 @@ static void hds_clap_lfos_render(cairo_t *cr, HdsClapPlugin *p, HdsClapLfosViewS
         if (L.row.y + L.row.h < HDS_LFO_HEADER_H || L.row.y > window_h) continue;
 
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 8.5);
+        cairo_set_font_size(cr, 9.5);
         hds_fx_rgb(cr, 0.5, 0.5, 0.53);
         char lbl[10]; snprintf(lbl, sizeof(lbl), "LFO %d", i + 1);
         hds_fx_left_text(cr, HDS_LFO_MARGIN, L.row.y + HDS_LFO_ROW_H / 2 + 3.0, lbl);

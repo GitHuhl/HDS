@@ -28,9 +28,9 @@ typedef struct {
 
 static void hds_clap_devices_view_state_init(HdsClapDevicesViewState *vs) { memset(vs, 0, sizeof(*vs)); }
 
-#define HDS_DEV_MARGIN 8.0
-#define HDS_DEV_CONTENT_TOP 30.0
-#define HDS_DEV_KNOB_R 9.0
+#define HDS_DEV_MARGIN 10.0
+#define HDS_DEV_CONTENT_TOP 34.0
+#define HDS_DEV_KNOB_R 10.0
 
 typedef struct {
     HdsFxRect polyphony_knob, blocksize_pill;
@@ -52,7 +52,7 @@ static void hds_clap_devices_render(cairo_t *cr, HdsClapPlugin *p, HdsClapDevice
     cairo_fill(cr);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 9.0);
+    cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.6, 0.6, 0.63);
     hds_fx_left_text(cr, HDS_DEV_MARGIN, HDS_DEV_CONTENT_TOP - 8.0, "Performance");
 
@@ -60,7 +60,7 @@ static void hds_clap_devices_render(cairo_t *cr, HdsClapPlugin *p, HdsClapDevice
     hds_clap_devices_compute_layout(&L);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 8.5);
+    cairo_set_font_size(cr, 9.5);
     hds_fx_rgb(cr, 0.55, 0.55, 0.58);
     hds_fx_left_text(cr, HDS_DEV_MARGIN, L.polyphony_knob.y + 3.0, "Polyphony:");
     hds_fx_left_text(cr, L.blocksize_pill.x - 66.0, L.blocksize_pill.y + L.blocksize_pill.h / 2 + 3.0, "Block Size:");
@@ -88,7 +88,7 @@ static void hds_clap_devices_render(cairo_t *cr, HdsClapPlugin *p, HdsClapDevice
         cairo_new_path(cr); cairo_set_line_width(cr, 1.0);
         cairo_rectangle(cr, bg.x + 0.5, bg.y + 0.5, bg.w - 1, bg.h - 1); cairo_stroke(cr);
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 9.0);
+        cairo_set_font_size(cr, 10.0);
         for (int i = 0; i < HDS_DEV_BLOCKSIZE_COUNT; i++) {
             HdsFxRect r = {bg.x, bg.y + i * 16.0, bg.w, 16.0};
             if (i == bs_idx) {
