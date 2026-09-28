@@ -107,10 +107,46 @@ static const char *const HDS_PLAY_EGMODE_NAMES[HDS_PLAY_EGMODE_COUNT] = {
 #define HDS_PLAY_DROPDOWN_SHAPE 1
 #define HDS_PLAY_DROPDOWN_EGMODE 2
 
+// A knob's own right-click menu, if it has one -- stashed at right-press time (see
+// hds_play_start_knob_drag()) and consulted on release if the button never actually dragged.
+// kind==0 means "no menu": most knobs don't have one, exactly like frontend.py's own
+// PotentiometerKnob, where setContextMenuCallback() is only ever wired onto ~17 specific knob
+// instances (destination knobs: oscillator Pitch/Phase/Pulse-Width, Filter Cutoff/Resonance, LFO
+// Rate/Depth/Phase) -- every other knob still gets double-click-reset and right-drag fine
+// adjustment, just no menu. kind/arg are interpreted entirely by whichever *_draw.c file opened
+// the menu (each file defines its own small kind-constant space); this struct itself stays
+// generic so every tab can keep sharing ONE HdsPlayKnobDrag type.
+typedef struct {
+    int kind;
+    int arg;
+} HdsPlayKnobMenu;
+
 typedef struct {
     float *target;      // knob currently being dragged, NULL = none
     double lo, hi;       // that knob's own real backend-unit range
     double start_y, start_val;
+
+    // Right-click support (mirrors frontend.py's own PotentiometerKnob mousePressEvent/
+    // mouseMoveEvent/mouseReleaseEvent exactly): button is 0 (idle), 1 (left, dragging at normal
+    // sensitivity) or 3 (right -- either still a "was this a click or a drag" pending gesture, or
+    // promoted to a fine-sensitivity drag once the pointer moves past the threshold). press_x/y is
+    // where the right button went down; right_moved flips true the first time the pointer clears
+    // HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX from there (frontend.py's own manhattanLength() > 3 check).
+    // A right-release with right_moved still false fires `menu` (if it has one) instead of having
+    // done anything to the value -- a real "was this a click or a drag" gesture, not a fixed
+    // click-vs-hold timer.
+    int button;
+    double press_x, press_y;
+    bool right_moved;
+    HdsPlayKnobMenu menu;
+
+    // Double-click-to-reset bookkeeping (mirrors PotentiometerKnob.mouseDoubleClickEvent, which
+    // always resets to a literal 0.0 regardless of the knob's own range -- clamped into range same
+    // as any other write). last_click_target is compared by POINTER IDENTITY (which knob), not
+    // value, so two different knobs' clicks never combine into a false double-click.
+    float *last_click_target;
+    struct timespec last_click_time;
+    double last_click_x, last_click_y;
 } HdsPlayKnobDrag;
 
 typedef struct {
@@ -576,7 +612,7 @@ static void hds_play_render_osc_strip(cairo_t *cr, HdsClapPlugin *p, HdsClapPlay
     hds_play_draw_osc_knob(cr, &L.uni_detune_knob, f.unison_detune, HDS_PLAY_KNOB_UNI_DETUNE, shape);
     hds_play_draw_osc_knob(cr, &L.vol_knob, f.vol, HDS_PLAY_KNOB_VOL, shape);
     bool muted = *f.mute != 0.0f;
-    hds_fx_draw_pill(cr, L.mute_btn.x, L.mute_btn.y, L.mute_btn.w, L.mute_btn.h, "M", muted, false);
+    hds_fx_draw_mute_pill(cr, L.mute_btn.x, L.mute_btn.y, L.mute_btn.w, L.mute_btn.h, "M", muted, false);
     hds_play_draw_osc_knob(cr, &L.pan_knob, f.pan, HDS_PLAY_KNOB_PAN, shape);
 }
 

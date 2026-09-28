@@ -656,10 +656,12 @@ static void hds_fx_left_text(cairo_t *cr, double x, double y, const char *text) 
     cairo_new_path(cr);
 }
 
-static void hds_fx_draw_pill(cairo_t *cr, double x, double y, double w, double h, const char *text, bool active, bool disabled) {
+// color_kind: 0 = normal (active = green), 1 = mute (active = red) -- hds_fx_draw_pill() below is
+// the normal case; hds_fx_draw_mute_pill() is the only other caller.
+static void hds_fx_draw_pill_kind(cairo_t *cr, double x, double y, double w, double h, const char *text, bool active, bool disabled, int color_kind) {
     hds_fx_rounded_rect(cr, x, y, w, h, 4);
     if (disabled) hds_fx_rgb(cr, 0.16, 0.16, 0.18);
-    else if (active) hds_fx_rgb(cr, 0.22, 0.32, 0.36);
+    else if (active) { if (color_kind == 1) hds_fx_rgb(cr, 0.55, 0.16, 0.16); else hds_fx_rgb(cr, 0.18, 0.42, 0.22); }
     else hds_fx_rgb(cr, 0.19, 0.19, 0.22);
     cairo_fill(cr);
     cairo_new_path(cr);
@@ -679,6 +681,14 @@ static void hds_fx_draw_pill(cairo_t *cr, double x, double y, double w, double h
     cairo_clip(cr);
     hds_fx_centered_text(cr, x + w / 2, y + h / 2 + 3.5, text);
     cairo_restore(cr);
+}
+
+static void hds_fx_draw_pill(cairo_t *cr, double x, double y, double w, double h, const char *text, bool active, bool disabled) {
+    hds_fx_draw_pill_kind(cr, x, y, w, h, text, active, disabled, 0);
+}
+
+__attribute__((unused)) static void hds_fx_draw_mute_pill(cairo_t *cr, double x, double y, double w, double h, const char *text, bool active, bool disabled) {
+    hds_fx_draw_pill_kind(cr, x, y, w, h, text, active, disabled, 1);
 }
 
 // A small knob: an optional short NAME label above it (what this pot actually does -- e.g.
