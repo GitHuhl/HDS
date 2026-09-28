@@ -103,6 +103,17 @@ typedef struct {
 
     int vu_decimator;
 
+    // The Tempo knob's own value (SynthSharedControls.tempo_bpm, via ProgramState -- see
+    // compute_current_tempo_bpm()) is NOT what the audio engine actually reads once
+    // knobs.seq_sync_source is set to External: clap_plugin_process() then takes the CLAP host's
+    // own process->transport->tempo instead every block (see that function's own comment) --
+    // process->transport is a per-call stack parameter the GUI thread can never reach, so this
+    // field is where clap_plugin_process() stashes the ACTUAL resolved tempo every block, for
+    // hds_clap_global_draw.c's own Tempo knob to read and display while synced to the host
+    // (matches Internal-mode's tempo_bpm exactly whenever sync is off, so it's always safe to read
+    // regardless of the current sync mode).
+    float host_tempo_bpm;
+
     lo_server osc_server;
     lo_address osc_reply_addr;
     bool osc_ready; // true once activate() successfully opened the OSC server this session

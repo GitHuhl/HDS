@@ -24,9 +24,13 @@
 //     switch to at all, so this control simply doesn't apply.
 //   - the live tempo readout label: frontend.py keeps a second read-only label in sync with the
 //     backend's OWN resolved tempo (which can diverge from the tempo_bpm knob once tempo markers
-//     are authored) via a live status-frame round trip; in this in-process plugin the knob field
-//     IS what the audio engine reads every block, so a second "live" readout would always just
-//     equal the knob -- nothing to build.
+//     are authored) via a live status-frame round trip. An EARLIER version of this comment claimed
+//     "the knob field IS what the audio engine reads every block, so nothing to build" -- true only
+//     while Internal sync is selected; once a CLAP host's own transport tempo is in play
+//     (knobs.seq_sync_source == External, see the Tempo section's own Internal/DAW pill below and
+//     clap_plugin_process()'s own host-tempo-sync comment), the knob field is NOT what's actually
+//     running, so this pass DOES build a live readout for that case -- see host_tempo_bpm's own
+//     comment in hds_engine_instance.h.
 //   - Arp Octave Range/Rate/Hold: real, working, already-Program-scoped backend fields
 //     (arp_octave_range/arp_rate/arp_hold) with no widget in frontend.py's OWN Global panel either
 //     (a pre-existing gap in the Python reference, not something this port introduces or fixes).
@@ -147,6 +151,7 @@ typedef struct {
     HdsFxRect fm_algo_pill;
     HdsFxRect fm_depth_knob[HDS_GLOBAL_FM_DEPTH_COUNT]; // only fields[0..count) (see hds_global_fm_depth_visible_fields()) are ever populated/valid for the current algorithm
     HdsFxRect glide_time_knob, glide_random_knob, tempo_knob;
+    HdsFxRect tempo_sync_internal_pill, tempo_sync_daw_pill; // CLAP-only: Internal (Tempo knob) vs DAW (host transport) -- see this file's own Tempo-section comment
     HdsFxRect metronome_pill;
     HdsFxRect arp_enabled_pill, arp_style_pill;
     HdsFxRect arp_velocity_knob, arp_gate_knob;
@@ -221,8 +226,13 @@ static void hds_clap_global_compute_layout(int fm_algo, double scroll_offset_px,
     out->glide_random_knob = (HdsFxRect){content_x + content_w / 2.0, y + HDS_GLOBAL_KNOB_R + 9.0, HDS_GLOBAL_KNOB_R, HDS_GLOBAL_KNOB_R};
     y += HDS_GLOBAL_KNOB_ROW_H + HDS_GLOBAL_SECTION_GAP;
 
-    // Tempo
+    // Tempo -- CLAP-only Internal/DAW pill row above the knob (see this file's own header comment
+    // on why a CLAP instance can't just always silently follow the host transport with no
+    // indication or override: some patches genuinely want their own authored Tempo/tempo-map).
     y += 12.0;
+    out->tempo_sync_internal_pill = (HdsFxRect){content_x, y, content_w / 2.0 - 3.0, HDS_GLOBAL_PILL_H};
+    out->tempo_sync_daw_pill = (HdsFxRect){content_x + content_w / 2.0 + 3.0, y, content_w / 2.0 - 3.0, HDS_GLOBAL_PILL_H};
+    y += HDS_GLOBAL_PILL_H + 6.0;
     out->tempo_knob = (HdsFxRect){content_x + content_w / 2.0, y + HDS_GLOBAL_KNOB_R + 9.0, HDS_GLOBAL_KNOB_R, HDS_GLOBAL_KNOB_R};
     y += HDS_GLOBAL_KNOB_ROW_H + HDS_GLOBAL_SECTION_GAP;
 
@@ -322,10 +332,18 @@ static void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalV
     hds_global_section_label(cr, HDS_GLOBAL_MARGIN, L.glide_random_knob.y - HDS_GLOBAL_KNOB_R - 12.0, "Glide Random");
     hds_play_draw_knob(cr, L.glide_random_knob.x, L.glide_random_knob.y, L.glide_random_knob.w,
                         (float)(prog->mono_glide_random / 100.0), false, "Glide Rnd", grandtxt);
-    char tempotxt[16]; snprintf(tempotxt, sizeof(tempotxt), "%d BPM", (int)(prog->tempo_bpm + 0.5f));
-    hds_global_section_label(cr, HDS_GLOBAL_MARGIN, L.tempo_knob.y - HDS_GLOBAL_KNOB_R - 12.0, "Tempo");
+    // Tempo: CLAP-only Internal/DAW pill row, then the knob -- see this file's own header comment
+    // on why a CLAP instance needs this switch (and can't just always silently follow the host
+    // transport with no override), and host_tempo_bpm's own comment in hds_engine_instance.h for
+    // why THAT field, not prog->tempo_bpm, is what gets displayed/dragged while synced to the DAW.
+    hds_global_section_label(cr, HDS_GLOBAL_MARGIN, L.tempo_sync_internal_pill.y - 4.0, "Tempo");
+    bool daw_sync = (p->knobs.seq_sync_source != 0.0f);
+    hds_fx_draw_pill(cr, L.tempo_sync_internal_pill.x, L.tempo_sync_internal_pill.y, L.tempo_sync_internal_pill.w, L.tempo_sync_internal_pill.h, "Internal", !daw_sync, false);
+    hds_fx_draw_pill(cr, L.tempo_sync_daw_pill.x, L.tempo_sync_daw_pill.y, L.tempo_sync_daw_pill.w, L.tempo_sync_daw_pill.h, "DAW", daw_sync, false);
+    float tempo_display = daw_sync ? p->host_tempo_bpm : prog->tempo_bpm;
+    char tempotxt[16]; snprintf(tempotxt, sizeof(tempotxt), "%d BPM", (int)(tempo_display + 0.5f));
     hds_play_draw_knob(cr, L.tempo_knob.x, L.tempo_knob.y, L.tempo_knob.w,
-                        (float)((prog->tempo_bpm - 20.0) / (300.0 - 20.0)), false, "Tempo", tempotxt);
+                        (float)((tempo_display - 20.0) / (300.0 - 20.0)), daw_sync, "Tempo", tempotxt);
 
     bool metronome_on = (p->knobs.metronome_enable != 0.0f);
     hds_fx_draw_pill(cr, L.metronome_pill.x, L.metronome_pill.y, L.metronome_pill.w, L.metronome_pill.h, "\xf0\x9f\x8e\xb5 Metronome", metronome_on, false);
@@ -443,7 +461,12 @@ static bool hds_clap_global_on_button_press(HdsClapPlugin *p, HdsClapGlobalViewS
 
     if (hds_play_knob_hit_test(&L.glide_time_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->portamento_time_ms, 0.0, 1000.0, y); return true; }
     if (hds_play_knob_hit_test(&L.glide_random_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->mono_glide_random, 0.0, 100.0, y); return true; }
-    if (hds_play_knob_hit_test(&L.tempo_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->tempo_bpm, 20.0, 300.0, y); return true; }
+    if (hds_play_rect_contains(&L.tempo_sync_internal_pill, x, y)) { if (button == 1) p->knobs.seq_sync_source = 0.0f; return true; }
+    if (hds_play_rect_contains(&L.tempo_sync_daw_pill, x, y)) { if (button == 1) p->knobs.seq_sync_source = 1.0f; return true; }
+    // No drag while synced to the DAW -- the knob is display-only then (shows host_tempo_bpm, see
+    // this file's own render-side comment), same "disabled means non-interactive" convention the
+    // Arp Velocity/Gate knobs already use when !arp_on.
+    if (p->knobs.seq_sync_source == 0.0f && hds_play_knob_hit_test(&L.tempo_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->tempo_bpm, 20.0, 300.0, y); return true; }
     if (hds_play_rect_contains(&L.metronome_pill, x, y)) {
         if (button == 1) p->knobs.metronome_enable = (p->knobs.metronome_enable != 0.0f) ? 0.0f : 1.0f;
         return true;

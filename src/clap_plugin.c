@@ -935,6 +935,10 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
     if (p->knobs.seq_sync_source != 0.0f && process->transport && (process->transport->flags & CLAP_TRANSPORT_HAS_TEMPO)) {
         current_tempo_bpm = (float)process->transport->tempo;
     }
+    // See host_tempo_bpm's own comment in hds_engine_instance.h: this is the only place the GUI's
+    // own Tempo knob (which can't reach process->transport itself) can learn what tempo this
+    // instance is actually running at right now, in either sync mode.
+    p->host_tempo_bpm = current_tempo_bpm;
     // Independent of the Sequencer transport (see poll_metronome()'s own comment) -- same "host's
     // full frames_count as one lump elapsed-sample count" granularity poll_arpeggiator already
     // uses below, for the same reason (block_size itself isn't resolved until the chunking loop
@@ -1174,6 +1178,23 @@ static const clap_plugin_t *clap_factory_create_plugin(const clap_plugin_factory
 
     p->host = host;
     init_default_controls(&p->knobs);
+    // CLAP-only default override: a plugin instance has a real host transport to follow, unlike
+    // the standalone app (whose own identical init_default_controls() call leaves this at Internal,
+    // since there's no MIDI Clock hardware to assume is present) -- so a FRESH instance here starts
+    // out already following the DAW's own tempo, not the Tempo knob. This only affects what a new
+    // instance starts as: clap_state_load()/a loaded DAW project restore this like any other knob
+    // (seq_sync_source is a plain OSC-covered SynthSharedControls field, walked by clap_state_save()
+    // like every other one -- see its own comment), so a user who explicitly chose Internal for a
+    // given project keeps that choice across reloads; only a brand-new, never-saved instance gets
+    // this default. See hds_clap_global_draw.c's own Tempo-section Internal/DAW pill for the control
+    // surface this default pairs with, and clap_plugin_process()'s own host-tempo-sync comment for
+    // where seq_sync_source actually takes effect.
+    p->knobs.seq_sync_source = 1.0f;
+    // Sane initial value for the GUI's own Tempo-knob display before this instance's first
+    // process() call ever runs (a host that creates the GUI before activating/processing audio
+    // would otherwise show a "0 BPM" flash) -- clap_plugin_process() overwrites this with the real
+    // resolved value (host transport or the Tempo knob, per seq_sync_source) every block from then on.
+    p->host_tempo_bpm = compute_current_tempo_bpm(&p->knobs, 0.0);
     // Seed the CLAP params shadow from the REAL live value init_default_controls() just set, not
     // a separately-hardcoded copy -- if the two ever drift, this avoids a spurious "changed"
     // event firing on this instance's very first process() call (see
