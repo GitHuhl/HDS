@@ -1722,6 +1722,76 @@ static void poll_stdin_control(SynthSharedControls *knobs, HdsSampleEngine *se) 
 // so port_input_stereo/port_output_channel stay NULL (calloc-zeroed) and SOURCE_COUNT is reused as
 // the nearest analogous count instead.
 #define HDS_FX_PORT_COUNT SOURCE_COUNT
+
+// Real ALSA/MIDI device enumeration for the native GUI's own Devices tab (standalone-only --
+// hds_clap_devices_draw.c's own header comment explains why hds.clap/hds_fx.clap never call these
+// at all: a CLAP host owns its own device selection). Mirrors frontend.py's own
+// _list_alsa_devices()/_list_midi_input_devices() exactly -- same tools (aplay/arecord -L,
+// aconnect -i), same parsing rules, same fallback-to-one-safe-entry-if-the-tool-is-missing
+// posture -- just done with popen()/fgets() instead of subprocess.run(), since this is C, not
+// Python. A real subprocess spawn+read, so only ever called from a "Rescan" click or the GUI's own
+// startup, never per-frame.
+#define HDS_DEVLIST_MAX 24
+typedef struct {
+    char names[HDS_DEVLIST_MAX][AUDIO_DEVICE_NAME_LEN];
+    int count;
+} HdsDeviceList;
+
+static void hds_devlist_add(HdsDeviceList *list, const char *name) {
+    if (list->count >= HDS_DEVLIST_MAX || !name[0]) return;
+    for (int i = 0; i < list->count; i++) if (strcmp(list->names[i], name) == 0) return;
+    snprintf(list->names[list->count], AUDIO_DEVICE_NAME_LEN, "%s", name);
+    list->count++;
+}
+
+// `aplay -L`/`arecord -L` list one PCM device name per unindented line, with indented description
+// lines following each -- only the unindented ones are real device names. "default" always first.
+static void hds_scan_alsa_devices(const char *tool, HdsDeviceList *out) {
+    out->count = 0;
+    hds_devlist_add(out, "default");
+    char cmd[64]; snprintf(cmd, sizeof(cmd), "%s -L 2>/dev/null", tool);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '\0' || isspace((unsigned char)line[0])) continue;
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        if (len > 0) hds_devlist_add(out, line);
+    }
+    pclose(fp);
+}
+
+// `aconnect -i` lists input-capable (MIDI-generating) clients as `client N: 'Name' [type=kernel,
+// ...]` -- skip client 0 (the kernel's own System client) and non-kernel/"Midi Through" clients,
+// the exact same filtering backend.c's own live autoconnect scan already applies independently
+// (midi_client_matches()) -- this is a preview of what auto-connect would pick up, not a separate
+// source of truth. Index 0 is always "auto" (rendered as "Auto (recommended)" -- see
+// hds_clap_devices_draw.c's own render code -- but stored/wired on the wire as literal "auto",
+// matching backend.c's own midi_device default and OSC convention).
+static void hds_scan_midi_devices(HdsDeviceList *out) {
+    out->count = 0;
+    hds_devlist_add(out, "auto");
+    FILE *fp = popen("aconnect -i 2>/dev/null", "r");
+    if (!fp) return;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        int client_id; char rest[240];
+        if (sscanf(line, "client %d:%239[^\n]", &client_id, rest) != 2) continue;
+        if (client_id == 0) continue;
+        char *q1 = strchr(rest, '\'');
+        if (!q1) continue;
+        char *q2 = strchr(q1 + 1, '\'');
+        if (!q2) continue;
+        *q2 = '\0';
+        const char *name = q1 + 1;
+        if (!strstr(q2 + 1, "type=kernel")) continue;
+        if (strcmp(name, "Midi Through") == 0) continue;
+        hds_devlist_add(out, name);
+    }
+    pclose(fp);
+}
+
 #include "hds_fx_gui_draw.c"
 #include "hds_clap_play_draw.c"
 #include "hds_clap_combi_draw.c"
