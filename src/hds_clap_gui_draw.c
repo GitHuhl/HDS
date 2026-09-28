@@ -1,8 +1,18 @@
-// hds_clap_gui_draw.c: hds.clap's own top-level GUI shell -- a tab bar (mirroring frontend.py's
-// QTabWidget order exactly: Play, Filters, LFOs, Envelopes, FX, Routing, Devices, Recording,
-// Mapping, Sequencer) plus per-tab dispatch. Platform-agnostic like hds_fx_gui_draw.c itself (plain
-// cairo_t*, no Xlib) -- hds_clap_gui_x11.c is this file's own platform shim, same split for the
-// same reason.
+// hds_clap_gui_draw.c: hds.clap's own top-level GUI shell -- a persistent left sidebar (see
+// hds_clap_global_draw.c's own header comment: frontend.py's always-visible "Global
+// Configurations" panel, ported here as a fixed-width column beside the tab area rather than a
+// tab of its own) plus a tab bar (mirroring frontend.py's QTabWidget order exactly: Play, Filters,
+// LFOs, Envelopes, FX, Routing, Devices, Recording, Mapping, Sequencer) with per-tab dispatch.
+// Platform-agnostic like hds_fx_gui_draw.c itself (plain cairo_t*, no Xlib) -- hds_clap_gui_x11.c
+// is this file's own platform shim, same split for the same reason.
+//
+// Composition: the sidebar occupies x=[0, HDS_CLAP_GLOBAL_SIDEBAR_W), full window height, with NO
+// tab bar over it (frontend.py's own sidebar sits beside its QTabWidget, not inside it). The tab
+// bar and every tab's own content occupy x=[HDS_CLAP_GLOBAL_SIDEBAR_W, window_w) instead -- see
+// hds_clap_gui_render()'s own cairo_translate() and every dispatch function's own x-offset
+// subtraction. HDS_CLAP_GUI_DEFAULT_W below already includes the sidebar's own width added on top
+// of every tab's original effective width (1080), so no existing tab's own layout math needed to
+// change to make room for it.
 //
 // The FX tab is NOT a new implementation: it's hds_fx_gui_draw.c's own hds_fx_gui_render()/
 // hds_fx_gui_on_*(), called verbatim against this instance's own HdsFxGuiHost (see clap_plugin.c's
@@ -30,9 +40,12 @@
 // HdsFxGuiHost/HdsClapPlugin are both defined.
 
 #define HDS_CLAP_TAB_BAR_H 32.0
-#define HDS_CLAP_GUI_DEFAULT_W 1080
+// 1080 (every tab's own original effective width) + HDS_CLAP_GLOBAL_SIDEBAR_W (260, the sidebar
+// added alongside it) -- so no existing tab's own layout math needed to change to make room for
+// the sidebar; it's purely additional space to its left. See this file's own header comment.
+#define HDS_CLAP_GUI_DEFAULT_W (1080 + (int)HDS_CLAP_GLOBAL_SIDEBAR_W)
 #define HDS_CLAP_GUI_DEFAULT_H 700
-#define HDS_CLAP_GUI_MIN_W 700
+#define HDS_CLAP_GUI_MIN_W (700 + (int)HDS_CLAP_GLOBAL_SIDEBAR_W)
 #define HDS_CLAP_GUI_MIN_H 400
 
 typedef enum {
@@ -43,7 +56,6 @@ typedef enum {
     HDS_CLAP_TAB_FX,
     HDS_CLAP_TAB_ROUTING,
     HDS_CLAP_TAB_DEVICES,
-    HDS_CLAP_TAB_GLOBAL,
     HDS_CLAP_TAB_MAPPING,
     HDS_CLAP_TAB_COUNT
 } HdsClapTab;
@@ -54,13 +66,12 @@ typedef enum {
 // (WavRecorder/the record_enable writer thread, and the Sequencer transport/lane/MIDI-playback
 // workflow respectively -- see clap_plugin_process()'s own comment on the latter), per explicit
 // product direction -- a DAW host already owns both recording and sequencing for its plugins.
-// "Global" has no equivalent QTabWidget entry in frontend.py at all -- it was an always-visible
-// sidebar there (see hds_clap_global_draw.c's own header comment), promoted to its own tab here
-// since this GUI's shell has no sidebar concept; placed right after Devices (the only other
-// "settings, not signal processing" tab) rather than at the very end next to the Mapping
-// placeholder, so it reads as a peer of Devices rather than an afterthought.
+// "Global" is NOT a tab here at all (an earlier version of this port made it one) -- it lives in
+// the persistent left sidebar instead, alongside the tab bar/content, matching frontend.py's own
+// placement exactly. See hds_clap_global_draw.c's own header comment and this file's own header
+// comment on how the sidebar and this tab bar compose together.
 static const char *const HDS_CLAP_TAB_LABELS[HDS_CLAP_TAB_COUNT] = {
-    "Play", "Filters", "LFOs", "Envelopes", "FX", "Routing", "Devices", "Global", "Mapping",
+    "Play", "Filters", "LFOs", "Envelopes", "FX", "Routing", "Devices", "Mapping",
 };
 
 typedef struct {
@@ -134,13 +145,25 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
     // set this on every redraw rather than hooking the tab-bar's own click handler specifically.
     p->knobs.gui_routing_tab_visible = (vs->active_tab == HDS_CLAP_TAB_ROUTING) ? 1.0f : 0.0f;
 
+    // The persistent left sidebar -- full window height, no tab bar over it (see this file's own
+    // header comment). Drawn first, in the untranslated coordinate space (it starts at x=0).
+    hds_clap_global_render(cr, p, &vs->global_view, HDS_CLAP_GLOBAL_SIDEBAR_W, vs->window_h);
+
+    // Everything else (tab bar + active tab's content) lives to the RIGHT of the sidebar --
+    // translate once here so every tab's own render function keeps using plain (0,0)-relative
+    // drawing exactly as it did before the sidebar existed, over a tab_area_w that already
+    // excludes the sidebar's own width.
+    double tab_area_w = vs->window_w - HDS_CLAP_GLOBAL_SIDEBAR_W;
+    cairo_save(cr);
+    cairo_translate(cr, HDS_CLAP_GLOBAL_SIDEBAR_W, 0);
+
     // Tab bar itself.
     hds_fx_rgb(cr, 0.14, 0.14, 0.17);
-    cairo_rectangle(cr, 0, 0, vs->window_w, HDS_CLAP_TAB_BAR_H);
+    cairo_rectangle(cr, 0, 0, tab_area_w, HDS_CLAP_TAB_BAR_H);
     cairo_fill(cr);
     for (int i = 0; i < HDS_CLAP_TAB_COUNT; i++) {
         HdsClapTabRect r;
-        hds_clap_gui_tab_rect(vs->window_w, i, &r);
+        hds_clap_gui_tab_rect((int)tab_area_w, i, &r);
         bool active = (i == (int)vs->active_tab);
         if (active) {
             hds_fx_rgb(cr, 0.10, 0.10, 0.12);
@@ -162,7 +185,7 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
     // fill/clip rect stop exactly at the real window's bottom edge -- no change needed to that
     // file at all.
     cairo_save(cr);
-    cairo_rectangle(cr, 0, HDS_CLAP_TAB_BAR_H, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+    cairo_rectangle(cr, 0, HDS_CLAP_TAB_BAR_H, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
     cairo_clip(cr);
     cairo_translate(cr, 0, HDS_CLAP_TAB_BAR_H);
     switch (vs->active_tab) {
@@ -177,8 +200,8 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
             // background (same "flood-fill background first" convention every tab in this GUI
             // uses), which would otherwise immediately paint over the pills.
             bool combi_mode = ((int)p->knobs.performance_mode == 1);
-            if (combi_mode) hds_clap_combi_render(cr, p, &vs->combi_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
-            else hds_clap_play_render(cr, p, &vs->play_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            if (combi_mode) hds_clap_combi_render(cr, p, &vs->combi_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            else hds_clap_play_render(cr, p, &vs->play_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             HdsFxRect single_r, combi_r;
             hds_clap_play_mode_toggle_rects(&single_r, &combi_r);
             hds_fx_draw_pill(cr, single_r.x, single_r.y, single_r.w, single_r.h, "Single", !combi_mode, false);
@@ -186,25 +209,22 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
             break;
         }
         case HDS_CLAP_TAB_FILTERS:
-            hds_clap_filters_render(cr, p, &vs->filters_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            hds_clap_filters_render(cr, p, &vs->filters_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
         case HDS_CLAP_TAB_LFOS:
-            hds_clap_lfos_render(cr, p, &vs->lfos_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            hds_clap_lfos_render(cr, p, &vs->lfos_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
         case HDS_CLAP_TAB_ENVELOPES:
-            hds_clap_envelopes_render(cr, p, &vs->envelopes_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            hds_clap_envelopes_render(cr, p, &vs->envelopes_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
         case HDS_CLAP_TAB_ROUTING:
-            hds_clap_routing_render(cr, p, &vs->routing_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            hds_clap_routing_render(cr, p, &vs->routing_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
         case HDS_CLAP_TAB_DEVICES:
-            hds_clap_devices_render(cr, p, &vs->devices_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
-            break;
-        case HDS_CLAP_TAB_GLOBAL:
-            hds_clap_global_render(cr, p, &vs->global_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            hds_clap_devices_render(cr, p, &vs->devices_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
         case HDS_CLAP_TAB_MAPPING:
-            hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Mapping (Sample Zone editor) -- not available in this GUI yet");
+            hds_clap_gui_render_placeholder(cr, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Mapping (Sample Zone editor) -- not available in this GUI yet");
             break;
         default:
             hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Coming soon");
@@ -214,11 +234,19 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
 }
 
 static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int button) {
+    // The persistent sidebar owns the whole left strip, full height -- checked FIRST, before the
+    // tab bar's own y<BAR_H check, since the sidebar has no tab bar of its own at all (see this
+    // file's own header comment).
+    if (x < HDS_CLAP_GLOBAL_SIDEBAR_W) {
+        return hds_clap_global_on_button_press(p, &vs->global_view, vs->window_h, x, y, button);
+    }
+    double tab_x = x - HDS_CLAP_GLOBAL_SIDEBAR_W;
+    double tab_area_w = vs->window_w - HDS_CLAP_GLOBAL_SIDEBAR_W;
     if (y < HDS_CLAP_TAB_BAR_H) {
         for (int i = 0; i < HDS_CLAP_TAB_COUNT; i++) {
             HdsClapTabRect r;
-            hds_clap_gui_tab_rect(vs->window_w, i, &r);
-            if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {
+            hds_clap_gui_tab_rect((int)tab_area_w, i, &r);
+            if (tab_x >= r.x && tab_x < r.x + r.w && y >= r.y && y < r.y + r.h) {
                 vs->active_tab = (HdsClapTab)i;
                 return true;
             }
@@ -227,49 +255,56 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
     }
     switch (vs->active_tab) {
         case HDS_CLAP_TAB_FX:
-            return hds_fx_gui_on_button_press(&p->gui_host, &vs->fx_view, x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_fx_gui_on_button_press(&p->gui_host, &vs->fx_view, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_PLAY: {
             HdsFxRect single_r, combi_r;
             hds_clap_play_mode_toggle_rects(&single_r, &combi_r);
             double py = y - HDS_CLAP_TAB_BAR_H;
-            if (hds_play_rect_contains(&single_r, x, py)) { if (button == 1) p->knobs.performance_mode = 0.0f; return true; }
-            if (hds_play_rect_contains(&combi_r, x, py)) { if (button == 1) p->knobs.performance_mode = 1.0f; return true; }
+            if (hds_play_rect_contains(&single_r, tab_x, py)) { if (button == 1) p->knobs.performance_mode = 0.0f; return true; }
+            if (hds_play_rect_contains(&combi_r, tab_x, py)) { if (button == 1) p->knobs.performance_mode = 1.0f; return true; }
             if ((int)p->knobs.performance_mode == 1)
-                return hds_clap_combi_on_button_press(p, &vs->combi_view, vs->window_h - HDS_CLAP_TAB_BAR_H, x, py, button);
-            return hds_clap_play_on_button_press(p, &vs->play_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, x, py, button);
+                return hds_clap_combi_on_button_press(p, &vs->combi_view, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, py, button);
+            return hds_clap_play_on_button_press(p, &vs->play_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, py, button);
         }
         case HDS_CLAP_TAB_FILTERS:
-            return hds_clap_filters_on_button_press(p, &vs->filters_view, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_filters_on_button_press(p, &vs->filters_view, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_LFOS:
-            return hds_clap_lfos_on_button_press(p, &vs->lfos_view, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_lfos_on_button_press(p, &vs->lfos_view, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_ENVELOPES:
-            return hds_clap_envelopes_on_button_press(p, &vs->envelopes_view, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_envelopes_on_button_press(p, &vs->envelopes_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_ROUTING:
-            return hds_clap_routing_on_button_press(p, &vs->routing_view, x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_routing_on_button_press(p, &vs->routing_view, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_DEVICES:
-            return hds_clap_devices_on_button_press(p, &vs->devices_view, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
-        case HDS_CLAP_TAB_GLOBAL:
-            return hds_clap_global_on_button_press(p, &vs->global_view, vs->window_h - HDS_CLAP_TAB_BAR_H, x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_devices_on_button_press(p, &vs->devices_view, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
         default:
             return true;
     }
 }
 
 static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y) {
-    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_motion(&p->gui_host, &vs->fx_view, x, y - HDS_CLAP_TAB_BAR_H);
+    // Unconditional, not gated by x/active_tab: a drag that started in the sidebar (or the tab
+    // area) must keep receiving motion even if the pointer strays outside that region afterward --
+    // each handler already no-ops on its own if it has no drag in flight (same pattern every other
+    // per-tab on_motion in this dispatch already relies on).
+    hds_clap_global_on_motion(&vs->global_view, x, y);
+
+    double tab_x = x - HDS_CLAP_GLOBAL_SIDEBAR_W;
+    double tab_area_w = vs->window_w - HDS_CLAP_GLOBAL_SIDEBAR_W;
+    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_motion(&p->gui_host, &vs->fx_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
     else if (vs->active_tab == HDS_CLAP_TAB_PLAY) {
-        if ((int)p->knobs.performance_mode == 1) hds_clap_combi_on_motion(&vs->combi_view, x, y - HDS_CLAP_TAB_BAR_H);
-        else hds_clap_play_on_motion(p, &vs->play_view, vs->window_w, x, y - HDS_CLAP_TAB_BAR_H);
+        if ((int)p->knobs.performance_mode == 1) hds_clap_combi_on_motion(&vs->combi_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
+        else hds_clap_play_on_motion(p, &vs->play_view, tab_area_w, tab_x, y - HDS_CLAP_TAB_BAR_H);
     }
-    else if (vs->active_tab == HDS_CLAP_TAB_FILTERS) hds_clap_filters_on_motion(&vs->filters_view, x, y - HDS_CLAP_TAB_BAR_H);
-    else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_motion(&vs->lfos_view, x, y - HDS_CLAP_TAB_BAR_H);
-    else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_motion(p, &vs->envelopes_view, vs->window_w, x, y - HDS_CLAP_TAB_BAR_H);
-    else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_motion(&vs->routing_view, x, y - HDS_CLAP_TAB_BAR_H);
-    else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_motion(&vs->devices_view, x, y - HDS_CLAP_TAB_BAR_H);
-    else if (vs->active_tab == HDS_CLAP_TAB_GLOBAL) hds_clap_global_on_motion(&vs->global_view, x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_FILTERS) hds_clap_filters_on_motion(&vs->filters_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_motion(&vs->lfos_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_motion(p, &vs->envelopes_view, tab_area_w, tab_x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_motion(&vs->routing_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_motion(&vs->devices_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
 }
 
 static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
+    // Same "unconditional, each side no-ops on its own" reasoning as on_motion just above.
+    hds_clap_global_on_button_release(&vs->global_view);
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_button_release(&vs->fx_view);
     else if (vs->active_tab == HDS_CLAP_TAB_PLAY) { hds_clap_play_on_button_release(&vs->play_view); hds_clap_combi_on_button_release(&vs->combi_view); }
     else if (vs->active_tab == HDS_CLAP_TAB_FILTERS) hds_clap_filters_on_button_release(&vs->filters_view);
@@ -277,19 +312,18 @@ static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_button_release(&vs->envelopes_view);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_button_release(&vs->routing_view);
     else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_button_release(&vs->devices_view);
-    else if (vs->active_tab == HDS_CLAP_TAB_GLOBAL) hds_clap_global_on_button_release(&vs->global_view);
 }
 
 static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int action, char ch) {
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_key(&p->gui_host, &vs->fx_view, action, ch);
 }
 
-static void hds_clap_gui_on_scroll(HdsClapGuiViewState *vs, double x, double y, int delta) {
+static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int delta) {
+    if (x < HDS_CLAP_GLOBAL_SIDEBAR_W) { hds_clap_global_on_scroll(p, &vs->global_view, vs->window_h, delta); return; }
     if (y < HDS_CLAP_TAB_BAR_H) return;
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_scroll(&vs->fx_view, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_scroll(&vs->lfos_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_scroll(&vs->envelopes_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
-    (void)x;
 }
 
 static void hds_clap_gui_on_resize(HdsClapGuiViewState *vs, int w, int h) {

@@ -77,7 +77,7 @@ static LRESULT CALLBACK hds_clap_gui_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPA
             if (w) {
                 POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
                 ScreenToClient(hwnd, &pt); // WM_MOUSEWHEEL's own lParam is in SCREEN coordinates, unlike every other mouse message here
-                hds_clap_gui_on_scroll(&w->view, (double)pt.x, (double)pt.y, GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1);
+                hds_clap_gui_on_scroll(w->plugin, &w->view, (double)pt.x, (double)pt.y, GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1);
             }
             return 0;
         case WM_SIZE:

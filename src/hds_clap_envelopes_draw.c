@@ -67,7 +67,7 @@ typedef struct {
     HdsFxRect title, intensity_knob, dest_pill, curve, mode_pill, dial[6];
 } HdsEnvPanelLayout;
 
-static void hds_clap_env_compute_panel_layout(int e, double scroll_offset_px, double panel_w, HdsEnvPanelLayout *out) {
+static void hds_clap_env_compute_panel_layout(int e, int env_type, double scroll_offset_px, double panel_w, HdsEnvPanelLayout *out) {
     memset(out, 0, sizeof(*out));
     double y = HDS_ENV_HEADER_H + e * HDS_ENV_PANEL_H - scroll_offset_px;
     out->title = (HdsFxRect){HDS_ENV_MARGIN, y, panel_w, HDS_ENV_TITLE_ROW_H};
@@ -79,8 +79,12 @@ static void hds_clap_env_compute_panel_layout(int e, double scroll_offset_px, do
     cy += HDS_ENV_CURVE_H + 6.0;
     out->mode_pill = (HdsFxRect){HDS_ENV_MARGIN, cy, 70.0, 16.0};
     cy += 16.0 + 10.0;
-    double dial_stride = panel_w / 6.0;
-    for (int i = 0; i < 6; i++) {
+    // dial[i] is the i-th VISIBLE knob's rect, left to right -- see HDS_PLAY_EG_FIELD_ORDER's own
+    // comment (hds_clap_play_draw.c) for why this is a per-type field order, not a fixed 6-slot
+    // arrangement with visibility toggling.
+    int count = hds_play_eg_dial_count(env_type);
+    double dial_stride = panel_w / (double)count;
+    for (int i = 0; i < count; i++) {
         out->dial[i] = (HdsFxRect){HDS_ENV_MARGIN + i * dial_stride + dial_stride / 2.0, cy + HDS_ENV_KNOB_R + 9.0, HDS_ENV_KNOB_R, HDS_ENV_KNOB_R};
     }
 }
@@ -166,7 +170,7 @@ static void hds_clap_envelopes_render(cairo_t *cr, HdsClapPlugin *p, HdsClapEnve
         if (env_type < 0 || env_type >= HDS_PLAY_EGMODE_COUNT) env_type = 0;
 
         HdsEnvPanelLayout L;
-        hds_clap_env_compute_panel_layout(e, vs->scroll_offset_px, panel_w, &L);
+        hds_clap_env_compute_panel_layout(e, env_type, vs->scroll_offset_px, panel_w, &L);
         if (L.title.y + HDS_ENV_PANEL_H < HDS_ENV_HEADER_H || L.title.y > window_h) continue;
 
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
@@ -199,15 +203,15 @@ static void hds_clap_envelopes_render(cairo_t *cr, HdsClapPlugin *p, HdsClapEnve
         bool mode_dd_open = (vs->dropdown_kind == HDS_ENV_DROPDOWN_MODE && vs->dropdown_row == e);
         hds_fx_draw_pill(cr, L.mode_pill.x, L.mode_pill.y, L.mode_pill.w, L.mode_pill.h, HDS_PLAY_EGMODE_NAMES[env_type], mode_dd_open, false);
 
-        bool show[6]; hds_play_eg_dial_visibility(env_type, show);
         double vals[6] = {eg->d, eg->h, eg->a, eg->dec, eg->s, eg->r};
-        for (int i = 0; i < 6; i++) {
-            if (!show[i]) continue;
-            float frac = (float)((vals[i] - HDS_PLAY_EG_LO[i]) / (HDS_PLAY_EG_HI[i] - HDS_PLAY_EG_LO[i]));
+        int dial_count = hds_play_eg_dial_count(env_type);
+        for (int i = 0; i < dial_count; i++) {
+            int field = HDS_PLAY_EG_FIELD_ORDER[env_type][i];
+            float frac = (float)((vals[field] - HDS_PLAY_EG_LO[field]) / (HDS_PLAY_EG_HI[field] - HDS_PLAY_EG_LO[field]));
             char vtxt[16];
-            if (i == 4) snprintf(vtxt, sizeof(vtxt), "%d%%", (int)(vals[i] + 0.5));
-            else snprintf(vtxt, sizeof(vtxt), "%dms", (int)(vals[i] + 0.5));
-            hds_play_draw_knob(cr, L.dial[i].x, L.dial[i].y, L.dial[i].w, frac, false, HDS_PLAY_DIAL_LABELS[i], vtxt);
+            if (field == HDS_PLAY_EG_FIELD_S) snprintf(vtxt, sizeof(vtxt), "%d%%", (int)(vals[field] + 0.5));
+            else snprintf(vtxt, sizeof(vtxt), "%dms", (int)(vals[field] + 0.5));
+            hds_play_draw_knob(cr, L.dial[i].x, L.dial[i].y, L.dial[i].w, frac, false, HDS_PLAY_DIAL_LABELS[field], vtxt);
         }
     }
     cairo_restore(cr);
@@ -292,7 +296,7 @@ static bool hds_clap_envelopes_on_button_press(HdsClapPlugin *p, HdsClapEnvelope
     int env_type = (int)prog->eg_mode[eg_idx];
 
     HdsEnvPanelLayout L;
-    hds_clap_env_compute_panel_layout(e, vs->scroll_offset_px, panel_w, &L);
+    hds_clap_env_compute_panel_layout(e, env_type, vs->scroll_offset_px, panel_w, &L);
 
     if (hds_play_knob_hit_test(&L.intensity_knob, x, y)) {
         hds_play_start_knob_drag(&vs->knob_drag, &prog->eg_intensity[e], -1.0, 1.0, y);
@@ -315,12 +319,12 @@ static bool hds_clap_envelopes_on_button_press(HdsClapPlugin *p, HdsClapEnvelope
         if (hit >= 0) vs->adsr_drag_eg = e;
         return true;
     }
-    bool dial_show[6]; hds_play_eg_dial_visibility(env_type, dial_show);
-    for (int d = 0; d < 6; d++) {
-        if (!dial_show[d]) continue;
+    int dial_count = hds_play_eg_dial_count(env_type);
+    for (int d = 0; d < dial_count; d++) {
         if (hds_play_knob_hit_test(&L.dial[d], x, y)) {
-            float *target = hds_play_eg_dial_target(eg, d);
-            hds_play_start_knob_drag(&vs->knob_drag, target, HDS_PLAY_EG_LO[d], HDS_PLAY_EG_HI[d], y);
+            int field = HDS_PLAY_EG_FIELD_ORDER[env_type][d];
+            float *target = hds_play_eg_dial_target(eg, field);
+            hds_play_start_knob_drag(&vs->knob_drag, target, HDS_PLAY_EG_LO[field], HDS_PLAY_EG_HI[field], y);
             return true;
         }
     }
@@ -345,7 +349,7 @@ static void hds_clap_envelopes_on_motion(HdsClapPlugin *p, HdsClapEnvelopesViewS
         int eg_idx = 4 + e;
         int env_type = (int)prog->eg_mode[eg_idx];
         HdsEnvPanelLayout L;
-        hds_clap_env_compute_panel_layout(e, vs->scroll_offset_px, panel_w, &L);
+        hds_clap_env_compute_panel_layout(e, env_type, vs->scroll_offset_px, panel_w, &L);
         AdsrEnvelopeState adsr;
         hds_clap_adsr_load_from_backend(&adsr, &prog->eg[eg_idx], env_type);
         adsr.active_node = vs->adsr_active_node[e];

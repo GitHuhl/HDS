@@ -64,8 +64,8 @@ static void hds_clap_gui_pump_events(HdsClapGuiWindow *w) {
         XNextEvent(w->display, &ev);
         switch (ev.type) {
             case ButtonPress:
-                if (ev.xbutton.button == 4) hds_clap_gui_on_scroll(&w->view, (double)ev.xbutton.x, (double)ev.xbutton.y, 1);
-                else if (ev.xbutton.button == 5) hds_clap_gui_on_scroll(&w->view, (double)ev.xbutton.x, (double)ev.xbutton.y, -1);
+                if (ev.xbutton.button == 4) hds_clap_gui_on_scroll(w->plugin, &w->view, (double)ev.xbutton.x, (double)ev.xbutton.y, 1);
+                else if (ev.xbutton.button == 5) hds_clap_gui_on_scroll(w->plugin, &w->view, (double)ev.xbutton.x, (double)ev.xbutton.y, -1);
                 else {
                     XSetInputFocus(w->display, w->win, RevertToParent, CurrentTime);
                     hds_clap_gui_on_button_press(w->plugin, &w->view, (double)ev.xbutton.x, (double)ev.xbutton.y, ev.xbutton.button == 3 ? 3 : 1);

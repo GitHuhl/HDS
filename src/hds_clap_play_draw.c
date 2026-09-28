@@ -140,7 +140,10 @@ static void hds_clap_play_view_state_init(HdsClapPlayViewState *vs) {
 // hds_fx_gui_compute_row_layout() already established.
 // ---------------------------------------------------------------------------------------------
 #define HDS_PLAY_MARGIN 8.0
-#define HDS_PLAY_OSC_COL_W 92.0
+// 130, not the original 92: each Amp EG panel below shares this same column width (see
+// hds_play_osc_col_x()/hds_play_render_eg_panel()'s own call site), and the widest topologies
+// (DADSR/AHDSR) show 5 dials at once -- 92px left them scrunched together with overlapping labels.
+#define HDS_PLAY_OSC_COL_W 130.0
 #define HDS_PLAY_KNOB_R 9.0
 #define HDS_PLAY_KNOB_STRIDE 40.0 // vertical space one knob (label+arc+value) reserves
 #define HDS_PLAY_PILL_H 16.0
@@ -241,7 +244,43 @@ typedef struct {
 
 #define HDS_PLAY_EG_CURVE_H 110.0
 
-static void hds_play_compute_eg_layout(int eg_index, double col_x, double col_w, double top_y, HdsPlayEgLayout *out) {
+// Field indices into HDS_PLAY_DIAL_LABELS/HDS_PLAY_EG_LO/HI/hds_play_eg_dial_target's own switch.
+#define HDS_PLAY_EG_FIELD_D   0
+#define HDS_PLAY_EG_FIELD_H   1
+#define HDS_PLAY_EG_FIELD_A   2
+#define HDS_PLAY_EG_FIELD_DEC 3
+#define HDS_PLAY_EG_FIELD_S   4
+#define HDS_PLAY_EG_FIELD_R   5
+
+// Per envelope-type, the ORDERED list of which fields are visible and in what left-to-right
+// on-screen order -- mirrors frontend.py's own ENV_TYPE_KNOB_ORDER exactly: its own ADSRPanel
+// docstring is explicit that it "physically shows, hides, and REORDERS knob columns on the screen
+// so the visible knobs always read left-to-right in the same order as the letters in the selected
+// envelope type's name." This is NOT the same as a fixed physical slot arrangement with per-slot
+// visibility toggling: that approach (this table's predecessor) silently broke ordering for AHD
+// and AHDSR specifically -- both names start with "A" (Attack), so Attack's dial must be the
+// LEFTMOST one visible, but Hold's own fixed field index (1) sits lower than Attack's (2), so
+// toggling visibility over fixed slots rendered Hold before Attack for exactly those two types.
+// -1 terminates a shorter row; each row has 6 entries (the max, DADSR/AHDSR), matching
+// HDS_PLAY_EGMODE_NAMES's own row order (ADSR, AR, AD, ASR, AHD, DADSR, AHDSR).
+static const int HDS_PLAY_EG_FIELD_ORDER[HDS_PLAY_EGMODE_COUNT][6] = {
+    /* ADSR  */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_DEC, HDS_PLAY_EG_FIELD_S, HDS_PLAY_EG_FIELD_R, -1, -1},
+    /* AR    */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_R, -1, -1, -1, -1},
+    /* AD    */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_DEC, -1, -1, -1, -1},
+    /* ASR   */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_S, HDS_PLAY_EG_FIELD_R, -1, -1, -1},
+    /* AHD   */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_H, HDS_PLAY_EG_FIELD_DEC, -1, -1, -1},
+    /* DADSR */ {HDS_PLAY_EG_FIELD_D, HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_DEC, HDS_PLAY_EG_FIELD_S, HDS_PLAY_EG_FIELD_R, -1},
+    /* AHDSR */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_H, HDS_PLAY_EG_FIELD_DEC, HDS_PLAY_EG_FIELD_S, HDS_PLAY_EG_FIELD_R, -1},
+};
+
+static int hds_play_eg_dial_count(int env_type) {
+    if (env_type < 0 || env_type >= HDS_PLAY_EGMODE_COUNT) env_type = 0;
+    int n = 0;
+    while (n < 6 && HDS_PLAY_EG_FIELD_ORDER[env_type][n] >= 0) n++;
+    return n;
+}
+
+static void hds_play_compute_eg_layout(int eg_index, int env_type, double col_x, double col_w, double top_y, HdsPlayEgLayout *out) {
     memset(out, 0, sizeof(*out));
     out->title = (HdsFxRect){col_x, top_y, col_w, 18.0};
     if (eg_index == 0) {
@@ -255,30 +294,16 @@ static void hds_play_compute_eg_layout(int eg_index, double col_x, double col_w,
     y += HDS_PLAY_EG_CURVE_H + 6.0;
     out->mode_pill = (HdsFxRect){col_x, y, 70.0, HDS_PLAY_PILL_H};
     y += HDS_PLAY_PILL_H + 10.0;
-    // All 6 dial rects are always computed here, regardless of which ones this EG's own topology
-    // actually uses (see hds_play_eg_dial_visibility()) -- geometry never depends on env_type, only
-    // WHETHER a dial is drawn/clickable does, and every caller (render, hit-test) checks visibility
-    // separately rather than this function pre-filtering it away.
-    double dial_stride = col_w / 6.0;
-    for (int i = 0; i < 6; i++) {
+    // dial[i] is the i-th VISIBLE knob's rect, left to right -- which underlying field that is
+    // comes from HDS_PLAY_EG_FIELD_ORDER[env_type][i], not from i itself (see that table's own
+    // comment). Spread evenly over however many are actually visible for this topology (2-5),
+    // not always over a fixed 6 slots, so a 2-knob topology (e.g. AR) doesn't leave 4 slots empty
+    // and a 5-knob one (DADSR/AHDSR) gets its full share of col_w instead of being squeezed into
+    // 5 of 6 equal slots.
+    int count = hds_play_eg_dial_count(env_type);
+    double dial_stride = col_w / (double)count;
+    for (int i = 0; i < count; i++) {
         out->dial[i] = (HdsFxRect){col_x + i * dial_stride + dial_stride / 2.0, y + HDS_PLAY_KNOB_R + 9.0, HDS_PLAY_KNOB_R, HDS_PLAY_KNOB_R};
-    }
-}
-
-// Which of the 6 Amp-EG dials are actually meaningful for a given topology -- mirrors
-// frontend.py's own ENV_TYPE_KNOB_ORDER exactly (env_type indices: 0=ADSR 1=AR 2=AD 3=ASR 4=AHD
-// 5=DADSR 6=AHDSR; dial indices: 0=Dly 1=Hld 2=A 3=Dec 4=S 5=R).
-static void hds_play_eg_dial_visibility(int env_type, bool *show /* [6] */) {
-    for (int i = 0; i < 6; i++) show[i] = false;
-    switch (env_type) {
-        case 0: show[2] = show[3] = show[4] = show[5] = true; break;             // ADSR: A,Dec,S,R
-        case 1: show[2] = show[5] = true; break;                                  // AR: A,R
-        case 2: show[2] = show[3] = true; break;                                  // AD: A,Dec
-        case 3: show[2] = show[4] = show[5] = true; break;                        // ASR: A,S,R
-        case 4: show[2] = show[1] = show[3] = true; break;                        // AHD: A,Hld,Dec
-        case 5: show[0] = show[2] = show[3] = show[4] = show[5] = true; break;     // DADSR: Dly,A,Dec,S,R
-        case 6: show[2] = show[1] = show[3] = show[4] = show[5] = true; break;     // AHDSR: A,Hld,Dec,S,R
-        default: show[2] = show[3] = show[4] = show[5] = true; break;
     }
 }
 
@@ -483,7 +508,7 @@ static void hds_play_render_dropdown(cairo_t *cr, HdsClapPlayViewState *vs, doub
 // computed. Each EG panel sits directly below its own same-numbered oscillator column (same x,
 // same width), not off to the side.
 // ---------------------------------------------------------------------------------------------
-#define HDS_PLAY_OSC_GAP 4.0
+#define HDS_PLAY_OSC_GAP 14.0 // widened from the original 4 -- clearer separation between strips
 #define HDS_PLAY_REGION_GAP 16.0 // vertical gap between the oscillator region and the EG region below it
 
 static double hds_play_osc_col_x(int osc) { return HDS_PLAY_MARGIN + osc * (HDS_PLAY_OSC_COL_W + HDS_PLAY_OSC_GAP); }
@@ -552,7 +577,7 @@ static void hds_play_render_eg_panel(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayV
     if (env_type < 0 || env_type >= HDS_PLAY_EGMODE_COUNT) env_type = 0;
 
     HdsPlayEgLayout L;
-    hds_play_compute_eg_layout(eg_index, col_x, col_w, top_y, &L);
+    hds_play_compute_eg_layout(eg_index, env_type, col_x, col_w, top_y, &L);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 9.0);
@@ -586,15 +611,15 @@ static void hds_play_render_eg_panel(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayV
     hds_fx_draw_pill(cr, L.mode_pill.x, L.mode_pill.y, L.mode_pill.w, L.mode_pill.h,
                       HDS_PLAY_EGMODE_NAMES[env_type], eg_dd_open, disabled);
 
-    bool show[6]; hds_play_eg_dial_visibility(env_type, show);
     double vals[6] = {eg->d, eg->h, eg->a, eg->dec, eg->s, eg->r};
-    for (int i = 0; i < 6; i++) {
-        if (!show[i]) continue;
-        float frac = (float)((vals[i] - HDS_PLAY_EG_LO[i]) / (HDS_PLAY_EG_HI[i] - HDS_PLAY_EG_LO[i]));
+    int count = hds_play_eg_dial_count(env_type);
+    for (int i = 0; i < count; i++) {
+        int field = HDS_PLAY_EG_FIELD_ORDER[env_type][i];
+        float frac = (float)((vals[field] - HDS_PLAY_EG_LO[field]) / (HDS_PLAY_EG_HI[field] - HDS_PLAY_EG_LO[field]));
         char vtxt[16];
-        if (i == 4) snprintf(vtxt, sizeof(vtxt), "%d%%", (int)(vals[i] + 0.5));
-        else snprintf(vtxt, sizeof(vtxt), "%dms", (int)(vals[i] + 0.5));
-        hds_play_draw_knob(cr, L.dial[i].x, L.dial[i].y, L.dial[i].w, frac, disabled, HDS_PLAY_DIAL_LABELS[i], vtxt);
+        if (field == HDS_PLAY_EG_FIELD_S) snprintf(vtxt, sizeof(vtxt), "%d%%", (int)(vals[field] + 0.5));
+        else snprintf(vtxt, sizeof(vtxt), "%dms", (int)(vals[field] + 0.5));
+        hds_play_draw_knob(cr, L.dial[i].x, L.dial[i].y, L.dial[i].w, frac, disabled, HDS_PLAY_DIAL_LABELS[field], vtxt);
     }
 }
 
@@ -699,8 +724,9 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
     (void)window_w;
     double eg_top_y = hds_play_eg_top_y(prog);
     for (int i = 0; i < 4; i++) {
+        int env_type = (int)prog->eg_mode[i];
         HdsPlayEgLayout L;
-        hds_play_compute_eg_layout(i, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, eg_top_y, &L);
+        hds_play_compute_eg_layout(i, env_type, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, eg_top_y, &L);
         bool disabled = (i > 0 && vs->amp_eg_live_sync);
 
         if (i == 0) {
@@ -722,7 +748,6 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
             return true;
         }
         if (!disabled && hds_play_rect_contains(&L.curve, x, y)) {
-            int env_type = (int)prog->eg_mode[i];
             AdsrEnvelopeState adsr;
             hds_clap_adsr_load_from_backend(&adsr, &prog->eg[i], env_type);
             adsr_calculate_geometry(&adsr, L.curve.w, L.curve.h); // populates point_x/y/count -- hit-testing needs real geometry, not just the raw d/h/a/... values
@@ -732,12 +757,12 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
             return true;
         }
         if (!disabled) {
-            bool dial_show[6]; hds_play_eg_dial_visibility((int)prog->eg_mode[i], dial_show);
-            for (int d = 0; d < 6; d++) {
-                if (!dial_show[d]) continue; // a hidden dial's rect is still geometrically valid (see hds_play_compute_eg_layout's own comment) but must never be clickable
+            int count = hds_play_eg_dial_count(env_type);
+            for (int d = 0; d < count; d++) {
                 if (hds_play_knob_hit_test(&L.dial[d], x, y)) {
-                    float *target = hds_play_eg_dial_target(&prog->eg[i], d);
-                    hds_play_start_knob_drag(&vs->knob_drag, target, HDS_PLAY_EG_LO[d], HDS_PLAY_EG_HI[d], y);
+                    int field = HDS_PLAY_EG_FIELD_ORDER[env_type][d];
+                    float *target = hds_play_eg_dial_target(&prog->eg[i], field);
+                    hds_play_start_knob_drag(&vs->knob_drag, target, HDS_PLAY_EG_LO[field], HDS_PLAY_EG_HI[field], y);
                     return true;
                 }
             }
@@ -771,7 +796,7 @@ static void hds_clap_play_on_motion(HdsClapPlugin *p, HdsClapPlayViewState *vs, 
         int i = vs->adsr_drag_eg;
         int env_type = (int)prog->eg_mode[i];
         HdsPlayEgLayout L;
-        hds_play_compute_eg_layout(i, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, hds_play_eg_top_y(prog), &L);
+        hds_play_compute_eg_layout(i, env_type, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, hds_play_eg_top_y(prog), &L);
         AdsrEnvelopeState adsr;
         hds_clap_adsr_load_from_backend(&adsr, &prog->eg[i], env_type);
         adsr.active_node = vs->adsr_active_node[i];
