@@ -70,6 +70,18 @@
 #include <semaphore.h>
 #endif
 
+// Native GUI (--gui flag, see this file's own HdsClapPlugin g_gui_ctx section further down): set by
+// the Makefile's pkg-config auto-detection, same "opt-in dependency, detected automatically" posture
+// as HDS_PIPEWIRE_ENABLED just above. Unlike PipeWire, this ISN'T about runtime availability on the
+// build machine -- it's that this same file is also compiled for the aarch64 cross-build (`make
+// arm64`, see the Makefile's own ARM64_BIN_OBJ rule), which cross-compiles NO Cairo/X11 at all (that
+// target is the headless backend engine only, no GUI client -- see the Makefile's own comment on
+// it), so aarch64-unknown-linux-gnu-gcc would fail outright on the <cairo/cairo.h>/<X11/Xlib.h>
+// includes this flag guards if it were ever left unconditional.
+#ifndef HDS_STANDALONE_GUI_ENABLED
+#define HDS_STANDALONE_GUI_ENABLED 0
+#endif
+
 #include "backend.c"
 
 // Keeps track of which ALSA sequencer client:port pairs are currently subscribed to feed our
@@ -1682,6 +1694,63 @@ static void poll_stdin_control(SynthSharedControls *knobs, HdsSampleEngine *se) 
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Native GUI (opt-in via --gui): the SAME Cairo-drawn tab bar/sidebar hds.clap already embeds in a
+// DAW host, opened here as this process's own top-level X11 window instead -- see
+// hds_engine_instance.h's own header comment for why HdsClapPlugin (despite its name) is exactly
+// the right shared context type to reuse, and hds_standalone_gui_x11.c's own header comment for
+// how this differs from hds.clap's own embedded-window platform shim (hds_clap_gui_x11.c).
+//
+// hds_fx_gui_host.h/hds_engine_instance.h have no Cairo/X11 dependency of their own (plain struct
+// definitions over backend.c's own types) so they're included UNCONDITIONALLY -- g_gui_ctx (below)
+// stays a real HdsClapPlugin, and g_gui_ctx.knobs stays THIS file's actual SynthSharedControls,
+// regardless of whether this particular build has the native GUI compiled in at all. Only the
+// actual DRAW files (Cairo) and hds_standalone_gui_x11.c (X11) need HDS_STANDALONE_GUI_ENABLED's
+// guard -- see that macro's own comment on why (the aarch64 cross-build has neither available).
+// hds_engine_instance.h's own HdsClapPlugin struct embeds a real clap_plugin_t/clap_host_t pair
+// (unused here -- g_gui_ctx.host stays NULL, this process has no CLAP host at all -- but still
+// part of the struct's layout, same as clap_plugin.c's own identical include right before its own
+// #include of this same header) -- pulled in via the CLAP SDK's own header, exactly as
+// clap_plugin.c does, purely for these type definitions; this app links no CLAP-specific code.
+#include "../third_party/clap/include/clap/clap.h"
+#include "hds_fx_gui_host.h"
+#include "hds_engine_instance.h"
+#if HDS_STANDALONE_GUI_ENABLED
+// HDS_FX_PORT_COUNT mirrors clap_plugin.c's own identical #define immediately before this same
+// include chain there -- see that file's own comment: this app, like hds.clap, has no flat N-port
+// Input/Output concept for the FX tab's Source combo (a slot's Input is which SOURCE feeds it),
+// so port_input_stereo/port_output_channel stay NULL (calloc-zeroed) and SOURCE_COUNT is reused as
+// the nearest analogous count instead.
+#define HDS_FX_PORT_COUNT SOURCE_COUNT
+#include "hds_fx_gui_draw.c"
+#include "hds_clap_play_draw.c"
+#include "hds_clap_combi_draw.c"
+#include "hds_clap_filters_draw.c"
+#include "hds_clap_lfos_draw.c"
+#include "hds_clap_envelopes_draw.c"
+#include "hds_clap_routing_draw.c"
+#include "hds_clap_devices_draw.c"
+#include "hds_clap_global_draw.c"
+#include "hds_clap_gui_draw.c"
+#include "hds_standalone_gui_x11.c"
+#endif
+
+// g_gui_ctx is a real, live, process-wide HdsClapPlugin -- g_gui_ctx.knobs (this file's own
+// SynthSharedControls, formerly a local `active_knobs` variable main() declared on its own stack)
+// IS the actual state the audio engine reads every block, not a second copy: the native GUI
+// reads/writes it directly, in-process, the exact same "no OSC round trip, no sync needed" design
+// hds_engine_instance.h's own header comment already establishes for hds.clap's per-instance
+// struct. Every other HdsClapPlugin field (the CLAP host pointer, per-instance sample/engine/voice
+// state, ...) stays unused here -- this app already has its own equivalent state as separate
+// globals/locals (g_engine, g_sample_engine, voices[], ...), exactly as that same header comment
+// discloses. File-scope static (not a main()-local), since hds_standalone_gui_pump() (called from
+// main()'s own loop) and hds_standalone_gui_create()/destroy() all need to reach it too, and this
+// process has exactly one instance of everything -- no per-instance addressing to thread through.
+// (No separate view-state global needed here -- hds_standalone_gui_x11.c's own HdsStandaloneGuiWindow
+// struct already owns its HdsClapGuiViewState internally, initialized inside
+// hds_standalone_gui_create(), the same way hds.clap's own HdsClapGuiWindow does.)
+static HdsClapPlugin g_gui_ctx;
+
 int main(int argc, char **argv) {
     assert_fm_algorithms_acyclic();
     signal(SIGINT, handle_sigint);
@@ -1729,6 +1798,11 @@ int main(int argc, char **argv) {
     // right between the two flags: nothing about loading a Program can ever touch this value).
     float cli_master_volume = 0.0f;
     bool cli_master_volume_set = false;
+    // --gui: opt-in only (default OFF) -- this is the SAME headless OSC-controlled daemon it always
+    // was unless asked otherwise, so an existing deployment with no X server (e.g. a headless
+    // Raspberry Pi) keeps working unchanged. See hds_standalone_gui_x11.c's own header comment for
+    // what the window itself does.
+    bool cli_gui = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--osc-listen-port") == 0 && i + 1 < argc) osc_listen_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--osc-reply-host") == 0 && i + 1 < argc) osc_reply_host = argv[++i];
@@ -1743,6 +1817,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--sfz-vco4") == 0 && i + 1 < argc) cli_sfz_path[3] = argv[++i];
         else if (strcmp(argv[i], "--program") == 0 && i + 1 < argc) cli_program_path = argv[++i];
         else if (strcmp(argv[i], "--master-volume") == 0 && i + 1 < argc) { cli_master_volume = (float)atof(argv[++i]); cli_master_volume_set = true; }
+        else if (strcmp(argv[i], "--gui") == 0) cli_gui = true;
     }
 
     if (strcmp(cli_backend, "pipewire") == 0) {
@@ -1760,13 +1835,29 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    SynthSharedControls active_knobs; init_default_controls(&active_knobs);
-    if (cli_output_device) snprintf(active_knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", cli_output_device);
-    if (cli_input_device) snprintf(active_knobs.input_device, AUDIO_DEVICE_NAME_LEN, "%s", cli_input_device);
+    init_default_controls(&g_gui_ctx.knobs);
+    if (cli_output_device) snprintf(g_gui_ctx.knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", cli_output_device);
+    if (cli_input_device) snprintf(g_gui_ctx.knobs.input_device, AUDIO_DEVICE_NAME_LEN, "%s", cli_input_device);
+
+    // Wire the HdsFxGuiHost view onto this process's own real fx[] -- mirrors
+    // clap_factory_create_plugin()'s own identical three lines in clap_plugin.c exactly. The four
+    // port_* pointers stay NULL (g_gui_ctx is a static, zero-initialized global): this app, like
+    // hds.clap, has no flat N-port Input/Output concept (see this file's own HDS_FX_PORT_COUNT
+    // comment above).
+    g_gui_ctx.gui_host.fx = g_gui_ctx.knobs.fx;
+    g_gui_ctx.gui_host.source_count = SOURCE_COUNT;
+    g_gui_ctx.gui_host.source_label = hds_clap_source_label;
+#if HDS_STANDALONE_GUI_ENABLED
+    if (cli_gui && !hds_standalone_gui_create(&g_gui_ctx)) {
+        fprintf(stderr, "[hds] --gui requested but the native GUI window could not be created -- continuing headless.\n");
+    }
+#else
+    if (cli_gui) fprintf(stderr, "[hds] --gui requested but this build has no native GUI support (no Cairo/X11 at build time) -- continuing headless.\n");
+#endif
 
     // Non-threaded lo_server, polled once per audio block from the main loop below (see the
     // "while (lo_server_recv_noblock(...))" call site) -- deliberately NOT lo_server_thread, so
-    // only this thread ever touches active_knobs/g_sample_slots, exactly like the poll_*_socket()
+    // only this thread ever touches g_gui_ctx.knobs/g_sample_slots, exactly like the poll_*_socket()
     // functions this replaces. The zone methods are registered with explicit type strings (liblo
     // tries the most specific registration first), the knob table's generic method last with
     // path=NULL/type=NULL as the catch-all for everything else.
@@ -1807,11 +1898,11 @@ int main(int argc, char **argv) {
     // a fixed configured target -- see request_state_handler's own comment on why. state_request_ctx
     // has this function's own full lifetime (never returns before shutdown), so a pointer to it
     // stays valid for as long as osc_server itself does.
-    HdsStateRequestContext state_request_ctx = { &active_knobs };
+    HdsStateRequestContext state_request_ctx = { &g_gui_ctx.knobs };
     lo_server_add_method(osc_server, "/hds/request_state", "", request_state_handler, &state_request_ctx);
 
     // "/hds/song/import_smf" -- see request_state's own comment just above on reply-to-sender.
-    HdsSmfImportContext smf_import_ctx = { &g_engine, &active_knobs };
+    HdsSmfImportContext smf_import_ctx = { &g_engine, &g_gui_ctx.knobs };
     lo_server_add_method(osc_server, "/hds/song/import_smf", "sf", song_import_smf_handler, &smf_import_ctx);
 
     // "/hds/song/import_smf_track" -- per-lane "Load MIDI..." (Sequencer tab), same reply-to-sender
@@ -1824,14 +1915,14 @@ int main(int argc, char **argv) {
     // itself (declared just above, same function scope, same lifetime as osc_server) -- the exact
     // variable send_osc_status()/send_seq_audio_status() already read from at their own call sites
     // further down this loop, so subscribing needs no changes there at all.
-    lo_server_add_method(osc_server, "/hds/ping", "", ping_handler, &active_knobs);
+    lo_server_add_method(osc_server, "/hds/ping", "", ping_handler, &g_gui_ctx.knobs);
     HdsSubscribeContext subscribe_ctx = { &osc_reply_addr };
     lo_server_add_method(osc_server, "/hds/subscribe", "", subscribe_handler, &subscribe_ctx);
 
 #if HDS_NAM_ENABLED
     // FX slot NAM model/cab IR upload -- see fx_upload_begin_handler's own comment. Gated the same
     // as the rest of NAM support (HDS_NAM_ENABLED) since it exists purely to feed that FX type.
-    HdsFxUploadContext fx_upload_ctx = { &g_engine, &active_knobs };
+    HdsFxUploadContext fx_upload_ctx = { &g_engine, &g_gui_ctx.knobs };
     lo_server_add_method(osc_server, "/hds/fx/upload_begin", "iiii", fx_upload_begin_handler, &fx_upload_ctx);
     lo_server_add_method(osc_server, "/hds/fx/upload_chunk", "ib", fx_upload_chunk_handler, &fx_upload_ctx);
     lo_server_add_method(osc_server, "/hds/fx/upload_end", "", fx_upload_end_handler, &fx_upload_ctx);
@@ -1839,7 +1930,7 @@ int main(int argc, char **argv) {
 
     // The real catch-all, registered LAST -- see its own comment above (right after the
     // /hds/tuning/load_scl registration) for why registration order here is load-bearing.
-    lo_server_add_method(osc_server, NULL, NULL, generic_osc_handler, &active_knobs);
+    lo_server_add_method(osc_server, NULL, NULL, generic_osc_handler, &g_gui_ctx.knobs);
 
     // --sfz-vcoN startup loading: right here, after the OSC methods are registered (so a
     // subsequent /hds/zone/load_sfz can still layer on top live) but before open_pcm_stream()
@@ -1856,7 +1947,7 @@ int main(int argc, char **argv) {
     }
 
     if (cli_program_path) {
-        hds_load_program_file(&active_knobs, &g_sample_engine, cli_program_path);
+        hds_load_program_file(&g_gui_ctx.knobs, &g_sample_engine, cli_program_path);
         // Best-effort seed for the arrow-key Left/Right cycle's "start relative to the current
         // Program" behavior (see hds_cycle_program's own comment) -- just the basename minus its
         // extension, regardless of whether this path actually lives under ~/HDS_Programs. If it
@@ -1870,7 +1961,7 @@ int main(int argc, char **argv) {
         if (dot) *dot = '\0';
     }
     if (cli_master_volume_set) {
-        active_knobs.master_volume = cli_master_volume;
+        g_gui_ctx.knobs.master_volume = cli_master_volume;
         fprintf(stderr, "[cli] --master-volume %.3f\n", (double)cli_master_volume);
     }
 
@@ -1878,17 +1969,17 @@ int main(int argc, char **argv) {
     // see the multi-source routing model's output-pair grid (SynthSharedControls.source_routing)
     // -- not hardcoded stereo, so a class-compliant multichannel interface's extra outputs are
     // actually reachable, not just its first pair. Symmetric with the input side just below.
-    int detected_output_channels = query_output_device_channel_count(active_knobs.output_device);
+    int detected_output_channels = query_output_device_channel_count(g_gui_ctx.knobs.output_device);
     HdsPcmStream *pcm_handle = NULL;
-    if (!open_pcm_stream(active_knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels)) {
+    if (!open_pcm_stream(g_gui_ctx.knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, g_gui_ctx.knobs.audio_latency_ms, detected_output_channels)) {
         // Rather than exiting immediately, offer an interactive way out -- but only when stdin is
         // actually a terminal (a non-interactive launch, e.g. a systemd unit or CI, can never
         // answer a prompt and would otherwise hang forever on fgets() waiting for input that will
         // never come). See interactive_recover_output_device()'s own comment for the full story.
         bool opened = false;
         if (isatty(STDIN_FILENO)) {
-            fprintf(stderr, "Could not open the configured output device ('%s').\n", active_knobs.output_device);
-            opened = interactive_recover_output_device(&active_knobs, &pcm_handle, &detected_output_channels);
+            fprintf(stderr, "Could not open the configured output device ('%s').\n", g_gui_ctx.knobs.output_device);
+            opened = interactive_recover_output_device(&g_gui_ctx.knobs, &pcm_handle, &detected_output_channels);
         }
         if (!opened) {
             fprintf(stderr, "Cannot continue without an output device.\n");
@@ -1896,7 +1987,7 @@ int main(int argc, char **argv) {
         }
     }
     char applied_output_device[AUDIO_DEVICE_NAME_LEN];
-    snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
+    snprintf(applied_output_device, sizeof(applied_output_device), "%s", g_gui_ctx.knobs.output_device);
 
     // External Audio Input: best-effort. Unlike output, a capture device failing to open isn't
     // fatal -- external input just stays silent (ext_in_enable has nothing to mix in) until a
@@ -1905,11 +1996,11 @@ int main(int argc, char **argv) {
     // not hardcoded stereo, so a class-compliant multichannel interface's extra inputs are
     // actually reachable, not just its first two.
     HdsPcmStream *pcm_capture_handle = NULL;
-    int detected_input_channels = query_device_channel_count(active_knobs.input_device);
-    open_pcm_stream(active_knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels);
+    int detected_input_channels = query_device_channel_count(g_gui_ctx.knobs.input_device);
+    open_pcm_stream(g_gui_ctx.knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, g_gui_ctx.knobs.audio_latency_ms, detected_input_channels);
     char applied_input_device[AUDIO_DEVICE_NAME_LEN];
-    snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
-    float applied_audio_latency_ms = active_knobs.audio_latency_ms;
+    snprintf(applied_input_device, sizeof(applied_input_device), "%s", g_gui_ctx.knobs.input_device);
+    float applied_audio_latency_ms = g_gui_ctx.knobs.audio_latency_ms;
 
     // Recording engine: `record_ring`/writer thread state must be static -- RecordEngine embeds
     // a RECORD_RING_CAPACITY(1<<22)-float ring buffer (16MB), far too large for main()'s stack.
@@ -1954,10 +2045,10 @@ int main(int argc, char **argv) {
     snd_seq_connect_from(seq_handle, our_midi_port, SND_SEQ_CLIENT_SYSTEM, SND_SEQ_PORT_SYSTEM_ANNOUNCE);
 
     MidiSourceList midi_sources = {0};
-    midi_autoconnect_scan(seq_handle, our_midi_port, active_knobs.midi_device, &midi_sources);
+    midi_autoconnect_scan(seq_handle, our_midi_port, g_gui_ctx.knobs.midi_device, &midi_sources);
     MidiLiveState midi_live = {0}; // pitch_bend/channel_pressure/cc[] all start at their "centered/off" 0.0
     char applied_midi_device[AUDIO_DEVICE_NAME_LEN];
-    snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
+    snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", g_gui_ctx.knobs.midi_device);
 
     float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}}; int vu_decimator = 0;
 
@@ -1968,16 +2059,19 @@ int main(int argc, char **argv) {
 
     while (g_synth_running) {
         // Drain every pending OSC datagram this block -- generic_osc_handler/zone_upsert_handler/
-        // zone_remove_handler write directly into active_knobs/g_sample_slots as each message is
+        // zone_remove_handler write directly into g_gui_ctx.knobs/g_sample_slots as each message is
         // dispatched, so nothing further is needed here once this returns 0 (no more pending).
         while (lo_server_recv_noblock(osc_server, 0) > 0) {}
-        poll_stdin_control(&active_knobs, &g_sample_engine); // arrow keys: Up/Down = master volume, Left/Right = Program cycle -- see its own comment
-        poll_seq_audio_load_requests(&g_streams_state, &active_knobs); // spawns a loader thread if a lane's audio_path changed
+#if HDS_STANDALONE_GUI_ENABLED
+        hds_standalone_gui_pump(); // no-op if --gui was never passed (g_standalone_gui_window stays NULL) -- see its own comment
+#endif
+        poll_stdin_control(&g_gui_ctx.knobs, &g_sample_engine); // arrow keys: Up/Down = master volume, Left/Right = Program cycle -- see its own comment
+        poll_seq_audio_load_requests(&g_streams_state, &g_gui_ctx.knobs); // spawns a loader thread if a lane's audio_path changed
         // poll_fx_nam_requests() itself now runs once per block from inside render_audio_block
         // (backend.c), right after sync_fx_engine_types() -- see that call site's own comment --
         // rather than being polled separately here, so it stays in sync with the exact same
         // "once per block" cadence for both this binary and clap_plugin.c alike.
-        poll_seq_audio_preview_triggers(&g_streams_state, &active_knobs); // starts one-shot playback if a lane's Preview button was clicked
+        poll_seq_audio_preview_triggers(&g_streams_state, &g_gui_ctx.knobs); // starts one-shot playback if a lane's Preview button was clicked
 
         // Programmable tempo: resolved once per block from the Tempo knob/tempo-map (see
         // compute_current_tempo_bpm()) against the Sequencer's own playhead position
@@ -2000,64 +2094,64 @@ int main(int argc, char **argv) {
         // to here, so nothing else needs to know or care which source it came from. Falls back to
         // Internal automatically if no clock tick has arrived recently (a disconnected/unplugged
         // external source degrades to the Tempo knob rather than freezing at a stale BPM).
-        bool use_external_clock = (active_knobs.seq_sync_source != 0.0f) && g_engine.midi_clock_valid
+        bool use_external_clock = (g_gui_ctx.knobs.seq_sync_source != 0.0f) && g_engine.midi_clock_valid
             && (hds_monotonic_seconds() - g_engine.midi_clock_last_tick_sec) < HDS_MIDI_CLOCK_TIMEOUT_SEC;
-        float current_tempo_bpm = use_external_clock ? g_engine.midi_clock_bpm : compute_current_tempo_bpm(&active_knobs, g_transport_playhead_sec);
+        float current_tempo_bpm = use_external_clock ? g_engine.midi_clock_bpm : compute_current_tempo_bpm(&g_gui_ctx.knobs, g_transport_playhead_sec);
 
         // block_size is computed here rather than down at its own former spot (right before
         // advance_transport_playhead) so poll_metronome -- which now runs its own free-running
         // clock in whole blocks, independent of the Sequencer transport (see its own comment) --
         // has it available too. effective_block_size() is a pure, trivial clamp of a knob value,
         // so calling it this much earlier costs nothing.
-        int block_size = effective_block_size(&active_knobs);
-        poll_transport_triggers(&g_streams_state, &g_engine, &active_knobs, current_tempo_bpm); // Play/Pause/Stop/Seek -- starts/freezes/resets/repositions the real Sequencer playhead
-        poll_metronome(&g_engine, &active_knobs, current_tempo_bpm, block_size); // schedules the next click, if engaged -- independent of transport state
-        poll_seq_audio_transport_catchup(&g_streams_state, &g_engine, &active_knobs); // starts any lane whose load finished after Play was already pressed
+        int block_size = effective_block_size(&g_gui_ctx.knobs);
+        poll_transport_triggers(&g_streams_state, &g_engine, &g_gui_ctx.knobs, current_tempo_bpm); // Play/Pause/Stop/Seek -- starts/freezes/resets/repositions the real Sequencer playhead
+        poll_metronome(&g_engine, &g_gui_ctx.knobs, current_tempo_bpm, block_size); // schedules the next click, if engaged -- independent of transport state
+        poll_seq_audio_transport_catchup(&g_streams_state, &g_engine, &g_gui_ctx.knobs); // starts any lane whose load finished after Play was already pressed
 
         // Live device switching: the Audio tab writes these as plain fields on the same control
         // packet as every other knob. Only reopen the stream whose name actually changed.
         // A latency change reopens BOTH streams (it's not tied to one device name), since
         // snd_pcm_set_params' latency target can only be applied at stream-open time.
-        bool latency_changed = active_knobs.audio_latency_ms != applied_audio_latency_ms;
+        bool latency_changed = g_gui_ctx.knobs.audio_latency_ms != applied_audio_latency_ms;
         // Defensive: an empty device name is never a real selection (unlike midi_device, which
         // has a genuine "auto" meaning for ""; see midi_client_should_autoconnect) -- it can only
         // mean a control packet arrived with this field not meaningfully set yet. Treat it as "no
         // change requested" rather than trying to open a PCM device named "", which fails every
         // time and, if it kept recurring on every poll, would flood stderr with ALSA errors and
         // starve the audio thread's attention on nothing but failed reopen attempts.
-        bool output_device_valid = active_knobs.output_device[0] != '\0';
-        if (output_device_valid && (latency_changed || strncmp(active_knobs.output_device, applied_output_device, AUDIO_DEVICE_NAME_LEN) != 0)) {
+        bool output_device_valid = g_gui_ctx.knobs.output_device[0] != '\0';
+        if (output_device_valid && (latency_changed || strncmp(g_gui_ctx.knobs.output_device, applied_output_device, AUDIO_DEVICE_NAME_LEN) != 0)) {
             // Re-detect channel count too -- a device switch can mean a completely different
             // interface with a different channel count, not just a renamed same one.
-            int candidate_output_channels = query_output_device_channel_count(active_knobs.output_device);
-            if (open_pcm_stream(active_knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, candidate_output_channels)) {
+            int candidate_output_channels = query_output_device_channel_count(g_gui_ctx.knobs.output_device);
+            if (open_pcm_stream(g_gui_ctx.knobs.output_device, HDS_STREAM_PLAYBACK, &pcm_handle, g_gui_ctx.knobs.audio_latency_ms, candidate_output_channels)) {
                 detected_output_channels = candidate_output_channels;
-                snprintf(applied_output_device, sizeof(applied_output_device), "%s", active_knobs.output_device);
+                snprintf(applied_output_device, sizeof(applied_output_device), "%s", g_gui_ctx.knobs.output_device);
             } else {
                 // Failed -- fall back to the last device that was actually working rather than
                 // leaving pcm_handle NULL, and stop retrying this same bad name every block.
-                open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels);
-                snprintf(active_knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", applied_output_device);
+                open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, g_gui_ctx.knobs.audio_latency_ms, detected_output_channels);
+                snprintf(g_gui_ctx.knobs.output_device, AUDIO_DEVICE_NAME_LEN, "%s", applied_output_device);
             }
         } else if (latency_changed) {
             // Latency-only change with no valid device name yet -- still worth reapplying to
             // whatever's already open rather than silently doing nothing.
-            open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, active_knobs.audio_latency_ms, detected_output_channels);
+            open_pcm_stream(applied_output_device, HDS_STREAM_PLAYBACK, &pcm_handle, g_gui_ctx.knobs.audio_latency_ms, detected_output_channels);
         }
-        bool input_device_valid = active_knobs.input_device[0] != '\0';
-        if (input_device_valid && (latency_changed || strncmp(active_knobs.input_device, applied_input_device, AUDIO_DEVICE_NAME_LEN) != 0)) {
+        bool input_device_valid = g_gui_ctx.knobs.input_device[0] != '\0';
+        if (input_device_valid && (latency_changed || strncmp(g_gui_ctx.knobs.input_device, applied_input_device, AUDIO_DEVICE_NAME_LEN) != 0)) {
             // Re-detect channel count too -- a device switch can mean a completely different
             // interface with a different channel count, not just a renamed same one.
-            detected_input_channels = query_device_channel_count(active_knobs.input_device);
-            open_pcm_stream(active_knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, active_knobs.audio_latency_ms, detected_input_channels); // best-effort
-            snprintf(applied_input_device, sizeof(applied_input_device), "%s", active_knobs.input_device);
+            detected_input_channels = query_device_channel_count(g_gui_ctx.knobs.input_device);
+            open_pcm_stream(g_gui_ctx.knobs.input_device, HDS_STREAM_CAPTURE, &pcm_capture_handle, g_gui_ctx.knobs.audio_latency_ms, detected_input_channels); // best-effort
+            snprintf(applied_input_device, sizeof(applied_input_device), "%s", g_gui_ctx.knobs.input_device);
         }
-        if (latency_changed) { applied_audio_latency_ms = active_knobs.audio_latency_ms; }
-        if (strncmp(active_knobs.midi_device, applied_midi_device, AUDIO_DEVICE_NAME_LEN) != 0) {
+        if (latency_changed) { applied_audio_latency_ms = g_gui_ctx.knobs.audio_latency_ms; }
+        if (strncmp(g_gui_ctx.knobs.midi_device, applied_midi_device, AUDIO_DEVICE_NAME_LEN) != 0) {
             // Selection changed live from the Audio tab -- drop whatever was auto-connected
             // under the old selection and rescan under the new one.
-            midi_autoconnect_scan(seq_handle, our_midi_port, active_knobs.midi_device, &midi_sources);
-            snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", active_knobs.midi_device);
+            midi_autoconnect_scan(seq_handle, our_midi_port, g_gui_ctx.knobs.midi_device, &midi_sources);
+            snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", g_gui_ctx.knobs.midi_device);
         }
 
         // Sample Bank: reconciliation now happens once per "/hds/zone/upsert"/"/hds/zone/remove"
@@ -2069,8 +2163,8 @@ int main(int argc, char **argv) {
         // block (see its #define for the real-time trade-off this bounds).
         drain_pending_sample_loads(&g_sample_engine);
 
-        process_midi_input(&g_streams_state, &g_engine, &g_sample_engine, seq_handle, voices, &active_knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live, current_tempo_bpm);
-        seq_playback_midi_events(&g_engine, &g_sample_engine, voices, &active_knobs, global_lfo_phases, &mono_stacks[SINGLE_PROGRAM_SLOT], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets SINGLE_PROGRAM_SLOT)
+        process_midi_input(&g_streams_state, &g_engine, &g_sample_engine, seq_handle, voices, &g_gui_ctx.knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live, current_tempo_bpm);
+        seq_playback_midi_events(&g_engine, &g_sample_engine, voices, &g_gui_ctx.knobs, global_lfo_phases, &mono_stacks[SINGLE_PROGRAM_SLOT], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets SINGLE_PROGRAM_SLOT)
 
         // voice_limit is computed fresh every iteration since it's a live, user-adjustable
         // control (Audio tab: Polyphony) -- see effective_voice_limit(). block_size itself was
@@ -2078,7 +2172,7 @@ int main(int argc, char **argv) {
         // capture_buffer/buffer stay declared at the hard BUFFER_SIZE ceiling; only the first
         // block_size frames of each are actually read/written/rendered this iteration.
         advance_transport_playhead(&g_engine, block_size); // advances the real Sequencer playhead by exactly this block's worth of time, only while PLAYING
-        poll_arpeggiator(&g_engine, &g_sample_engine, voices, &active_knobs, global_lfo_phases, mono_stacks, &midi_live, block_size); // fires the next arp step(s) for every Program with arp_enabled, independent of Sequencer transport state
+        poll_arpeggiator(&g_engine, &g_sample_engine, voices, &g_gui_ctx.knobs, global_lfo_phases, mono_stacks, &midi_live, block_size); // fires the next arp step(s) for every Program with arp_enabled, independent of Sequencer transport state
 
         // Read one block of external input, ALL detected_input_channels of it -- interleaved,
         // stride detected_input_channels per frame (not always 2 anymore; see
@@ -2098,7 +2192,7 @@ int main(int argc, char **argv) {
         // DIAGNOSTIC: cheap (active_voice_limit simple state checks, negligible next to the
         // render itself) count of currently-active voices, purely to report alongside any
         // underrun/over-budget warning below -- see the comment on write_audio_block.
-        int voice_limit = effective_voice_limit(&active_knobs);
+        int voice_limit = effective_voice_limit(&g_gui_ctx.knobs);
         int active_voices_count = 0;
         for (int v = 0; v < voice_limit; v++) {
             if (voices[v].vco1_eg.state != STATE_IDLE || voices[v].vco2_eg.state != STATE_IDLE || voices[v].vco3_eg.state != STATE_IDLE) active_voices_count++;
@@ -2110,9 +2204,8 @@ int main(int argc, char **argv) {
         static float buffer[BUFFER_SIZE * OUTPUT_MAX_CHANNELS];
         struct timespec render_t0, render_t1;
         clock_gettime(CLOCK_MONOTONIC, &render_t0);
-        float ext_in_peak[EXT_IN_PAIR_COUNT];
         float gr_db[FX_SLOT_COUNT];
-        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &active_knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer, current_tempo_bpm, ext_in_peak, NULL, gr_db);
+        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &g_gui_ctx.knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer, current_tempo_bpm, g_gui_ctx.ext_in_peak, NULL, gr_db);
         clock_gettime(CLOCK_MONOTONIC, &render_t1);
         double render_ms = (render_t1.tv_sec - render_t0.tv_sec) * 1000.0 + (render_t1.tv_nsec - render_t0.tv_nsec) / 1e6;
         double budget_ms = (block_size / (double)SAMPLE_RATE) * 1000.0;
@@ -2139,12 +2232,12 @@ int main(int argc, char **argv) {
             atomic_store_explicit(&record_engine.command, RECORD_CMD_STOP, memory_order_release);
             record_gather.active = false;
         }
-        bool want_recording = record_writer_thread_ok && active_knobs.record_enable != 0.0f;
+        bool want_recording = record_writer_thread_ok && g_gui_ctx.knobs.record_enable != 0.0f;
         if (want_recording && !applied_record_enable) {
-            bool sel_include_synth_output = active_knobs.record_include_synth_output != 0.0f;
-            bool sel_downmix_stereo = active_knobs.record_downmix_stereo != 0.0f;
+            bool sel_include_synth_output = g_gui_ctx.knobs.record_include_synth_output != 0.0f;
+            bool sel_downmix_stereo = g_gui_ctx.knobs.record_downmix_stereo != 0.0f;
             bool sel_input_channel[RECORD_MAX_CHANNELS];
-            for (int c = 0; c < RECORD_MAX_CHANNELS; c++) sel_input_channel[c] = (c < detected_input_channels) && (active_knobs.record_input_channel_enable[c] != 0.0f);
+            for (int c = 0; c < RECORD_MAX_CHANNELS; c++) sel_input_channel[c] = (c < detected_input_channels) && (g_gui_ctx.knobs.record_input_channel_enable[c] != 0.0f);
             int channels = wav_recorder_compute_channels(sel_include_synth_output, sel_downmix_stereo, sel_input_channel, detected_input_channels);
 
             if (channels <= 0) {
@@ -2154,11 +2247,11 @@ int main(int argc, char **argv) {
                 // Publish the command's parameters BEFORE the atomic release-store of `command`
                 // below -- see RecordEngine's comment on why that ordering makes these plain
                 // writes safely visible to the writer thread.
-                snprintf(record_engine.cmd_path, sizeof(record_engine.cmd_path), "%s", active_knobs.record_path);
+                snprintf(record_engine.cmd_path, sizeof(record_engine.cmd_path), "%s", g_gui_ctx.knobs.record_path);
                 record_engine.cmd_include_synth_output = sel_include_synth_output;
                 record_engine.cmd_downmix_stereo = sel_downmix_stereo;
                 record_engine.cmd_input_channel_count = detected_input_channels;
-                record_engine.cmd_record_format = (int)active_knobs.record_format;
+                record_engine.cmd_record_format = (int)g_gui_ctx.knobs.record_format;
                 for (int c = 0; c < RECORD_MAX_CHANNELS; c++) record_engine.cmd_input_channel_enable[c] = sel_input_channel[c];
 
                 record_gather.sel_include_synth_output = sel_include_synth_output;
@@ -2171,7 +2264,7 @@ int main(int argc, char **argv) {
 
                 atomic_store_explicit(&record_engine.start_failed, false, memory_order_relaxed);
                 atomic_store_explicit(&record_engine.command, RECORD_CMD_START, memory_order_release);
-                fprintf(stderr, "[record] start requested: '%s', %d channel(s)%s\n", active_knobs.record_path, channels,
+                fprintf(stderr, "[record] start requested: '%s', %d channel(s)%s\n", g_gui_ctx.knobs.record_path, channels,
                         sel_downmix_stereo ? " (downmixed)" : "");
             }
         } else if (!want_recording && applied_record_enable) {
@@ -2207,7 +2300,7 @@ int main(int argc, char **argv) {
                 .seq_elapsed_seconds = (float)g_transport_playhead_sec,
                 .seq_transport_state = (float)g_transport_state,
             };
-            for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) status.ext_in_peak[p] = ext_in_peak[p];
+            for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) status.ext_in_peak[p] = g_gui_ctx.ext_in_peak[p];
             status.midi_clock_locked = use_external_clock ? 1.0f : 0.0f;
             for (int s = 0; s < FX_SLOT_COUNT; s++) status.fx_gain_reduction_db[s] = gr_db[s];
             send_osc_status(osc_reply_addr, &status);
@@ -2216,6 +2309,9 @@ int main(int argc, char **argv) {
         }
         write_audio_block(pcm_handle, buffer, detected_output_channels, block_size, active_voices_count, render_ms);
     }
+#if HDS_STANDALONE_GUI_ENABLED
+    hds_standalone_gui_destroy(); // no-op if --gui was never passed
+#endif
     hds_stdin_raw_mode_restore(); // no-op unless hds_stdin_raw_mode_enable() actually changed the terminal
     // Flush/finalize a still-running take on shutdown: signal the writer thread to stop (if a
     // recording was active) and to exit, then join it so its final fclose actually happens

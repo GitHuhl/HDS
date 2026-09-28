@@ -259,10 +259,18 @@ FORCE:
 # same story but ONLY for $(BIN_OBJ)/$(ARM64_BIN_OBJ): it's #include'd by hds_standalone.c alone
 # (never reachable from a CLAP plugin instance -- see its own header comment), so it's deliberately
 # left off $(CLAP_OBJ)'s own prerequisite list below.
-$(BIN_OBJ): $(SRC) src/backend.c src/fx_types.h src/fx_chain.c src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -c $(SRC) -o $@
+# HDS_STANDALONE_GUI_ENABLED=1 turns on hds_standalone.c's own native-GUI include chain (Cairo/X11 --
+# see that macro's own comment there for why it's a BUILD-time flag, not just the --gui runtime flag's
+# concern: this same file is also compiled for the aarch64 cross-build below, which has no Cairo/X11
+# cross-built at all). Native $(BIN_OBJ) always turns it on (this machine has Cairo/X11 via nix, same
+# as $(CLAP_OBJ) already does), so it needs the matching cflags and the same draw-file prerequisite
+# list $(CLAP_OBJ) has below (plus src/hds_engine_instance.h and src/hds_clap_global_draw.c -- both
+# real prerequisites of $(CLAP_OBJ) too; their absence there is a pre-existing gap this same pass
+# fixes) so editing any of them triggers a rebuild here as well.
+$(BIN_OBJ): $(SRC) src/backend.c src/fx_types.h src/fx_chain.c src/sequencer.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_global_draw.c src/hds_clap_gui_draw.c src/hds_standalone_gui_x11.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -DHDS_STANDALONE_GUI_ENABLED=1 $(shell pkg-config --cflags cairo x11) -c $(SRC) -o $@
 
-$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_x11.c | $(BUILD_DIR)
+$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/fx_types.h src/fx_chain.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_global_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_x11.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(HDS_FX_CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
 $(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.c src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_fx_gui_x11.c src/nam_bridge.h | $(BUILD_DIR)
@@ -280,7 +288,7 @@ $(NAM_BUILD_DIR)/%.o: src/%.cpp $(NAM_FLAGS_STAMP) | $(NAM_BUILD_DIR)
 	$(CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
 $(BIN): $(BIN_OBJ) $(NAM_OBJS)
-	$(CXX) -o $@ $(BIN_OBJ) $(NAM_OBJS) $(LDLIBS) $(PIPEWIRE_LDLIBS)
+	$(CXX) -o $@ $(BIN_OBJ) $(NAM_OBJS) $(LDLIBS) $(PIPEWIRE_LDLIBS) $(shell pkg-config --libs cairo x11)
 
 clap: $(CLAP_OBJ) $(NAM_OBJS)
 	$(CXX) -shared -o $(CLAP_BIN) $(CLAP_OBJ) $(NAM_OBJS) $(LDLIBS) $(shell pkg-config --libs cairo x11)
