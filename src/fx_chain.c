@@ -1191,6 +1191,15 @@ static void run_fx_tapedelay2(FXSlotEngine *engine, const FXSlotParams *params, 
             speedR *= 1.15f;
         }
 
+        // Belt-and-suspenders bounds guard: delayL/R drive every dL[]/dR[] index below via
+        // floorf(), and casting a non-finite float to int is undefined behavior in C -- a wild
+        // index is exactly the kind of thing that corrupts the heap now and aborts somewhere
+        // unrelated later. process_fx_chain() already sanitizes non-finite audio at its own single
+        // chokepoint, but this guards the persistent delayL/R state itself in case it was ever
+        // poisoned some other way (extreme feedback/resonance self-oscillation, for instance).
+        if (!isfinite(st->delayL) || st->delayL < 0.0f || st->delayL >= 88200.0f) st->delayL = 0.0f;
+        if (!isfinite(st->delayR) || st->delayR < 0.0f || st->delayR >= 88200.0f) st->delayR = 0.0f;
+
         // Ping-Pong cross-feed point: capture each channel's CURRENT delay-tap value before
         // either channel's own write step touches it, so the choice of self-feed (Off, default)
         // vs. cross-feed (Stereo Ping-Pong) is a pure selection between two already-computed
@@ -4580,6 +4589,14 @@ static void sync_fx_engine_types(const FXSlotParams fx_params[FX_SLOT_COUNT], FX
 // slot ends up written by exactly the one call that owns it (see render_audio_block's own zeroing
 // of the whole array before its source loop, which covers a source with zero owned slots).
 static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, const float sc_snapshot_l[SOURCE_COUNT], const float sc_snapshot_r[SOURCE_COUNT], float *l, float *r, float gr_db_out[FX_SLOT_COUNT]) {
+    // A NaN/Inf sample reaching a slot is never a valid audio value, but several ported effects'
+    // own persistent state (e.g. run_fx_tapedelay2's sweepL/R, accumulated from squared input) has
+    // no boundary check of its own -- once poisoned, a non-finite value can propagate into a
+    // floorf()-derived array index, which is undefined behavior in C and a real crash/heap-
+    // corruption vector, not just a silent glitch. Sanitized once here, at the one chokepoint every
+    // slot's input already flows through, rather than in each of the ~20 ported effects individually.
+    if (!isfinite(*l)) *l = 0.0f;
+    if (!isfinite(*r)) *r = 0.0f;
     float parallel_in_l = *l, parallel_in_r = *r;
     float parallel_sum_l = 0.0f, parallel_sum_r = 0.0f;
     int parallel_branch_count = 0;
