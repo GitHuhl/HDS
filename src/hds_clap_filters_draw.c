@@ -205,9 +205,9 @@ static void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFilter
         hds_clap_filters_render_dropdown(cr, vs, window_h, (int)prog->filters[vs->dropdown_index].filter_type);
     }
 
-    if (vs->ctx_menu.open && vs->ctx_menu.kind == HDS_CTXMENU_KIND_MODULATE_FROM) {
+    if (vs->ctx_menu.open) {
         HdsCtxMenuRow rows[HDS_CTXMENU_MAX_ROWS]; int count = 0;
-        hds_play_build_modulate_from_rows(p, vs->ctx_menu.arg, rows, &count);
+        hds_play_build_ctxmenu_rows(p, &vs->ctx_menu, rows, &count);
         hds_ctxmenu_render(cr, &vs->ctx_menu, rows, count, window_w, window_h);
     }
 }
@@ -215,10 +215,11 @@ static void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFilter
 // ---------------------------------------------------------------------------------------------
 // Interaction
 // ---------------------------------------------------------------------------------------------
-// Cutoff/Resonance's own right-click "Modulate From" menu target numbers, one pair per flat
-// filter slot (0-4) -- inverse of hds_lfo_dest_label()'s own `target >= 90` decode (Freq on the
-// even target, Res on the odd one right after it).
-static int hds_filt_cutoff_dest_target(int idx) { return 90 + idx * 2; }
+// Resonance's own right-click "Modulate From" menu target number -- Cutoff's own
+// (hds_filt_cutoff_dest_target) lives in hds_clap_play_draw.c instead, since Cutoff's fuller
+// "Key Track + ext-MIDI-CC + Modulate From" menu (hds_play_build_filter_cutoff_menu_rows) needs it
+// there too -- inverse of hds_lfo_dest_label()'s own `target >= 90` decode (Freq on the even
+// target, Res on the odd one right after it).
 static int hds_filt_res_dest_target(int idx) { return 91 + idx * 2; }
 
 static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersViewState *vs, double window_w, double window_h, double x, double y, int button) {
@@ -256,7 +257,7 @@ static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersVie
         HdsFiltRowLayout L;
         hds_clap_filters_compute_row_layout(i, rows_top, &L);
 
-        HdsPlayKnobMenu cutoff_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, hds_filt_cutoff_dest_target(i)};
+        HdsPlayKnobMenu cutoff_menu = {HDS_CTXMENU_KIND_FILTER_CUTOFF, i};
         HdsPlayKnobMenu res_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, hds_filt_res_dest_target(i)};
         if (hds_play_knob_hit_test(&L.freq_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &filt->cutoff, 40.0, 18000.0, x, y, button, cutoff_menu); return true; }
         if (hds_play_knob_hit_test(&L.res_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &filt->res_q, 0.0, 100.0, x, y, button, res_menu); return true; }

@@ -441,9 +441,11 @@ static float *hds_play_modsource_dest_ptr(ProgramState *prog, int group, int ind
     return (group == 0) ? &prog->lfo[index].dest_target : &prog->eg_dest_target[index];
 }
 
-static void hds_play_build_modulate_from_rows(HdsClapPlugin *p, int target, HdsCtxMenuRow *rows, int *count) {
+// Appends (never resets *count -- see hds_play_build_modulate_from_rows() below for the
+// reset-and-call-this wrapper every plain "Modulate From"-only knob uses) the same section every
+// kind of "Modulate From" menu ends with.
+static void hds_play_append_modulate_from_rows(HdsClapPlugin *p, int target, HdsCtxMenuRow *rows, int *count) {
     ProgramState *prog = hds_play_program(p);
-    *count = 0;
     hds_ctxmenu_add(rows, count, true, false, false, false, 0, 0, "Modulate From");
     for (int i = 0; i < LFO_COUNT; i++) {
         int cur = (int)prog->lfo[i].dest_target;
@@ -467,23 +469,129 @@ static void hds_play_build_modulate_from_rows(HdsClapPlugin *p, int target, HdsC
     }
 }
 
+static void hds_play_build_modulate_from_rows(HdsClapPlugin *p, int target, HdsCtxMenuRow *rows, int *count) {
+    *count = 0;
+    hds_play_append_modulate_from_rows(p, target, rows, count);
+}
+
 static void hds_play_toggle_modulate_from(HdsClapPlugin *p, int target, int group, int index, bool was_checked) {
     float *dest = hds_play_modsource_dest_ptr(hds_play_program(p), group, index);
     *dest = was_checked ? 0.0f : (float)target;
 }
 
+// Common "None/Mod Wheel/Breath/Foot/Expression/Channel Aftertouch" preset list -- mirrors
+// frontend.py's own _MOD_SOURCE_PRESETS exactly, shared by LFO Depth's own "Modulation Source
+// (CC)" section and Filter Cutoff's own "Modulation Source (ext MIDI)" section below. Both fields
+// this sets (PackLfoParams.mod_source_cc / FilterParams.cutoff_mod_source_cc) share the same
+// -1=none/0-127=CC/128=aftertouch convention. frontend.py also offers a free-text "Custom CC..."
+// entry via a Qt input dialog -- this GUI has no text-entry widget anywhere (same disclosed-scope
+// boundary as Program Load/Save, see hds_clap_global_draw.c's own header comment), so a CC already
+// set that way from the Python GUI keeps whatever value it has, just without its own checked row
+// here; real follow-up work if a non-preset CC picker is ever needed.
+typedef struct { const char *label; float value; } HdsPresetOption;
+#define HDS_MOD_SOURCE_PRESET_COUNT 6
+static const HdsPresetOption HDS_MOD_SOURCE_PRESETS[HDS_MOD_SOURCE_PRESET_COUNT] = {
+    {"None", -1.0f}, {"Mod Wheel (CC1)", 1.0f}, {"Breath Controller (CC2)", 2.0f},
+    {"Foot Controller (CC4)", 4.0f}, {"Expression (CC11)", 11.0f}, {"Channel Aftertouch", 128.0f},
+};
+
+// Filter Cutoff's own "Key Track" preset list -- mirrors frontend.py's own _KEY_TRACK_PRESETS.
+#define HDS_KEY_TRACK_PRESET_COUNT 4
+static const HdsPresetOption HDS_KEY_TRACK_PRESETS[HDS_KEY_TRACK_PRESET_COUNT] = {
+    {"Off", 0.0f}, {"50%", 50.0f}, {"100%", 100.0f}, {"150%", 150.0f},
+};
+
+// Filter Cutoff's own right-click target numbers (Resonance's own menu, plain "Modulate From"
+// only, computes its own inline in hds_clap_filters_draw.c -- no shared section needs it there).
+// Lives here (an earlier-included file), not in hds_clap_filters_draw.c, because
+// hds_play_build_filter_cutoff_menu_rows() below needs it too -- same fixed single-TU #include-
+// order constraint as hds_lfo_dest_label() above.
+static int hds_filt_cutoff_dest_target(int idx) { return 90 + idx * 2; }
+
+// group/index values these two menus' own preset rows use, distinct from Modulate From's own
+// group 0 (LFO)/1 (EG) -- meaningful only to hds_play_ctxmenu_handle_click() below.
+#define HDS_CTXROW_GROUP_LFO_MODSOURCE 2
+#define HDS_CTXROW_GROUP_FILTER_KEYTRACK 3
+#define HDS_CTXROW_GROUP_FILTER_MODSOURCE 4
+
+// LFO Depth's own right-click menu: "Modulation Source (CC)" (mod_source_cc, a live-MIDI
+// multiplicative scale on this LFO's own output) THEN the generic "Modulate From" section --
+// mirrors frontend.py's own _show_lfo_row_menu's 'depth' case exactly (same two-section shape).
+// `lfo_idx` doubles as both which LFO's own mod_source_cc to read/write AND (via
+// hds_lfo_depth_dest_target()) the Modulate From section's own target number.
+static void hds_play_build_lfo_depth_menu_rows(HdsClapPlugin *p, int lfo_idx, HdsCtxMenuRow *rows, int *count) {
+    *count = 0;
+    PackLfoParams *lfo = &hds_play_program(p)->lfo[lfo_idx];
+    hds_ctxmenu_add(rows, count, true, false, false, false, 0, 0, "Modulation Source (CC)");
+    for (int i = 0; i < HDS_MOD_SOURCE_PRESET_COUNT; i++) {
+        bool checked = (lfo->mod_source_cc == HDS_MOD_SOURCE_PRESETS[i].value);
+        hds_ctxmenu_add(rows, count, false, true, checked, false, HDS_CTXROW_GROUP_LFO_MODSOURCE, i, HDS_MOD_SOURCE_PRESETS[i].label);
+    }
+    hds_play_append_modulate_from_rows(p, hds_lfo_depth_dest_target(lfo_idx), rows, count);
+}
+
+// Filter Cutoff's own right-click menu: "Key Track" preset list, THEN "Modulation Source (ext
+// MIDI)" (cutoff_mod_source_cc, an additive cutoff offset -- see FilterParams' own comment in
+// backend.c), THEN the generic "Modulate From" section -- mirrors frontend.py's own
+// _show_filter_cutoff_menu exactly (same three-section shape). `filt_idx` doubles as which
+// filter's own key_track/cutoff_mod_source_cc to read/write AND (via
+// hds_filt_cutoff_dest_target()) the Modulate From section's own target number.
+static void hds_play_build_filter_cutoff_menu_rows(HdsClapPlugin *p, int filt_idx, HdsCtxMenuRow *rows, int *count) {
+    *count = 0;
+    FilterParams *filt = &hds_play_program(p)->filters[filt_idx];
+    hds_ctxmenu_add(rows, count, true, false, false, false, 0, 0, "Key Track");
+    for (int i = 0; i < HDS_KEY_TRACK_PRESET_COUNT; i++) {
+        bool checked = (filt->key_track == HDS_KEY_TRACK_PRESETS[i].value);
+        hds_ctxmenu_add(rows, count, false, true, checked, false, HDS_CTXROW_GROUP_FILTER_KEYTRACK, i, HDS_KEY_TRACK_PRESETS[i].label);
+    }
+    hds_ctxmenu_add(rows, count, true, false, false, false, 0, 0, "Modulation Source (ext MIDI)");
+    for (int i = 0; i < HDS_MOD_SOURCE_PRESET_COUNT; i++) {
+        bool checked = (filt->cutoff_mod_source_cc == HDS_MOD_SOURCE_PRESETS[i].value);
+        hds_ctxmenu_add(rows, count, false, true, checked, false, HDS_CTXROW_GROUP_FILTER_MODSOURCE, i, HDS_MOD_SOURCE_PRESETS[i].label);
+    }
+    hds_play_append_modulate_from_rows(p, hds_filt_cutoff_dest_target(filt_idx), rows, count);
+}
+
+#define HDS_CTXMENU_KIND_MODULATE_FROM 1
+#define HDS_CTXMENU_KIND_LFO_DEPTH 2
+#define HDS_CTXMENU_KIND_FILTER_CUTOFF 3
+
+// Builds whichever row list `menu->kind` needs -- the one place both rendering (draw whatever's
+// open) and hit-testing (below) get their content from, so the two can never disagree.
+static void hds_play_build_ctxmenu_rows(HdsClapPlugin *p, const HdsCtxMenu *menu, HdsCtxMenuRow *rows, int *count) {
+    switch (menu->kind) {
+        case HDS_CTXMENU_KIND_MODULATE_FROM: hds_play_build_modulate_from_rows(p, menu->arg, rows, count); break;
+        case HDS_CTXMENU_KIND_LFO_DEPTH: hds_play_build_lfo_depth_menu_rows(p, menu->arg, rows, count); break;
+        case HDS_CTXMENU_KIND_FILTER_CUTOFF: hds_play_build_filter_cutoff_menu_rows(p, menu->arg, rows, count); break;
+        default: *count = 0; break;
+    }
+}
+
 // Every tab file with a ctx_menu field calls this from its own on_button_press, right after its
 // existing dropdown check (same "consume the click, open list wins" precedence) -- closes the menu
 // unconditionally (a click anywhere, hit or miss, dismisses it, same as every dropdown in this GUI)
-// and toggles the hit row's own destination field first if one was hit.
-#define HDS_CTXMENU_KIND_MODULATE_FROM 1
+// and applies whatever the hit row means first if one was hit. A preset row (Key Track/either
+// Modulation Source list) always SETS its own value on click, never toggles back off -- matching
+// frontend.py's own plain (not checkable-toggle) QAction wiring for those two menus.
 static bool hds_play_ctxmenu_handle_click(HdsClapPlugin *p, HdsCtxMenu *menu, double win_w, double win_h, double x, double y) {
     if (!menu->open) return false;
-    if (menu->kind == HDS_CTXMENU_KIND_MODULATE_FROM) {
-        HdsCtxMenuRow rows[HDS_CTXMENU_MAX_ROWS]; int count = 0;
-        hds_play_build_modulate_from_rows(p, menu->arg, rows, &count);
-        int hit = hds_ctxmenu_hit_row(menu, rows, count, win_w, win_h, x, y);
-        if (hit >= 0) hds_play_toggle_modulate_from(p, menu->arg, rows[hit].group, rows[hit].index, rows[hit].checked);
+    HdsCtxMenuRow rows[HDS_CTXMENU_MAX_ROWS]; int count = 0;
+    hds_play_build_ctxmenu_rows(p, menu, rows, &count);
+    int hit = hds_ctxmenu_hit_row(menu, rows, count, win_w, win_h, x, y);
+    if (hit >= 0) {
+        HdsCtxMenuRow *r = &rows[hit];
+        if (r->group == 0 || r->group == 1) {
+            int target = (menu->kind == HDS_CTXMENU_KIND_LFO_DEPTH) ? hds_lfo_depth_dest_target(menu->arg)
+                       : (menu->kind == HDS_CTXMENU_KIND_FILTER_CUTOFF) ? hds_filt_cutoff_dest_target(menu->arg)
+                       : menu->arg;
+            hds_play_toggle_modulate_from(p, target, r->group, r->index, r->checked);
+        } else if (r->group == HDS_CTXROW_GROUP_LFO_MODSOURCE) {
+            hds_play_program(p)->lfo[menu->arg].mod_source_cc = HDS_MOD_SOURCE_PRESETS[r->index].value;
+        } else if (r->group == HDS_CTXROW_GROUP_FILTER_KEYTRACK) {
+            hds_play_program(p)->filters[menu->arg].key_track = HDS_KEY_TRACK_PRESETS[r->index].value;
+        } else if (r->group == HDS_CTXROW_GROUP_FILTER_MODSOURCE) {
+            hds_play_program(p)->filters[menu->arg].cutoff_mod_source_cc = HDS_MOD_SOURCE_PRESETS[r->index].value;
+        }
     }
     menu->open = false;
     return true;
@@ -1120,9 +1228,9 @@ static void hds_clap_play_render(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewS
         hds_play_render_dropdown(cr, vs, window_h, (int)prog->eg_mode[vs->dropdown_index]);
     }
 
-    if (vs->ctx_menu.open && vs->ctx_menu.kind == HDS_CTXMENU_KIND_MODULATE_FROM) {
+    if (vs->ctx_menu.open) {
         HdsCtxMenuRow rows[HDS_CTXMENU_MAX_ROWS]; int count = 0;
-        hds_play_build_modulate_from_rows(p, vs->ctx_menu.arg, rows, &count);
+        hds_play_build_ctxmenu_rows(p, &vs->ctx_menu, rows, &count);
         hds_ctxmenu_render(cr, &vs->ctx_menu, rows, count, window_w, window_h);
     }
 }

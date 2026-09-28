@@ -246,9 +246,9 @@ static void hds_clap_lfos_render(cairo_t *cr, HdsClapPlugin *p, HdsClapLfosViewS
         }
     }
 
-    if (vs->ctx_menu.open && vs->ctx_menu.kind == HDS_CTXMENU_KIND_MODULATE_FROM) {
+    if (vs->ctx_menu.open) {
         HdsCtxMenuRow rows[HDS_CTXMENU_MAX_ROWS]; int count = 0;
-        hds_play_build_modulate_from_rows(p, vs->ctx_menu.arg, rows, &count);
+        hds_play_build_ctxmenu_rows(p, &vs->ctx_menu, rows, &count);
         hds_ctxmenu_render(cr, &vs->ctx_menu, rows, count, window_w, window_h);
     }
 }
@@ -320,7 +320,7 @@ static bool hds_clap_lfos_on_button_press(HdsClapPlugin *p, HdsClapLfosViewState
     }
     bool synced = (int)lfo->tempo_sync_division != 0;
     HdsPlayKnobMenu rate_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, hds_lfo_rate_dest_target(row)};
-    HdsPlayKnobMenu depth_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, hds_lfo_depth_dest_target(row)};
+    HdsPlayKnobMenu depth_menu = {HDS_CTXMENU_KIND_LFO_DEPTH, row};
     HdsPlayKnobMenu phase_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, hds_lfo_phase_dest_target(row)};
     if (!synced && hds_play_knob_hit_test(&L.rate_knob, x, y)) {
         hds_play_start_knob_drag(&vs->knob_drag, &lfo->rate_hz, 0.1, 200.0, x, y, button, rate_menu);
