@@ -5,8 +5,8 @@
 // an assignable EG can target pitch/pan/filter cutoff/anything else in matrix_shared_routes, so
 // Intensity doubles as both depth AND polarity) and Destination combo (eg_dest_target[6], the
 // exact same 100-entry matrix_shared_routes list the LFOs tab's own Destination combo already
-// uses -- this file reuses hds_lfo_dest_label()/hds_lfo_dest_selectable()/HDS_LFO_DEST_COUNT
-// verbatim from hds_clap_lfos_draw.c rather than re-transcribing the list a second time).
+// uses -- this file reuses hds_lfo_dest_label()/HDS_LFO_DEST_COUNT/hds_dest_list_build() and
+// friends verbatim from hds_clap_play_draw.c rather than re-transcribing the list a second time).
 //
 // Layout mirrors frontend.py's own Envelopes tab exactly: 6 full-width ADSRPanel-equivalents
 // stacked vertically (NOT the Play tab's 4-across QHBoxLayout -- Amp EGs sit 4-up in their own
@@ -90,15 +90,15 @@ static void hds_clap_env_compute_panel_layout(int e, int env_type, double scroll
 }
 
 // ---------------------------------------------------------------------------------------------
-// The Destination dropdown -- same scrollable-100-entry-list mechanism as hds_clap_lfos_draw.c's
-// own (see that file's own header comment on HDS_LFO_DEST_LIST_ROW_H/MAX_H, and
-// hds_lfo_dest_label()/hds_lfo_dest_selectable()), duplicated here only for the small amount of
-// geometry/state that's genuinely per-tab (this tab's own dropdown_anchor/dest_scroll_px live on
-// HdsClapEnvelopesViewState, not HdsClapLfosViewState) -- the actual 100-entry list/labels/
-// selectability rules are reused, never re-transcribed.
+// The Destination dropdown -- same shared grouped list as hds_clap_lfos_draw.c's own Destination
+// pill (hds_dest_list_build/hds_dest_list_render/hds_dest_list_hit_test, all in
+// hds_clap_play_draw.c), duplicated here only for the small amount of geometry/state that's
+// genuinely per-tab (this tab's own dropdown_anchor/dest_scroll_px live on
+// HdsClapEnvelopesViewState, not HdsClapLfosViewState) -- the actual list content is reused, never
+// re-transcribed.
 // ---------------------------------------------------------------------------------------------
 static void hds_clap_env_dest_list_rect(const HdsFxRect *anchor, double window_h, HdsFxRect *out) {
-    double list_h = HDS_LFO_DEST_LIST_MAX_H;
+    double list_h = HDS_DEST_LIST_MAX_H;
     if (list_h > window_h - 8.0) list_h = window_h - 8.0;
     double below_y = anchor->y + anchor->h + 2.0;
     double y0 = (below_y + list_h > window_h) ? (anchor->y - list_h - 2.0) : below_y;
@@ -109,38 +109,7 @@ static void hds_clap_env_dest_list_rect(const HdsFxRect *anchor, double window_h
 static void hds_clap_env_render_dest_dropdown(cairo_t *cr, HdsClapEnvelopesViewState *vs, double window_h, int current) {
     HdsFxRect bg;
     hds_clap_env_dest_list_rect(&vs->dropdown_anchor, window_h, &bg);
-    int visible_rows = (int)(bg.h / HDS_LFO_DEST_LIST_ROW_H);
-    double max_scroll = (HDS_LFO_DEST_COUNT - visible_rows) * HDS_LFO_DEST_LIST_ROW_H;
-    if (max_scroll < 0.0) max_scroll = 0.0;
-    if (vs->dest_scroll_px < 0.0) vs->dest_scroll_px = 0.0;
-    if (vs->dest_scroll_px > max_scroll) vs->dest_scroll_px = max_scroll;
-
-    hds_fx_rgb(cr, 0.13, 0.13, 0.16);
-    cairo_new_path(cr); cairo_rectangle(cr, bg.x, bg.y, bg.w, bg.h); cairo_fill(cr);
-    hds_fx_rgba(cr, 1, 1, 1, 0.25);
-    cairo_new_path(cr); cairo_set_line_width(cr, 1.0);
-    cairo_rectangle(cr, bg.x + 0.5, bg.y + 0.5, bg.w - 1, bg.h - 1); cairo_stroke(cr);
-
-    cairo_save(cr);
-    cairo_rectangle(cr, bg.x, bg.y, bg.w, bg.h);
-    cairo_clip(cr);
-    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 9.5);
-    int first = (int)(vs->dest_scroll_px / HDS_LFO_DEST_LIST_ROW_H);
-    for (int i = first; i < HDS_LFO_DEST_COUNT; i++) {
-        double ry = bg.y + i * HDS_LFO_DEST_LIST_ROW_H - vs->dest_scroll_px;
-        if (ry > bg.y + bg.h) break;
-        char label[24]; hds_lfo_dest_label(i, label, sizeof(label));
-        bool selectable = hds_lfo_dest_selectable(i);
-        if (i == current) {
-            hds_fx_rgb(cr, 0.22, 0.32, 0.36);
-            cairo_new_path(cr); cairo_rectangle(cr, bg.x, ry, bg.w, HDS_LFO_DEST_LIST_ROW_H); cairo_fill(cr);
-        }
-        if (!selectable) hds_fx_rgb(cr, 0.35, 0.35, 0.38);
-        else hds_fx_rgb(cr, i == current ? 0.92 : 0.78, i == current ? 0.95 : 0.78, i == current ? 0.92 : 0.81);
-        hds_fx_left_text(cr, bg.x + 4, ry + HDS_LFO_DEST_LIST_ROW_H / 2 + 3.0, label);
-    }
-    cairo_restore(cr);
+    hds_dest_list_render(cr, &bg, &vs->dest_scroll_px, current);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -260,11 +229,11 @@ static bool hds_clap_envelopes_on_button_press(HdsClapPlugin *p, HdsClapEnvelope
             HdsFxRect bg;
             hds_clap_env_dest_list_rect(&vs->dropdown_anchor, window_h, &bg);
             if (hds_play_rect_contains(&bg, x, y)) {
-                int i = (int)((y - bg.y + vs->dest_scroll_px) / HDS_LFO_DEST_LIST_ROW_H);
-                if (i >= 0 && i < HDS_LFO_DEST_COUNT && hds_lfo_dest_selectable(i)) {
-                    if (button == 1) prog->eg_dest_target[vs->dropdown_row] = (float)i;
+                int target;
+                if (hds_dest_list_hit_test(&bg, vs->dest_scroll_px, x, y, &target)) {
+                    if (button == 1) prog->eg_dest_target[vs->dropdown_row] = (float)target;
                     vs->dropdown_kind = HDS_ENV_DROPDOWN_NONE;
-                }
+                } // a section-header hit is a no-op -- keeps the list open, same as before
                 return true;
             }
             vs->dropdown_kind = HDS_ENV_DROPDOWN_NONE;
@@ -299,7 +268,7 @@ static bool hds_clap_envelopes_on_button_press(HdsClapPlugin *p, HdsClapEnvelope
     hds_clap_env_compute_panel_layout(e, env_type, vs->scroll_offset_px, panel_w, &L);
 
     if (hds_play_knob_hit_test(&L.intensity_knob, x, y)) {
-        hds_play_start_knob_drag(&vs->knob_drag, &prog->eg_intensity[e], -1.0, 1.0, y);
+        hds_play_start_knob_drag(&vs->knob_drag, &prog->eg_intensity[e], -1.0, 1.0, x, y, button, HDS_PLAY_NO_MENU);
         return true;
     }
     if (hds_play_rect_contains(&L.dest_pill, x, y)) {
@@ -324,7 +293,7 @@ static bool hds_clap_envelopes_on_button_press(HdsClapPlugin *p, HdsClapEnvelope
         if (hds_play_knob_hit_test(&L.dial[d], x, y)) {
             int field = HDS_PLAY_EG_FIELD_ORDER[env_type][d];
             float *target = hds_play_eg_dial_target(eg, field);
-            hds_play_start_knob_drag(&vs->knob_drag, target, HDS_PLAY_EG_LO[field], HDS_PLAY_EG_HI[field], y);
+            hds_play_start_knob_drag(&vs->knob_drag, target, HDS_PLAY_EG_LO[field], HDS_PLAY_EG_HI[field], x, y, button, HDS_PLAY_NO_MENU);
             return true;
         }
     }
@@ -338,10 +307,7 @@ static void hds_clap_envelopes_on_motion(HdsClapPlugin *p, HdsClapEnvelopesViewS
     double panel_w = window_w - 2.0 * HDS_ENV_MARGIN;
 
     if (vs->knob_drag.target) {
-        double delta = vs->knob_drag.start_y - y;
-        double v = vs->knob_drag.start_val + (delta / HDS_PLAY_DRAG_PIXELS_FULL_RANGE) * (vs->knob_drag.hi - vs->knob_drag.lo);
-        if (v < vs->knob_drag.lo) v = vs->knob_drag.lo; else if (v > vs->knob_drag.hi) v = vs->knob_drag.hi;
-        *vs->knob_drag.target = (float)v;
+        hds_play_apply_knob_drag(&vs->knob_drag, x, y);
         return;
     }
     if (vs->adsr_drag_eg >= 0) {
@@ -360,13 +326,13 @@ static void hds_clap_envelopes_on_motion(HdsClapPlugin *p, HdsClapEnvelopesViewS
 }
 
 static void hds_clap_envelopes_on_button_release(HdsClapEnvelopesViewState *vs) {
-    vs->knob_drag.target = NULL;
+    hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL);
     vs->adsr_drag_eg = -1;
 }
 
 static void hds_clap_envelopes_on_scroll(HdsClapEnvelopesViewState *vs, double window_h, int delta) {
     if (vs->dropdown_kind == HDS_ENV_DROPDOWN_DEST) {
-        vs->dest_scroll_px -= delta * HDS_LFO_DEST_LIST_ROW_H * 3.0;
+        vs->dest_scroll_px -= delta * HDS_DEST_LIST_ROW_H * 3.0;
         if (vs->dest_scroll_px < 0.0) vs->dest_scroll_px = 0.0;
         return;
     }

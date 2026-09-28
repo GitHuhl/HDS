@@ -274,9 +274,9 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
             return hds_clap_play_on_button_press(p, &vs->play_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, py, button);
         }
         case HDS_CLAP_TAB_FILTERS:
-            return hds_clap_filters_on_button_press(p, &vs->filters_view, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_filters_on_button_press(p, &vs->filters_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_LFOS:
-            return hds_clap_lfos_on_button_press(p, &vs->lfos_view, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_lfos_on_button_press(p, &vs->lfos_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_ENVELOPES:
             return hds_clap_envelopes_on_button_press(p, &vs->envelopes_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_ROUTING:

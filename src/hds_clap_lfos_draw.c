@@ -7,15 +7,21 @@
 // duplicating them a third time.
 //
 // SCOPE for this pass: every control visible WITHOUT a right-click in frontend.py, same posture as
-// Play/Filters. The Destination combo itself (100 real entries, `matrix_shared_routes`) IS in
-// scope -- unlike Filter/Osc knobs, an LFO's whole reason to exist is routing its own output
-// somewhere, so this is the plain, always-visible way to do that, not a right-click extra.
-// Deliberately NOT here yet: each Rate/Depth/Phase knob's own right-click "Modulate From" menu
-// (lets one LFO/EG modulate another LFO's own Rate/Depth/Phase -- needs the Envelopes tab's own
-// modulator-source list too, which doesn't exist in this native GUI yet either), and Depth's own
-// separate right-click "Modulation Source (CC)" menu (mod_source_cc -- a live-MIDI multiplicative
-// scale). Both fields those menus would set stay untouched by this pass's UI, same "don't reset
-// what the Python GUI already set" posture as Filters' own Key Track/ext-MIDI-CC deferral.
+// Play/Filters, PLUS Rate/Depth/Phase's own right-click "Modulate From" menu (hds_clap_play_draw.c's
+// generic HdsCtxMenu machinery, wired the same way as Play's oscillator Pitch/Phase/Pulse-Width and
+// Filters' Cutoff/Resonance). The Destination combo itself (100 real entries, `matrix_shared_routes`)
+// IS in scope too -- unlike Filter/Osc knobs, an LFO's whole reason to exist is routing its own
+// output somewhere, so this is the plain, always-visible way to do that, not a right-click extra.
+// Deliberately NOT here yet: Depth's own separate right-click "Modulation Source (CC)" menu
+// (mod_source_cc -- a live-MIDI multiplicative scale, unrelated to the additive "Modulate From"
+// routing). That field stays untouched by this pass's UI, same "don't reset what the Python GUI
+// already set" posture as Filters' own Key Track/ext-MIDI-CC deferral.
+//
+// hds_lfo_dest_label()/HDS_LFO_DEST_COUNT and the Destination dropdown's own grouped display order
+// (hds_dest_list_build/hds_dest_list_render/hds_dest_list_hit_test) now live in
+// hds_clap_play_draw.c (an earlier-included file) instead of here: the "Modulate From" menu content
+// built there needs the label/count too, and that file is #include'd before this one in the fixed
+// single-TU chain clap_plugin.c/hds_standalone.c both use.
 //
 // The LFO waveform enum (Tri/Sine/RevSaw/Sq/Off/Saw = indices 0-5) is a SEPARATE, LFO-only enum
 // from the oscillators' own WaveType (WAVE_SAW=0..WAVE_REVSAW=9, see hds_clap_play_draw.c) --
@@ -50,53 +56,13 @@ static const char *const HDS_LFO_TEMPOSYNC_NAMES[HDS_LFO_TEMPOSYNC_COUNT] = {
     "1/64", "1/64 D", "1/64 T",
 };
 
-// The 100-entry Destination list (matrix_shared_routes in frontend.py) -- shared verbatim by
-// every LFO row (and, later, every assignable EG row on the Envelopes tab: this same function
-// should be reused there rather than re-transcribed, when that tab is built). Indices 8-13 and
-// 84-89 are retired placeholders from a pre-simplification design (kept only so a target ID
-// already saved in an old patch still resolves to SOME row of this same list) -- shown as "--"
-// and, since nothing meaningful would happen selecting them, simply not offered for selection
-// (see hds_clap_lfos_on_button_press's own dest-dropdown click handling).
-#define HDS_LFO_DEST_COUNT 100
-static void hds_lfo_dest_label(int target, char *buf, size_t buflen) {
-    static const char *const fixed[48] = {
-        "None", "Osc 1 Pitch", "Osc 2 Pitch", "Osc 1+2 Pitch", "O1 Fine", "O2 Fine", "Osc 1 Amp", "Osc 2 Amp",
-        "--", "--", "--", "--", "--", "--", // 8-13: retired
-        "LFO 1 Rate", "LFO 2 Rate", "LFO 3 Rate", "LFO 4 Rate",
-        "LFO 1 Dp", "LFO 2 Dp", "LFO 3 Dp", "LFO 4 Dp",
-        "FM Depth", "Mix Balance",
-        "Osc 1 Phase", "Osc 2 Phase",
-        "O1 Unison Detune", "O2 Unison Detune",
-        "LFO 1 Phase", "LFO 2 Phase", "LFO 3 Phase", "LFO 4 Phase",
-        "Osc 1 Pan", "Osc 2 Pan",
-        "Osc 1 Pulse Width", "Osc 2 Pulse Width",
-        "Osc 3 Amp", "Osc 3 Pan", "Osc 3 Tilt",
-        "Osc 4 Amp", "Osc 4 Pan",
-        "Osc 3 Pitch", "Osc 4 Pitch",
-        "Osc 3 Phase", "Osc 4 Phase",
-        "Osc 3 Unison Detune", "Osc 4 Unison Detune",
-        "Osc 4 Tilt",
-    };
-    if (target < 0 || target >= HDS_LFO_DEST_COUNT) { snprintf(buf, buflen, "?"); return; }
-    if (target < 48) { snprintf(buf, buflen, "%s", fixed[target]); return; }
-    if (target < 60) { snprintf(buf, buflen, "LFO %d Rate", target - 48 + 5); return; }
-    if (target < 72) { snprintf(buf, buflen, "LFO %d Dp", target - 60 + 5); return; }
-    if (target < 84) { snprintf(buf, buflen, "LFO %d Phase", target - 72 + 5); return; }
-    if (target < 90) { snprintf(buf, buflen, "--"); return; }
-    int f = (target - 90) / 2;
-    if ((target - 90) % 2 == 0) snprintf(buf, buflen, "Filter %d Freq", f + 1);
-    else snprintf(buf, buflen, "Filter %d Res", f + 1);
-}
-static bool hds_lfo_dest_selectable(int target) {
-    return !((target >= 8 && target <= 13) || (target >= 84 && target <= 89));
-}
-
 typedef struct {
     int dropdown_kind;   // HDS_LFO_DROPDOWN_*
     int dropdown_row;    // which LFO (0-15) the open dropdown belongs to
     HdsFxRect dropdown_anchor;
     double dest_scroll_px; // the open Destination list's own internal scroll (reset whenever a NEW one opens)
     HdsPlayKnobDrag knob_drag; // reused verbatim -- see this file's own header comment
+    HdsCtxMenu ctx_menu;       // Rate's/Depth's/Phase's own "Modulate From" menu, if one is open
     double scroll_offset_px;  // the whole 16-row list's own vertical scroll, same convention as HdsFxGuiViewState's own
 } HdsClapLfosViewState;
 
@@ -168,11 +134,8 @@ static void hds_clap_lfos_render_short_dropdown(cairo_t *cr, const HdsFxRect *an
     }
 }
 
-#define HDS_LFO_DEST_LIST_ROW_H 17.0
-#define HDS_LFO_DEST_LIST_MAX_H 340.0
-
 static void hds_clap_lfos_dest_list_rect(const HdsFxRect *anchor, double window_h, HdsFxRect *out) {
-    double list_h = HDS_LFO_DEST_LIST_MAX_H;
+    double list_h = HDS_DEST_LIST_MAX_H;
     if (list_h > window_h - 8.0) list_h = window_h - 8.0;
     double below_y = anchor->y + anchor->h + 2.0;
     double y0 = (below_y + list_h > window_h) ? (anchor->y - list_h - 2.0) : below_y;
@@ -183,38 +146,7 @@ static void hds_clap_lfos_dest_list_rect(const HdsFxRect *anchor, double window_
 static void hds_clap_lfos_render_dest_dropdown(cairo_t *cr, HdsClapLfosViewState *vs, double window_h, int current) {
     HdsFxRect bg;
     hds_clap_lfos_dest_list_rect(&vs->dropdown_anchor, window_h, &bg);
-    int visible_rows = (int)(bg.h / HDS_LFO_DEST_LIST_ROW_H);
-    double max_scroll = (HDS_LFO_DEST_COUNT - visible_rows) * HDS_LFO_DEST_LIST_ROW_H;
-    if (max_scroll < 0.0) max_scroll = 0.0;
-    if (vs->dest_scroll_px < 0.0) vs->dest_scroll_px = 0.0;
-    if (vs->dest_scroll_px > max_scroll) vs->dest_scroll_px = max_scroll;
-
-    hds_fx_rgb(cr, 0.13, 0.13, 0.16);
-    cairo_new_path(cr); cairo_rectangle(cr, bg.x, bg.y, bg.w, bg.h); cairo_fill(cr);
-    hds_fx_rgba(cr, 1, 1, 1, 0.25);
-    cairo_new_path(cr); cairo_set_line_width(cr, 1.0);
-    cairo_rectangle(cr, bg.x + 0.5, bg.y + 0.5, bg.w - 1, bg.h - 1); cairo_stroke(cr);
-
-    cairo_save(cr);
-    cairo_rectangle(cr, bg.x, bg.y, bg.w, bg.h);
-    cairo_clip(cr);
-    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 9.5);
-    int first = (int)(vs->dest_scroll_px / HDS_LFO_DEST_LIST_ROW_H);
-    for (int i = first; i < HDS_LFO_DEST_COUNT; i++) {
-        double ry = bg.y + i * HDS_LFO_DEST_LIST_ROW_H - vs->dest_scroll_px;
-        if (ry > bg.y + bg.h) break;
-        char label[24]; hds_lfo_dest_label(i, label, sizeof(label));
-        bool selectable = hds_lfo_dest_selectable(i);
-        if (i == current) {
-            hds_fx_rgb(cr, 0.22, 0.32, 0.36);
-            cairo_new_path(cr); cairo_rectangle(cr, bg.x, ry, bg.w, HDS_LFO_DEST_LIST_ROW_H); cairo_fill(cr);
-        }
-        if (!selectable) hds_fx_rgb(cr, 0.35, 0.35, 0.38);
-        else hds_fx_rgb(cr, i == current ? 0.92 : 0.78, i == current ? 0.95 : 0.78, i == current ? 0.92 : 0.81);
-        hds_fx_left_text(cr, bg.x + 4, ry + HDS_LFO_DEST_LIST_ROW_H / 2 + 3.0, label);
-    }
-    cairo_restore(cr);
+    hds_dest_list_render(cr, &bg, &vs->dest_scroll_px, current);
 }
 
 static void hds_clap_lfos_render(cairo_t *cr, HdsClapPlugin *p, HdsClapLfosViewState *vs, double window_w, double window_h) {
@@ -296,29 +228,38 @@ static void hds_clap_lfos_render(cairo_t *cr, HdsClapPlugin *p, HdsClapLfosViewS
     }
     cairo_restore(cr);
 
-    if (vs->dropdown_kind == HDS_LFO_DROPDOWN_NONE) return;
-    PackLfoParams *lfo = &prog->lfo[vs->dropdown_row];
-    switch (vs->dropdown_kind) {
-        case HDS_LFO_DROPDOWN_WAVE:
-            hds_clap_lfos_render_short_dropdown(cr, &vs->dropdown_anchor, window_h, HDS_LFO_WAVE_NAMES, HDS_LFO_WAVE_COUNT, (int)lfo->wave_type);
-            break;
-        case HDS_LFO_DROPDOWN_TEMPOSYNC:
-            hds_clap_lfos_render_short_dropdown(cr, &vs->dropdown_anchor, window_h, HDS_LFO_TEMPOSYNC_NAMES, HDS_LFO_TEMPOSYNC_COUNT, (int)lfo->tempo_sync_division);
-            break;
-        case HDS_LFO_DROPDOWN_KEYSYNC:
-            hds_clap_lfos_render_short_dropdown(cr, &vs->dropdown_anchor, window_h, HDS_LFO_KEYSYNC_NAMES, HDS_LFO_KEYSYNC_COUNT, (int)lfo->key_sync);
-            break;
-        case HDS_LFO_DROPDOWN_DEST:
-            hds_clap_lfos_render_dest_dropdown(cr, vs, window_h, (int)lfo->dest_target);
-            break;
+    if (vs->dropdown_kind != HDS_LFO_DROPDOWN_NONE) {
+        PackLfoParams *lfo = &prog->lfo[vs->dropdown_row];
+        switch (vs->dropdown_kind) {
+            case HDS_LFO_DROPDOWN_WAVE:
+                hds_clap_lfos_render_short_dropdown(cr, &vs->dropdown_anchor, window_h, HDS_LFO_WAVE_NAMES, HDS_LFO_WAVE_COUNT, (int)lfo->wave_type);
+                break;
+            case HDS_LFO_DROPDOWN_TEMPOSYNC:
+                hds_clap_lfos_render_short_dropdown(cr, &vs->dropdown_anchor, window_h, HDS_LFO_TEMPOSYNC_NAMES, HDS_LFO_TEMPOSYNC_COUNT, (int)lfo->tempo_sync_division);
+                break;
+            case HDS_LFO_DROPDOWN_KEYSYNC:
+                hds_clap_lfos_render_short_dropdown(cr, &vs->dropdown_anchor, window_h, HDS_LFO_KEYSYNC_NAMES, HDS_LFO_KEYSYNC_COUNT, (int)lfo->key_sync);
+                break;
+            case HDS_LFO_DROPDOWN_DEST:
+                hds_clap_lfos_render_dest_dropdown(cr, vs, window_h, (int)lfo->dest_target);
+                break;
+        }
+    }
+
+    if (vs->ctx_menu.open && vs->ctx_menu.kind == HDS_CTXMENU_KIND_MODULATE_FROM) {
+        HdsCtxMenuRow rows[HDS_CTXMENU_MAX_ROWS]; int count = 0;
+        hds_play_build_modulate_from_rows(p, vs->ctx_menu.arg, rows, &count);
+        hds_ctxmenu_render(cr, &vs->ctx_menu, rows, count, window_w, window_h);
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Interaction
 // ---------------------------------------------------------------------------------------------
-static bool hds_clap_lfos_on_button_press(HdsClapPlugin *p, HdsClapLfosViewState *vs, double window_h, double x, double y, int button) {
+static bool hds_clap_lfos_on_button_press(HdsClapPlugin *p, HdsClapLfosViewState *vs, double window_w, double window_h, double x, double y, int button) {
     ProgramState *prog = hds_play_program(p);
+
+    if (vs->ctx_menu.open) return hds_play_ctxmenu_handle_click(p, &vs->ctx_menu, window_w, window_h, x, y);
 
     if (vs->dropdown_kind != HDS_LFO_DROPDOWN_NONE) {
         PackLfoParams *lfo = &prog->lfo[vs->dropdown_row];
@@ -326,11 +267,11 @@ static bool hds_clap_lfos_on_button_press(HdsClapPlugin *p, HdsClapLfosViewState
             HdsFxRect bg;
             hds_clap_lfos_dest_list_rect(&vs->dropdown_anchor, window_h, &bg);
             if (hds_play_rect_contains(&bg, x, y)) {
-                int i = (int)((y - bg.y + vs->dest_scroll_px) / HDS_LFO_DEST_LIST_ROW_H);
-                if (i >= 0 && i < HDS_LFO_DEST_COUNT && hds_lfo_dest_selectable(i)) {
-                    if (button == 1) lfo->dest_target = (float)i;
+                int target;
+                if (hds_dest_list_hit_test(&bg, vs->dest_scroll_px, x, y, &target)) {
+                    if (button == 1) lfo->dest_target = (float)target;
                     vs->dropdown_kind = HDS_LFO_DROPDOWN_NONE;
-                }
+                } // a section-header hit is a no-op -- keeps the list open, same as before
                 return true;
             }
             vs->dropdown_kind = HDS_LFO_DROPDOWN_NONE;
@@ -374,20 +315,23 @@ static bool hds_clap_lfos_on_button_press(HdsClapPlugin *p, HdsClapLfosViewState
     }
     int wave = (int)lfo->wave_type;
     if (hds_lfo_wave_has_curve(wave) && hds_play_knob_hit_test(&L.curve_knob, x, y)) {
-        hds_play_start_knob_drag(&vs->knob_drag, &lfo->curve_drive, -1.0, 1.0, y);
+        hds_play_start_knob_drag(&vs->knob_drag, &lfo->curve_drive, -1.0, 1.0, x, y, button, HDS_PLAY_NO_MENU);
         return true;
     }
     bool synced = (int)lfo->tempo_sync_division != 0;
+    HdsPlayKnobMenu rate_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, hds_lfo_rate_dest_target(row)};
+    HdsPlayKnobMenu depth_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, hds_lfo_depth_dest_target(row)};
+    HdsPlayKnobMenu phase_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, hds_lfo_phase_dest_target(row)};
     if (!synced && hds_play_knob_hit_test(&L.rate_knob, x, y)) {
-        hds_play_start_knob_drag(&vs->knob_drag, &lfo->rate_hz, 0.1, 200.0, y);
+        hds_play_start_knob_drag(&vs->knob_drag, &lfo->rate_hz, 0.1, 200.0, x, y, button, rate_menu);
         return true;
     }
     if (hds_play_rect_contains(&L.temposync_pill, x, y)) {
         vs->dropdown_kind = HDS_LFO_DROPDOWN_TEMPOSYNC; vs->dropdown_row = row; vs->dropdown_anchor = L.temposync_pill;
         return true;
     }
-    if (hds_play_knob_hit_test(&L.depth_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &lfo->mod_depth, 0.0, 1.0, y); return true; }
-    if (hds_play_knob_hit_test(&L.phase_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &lfo->phase_offset, 0.0, 360.0, y); return true; }
+    if (hds_play_knob_hit_test(&L.depth_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &lfo->mod_depth, 0.0, 1.0, x, y, button, depth_menu); return true; }
+    if (hds_play_knob_hit_test(&L.phase_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &lfo->phase_offset, 0.0, 360.0, x, y, button, phase_menu); return true; }
     if (hds_play_rect_contains(&L.keysync_pill, x, y)) {
         vs->dropdown_kind = HDS_LFO_DROPDOWN_KEYSYNC; vs->dropdown_row = row; vs->dropdown_anchor = L.keysync_pill;
         return true;
@@ -397,8 +341,8 @@ static bool hds_clap_lfos_on_button_press(HdsClapPlugin *p, HdsClapLfosViewState
         return true;
     }
     if (lfo->per_key_mode != 0.0f) {
-        if (hds_play_knob_hit_test(&L.keytrack_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &lfo->key_track, -100.0, 100.0, y); return true; }
-        if (hds_play_knob_hit_test(&L.veltrack_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &lfo->vel_track, -100.0, 100.0, y); return true; }
+        if (hds_play_knob_hit_test(&L.keytrack_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &lfo->key_track, -100.0, 100.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
+        if (hds_play_knob_hit_test(&L.veltrack_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &lfo->vel_track, -100.0, 100.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
     }
     if (hds_play_rect_contains(&L.dest_pill, x, y)) {
         vs->dropdown_kind = HDS_LFO_DROPDOWN_DEST; vs->dropdown_row = row; vs->dropdown_anchor = L.dest_pill; vs->dest_scroll_px = 0.0;
@@ -410,19 +354,18 @@ static bool hds_clap_lfos_on_button_press(HdsClapPlugin *p, HdsClapLfosViewState
 }
 
 static void hds_clap_lfos_on_motion(HdsClapLfosViewState *vs, double x, double y) {
-    (void)x;
-    if (!vs->knob_drag.target) return;
-    double delta = vs->knob_drag.start_y - y;
-    double v = vs->knob_drag.start_val + (delta / HDS_PLAY_DRAG_PIXELS_FULL_RANGE) * (vs->knob_drag.hi - vs->knob_drag.lo);
-    if (v < vs->knob_drag.lo) v = vs->knob_drag.lo; else if (v > vs->knob_drag.hi) v = vs->knob_drag.hi;
-    *vs->knob_drag.target = (float)v;
+    hds_play_apply_knob_drag(&vs->knob_drag, x, y);
 }
 
-static void hds_clap_lfos_on_button_release(HdsClapLfosViewState *vs) { vs->knob_drag.target = NULL; }
+static void hds_clap_lfos_on_button_release(HdsClapLfosViewState *vs) {
+    double anchor_x = 0.0, anchor_y = 0.0;
+    HdsPlayKnobMenu menu = hds_play_release_knob_drag(&vs->knob_drag, &anchor_x, &anchor_y);
+    if (menu.kind != 0) vs->ctx_menu = (HdsCtxMenu){true, anchor_x, anchor_y, menu.kind, menu.arg};
+}
 
 static void hds_clap_lfos_on_scroll(HdsClapLfosViewState *vs, double window_h, int delta) {
     if (vs->dropdown_kind == HDS_LFO_DROPDOWN_DEST) {
-        vs->dest_scroll_px -= delta * HDS_LFO_DEST_LIST_ROW_H * 3.0;
+        vs->dest_scroll_px -= delta * HDS_DEST_LIST_ROW_H * 3.0;
         if (vs->dest_scroll_px < 0.0) vs->dest_scroll_px = 0.0;
         return;
     }

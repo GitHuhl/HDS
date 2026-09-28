@@ -106,10 +106,10 @@ static void hds_clap_build_osc_dispatch_table_once(void) {
 #include "hds_clap_combi_draw.c"
 #include "hds_clap_filters_draw.c"
 #include "hds_clap_lfos_draw.c"
-// hds_clap_envelopes_draw.c comes after hds_clap_lfos_draw.c: it reuses that file's own
-// hds_lfo_dest_label()/hds_lfo_dest_selectable()/HDS_LFO_DEST_COUNT/HDS_LFO_DEST_LIST_ROW_H/
-// HDS_LFO_DEST_LIST_MAX_H (the shared 100-entry matrix_shared_routes list) rather than
-// re-transcribing them -- see its own header comment.
+// hds_clap_envelopes_draw.c comes after hds_clap_lfos_draw.c (which is itself just a consumer,
+// alongside this file, of hds_clap_play_draw.c's own hds_lfo_dest_label()/HDS_LFO_DEST_COUNT/
+// hds_dest_list_build()/HDS_DEST_LIST_ROW_H/HDS_DEST_LIST_MAX_H -- the shared 100-entry
+// matrix_shared_routes list) rather than re-transcribing any of it -- see its own header comment.
 #include "hds_clap_envelopes_draw.c"
 #include "hds_clap_routing_draw.c"
 #include "hds_clap_devices_draw.c"

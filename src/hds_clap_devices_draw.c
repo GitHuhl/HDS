@@ -123,7 +123,7 @@ static bool hds_clap_devices_on_button_press(HdsClapPlugin *p, HdsClapDevicesVie
     HdsDevicesLayout L;
     hds_clap_devices_compute_layout(&L);
     if (hds_play_knob_hit_test(&L.polyphony_knob, x, y)) {
-        hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.active_voice_limit, 1.0, 256.0, y);
+        hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.active_voice_limit, 1.0, 256.0, x, y, button, HDS_PLAY_NO_MENU);
         return true;
     }
     if (hds_play_rect_contains(&L.blocksize_pill, x, y)) {
@@ -136,12 +136,7 @@ static bool hds_clap_devices_on_button_press(HdsClapPlugin *p, HdsClapDevicesVie
 }
 
 static void hds_clap_devices_on_motion(HdsClapDevicesViewState *vs, double x, double y) {
-    (void)x;
-    if (!vs->knob_drag.target) return;
-    double delta = vs->knob_drag.start_y - y;
-    double v = vs->knob_drag.start_val + (delta / HDS_PLAY_DRAG_PIXELS_FULL_RANGE) * (vs->knob_drag.hi - vs->knob_drag.lo);
-    if (v < vs->knob_drag.lo) v = vs->knob_drag.lo; else if (v > vs->knob_drag.hi) v = vs->knob_drag.hi;
-    *vs->knob_drag.target = (float)v;
+    hds_play_apply_knob_drag(&vs->knob_drag, x, y);
 }
 
-static void hds_clap_devices_on_button_release(HdsClapDevicesViewState *vs) { vs->knob_drag.target = NULL; }
+static void hds_clap_devices_on_button_release(HdsClapDevicesViewState *vs) { hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL); }

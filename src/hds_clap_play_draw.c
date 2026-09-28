@@ -149,12 +149,354 @@ typedef struct {
     double last_click_x, last_click_y;
 } HdsPlayKnobDrag;
 
+static bool hds_play_rect_contains(const HdsFxRect *r, double x, double y); // defined below
+
+// Generic right-click popup menu (checkable rows, optional section headers) -- reused by every
+// tab that ports one of frontend.py's "Modulate From"/Key Track/Mod Source menus. kind/arg are
+// opaque here; each opening file defines its own kind constants and rebuilds the same row list on
+// every render/hit-test call (like every other dropdown in this GUI) rather than caching it.
+#define HDS_CTXMENU_ROW_H 16.0
+#define HDS_CTXMENU_SECTION_H 14.0
+#define HDS_CTXMENU_W 160.0
+#define HDS_CTXMENU_MAX_ROWS 24
+
+typedef struct {
+    bool is_section, checkable, checked, disabled;
+    char label[40];
+    int group, index; // meaning is up to whichever file built this row
+} HdsCtxMenuRow;
+
+typedef struct {
+    bool open;
+    double x, y;
+    int kind, arg;
+} HdsCtxMenu;
+
+static void hds_ctxmenu_add(HdsCtxMenuRow *rows, int *count, bool is_section, bool checkable, bool checked, bool disabled, int group, int index, const char *label) {
+    if (*count >= HDS_CTXMENU_MAX_ROWS) return;
+    HdsCtxMenuRow *r = &rows[(*count)++];
+    r->is_section = is_section; r->checkable = checkable; r->checked = checked; r->disabled = disabled;
+    r->group = group; r->index = index;
+    snprintf(r->label, sizeof(r->label), "%s", label);
+}
+
+static double hds_ctxmenu_total_h(const HdsCtxMenuRow *rows, int count) {
+    double h = 4.0;
+    for (int i = 0; i < count; i++) h += rows[i].is_section ? HDS_CTXMENU_SECTION_H : HDS_CTXMENU_ROW_H;
+    return h + 4.0;
+}
+
+static void hds_ctxmenu_origin(const HdsCtxMenu *m, double total_h, double win_w, double win_h, double *out_x, double *out_y) {
+    double mx = m->x, my = m->y;
+    if (mx + HDS_CTXMENU_W > win_w) mx = win_w - HDS_CTXMENU_W;
+    if (my + total_h > win_h) my = win_h - total_h;
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+    *out_x = mx; *out_y = my;
+}
+
+static void hds_ctxmenu_row_rect(const HdsCtxMenu *m, const HdsCtxMenuRow *rows, int count, int i, double win_w, double win_h, HdsFxRect *out) {
+    double total_h = hds_ctxmenu_total_h(rows, count);
+    double mx, my; hds_ctxmenu_origin(m, total_h, win_w, win_h, &mx, &my);
+    double y = my + 4.0;
+    for (int k = 0; k < i; k++) y += rows[k].is_section ? HDS_CTXMENU_SECTION_H : HDS_CTXMENU_ROW_H;
+    out->x = mx; out->w = HDS_CTXMENU_W;
+    out->y = y; out->h = rows[i].is_section ? HDS_CTXMENU_SECTION_H : HDS_CTXMENU_ROW_H;
+}
+
+static void hds_ctxmenu_render(cairo_t *cr, const HdsCtxMenu *m, const HdsCtxMenuRow *rows, int count, double win_w, double win_h) {
+    if (!m->open || count == 0) return;
+    double total_h = hds_ctxmenu_total_h(rows, count);
+    double mx, my; hds_ctxmenu_origin(m, total_h, win_w, win_h, &mx, &my);
+    hds_fx_rgb(cr, 0.13, 0.13, 0.16);
+    cairo_new_path(cr); cairo_rectangle(cr, mx, my, HDS_CTXMENU_W, total_h); cairo_fill(cr);
+    hds_fx_rgba(cr, 1, 1, 1, 0.25);
+    cairo_new_path(cr); cairo_set_line_width(cr, 1.0);
+    cairo_rectangle(cr, mx + 0.5, my + 0.5, HDS_CTXMENU_W - 1, total_h - 1); cairo_stroke(cr);
+    for (int i = 0; i < count; i++) {
+        HdsFxRect r; hds_ctxmenu_row_rect(m, rows, count, i, win_w, win_h, &r);
+        const HdsCtxMenuRow *row = &rows[i];
+        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, row->is_section ? CAIRO_FONT_WEIGHT_BOLD : CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, row->is_section ? 8.0 : 9.0);
+        if (row->is_section) { hds_fx_rgb(cr, 0.55, 0.55, 0.6); hds_fx_left_text(cr, r.x + 5, r.y + r.h / 2 + 3.0, row->label); continue; }
+        if (row->checked) { hds_fx_rgb(cr, 0.18, 0.32, 0.36); cairo_new_path(cr); cairo_rectangle(cr, r.x, r.y, r.w, r.h); cairo_fill(cr); }
+        double c1 = row->disabled ? 0.4 : (row->checked ? 0.92 : 0.78), c3 = row->disabled ? 0.42 : (row->checked ? 0.92 : 0.81);
+        hds_fx_rgb(cr, c1, c1 + (row->checked && !row->disabled ? 0.03 : 0.0), c3);
+        char buf[48];
+        if (row->checkable) snprintf(buf, sizeof(buf), "%s %s", row->checked ? "[x]" : "[ ]", row->label);
+        else snprintf(buf, sizeof(buf), "%s", row->label);
+        hds_fx_left_text(cr, r.x + 5, r.y + r.h / 2 + 3.0, buf);
+    }
+}
+
+// -1 if no row (or a section header) was hit.
+static int hds_ctxmenu_hit_row(const HdsCtxMenu *m, const HdsCtxMenuRow *rows, int count, double win_w, double win_h, double x, double y) {
+    if (!m->open) return -1;
+    for (int i = 0; i < count; i++) {
+        if (rows[i].is_section) continue;
+        HdsFxRect r; hds_ctxmenu_row_rect(m, rows, count, i, win_w, win_h, &r);
+        if (hds_play_rect_contains(&r, x, y)) return i;
+    }
+    return -1;
+}
+
+// The 100-entry Destination list (matrix_shared_routes in frontend.py) -- shared by every LFO row's
+// own Destination pill (hds_clap_lfos_draw.c) AND every assignable EG's own eg_dest_target
+// (hds_clap_envelopes_draw.c), plus this file's own "Modulate From" menu content below (which shows
+// an already-pointed-elsewhere source's current destination inline). Lives here, in an
+// EARLIER-included file, rather than in hds_clap_lfos_draw.c where it used to live, purely because
+// of the fixed single-TU #include order (see clap_plugin.c/hds_standalone.c): this file's own
+// "Modulate From" builder needs it, and can't reach forward into a later-included file. Indices
+// 8-13 and 84-89 are retired placeholders from a pre-simplification design (kept only so a target ID
+// already saved in an old patch still resolves to SOME row of this same list) -- shown as "--" and,
+// since nothing meaningful would happen selecting them, simply not offered for selection.
+#define HDS_LFO_DEST_COUNT 100
+static void hds_lfo_dest_label(int target, char *buf, size_t buflen) {
+    static const char *const fixed[48] = {
+        "None", "Osc 1 Pitch", "Osc 2 Pitch", "Osc 1+2 Pitch", "O1 Fine", "O2 Fine", "Osc 1 Amp", "Osc 2 Amp",
+        "--", "--", "--", "--", "--", "--", // 8-13: retired
+        "LFO 1 Rate", "LFO 2 Rate", "LFO 3 Rate", "LFO 4 Rate",
+        "LFO 1 Dp", "LFO 2 Dp", "LFO 3 Dp", "LFO 4 Dp",
+        "FM Depth", "Mix Balance",
+        "Osc 1 Phase", "Osc 2 Phase",
+        "O1 Unison Detune", "O2 Unison Detune",
+        "LFO 1 Phase", "LFO 2 Phase", "LFO 3 Phase", "LFO 4 Phase",
+        "Osc 1 Pan", "Osc 2 Pan",
+        "Osc 1 Pulse Width", "Osc 2 Pulse Width",
+        "Osc 3 Amp", "Osc 3 Pan", "Osc 3 Tilt",
+        "Osc 4 Amp", "Osc 4 Pan",
+        "Osc 3 Pitch", "Osc 4 Pitch",
+        "Osc 3 Phase", "Osc 4 Phase",
+        "Osc 3 Unison Detune", "Osc 4 Unison Detune",
+        "Osc 4 Tilt",
+    };
+    if (target < 0 || target >= HDS_LFO_DEST_COUNT) { snprintf(buf, buflen, "?"); return; }
+    if (target < 48) { snprintf(buf, buflen, "%s", fixed[target]); return; }
+    if (target < 60) { snprintf(buf, buflen, "LFO %d Rate", target - 48 + 5); return; }
+    if (target < 72) { snprintf(buf, buflen, "LFO %d Dp", target - 60 + 5); return; }
+    if (target < 84) { snprintf(buf, buflen, "LFO %d Phase", target - 72 + 5); return; }
+    if (target < 90) { snprintf(buf, buflen, "--"); return; }
+    int f = (target - 90) / 2;
+    if ((target - 90) % 2 == 0) snprintf(buf, buflen, "Filter %d Freq", f + 1);
+    else snprintf(buf, buflen, "Filter %d Res", f + 1);
+}
+// Rate/Depth/Phase's own right-click "Modulate From" menu target numbers (LFOs tab) and the same
+// LFO's own Destination-dropdown target (below) both need these, mirroring frontend.py's own
+// _lfo_rate_dest_target/_lfo_depth_dest_target/_lfo_phase_dest_target exactly (two ranges each:
+// LFO 1-4's original slots, LFO 5-16 appended after target 47).
+static int hds_lfo_rate_dest_target(int idx) { return idx < 4 ? 14 + idx : 44 + idx; }
+static int hds_lfo_depth_dest_target(int idx) { return idx < 4 ? 18 + idx : 56 + idx; }
+static int hds_lfo_phase_dest_target(int idx) { return idx < 4 ? 28 + idx : 68 + idx; }
+
+// ---------------------------------------------------------------------------------------------
+// The Destination dropdown's shared DISPLAY order -- grouped by what a target actually modulates
+// (Oscillator Pitch/Fine-Detune/Phase/Pulse-Width/Amp-Pan-Tilt, Mix, Filters, LFO Rate/Depth/
+// Phase), with a section header before each group, rather than frontend.py's own flat ascending
+// target-number order (0, 1, 2, 3, ... 99) -- pure display reorganization: the STORED value
+// (dest_target / eg_dest_target) is still the exact same target number hds_lfo_dest_label() above
+// already returns a label for, so an existing saved patch resolves identically either way. The 12
+// retired placeholder targets (8-13, 84-89 -- shown as "--" and never selectable) are dropped from
+// this list entirely instead of appearing as blank, unlabeled rows. Shared by the LFOs tab's own
+// Destination pill and the Envelopes tab's own assignable-EG Destination pill (hds_dest_list_render/
+// hds_dest_list_hit_test below) -- rebuilt fresh on every render/hit-test call, same "cheap, always
+// consistent, never a stale cache" convention every other dropdown in this GUI already uses.
+// ---------------------------------------------------------------------------------------------
+#define HDS_DEST_LIST_MAX_ROWS 100
+#define HDS_DEST_LIST_ROW_H 17.0
+#define HDS_DEST_LIST_SECTION_H 14.0
+#define HDS_DEST_LIST_MAX_H 340.0
+
+typedef struct {
+    bool is_section;
+    int target;         // meaningless when is_section is true
+    const char *label;  // section title when is_section; NULL otherwise (hds_lfo_dest_label(target) is used)
+} HdsDestListRow;
+
+static void hds_dest_list_add(HdsDestListRow *rows, int *count, bool is_section, int target, const char *label) {
+    if (*count >= HDS_DEST_LIST_MAX_ROWS) return;
+    rows[(*count)++] = (HdsDestListRow){is_section, target, label};
+}
+
+static void hds_dest_list_build(HdsDestListRow *rows, int *count) {
+    *count = 0;
+    hds_dest_list_add(rows, count, false, 0, NULL); // None -- always first, no section of its own
+
+    hds_dest_list_add(rows, count, true, -1, "Oscillator Pitch");
+    static const int pitch[] = {1, 2, 41, 42, 3};
+    for (size_t i = 0; i < sizeof(pitch) / sizeof(pitch[0]); i++) hds_dest_list_add(rows, count, false, pitch[i], NULL);
+
+    hds_dest_list_add(rows, count, true, -1, "Oscillator Fine / Detune");
+    static const int fine[] = {4, 5, 26, 27, 45, 46};
+    for (size_t i = 0; i < sizeof(fine) / sizeof(fine[0]); i++) hds_dest_list_add(rows, count, false, fine[i], NULL);
+
+    hds_dest_list_add(rows, count, true, -1, "Oscillator Phase");
+    static const int phase[] = {24, 25, 43, 44};
+    for (size_t i = 0; i < sizeof(phase) / sizeof(phase[0]); i++) hds_dest_list_add(rows, count, false, phase[i], NULL);
+
+    hds_dest_list_add(rows, count, true, -1, "Oscillator Pulse Width");
+    hds_dest_list_add(rows, count, false, 34, NULL);
+    hds_dest_list_add(rows, count, false, 35, NULL);
+
+    hds_dest_list_add(rows, count, true, -1, "Oscillator Amp / Pan / Tilt");
+    static const int amp[] = {6, 7, 36, 39, 32, 33, 37, 40, 38, 47};
+    for (size_t i = 0; i < sizeof(amp) / sizeof(amp[0]); i++) hds_dest_list_add(rows, count, false, amp[i], NULL);
+
+    hds_dest_list_add(rows, count, true, -1, "Mix");
+    hds_dest_list_add(rows, count, false, 22, NULL);
+    hds_dest_list_add(rows, count, false, 23, NULL);
+
+    hds_dest_list_add(rows, count, true, -1, "Filters");
+    for (int f = 0; f < 5; f++) {
+        hds_dest_list_add(rows, count, false, 90 + f * 2, NULL);
+        hds_dest_list_add(rows, count, false, 91 + f * 2, NULL);
+    }
+
+    hds_dest_list_add(rows, count, true, -1, "LFO Rate");
+    for (int i = 0; i < LFO_COUNT; i++) hds_dest_list_add(rows, count, false, hds_lfo_rate_dest_target(i), NULL);
+
+    hds_dest_list_add(rows, count, true, -1, "LFO Depth");
+    for (int i = 0; i < LFO_COUNT; i++) hds_dest_list_add(rows, count, false, hds_lfo_depth_dest_target(i), NULL);
+
+    hds_dest_list_add(rows, count, true, -1, "LFO Phase");
+    for (int i = 0; i < LFO_COUNT; i++) hds_dest_list_add(rows, count, false, hds_lfo_phase_dest_target(i), NULL);
+}
+
+// Renders the grouped list into `bg` (already positioned/sized by the caller's own anchor logic),
+// clamping *scroll_px into range first exactly like the old flat-list renderer did. `current` is
+// the field's OWN CURRENTLY STORED target (for highlighting), never a display index.
+static void hds_dest_list_render(cairo_t *cr, const HdsFxRect *bg, double *scroll_px, int current) {
+    HdsDestListRow rows[HDS_DEST_LIST_MAX_ROWS]; int count = 0;
+    hds_dest_list_build(rows, &count);
+
+    double total_h = 0.0;
+    for (int i = 0; i < count; i++) total_h += rows[i].is_section ? HDS_DEST_LIST_SECTION_H : HDS_DEST_LIST_ROW_H;
+    double max_scroll = total_h - bg->h;
+    if (max_scroll < 0.0) max_scroll = 0.0;
+    if (*scroll_px < 0.0) *scroll_px = 0.0;
+    if (*scroll_px > max_scroll) *scroll_px = max_scroll;
+
+    hds_fx_rgb(cr, 0.13, 0.13, 0.16);
+    cairo_new_path(cr); cairo_rectangle(cr, bg->x, bg->y, bg->w, bg->h); cairo_fill(cr);
+    hds_fx_rgba(cr, 1, 1, 1, 0.25);
+    cairo_new_path(cr); cairo_set_line_width(cr, 1.0);
+    cairo_rectangle(cr, bg->x + 0.5, bg->y + 0.5, bg->w - 1, bg->h - 1); cairo_stroke(cr);
+
+    cairo_save(cr);
+    cairo_rectangle(cr, bg->x, bg->y, bg->w, bg->h);
+    cairo_clip(cr);
+    double y = bg->y - *scroll_px;
+    for (int i = 0; i < count; i++) {
+        double row_h = rows[i].is_section ? HDS_DEST_LIST_SECTION_H : HDS_DEST_LIST_ROW_H;
+        if (y + row_h < bg->y) { y += row_h; continue; }
+        if (y > bg->y + bg->h) break;
+        if (rows[i].is_section) {
+            cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+            cairo_set_font_size(cr, 8.5);
+            hds_fx_rgb(cr, 0.5, 0.5, 0.55);
+            hds_fx_left_text(cr, bg->x + 4, y + row_h / 2 + 3.0, rows[i].label);
+        } else {
+            cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+            cairo_set_font_size(cr, 9.5);
+            char label[24]; hds_lfo_dest_label(rows[i].target, label, sizeof(label));
+            bool is_current = (rows[i].target == current);
+            if (is_current) {
+                hds_fx_rgb(cr, 0.22, 0.32, 0.36);
+                cairo_new_path(cr); cairo_rectangle(cr, bg->x, y, bg->w, row_h); cairo_fill(cr);
+            }
+            hds_fx_rgb(cr, is_current ? 0.92 : 0.78, is_current ? 0.95 : 0.78, is_current ? 0.92 : 0.81);
+            hds_fx_left_text(cr, bg->x + 4, y + row_h / 2 + 3.0, label);
+        }
+        y += row_h;
+    }
+    cairo_restore(cr);
+}
+
+// Returns true and writes *out_target if (x,y) landed on a real (non-section) row inside `bg`;
+// false (no write) for a miss outside `bg` or a hit on a section header -- clicking a header is a
+// no-op, same convention hds_ctxmenu_hit_row() already uses for its own section rows.
+static bool hds_dest_list_hit_test(const HdsFxRect *bg, double scroll_px, double x, double y, int *out_target) {
+    if (!hds_play_rect_contains(bg, x, y)) return false;
+    HdsDestListRow rows[HDS_DEST_LIST_MAX_ROWS]; int count = 0;
+    hds_dest_list_build(rows, &count);
+    double ry = bg->y - scroll_px;
+    for (int i = 0; i < count; i++) {
+        double row_h = rows[i].is_section ? HDS_DEST_LIST_SECTION_H : HDS_DEST_LIST_ROW_H;
+        if (y >= ry && y < ry + row_h) {
+            if (rows[i].is_section) return false;
+            *out_target = rows[i].target;
+            return true;
+        }
+        ry += row_h;
+    }
+    return false;
+}
+
+// Generic "Modulate From" menu content -- mirrors frontend.py's own _populate_modulate_from_menu()
+// exactly: every LFO (16) + every assignable EG (6), each toggling that source's own Destination
+// field (PackLfoParams.dest_target / ProgramState.eg_dest_target[]) to `target`, or back to 0/None
+// if it was already pointed there. group 0 = LFO index, group 1 = assignable-EG index (see
+// hds_play_modsource_dest_ptr() below) -- opaque to HdsCtxMenuRow itself, meaningful only here.
+// Self-modulation (an LFO/EG targeting its own Rate/Depth/Phase) is allowed, same as frontend.py.
+static float *hds_play_modsource_dest_ptr(ProgramState *prog, int group, int index) {
+    return (group == 0) ? &prog->lfo[index].dest_target : &prog->eg_dest_target[index];
+}
+
+static void hds_play_build_modulate_from_rows(HdsClapPlugin *p, int target, HdsCtxMenuRow *rows, int *count) {
+    ProgramState *prog = hds_play_program(p);
+    *count = 0;
+    hds_ctxmenu_add(rows, count, true, false, false, false, 0, 0, "Modulate From");
+    for (int i = 0; i < LFO_COUNT; i++) {
+        int cur = (int)prog->lfo[i].dest_target;
+        bool checked = (cur == target);
+        char label[40];
+        if (!checked && cur > 0 && cur < HDS_LFO_DEST_COUNT) {
+            char dl[24]; hds_lfo_dest_label(cur, dl, sizeof(dl));
+            snprintf(label, sizeof(label), "LFO %d  (-> %s)", i + 1, dl);
+        } else snprintf(label, sizeof(label), "LFO %d", i + 1);
+        hds_ctxmenu_add(rows, count, false, true, checked, false, 0, i, label);
+    }
+    for (int i = 0; i < ASSIGNABLE_EG_COUNT; i++) {
+        int cur = (int)prog->eg_dest_target[i];
+        bool checked = (cur == target);
+        char label[40];
+        if (!checked && cur > 0 && cur < HDS_LFO_DEST_COUNT) {
+            char dl[24]; hds_lfo_dest_label(cur, dl, sizeof(dl));
+            snprintf(label, sizeof(label), "EG %d  (-> %s)", i + 1, dl);
+        } else snprintf(label, sizeof(label), "EG %d", i + 1);
+        hds_ctxmenu_add(rows, count, false, true, checked, false, 1, i, label);
+    }
+}
+
+static void hds_play_toggle_modulate_from(HdsClapPlugin *p, int target, int group, int index, bool was_checked) {
+    float *dest = hds_play_modsource_dest_ptr(hds_play_program(p), group, index);
+    *dest = was_checked ? 0.0f : (float)target;
+}
+
+// Every tab file with a ctx_menu field calls this from its own on_button_press, right after its
+// existing dropdown check (same "consume the click, open list wins" precedence) -- closes the menu
+// unconditionally (a click anywhere, hit or miss, dismisses it, same as every dropdown in this GUI)
+// and toggles the hit row's own destination field first if one was hit.
+#define HDS_CTXMENU_KIND_MODULATE_FROM 1
+static bool hds_play_ctxmenu_handle_click(HdsClapPlugin *p, HdsCtxMenu *menu, double win_w, double win_h, double x, double y) {
+    if (!menu->open) return false;
+    if (menu->kind == HDS_CTXMENU_KIND_MODULATE_FROM) {
+        HdsCtxMenuRow rows[HDS_CTXMENU_MAX_ROWS]; int count = 0;
+        hds_play_build_modulate_from_rows(p, menu->arg, rows, &count);
+        int hit = hds_ctxmenu_hit_row(menu, rows, count, win_w, win_h, x, y);
+        if (hit >= 0) hds_play_toggle_modulate_from(p, menu->arg, rows[hit].group, rows[hit].index, rows[hit].checked);
+    }
+    menu->open = false;
+    return true;
+}
+
 typedef struct {
     int dropdown_kind;         // HDS_PLAY_DROPDOWN_* -- one at a time, same convention as the FX tab's own
     int dropdown_index;        // which oscillator (0-3, SHAPE) or which Amp EG (0-3, EGMODE)
     HdsFxRect dropdown_anchor;
 
     HdsPlayKnobDrag knob_drag;
+    HdsCtxMenu ctx_menu;        // the open "Modulate From" menu (if any) from a right-click-without-
+                                 // drag release on Pitch/Phase/Pulse-Width -- see knob_drag.menu
 
     int adsr_drag_eg;           // -1 = not dragging any Amp EG curve; else 0-3
     int adsr_active_node[4];    // per-EG "which node is highlighted/being dragged", -1 = none
@@ -470,19 +812,95 @@ static void hds_play_draw_osc_knob(cairo_t *cr, const HdsFxRect *r, float *targe
 // state, so a later tab file (e.g. hds_clap_filters_draw.c) can reuse it verbatim against its own
 // view state's own drag field, the same way it already reuses hds_play_draw_knob()/
 // hds_play_knob_hit_test().
-static void hds_play_start_knob_drag(HdsPlayKnobDrag *drag, float *target, double lo, double hi, double y) {
+#define HDS_PLAY_NO_MENU ((HdsPlayKnobMenu){0, 0})
+#define HDS_PLAY_DOUBLE_CLICK_MS 400.0
+#define HDS_PLAY_DOUBLE_CLICK_PX 4.0
+
+// button 1 (left): double-click (same knob, within HDS_PLAY_DOUBLE_CLICK_MS/PX of the last left
+// click) resets to 0 -- mirrors frontend.py's PotentiometerKnob.mouseDoubleClickEvent, which
+// always resets to a literal 0.0 regardless of range -- otherwise starts a normal drag. button 3
+// (right): recorded as pending; hds_play_apply_knob_drag()/hds_play_release_knob_drag() below
+// promote it to a fine-sensitivity drag once the pointer moves, or open `menu` on release if it
+// never did (frontend.py's own manhattanLength() > 3 click-vs-drag gesture).
+static void hds_play_start_knob_drag(HdsPlayKnobDrag *drag, float *target, double lo, double hi, double x, double y, int button, HdsPlayKnobMenu menu) {
     if (!target) return;
-    drag->target = target;
-    drag->lo = lo; drag->hi = hi;
-    drag->start_y = y;
-    drag->start_val = *target;
+    if (button == 3) {
+        drag->target = target; drag->lo = lo; drag->hi = hi;
+        drag->start_y = y; drag->start_val = *target;
+        drag->button = 3; drag->press_x = x; drag->press_y = y; drag->right_moved = false;
+        drag->menu = menu;
+        return;
+    }
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    double dt_ms = (now.tv_sec - drag->last_click_time.tv_sec) * 1000.0 + (now.tv_nsec - drag->last_click_time.tv_nsec) / 1e6;
+    double ddx = x - drag->last_click_x, ddy = y - drag->last_click_y;
+    bool is_double = drag->last_click_target == target && dt_ms < HDS_PLAY_DOUBLE_CLICK_MS && (ddx * ddx + ddy * ddy) < (HDS_PLAY_DOUBLE_CLICK_PX * HDS_PLAY_DOUBLE_CLICK_PX);
+    drag->last_click_time = now; drag->last_click_x = x; drag->last_click_y = y;
+    if (is_double) {
+        *target = (float)fmax(lo, fmin(hi, 0.0));
+        drag->last_click_target = NULL;
+        drag->button = 0; drag->target = NULL;
+        return;
+    }
+    drag->last_click_target = target;
+    drag->target = target; drag->lo = lo; drag->hi = hi;
+    drag->start_y = y; drag->start_val = *target;
+    drag->button = 1;
 }
 
-static bool hds_play_try_osc_knob_click(HdsClapPlayViewState *vs, const HdsFxRect *r, float *target, HdsPlayOscKnobId id, int shape, double x, double y) {
+#define HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX 3.0
+#define HDS_PLAY_RIGHT_DRAG_SENSITIVITY 0.1
+
+// Called every motion event a knob_drag is in flight (button 1 or 3 -- idle button==0 means
+// drag->target is NULL and this is never reached). button 1 is the plain full-sensitivity drag this
+// file always had. button 3 stays a no-op (not yet a drag at all) until the pointer clears
+// HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX of its own ORIGINAL press point -- frontend.py's own
+// manhattanLength() > 3 promotion -- after which it applies the exact same linear mapping at 1/10th
+// sensitivity (frontend.py's sensitivity_scale=0.1), always measured from that same press point
+// (never a running last-position), matching PotentiometerKnob.mouseMoveEvent's own math exactly.
+static void hds_play_apply_knob_drag(HdsPlayKnobDrag *drag, double x, double y) {
+    if (!drag->target) return;
+    if (drag->button == 3) {
+        double mdx = x - drag->press_x, mdy = y - drag->press_y;
+        if (!drag->right_moved) {
+            if (fabs(mdx) + fabs(mdy) <= HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX) return;
+            drag->right_moved = true;
+        }
+        double delta = (drag->press_y - y) * HDS_PLAY_RIGHT_DRAG_SENSITIVITY;
+        double v = drag->start_val + (delta / HDS_PLAY_DRAG_PIXELS_FULL_RANGE) * (drag->hi - drag->lo);
+        if (v < drag->lo) v = drag->lo; else if (v > drag->hi) v = drag->hi;
+        *drag->target = (float)v;
+        return;
+    }
+    double delta = drag->start_y - y;
+    double v = drag->start_val + (delta / HDS_PLAY_DRAG_PIXELS_FULL_RANGE) * (drag->hi - drag->lo);
+    if (v < drag->lo) v = drag->lo; else if (v > drag->hi) v = drag->hi;
+    *drag->target = (float)v;
+}
+
+// Called from on_button_release. Returns the knob's own menu (HDS_PLAY_NO_MENU if it doesn't have
+// one, or if this release ends an actual drag rather than a click) and, only when a real menu is
+// returned, where to anchor it -- the ORIGINAL right-press point, which is always within
+// HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX of wherever the button was released in that case (right_moved is
+// still false), so there's no need to plumb the release event's own x/y through the ~8 on_button_
+// release call sites in this codebase just for this.
+static HdsPlayKnobMenu hds_play_release_knob_drag(HdsPlayKnobDrag *drag, double *out_anchor_x, double *out_anchor_y) {
+    HdsPlayKnobMenu menu = HDS_PLAY_NO_MENU;
+    if (drag->target && drag->button == 3 && !drag->right_moved && drag->menu.kind != 0) {
+        menu = drag->menu;
+        if (out_anchor_x) *out_anchor_x = drag->press_x;
+        if (out_anchor_y) *out_anchor_y = drag->press_y;
+    }
+    drag->target = NULL;
+    drag->button = 0;
+    return menu;
+}
+
+static bool hds_play_try_osc_knob_click(HdsClapPlayViewState *vs, const HdsFxRect *r, float *target, HdsPlayOscKnobId id, int shape, double x, double y, int button, HdsPlayKnobMenu menu) {
     if (!target || !hds_play_knob_hit_test(r, x, y)) return false;
     double lo, hi; const char *label; (void)label;
     hds_play_osc_knob_info(id, shape, &lo, &hi, &label);
-    hds_play_start_knob_drag(&vs->knob_drag, target, lo, hi, y);
+    hds_play_start_knob_drag(&vs->knob_drag, target, lo, hi, x, y, button, menu);
     return true;
 }
 
@@ -701,11 +1119,24 @@ static void hds_clap_play_render(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewS
     } else if (vs->dropdown_kind == HDS_PLAY_DROPDOWN_EGMODE) {
         hds_play_render_dropdown(cr, vs, window_h, (int)prog->eg_mode[vs->dropdown_index]);
     }
+
+    if (vs->ctx_menu.open && vs->ctx_menu.kind == HDS_CTXMENU_KIND_MODULATE_FROM) {
+        HdsCtxMenuRow rows[HDS_CTXMENU_MAX_ROWS]; int count = 0;
+        hds_play_build_modulate_from_rows(p, vs->ctx_menu.arg, rows, &count);
+        hds_ctxmenu_render(cr, &vs->ctx_menu, rows, count, window_w, window_h);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Interaction
 // ---------------------------------------------------------------------------------------------
+
+// Oscillator Pitch/Phase/Pulse-Width's own "Modulate From" target numbers, one per oscillator
+// (0-3) -- the same 3 knob kinds frontend.py wires setContextMenuCallback() onto via
+// _show_dest_assign_menu(), matching hds_lfo_dest_label()'s own numbering exactly.
+static const int HDS_PLAY_PITCH_DEST_TARGET[4] = {1, 2, 41, 42};
+static const int HDS_PLAY_PHASE_DEST_TARGET[4] = {24, 25, 43, 44};
+static const int HDS_PLAY_PULSE_DEST_TARGET[4] = {34, 35, 38, 47};
 
 // "1->All"/"Sync": one-shot and live copy of Amp EG 0 (Osc1)'s full state onto Amp EGs 1-3 --
 // mirrors frontend.py's own _copy_amp_eg_to_all()/_mirror_amp_eg_live() exactly (topology mode +
@@ -719,6 +1150,8 @@ static void hds_play_copy_eg0_to_all(ProgramState *prog) {
 
 static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState *vs, double window_w, double window_h, double x, double y, int button) {
     ProgramState *prog = hds_play_program(p);
+
+    if (vs->ctx_menu.open) return hds_play_ctxmenu_handle_click(p, &vs->ctx_menu, window_w, window_h, x, y);
 
     if (vs->dropdown_kind != HDS_PLAY_DROPDOWN_NONE) {
         int count = hds_play_dropdown_option_count(vs->dropdown_kind);
@@ -762,19 +1195,21 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
             if (button == 1) *f.mute = (*f.mute != 0.0f) ? 0.0f : 1.0f;
             return true;
         }
-        if (hds_play_try_osc_knob_click(vs, &L.pulse_knob, f.pulse_width, HDS_PLAY_KNOB_PULSE, shape, x, y)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.curve_knob, f.curve_drive, HDS_PLAY_KNOB_CURVE, shape, x, y)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.pitch_off_knob, f.pitch_offset, HDS_PLAY_KNOB_PITCH_OFFSET, shape, x, y)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.fine_knob, f.fine_tune, HDS_PLAY_KNOB_FINE, shape, x, y)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.phase_knob, f.phase_offset, HDS_PLAY_KNOB_PHASE, shape, x, y)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.pitch_knob, f.pitch, HDS_PLAY_KNOB_PITCH, shape, x, y)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.uni_width_knob, f.unison_width, HDS_PLAY_KNOB_UNI_WIDTH, shape, x, y)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.uni_detune_knob, f.unison_detune, HDS_PLAY_KNOB_UNI_DETUNE, shape, x, y)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.vol_knob, f.vol, HDS_PLAY_KNOB_VOL, shape, x, y)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.pan_knob, f.pan, HDS_PLAY_KNOB_PAN, shape, x, y)) return true;
+        HdsPlayKnobMenu pulse_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, HDS_PLAY_PULSE_DEST_TARGET[osc]};
+        HdsPlayKnobMenu phase_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, HDS_PLAY_PHASE_DEST_TARGET[osc]};
+        HdsPlayKnobMenu pitch_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, HDS_PLAY_PITCH_DEST_TARGET[osc]};
+        if (hds_play_try_osc_knob_click(vs, &L.pulse_knob, f.pulse_width, HDS_PLAY_KNOB_PULSE, shape, x, y, button, pulse_menu)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.curve_knob, f.curve_drive, HDS_PLAY_KNOB_CURVE, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.pitch_off_knob, f.pitch_offset, HDS_PLAY_KNOB_PITCH_OFFSET, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.fine_knob, f.fine_tune, HDS_PLAY_KNOB_FINE, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.phase_knob, f.phase_offset, HDS_PLAY_KNOB_PHASE, shape, x, y, button, phase_menu)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.pitch_knob, f.pitch, HDS_PLAY_KNOB_PITCH, shape, x, y, button, pitch_menu)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.uni_width_knob, f.unison_width, HDS_PLAY_KNOB_UNI_WIDTH, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.uni_detune_knob, f.unison_detune, HDS_PLAY_KNOB_UNI_DETUNE, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.vol_knob, f.vol, HDS_PLAY_KNOB_VOL, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.pan_knob, f.pan, HDS_PLAY_KNOB_PAN, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
     }
 
-    (void)window_w;
     double eg_top_y = hds_play_eg_top_y(prog);
     for (int i = 0; i < 4; i++) {
         int env_type = (int)prog->eg_mode[i];
@@ -797,7 +1232,7 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
         // own comment on why Osc 1 is not special-cased out of this control at all.
         if (!disabled) {
             HdsPlayOscFields f; hds_play_osc_fields(prog, i, &f);
-            if (hds_play_try_osc_knob_click(vs, &L.vel_to_amp_knob, f.vel_to_amp, HDS_PLAY_KNOB_VEL_TO_AMP, 0, x, y)) return true;
+            if (hds_play_try_osc_knob_click(vs, &L.vel_to_amp_knob, f.vel_to_amp, HDS_PLAY_KNOB_VEL_TO_AMP, 0, x, y, button, HDS_PLAY_NO_MENU)) return true;
         }
 
         if (!disabled && hds_play_rect_contains(&L.mode_pill, x, y)) {
@@ -819,7 +1254,7 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
                 if (hds_play_knob_hit_test(&L.dial[d], x, y)) {
                     int field = HDS_PLAY_EG_FIELD_ORDER[env_type][d];
                     float *target = hds_play_eg_dial_target(&prog->eg[i], field);
-                    hds_play_start_knob_drag(&vs->knob_drag, target, HDS_PLAY_EG_LO[field], HDS_PLAY_EG_HI[field], y);
+                    hds_play_start_knob_drag(&vs->knob_drag, target, HDS_PLAY_EG_LO[field], HDS_PLAY_EG_HI[field], x, y, button, HDS_PLAY_NO_MENU);
                     return true;
                 }
             }
@@ -835,10 +1270,7 @@ static void hds_clap_play_on_motion(HdsClapPlugin *p, HdsClapPlayViewState *vs, 
     (void)window_w;
 
     if (vs->knob_drag.target) {
-        double delta = vs->knob_drag.start_y - y; // up = increase, matching every knob in this GUI
-        double v = vs->knob_drag.start_val + (delta / HDS_PLAY_DRAG_PIXELS_FULL_RANGE) * (vs->knob_drag.hi - vs->knob_drag.lo);
-        if (v < vs->knob_drag.lo) v = vs->knob_drag.lo; else if (v > vs->knob_drag.hi) v = vs->knob_drag.hi;
-        *vs->knob_drag.target = (float)v;
+        hds_play_apply_knob_drag(&vs->knob_drag, x, y);
         if (vs->amp_eg_live_sync) {
             // Cheap and correct rather than clever: any drag currently in flight might be one of
             // Amp EG 0's own 6 dial fields (their pointers all point inside prog->eg[0]) -- there's
@@ -865,6 +1297,10 @@ static void hds_clap_play_on_motion(HdsClapPlugin *p, HdsClapPlayViewState *vs, 
 }
 
 static void hds_clap_play_on_button_release(HdsClapPlayViewState *vs) {
-    vs->knob_drag.target = NULL;
+    double anchor_x = 0.0, anchor_y = 0.0;
+    HdsPlayKnobMenu menu = hds_play_release_knob_drag(&vs->knob_drag, &anchor_x, &anchor_y);
+    if (menu.kind != 0) {
+        vs->ctx_menu = (HdsCtxMenu){true, anchor_x, anchor_y, menu.kind, menu.arg};
+    }
     vs->adsr_drag_eg = -1;
 }

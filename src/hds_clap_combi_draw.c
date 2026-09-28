@@ -319,11 +319,11 @@ static bool hds_clap_combi_on_button_press(HdsClapPlugin *p, HdsClapCombiViewSta
         HdsCombiLaneLayout L;
         hds_combi_compute_lane_layout(lane, HDS_PLAY_CONTENT_TOP, &L);
         if (hds_play_knob_hit_test(&L.level_knob, x, y)) {
-            hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.seq_lanes[lane].volume, 0.0, 100.0, y);
+            hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.seq_lanes[lane].volume, 0.0, 100.0, x, y, button, HDS_PLAY_NO_MENU);
             return true;
         }
         if (hds_play_knob_hit_test(&L.pan_knob, x, y)) {
-            hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.seq_lanes[lane].pan, -1.0, 1.0, y);
+            hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.seq_lanes[lane].pan, -1.0, 1.0, x, y, button, HDS_PLAY_NO_MENU);
             return true;
         }
         if (hds_play_rect_contains(&L.program_pill, x, y)) {
@@ -355,12 +355,7 @@ static bool hds_clap_combi_on_button_press(HdsClapPlugin *p, HdsClapCombiViewSta
 }
 
 static void hds_clap_combi_on_motion(HdsClapCombiViewState *vs, double x, double y) {
-    (void)x;
-    if (!vs->knob_drag.target) return;
-    double delta = vs->knob_drag.start_y - y;
-    double v = vs->knob_drag.start_val + (delta / HDS_PLAY_DRAG_PIXELS_FULL_RANGE) * (vs->knob_drag.hi - vs->knob_drag.lo);
-    if (v < vs->knob_drag.lo) v = vs->knob_drag.lo; else if (v > vs->knob_drag.hi) v = vs->knob_drag.hi;
-    *vs->knob_drag.target = (float)v;
+    hds_play_apply_knob_drag(&vs->knob_drag, x, y);
 }
 
-static void hds_clap_combi_on_button_release(HdsClapCombiViewState *vs) { vs->knob_drag.target = NULL; }
+static void hds_clap_combi_on_button_release(HdsClapCombiViewState *vs) { hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL); }

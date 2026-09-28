@@ -140,6 +140,14 @@ tempo (toggle to "Internal" in the Global sidebar's Tempo section to use
 the Tempo knob/tempo-map instead — this choice is saved with the host
 project like any other parameter).
 
+Knobs: click-drag for a normal-sensitivity adjustment, double-click to
+reset to 0, right-click-drag for a 10x finer adjustment. A knob that also
+modulates something else (oscillator Pitch/Phase/Pulse-Width, Filter
+Cutoff/Resonance, LFO Rate/Depth/Phase) opens a "Modulate From" menu on a
+right-click that doesn't drag, letting any LFO or assignable EG target it
+directly — the same field its own Destination dropdown already sets, just
+a second way to reach it.
+
 ## Platform notes
 
 - **Raspberry Pi / aarch64 Linux**: `make arm64` cross-compiles

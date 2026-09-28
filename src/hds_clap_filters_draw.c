@@ -34,6 +34,7 @@ typedef struct {
     int dropdown_index;  // which filter slot (0-4) the open Type dropdown belongs to
     HdsFxRect dropdown_anchor;
     HdsPlayKnobDrag knob_drag; // reused verbatim from hds_clap_play_draw.c -- see this file's own header comment
+    HdsCtxMenu ctx_menu;       // Cutoff's/Resonance's own "Modulate From" menu, if one is open
 } HdsClapFiltersViewState;
 
 static void hds_clap_filters_view_state_init(HdsClapFiltersViewState *vs) {
@@ -203,13 +204,27 @@ static void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFilter
     if (vs->dropdown_kind == HDS_FILT_DROPDOWN_TYPE) {
         hds_clap_filters_render_dropdown(cr, vs, window_h, (int)prog->filters[vs->dropdown_index].filter_type);
     }
+
+    if (vs->ctx_menu.open && vs->ctx_menu.kind == HDS_CTXMENU_KIND_MODULATE_FROM) {
+        HdsCtxMenuRow rows[HDS_CTXMENU_MAX_ROWS]; int count = 0;
+        hds_play_build_modulate_from_rows(p, vs->ctx_menu.arg, rows, &count);
+        hds_ctxmenu_render(cr, &vs->ctx_menu, rows, count, window_w, window_h);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Interaction
 // ---------------------------------------------------------------------------------------------
-static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersViewState *vs, double window_h, double x, double y, int button) {
+// Cutoff/Resonance's own right-click "Modulate From" menu target numbers, one pair per flat
+// filter slot (0-4) -- inverse of hds_lfo_dest_label()'s own `target >= 90` decode (Freq on the
+// even target, Res on the odd one right after it).
+static int hds_filt_cutoff_dest_target(int idx) { return 90 + idx * 2; }
+static int hds_filt_res_dest_target(int idx) { return 91 + idx * 2; }
+
+static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersViewState *vs, double window_w, double window_h, double x, double y, int button) {
     ProgramState *prog = hds_play_program(p);
+
+    if (vs->ctx_menu.open) return hds_play_ctxmenu_handle_click(p, &vs->ctx_menu, window_w, window_h, x, y);
 
     if (vs->dropdown_kind != HDS_FILT_DROPDOWN_NONE) {
         for (int i = 0; i < HDS_FILT_TYPE_COUNT; i++) {
@@ -241,8 +256,10 @@ static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersVie
         HdsFiltRowLayout L;
         hds_clap_filters_compute_row_layout(i, rows_top, &L);
 
-        if (hds_play_knob_hit_test(&L.freq_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &filt->cutoff, 40.0, 18000.0, y); return true; }
-        if (hds_play_knob_hit_test(&L.res_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &filt->res_q, 0.0, 100.0, y); return true; }
+        HdsPlayKnobMenu cutoff_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, hds_filt_cutoff_dest_target(i)};
+        HdsPlayKnobMenu res_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, hds_filt_res_dest_target(i)};
+        if (hds_play_knob_hit_test(&L.freq_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &filt->cutoff, 40.0, 18000.0, x, y, button, cutoff_menu); return true; }
+        if (hds_play_knob_hit_test(&L.res_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &filt->res_q, 0.0, 100.0, x, y, button, res_menu); return true; }
         if (hds_play_rect_contains(&L.slope_pill, x, y)) {
             if (button == 1) filt->slope_poles = (filt->slope_poles != 0.0f) ? 0.0f : 1.0f;
             return true;
@@ -259,9 +276,9 @@ static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersVie
         double col_x = HDS_FILT_MARGIN + b * HDS_FILT_EQ_BAND_W;
         HdsEqBandLayout L;
         hds_clap_filters_compute_eq_layout(b, col_x, eq_top, &L);
-        if (hds_play_knob_hit_test(&L.freq_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &band->freq, 20.0, 20000.0, y); return true; }
-        if (hds_play_knob_hit_test(&L.gain_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &band->gain_db, -18.0, 18.0, y); return true; }
-        if (b == 1 && hds_play_knob_hit_test(&L.q_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &band->q, 0.1, 10.0, y); return true; }
+        if (hds_play_knob_hit_test(&L.freq_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &band->freq, 20.0, 20000.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
+        if (hds_play_knob_hit_test(&L.gain_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &band->gain_db, -18.0, 18.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
+        if (b == 1 && hds_play_knob_hit_test(&L.q_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &band->q, 0.1, 10.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
     }
 
     (void)button;
@@ -269,12 +286,11 @@ static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersVie
 }
 
 static void hds_clap_filters_on_motion(HdsClapFiltersViewState *vs, double x, double y) {
-    (void)x;
-    if (!vs->knob_drag.target) return;
-    double delta = vs->knob_drag.start_y - y;
-    double v = vs->knob_drag.start_val + (delta / HDS_PLAY_DRAG_PIXELS_FULL_RANGE) * (vs->knob_drag.hi - vs->knob_drag.lo);
-    if (v < vs->knob_drag.lo) v = vs->knob_drag.lo; else if (v > vs->knob_drag.hi) v = vs->knob_drag.hi;
-    *vs->knob_drag.target = (float)v;
+    hds_play_apply_knob_drag(&vs->knob_drag, x, y);
 }
 
-static void hds_clap_filters_on_button_release(HdsClapFiltersViewState *vs) { vs->knob_drag.target = NULL; }
+static void hds_clap_filters_on_button_release(HdsClapFiltersViewState *vs) {
+    double anchor_x = 0.0, anchor_y = 0.0;
+    HdsPlayKnobMenu menu = hds_play_release_knob_drag(&vs->knob_drag, &anchor_x, &anchor_y);
+    if (menu.kind != 0) vs->ctx_menu = (HdsCtxMenu){true, anchor_x, anchor_y, menu.kind, menu.arg};
+}

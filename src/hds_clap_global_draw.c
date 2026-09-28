@@ -432,16 +432,16 @@ static bool hds_clap_global_on_button_press(HdsClapPlugin *p, HdsClapGlobalViewS
     if (hds_play_rect_contains(&L.hardsync_pill, x, y)) {
         vs->dropdown_kind = HDS_GLOBAL_DROPDOWN_HARDSYNC; vs->dropdown_anchor = L.hardsync_pill; return true;
     }
-    if (hds_play_knob_hit_test(&L.pb_up_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->pb_range_up, 0.0, 24.0, y); return true; }
-    if (hds_play_knob_hit_test(&L.pb_down_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->pb_range_down, 0.0, 24.0, y); return true; }
-    if (hds_play_knob_hit_test(&L.transpose_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.transpose_semitones, -16.0, 16.0, y); return true; }
+    if (hds_play_knob_hit_test(&L.pb_up_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->pb_range_up, 0.0, 24.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
+    if (hds_play_knob_hit_test(&L.pb_down_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->pb_range_down, 0.0, 24.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
+    if (hds_play_knob_hit_test(&L.transpose_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.transpose_semitones, -16.0, 16.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
 
     if (hds_play_rect_contains(&L.tuning_enable_pill, x, y)) {
         if (button == 1) p->knobs.tuning_enable = (p->knobs.tuning_enable != 0.0f) ? 0.0f : 1.0f;
         return true;
     }
-    if (hds_play_knob_hit_test(&L.tuning_note_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.tuning_reference_note, 0.0, 127.0, y); return true; }
-    if (hds_play_knob_hit_test(&L.tuning_freq_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.tuning_reference_freq, 20.0, 2000.0, y); return true; }
+    if (hds_play_knob_hit_test(&L.tuning_note_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.tuning_reference_note, 0.0, 127.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
+    if (hds_play_knob_hit_test(&L.tuning_freq_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.tuning_reference_freq, 20.0, 2000.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
 
     if (hds_play_rect_contains(&L.sustain_normal_pill, x, y)) { if (button == 1) prog->sustain_pedal_polarity = 0.0f; return true; }
     if (hds_play_rect_contains(&L.sustain_inverted_pill, x, y)) { if (button == 1) prog->sustain_pedal_polarity = 1.0f; return true; }
@@ -454,19 +454,19 @@ static bool hds_clap_global_on_button_press(HdsClapPlugin *p, HdsClapGlobalViewS
     for (int i = 0; i < fcount; i++) {
         int f = fields[i];
         if (hds_play_knob_hit_test(&L.fm_depth_knob[f], x, y)) {
-            hds_play_start_knob_drag(&vs->knob_drag, hds_global_fm_depth_target(prog, f), 0.0, 2.0, y);
+            hds_play_start_knob_drag(&vs->knob_drag, hds_global_fm_depth_target(prog, f), 0.0, 2.0, x, y, button, HDS_PLAY_NO_MENU);
             return true;
         }
     }
 
-    if (hds_play_knob_hit_test(&L.glide_time_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->portamento_time_ms, 0.0, 1000.0, y); return true; }
-    if (hds_play_knob_hit_test(&L.glide_random_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->mono_glide_random, 0.0, 100.0, y); return true; }
+    if (hds_play_knob_hit_test(&L.glide_time_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->portamento_time_ms, 0.0, 1000.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
+    if (hds_play_knob_hit_test(&L.glide_random_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->mono_glide_random, 0.0, 100.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
     if (hds_play_rect_contains(&L.tempo_sync_internal_pill, x, y)) { if (button == 1) p->knobs.seq_sync_source = 0.0f; return true; }
     if (hds_play_rect_contains(&L.tempo_sync_daw_pill, x, y)) { if (button == 1) p->knobs.seq_sync_source = 1.0f; return true; }
     // No drag while synced to the DAW -- the knob is display-only then (shows host_tempo_bpm, see
     // this file's own render-side comment), same "disabled means non-interactive" convention the
     // Arp Velocity/Gate knobs already use when !arp_on.
-    if (p->knobs.seq_sync_source == 0.0f && hds_play_knob_hit_test(&L.tempo_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->tempo_bpm, 20.0, 300.0, y); return true; }
+    if (p->knobs.seq_sync_source == 0.0f && hds_play_knob_hit_test(&L.tempo_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->tempo_bpm, 20.0, 300.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
     if (hds_play_rect_contains(&L.metronome_pill, x, y)) {
         if (button == 1) p->knobs.metronome_enable = (p->knobs.metronome_enable != 0.0f) ? 0.0f : 1.0f;
         return true;
@@ -479,23 +479,18 @@ static bool hds_clap_global_on_button_press(HdsClapPlugin *p, HdsClapGlobalViewS
     if (arp_on && hds_play_rect_contains(&L.arp_style_pill, x, y)) {
         vs->dropdown_kind = HDS_GLOBAL_DROPDOWN_ARPSTYLE; vs->dropdown_anchor = L.arp_style_pill; return true;
     }
-    if (arp_on && hds_play_knob_hit_test(&L.arp_velocity_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->arp_velocity, 0.0, 127.0, y); return true; }
-    if (arp_on && hds_play_knob_hit_test(&L.arp_gate_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->arp_gate_pct, 1.0, 100.0, y); return true; }
+    if (arp_on && hds_play_knob_hit_test(&L.arp_velocity_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->arp_velocity, 0.0, 127.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
+    if (arp_on && hds_play_knob_hit_test(&L.arp_gate_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->arp_gate_pct, 1.0, 100.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
 
     (void)button;
     return true;
 }
 
 static void hds_clap_global_on_motion(HdsClapGlobalViewState *vs, double x, double y) {
-    (void)x;
-    if (!vs->knob_drag.target) return;
-    double delta = vs->knob_drag.start_y - y;
-    double v = vs->knob_drag.start_val + (delta / HDS_PLAY_DRAG_PIXELS_FULL_RANGE) * (vs->knob_drag.hi - vs->knob_drag.lo);
-    if (v < vs->knob_drag.lo) v = vs->knob_drag.lo; else if (v > vs->knob_drag.hi) v = vs->knob_drag.hi;
-    *vs->knob_drag.target = (float)v;
+    hds_play_apply_knob_drag(&vs->knob_drag, x, y);
 }
 
-static void hds_clap_global_on_button_release(HdsClapGlobalViewState *vs) { vs->knob_drag.target = NULL; }
+static void hds_clap_global_on_button_release(HdsClapGlobalViewState *vs) { hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL); }
 
 // Same scroll convention as hds_clap_lfos_draw.c/hds_clap_envelopes_draw.c's own scroll handlers --
 // content_h comes from the SAME layout function render/hit-test already use, so it can never
