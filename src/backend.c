@@ -2459,6 +2459,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SUBARRAY("/hds/fx/%d/source", fx, FXSlotParams, fx_source, FX_SLOT_COUNT),
     OSC_SUBARRAY("/hds/fx/%d/chain_to_next", fx, FXSlotParams, chain_to_next, FX_SLOT_COUNT),
     OSC_SUBARRAY("/hds/fx/%d/sidechain_source", fx, FXSlotParams, sidechain_source, FX_SLOT_COUNT),
+    OSC_SUBARRAY("/hds/fx/%d/input_from_slot", fx, FXSlotParams, input_from_slot, FX_SLOT_COUNT),
     OSC_NESTED("/hds/fx/%d/param/%d", fx, FXSlotParams, param, FX_SLOT_COUNT, FX_SLOT_PARAM_COUNT),
     // FX_TYPE_NAM's own loaded-file paths -- plain string fields, generically saved/restored by
     // CLAP state (see clap_state_save/load's own K/T-line walk over this whole table) with no
@@ -3519,6 +3520,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
         knobs->fx[f].fx_source = 0.0f; // Program -- reproduces today's exact behavior by default
         knobs->fx[f].chain_to_next = 0.0f; // every slot its own one-slot branch in Parallel mode -- today's exact behavior
         knobs->fx[f].sidechain_source = -1.0f; // "Same as Source" -- self-key, ordinary compression by default
+        knobs->fx[f].input_from_slot = -1.0f; // not used -- see FXSlotParams' own comment
         knobs->fx[f].nam_model_path[0] = '\0';
         knobs->fx[f].nam_ir_path[0] = '\0';
     }
@@ -6136,6 +6138,16 @@ typedef struct {
     float         eq_z2[COMBI_PROGRAM_COUNT + 1][3][2];
     FXSlotEngine  fx_engine[FX_SLOT_COUNT];
     bool          fx_engine_initialized;
+    // Every slot's own last-computed post-mix output, in POOL-SLOT order (not per-source) -- lets
+    // any slot's FXSlotParams.input_from_slot pull a DIFFERENT slot's real output directly, even one
+    // owned by a different source's own process_fx_chain() call. Written unconditionally for every
+    // slot process_fx_chain() actually processes (see that function's own comment); a slot referenced
+    // before its own source has run this sample simply reads last sample's value -- a one-sample-or-
+    // less lag, the same tradeoff sc_snapshot_l/r already accepts for the sidechain case. Persists
+    // across blocks like fx_engine[] itself (never reset to 0 on its own), so this stays correct
+    // regardless of which order sources happen to be walked in.
+    float         fx_slot_out_l[FX_SLOT_COUNT];
+    float         fx_slot_out_r[FX_SLOT_COUNT];
     float         limiter_gain[OUTPUT_PAIR_MAX];
     bool          limiter_gain_initialized;
     float         master_volume_smoothed; // chases knobs->master_volume over a short time
@@ -8517,7 +8529,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // effect to.
         for (int src = 0; src < SOURCE_COUNT; src++) {
             if (!source_has_fx_slots[src]) continue;
-            process_fx_chain(knobs->fx, fx_engine, /* always Parallel, matches HDS FX */ 1, src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src], gr_db_out);
+            process_fx_chain(knobs->fx, fx_engine, /* always Parallel, matches HDS FX */ 1, src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src], gr_db_out, engine->fx_slot_out_l, engine->fx_slot_out_r);
         }
 
         // CLAP multi-out (see this function's own per_program_out comment) -- captured here,

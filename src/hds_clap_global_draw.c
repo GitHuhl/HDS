@@ -34,9 +34,11 @@
 //   - Arp Octave Range/Rate/Hold: real, working, already-Program-scoped backend fields
 //     (arp_octave_range/arp_rate/arp_hold) with no widget in frontend.py's OWN Global panel either
 //     (a pre-existing gap in the Python reference, not something this port introduces or fixes).
-//   - The "Output" group box (VU meter + master volume slider) stacked below Global Configurations
-//     in frontend.py's own sidebar: a separate panel, not part of "Global Configurations" itself --
-//     out of scope for this port, real follow-up work.
+//   - The "Output" group box's VU meter, stacked below Global Configurations in frontend.py's own
+//     sidebar: a separate panel, not part of "Global Configurations" itself -- out of scope for
+//     this port, real follow-up work (Master Volume itself, that same group box's other control,
+//     IS ported below -- as its own small section at the bottom of this sidebar rather than a
+//     separate panel, since there's no meter to justify a whole extra group box yet).
 //
 // #include'd by clap_plugin.c after hds_clap_play_draw.c (needs HdsPlayKnobDrag/hds_play_draw_knob/
 // hds_play_knob_hit_test/hds_play_start_knob_drag/hds_play_rect_contains, same reuse convention
@@ -155,6 +157,7 @@ typedef struct {
     HdsFxRect metronome_pill;
     HdsFxRect arp_enabled_pill, arp_style_pill;
     HdsFxRect arp_velocity_knob, arp_gate_knob;
+    HdsFxRect master_volume_knob;
     double content_h; // total stacked height, for scroll clamping -- constant regardless of state (the FM depth row's own width varies by algorithm, never its height)
 } HdsGlobalLayout;
 
@@ -247,6 +250,12 @@ static void hds_clap_global_compute_layout(int fm_algo, double scroll_offset_px,
     y += HDS_GLOBAL_PILL_H + 6.0;
     out->arp_velocity_knob = (HdsFxRect){lane_l_cx, y + HDS_GLOBAL_KNOB_R + 9.0, HDS_GLOBAL_KNOB_R, HDS_GLOBAL_KNOB_R};
     out->arp_gate_knob = (HdsFxRect){lane_r_cx, y + HDS_GLOBAL_KNOB_R + 9.0, HDS_GLOBAL_KNOB_R, HDS_GLOBAL_KNOB_R};
+    y += HDS_GLOBAL_KNOB_ROW_H + HDS_GLOBAL_SECTION_GAP;
+
+    // Master Volume -- session-level (SynthSharedControls.master_volume), not Program-scoped, same
+    // reasoning as Transpose/Microtuning above for why it lives on p->knobs directly.
+    y += 12.0;
+    out->master_volume_knob = (HdsFxRect){content_x + content_w / 2.0, y + HDS_GLOBAL_KNOB_R + 9.0, HDS_GLOBAL_KNOB_R, HDS_GLOBAL_KNOB_R};
     y += HDS_GLOBAL_KNOB_ROW_H;
 
     out->content_h = y + scroll_offset_px + HDS_GLOBAL_MARGIN; // undo the scroll subtraction this function started with, so callers get the SAME content height regardless of current scroll position
@@ -361,6 +370,11 @@ static void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalV
     char gatetxt[8]; snprintf(gatetxt, sizeof(gatetxt), "%d%%", (int)(prog->arp_gate_pct + 0.5f));
     hds_play_draw_knob(cr, L.arp_gate_knob.x, L.arp_gate_knob.y, L.arp_gate_knob.w,
                         (float)(prog->arp_gate_pct / 100.0), !arp_on, "Gate", gatetxt);
+
+    hds_global_section_label(cr, HDS_GLOBAL_MARGIN, L.master_volume_knob.y - HDS_GLOBAL_KNOB_R - 12.0, "Master Volume");
+    char mastertxt[8]; snprintf(mastertxt, sizeof(mastertxt), "%d%%", (int)(p->knobs.master_volume * 100.0f + 0.5f));
+    hds_play_draw_knob(cr, L.master_volume_knob.x, L.master_volume_knob.y, L.master_volume_knob.w,
+                        p->knobs.master_volume, false, "Volume", mastertxt);
 
     cairo_restore(cr);
 
@@ -481,6 +495,7 @@ static bool hds_clap_global_on_button_press(HdsClapPlugin *p, HdsClapGlobalViewS
     }
     if (arp_on && hds_play_knob_hit_test(&L.arp_velocity_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->arp_velocity, 0.0, 127.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
     if (arp_on && hds_play_knob_hit_test(&L.arp_gate_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &prog->arp_gate_pct, 1.0, 100.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
+    if (hds_play_knob_hit_test(&L.master_volume_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.master_volume, 0.0, 1.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
 
     (void)button;
     return true;

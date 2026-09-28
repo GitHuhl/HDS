@@ -547,6 +547,16 @@ typedef struct {
     // See process_fx_chain()'s own sc_snapshot_l/r comment for why this reads a FROZEN snapshot of
     // every source's dry signal rather than the live, in-place-mutated bus_l/bus_r array.
     float sidechain_source;
+    // Explicit cross-slot Input override (default -1 = "not used, resolve Input from fx_source/
+    // chain_to_next as normal"). Any other value is a POOL SLOT INDEX (0..FX_SLOT_COUNT-1, never
+    // this slot's own index -- the GUI disallows it, and process_fx_chain() also refuses it
+    // defensively) whose own last-computed POST-MIX output feeds this slot's dry input instead,
+    // completely independent of fx_source/chain_to_next -- lets one slot read directly from
+    // another slot anywhere in the shared pool (even one owned by a different source/port), not
+    // just the next array-position slot sharing its own fx_source the way chain_to_next requires.
+    // Always wins over chain_to_next/continue_branch when set -- see process_fx_chain()'s own
+    // comment on fx_slot_out_l/r for how this is actually resolved.
+    float input_from_slot;
     // FX_TYPE_NAM's own loaded-file paths (unused by every other effect type -- harmless dead
     // bytes on their slots, same posture as param[] entries an effect doesn't read). Plain string
     // fields, not a dedicated load message: see poll_fx_nam_requests()'s own comment for why this

@@ -4590,7 +4590,16 @@ static void sync_fx_engine_types(const FXSlotParams fx_params[FX_SLOT_COUNT], FX
 // render_audio_block calls this once per source and slots partition cleanly by fx_source, every
 // slot ends up written by exactly the one call that owns it (see render_audio_block's own zeroing
 // of the whole array before its source loop, which covers a source with zero owned slots).
-static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, const float sc_snapshot_l[SOURCE_COUNT], const float sc_snapshot_r[SOURCE_COUNT], float *l, float *r, float gr_db_out[FX_SLOT_COUNT]) {
+// slot_out_l/r[FX_SLOT_COUNT] (required, not NULL-able, PERSISTENT across calls -- owned by the
+// caller's own long-lived engine state, e.g. HdsEngineState/HdsFxPlugin, never a stack array):
+// every slot s this call actually processes (owned or not -- see the Off/bypassed early-skip path
+// below) gets its own just-computed post-mix output written here unconditionally, in POOL-SLOT
+// order rather than per-source. This is what FXSlotParams.input_from_slot reads from (see that
+// field's own comment) to let one slot's Input be explicitly another slot's real output, anywhere
+// in the shared pool, independent of fx_source/chain_to_next's own same-source array-position
+// adjacency. A slot whose OWN source hasn't run yet this sample simply still holds last sample's
+// value here -- the same frozen-snapshot tradeoff sc_snapshot_l/r above already accepts.
+static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, const float sc_snapshot_l[SOURCE_COUNT], const float sc_snapshot_r[SOURCE_COUNT], float *l, float *r, float gr_db_out[FX_SLOT_COUNT], float slot_out_l[FX_SLOT_COUNT], float slot_out_r[FX_SLOT_COUNT]) {
     // A NaN/Inf sample reaching a slot is never a valid audio value, but several ported effects'
     // own persistent state (e.g. run_fx_tapedelay2's sweepL/R, accumulated from squared input) has
     // no boundary check of its own -- once poisoned, a non-finite value can propagate into a
@@ -4615,8 +4624,23 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
         if ((int)fx_params[s].fx_source != source_id) continue; // not this source's slot
         int type = fx_engine[s].active_type;
 
+        // Explicit cross-slot Input override (FXSlotParams.input_from_slot) always wins over
+        // fx_source/chain_to_next when set -- see that field's own comment. Never trust a
+        // self-reference even though the GUI already refuses to let one be picked: wire/state data
+        // (a loaded project, a live OSC write) is never assumed sane just because the UI is.
+        int input_from = (fx_params[s].input_from_slot >= 0.0f) ? (int)(fx_params[s].input_from_slot + 0.5f) : -1;
+        if (input_from == s || input_from < 0 || input_from >= FX_SLOT_COUNT) input_from = -1;
+
         float dry_l, dry_r;
-        if (routing_mode == 0) {
+        if (input_from >= 0) {
+            // Starts a fresh one-slot branch fed by another slot's own last-computed output,
+            // completely independent of continue_branch -- this slot can never ALSO be a genuine
+            // chain_to_next continuation target for real (the GUI only lets input_from_slot be set
+            // on a chain head), so there's nothing to preserve by honoring continue_branch here.
+            if (branch_open) { parallel_sum_l += branch_l; parallel_sum_r += branch_r; parallel_branch_count++; }
+            dry_l = slot_out_l[input_from]; dry_r = slot_out_r[input_from];
+            branch_open = true;
+        } else if (routing_mode == 0) {
             dry_l = *l; dry_r = *r; // Series -- chain_to_next ignored, always the running chain result
         } else if (continue_branch) {
             dry_l = branch_l; dry_r = branch_r; // Parallel, continuing an already-open branch
@@ -4636,6 +4660,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
             // passthrough this function's own finalization below already handles.
             gr_db_out[s] = 0.0f;
             continue_branch = false;
+            slot_out_l[s] = parallel_in_l; slot_out_r[s] = parallel_in_r; // still publish something sane for any OTHER slot's input_from_slot pointed at this one
             continue;
         } else {
             if (branch_open) { parallel_sum_l += branch_l; parallel_sum_r += branch_r; parallel_branch_count++; }
@@ -4714,6 +4739,8 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
             out_l = dry_l * (1.0f - mix) + wet_l * mix;
             out_r = dry_r * (1.0f - mix) + wet_r * mix;
         }
+
+        slot_out_l[s] = out_l; slot_out_r[s] = out_r; // see this function's own slot_out_l/r comment -- published unconditionally, regardless of routing_mode
 
         if (routing_mode == 0) {
             *l = out_l;

@@ -180,6 +180,11 @@ typedef struct {
 
     float gr_db_scratch[FX_SLOT_COUNT]; // required non-NULL out-param, not yet exposed to the host/GUI -- shared across all 8 ports' own calls, same convention as backend.c's own gr_db_out (see render_audio_block)
 
+    // Every slot's own last-computed post-mix output, in POOL-SLOT order -- see process_fx_chain()'s
+    // own slot_out_l/r comment. Persists across blocks like fx_engine[] itself, never reset to 0.
+    float fx_slot_out_l[FX_SLOT_COUNT];
+    float fx_slot_out_r[FX_SLOT_COUNT];
+
     // CLAP params extension shadow (see hds_fx_push_changed_params's own comment, same pattern
     // clap_plugin.c already uses for HDS_CLAP_PARAMS) -- one entry per exposed param.
     double param_shadow[FX_SLOT_COUNT];
@@ -371,6 +376,7 @@ static void hds_fx_init_pool_defaults(HdsFxPlugin *p) {
         p->fx[s].fx_source = 0.0f; // every slot defaults to Port 1 -- freely reassignable via the GUI's own Input pill, see HdsFxPlugin's own comment
         p->fx[s].chain_to_next = 0.0f;
         p->fx[s].sidechain_source = -1.0f; // "Same as Source" -- see FXSlotParams' own comment
+        p->fx[s].input_from_slot = -1.0f; // not used -- see FXSlotParams' own comment
     }
     reset_fx_engine(p->fx_engine);
     for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
@@ -454,6 +460,10 @@ static bool hds_fx_state_save(const clap_plugin_t *plugin, const clap_ostream_t 
         // sidechain_source on its own line kind (state_load()'s own "C" handler reads it) rather
         // than a 16th field crammed onto the S line above.
         hds_fx_state_buf_appendf(&b, "C %d %.9g\n", s, (double)fx->sidechain_source);
+        // input_from_slot, on its own line kind too, purely additive (an older save simply has no F
+        // line for a slot, which hds_fx_init_pool_defaults()'s own reset above already leaves at its
+        // default of -1.0f/"not used" before any line gets applied) -- see FXSlotParams' own comment.
+        hds_fx_state_buf_appendf(&b, "F %d %.9g\n", s, (double)fx->input_from_slot);
         if (fx->nam_model_path[0]) hds_fx_state_buf_appendf(&b, "MP %d %s\n", s, fx->nam_model_path);
         if (fx->nam_ir_path[0]) hds_fx_state_buf_appendf(&b, "IP %d %s\n", s, fx->nam_ir_path);
     }
@@ -531,6 +541,11 @@ static bool hds_fx_state_load(const clap_plugin_t *plugin, const clap_istream_t 
             int s; double sidechain_source;
             if (sscanf(cursor + 2, "%d %lf", &s, &sidechain_source) == 2 && s >= 0 && s < FX_SLOT_COUNT) {
                 p->fx[s].sidechain_source = (float)sidechain_source; applied++;
+            } else skipped++;
+        } else if (cursor[0] == 'F' && cursor[1] == ' ') {
+            int s; double input_from_slot;
+            if (sscanf(cursor + 2, "%d %lf", &s, &input_from_slot) == 2 && s >= 0 && s < FX_SLOT_COUNT) {
+                p->fx[s].input_from_slot = (float)input_from_slot; applied++;
             } else skipped++;
         } else if (cursor[0] == 'P' && cursor[1] == ' ') {
             int port; double input_stereo, output_channel, input_off, output_off;
@@ -693,7 +708,7 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
         }
         for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
             float l = sc_snapshot_l[port], r = sc_snapshot_r[port];
-            process_fx_chain(p->fx, p->fx_engine, /* always Parallel */ 1, port, sc_snapshot_l, sc_snapshot_r, &l, &r, p->gr_db_scratch);
+            process_fx_chain(p->fx, p->fx_engine, /* always Parallel */ 1, port, sc_snapshot_l, sc_snapshot_r, &l, &r, p->gr_db_scratch, p->fx_slot_out_l, p->fx_slot_out_r);
 
             if (p->port_output_off[port] != 0.0f) continue; // Off: this chain's Output goes nowhere
 

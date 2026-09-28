@@ -494,27 +494,70 @@ static int hds_fx_prev_same_source_slot(const HdsFxGuiHost *p, int slot) {
     return -1;
 }
 
+// The nearest LATER slot sharing this slot's own fx_source (the slot chain_to_next would chain
+// INTO, if this slot has it set), or -1 if there is none -- see hds_fx_slot_is_chain_tail()'s own
+// comment for why this existence check matters.
+static int hds_fx_next_same_source_slot(const HdsFxGuiHost *p, int slot) {
+    int src = (int)p->fx[slot].fx_source;
+    for (int i = slot + 1; i < FX_SLOT_COUNT; i++) if ((int)p->fx[i].fx_source == src) return i;
+    return -1;
+}
+
 // True if this slot starts its own chain (nothing chains INTO it) -- its own Input pill is live.
+// An explicit cross-slot Input override (input_from_slot) always wins: it can never ALSO be the
+// live target of some earlier slot's own Chain-to-Next (the GUI only lets input_from_slot be set
+// while a slot's Input pill is open, which is gated on being a chain head in the first place -- see
+// hds_fx_gui_on_button_press()'s own Input-pill handling), so this is never ambiguous in practice.
 static bool hds_fx_slot_is_chain_head(const HdsFxGuiHost *p, int slot) {
+    if (p->fx[slot].input_from_slot >= 0.0f) return true;
     int prev = hds_fx_prev_same_source_slot(p, slot);
     return prev < 0 || p->fx[prev].chain_to_next == 0.0f;
 }
 
 // True if this slot is the TAIL of its own chain (chains nowhere further) -- its own Output pill is
-// live. Simply "not chaining forward"; every slot is exactly one of {chains forward} or {is a tail}.
+// live. NOT simply "chain_to_next is off": a slot can have chain_to_next SET with no real successor
+// to receive it (its own fx_source's last slot in the pool, or a stale flag left over from before a
+// LATER same-fx_source slot got moved/reassigned away) -- process_fx_chain() itself still treats
+// that as an ordinary, fully-live branch (the dangling continue_branch just gets folded into the
+// parallel average at the end, same as any other closed branch), so the Output picker must stay
+// live for it too. Without this check, such a slot's Output pill silently vanished with no other
+// slot ever gaining one in its place -- a real, reported "the chain UI doesn't always do what it
+// should" bug, not merely a cosmetic one (the ALREADY-SET output channel kept working under the
+// hood; only the ability to see or change it disappeared).
 static bool hds_fx_slot_is_chain_tail(const HdsFxGuiHost *p, int slot) {
-    return p->fx[slot].chain_to_next == 0.0f;
+    if (p->fx[slot].chain_to_next == 0.0f) return true;
+    return hds_fx_next_same_source_slot(p, slot) < 0;
+}
+
+// True if some OTHER slot's input_from_slot currently points at this one -- an explicit cross-slot
+// link, same "protect both ends of a link from a silent Up/Down rewire" reasoning as chain_to_next's
+// own array-position link below.
+static bool hds_fx_slot_is_referenced_as_input(const HdsFxGuiHost *p, int slot) {
+    for (int i = 0; i < FX_SLOT_COUNT; i++) {
+        if (i == slot || p->fx[i].input_from_slot < 0.0f) continue;
+        if ((int)(p->fx[i].input_from_slot + 0.5f) == slot) return true;
+    }
+    return false;
 }
 
 // True if a value-swap (Up/Down reorder) touching this slot could silently rewire a chain link --
 // either this slot receives from a previous slot's Chain-to-Next, or this slot itself chains
-// forward. A chain link is defined by ARRAY POSITION + matching fx_source, not by an ID that
-// travels with a slot's own params, so swapping either end of a link would move the wrong slot's
-// configuration into the position the link actually depends on -- disallowed outright rather than
-// attempting a more surgical (and more bug-prone) partial allowance. See hds_fx_plugin.c's own
-// header comment.
+// forward, or this slot is either end of an explicit input_from_slot cross-reference. A chain link
+// is defined by ARRAY POSITION + matching fx_source (or, for input_from_slot, by ARRAY POSITION
+// alone), not by an ID that travels with a slot's own params, so swapping either end of a link
+// would move the wrong slot's configuration into the position the link actually depends on --
+// disallowed outright rather than attempting a more surgical (and more bug-prone) partial
+// allowance. See hds_fx_plugin.c's own header comment.
 static bool hds_fx_slot_participates_in_chain(const HdsFxGuiHost *p, int slot) {
-    return !hds_fx_slot_is_chain_head(p, slot) || !hds_fx_slot_is_chain_tail(p, slot);
+    return !hds_fx_slot_is_chain_head(p, slot) || !hds_fx_slot_is_chain_tail(p, slot)
+        || p->fx[slot].input_from_slot >= 0.0f || hds_fx_slot_is_referenced_as_input(p, slot);
+}
+
+// Maps a 0-based position within the "FX Slot Output" section of the Input dropdown (which always
+// excludes THIS row's own slot number -- self-reference is nonsensical and explicitly disallowed)
+// to the real target slot index (0..FX_SLOT_COUNT-1).
+static int hds_fx_slot_output_target(int row, int list_pos) {
+    return (list_pos < row) ? list_pos : list_pos + 1;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -904,27 +947,36 @@ static void hds_fx_format_input_pill(char *buf, size_t buflen, int port, bool st
 static int hds_fx_dropdown_option_count(const HdsFxGuiHost *p, int kind) {
     switch (kind) {
         case HDS_FX_DROPDOWN_TYPE: return HDS_FX_SELECTABLE_TYPE_COUNT;
-        case HDS_FX_DROPDOWN_INPUT: return 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT; // Off + 8 mono + 8 stereo
+        // + (FX_SLOT_COUNT - 1): the "FX Slot Output" section, one entry per OTHER slot in the pool
+        // (see hds_fx_slot_output_target()'s own comment) -- always exactly FX_SLOT_COUNT-1 long
+        // regardless of which row is open, since every row excludes exactly one slot: itself.
+        case HDS_FX_DROPDOWN_INPUT: return 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT + (FX_SLOT_COUNT - 1); // Off + 8 mono + 8 stereo + slot outputs
         case HDS_FX_DROPDOWN_OUTPUT: return 1 + HDS_FX_PORT_COUNT; // Off + 8 (always that port's real stereo pair)
         case HDS_FX_DROPDOWN_SIDECHAIN: return 1 + HDS_FX_PORT_COUNT; // "Same as Source" + 8
-        case HDS_FX_DROPDOWN_SOURCE: return p->source_count; // no Off/Mono/Stereo suboptions -- matches frontend.py's own plain Source combo
+        case HDS_FX_DROPDOWN_SOURCE: return p->source_count + (FX_SLOT_COUNT - 1); // no Off/Mono/Stereo suboptions -- matches frontend.py's own plain Source combo, plus the same slot-output section INPUT gets
         default: return 0;
     }
 }
 
 // Pure text for option `idx` -- doesn't need plugin state (except SOURCE, which is host-defined
 // and has no other concept to fall back on), just which list and which row within it.
-static void hds_fx_dropdown_option_label(const HdsFxGuiHost *p, int kind, int idx, char *buf, size_t buflen) {
+static void hds_fx_dropdown_option_label(const HdsFxGuiHost *p, int kind, int row, int idx, char *buf, size_t buflen) {
     switch (kind) {
         case HDS_FX_DROPDOWN_TYPE:
             snprintf(buf, buflen, "%s", hds_fx_type_name(HDS_FX_SELECTABLE_TYPES[idx]));
             return;
         case HDS_FX_DROPDOWN_INPUT: {
-            if (idx == 0) { snprintf(buf, buflen, "Off"); return; }
-            int j = idx - 1;
-            bool stereo = j >= HDS_FX_PORT_COUNT;
-            int port = stereo ? (j - HDS_FX_PORT_COUNT) : j;
-            hds_fx_format_input_pill(buf, buflen, port, stereo);
+            int base = 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT;
+            if (idx < base) {
+                if (idx == 0) { snprintf(buf, buflen, "Off"); return; }
+                int j = idx - 1;
+                bool stereo = j >= HDS_FX_PORT_COUNT;
+                int port = stereo ? (j - HDS_FX_PORT_COUNT) : j;
+                hds_fx_format_input_pill(buf, buflen, port, stereo);
+                return;
+            }
+            int target = hds_fx_slot_output_target(row, idx - base);
+            snprintf(buf, buflen, "Slot %d Out", target + 1);
             return;
         }
         case HDS_FX_DROPDOWN_OUTPUT:
@@ -935,9 +987,12 @@ static void hds_fx_dropdown_option_label(const HdsFxGuiHost *p, int kind, int id
             if (idx == 0) snprintf(buf, buflen, "Same as Source");
             else snprintf(buf, buflen, "SC In %d", idx);
             return;
-        case HDS_FX_DROPDOWN_SOURCE:
-            p->source_label(idx, buf, buflen);
+        case HDS_FX_DROPDOWN_SOURCE: {
+            if (idx < p->source_count) { p->source_label(idx, buf, buflen); return; }
+            int target = hds_fx_slot_output_target(row, idx - p->source_count);
+            snprintf(buf, buflen, "Slot %d Out", target + 1);
             return;
+        }
         default: buf[0] = 0; return;
     }
 }
@@ -948,6 +1003,11 @@ static int hds_fx_dropdown_current_index(const HdsFxGuiHost *p, int kind, int ro
         case HDS_FX_DROPDOWN_TYPE:
             return hds_fx_selectable_type_index((int)p->fx[row].fx_type);
         case HDS_FX_DROPDOWN_INPUT: {
+            if (p->fx[row].input_from_slot >= 0.0f) {
+                int target = (int)(p->fx[row].input_from_slot + 0.5f);
+                int base = 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT;
+                return base + (target < row ? target : target - 1);
+            }
             int port = (int)p->fx[row].fx_source;
             if (port < 0 || port >= HDS_FX_PORT_COUNT) port = 0;
             if (p->port_input_off[port] != 0.0f) return 0;
@@ -967,6 +1027,10 @@ static int hds_fx_dropdown_current_index(const HdsFxGuiHost *p, int kind, int ro
             return (sc < 0 || sc >= HDS_FX_PORT_COUNT) ? 0 : sc + 1;
         }
         case HDS_FX_DROPDOWN_SOURCE: {
+            if (p->fx[row].input_from_slot >= 0.0f) {
+                int target = (int)(p->fx[row].input_from_slot + 0.5f);
+                return p->source_count + (target < row ? target : target - 1);
+            }
             int s = (int)p->fx[row].fx_source;
             return (s < 0 || s >= p->source_count) ? 0 : s;
         }
@@ -983,6 +1047,12 @@ static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
             p->fx[row].fx_type = (float)HDS_FX_SELECTABLE_TYPES[idx];
             return;
         case HDS_FX_DROPDOWN_INPUT: {
+            int base = 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT;
+            if (idx >= base) {
+                p->fx[row].input_from_slot = (float)hds_fx_slot_output_target(row, idx - base);
+                return;
+            }
+            p->fx[row].input_from_slot = -1.0f; // picking a normal port Input clears any slot-output override
             int port = (int)p->fx[row].fx_source;
             if (port < 0 || port >= HDS_FX_PORT_COUNT) port = 0;
             if (idx == 0) { p->port_input_off[port] = 1.0f; return; }
@@ -1006,6 +1076,11 @@ static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
             p->fx[row].sidechain_source = (idx == 0) ? -1.0f : (float)(idx - 1);
             return;
         case HDS_FX_DROPDOWN_SOURCE:
+            if (idx >= p->source_count) {
+                p->fx[row].input_from_slot = (float)hds_fx_slot_output_target(row, idx - p->source_count);
+                return;
+            }
+            p->fx[row].input_from_slot = -1.0f; // picking a normal Source clears any slot-output override
             p->fx[row].fx_source = (float)idx;
             return;
         default: return;
@@ -1018,8 +1093,9 @@ static double hds_fx_dropdown_width(int kind) {
     switch (kind) {
         case HDS_FX_DROPDOWN_TYPE: return 130.0;
         case HDS_FX_DROPDOWN_SIDECHAIN: return 110.0;
-        case HDS_FX_DROPDOWN_SOURCE: return 120.0; // "Program 8"/"Ext In 8"/"Combi Mix" -- widest names in the list
-        default: return 90.0; // Input/Output
+        case HDS_FX_DROPDOWN_SOURCE: return 120.0; // "Program 8"/"Ext In 8"/"Combi Mix"/"Slot 32 Out" -- widest names in the list
+        case HDS_FX_DROPDOWN_INPUT: return 120.0; // wide enough for "Slot 32 Out" alongside the plain port list -- see hds_fx_slot_output_target()'s own comment
+        default: return 90.0; // Output
     }
 }
 
@@ -1073,7 +1149,7 @@ static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFx
             cairo_fill(cr);
         }
         char label[24];
-        hds_fx_dropdown_option_label(p, dd->kind, i, label, sizeof(label));
+        hds_fx_dropdown_option_label(p, dd->kind, dd->row, i, label, sizeof(label));
         hds_fx_rgb(cr, i == current ? 0.92 : 0.78, i == current ? 0.95 : 0.78, i == current ? 0.92 : 0.81);
         hds_fx_left_text(cr, r.x + 6, r.y + r.h / 2 + 3.5, label);
     }
@@ -1365,7 +1441,14 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         // just inherits the running signal from whatever chains into it. "Off" (silence in,
         // instead of any physical port) is its own selectable state, independent of which port
         // number is stored -- see hds_fx_dropdown_apply()'s own comment.
-        if (p->port_input_stereo) {
+        if (slot->input_from_slot >= 0.0f) {
+            // Explicit cross-slot Input override (see FXSlotParams' own comment) -- always shown as
+            // a live, active pill: it always wins over whatever fx_source/port state is left
+            // underneath it, so it's never "disabled" the way an ordinary non-head slot's Input is.
+            char inbuf[24];
+            snprintf(inbuf, sizeof(inbuf), "Slot %d Out", (int)(slot->input_from_slot + 0.5f) + 1);
+            hds_fx_draw_pill(cr, L.input_pill.x, L.input_pill.y, L.input_pill.w, L.input_pill.h, inbuf, true, false);
+        } else if (p->port_input_stereo) {
             char inbuf[16];
             bool input_off = p->port_input_off[port] != 0.0f;
             if (input_off) snprintf(inbuf, sizeof(inbuf), "Off");
