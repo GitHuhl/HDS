@@ -1208,6 +1208,8 @@ static void run_fx_tapedelay2(FXSlotEngine *engine, const FXSlotParams *params, 
         // self-feedback wiring.
         int posL = (int)floorf(st->delayL);
         int posR = (int)floorf(st->delayR);
+        if (posL < 0 || posL >= 88200) posL = 0;
+        if (posR < 0 || posR >= 88200) posR = 0;
         float feedFromL = st->dL[posL];
         float feedFromR = st->dR[posR];
         float feedSampleL = stereo_pingpong ? feedFromR : feedFromL;
@@ -1230,7 +1232,7 @@ static void run_fx_tapedelay2(FXSlotEngine *engine, const FXSlotParams *params, 
             pos--; if (pos < 0) pos += 88200;
         }
         st->prevSampleL = newSample;
-        pos = (int)floorf(st->delayL); inputSampleL = st->dL[pos];
+        pos = (int)floorf(st->delayL); if (pos < 0 || pos >= 88200) pos = 0; inputSampleL = st->dL[pos];
         tempSample = (inputSampleL * st->outFilterL[2]) + st->outFilterL[7];
         st->outFilterL[7] = -(tempSample * st->outFilterL[5]) + st->outFilterL[8];
         st->outFilterL[8] = (inputSampleL * st->outFilterL[4]) - (tempSample * st->outFilterL[6]);
@@ -1254,7 +1256,7 @@ static void run_fx_tapedelay2(FXSlotEngine *engine, const FXSlotParams *params, 
             pos--; if (pos < 0) pos += 88200;
         }
         st->prevSampleR = newSample;
-        pos = (int)floorf(st->delayR); inputSampleR = st->dR[pos];
+        pos = (int)floorf(st->delayR); if (pos < 0 || pos >= 88200) pos = 0; inputSampleR = st->dR[pos];
         tempSample = (inputSampleR * st->outFilterR[2]) + st->outFilterR[7];
         st->outFilterR[7] = -(tempSample * st->outFilterR[5]) + st->outFilterR[8];
         st->outFilterR[8] = (inputSampleR * st->outFilterR[4]) - (tempSample * st->outFilterR[6]);
