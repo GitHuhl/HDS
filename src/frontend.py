@@ -460,10 +460,6 @@ def _build_zones_from_sfz(path, zone_id_start):
         zone.gain_db = _float_opt("volume", 0.0)
         zone.pan = _float_opt("pan", 0.0)
         zone.reverse = region.get("direction", "").strip().lower() == "reverse"
-        # hds_drum_bus=: HDS-specific, non-standard opcode (see backend.c's sfz_apply_opcode()) --
-        # imported here too so a hand-authored or externally-exported .sfz using it round-trips
-        # into the Mapping tab's own Zone Inspector, not just a direct --sfz-vcoN/native-GUI load.
-        zone.drum_bus = max(0, min(DRUM_BUS_COUNT, _int_opt("hds_drum_bus", 0)))
 
         # Round-robin: group= is overloaded in SFZ (also used for unrelated choke/polyphony
         # groups) -- only treat it as round-robin when seq_length is actually present, and
@@ -612,15 +608,7 @@ SINGLE_PROGRAM_SLOT = COMBI_PROGRAM_COUNT
 # ids 1-8 to COMBI_PROGRAM_COUNT+1..+8 (9-16) -- see SOURCE_COUNT's own comment in backend.c.
 EXT_IN_PAIR_COUNT = 8
 OUTPUT_PAIR_MAX = 8
-# BREAKING CHANGE (Drum Buses): 24 more sources appended after every ext-in pair -- must match
-# DRUM_BUS_COUNT/DRUM_BUS_SOURCE_BASE in backend.c exactly. Drum Buses have no enable/gain/stereo
-# widget of their own on the Routing tab (same as Programs/Combi Mix -- see that tab's own
-# construction code), only the output-pair routing grid and the FX/sidechain Source combos, all
-# already generic over SOURCE_COUNT.
-DRUM_BUS_COUNT = 24
-SOURCE_NAMES = ([f"Program {p + 1}" for p in range(COMBI_PROGRAM_COUNT)] + ["Combi Mix"] +
-                [f"Ext In {p + 1}" for p in range(EXT_IN_PAIR_COUNT)] +
-                [f"Drum Bus {p + 1}" for p in range(DRUM_BUS_COUNT)])
+SOURCE_NAMES = [f"Program {p + 1}" for p in range(COMBI_PROGRAM_COUNT)] + ["Combi Mix"] + [f"Ext In {p + 1}" for p in range(EXT_IN_PAIR_COUNT)]
 SOURCE_COUNT = len(SOURCE_NAMES)
 # Hard array-allocation ceilings -- must match MAX_VOICES / BUFFER_SIZE in backend.c exactly.
 # The ACTUAL live polyphony/block size are user-adjustable (Audio tab) up to these ceilings;
@@ -1876,13 +1864,6 @@ class SampleZone:
         # actually the one performance_mode makes audible -- see apply_zone_upsert()'s own comment
         # in backend.c.
         self.owner_program = SINGLE_PROGRAM_SLOT
-        # Drum Bus routing (see DRUM_BUS_COUNT's own comment): 0 = off (plays through this
-        # oscillator's normal Volume/Mute/Pan -> Filter/EQ pipeline, today's exact behavior),
-        # 1..DRUM_BUS_COUNT = bypasses all of that and sums into that Drum Bus instead. Sent as
-        # its own dedicated "/hds/zone/drum_bus" message (see transmit_zone_drum_bus), NOT part of
-        # the 19-float zone upsert wire -- matches backend.c's ZoneRecordWire.drum_bus/SampleSlot.
-        # drum_bus own comment on why this one field stays off the wire.
-        self.drum_bus = 0
 
 class MidiKeyButton(QPushButton):
     """A single piano key on the Mapping tab's reference keyboard -- visual only (no MIDI is
@@ -2479,24 +2460,6 @@ class ZoneInspectorPanel(QWidget):
         self.reverse_cb.setToolTip("Plays the file (or loop region) backward.")
         self.reverse_cb.toggled.connect(self._on_reverse_toggled)
         params_row.addWidget(self.reverse_cb)
-
-        params_row.addWidget(QLabel("Drum Bus:"))
-        self.drum_bus_spin = QSpinBox()
-        self.drum_bus_spin.setRange(0, DRUM_BUS_COUNT)
-        self.drum_bus_spin.setSpecialValueText("Off")
-        self.drum_bus_spin.setToolTip(
-            "Off (default): plays through this oscillator's normal Volume/Mute/Pan and Filter "
-            "chain, same as always. 1-24: this zone's rendered output BYPASSES all of that "
-            "(only its own Gain/Pan and Amp EG still apply) and sums directly into that Drum "
-            "Bus instead -- assign the Drum Bus to an FX slot and/or output pair on the FX and "
-            "Routing tabs to hear it. Useful for sending individual multisample keys (e.g. drum "
-            "kit elements) to their own effects/output independent of this whole Program."
-        )
-        # Sent as its own dedicated message, NOT folded into transmit_zone_upsert -- see
-        # SampleZone.drum_bus's own comment on why this one field stays off the 19-float wire.
-        self.drum_bus_spin.valueChanged.connect(self._on_drum_bus_changed)
-        params_row.addWidget(self.drum_bus_spin)
-
         params_row.addStretch(1)
         outer.addLayout(params_row)
 
@@ -2508,7 +2471,7 @@ class ZoneInspectorPanel(QWidget):
     def set_zone(self, zone):
         self.zone = zone
         for w in (self.loop_enabled_cb, self.round_robin_spin, self.tune_spin, self.gain_spin,
-                  self.pan_spin, self.start_offset_spin, self.reverse_cb, self.drum_bus_spin):
+                  self.pan_spin, self.start_offset_spin, self.reverse_cb):
             w.blockSignals(True)
         if zone is None:
             self.filename_label.setText("No zone selected")
@@ -2519,9 +2482,8 @@ class ZoneInspectorPanel(QWidget):
             self.pan_spin.setValue(0)
             self.start_offset_spin.setValue(0)
             self.reverse_cb.setChecked(False)
-            self.drum_bus_spin.setValue(0)
             for w in (self.loop_enabled_cb, self.round_robin_spin, self.tune_spin, self.gain_spin,
-                      self.pan_spin, self.start_offset_spin, self.reverse_cb, self.drum_bus_spin):
+                      self.pan_spin, self.start_offset_spin, self.reverse_cb):
                 w.setEnabled(False)
         else:
             self.filename_label.setText(zone.filename)
@@ -2532,12 +2494,11 @@ class ZoneInspectorPanel(QWidget):
             self.pan_spin.setValue(zone.pan)
             self.start_offset_spin.setValue(int(round(zone.start_offset * 100)))
             self.reverse_cb.setChecked(zone.reverse)
-            self.drum_bus_spin.setValue(zone.drum_bus)
             for w in (self.loop_enabled_cb, self.round_robin_spin, self.tune_spin, self.gain_spin,
-                      self.pan_spin, self.start_offset_spin, self.reverse_cb, self.drum_bus_spin):
+                      self.pan_spin, self.start_offset_spin, self.reverse_cb):
                 w.setEnabled(True)
         for w in (self.loop_enabled_cb, self.round_robin_spin, self.tune_spin, self.gain_spin,
-                  self.pan_spin, self.start_offset_spin, self.reverse_cb, self.drum_bus_spin):
+                  self.pan_spin, self.start_offset_spin, self.reverse_cb):
             w.blockSignals(False)
         self.waveform.set_zone(zone)
 
@@ -2587,13 +2548,6 @@ class ZoneInspectorPanel(QWidget):
             self.start_offset_spin.setValue(100)
             self.start_offset_spin.blockSignals(False)
         if self.parent_window: self.parent_window.transmit_zone_upsert([self.zone])
-
-    def _on_drum_bus_changed(self, value):
-        if self.zone is None: return
-        self.zone.drum_bus = value
-        # transmit_zone_drum_bus, not transmit_zone_upsert -- drum_bus is deliberately off the
-        # 19-float zone upsert wire (see SampleZone.drum_bus's own comment).
-        if self.parent_window: self.parent_window.transmit_zone_drum_bus(self.zone.zone_id, value)
 
 # Program save/load: which OSC addresses count as "the Program" (saved/restored by
 # Save/Load) vs. "the rig" (device selection, recording, routing/ext-in, hardware performance
@@ -5171,15 +5125,12 @@ class SynthGui(QWidget):
         for src in range(SOURCE_COUNT):
             row = src + 1
             self.routing_grid.addWidget(QLabel(SOURCE_NAMES[src]), row, 0)
-            if src < COMBI_PROGRAM_COUNT + 1 or src >= COMBI_PROGRAM_COUNT + 1 + EXT_IN_PAIR_COUNT:
-                # A Program (0..COMBI_PROGRAM_COUNT-1), the Combi Mix bus (COMBI_PROGRAM_COUNT), or
-                # a Drum Bus (COMBI_PROGRAM_COUNT+1+EXT_IN_PAIR_COUNT..SOURCE_COUNT-1) has no
-                # enable/gain/stereo of its own here -- Programs are always live (master_volume
-                # lives on the main page, and each oscillator has its own Vol knob) and are already
-                # genuine stereo throughout; a Drum Bus has no gain/stereo concept of its own either
-                # (see DRUM_BUS_COUNT's own comment -- only the zones routed into it, and their own
-                # gain/pan, ever determine its level); only output routing is configured here for
-                # any of these.
+            if src < COMBI_PROGRAM_COUNT + 1:
+                # A Program (0..COMBI_PROGRAM_COUNT-1) or the Combi Mix bus (COMBI_PROGRAM_COUNT)
+                # has no enable/gain/stereo of its own here -- Programs are always live
+                # (master_volume lives on the main page, and each oscillator has its own Vol
+                # knob) and are already genuine stereo throughout; only their output routing is
+                # configured on this tab.
                 self.routing_ext_in_enable_cbs.append(None)
                 self.routing_ext_in_gain_dials.append(None)
                 self.routing_ext_in_stereo_cbs.append(None)
@@ -6030,7 +5981,6 @@ class SynthGui(QWidget):
             self.mapping_sfz_readout.setText(f"SFZ: {os.path.basename(path)}")
             self.mapping_grid.update()
             self.transmit_zone_upsert(zones)
-            self._transmit_zones_drum_bus(zones)
         filename = os.path.basename(path)
         self.set_mapping_status(f"Imported {len(zones)} zone(s) from {filename}" if zones else f"Imported 0 zones from {filename}", error=not zones)
         if warnings:
@@ -7664,7 +7614,6 @@ class SynthGui(QWidget):
                             z.owner_program = owner_program
                         self.mapping_grid.sample_zones.extend(zones)
                         self.transmit_zone_upsert(zones)
-                        self._transmit_zones_drum_bus(zones)
                     if lane_idx is None:
                         self.mapping_loaded_sfz_path[osc] = sfz_path
                     all_warnings.extend(warnings)
@@ -8786,28 +8735,6 @@ class SynthGui(QWidget):
             try: self.osc_client.send(msg.build())
             except OSError: pass
 
-    def transmit_zone_drum_bus(self, zone_id, bus):
-        """Sends "/hds/zone/drum_bus" (zone_id, bus) -- same one-off-message pattern as
-        transmit_zone_remove, since drum_bus is deliberately not part of the 19-float zone upsert
-        wire (see SampleZone.drum_bus's own comment)."""
-        if self.osc_client is None:
-            return
-        msg = OscMessageBuilder(address="/hds/zone/drum_bus")
-        msg.add_arg(int(zone_id), "i")
-        msg.add_arg(int(bus), "i")
-        try: self.osc_client.send(msg.build())
-        except OSError: pass
-
-    def _transmit_zones_drum_bus(self, zones):
-        """Companion to transmit_zone_upsert() for a freshly-imported batch of zones (SFZ import,
-        Program load's own companion .sfz) -- the plain zone upsert wire never carries drum_bus
-        (see transmit_zone_drum_bus's own comment), so any zone whose hds_drum_bus= opcode
-        _build_zones_from_sfz() picked up needs this separate push too, or the backend would never
-        learn about it despite the Zone Inspector showing it correctly."""
-        for z in zones:
-            if z.drum_bus != 0:
-                self.transmit_zone_drum_bus(z.zone_id, z.drum_bus)
-
     def closeEvent(self, event):
         # Bug fix: SimpleUDPClient.close() doesn't exist in every installed pythonosc version --
         # it was only added in a later release. Where it's missing, this raised an uncaught
@@ -9029,9 +8956,9 @@ def runtime_connect_and_bind(gui):
         gui.fx_chain_to_next_buttons[slot_idx].toggled.connect(gui.transmit_knob_packet)
 
     # Routing tab: per-pair ext-in enable/gain + the source x output-pair grid. Only ext-in
-    # sources (ids COMBI_PROGRAM_COUNT+1..COMBI_PROGRAM_COUNT+EXT_IN_PAIR_COUNT) have enable/gain
-    # widgets -- Programs, Combi Mix, and Drum Buses don't (see their construction's own comment).
-    for src in range(COMBI_PROGRAM_COUNT + 1, COMBI_PROGRAM_COUNT + 1 + EXT_IN_PAIR_COUNT):
+    # sources (ids COMBI_PROGRAM_COUNT+1..SOURCE_COUNT-1) have enable/gain widgets -- Programs
+    # and Combi Mix don't (see their construction's own comment).
+    for src in range(COMBI_PROGRAM_COUNT + 1, SOURCE_COUNT):
         gui.routing_ext_in_enable_cbs[src].toggled.connect(gui.transmit_knob_packet)
         gui.routing_ext_in_gain_dials[src].valueChanged.connect(gui.transmit_knob_packet)
         gui.routing_ext_in_stereo_cbs[src].toggled.connect(gui.transmit_knob_packet)
