@@ -254,7 +254,10 @@ static void hds_clap_routing_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRoutin
 #ifdef HDS_STANDALONE_GUI_ENABLED
         for (int op = 0; op < OUTPUT_PAIR_MAX; op++) {
             bool on = p->knobs.source_routing[src].enable[op] != 0.0f;
-            hds_fx_draw_pill(cr, L.out_pill[op].x, L.out_pill[op].y, L.out_pill[op].w, L.out_pill[op].h, on ? "\xe2\x9c\x93" : "", on, false);
+            // Plain ASCII "X", not the UTF-8 checkmark glyph this used to draw -- see
+            // hds_clap_global_draw.c's own comment on why cairo's "toy" text API can silently
+            // render nothing for a glyph the resolved font happens to lack, with no fallback.
+            hds_fx_draw_pill(cr, L.out_pill[op].x, L.out_pill[op].y, L.out_pill[op].w, L.out_pill[op].h, on ? "X" : "", on, false);
         }
 #else
         bool main_out = p->knobs.source_routing[src].enable[0] != 0.0f;
@@ -296,8 +299,11 @@ static void hds_clap_routing_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRoutin
         hds_fx_rgb(cr, 0.75, 0.75, 0.78);
         hds_fx_left_text(cr, DL.title_area.x, DL.title_area.y + 12.0, "Drum Bus Key Routing");
 
-        hds_fx_draw_pill(cr, DL.prev_btn.x, DL.prev_btn.y, DL.prev_btn.w, DL.prev_btn.h, "\xe2\x97\x84", false, false);
-        hds_fx_draw_pill(cr, DL.next_btn.x, DL.next_btn.y, DL.next_btn.w, DL.next_btn.h, "\xe2\x96\xb6", false, false);
+        // Plain ASCII "<"/">" -- same "toy text API has no per-glyph font fallback" reasoning as
+        // the "X" above and hds_clap_global_draw.c's own "->" comment; a real arrow glyph here
+        // tofu'd on at least one real system this shipped to.
+        hds_fx_draw_pill(cr, DL.prev_btn.x, DL.prev_btn.y, DL.prev_btn.w, DL.prev_btn.h, "<", false, false);
+        hds_fx_draw_pill(cr, DL.next_btn.x, DL.next_btn.y, DL.next_btn.w, DL.next_btn.h, ">", false, false);
         char bus_label[16]; snprintf(bus_label, sizeof(bus_label), "Bus %d", vs->drum_bus_selected);
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
         cairo_set_font_size(cr, 11.0);
@@ -334,10 +340,13 @@ static void hds_clap_routing_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRoutin
                 cairo_new_path(cr); cairo_set_line_width(cr, 1.0);
                 cairo_rectangle(cr, c->x + 0.5, c->y + 0.5, c->w - 1, c->h - 1); cairo_stroke(cr);
                 if (on) {
+                    // Plain ASCII "X" -- see the out_pill checkbox's own comment above on why not
+                    // the UTF-8 checkmark glyph. The green fill already carries the on/off state;
+                    // this is just a redundant, font-safe clarity aid on top of it.
                     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
                     cairo_set_font_size(cr, 10.0);
                     hds_fx_rgb(cr, 0.85, 0.98, 0.88);
-                    hds_fx_centered_text(cr, c->x + c->w / 2.0, c->y + c->h / 2.0 + 3.5, "\xe2\x9c\x93");
+                    hds_fx_centered_text(cr, c->x + c->w / 2.0, c->y + c->h / 2.0 + 3.5, "X");
                 }
             }
         }
