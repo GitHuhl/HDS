@@ -815,11 +815,20 @@ typedef struct {
     // NOT part of ProgramState" reasoning as master_volume just above: a live performance
     // control (like a hardware keyboard's own Transpose button), not a property of any one
     // patch, so switching Programs never yanks the current transposition out from under
-    // whatever the performer set it to. Applied every block, alongside pitch bend, as an
-    // additive cents offset (see mod_vco{1-4}_pitch in render_audio_block) -- not baked into
-    // voice->midi_note -- so it retunes already-held notes live and never disturbs Key Track,
-    // Per-Key LFO, or note-off voice matching, all of which depend on midi_note reflecting the
-    // physically played key.
+    // whatever the performer set it to.
+    //
+    // Applied by dispatch_midi_event() at the very top of its own NOTE_ON/NOTE_OFF handling --
+    // added directly to the raw incoming MIDI note number, before ANY downstream use (Combi
+    // key-range gating, Arp, handle_note_on/off, Sequencer recording) -- rather than as a live
+    // audio-rate cents offset the way pitch bend is. This used to be a cents offset added
+    // alongside pitch bend in mod_vco{1-4}_pitch below, which genuinely transposes a synthesized
+    // oscillator, but for a Multisample oscillator it's a pure playback-RATE change: the ORIGINAL
+    // note's sample zone stays selected and just gets sped up/slowed down (a chipmunk/formant
+    // shift), not replaced with the correct zone for the new pitch the way a real transposed key
+    // press would be. Moving the offset onto the note number itself fixes that -- the whole
+    // engine, sample-zone lookup included, now genuinely believes a different key was pressed --
+    // at the cost of no longer retuning already-held notes live (a real hardware Transpose button
+    // doesn't either: it changes what note the NEXT key press sends, not notes already sounding).
     float transpose_semitones;
 
     // Microtuning (Scala .scl import -- see hds_note_to_hz()/HdsTuningTable's own comment).
@@ -1059,10 +1068,11 @@ typedef struct {
     // layering"). Session-level, same placement rationale as combi_lane_midi_channel/key_lo above
     // (a property of THIS Combi performance setup, not of any one patch) -- deliberately NOT
     // inside ProgramState, so re-picking a different Program into a lane never disturbs whatever
-    // octave that lane was set to play at. Applied as an additive cents offset alongside the
-    // global transpose_semitones knob (see mod_vco{1-4}_pitch in render_audio_block) -- the two
-    // compose cleanly since both are just more terms in the same additive-cents accumulator pitch
-    // bend and pitch_offset already use.
+    // octave that lane was set to play at. Applied as an additive cents offset in mod_vco{1-4}_pitch
+    // (render_audio_block) -- unlike the global transpose_semitones knob (see its own comment for
+    // why THAT one moved to dispatch_midi_event instead), this one deliberately stays a live
+    // cents offset: it's meant as a live layering/detune effect across already-held notes, not a
+    // stand-in for "the performer pressed a different key."
     float combi_lane_transpose[COMBI_PROGRAM_COUNT];
 
     // Audio device selection: fixed-size ALSA PCM device name strings (e.g. "default",
@@ -7277,7 +7287,20 @@ static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, Hds
                                  float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT],
                                  MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], MidiLiveState *midi_live, float current_tempo_bpm) {
     if (type == HDS_MIDI_NOTE_ON || type == HDS_MIDI_NOTE_OFF) {
-        int note = data1;
+        // Global performance Transpose (see SynthSharedControls.transpose_semitones' own comment
+        // for why this moved here from a live audio-rate cents offset): applied to the raw
+        // incoming note number FIRST, before anything downstream -- Combi key-range gating, Arp,
+        // handle_note_on/off (voice claiming AND Multisample sample-zone lookup), Sequencer
+        // recording -- ever sees it, so the whole engine genuinely believes a different key was
+        // pressed rather than pitch-shifting whatever the physical key would have selected.
+        // lroundf, not a plain cast: the knob is float-typed but always an integer value in
+        // practice (a real transpose is whole semitones -- see the knob's own -16..16 int-stepped
+        // range in every frontend), and round-to-nearest is the correct way to treat a value that
+        // could in principle carry float imprecision from OSC/state round-tripping as that intended
+        // integer. Clamped to the valid MIDI note range so an extreme transpose at the very top/
+        // bottom of the keyboard can't hand a negative or >127 note number to anything downstream.
+        int note = data1 + (int)lroundf(knobs->transpose_semitones);
+        if (note < 0) note = 0; else if (note > 127) note = 127;
         bool is_note_on = (type == HDS_MIDI_NOTE_ON);
         if ((int)knobs->performance_mode == 1) {
             // Combi mode: live dispatch fans out to every Combi lane whose own MIDI channel
@@ -7892,22 +7915,24 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             // vco{N}_pitch: the manual Pitch knob (cents, +-2400 = +-24 semitones), added in
             // alongside fine_tune/pitch_offset/pitch-bend -- an LFO/EG targeting "Osc N Pitch"
             // sums into this same accumulator further down, so knob + live modulation just add.
-            // transpose_cents: the global performance Transpose knob (-16..16 semitones,
-            // session-level -- see SynthSharedControls.transpose_semitones), applied the same
-            // way pitch bend is: an additive cents offset here, never touching voice->midi_note,
-            // so it retunes already-held notes live without disturbing Key Track/note-off
-            // matching (both of which read midi_note directly).
-            float transpose_cents = knobs->transpose_semitones * 100.0f;
-            // Combi per-lane transpose (octave layering): an additional additive-cents term,
-            // exactly like transpose_cents above, but per-Combi-lane instead of global -- see
-            // SynthSharedControls.combi_lane_transpose's own comment. Only meaningful for the 8
-            // real Combi lanes (pidx 0-7); SINGLE_PROGRAM_SLOT (pidx==COMBI_PROGRAM_COUNT) has no
-            // lane to look up, so it contributes nothing there, same as today.
+            // The global performance Transpose knob is deliberately NOT here any more -- see
+            // SynthSharedControls.transpose_semitones' own comment for why it moved to
+            // dispatch_midi_event() instead, adding directly onto the incoming MIDI note number
+            // rather than retuning already-selected voices live.
+            // Combi per-lane transpose (octave layering): an additive-cents term, exactly the
+            // shape the global Transpose knob used to be, but per-Combi-lane instead of global --
+            // see SynthSharedControls.combi_lane_transpose's own comment for why THIS one stays a
+            // live cents offset (it's a deliberate live layering/detune effect, not a stand-in for
+            // "the performer pressed a different key," so the Multisample sample-zone-selection
+            // problem that moved the global knob doesn't apply to it the same way). Only
+            // meaningful for the 8 real Combi lanes (pidx 0-7); SINGLE_PROGRAM_SLOT
+            // (pidx==COMBI_PROGRAM_COUNT) has no lane to look up, so it contributes nothing there,
+            // same as today.
             float combi_transpose_cents = (pidx < COMBI_PROGRAM_COUNT) ? knobs->combi_lane_transpose[pidx] * 100.0f : 0.0f;
-            float mod_vco1_pitch = prog->vco1_fine_tune + prog->vco1_pitch + pb_bend_cents[pidx] + transpose_cents + combi_transpose_cents;
-            float mod_vco2_pitch = prog->vco2_fine_tune + (prog->vco2_pitch_offset * 100.0f) + prog->vco2_pitch + pb_bend_cents[pidx] + transpose_cents + combi_transpose_cents;
-            float mod_vco3_pitch = prog->vco3_fine_tune + (prog->vco3_pitch_offset * 100.0f) + prog->vco3_pitch + pb_bend_cents[pidx] + transpose_cents + combi_transpose_cents;
-            float mod_vco4_pitch = prog->vco4_fine_tune + (prog->vco4_pitch_offset * 100.0f) + prog->vco4_pitch + pb_bend_cents[pidx] + transpose_cents + combi_transpose_cents;
+            float mod_vco1_pitch = prog->vco1_fine_tune + prog->vco1_pitch + pb_bend_cents[pidx] + combi_transpose_cents;
+            float mod_vco2_pitch = prog->vco2_fine_tune + (prog->vco2_pitch_offset * 100.0f) + prog->vco2_pitch + pb_bend_cents[pidx] + combi_transpose_cents;
+            float mod_vco3_pitch = prog->vco3_fine_tune + (prog->vco3_pitch_offset * 100.0f) + prog->vco3_pitch + pb_bend_cents[pidx] + combi_transpose_cents;
+            float mod_vco4_pitch = prog->vco4_fine_tune + (prog->vco4_pitch_offset * 100.0f) + prog->vco4_pitch + pb_bend_cents[pidx] + combi_transpose_cents;
             float mod_vco1_amp = 0.0f, mod_vco2_amp = 0.0f, fm_mod = 0.0f, mix_bal = 0.0f;
             // Filter cutoff/resonance mod destinations -- one flat slot per filter (0-4), targets
             // 90-99 (see the frontend's matrix_shared_routes comment). Key Track and ext-MIDI CC/

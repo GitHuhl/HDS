@@ -317,7 +317,11 @@ static void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalV
     snprintf(pbtxt, sizeof(pbtxt), "%d st", (int)(prog->pb_range_down + 0.5f));
     hds_play_draw_knob(cr, L.pb_down_knob.x, L.pb_down_knob.y, L.pb_down_knob.w, (float)(prog->pb_range_down / 24.0), false, "Down", pbtxt);
 
-    char transtxt[8]; snprintf(transtxt, sizeof(transtxt), "%d", (int)(p->knobs.transpose_semitones));
+    // Rounds the same way dispatch_midi_event() rounds when it actually applies this value to an
+    // incoming MIDI note (lroundf, not a plain truncating cast) -- so what's on screen while
+    // dragging always matches the whole-semitone shift a new key press will actually get, even for
+    // the negative half of this knob's range where truncation and round-to-nearest disagree.
+    char transtxt[8]; snprintf(transtxt, sizeof(transtxt), "%d", (int)lroundf(p->knobs.transpose_semitones));
     hds_play_draw_knob(cr, L.transpose_knob.x, L.transpose_knob.y, L.transpose_knob.w,
                         (float)((p->knobs.transpose_semitones + 16.0) / 32.0), false, "Transpose", transtxt);
 
