@@ -889,7 +889,30 @@ static void clap_plugin_reset(const clap_plugin_t *plugin) {
     // limiter internal state is a function-local `static` inside render_audio_block, not reset
     // here -- not reachable from outside that function without a backend.c change, a documented,
     // minor limitation rather than a silent gap.
-    for (int i = 0; i < MAX_VOICES; i++) init_voice(&p->voices[i]);
+    //
+    // Any voice a Multisample oscillator is still actively streaming from MUST release its
+    // SampleStream pool claim here BEFORE init_voice() wipes vcoN_sample_stream back to -1 --
+    // otherwise that pool entry's own `in_use` flag never gets cleared (release_sample_stream()
+    // is the only thing that ever clears it) and it leaks for the rest of this instance's
+    // lifetime. A host that calls reset() on every transport stop (many do) while notes are
+    // still sounding -- e.g. repeatedly hitting Stop/Play fast enough that a note's envelope
+    // hasn't finished yet -- was leaking a few of the pool's 32 slots per reset this way; a
+    // relatively small number of rapid stop/starts was enough to exhaust the whole pool, after
+    // which every Multisample oscillator note-on silently gets stream_idx=-1 forever (nothing
+    // downstream distinguishes "pool exhausted" from "no matching zone" -- see
+    // start_sample_osc's own comment), matching the "samples just stop playing back" symptom
+    // exactly. release_idle_sample_streams() isn't reused here since it deliberately only
+    // releases a stream whose EG has already gone idle -- reset() must release regardless of EG
+    // state, the same "stop everything now" contract init_voice() itself already has for every
+    // other piece of per-voice state.
+    for (int i = 0; i < MAX_VOICES; i++) {
+        SynthVoice *v = &p->voices[i];
+        if (v->vco1_sample_stream >= 0) release_sample_stream(&p->sample_engine, v->vco1_sample_stream);
+        if (v->vco2_sample_stream >= 0) release_sample_stream(&p->sample_engine, v->vco2_sample_stream);
+        if (v->vco3_sample_stream >= 0) release_sample_stream(&p->sample_engine, v->vco3_sample_stream);
+        if (v->vco4_sample_stream >= 0) release_sample_stream(&p->sample_engine, v->vco4_sample_stream);
+        init_voice(v);
+    }
     for (int i = 0; i <= COMBI_PROGRAM_COUNT; i++) p->mono_stacks[i] = (MonoNoteStack){0};
     memset(p->global_lfo_phases, 0, sizeof(p->global_lfo_phases));
     p->midi_live = (MidiLiveState){0};
