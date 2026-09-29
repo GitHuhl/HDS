@@ -2784,6 +2784,143 @@ static void run_fx_fetcomp(FXSlotEngine *engine, const FXSlotParams *params, flo
     st->last_gr_db = fmaxf(0.0f, 20.0f * log10f(1.0f + FETCOMP_R5 * g0_now));
 }
 
+// --- FX_TYPE_DBX160: see FX_TYPE_DBX160's own comment above (fx_types.h) for the param map, the
+// general-knowledge basis for its design, and the two real bugs fixed from its first draft. ---
+typedef struct {
+    float rms_state;       // one-pole smoothed max(L,R)^2 -- see this effect's own top comment for
+                             // why its ~30ms smoothing time IS this effect's whole attack behavior
+    float current_gain_db; // 0 (no reduction) down to very negative
+    float hpf_lp[2];        // sidechain HPF's own one-pole lowpass state, per channel
+    // Real 4x oversampling for the saturation stage: two cascaded 2x zero-stuff+biquad stages (see
+    // FX_TYPE_DBX160's own comment in fx_types.h for why two cascaded 2x stages beat one filter run
+    // at a straight 4x rate) -- coefficients computed once at init (SAMPLE_RATE is fixed), one z1/z2
+    // pair per channel per stage, both on the way up and on the way back down.
+    EqBiquadCoeffs os_coeffs_2x, os_coeffs_4x;
+    float up1_z1[2], up1_z2[2];     // 1x -> 2x upsample filter state
+    float up2_z1[2], up2_z2[2];     // 2x -> 4x upsample filter state
+    float down2_z1[2], down2_z2[2]; // 4x -> 2x downsample filter state
+    float down1_z1[2], down1_z2[2]; // 2x -> 1x downsample filter state
+    bool initialized;
+    float last_gr_db; // read back by process_fx_chain() for the GR meter
+} FxDbx160State;
+
+static void dbx160_init(FxDbx160State *st) {
+    compute_fetcomp_os_lowpass_coeffs(&st->os_coeffs_2x, (float)SAMPLE_RATE * 2.0f);
+    compute_fetcomp_os_lowpass_coeffs(&st->os_coeffs_4x, (float)SAMPLE_RATE * 4.0f);
+}
+
+// VCA-style cubic waveshaper -- drive scales up with how much gain reduction is currently being
+// applied (gain_reduction_db is this sample's own |current_gain_db|, a positive magnitude), the
+// general "harder VCA compression grinds more" behavior common to VCA designs (see this effect's
+// own top comment: not a curve measured from real 160-family hardware). Memoryless by design, which
+// is exactly why it's the one part of this effect that needs oversampling -- everything else here
+// only ever changes at the ~30ms RMS smoothing rate, far below anything aliasing could touch.
+static inline float dbx160_saturate(float x, float drive, float gain_reduction_db) {
+    if (drive <= 0.0f) return x;
+    const float dynamic_drive = drive * (1.0f + gain_reduction_db * 0.15f);
+    float scaled = x * (1.0f + dynamic_drive * 0.4f);
+    scaled = fmaxf(-1.2f, fminf(1.2f, scaled));
+    const float distortion = (scaled * scaled * scaled) * (dynamic_drive * 0.12f);
+    return scaled - distortion;
+}
+
+// A plain, correctly-normalized one-pole highpass (DC-blocker style: highpass = input - lowpass).
+// See FX_TYPE_DBX160's own comment in fx_types.h for the bug this replaces in the first draft.
+static inline float dbx160_hpf(float x, float *lp, float alpha) {
+    *lp += alpha * (x - *lp);
+    return x - *lp;
+}
+
+static void run_fx_dbx160(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxDbx160State *st = (FxDbx160State *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxDbx160State));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+    if (!st->initialized) { dbx160_init(st); st->initialized = true; }
+
+    const float p0 = fmaxf(0.0f, fminf(1.0f, params->param[0]));
+    const float p1 = fmaxf(0.0f, fminf(1.0f, params->param[1]));
+    const float p2 = fmaxf(0.0f, fminf(1.0f, params->param[2]));
+    const float p3 = fmaxf(0.0f, fminf(1.0f, params->param[3]));
+    const float p4 = fmaxf(0.0f, fminf(1.0f, params->param[4]));
+
+    const float threshold_db = -60.0f + p0 * 60.0f; // -60..0dB
+    const float ratio = 1.0f + p1 * 19.0f;          // 1:1..20:1
+    const float makeup_db = -12.0f + p2 * 24.0f;    // +-12dB
+    const float saturation = p3;                    // 0..1 drive
+    const float hpf_hz = 20.0f + p4 * 280.0f;       // 20..300Hz -- 20Hz is this knob's own honest
+                                                     // "off" (see fx_types.h's own comment)
+    const float makeup_gain = powf(10.0f, makeup_db / 20.0f);
+
+    // --- Sidechain: per-channel HPF into a shared, stereo-linked detector (max of both channels'
+    // instantaneous power, one-pole smoothed) -- same stereo-link convention as FX_TYPE_GATE and
+    // FX_TYPE_OPTOCOMP above: one detector value drives both channels' gain equally so the stereo
+    // image never skews toward whichever channel happens to be louder at a given instant. ---
+    const float hpf_alpha = 1.0f - expf(-2.0f * (float)M_PI * hpf_hz / (float)SAMPLE_RATE);
+    const float sc_l = dbx160_hpf(*l, &st->hpf_lp[0], hpf_alpha);
+    const float sc_r = dbx160_hpf(*r, &st->hpf_lp[1], hpf_alpha);
+
+    const float rms_alpha = 1.0f - expf(-1.0f / ((float)SAMPLE_RATE * 0.030f)); // ~30ms window --
+                             // this smoothing time IS this effect's own effective attack, see this
+                             // effect's own top comment for why there's no separate Attack knob
+    const float power = fmaxf(sc_l * sc_l, sc_r * sc_r);
+    st->rms_state = rms_alpha * power + (1.0f - rms_alpha) * st->rms_state;
+    const float rms_db = 10.0f * log10f(fmaxf(1e-12f, st->rms_state)); // == 20*log10(sqrt(power))
+
+    const float overshoot_db = rms_db - threshold_db;
+    float target_gain_db = 0.0f;
+    if (overshoot_db > 0.0f) target_gain_db = -overshoot_db * (1.0f - 1.0f / ratio);
+
+    const float release_db_per_sample = 120.0f / (float)SAMPLE_RATE; // fixed -- no Release knob,
+                             // see this effect's own top comment
+    if (target_gain_db < st->current_gain_db) {
+        st->current_gain_db = target_gain_db; // attack: instant -- the smoothed detector above is
+                                                // the only lag this effect has, by design
+    } else {
+        st->current_gain_db = fminf(0.0f, st->current_gain_db + release_db_per_sample);
+    }
+    const float gain_linear = powf(10.0f, st->current_gain_db / 20.0f);
+    const float gr_mag_db = fabsf(st->current_gain_db);
+
+    // --- Gain cell + saturation, real 4x oversampling (see FX_TYPE_DBX160's own comment in
+    // fx_types.h for why this is two cascaded 2x stages rather than one filter run at a straight 4x
+    // rate). Outer loop: 1x<->2x. Inner loop: 2x<->4x, where the saturator itself actually runs. ---
+    const float dry_l = *l * gain_linear;
+    const float dry_r = *r * gain_linear;
+    float out_l = dry_l, out_r = dry_r;
+    for (int stage1 = 0; stage1 < 2; stage1++) {
+        const float in1_l = (stage1 == 0) ? (dry_l * 2.0f) : 0.0f;
+        const float in1_r = (stage1 == 0) ? (dry_r * 2.0f) : 0.0f;
+        const float up1_l = run_eq_biquad(in1_l, &st->os_coeffs_2x, &st->up1_z1[0], &st->up1_z2[0]);
+        const float up1_r = run_eq_biquad(in1_r, &st->os_coeffs_2x, &st->up1_z1[1], &st->up1_z2[1]);
+
+        float kept2x_l = 0.0f, kept2x_r = 0.0f; // this stage1 iteration's 4x->2x decimated sample
+        for (int stage2 = 0; stage2 < 2; stage2++) {
+            const float in2_l = (stage2 == 0) ? (up1_l * 2.0f) : 0.0f;
+            const float in2_r = (stage2 == 0) ? (up1_r * 2.0f) : 0.0f;
+            const float up2_l = run_eq_biquad(in2_l, &st->os_coeffs_4x, &st->up2_z1[0], &st->up2_z2[0]);
+            const float up2_r = run_eq_biquad(in2_r, &st->os_coeffs_4x, &st->up2_z1[1], &st->up2_z2[1]);
+
+            const float sat_l = dbx160_saturate(up2_l, saturation, gr_mag_db);
+            const float sat_r = dbx160_saturate(up2_r, saturation, gr_mag_db);
+
+            const float down2_l = run_eq_biquad(sat_l, &st->os_coeffs_4x, &st->down2_z1[0], &st->down2_z2[0]);
+            const float down2_r = run_eq_biquad(sat_r, &st->os_coeffs_4x, &st->down2_z1[1], &st->down2_z2[1]);
+            if (stage2 == 1) { kept2x_l = down2_l; kept2x_r = down2_r; } // decimate 4x -> 2x
+        }
+
+        const float down1_l = run_eq_biquad(kept2x_l, &st->os_coeffs_2x, &st->down1_z1[0], &st->down1_z2[0]);
+        const float down1_r = run_eq_biquad(kept2x_r, &st->os_coeffs_2x, &st->down1_z1[1], &st->down1_z2[1]);
+        if (stage1 == 1) { out_l = down1_l; out_r = down1_r; } // decimate 2x -> 1x
+    }
+
+    *l = out_l * makeup_gain;
+    *r = out_r * makeup_gain;
+    st->last_gr_db = fmaxf(0.0f, -st->current_gain_db);
+}
+
 // --- FX_TYPE_FAIRKID67: ported from PHU-FAIR-KID-67 (github.com/huberp/phu-fair-kid-67, MIT
 // license; DSP core from its sibling github.com/huberp/phu-audio-lib, also MIT) --- see
 // FX_TYPE_FAIRKID67's own comment above for the param map. Like FX_TYPE_FETCOMP this is a genuine
@@ -4865,6 +5002,10 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                 case FX_TYPE_HARDTUNE: run_fx_hardtune(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_FDNVERB: run_fx_fdnverb(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_SSL4K: run_fx_ssl4k(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_DBX160:
+                    run_fx_dbx160(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
+                    if (fx_engine[s].state) gr_db_out[s] = ((FxDbx160State *)fx_engine[s].state)->last_gr_db;
+                    break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through

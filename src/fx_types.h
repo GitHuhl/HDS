@@ -547,6 +547,45 @@ static inline float run_eq_biquad(float input, const EqBiquadCoeffs *c, float *z
 // Raised again, 10 -> 11, for FX_TYPE_SSL4K's own E/G console switch (param[10]) -- same
 // purely-additive reasoning as the raise above: every existing effect's param[0..9] addresses are
 // untouched, param[10] is simply a new address no earlier-ported effect type ever reads.
+#define FX_TYPE_DBX160 23
+// An original design (not ported from any single codebase, and NOT reverse-engineered from any
+// real dbx 160-family schematic) modeling general, widely-known characteristics of that hardware
+// family's basic architecture: a minimal 3-control interface (Threshold/Ratio/Output Gain, no
+// Attack or Release knob at all -- real 160-family units are famous for exactly this simplicity),
+// an RMS-linked stereo detector (max(L,R) power, one-pole smoothed) whose own smoothing time IS
+// the effective attack (no separate attack stage), an instantaneous jump to the needed gain
+// reduction the moment the smoothed level crosses Threshold, and a fixed (non-adjustable, to match
+// that same real hardware minimalism) linear-dB/second release ramp. Two extras go beyond any real
+// 160-family unit: a Saturation knob (a VCA-style cubic waveshaper whose drive scales up with how
+// hard the gain cell is currently pulling down -- the general "the harder a VCA compresses, the
+// more it audibly grinds" behavior common to VCA designs, not a measured-from-hardware curve) run
+// through this file's own 4x oversampling idiom (two cascaded 2x zero-stuff+biquad stages, see
+// run_fx_dbx160()'s own comment -- genuine 4x, not the fake "4x" from this effect's own first draft,
+// see below) to keep its harmonics from aliasing, and a sidechain highpass (a plain one-pole, tuned
+// low, for keeping a low end-heavy source's kick/bass energy from needlessly ducking the detector).
+// param[0] Threshold (-60..0dB), param[1] Ratio (1:1..20:1), param[2] Makeup Gain (+-12dB),
+// param[3] Saturation (0..1 drive), param[4] SC-HPF (20-300Hz -- 20Hz is this knob's own honest
+// "off" position, same convention as e.g. FX_TYPE_GATE's Range: far enough below any bass content
+// that matters that it's a no-op by design, not a special-cased bypass). See run_fx_dbx160().
+//
+// This effect's first draft came from an outside AI assistant (Gemini), not from any specific
+// existing DSP codebase -- porting it here meant fixing two real problems rather than a style
+// pass: (1) its sidechain highpass computed `state = alpha*(state+x)` where the standard one-pole
+// lowpass-for-a-DC-blocker needs `state = alpha*x + (1-alpha)*state` -- the missing retention term
+// makes it an unbounded integrator, not a filter (feed it a steady input and the state diverges
+// within a handful of samples); replaced with a plain, correctly-normalized one-pole. (2) its
+// claimed "4x oversampling" never actually upsampled anything: every one of its 4 "subsample"
+// iterations recomputed the exact same unchanged value (same input sample, same gain, and its
+// waveshaper is memoryless) and pushed it through one fixed filter's persistent state 4 times in a
+// row, averaging the result -- four times the CPU for a number a single filtered call already
+// approximates, with no new inter-sample harmonic content ever generated. Real 4x oversampling (see
+// run_fx_dbx160()) is built the same way this file already does 2x for FX_TYPE_FETCOMP -- zero-stuff
+// + RBJ-cookbook Butterworth lowpass biquad up, process, lowpass + decimate down -- just cascaded
+// twice (1x->2x->4x on the way up, 4x->2x->1x on the way down) instead of run once, which is also
+// why it's a cleaner way to reach 4x than one filter stage recomputed at a 4x rate directly: each
+// stage only has to reject the ONE nearest set of spectral images, so the two 2nd-order sections
+// together give a steeper effective stopband than a single 2nd-order section would front-load all
+// of that rejection onto by itself.
 #define FX_SLOT_PARAM_COUNT 11
 typedef struct {
     float fx_type;

@@ -71,7 +71,7 @@ static const int HDS_FX_SELECTABLE_TYPES[] = {
     FX_TYPE_STEREODOUBLER, FX_TYPE_TAPEDELAY2, FX_TYPE_POINTYGUITAR, FX_TYPE_GUITARCONDITIONER,
     FX_TYPE_CABS2, FX_TYPE_NAM, FX_TYPE_GATE, FX_TYPE_EQ3, FX_TYPE_LIMITER, FX_TYPE_FETCOMP,
     FX_TYPE_FAIRKID67, FX_TYPE_PEAKMAX, FX_TYPE_MULTIFILTER, FX_TYPE_OPTOCOMP, FX_TYPE_DEESSER,
-    FX_TYPE_HARDTUNE, FX_TYPE_FDNVERB, FX_TYPE_SSL4K,
+    FX_TYPE_HARDTUNE, FX_TYPE_FDNVERB, FX_TYPE_SSL4K, FX_TYPE_DBX160,
 };
 #define HDS_FX_SELECTABLE_TYPE_COUNT (int)(sizeof(HDS_FX_SELECTABLE_TYPES) / sizeof(HDS_FX_SELECTABLE_TYPES[0]))
 
@@ -105,6 +105,7 @@ static const char *hds_fx_type_name(int fx_type) {
         case FX_TYPE_HARDTUNE: return "HardTune";
         case FX_TYPE_FDNVERB: return "FDNVerb";
         case FX_TYPE_SSL4K: return "SSL4K";
+        case FX_TYPE_DBX160: return "DBX160";
         default: return "?";
     }
 }
@@ -115,9 +116,9 @@ static int hds_fx_type_param_count(int fx_type) {
     static const int counts[] = {
         /* OFF */ 0, /* ENSEMBLE */ 2, /* CREAMCOAT */ 5, /* DENSITY3 */ 3, /* STEREOCHORUS */ 2,
         /* STEREODOUBLER */ 2, /* TAPEDELAY2 */ 7, /* POINTYGUITAR */ 10, /* GUITARCONDITIONER */ 0,
-        /* CABS2 */ 2, /* NAM */ 3, /* GATE */ 4, /* EQ3 */ 7, /* LIMITER */ 3, /* FETCOMP */ 8,
+        /* CABS2 */ 2, /* NAM */ 3, /* GATE */ 6, /* EQ3 */ 7, /* LIMITER */ 3, /* FETCOMP */ 8,
         /* FAIRKID67 */ 8, /* PEAKMAX */ 7, /* MULTIFILTER */ 4, /* OPTOCOMP */ 5, /* DEESSER */ 6,
-        /* HARDTUNE */ 10, /* FDNVERB */ 10,
+        /* HARDTUNE */ 10, /* FDNVERB */ 10, /* SSL4K */ 11, /* DBX160 */ 5,
     };
     if (fx_type < 0 || fx_type >= (int)(sizeof(counts) / sizeof(counts[0]))) return 0;
     return counts[fx_type];
@@ -150,6 +151,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
     static const char *const hardtune[] = {"Key", "Scale", "Target", "Amount", "Retune", "Track", "Voice", "VibRt", "VibDp", "VibSrc"};
     static const char *const fdnverb[] = {"Decay", "Size", "PreDly", "Damp", "Diffus", "ModRt", "ModDp", "ERLvl", "ERDcy", "Freeze"};
     static const char *const ssl4k[] = {"HPFrq", "LFFrq", "LFGan", "LMFrq", "LMGan", "LMQ", "HMFrq", "HMGan", "HFFrq", "HFGan", "E/G"};
+    static const char *const dbx160[] = {"Thresh", "Ratio", "Makeup", "Sat", "SC-HP"};
 
     const char *const *table = NULL;
     int count = 0;
@@ -175,6 +177,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
         case FX_TYPE_HARDTUNE: table = hardtune; count = 10; break;
         case FX_TYPE_FDNVERB: table = fdnverb; count = 10; break;
         case FX_TYPE_SSL4K: table = ssl4k; count = 11; break;
+        case FX_TYPE_DBX160: table = dbx160; count = 5; break;
         default: return "";
     }
     if (idx < 0 || idx >= count) return "";
@@ -301,6 +304,8 @@ static void hds_fx_type_param_value_text(int fx_type, int idx, float frac, char 
             if (idx == 1) { hds_fx_fmt_ms(frac, 0.1f, 20.0f, buf, buflen); return; }
             if (idx == 2) { hds_fx_fmt_ms(frac, 5.0f, 500.0f, buf, buflen); return; }
             if (idx == 3) { hds_fx_fmt_db(frac, -80.0f, 0.0f, buf, buflen); return; }
+            if (idx == 4) { hds_fx_fmt_db(frac, 0.0f, 12.0f, buf, buflen); return; }
+            if (idx == 5) { hds_fx_fmt_ms(frac, 0.0f, 500.0f, buf, buflen); return; }
             break;
         case FX_TYPE_EQ3:
             if (idx == 0 || idx == 2 || idx == 5) { hds_fx_fmt_hz_log(frac, 20.0f, 20000.0f, buf, buflen); return; }
@@ -393,6 +398,29 @@ static void hds_fx_type_param_value_text(int fx_type, int idx, float frac, char 
         case FX_TYPE_CREAMCOAT:
             if (idx == 0) { hds_fx_fmt_stepped(frac, creamcoat_select, 17, buf, buflen); return; }
             break; // idx 1-4 are all proprietary internal coefficients
+        case FX_TYPE_SSL4K:
+            if (idx == 0) { hds_fx_fmt_hz_log(frac, 20.0f, 500.0f, buf, buflen); return; }
+            if (idx == 1) { hds_fx_fmt_hz_log(frac, 30.0f, 450.0f, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_db(frac, -16.0f, 16.0f, buf, buflen); return; }
+            // idx 3 (LMF Freq) falls through to plain percent -- its real Hz depends on the Console
+            // switch (param[10]), which this function has no access to (only its own `frac`); a
+            // guessed-console Hz reading would be confidently wrong half the time, worse than "NN%"
+            // (see this section's own header comment on why a false unit beats no unit).
+            if (idx == 4) { hds_fx_fmt_db(frac, -16.0f, 16.0f, buf, buflen); return; }
+            if (idx == 5) { hds_fx_fmt_plain(frac, 0.3f, 3.0f, " Q", buf, buflen); return; }
+            // idx 6 (HMF Freq): same Console-dependent caveat as idx 3.
+            if (idx == 7) { hds_fx_fmt_db(frac, -16.0f, 16.0f, buf, buflen); return; }
+            if (idx == 8) { hds_fx_fmt_hz_log(frac, 1500.0f, 16000.0f, buf, buflen); return; }
+            if (idx == 9) { hds_fx_fmt_db(frac, -16.0f, 16.0f, buf, buflen); return; }
+            if (idx == 10) { hds_fx_fmt_onoff(frac, "E", "G", false, buf, buflen); return; }
+            break;
+        case FX_TYPE_DBX160:
+            if (idx == 0) { hds_fx_fmt_db(frac, -60.0f, 0.0f, buf, buflen); return; }
+            if (idx == 1) { hds_fx_fmt_ratio(frac, 1.0f, 20.0f, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_db(frac, -12.0f, 12.0f, buf, buflen); return; }
+            if (idx == 3) { hds_fx_fmt_percent(frac, buf, buflen); return; }
+            if (idx == 4) { hds_fx_fmt_hz_linear(frac, 20.0f, 300.0f, buf, buflen); return; }
+            break;
         default: break;
     }
     hds_fx_fmt_percent(frac, buf, buflen);
@@ -409,7 +437,7 @@ static bool hds_fx_type_uses_sidechain(int fx_type) { return fx_type == FX_TYPE_
 // pattern hds_fx_type_uses_sidechain() already established.
 static bool hds_fx_type_uses_nam_paths(int fx_type) { return fx_type == FX_TYPE_NAM; }
 
-// The 7 FX types that report a live gain-reduction reading (see process_fx_chain()'s own switch
+// The 8 FX types that report a live gain-reduction reading (see process_fx_chain()'s own switch
 // in fx_chain.c, the only place that fills gr_db_out[s] with anything other than the 0.0f
 // default) -- mirrors frontend.py's own FX_TYPE_GR_CAPABLE_INDICES exactly. Gates whether the GR
 // dB readout (see HdsFxRowLayout's own gr_label comment) is drawn on a given row at all: on every
@@ -419,7 +447,7 @@ static bool hds_fx_type_uses_nam_paths(int fx_type) { return fx_type == FX_TYPE_
 static bool hds_fx_type_is_gr_capable(int fx_type) {
     switch (fx_type) {
         case FX_TYPE_GATE: case FX_TYPE_LIMITER: case FX_TYPE_FETCOMP: case FX_TYPE_FAIRKID67:
-        case FX_TYPE_PEAKMAX: case FX_TYPE_OPTOCOMP: case FX_TYPE_DEESSER:
+        case FX_TYPE_PEAKMAX: case FX_TYPE_OPTOCOMP: case FX_TYPE_DEESSER: case FX_TYPE_DBX160:
             return true;
         default:
             return false;
