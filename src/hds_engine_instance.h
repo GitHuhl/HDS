@@ -28,14 +28,19 @@
 
 // hds_clap_source_label: text for Source index `idx`, exactly matching frontend.py's own
 // SOURCE_NAMES construction (Program 1..COMBI_PROGRAM_COUNT, then Combi Mix, then Ext In
-// 1..EXT_IN_PAIR_COUNT) so a slot's Source combo and a DAW host's own port names (see
-// clap_plugin.c's own clap_audio_ports_get()) name the same thing identically. Generic enough
-// that the standalone app's own gui_host wiring uses this exact same function too, not a
-// re-transcription of the same three lines.
+// 1..EXT_IN_PAIR_COUNT, then Drum Bus 1..DRUM_BUS_COUNT -- see DRUM_BUS_COUNT's own comment in
+// backend.c) so a slot's Source combo and a DAW host's own port names (see clap_plugin.c's own
+// clap_audio_ports_get()) name the same thing identically. Generic enough that the standalone
+// app's own gui_host wiring uses this exact same function too, not a re-transcription of the same
+// lines. Drum Buses have no dedicated per-zone assignment UI yet (see SampleSlot.drum_bus's own
+// comment -- OSC/SFZ-only for now), but this label still needs to be correct now: without it, this
+// same Source combo (already live for Program/Ext-In sources) would show a bogus "Ext In N" for
+// every Drum Bus id once SOURCE_COUNT grew to include them.
 static void hds_clap_source_label(int idx, char *buf, size_t buflen) {
     if (idx < COMBI_PROGRAM_COUNT) snprintf(buf, buflen, "Program %d", idx + 1);
     else if (idx == COMBI_PROGRAM_COUNT) snprintf(buf, buflen, "Combi Mix");
-    else snprintf(buf, buflen, "Ext In %d", idx - COMBI_PROGRAM_COUNT);
+    else if (idx < DRUM_BUS_SOURCE_BASE) snprintf(buf, buflen, "Ext In %d", idx - COMBI_PROGRAM_COUNT);
+    else snprintf(buf, buflen, "Drum Bus %d", idx - DRUM_BUS_SOURCE_BASE + 1);
 }
 
 // ---------------------------------------------------------------------------------------------

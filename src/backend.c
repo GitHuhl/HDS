@@ -124,6 +124,18 @@ static char *hds_realpath_compat(const char *path, char *resolved) {
 // loops, the OSC address family below) -- untouched by this.
 #define SINGLE_PROGRAM_SLOT COMBI_PROGRAM_COUNT
 #define EXT_IN_PAIR_COUNT 8
+// Drum Buses: DRUM_BUS_COUNT independent, session-level audio buses a WAVE_SAMPLE zone can be
+// routed DIRECTLY into (SampleSlot.drum_bus), bypassing that oscillator's own Volume/Mute/Pan
+// knobs AND its Program's own Filter chain/post-filter EQ entirely -- only the zone's own gain_db/
+// pan and its own amp EG still apply (see render_audio_block's own drum-bus mixing comment). The
+// point: routing individual drum-kit hits (kick, snare, hats, ...) on ONE Multisample oscillator to
+// independent FX destinations without needing a per-key filter/pan/EQ routing matrix -- a zone
+// that never sets drum_bus (0, the default) is completely unaffected, playing through the normal
+// oscillator pipeline exactly as before. Appended to SOURCE_COUNT (see its own updated comment)
+// rather than built as a parallel system, so a Drum Bus is immediately usable as any FX slot's own
+// fx_source and in the multi-output source_routing grid, exactly like a Program or ext-in pair --
+// no new FX-side machinery needed at all.
+#define DRUM_BUS_COUNT 24
 // BREAKING CHANGE (real Combi mode): SOURCE_COUNT grows from 9 (1 Program + 8 ext-in) to 17, and
 // existing source ids are RENUMBERED -- ext-in pairs move from ids 1-8 to 9-16, since ids 0-7 are
 // now the 8 Combi Programs (0 = today's single Program, byte-identical) and id 8 is the new
@@ -133,7 +145,16 @@ static char *hds_realpath_compat(const char *path, char *resolved) {
 // configuration referencing ext-in pairs by their old 1-8 ids now points at the wrong source and
 // must be re-set -- the same category of break this file's own running BREAKING CHANGE log has
 // documented for every prior wire-format-shape change.
-#define SOURCE_COUNT (COMBI_PROGRAM_COUNT + 1 + EXT_IN_PAIR_COUNT)
+// BREAKING CHANGE (Drum Buses): SOURCE_COUNT grows again, from 17 to 17+DRUM_BUS_COUNT (41) --
+// DRUM_BUS_COUNT new source ids appended AFTER every ext-in pair (ids 17..40), never inserted
+// earlier in the list, so no existing Program/Combi-Mix/ext-in id is renumbered by this change.
+// See DRUM_BUS_SOURCE_BASE for the exact base id and DRUM_BUS_COUNT's own comment for what these
+// new sources actually carry.
+#define SOURCE_COUNT (COMBI_PROGRAM_COUNT + 1 + EXT_IN_PAIR_COUNT + DRUM_BUS_COUNT)
+// The first Drum Bus's own source id (Drum Bus b, 0-based, is source id DRUM_BUS_SOURCE_BASE + b)
+// -- shared by every site that needs to convert between a raw SampleSlot.drum_bus value (1-based,
+// 0 = off) and its own source-array index.
+#define DRUM_BUS_SOURCE_BASE (COMBI_PROGRAM_COUNT + 1 + EXT_IN_PAIR_COUNT)
 #define OUTPUT_MAX_CHANNELS 16
 #define OUTPUT_PAIR_MAX (OUTPUT_MAX_CHANNELS / 2)
 #define AUDIO_DEVICE_NAME_LEN 64
@@ -1350,6 +1371,14 @@ typedef struct {
     bool vco2_using_own_ampeg; EGDerivedRates vco2_own_eg_rates;
     bool vco3_using_own_ampeg; EGDerivedRates vco3_own_eg_rates;
     bool vco4_using_own_ampeg; EGDerivedRates vco4_own_eg_rates;
+
+    // Drum Bus routing (see DRUM_BUS_COUNT's own comment): resolved once at this note's own
+    // handle_note_on() call, from the zone this oscillator's currently-claimed stream belongs to
+    // (mirrors vco1_using_own_ampeg's own resolve-once-at-note-on posture exactly, for the same
+    // reason -- the zone can't change mid-note). 0 (off, the default) for every oscillator not
+    // currently playing a zone with drum_bus set, or not even WAVE_SAMPLE -- render_audio_block's
+    // stereo-mixer stage is a complete no-op for this feature in that ordinary case.
+    int vco1_drum_bus, vco2_drum_bus, vco3_drum_bus, vco4_drum_bus;
 } SynthVoice;
 // FIXED: Restored 'p->s' to reference sustain data properties correctly
 // Everything tick_adsr() needs BESIDES the envelope instance's own dynamic state (current_level/
@@ -3732,6 +3761,7 @@ static void init_voice(SynthVoice *voice) {
     voice->vco4_xfade_gain = 1.0f; voice->vco4_layer_xfade_gain = 0.0f; voice->vco4_sample_delay_remaining = 0;
     voice->vco1_using_own_ampeg = false; voice->vco2_using_own_ampeg = false;
     voice->vco3_using_own_ampeg = false; voice->vco4_using_own_ampeg = false;
+    voice->vco1_drum_bus = 0; voice->vco2_drum_bus = 0; voice->vco3_drum_bus = 0; voice->vco4_drum_bus = 0;
     for (int l = 0; l < LFO_COUNT; l++) {
         voice->lfo_phase[l] = 0.0f;
         voice->lfo_decim_counter[l] = 0;
@@ -4026,6 +4056,14 @@ typedef struct {
     // that crossfade edge is unset (no layering on that axis for this zone).
     int xfin_lovel, xfin_hivel, xfout_lovel, xfout_hivel;
     int xfin_lokey, xfin_hikey, xfout_lokey, xfout_hikey;
+
+    // Drum Bus routing (HDS-specific, not a real SFZ opcode -- see DRUM_BUS_COUNT's own comment).
+    // 0 (the default) = off, plays through this oscillator's normal Volume/Mute/Pan -> Filter/EQ
+    // pipeline exactly as before. 1..DRUM_BUS_COUNT = this zone's rendered voice output bypasses
+    // ALL of that (only this zone's own gain_db/pan and its own amp EG still apply) and sums
+    // directly into Drum Bus (drum_bus - 1) instead -- see render_audio_block's own drum-bus mixing
+    // block and DRUM_BUS_SOURCE_BASE for how that bus then becomes an ordinary FX-slot source.
+    int drum_bus;
 } SampleSlot;
 
 // Part of the multi-instance refactor's HdsEngineState consolidation (see its main definition,
@@ -4393,6 +4431,11 @@ typedef struct {
     int velcurve_count;
     int velcurve_point[SFZ_MAX_VELCURVE_POINTS];
     float velcurve_gain[SFZ_MAX_VELCURVE_POINTS];
+    // hds_drum_bus=<1..DRUM_BUS_COUNT>: HDS-specific, non-standard opcode (like direction=reverse
+    // above) -- lets a drum-kit SFZ declare each key's own Drum Bus routing directly in the file,
+    // instead of needing a separate live OSC message per zone after loading. See SampleSlot.
+    // drum_bus's own comment for what this actually does at render time.
+    bool has_drum_bus;             int drum_bus;
 } SfzRegion;
 
 #define SFZ_MAX_REGIONS_PER_FILE 65536
@@ -4581,6 +4624,7 @@ static void sfz_apply_opcode(SfzRegion *r, const char *key, const char *value) {
     else if (strcasecmp(key, "volume") == 0) { r->has_volume = true; r->volume = (float)atof(value); }
     else if (strcasecmp(key, "pan") == 0) { r->has_pan = true; r->pan = (float)atof(value); }
     else if (strcasecmp(key, "direction") == 0) { r->has_direction = true; sfz_set_text_field(r->direction, sizeof(r->direction), value); }
+    else if (strcasecmp(key, "hds_drum_bus") == 0) { r->has_drum_bus = true; r->drum_bus = atoi(value); }
     else if (strcasecmp(key, "group") == 0) { r->has_group = true; r->group = atoi(value); }
     else if (strcasecmp(key, "off_by") == 0 || strcasecmp(key, "offby") == 0) { r->has_off_by = true; r->off_by = atoi(value); }
     else if (strcasecmp(key, "seq_length") == 0) { r->has_seq_length = true; r->seq_length = atoi(value); }
@@ -5440,6 +5484,7 @@ typedef struct {
     float velcurve_gain[SFZ_MAX_VELCURVE_POINTS];
     int xfin_lovel, xfin_hivel, xfout_lovel, xfout_hivel; // -1 = unset
     int xfin_lokey, xfin_hikey, xfout_lokey, xfout_hikey; // -1 = unset
+    int drum_bus; // 0 = off (the OSC-safe default) -- see SampleSlot.drum_bus's own comment
 } ZoneRecordWire;
 
 // Fills every SFZ-first-class field of `rec` with "this feature is off for this zone" -- the
@@ -5463,6 +5508,7 @@ static void zone_record_wire_set_sfz_defaults(ZoneRecordWire *rec) {
     rec->velcurve_count = 0;
     rec->xfin_lovel = -1; rec->xfin_hivel = -1; rec->xfout_lovel = -1; rec->xfout_hivel = -1;
     rec->xfin_lokey = -1; rec->xfin_hikey = -1; rec->xfout_lokey = -1; rec->xfout_hikey = -1;
+    rec->drum_bus = 0;
 }
 
 // A zone whose file needs (re)loading, queued rather than loaded immediately -- see
@@ -5505,6 +5551,7 @@ typedef struct {
     float velcurve_gain[SFZ_MAX_VELCURVE_POINTS];
     int xfin_lovel, xfin_hivel, xfout_lovel, xfout_hivel;
     int xfin_lokey, xfin_hikey, xfout_lokey, xfout_hikey;
+    int drum_bus;
 } PendingSampleLoad;
 #define PENDING_SAMPLE_LOAD_CAPACITY 4096
 // How many queued sample loads (each a bounded, one-file blocking file-open+pre-roll-decode) the
@@ -5628,6 +5675,7 @@ static void enqueue_pending_sample_load(HdsSampleEngine *se, int slot_index, con
     p->xfout_lovel = rec->xfout_lovel; p->xfout_hivel = rec->xfout_hivel;
     p->xfin_lokey = rec->xfin_lokey; p->xfin_hikey = rec->xfin_hikey;
     p->xfout_lokey = rec->xfout_lokey; p->xfout_hikey = rec->xfout_hikey;
+    p->drum_bus = rec->drum_bus;
     se->pending->pending_load_tail = (se->pending->pending_load_tail + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
     se->pending->pending_load_count++;
 }
@@ -5727,6 +5775,7 @@ static void drain_pending_sample_loads(HdsSampleEngine *se) {
             slot->xfout_lovel = p->xfout_lovel; slot->xfout_hivel = p->xfout_hivel;
             slot->xfin_lokey = p->xfin_lokey; slot->xfin_hikey = p->xfin_hikey;
             slot->xfout_lokey = p->xfout_lokey; slot->xfout_hikey = p->xfout_hikey;
+            slot->drum_bus = p->drum_bus;
         } else {
             fprintf(stderr, "[samples] failed to load queued sample '%s' (zone_id %d)\n", p->path, p->zone_id);
             se->slots->sample_slots[p->slot_index].active = false;
@@ -5838,6 +5887,7 @@ static void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     slot->xfout_lovel = rec->xfout_lovel; slot->xfout_hivel = rec->xfout_hivel;
     slot->xfin_lokey = rec->xfin_lokey; slot->xfin_hikey = rec->xfin_hikey;
     slot->xfout_lokey = rec->xfout_lokey; slot->xfout_hikey = rec->xfout_hikey;
+    slot->drum_bus = rec->drum_bus;
 }
 
 static void apply_zone_remove(HdsSampleEngine *se, int32_t zone_id) {
@@ -5875,6 +5925,27 @@ static int zone_remove_handler(const char *path, const char *types, lo_arg **arg
     (void)path; (void)types; (void)argc; (void)msg;
     HdsSampleEngine *se = (HdsSampleEngine *)user_data;
     apply_zone_remove(se, argv[0]->i);
+    return 0;
+}
+// "/hds/zone/drum_bus" i i -- zone_id, bus (0 = off, 1..DRUM_BUS_COUNT) -- see SampleSlot.drum_bus's
+// own comment. A dedicated, minimal handler rather than another ZoneRecordWire field threaded
+// through the wire's own 19-float upsert message: this is an HDS-specific extension, not part of
+// the Mapping-tab wire protocol, and it's a cheap in-place field update on an already-loaded zone
+// (like apply_zone_upsert's own "path unchanged" branch), never a reason to reload the sample
+// itself. Silently a no-op if zone_id isn't currently active (e.g. a stale message after removal).
+static int zone_drum_bus_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+    (void)path; (void)types; (void)argc; (void)msg;
+    HdsSampleEngine *se = (HdsSampleEngine *)user_data;
+    int32_t zone_id = argv[0]->i;
+    int bus = argv[1]->i;
+    if (bus < 0) bus = 0;
+    if (bus > DRUM_BUS_COUNT) bus = DRUM_BUS_COUNT;
+    for (int s = 0; s < se->slots->sample_slot_count; s++) {
+        if (se->slots->sample_slots[s].active && se->slots->sample_slots[s].zone_id == zone_id) {
+            se->slots->sample_slots[s].drum_bus = bus;
+            break;
+        }
+    }
     return 0;
 }
 
@@ -6069,6 +6140,12 @@ static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_pr
         rec.xfin_hikey = r->has_xfin_hikey ? sfz_note_to_number(r->xfin_hikey) : -1;
         rec.xfout_lokey = r->has_xfout_lokey ? sfz_note_to_number(r->xfout_lokey) : -1;
         rec.xfout_hikey = r->has_xfout_hikey ? sfz_note_to_number(r->xfout_hikey) : -1;
+        rec.drum_bus = 0;
+        if (r->has_drum_bus) {
+            rec.drum_bus = r->drum_bus;
+            if (rec.drum_bus < 0) rec.drum_bus = 0;
+            if (rec.drum_bus > DRUM_BUS_COUNT) rec.drum_bus = DRUM_BUS_COUNT;
+        }
 
         apply_zone_upsert(se, &rec);
         queued++;
@@ -6422,6 +6499,16 @@ static bool resolve_zone_owned_ampeg(HdsSampleEngine *se, int stream_idx, bool f
     if (!slot->has_own_ampeg) return false;
     compute_zone_owned_eg_rates(slot, out_rates);
     return true;
+}
+
+// Drum Bus routing resolution (see DRUM_BUS_COUNT's own comment) -- looks up the zone a just-
+// claimed stream belongs to and returns its own drum_bus assignment (0 = off, the ordinary case
+// for every zone that never sets it). Same "resolve once at note-on, cache on the voice" posture
+// as resolve_zone_owned_ampeg() just above, for the same reason.
+static int resolve_zone_drum_bus(HdsSampleEngine *se, int stream_idx) {
+    if (stream_idx < 0) return 0;
+    int slot_idx = atomic_load_explicit(&se->streams->sample_streams[stream_idx].slot_index, memory_order_relaxed);
+    return se->slots->sample_slots[slot_idx].drum_bus;
 }
 
 // Shared "where does this envelope INSTANCE start" logic for handle_note_on's own EG-init block --
@@ -7225,6 +7312,14 @@ static void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthShared
         voices[slot].vco2_using_own_ampeg = resolve_zone_owned_ampeg(se, voices[slot].vco2_sample_stream, prog->vco2_force_own_amp_eg != 0.0f, &voices[slot].vco2_own_eg_rates);
         voices[slot].vco3_using_own_ampeg = resolve_zone_owned_ampeg(se, voices[slot].vco3_sample_stream, prog->vco3_force_own_amp_eg != 0.0f, &voices[slot].vco3_own_eg_rates);
         voices[slot].vco4_using_own_ampeg = resolve_zone_owned_ampeg(se, voices[slot].vco4_sample_stream, prog->vco4_force_own_amp_eg != 0.0f, &voices[slot].vco4_own_eg_rates);
+
+        // Drum Bus routing: resolve, per oscillator, whether the zone just (re)claimed above is
+        // routed to a Drum Bus -- see DRUM_BUS_COUNT's own comment. 0 (off) for every oscillator
+        // not currently playing such a zone, the ordinary, unaffected case.
+        voices[slot].vco1_drum_bus = resolve_zone_drum_bus(se, voices[slot].vco1_sample_stream);
+        voices[slot].vco2_drum_bus = resolve_zone_drum_bus(se, voices[slot].vco2_sample_stream);
+        voices[slot].vco3_drum_bus = resolve_zone_drum_bus(se, voices[slot].vco3_sample_stream);
+        voices[slot].vco4_drum_bus = resolve_zone_drum_bus(se, voices[slot].vco4_sample_stream);
 
         int m0 = (int)prog->eg_mode[0];
         init_amp_eg_start(&voices[slot].vco1_eg, voices[slot].vco1_using_own_ampeg, &voices[slot].vco1_own_eg_rates, m0, &prog->eg[0]);
@@ -9011,6 +9106,11 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
 
     for (int i = 0; i < block_size; i++) {
         float mixed_l[COMBI_PROGRAM_COUNT + 1] = {0.0f}, mixed_r[COMBI_PROGRAM_COUNT + 1] = {0.0f};
+        // Drum Bus routing (see DRUM_BUS_COUNT's own comment): a second, session-level (not
+        // per-Program) set of accumulators, filled directly by individual oscillators inside the
+        // voice loop below (bypassing this Program's own Filter/EQ pipeline entirely) instead of
+        // through mixed_l/mixed_r -- see the stereo-mixer block's own drum-bus interception.
+        float drum_bus_l[DRUM_BUS_COUNT] = {0.0f}, drum_bus_r[DRUM_BUS_COUNT] = {0.0f};
         float lfo_out[COMBI_PROGRAM_COUNT + 1][LFO_COUNT] = {{0.0f}};
         // LFOs are computed per active Program slot (see active_program_count's own comment --
         // always advancing continuously per Program, never gated on voice activity, to preserve
@@ -9613,21 +9713,48 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                 vel_amp_mult_arr[osc] = fmaxf(0.0f, 1.0f + (vel_to_amp_arr[osc] / 100.0f) * ((float)(voices[v].midi_velocity - 64) / 63.0f));
             }
             float osc_l[4], osc_r[4];
+            int drum_bus_arr[4] = { voices[v].vco1_drum_bus, voices[v].vco2_drum_bus, voices[v].vco3_drum_bus, voices[v].vco4_drum_bus };
+            float zone_pan_arr[4] = { zone_pan1, zone_pan2, zone_pan3, zone_pan4 };
             for (int osc = 0; osc < 4; osc++) {
-                float amp = gain_audible_arr[osc] * eg_level_arr[osc] * vel_amp_mult_arr[osc];
-                // Unison Saw/Sample's side_l/r are ALREADY a full stereo image (unlike every
-                // other shape's osc_out, which is mono until this Pan multiply gives it width) --
-                // reusing the plain mono-source pan law here would silently cut an untouched
-                // (centered) Unison Saw/Sample oscillator by -3dB, the same "already-stereo
-                // source" bug this codebase has already fixed for Filter A/B's Parallel combine
-                // and the Sequencer/Combi lane mixer's own Level/Pan (see those for the identical
-                // sqrt(2)-normalization fix) -- reused here for the same reason: pan_l_arr/
-                // pan_r_arr read exactly 0.70711 at center (correct for a mono source split two
-                // ways), so an already-stereo source needs the sqrt(2)-normalized law instead,
-                // which reads exactly 1.0 at center and only narrows/widens away from it.
-                float pan_gain_mult = osc_uses_side[osc] ? 1.41421356f : 1.0f;
-                osc_l[osc] = (osc_uses_side[osc] ? osc_side_l[osc] : osc_out[osc]) * amp * pan_l_arr[osc] * pan_gain_mult;
-                osc_r[osc] = (osc_uses_side[osc] ? osc_side_r[osc] : osc_out[osc]) * amp * pan_r_arr[osc] * pan_gain_mult;
+                // Drum Bus routing (see DRUM_BUS_COUNT's own comment): a zone-routed oscillator
+                // contributes NOTHING to this Program's own osc_l/osc_r (so it never reaches the
+                // Filter/EQ pipeline just below, and completely ignores this oscillator's own
+                // Volume/Mute/Pan/vel-to-amp knobs) -- instead its raw render output (already
+                // carrying its own gain_db, amp_velcurve_N, and any crossfade-layer mix, all
+                // applied earlier at this same oscillator's own osc_out/osc_side_l/r computation)
+                // times ONLY its amp EG level, panned by ONLY its own zone pan (equal-power, same
+                // law as pan_l_arr/pan_r_arr above but with no oscillator knob/modulation added
+                // in), sums directly into that Drum Bus. A zone that never sets drum_bus at all
+                // (the ordinary case) always has drum_bus_arr[osc] == 0 and takes the untouched
+                // else-branch below, byte-identical to pre-this-feature behavior.
+                int db = (shape_arr[osc] == WAVE_SAMPLE) ? drum_bus_arr[osc] : 0;
+                if (db > 0) {
+                    float sig_l = osc_uses_side[osc] ? osc_side_l[osc] : osc_out[osc];
+                    float sig_r = osc_uses_side[osc] ? osc_side_r[osc] : osc_out[osc];
+                    float pan_gain_mult = osc_uses_side[osc] ? 1.41421356f : 1.0f;
+                    float db_pan_angle = (fmaxf(-1.0f, fminf(1.0f, zone_pan_arr[osc])) + 1.0f) * (M_PI / 4.0f);
+                    float db_pan_l = cosf(db_pan_angle), db_pan_r = sinf(db_pan_angle);
+                    float db_amp = eg_level_arr[osc] * pan_gain_mult;
+                    drum_bus_l[db - 1] += sig_l * db_amp * db_pan_l;
+                    drum_bus_r[db - 1] += sig_r * db_amp * db_pan_r;
+                    osc_l[osc] = 0.0f;
+                    osc_r[osc] = 0.0f;
+                } else {
+                    float amp = gain_audible_arr[osc] * eg_level_arr[osc] * vel_amp_mult_arr[osc];
+                    // Unison Saw/Sample's side_l/r are ALREADY a full stereo image (unlike every
+                    // other shape's osc_out, which is mono until this Pan multiply gives it width) --
+                    // reusing the plain mono-source pan law here would silently cut an untouched
+                    // (centered) Unison Saw/Sample oscillator by -3dB, the same "already-stereo
+                    // source" bug this codebase has already fixed for Filter A/B's Parallel combine
+                    // and the Sequencer/Combi lane mixer's own Level/Pan (see those for the identical
+                    // sqrt(2)-normalization fix) -- reused here for the same reason: pan_l_arr/
+                    // pan_r_arr read exactly 0.70711 at center (correct for a mono source split two
+                    // ways), so an already-stereo source needs the sqrt(2)-normalized law instead,
+                    // which reads exactly 1.0 at center and only narrows/widens away from it.
+                    float pan_gain_mult = osc_uses_side[osc] ? 1.41421356f : 1.0f;
+                    osc_l[osc] = (osc_uses_side[osc] ? osc_side_l[osc] : osc_out[osc]) * amp * pan_l_arr[osc] * pan_gain_mult;
+                    osc_r[osc] = (osc_uses_side[osc] ? osc_side_r[osc] : osc_out[osc]) * amp * pan_r_arr[osc] * pan_gain_mult;
+                }
             }
 
             // Phase advance (unconditional, even for WAVE_OFF -- phase bookkeeping stays live so
@@ -9891,6 +10018,18 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                     if (pair_peak > ext_in_peak_out[p]) ext_in_peak_out[p] = pair_peak;
                 }
             }
+        }
+        // Drum Buses (see DRUM_BUS_COUNT's own comment): appended after every ext-in pair (ids
+        // DRUM_BUS_SOURCE_BASE..SOURCE_COUNT-1), populated directly from drum_bus_l/r (filled by
+        // individual oscillators inside the voice loop above, entirely bypassing this Program's own
+        // Filter/EQ pipeline) rather than from mixed_l/ext_in_buffer. master_volume still applies --
+        // it's session-level, scaling the whole session's output uniformly, same reasoning as every
+        // Program's own bus just above (ext-in pairs are the one exception, relying solely on their
+        // own per-pair gain instead).
+        for (int b = 0; b < DRUM_BUS_COUNT; b++) {
+            int src = DRUM_BUS_SOURCE_BASE + b;
+            bus_l[src] = drum_bus_l[b] * (*master_volume_smoothed);
+            bus_r[src] = drum_bus_r[b] * (*master_volume_smoothed);
         }
 
         // Sidechain snapshot: every source's own pre-FX dry signal THIS SAME SAMPLE, taken now

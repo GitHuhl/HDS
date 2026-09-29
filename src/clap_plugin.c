@@ -776,6 +776,7 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         lo_server_add_method(p->osc_server, "/hds/zone/upsert", "i" "fffffffffffffffffff" "s", zone_upsert_handler, &p->sample_engine);
         lo_server_add_method(p->osc_server, "/hds/zone/remove", "i", zone_remove_handler, &p->sample_engine);
         lo_server_add_method(p->osc_server, "/hds/zone/load_sfz", "iis", zone_load_sfz_handler, &p->sample_engine);
+        lo_server_add_method(p->osc_server, "/hds/zone/drum_bus", "ii", zone_drum_bus_handler, &p->sample_engine);
         char reply_port_str[16]; snprintf(reply_port_str, sizeof(reply_port_str), "%d", p->osc_reply_port);
         p->osc_reply_addr = lo_address_new(CLAP_OSC_REPLY_HOST, reply_port_str);
         // Registered here rather than in the block above, purely by grouping convention -- these

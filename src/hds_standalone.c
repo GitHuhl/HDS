@@ -1900,6 +1900,7 @@ int main(int argc, char **argv) {
     lo_server_add_method(osc_server, "/hds/zone/upsert", "i" "fffffffffffffffffff" "s", zone_upsert_handler, &g_sample_engine);
     lo_server_add_method(osc_server, "/hds/zone/remove", "i", zone_remove_handler, &g_sample_engine);
     lo_server_add_method(osc_server, "/hds/zone/load_sfz", "iis", zone_load_sfz_handler, &g_sample_engine);
+    lo_server_add_method(osc_server, "/hds/zone/drum_bus", "ii", zone_drum_bus_handler, &g_sample_engine);
     lo_server_add_method(osc_server, "/hds/song/save_midi", "s", song_save_midi_handler, &g_engine);
     lo_server_add_method(osc_server, "/hds/song/load_midi", "s", song_load_midi_handler, &g_engine);
     lo_server_add_method(osc_server, "/hds/tuning/load_scl", "s", tuning_load_scl_handler, NULL);

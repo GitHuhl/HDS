@@ -84,6 +84,19 @@ A few notable addresses:
   envelope (`ampeg_*`) that's either fully used as-is or fully overridden by
   the oscillator's own Amp EG via its "Use Amp EG" checkbox (Multisample
   oscillators only) — never blended.
+- `/hds/zone/drum_bus` (`ii`: zone id, bus 0-24) — assigns a Sample Bank zone
+  to one of 24 Drum Buses (0 = off). A zone routed to a Drum Bus contributes
+  NOTHING to its owning oscillator's Volume/Mute/Pan/vel-to-amp or that
+  Program's Filter chain — only the zone's own gain/pan and its own amp EG
+  level reach the bus — so individual multisample keys (e.g. drum kit
+  elements) can be sent straight to their own FX chain and output routing,
+  fully bypassing the owning Program. Drum Buses reuse the same FX-slot
+  (`/hds/fx/<slot>/source`) and output-routing (`/hds/routing/<source>/out/<pair>`)
+  machinery as every other source — Drum Bus 1..24 sit at source ids
+  `COMBI_PROGRAM_COUNT + 1 + EXT_IN_PAIR_COUNT` upward. Also settable per-zone
+  via the non-standard SFZ opcode `hds_drum_bus=<1-24>`. No dedicated native-
+  GUI zone assignment yet (OSC/SFZ-only) — the FX and Routing tabs already
+  show/label Drum Bus sources correctly.
 
 A CLAP plugin instance runs its own embedded OSC server too (default
 `9010`/`9011`, incrementing per instance), so `frontend.py` can drive a
