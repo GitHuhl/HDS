@@ -906,6 +906,16 @@ typedef struct {
     // bus, regardless of whether channel 2p+1 exists or what it carries.
     float ext_in_stereo[EXT_IN_PAIR_COUNT];
 
+    // Per-Drum-Bus output gain (0.0-2.0, i.e. 0-200%, same range/UI convention as ext_in_gain
+    // above) -- applied AFTER master_volume, right where drum_bus_l/r get folded into bus_l/r (see
+    // render_audio_block's own Drum Bus population loop). Unlike ext_in_gain, defaults to 1.0 (unity)
+    // rather than 0.0: an ext-in pair is a live hardware input that could feed back/clip the moment
+    // Enable is checked, so it always starts silent -- a Drum Bus only ever makes sound because the
+    // user already explicitly assigned zones to it (Key Routing grid) and routed its output
+    // somewhere (Routing tab), so starting it silent on top of that would just be a second,
+    // redundant "why isn't this making sound" trap.
+    float drum_bus_gain[DRUM_BUS_COUNT];
+
     // Routing tab visibility (sent by the frontend on every QTabWidget.currentChanged, see
     // frontend.py's own comment) -- gates render_audio_block's per-ext-in-pair peak metering
     // (see ext_in_peak_out) so that cost is only ever paid while a player is actually looking at
@@ -2584,6 +2594,7 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_ARRAY("/hds/ext_in/%d/enable", ext_in_enable, EXT_IN_PAIR_COUNT),
     OSC_ARRAY("/hds/ext_in/%d/gain", ext_in_gain, EXT_IN_PAIR_COUNT),
     OSC_ARRAY("/hds/ext_in/%d/stereo", ext_in_stereo, EXT_IN_PAIR_COUNT),
+    OSC_ARRAY("/hds/drum_bus/%d/gain", drum_bus_gain, DRUM_BUS_COUNT),
     OSC_SCALAR("/hds/gui/routing_tab_visible", gui_routing_tab_visible),
 
     // --- FX Bus (fx[FX_SLOT_COUNT], FXSlotParams) ---
@@ -3647,6 +3658,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     // frontend's own dial -- which also always inits to 0 -- has sent its first packet). The
     // user always has to bring this up manually.
     for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) { knobs->ext_in_enable[p] = 0.0f; knobs->ext_in_gain[p] = 0.0f; knobs->ext_in_stereo[p] = 1.0f; }
+    for (int b = 0; b < DRUM_BUS_COUNT; b++) knobs->drum_bus_gain[b] = 1.0f; // unity -- see this field's own comment on why (unlike ext_in_gain) it doesn't default to silence
     knobs->gui_routing_tab_visible = 0.0f;
     for (int f = 0; f < FX_SLOT_COUNT; f++) {
         knobs->fx[f].fx_type = FX_TYPE_OFF;
@@ -10033,11 +10045,13 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // Filter/EQ pipeline) rather than from mixed_l/ext_in_buffer. master_volume still applies --
         // it's session-level, scaling the whole session's output uniformly, same reasoning as every
         // Program's own bus just above (ext-in pairs are the one exception, relying solely on their
-        // own per-pair gain instead).
+        // own per-pair gain instead). drum_bus_gain is this bus's own 0-200% trim (see its own
+        // comment on SynthSharedControls) -- useful since a Drum Bus sums however many zones got
+        // assigned to it, with no other per-bus level control otherwise.
         for (int b = 0; b < DRUM_BUS_COUNT; b++) {
             int src = DRUM_BUS_SOURCE_BASE + b;
-            bus_l[src] = drum_bus_l[b] * (*master_volume_smoothed);
-            bus_r[src] = drum_bus_r[b] * (*master_volume_smoothed);
+            bus_l[src] = drum_bus_l[b] * (*master_volume_smoothed) * knobs->drum_bus_gain[b];
+            bus_r[src] = drum_bus_r[b] * (*master_volume_smoothed) * knobs->drum_bus_gain[b];
         }
 
         // Sidechain snapshot: every source's own pre-FX dry signal THIS SAME SAMPLE, taken now

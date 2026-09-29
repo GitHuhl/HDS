@@ -105,6 +105,8 @@ static void hds_clap_routing_compute_row_layout(int src, double scroll_offset_px
 // memory. Bounding the range to the real ext-in pairs only fixes it.
 static bool hds_routing_is_ext_in(int src) { return src >= COMBI_PROGRAM_COUNT + 1 && src < COMBI_PROGRAM_COUNT + 1 + EXT_IN_PAIR_COUNT; }
 static int hds_routing_ext_in_pair(int src) { return src - COMBI_PROGRAM_COUNT - 1; }
+static bool hds_routing_is_drum_bus(int src) { return src >= DRUM_BUS_SOURCE_BASE && src < SOURCE_COUNT; }
+static int hds_routing_drum_bus_index(int src) { return src - DRUM_BUS_SOURCE_BASE; }
 
 // --- Drum Bus Key Routing: a compact, low-footprint way to actually assign Sample Bank zones to
 // Drum Buses from the GUI (see DRUM_BUS_COUNT's own comment in backend.c) -- the only other way is
@@ -264,6 +266,19 @@ static void hds_clap_routing_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRoutin
         hds_fx_draw_pill(cr, L.mainout_pill.x, L.mainout_pill.y, L.mainout_pill.w, L.mainout_pill.h, main_out ? "On" : "Off", main_out, false);
 #endif
 
+        if (hds_routing_is_drum_bus(src)) {
+            // Just the Gain knob (0-200%, same convention/range as ext_in_gain's own -- see
+            // drum_bus_gain's own comment on SynthSharedControls) -- no Enable/Stereo/VU here, a
+            // Drum Bus has no hardware-input concept for either of those to mean anything: it's
+            // either fed zones or it isn't (Key Routing grid below), and it's already inherently
+            // stereo from each zone's own pan. Reuses the exact same L.gain_knob rect ext-in rows
+            // use, since it's computed unconditionally regardless of which kind of row this is.
+            int b = hds_routing_drum_bus_index(src);
+            float gain = p->knobs.drum_bus_gain[b];
+            char gtxt[16]; snprintf(gtxt, sizeof(gtxt), "%d%%", (int)(gain * 100.0f + 0.5f));
+            hds_play_draw_knob(cr, L.gain_knob.x, L.gain_knob.y, L.gain_knob.w, gain / 2.0f, false, NULL, gtxt);
+            continue;
+        }
         if (!ext_in) continue;
         int pair = hds_routing_ext_in_pair(src);
         bool enabled = p->knobs.ext_in_enable[pair] != 0.0f;
@@ -420,6 +435,11 @@ static bool hds_clap_routing_on_button_press(HdsClapPlugin *p, HdsClapRoutingVie
             if (button == 1) p->knobs.ext_in_stereo[pair] = (p->knobs.ext_in_stereo[pair] != 0.0f) ? 0.0f : 1.0f;
             return true;
         }
+    }
+    if (hds_routing_is_drum_bus(src) && hds_play_knob_hit_test(&L.gain_knob, x, y)) {
+        int b = hds_routing_drum_bus_index(src);
+        hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.drum_bus_gain[b], 0.0, 2.0, x, y, button, HDS_PLAY_NO_MENU);
+        return true;
     }
 
     (void)button;

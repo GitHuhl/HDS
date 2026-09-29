@@ -97,9 +97,13 @@ A few notable addresses:
   via the non-standard SFZ opcode `hds_drum_bus=<1-24>`. The native GUI's
   Routing tab has a "Drum Bus Key Routing" grid (below the Source rows,
   scroll to reach it) for this directly: a stepper picks which of the 24
-  buses you're editing, and a 7 (natural note letter) x 8 (octave) checkbox
+  buses you're editing, and a full 12 (chromatic note, naturals + sharps)
+  x 11 (octave -1 through 9, the entire real MIDI 0-127 range) checkbox
   grid assigns/clears every Single-Program-scope zone covering that note,
-  live, no reload needed. The FX and Routing tabs' Source rows/combos
+  live, no reload needed. Each Drum Bus row also gets its own Gain knob
+  (`/hds/drum_bus/<n>/gain`, 0-200%, defaults to 100% unlike ext-in's own
+  gain, which defaults to silent) — useful since a bus sums however many
+  zones got assigned to it. The FX and Routing tabs' Source rows/combos
   already show/label Drum Bus sources correctly too.
 
 A CLAP plugin instance runs its own embedded OSC server too (default
