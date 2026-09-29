@@ -3825,9 +3825,12 @@ typedef struct {
 //
 // This tier: the Sample Bank catalog. Its base address never moves for the life of ITS OWNING
 // INSTANCE (same guarantee sample_disk_thread_main() depends on, now scoped per-instance instead
-// of per-process). sample_slot_count tracks the next append position; entries are append-only and
-// never compacted/reused after a ZONE_OP_REMOVE (see the OSC zone handlers) -- an inactive
-// (.active == false) entry is just permanently skipped everywhere.
+// of per-process). sample_slot_count tracks the high-water mark of slots ever used; an inactive
+// (.active == false) entry left by a ZONE_OP_REMOVE is eligible for reuse by the next brand-new
+// zone apply_zone_upsert() sees (see that function's own comment), so the catalog stays bounded by
+// the PEAK number of simultaneously-active zones rather than growing with every zone ever loaded
+// across the whole session -- e.g. repeatedly swapping a Multisample oscillator's SFZ file no
+// longer leaves every previous load's own dead entry sitting in the catalog forever.
 typedef struct {
     SampleSlot sample_slots[SAMPLE_SLOT_CAPACITY];
     int        sample_slot_count;
@@ -5091,10 +5094,13 @@ static void drain_pending_sample_loads(HdsSampleEngine *se) {
         // A ZONE_OP_REMOVE can tombstone this slot_index while its load is still sitting in the
         // queue (added, then removed again before its throttled turn comes up) -- the removal
         // wins: skip the load rather than have load_sample_slot() resurrect a tombstoned slot by
-        // setting active back to true. Safe under the append-only invariant (a slot_index is
-        // never reused for a different zone_id), so this can only be the same zone this load was
-        // originally queued for.
-        if (!se->slots->sample_slots[p->slot_index].active) continue;
+        // setting active back to true. Checks zone_id, not just active, because
+        // apply_zone_upsert() can now reuse a removed zone's own freed slot_index for a brand new,
+        // unrelated zone before this stale queue entry's throttled turn comes up (see that
+        // function's own comment on slot reuse) -- without the zone_id check, a slow-draining
+        // load for the OLD zone could resurrect/overwrite the NEW zone now sitting at the same
+        // index with the wrong file entirely.
+        if (!se->slots->sample_slots[p->slot_index].active || se->slots->sample_slots[p->slot_index].zone_id != p->zone_id) continue;
 
         if (load_sample_slot(se, p->slot_index, p->path, p->root_note)) {
             SampleSlot *slot = &se->slots->sample_slots[p->slot_index];
@@ -5138,14 +5144,37 @@ static void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     }
 
     if (found_index < 0) {
-        // Brand new zone -- append. sample_slots is a plain static array (zero-initialized
-        // BSS), so a never-before-used position already has loaded=false, pre_roll_l/r=NULL,
-        // etc.; only zone_id/active/owner_program need setting explicitly here.
-        if (se->slots->sample_slot_count >= SAMPLE_SLOT_CAPACITY) {
-            fprintf(stderr, "[samples] Sample Bank at its %d-zone capacity -- ignoring zone_id %d\n", SAMPLE_SLOT_CAPACITY, rec->zone_id);
-            return;
+        // Brand new zone -- reuse an earlier REMOVED zone's now-inactive slot if one exists,
+        // rather than always appending a new one. Without this, swapping a Multisample
+        // oscillator's SFZ over and over (standard sampler behavior: loading a new instrument
+        // into a slot replaces the old one, it doesn't pile up alongside it) left every previous
+        // load's own SampleSlot entry sitting inactive-but-present in the catalog forever --
+        // apply_zone_remove() already frees the big part (pre_roll_l/r) and clears `active`, but
+        // sample_slot_count itself only ever grew, so every catalog scan (find_matching_sample_
+        // slot, this same reuse scan, round-robin cycling, ...) kept walking an ever-longer tail
+        // of dead entries for the rest of the session -- a real, unbounded-with-usage cost despite
+        // no individual zone actually leaking its own RAM. A removed slot is always safe to hand
+        // to a brand new zone: apply_zone_remove() already leaves it fully reset (loaded=false,
+        // pre_roll_l/r=NULL), identical to a never-used BSS-zeroed entry -- see
+        // drain_pending_sample_loads()'s own zone_id check for the one place slot-index reuse
+        // needed a matching fix (a stale queued load for the OLD zone that used to live at this
+        // index must never be allowed to resurrect it as if it were the new zone).
+        int reuse_index = -1;
+        for (int s = 0; s < se->slots->sample_slot_count; s++) {
+            if (!se->slots->sample_slots[s].active) { reuse_index = s; break; }
         }
-        found_index = se->slots->sample_slot_count++;
+        if (reuse_index >= 0) {
+            found_index = reuse_index;
+        } else {
+            // Nothing to reuse -- append. sample_slots is a plain static array (zero-initialized
+            // BSS), so a never-before-used position already has loaded=false, pre_roll_l/r=NULL,
+            // etc.; only zone_id/active/owner_program need setting explicitly here.
+            if (se->slots->sample_slot_count >= SAMPLE_SLOT_CAPACITY) {
+                fprintf(stderr, "[samples] Sample Bank at its %d-zone capacity -- ignoring zone_id %d\n", SAMPLE_SLOT_CAPACITY, rec->zone_id);
+                return;
+            }
+            found_index = se->slots->sample_slot_count++;
+        }
         se->slots->sample_slots[found_index].zone_id = rec->zone_id;
         se->slots->sample_slots[found_index].active = true;
         se->slots->sample_slots[found_index].owner_program = clamp_owner_program(rec->owner_program);
@@ -5368,10 +5397,16 @@ static int zone_load_sfz_handler(const char *path, const char *types, lo_arg **a
 //
 // Uses O(1) extra memory (three linear passes over the catalog) instead of building candidate/
 // group-member arrays sized to a compile-time constant, since the catalog no longer has one.
-// "First encountered while scanning in ascending array-index order" doubles as "lowest zone_id"
-// here because g_sample_slots is strictly append-only (see its own comment) -- array index order
-// and zone_id creation order are the same thing. That invariant would need revisiting if slot
-// reuse/compaction is ever added later.
+// "First encountered while scanning in ascending array-index order" is all either tie-break here
+// actually needs -- a stable, consistent ordering so the SAME physical zone is always picked first
+// among ties and round-robin's own ordinal-to-member mapping never shifts between successive hits
+// within a session. It is NOT "lowest zone_id"/creation order any more now that apply_zone_upsert()
+// can reuse a removed zone's freed slot index for a brand new zone (see its own comment) -- a
+// reused low index can hold a zone created later than one sitting at a higher, never-reused index.
+// That's a harmless cosmetic difference (which round-robin member is nominally "first" among ties
+// with no round_robin_group set is undefined/arbitrary either way), never a correctness one: which
+// zone(s) match a given note+velocity, and how many round-robin members exist among them, are
+// unaffected by array position.
 static int find_matching_sample_slot(HdsSampleEngine *se, int assigned_osc, int owner_program, int note, int velocity) {
     long best_area = -1; // -1 sentinel: "no candidate yet", distinct from a real zero-area zone
     int first_best_idx = -1;

@@ -710,6 +710,19 @@ static void clap_plugin_destroy(const clap_plugin_t *plugin) {
     // clean up an open X11 window/Display here too rather than leak it if one doesn't -- same
     // posture hds_fx_plugin_destroy() already takes.
     hds_clap_gui_destroy_internal(plugin);
+    // Every zone ever loaded into this instance's own Sample Bank owns a separately-heap-allocated
+    // pre-roll cache (pre_roll_l/r -- see SampleSlot's own comment) that free(p) below does NOT
+    // reach: p is one calloc'd block, but pre_roll_l/r are each their own malloc, so freeing p
+    // only reclaims the pointers themselves, not what they point to. hds_standalone.c's own
+    // process-shutdown path already does exactly this same loop (it matters less there -- the OS
+    // reclaims everything the moment that process exits either way) but a CLAP instance lives
+    // inside a host process that very much does NOT exit when one plugin instance is closed/
+    // removed -- every instance load+unload cycle across a whole session was leaking however much
+    // RAM its own loaded multisamples' pre-roll caches used, for good, until the host itself quit.
+    for (int s = 0; s < p->sample_slot_state.sample_slot_count; s++) {
+        free(p->sample_slot_state.sample_slots[s].pre_roll_l);
+        free(p->sample_slot_state.sample_slots[s].pre_roll_r);
+    }
     free(p);
 }
 
@@ -853,6 +866,21 @@ static void clap_plugin_deactivate(const clap_plugin_t *plugin) {
         pthread_join(p->streams_state.sample_disk_thread, NULL);
         atomic_store_explicit(&p->streams_state.sample_disk_thread_shutdown, false, memory_order_release); // see activate()'s own comment on why this must be reset for a future reactivation
         p->streams_state.sample_disk_thread_running = false;
+        // The disk thread's own loop never closes a still-open file on its way out (it only ever
+        // fclose()s in response to a START/STOP command reaching that pool slot, not on shutdown)
+        // -- whatever was open at the moment it exited stays open otherwise. Safe to fclose+NULL
+        // here unconditionally, now that the thread is confirmed joined (no concurrent access):
+        // NULLing matters because a future reactivation's disk thread starts fresh and would
+        // otherwise fclose() this same already-closed FILE* again on its first SAMPLE_CMD_START
+        // for this slot (a double-close). Mirrors hds_standalone.c's own post-join fclose loop at
+        // process shutdown -- same leak, just needing to matter here on every deactivate/reactivate
+        // cycle a persistent host process can run this plugin instance through, not only at exit.
+        for (int s = 0; s < MAX_SAMPLE_STREAMS; s++) {
+            if (p->streams_state.sample_streams[s].disk_file_handle) {
+                fclose(p->streams_state.sample_streams[s].disk_file_handle);
+                p->streams_state.sample_streams[s].disk_file_handle = NULL;
+            }
+        }
     }
 
     // Join any still-in-flight Sequencer audio-lane loader thread before this instance's own
