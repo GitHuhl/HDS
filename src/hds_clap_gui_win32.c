@@ -133,7 +133,7 @@ static void hds_clap_gui_on_timer(const clap_plugin_t *plugin, clap_id timer_id)
     HdsClapGuiWindow *w = (HdsClapGuiWindow *)p->gui_window;
     if (!w || timer_id != w->timer_id) return;
     hds_clap_gui_pump_events(w);
-    hds_fx_gui_browser_refresh(&p->gui_host, &w->view.fx_view.browser); // reused verbatim, see hds_clap_gui_x11.c's own comment
+    hds_fx_gui_browser_refresh(&w->view.fx_view.browser); // reused verbatim, see hds_clap_gui_x11.c's own comment
     hds_clap_gui_redraw(w);
 }
 

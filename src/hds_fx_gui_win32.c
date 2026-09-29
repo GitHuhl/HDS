@@ -169,7 +169,7 @@ static void hds_fx_gui_on_timer(const clap_plugin_t *plugin, clap_id timer_id) {
     HdsFxGuiWindow *w = (HdsFxGuiWindow *)host->gui_window;
     if (!w || timer_id != w->timer_id) return;
     hds_fx_gui_pump_events(w);
-    hds_fx_gui_browser_refresh(w->plugin, &w->view.browser);
+    hds_fx_gui_browser_refresh(&w->view.browser);
     hds_fx_gui_redraw(w);
 }
 

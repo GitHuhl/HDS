@@ -169,7 +169,7 @@ static void hds_standalone_gui_pump(void) {
     struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
     double elapsed_ms = (now.tv_sec - w->last_redraw.tv_sec) * 1000.0 + (now.tv_nsec - w->last_redraw.tv_nsec) / 1e6;
     if (elapsed_ms >= 33.0) {
-        hds_fx_gui_browser_refresh(&w->plugin->gui_host, &w->view.fx_view.browser); // reused verbatim -- see this file's own header comment
+        hds_fx_gui_browser_refresh(&w->view.fx_view.browser); // reused verbatim -- see this file's own header comment
         hds_standalone_gui_redraw(w);
     }
 }

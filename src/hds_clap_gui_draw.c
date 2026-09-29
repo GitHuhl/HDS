@@ -230,6 +230,13 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
             hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Coming soon");
             break;
     }
+    // The shared file browser (see hds_fx_gui_draw.c's own HdsFxBrowser comment) draws on top of
+    // whichever tab is active, REGARDLESS of active_tab -- it's opened from the FX tab's own NAM
+    // pills, but also from the Play tab's own Multisample .sfz loader and the Global sidebar's own
+    // Scale .scl loader (neither of which is the FX tab), so it can't be nested inside the FX-only
+    // branch above the way it effectively was before this GUI had any OTHER file-picking need.
+    if (vs->fx_view.browser.open) hds_fx_gui_render_browser(cr, &vs->fx_view);
+
     cairo_restore(cr); // closes the inner cairo_save() at this function's own line ~187 (the active-tab clip/translate)
     cairo_restore(cr); // closes the OUTER cairo_save() at this function's own line ~157 (the sidebar-width translate) --
                         // without this second restore, cr's CTM (this is the persistent backbuffer context, reused
@@ -241,11 +248,20 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
 }
 
 static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int button) {
+    // The shared file browser (see hds_clap_gui_render()'s own comment) is a true modal: while
+    // open, it owns every click regardless of where it lands or which tab is actually active --
+    // checked FIRST, even before the sidebar. hds_fx_gui_on_button_press() itself already checks
+    // vs->browser.open before anything else, so this is safe to call with coordinates that may be
+    // negative/out of its own usual range (a click on the sidebar, say) -- it just reads as "outside
+    // the panel," which already means "close the browser," exactly the right behavior.
+    if (vs->fx_view.browser.open) {
+        return hds_fx_gui_on_button_press(&p->gui_host, &vs->fx_view, x - HDS_CLAP_GLOBAL_SIDEBAR_W, y - HDS_CLAP_TAB_BAR_H, button);
+    }
     // The persistent sidebar owns the whole left strip, full height -- checked FIRST, before the
     // tab bar's own y<BAR_H check, since the sidebar has no tab bar of its own at all (see this
     // file's own header comment).
     if (x < HDS_CLAP_GLOBAL_SIDEBAR_W) {
-        return hds_clap_global_on_button_press(p, &vs->global_view, vs->window_h, x, y, button);
+        return hds_clap_global_on_button_press(p, &vs->global_view, &vs->fx_view, vs->window_h, x, y, button);
     }
     double tab_x = x - HDS_CLAP_GLOBAL_SIDEBAR_W;
     double tab_area_w = vs->window_w - HDS_CLAP_GLOBAL_SIDEBAR_W;
@@ -271,7 +287,7 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
             if (hds_play_rect_contains(&combi_r, tab_x, py)) { if (button == 1) p->knobs.performance_mode = 1.0f; return true; }
             if ((int)p->knobs.performance_mode == 1)
                 return hds_clap_combi_on_button_press(p, &vs->combi_view, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, py, button);
-            return hds_clap_play_on_button_press(p, &vs->play_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, py, button);
+            return hds_clap_play_on_button_press(p, &vs->play_view, &vs->fx_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, py, button);
         }
         case HDS_CLAP_TAB_FILTERS:
             return hds_clap_filters_on_button_press(p, &vs->filters_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
@@ -322,10 +338,13 @@ static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
 }
 
 static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int action, char ch) {
-    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_key(&p->gui_host, &vs->fx_view, action, ch);
+    // The shared file browser's own path bar needs key events regardless of active_tab too -- same
+    // "modal owns everything" reasoning as hds_clap_gui_on_button_press()'s own browser check.
+    if (vs->fx_view.browser.open || vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_key(&p->gui_host, &vs->fx_view, action, ch);
 }
 
 static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int delta) {
+    if (vs->fx_view.browser.open) { hds_fx_gui_on_scroll(&vs->fx_view, delta); return; }
     if (x < HDS_CLAP_GLOBAL_SIDEBAR_W) { hds_clap_global_on_scroll(p, &vs->global_view, vs->window_h, delta); return; }
     if (y < HDS_CLAP_TAB_BAR_H) return;
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_scroll(&vs->fx_view, delta);

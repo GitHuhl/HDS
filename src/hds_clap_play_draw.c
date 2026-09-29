@@ -96,7 +96,7 @@ static ProgramState *hds_play_program(HdsClapPlugin *p) { return &p->knobs.progr
 // ---------------------------------------------------------------------------------------------
 #define HDS_PLAY_SHAPE_COUNT 10
 static const char *const HDS_PLAY_SHAPE_NAMES[HDS_PLAY_SHAPE_COUNT] = {
-    "Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample", "Off", "Rev Saw",
+    "Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Multisample", "Off", "Rev Saw",
 };
 #define HDS_PLAY_EGMODE_COUNT 7
 static const char *const HDS_PLAY_EGMODE_NAMES[HDS_PLAY_EGMODE_COUNT] = {
@@ -654,6 +654,7 @@ static void hds_clap_play_mode_toggle_rects(HdsFxRect *single_r, HdsFxRect *comb
 
 typedef struct {
     HdsFxRect shape_pill;
+    HdsFxRect sfz_load_btn;  // Multisample shape only -- see hds_play_compute_osc_layout()'s own comment
     HdsFxRect pulse_knob;    // Pulse Width (Pulse shape) or Tilt (Noise shape)
     HdsFxRect mono_chk;      // Noise shape only
     HdsFxRect curve_knob;    // Curve (Saw/Triangle/RevSaw) or Drive (Sine)
@@ -676,6 +677,14 @@ static void hds_play_compute_osc_layout(int osc, int shape, double col_x, double
 
     out->shape_pill = (HdsFxRect){col_x, y, HDS_PLAY_OSC_COL_W, HDS_PLAY_PILL_H};
     y += HDS_PLAY_PILL_H + 4.0;
+
+    // Multisample's own .sfz loader -- a real button, not a knob, so it gets its own full-width row
+    // right below the Shape pill exactly like Noise's Mono checkbox does below Pulse Width's own
+    // knob. See hds_clap_play_on_button_press()'s own comment for what clicking it actually does.
+    if (shape == WAVE_SAMPLE) {
+        out->sfz_load_btn = (HdsFxRect){col_x, y, HDS_PLAY_OSC_COL_W, HDS_PLAY_CHECK_H};
+        y += HDS_PLAY_CHECK_H + 4.0;
+    }
 
     bool show_pulse = (shape == WAVE_PULSE || shape == WAVE_NOISE);
     if (show_pulse) {
@@ -1124,6 +1133,10 @@ static void hds_play_render_osc_strip(cairo_t *cr, HdsClapPlugin *p, HdsClapPlay
                       HDS_PLAY_SHAPE_NAMES[shape >= 0 && shape < HDS_PLAY_SHAPE_COUNT ? shape : 0],
                       shape_dd_open, false);
 
+    if (L.sfz_load_btn.w > 0) {
+        hds_fx_draw_pill(cr, L.sfz_load_btn.x, L.sfz_load_btn.y, L.sfz_load_btn.w, L.sfz_load_btn.h, "Load .sfz\xe2\x80\xa6", false, false);
+    }
+
     hds_play_draw_osc_knob(cr, &L.pulse_knob, f.pulse_width, HDS_PLAY_KNOB_PULSE, shape);
     if (L.mono_chk.w > 0) {
         bool mono = f.mono_noise && *f.mono_noise != 0.0f;
@@ -1202,7 +1215,21 @@ static void hds_play_render_eg_panel(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayV
     }
 }
 
+// A non-empty p->sfz_browser_result means the shared file browser's own .sfz pick (see
+// HdsClapPlugin's own comment on that field) completed since the last render -- fire the real load
+// right now, then clear it so this only ever runs once per pick. Safe to poll here specifically:
+// the browser is a true modal (hds_clap_gui_draw.c's own top-level click dispatch refuses every
+// click, including a tab-bar switch, while it's open -- see that file's own comment), so the Play
+// tab stays the active tab, and this render function keeps running every frame, for the browser's
+// entire open-to-closed lifetime whenever it was THIS button that opened it.
+static void hds_play_poll_sfz_pick(HdsClapPlugin *p) {
+    if (!p->sfz_browser_result[0]) return;
+    hds_load_sfz_for_osc(&p->sample_engine, p->sfz_browser_target_osc, SINGLE_PROGRAM_SLOT, p->sfz_browser_result);
+    p->sfz_browser_result[0] = '\0';
+}
+
 static void hds_clap_play_render(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewState *vs, double window_w, double window_h) {
+    hds_play_poll_sfz_pick(p);
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
     cairo_rectangle(cr, 0, 0, window_w, window_h);
     cairo_fill(cr);
@@ -1256,7 +1283,7 @@ static void hds_play_copy_eg0_to_all(ProgramState *prog) {
     }
 }
 
-static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState *vs, double window_w, double window_h, double x, double y, int button) {
+static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState *vs, HdsFxGuiViewState *fxvs, double window_w, double window_h, double x, double y, int button) {
     ProgramState *prog = hds_play_program(p);
 
     if (vs->ctx_menu.open) return hds_play_ctxmenu_handle_click(p, &vs->ctx_menu, window_w, window_h, x, y);
@@ -1293,6 +1320,18 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
 
         if (hds_play_rect_contains(&L.shape_pill, x, y)) {
             vs->dropdown_kind = HDS_PLAY_DROPDOWN_SHAPE; vs->dropdown_index = osc; vs->dropdown_anchor = L.shape_pill;
+            return true;
+        }
+        // Multisample's own .sfz loader -- opens the ONE shared file browser (see HdsFxBrowser's
+        // own comment) with p->sfz_browser_result as its dest; hds_play_poll_sfz_pick() (called at
+        // the top of every hds_clap_play_render()) fires the real hds_load_sfz_for_osc() call once
+        // a pick actually lands there.
+        if (L.sfz_load_btn.w > 0 && hds_play_rect_contains(&L.sfz_load_btn, x, y)) {
+            if (button == 1) {
+                p->sfz_browser_target_osc = osc;
+                p->sfz_browser_result[0] = '\0';
+                hds_fx_gui_browser_open(fxvs, ".sfz", "Select SFZ File (*.sfz)", p->sfz_browser_result, SAMPLE_PATH_LEN);
+            }
             return true;
         }
         if (L.mono_chk.w > 0 && hds_play_rect_contains(&L.mono_chk, x, y)) {

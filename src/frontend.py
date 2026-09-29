@@ -635,7 +635,7 @@ MAX_ROUND_ROBIN_GROUPS = 256
 # must match WaveType in backend.c exactly (append-only order -- "Rev Saw" was appended AFTER
 # "Off" rather than next to "Saw" so "Off"'s own numeric index never shifts, same reason "Off"
 # itself isn't first).
-OSC_SHAPE_NAMES = ["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Sample", "Off", "Rev Saw"]
+OSC_SHAPE_NAMES = ["Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Multisample", "Off", "Rev Saw"]
 # LFO count: must match LFO_COUNT in backend.c exactly.
 LFO_COUNT = 16
 # LFO Tempo Sync divisions -- index 0 ("Free") means "use the Rate dial's own Hz value", matching

@@ -615,8 +615,18 @@ typedef struct {
 
 typedef struct {
     bool open;
-    int row;   // which pool slot this browser is filling
-    int field; // 0 = Model (*.nam), 1 = IR (*.wav)
+    // Generic: which extension to filter/match (e.g. ".nam", ".wav", ".sfz", ".scl") and the
+    // caller-owned destination buffer the picked path gets written into on commit -- set at open
+    // time (hds_fx_gui_browser_open()), so this ONE modal instance can serve every "pick an
+    // existing file" need in the whole GUI (NAM Model/IR, a Play-tab oscillator's own .sfz, the
+    // Global sidebar's own .scl, ...) rather than each caller needing its own copy of this widget.
+    // `dest` must outlive this browser's own open state -- true for every real caller, since it's
+    // always a field on some persistent struct (FXSlotParams, HdsClapPlugin, ...), never a stack
+    // buffer.
+    char ext[8];
+    char title[64]; // header text, e.g. "Select NAM Model (*.nam)" -- set at open time too
+    char *dest;
+    size_t dest_len;
 
     // dir is the authoritative current directory while NOT editing the path bar; WHILE editing
     // (path_bar_editing) it doubles as the live typed buffer instead (same "one buffer serves both
@@ -1209,20 +1219,24 @@ static void hds_fx_browser_compute_layout(const HdsFxGuiViewState *vs, HdsFxBrow
     if (out->visible_rows < 1) out->visible_rows = 1;
 }
 
-// Opens the browser for FX_TYPE_NAM slot `row`'s Model (field 0) or IR (field 1) pill -- called
-// from hds_fx_gui_on_button_press() in place of the old inline-edit-open code. Seeds the starting
-// directory from whatever path is already stored (hds_fx_dirname()); needs_refresh tells the
-// platform shim (hds_fx_gui_x11.c) to actually list it on the very next poll, which happens before
-// this same tick's own redraw (see hds_fx_gui_on_timer()'s own ordering) -- so the very click that
-// opens the browser also sees a populated listing immediately, never one empty frame first.
-static void hds_fx_gui_browser_open(HdsFxGuiHost *p, HdsFxGuiViewState *vs, int row, int field) {
+// Opens the browser to fill `dest` (a caller-owned buffer of `dest_len`, still holding whatever
+// path -- if any -- is already stored there) with an existing file matching `ext`, labeled `title`
+// -- called from wherever a "pick a file" need arises (FX_TYPE_NAM's own Model/IR pills here, an
+// oscillator's own .sfz Multisample loader, the Global sidebar's own .scl Scale loader, ...): this
+// ONE modal instance serves every one of them, never a per-caller copy. Seeds the starting directory
+// from whatever path is already stored (hds_fx_dirname()); needs_refresh tells the platform shim
+// (hds_fx_gui_x11.c) to actually list it on the very next poll, which happens before this same
+// tick's own redraw (see hds_fx_gui_on_timer()'s own ordering) -- so the very click that opens the
+// browser also sees a populated listing immediately, never one empty frame first.
+static void hds_fx_gui_browser_open(HdsFxGuiViewState *vs, const char *ext, const char *title, char *dest, size_t dest_len) {
     HdsFxBrowser *b = &vs->browser;
     memset(b, 0, sizeof(*b));
     b->open = true;
-    b->row = row;
-    b->field = field;
-    const char *cur = (field == 0) ? p->fx[row].nam_model_path : p->fx[row].nam_ir_path;
-    hds_fx_dirname(cur, b->dir, sizeof(b->dir));
+    snprintf(b->ext, sizeof(b->ext), "%s", ext);
+    snprintf(b->title, sizeof(b->title), "%s", title);
+    b->dest = dest;
+    b->dest_len = dest_len;
+    hds_fx_dirname(dest, b->dir, sizeof(b->dir));
     b->needs_refresh = true;
 }
 
@@ -1232,7 +1246,7 @@ static void hds_fx_gui_browser_close(HdsFxGuiViewState *vs) { vs->browser.open =
 // hds_fx_gui_on_button_press()'s own ordering, same "one modal owns every click" posture the
 // dropdown check above already has). Always returns true (consumed): a click anywhere while the
 // browser is open is never "let it fall through to whatever's underneath."
-static bool hds_fx_gui_browser_on_click(HdsFxGuiHost *p, HdsFxGuiViewState *vs, double x, double y) {
+static bool hds_fx_gui_browser_on_click(HdsFxGuiViewState *vs, double x, double y) {
     HdsFxBrowser *b = &vs->browser;
     HdsFxBrowserLayout L;
     hds_fx_browser_compute_layout(vs, &L);
@@ -1269,8 +1283,7 @@ static bool hds_fx_gui_browser_on_click(HdsFxGuiHost *p, HdsFxGuiViewState *vs, 
                 hds_fx_safe_copy(b->dir, sizeof(b->dir), full);
                 b->needs_refresh = true;
             } else {
-                char *dst = (b->field == 0) ? p->fx[b->row].nam_model_path : p->fx[b->row].nam_ir_path;
-                hds_fx_safe_copy(dst, SAMPLE_PATH_LEN, full);
+                hds_fx_safe_copy(b->dest, b->dest_len, full);
                 hds_fx_gui_browser_close(vs);
             }
         }
@@ -1302,8 +1315,7 @@ static void hds_fx_gui_render_browser(cairo_t *cr, const HdsFxGuiViewState *vs) 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 13);
     hds_fx_rgb(cr, 0.9, 0.9, 0.92);
-    hds_fx_left_text(cr, L.panel.x + HDS_FX_BROWSER_MARGIN, L.panel.y + 20,
-                      b->field == 0 ? "Select NAM Model (*.nam)" : "Select Cab IR (*.wav)");
+    hds_fx_left_text(cr, L.panel.x + HDS_FX_BROWSER_MARGIN, L.panel.y + 20, b->title);
 
     hds_fx_rgb(cr, 0.22, 0.22, 0.26);
     hds_fx_rounded_rect(cr, L.close_btn.x, L.close_btn.y, L.close_btn.w, L.close_btn.h, 3);
@@ -1499,8 +1511,8 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         // basename or "(none)" -- clicking either pill opens the in-house file browser (see
         // hds_fx_gui_on_button_press()'s own NAM handling and HdsFxBrowser's own comment).
         if (hds_fx_type_uses_nam_paths(fx_type)) {
-            bool browsing_model = (vs->browser.open && vs->browser.row == s && vs->browser.field == 0);
-            bool browsing_ir = (vs->browser.open && vs->browser.row == s && vs->browser.field == 1);
+            bool browsing_model = (vs->browser.open && vs->browser.dest == slot->nam_model_path);
+            bool browsing_ir = (vs->browser.open && vs->browser.dest == slot->nam_ir_path);
             char model_buf[64], ir_buf[64];
             // Just the filename (hds_fx_basename()), never the full path -- the pill has room for
             // a name, not a path, and the full path still lives in nam_model_path/nam_ir_path
@@ -1632,7 +1644,7 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
     int width = vs->window_w;
 
     if (vs->browser.open) {
-        if (button == 1) return hds_fx_gui_browser_on_click(p, vs, x, y);
+        if (button == 1) return hds_fx_gui_browser_on_click(vs, x, y);
         return true; // right-click etc. while the browser is open -- still fully consumed
     }
 
@@ -1676,8 +1688,8 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
         return true;
     }
     if (hds_fx_type_uses_nam_paths((int)p->fx[row].fx_type)) {
-        if (hds_fx_rect_contains(&L.nam_model_pill, x, y)) { hds_fx_gui_browser_open(p, vs, row, 0); return true; }
-        if (hds_fx_rect_contains(&L.nam_ir_pill, x, y)) { hds_fx_gui_browser_open(p, vs, row, 1); return true; }
+        if (hds_fx_rect_contains(&L.nam_model_pill, x, y)) { hds_fx_gui_browser_open(vs, ".nam", "Select NAM Model (*.nam)", p->fx[row].nam_model_path, SAMPLE_PATH_LEN); return true; }
+        if (hds_fx_rect_contains(&L.nam_ir_pill, x, y)) { hds_fx_gui_browser_open(vs, ".wav", "Select Cab IR (*.wav)", p->fx[row].nam_ir_path, SAMPLE_PATH_LEN); return true; }
     }
     if (p->port_output_channel && hds_fx_slot_is_chain_tail(p, row) && hds_fx_rect_contains(&L.output_pill, x, y)) {
         vs->dropdown.kind = HDS_FX_DROPDOWN_OUTPUT; vs->dropdown.row = row; vs->dropdown.anchor = L.output_pill;

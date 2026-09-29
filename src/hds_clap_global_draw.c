@@ -14,11 +14,14 @@
 // app and this in-process plugin).
 //
 // Deliberately NOT ported (disclosed scope boundary, not an oversight):
-//   - Program Load/Save and "Load Scale (.scl)": all three are FILE-PATH operations (open/save a
-//     named file from disk) -- frontend.py implements them via Qt file dialogs, which this GUI has
-//     no equivalent widget for at all (hds_fx_gui_browser.c's own file browser lists an existing
-//     directory's contents for picking a NAM model/IR to load, not for typing a save filename+
-//     category) -- real, follow-up work, not attempted here.
+//   - Program Load/Save: both are SAVE-capable file-path operations (typing a NEW filename, not
+//     just picking an existing one) -- the shared file browser (see HdsFxBrowser's own comment in
+//     hds_fx_gui_draw.c) only ever picks an EXISTING file, with no text-entry-a-new-name mode, so
+//     these still have no equivalent widget here -- real, follow-up work, not attempted below.
+//     "Load Scale (.scl)" is the one Program/Scale trio member that's a plain EXISTING-file pick,
+//     so it IS ported below, reusing that same shared browser exactly like the Play tab's own
+//     Multisample ".sfz" loader does (hds_clap_play_draw.c) -- see this file's own Microtuning
+//     section further down.
 //   - Instance Switcher: a standalone-app-only concept (frontend.py's own OSC client can retarget
 //     which separate backend PROCESS it talks to) -- this plugin has no separate backend process to
 //     switch to at all, so this control simply doesn't apply.
@@ -149,6 +152,7 @@ typedef struct {
     HdsFxRect transpose_knob;
     HdsFxRect tuning_enable_pill;
     HdsFxRect tuning_note_knob, tuning_freq_knob;
+    HdsFxRect tuning_load_scale_btn;
     HdsFxRect sustain_normal_pill, sustain_inverted_pill;
     HdsFxRect fm_algo_pill;
     HdsFxRect fm_depth_knob[HDS_GLOBAL_FM_DEPTH_COUNT]; // only fields[0..count) (see hds_global_fm_depth_visible_fields()) are ever populated/valid for the current algorithm
@@ -197,7 +201,9 @@ static void hds_clap_global_compute_layout(int fm_algo, double scroll_offset_px,
     y += HDS_GLOBAL_PILL_H + 6.0;
     out->tuning_note_knob = (HdsFxRect){lane_l_cx, y + HDS_GLOBAL_KNOB_R + 9.0, HDS_GLOBAL_KNOB_R, HDS_GLOBAL_KNOB_R};
     out->tuning_freq_knob = (HdsFxRect){lane_r_cx, y + HDS_GLOBAL_KNOB_R + 9.0, HDS_GLOBAL_KNOB_R, HDS_GLOBAL_KNOB_R};
-    y += HDS_GLOBAL_KNOB_ROW_H + HDS_GLOBAL_SECTION_GAP;
+    y += HDS_GLOBAL_KNOB_ROW_H;
+    out->tuning_load_scale_btn = (HdsFxRect){content_x, y, content_w, HDS_GLOBAL_PILL_H};
+    y += HDS_GLOBAL_PILL_H + HDS_GLOBAL_SECTION_GAP;
 
     // Sustain Pedal Polarity
     y += 12.0;
@@ -268,7 +274,17 @@ static void hds_global_section_label(cairo_t *cr, double x, double y, const char
     hds_fx_left_text(cr, x, y, text);
 }
 
+// A non-empty p->scl_browser_result means the shared file browser's own .scl pick (see
+// HdsClapPlugin's own comment on that field) completed since the last render -- same "poll once at
+// the top of render, then clear" convention as hds_clap_play_draw.c's own hds_play_poll_sfz_pick().
+static void hds_global_poll_scl_pick(HdsClapPlugin *p) {
+    if (!p->scl_browser_result[0]) return;
+    hds_tuning_load_scl(p->scl_browser_result);
+    p->scl_browser_result[0] = '\0';
+}
+
 static void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalViewState *vs, double window_w, double window_h) {
+    hds_global_poll_scl_pick(p);
     (void)window_w; // always HDS_CLAP_GLOBAL_SIDEBAR_W wide -- see this file's own header comment
     hds_fx_rgb(cr, 0.12, 0.12, 0.145); // one shade lighter than the tab-content area, reads as a distinct panel (matches frontend.py's own bordered QGroupBox convention)
     cairo_rectangle(cr, 0, 0, HDS_CLAP_GLOBAL_SIDEBAR_W, window_h);
@@ -314,6 +330,12 @@ static void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalV
     char freqtxt[16]; snprintf(freqtxt, sizeof(freqtxt), "%.1f Hz", p->knobs.tuning_reference_freq);
     hds_play_draw_knob(cr, L.tuning_freq_knob.x, L.tuning_freq_knob.y, L.tuning_freq_knob.w,
                         (float)((p->knobs.tuning_reference_freq - 20.0) / (2000.0 - 20.0)), false, "Ref Freq", freqtxt);
+    // Mirrors frontend.py's own tuning_scale_label text exactly ("No scale loaded (12-TET)" vs
+    // "Loaded: <basename>") -- see hds_tuning_load_scl()'s own g_tuning_table.loaded/description.
+    char scaletxt[144];
+    if (g_tuning_table.loaded) snprintf(scaletxt, sizeof(scaletxt), "Loaded: %s", g_tuning_table.description);
+    else snprintf(scaletxt, sizeof(scaletxt), "No scale loaded (12-TET)");
+    hds_fx_draw_pill(cr, L.tuning_load_scale_btn.x, L.tuning_load_scale_btn.y, L.tuning_load_scale_btn.w, L.tuning_load_scale_btn.h, scaletxt, false, false);
 
     hds_global_section_label(cr, HDS_GLOBAL_MARGIN, L.sustain_normal_pill.y - 4.0, "Sustain Polarity");
     bool inverted = (prog->sustain_pedal_polarity != 0.0f);
@@ -410,7 +432,7 @@ static void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalV
     }
 }
 
-static bool hds_clap_global_on_button_press(HdsClapPlugin *p, HdsClapGlobalViewState *vs, double window_h, double x, double y, int button) {
+static bool hds_clap_global_on_button_press(HdsClapPlugin *p, HdsClapGlobalViewState *vs, HdsFxGuiViewState *fxvs, double window_h, double x, double y, int button) {
     ProgramState *prog = hds_play_program(p);
 
     if (vs->dropdown_kind != HDS_GLOBAL_DROPDOWN_NONE) {
@@ -456,6 +478,13 @@ static bool hds_clap_global_on_button_press(HdsClapPlugin *p, HdsClapGlobalViewS
     }
     if (hds_play_knob_hit_test(&L.tuning_note_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.tuning_reference_note, 0.0, 127.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
     if (hds_play_knob_hit_test(&L.tuning_freq_knob, x, y)) { hds_play_start_knob_drag(&vs->knob_drag, &p->knobs.tuning_reference_freq, 20.0, 2000.0, x, y, button, HDS_PLAY_NO_MENU); return true; }
+    if (hds_play_rect_contains(&L.tuning_load_scale_btn, x, y)) {
+        if (button == 1) {
+            p->scl_browser_result[0] = '\0';
+            hds_fx_gui_browser_open(fxvs, ".scl", "Select Scale (*.scl)", p->scl_browser_result, SAMPLE_PATH_LEN);
+        }
+        return true;
+    }
 
     if (hds_play_rect_contains(&L.sustain_normal_pill, x, y)) { if (button == 1) prog->sustain_pedal_polarity = 0.0f; return true; }
     if (hds_play_rect_contains(&L.sustain_inverted_pill, x, y)) { if (button == 1) prog->sustain_pedal_polarity = 1.0f; return true; }

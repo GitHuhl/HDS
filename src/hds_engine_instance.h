@@ -149,4 +149,25 @@ typedef struct {
     // dispatching across several tabs), not an FX-tab-specific one, so it lives here rather than
     // inside gui_host.
     void *gui_window;
+
+    // Transient result of the shared file browser's own .sfz pick (see HdsFxBrowser's own comment
+    // in hds_fx_gui_draw.c on why this ONE modal instance serves every "pick a file" need) --
+    // hds_clap_play_draw.c's own Multisample "Load .sfz..." button opens the browser with this as
+    // its dest, then its own render function polls it every frame: a non-empty string here means a
+    // pick just completed since the last check, gets fed straight into hds_load_sfz_for_osc() (the
+    // exact same function the /hds/zone/load_sfz OSC method and --sfz-vcoN startup flags already
+    // call -- see backend.c's own comment), and is immediately cleared back to "" so the load fires
+    // exactly once. Unlike NAM's own persistent nam_model_path/nam_ir_path (which the DSP itself
+    // reads every block), there's no persistent "current sfz path" field to hold this in for
+    // long -- an SFZ load populates real, already-persistent Sample Bank zones (owner_program-
+    // scoped, saved/restored with the rest of the program) instead, so this buffer only ever needs
+    // to survive from one click to the next render.
+    char sfz_browser_result[SAMPLE_PATH_LEN];
+    int sfz_browser_target_osc; // which oscillator (0-3) the currently-open/just-closed pick was for
+
+    // Same transient-pick convention as sfz_browser_result just above, for the Global sidebar's own
+    // "Load Scale (.scl)..." button -- hds_clap_global_draw.c's own render function polls this every
+    // frame and feeds a non-empty pick straight into hds_tuning_load_scl() (backend.c), then clears
+    // it. No per-oscillator target needed here (unlike SFZ): a scale is one session-level setting.
+    char scl_browser_result[SAMPLE_PATH_LEN];
 } HdsClapPlugin;

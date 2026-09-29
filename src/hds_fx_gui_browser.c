@@ -1,14 +1,16 @@
-// hds_fx_gui_browser.c: the actual filesystem-touching half of the in-house NAM Model/IR file
-// browser (opendir/readdir/stat) -- see HdsFxBrowser's own comment in hds_fx_gui_draw.c for why an
-// in-house browser replaced an earlier zenity/kdialog subprocess approach. hds_fx_gui_draw.c only
+// hds_fx_gui_browser.c: the actual filesystem-touching half of the in-house, generic "pick an
+// existing file with one extension" file browser (opendir/readdir/stat) -- see HdsFxBrowser's own
+// comment in hds_fx_gui_draw.c for why an in-house browser replaced an earlier zenity/kdialog
+// subprocess approach, and for why it's generic (ext/dest set per-open, not fixed to NAM's own
+// Model/IR pair) rather than a whole separate copy of this widget per caller. hds_fx_gui_draw.c only
 // ever reads the plain-data results this fills in, keeping it free of any OS call; this is the ONE
 // place that makes real filesystem calls. Pulled into its own file (rather than living inside
 // hds_fx_gui_x11.c, where it originated) specifically so hds_clap_gui_x11.c can reuse it verbatim
 // too, without either platform shim's own window/event-pump code needing to be shared -- see each
 // platform file's own header comment on why those stay separate, small copies.
 //
-// #include'd right after hds_fx_gui_draw.c (needs HdsFxBrowser/HDS_FX_BROWSER_*/HdsFxGuiHost/
-// hds_fx_safe_copy, all defined there).
+// #include'd right after hds_fx_gui_draw.c (needs HdsFxBrowser/HDS_FX_BROWSER_*/hds_fx_safe_copy,
+// all defined there).
 #include <dirent.h>   // opendir/readdir/closedir
 #include <sys/stat.h> // stat/S_ISDIR/S_ISREG
 #include <strings.h>  // strcasecmp -- case-insensitive *.nam/*.wav filtering and sorting
@@ -41,11 +43,13 @@ static bool hds_fx_path_has_ext(const char *name, const char *ext) {
 // browser functions). Never blocks the UI thread on anything slow (a real directory read is fast
 // on local disk, but this same non-blocking-poll shape is what would let a future version move the
 // actual I/O to a worker thread for a slow/network path without touching any caller).
-// Takes the host + browser explicitly (not a window struct) so it's reusable by any platform
-// shim with an HdsFxBrowser lying around, regardless of how deep in its own view-state nesting
-// that browser lives (hds_fx.clap's own window keeps it at the top level; hds.clap's own nests it
-// one level down, inside its own FX-tab sub-state).
-static void hds_fx_gui_browser_refresh(HdsFxGuiHost *host, HdsFxBrowser *b) {
+// Takes just the browser (fully self-contained since HdsFxBrowser generalized to ext/dest -- see
+// its own comment; no host lookup needed anymore) so it's reusable by any platform shim with an
+// HdsFxBrowser lying around, regardless of how deep in its own view-state nesting that browser
+// lives (hds_fx.clap's own window keeps it at the top level; hds.clap's own nests it one level
+// down, inside its own FX-tab sub-state, yet reuses this SAME instance from its Play/Global tabs
+// too -- see hds_clap_gui_draw.c's own header comment).
+static void hds_fx_gui_browser_refresh(HdsFxBrowser *b) {
     if (!b->open || !b->needs_refresh) return;
     b->needs_refresh = false;
 
@@ -57,11 +61,9 @@ static void hds_fx_gui_browser_refresh(HdsFxGuiHost *host, HdsFxBrowser *b) {
     // opendir() it and fall back to home/"/", same as any other bad typed path.
     if (b->path_bar_commit_attempt) {
         b->path_bar_commit_attempt = false;
-        const char *ext = (b->field == 0) ? ".nam" : ".wav";
         struct stat st;
-        if (hds_fx_path_has_ext(b->dir, ext) && stat(b->dir, &st) == 0 && S_ISREG(st.st_mode)) {
-            char *dst = (b->field == 0) ? host->fx[b->row].nam_model_path : host->fx[b->row].nam_ir_path;
-            snprintf(dst, SAMPLE_PATH_LEN, "%s", b->dir);
+        if (hds_fx_path_has_ext(b->dir, b->ext) && stat(b->dir, &st) == 0 && S_ISREG(st.st_mode)) {
+            hds_fx_safe_copy(b->dest, b->dest_len, b->dir);
             b->open = false;
             return;
         }
@@ -80,7 +82,6 @@ static void hds_fx_gui_browser_refresh(HdsFxGuiHost *host, HdsFxBrowser *b) {
     b->scroll = 0;
     if (!d) return; // nothing listable at all -- the path bar and Close are still available
 
-    const char *ext = (b->field == 0) ? ".nam" : ".wav";
     HdsFxBrowserSortEntry sort_buf[HDS_FX_BROWSER_MAX_ENTRIES];
     int n = 0;
     struct dirent *de;
@@ -93,7 +94,7 @@ static void hds_fx_gui_browser_refresh(HdsFxGuiHost *host, HdsFxBrowser *b) {
         struct stat st;
         if (stat(full, &st) != 0) continue; // e.g. a broken symlink -- just skip it
         bool is_dir = S_ISDIR(st.st_mode);
-        if (!is_dir && !hds_fx_path_has_ext(de->d_name, ext)) continue; // filtered out
+        if (!is_dir && !hds_fx_path_has_ext(de->d_name, b->ext)) continue; // filtered out
         snprintf(sort_buf[n].name, sizeof(sort_buf[n].name), "%s", de->d_name);
         sort_buf[n].is_dir = is_dir;
         n++;
