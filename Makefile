@@ -1,6 +1,15 @@
 CC ?= cc
 CXX ?= g++
 CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
+# No -g anywhere in CFLAGS above (never was), so there's no DWARF debug info to omit -- but by
+# default the linker still keeps every binary's full symbol table (function/variable names), which
+# is exactly what makes a disassembler pleasant to read. STRIPFLAGS (-s, "strip at link time") on
+# every final link below removes that symbol table so a beta build doesn't hand a curious tester a
+# labeled map of the codebase for free. This is NOT real anti-tampering/anti-RE protection -- the
+# actual DSP logic, control flow, and strings are all still fully present and reversible with
+# enough effort (a stripped binary's function boundaries/args are still recoverable via a decompiler,
+# just unnamed) -- it just raises the floor past "nm/objdump immediately hands you every symbol".
+STRIPFLAGS := -s
 # WavPack recording is disabled for now (see HDS_WAVPACK_ENABLED in src/hds_standalone.c) --
 # -lwavpack dropped from here to match; re-add it alongside flipping that flag back to 1.
 LDLIBS := -lasound -lm -lpthread -llo
@@ -288,13 +297,13 @@ $(NAM_BUILD_DIR)/%.o: src/%.cpp $(NAM_FLAGS_STAMP) | $(NAM_BUILD_DIR)
 	$(CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
 $(BIN): $(BIN_OBJ) $(NAM_OBJS)
-	$(CXX) -o $@ $(BIN_OBJ) $(NAM_OBJS) $(LDLIBS) $(PIPEWIRE_LDLIBS) $(shell pkg-config --libs cairo x11)
+	$(CXX) $(STRIPFLAGS) -o $@ $(BIN_OBJ) $(NAM_OBJS) $(LDLIBS) $(PIPEWIRE_LDLIBS) $(shell pkg-config --libs cairo x11)
 
 clap: $(CLAP_OBJ) $(NAM_OBJS)
-	$(CXX) -shared -o $(CLAP_BIN) $(CLAP_OBJ) $(NAM_OBJS) $(LDLIBS) $(shell pkg-config --libs cairo x11)
+	$(CXX) $(STRIPFLAGS) -shared -o $(CLAP_BIN) $(CLAP_OBJ) $(NAM_OBJS) $(LDLIBS) $(shell pkg-config --libs cairo x11)
 
 hds-fx: $(HDS_FX_OBJ) $(NAM_OBJS)
-	$(CXX) -shared -o $(HDS_FX_BIN) $(HDS_FX_OBJ) $(NAM_OBJS) $(HDS_FX_LDLIBS)
+	$(CXX) $(STRIPFLAGS) -shared -o $(HDS_FX_BIN) $(HDS_FX_OBJ) $(NAM_OBJS) $(HDS_FX_LDLIBS)
 
 # arm64's own NAM object set: SEPARATE .o files from $(NAM_OBJS) above (wrong ISA to reuse, even
 # though the flags are identical -- NAM_CXXFLAGS needs nothing arm64-specific since NAM_INC is just
@@ -324,7 +333,7 @@ $(ARM64_BIN_OBJ): $(SRC) src/backend.c src/fx_types.h src/fx_chain.c src/sequenc
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $(SRC) -o $@
 
 arm64: $(ARM64_BIN_OBJ) $(ARM64_NAM_OBJS)
-	$(ARM64_CXX) -o $(ARM64_BIN) $(ARM64_BIN_OBJ) $(ARM64_NAM_OBJS) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo
+	$(ARM64_CXX) $(STRIPFLAGS) -o $(ARM64_BIN) $(ARM64_BIN_OBJ) $(ARM64_NAM_OBJS) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo
 	mkdir -p $(ARM64_LIBDIR)
 	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
 	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_BIN)
@@ -469,11 +478,11 @@ $(WIN_NAM_BUILD_DIR)/%.o: src/%.cpp $(WIN_NAM_FLAGS_STAMP) | $(WIN_NAM_BUILD_DIR
 	$(WIN_CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
 clap-windows: $(WIN_CLAP_OBJ) $(WIN_NAM_OBJS)
-	$(WIN_CXX) -shared $(WIN_LDFLAGS) -o $(WIN_CLAP_BIN) $(WIN_CLAP_OBJ) $(WIN_NAM_OBJS) $(WIN_LDLIBS)
+	$(WIN_CXX) -shared $(STRIPFLAGS) $(WIN_LDFLAGS) -o $(WIN_CLAP_BIN) $(WIN_CLAP_OBJ) $(WIN_NAM_OBJS) $(WIN_LDLIBS)
 	@if [ -n "$(WIN_EXTRA_RUNTIME_DLLS)" ]; then cp -f $(WIN_EXTRA_RUNTIME_DLLS) .; fi
 
 hds-fx-windows: $(WIN_HDS_FX_OBJ) $(WIN_NAM_OBJS)
-	$(WIN_CXX) -shared $(WIN_LDFLAGS) -o $(WIN_HDS_FX_BIN) $(WIN_HDS_FX_OBJ) $(WIN_NAM_OBJS) $(WIN_LDLIBS)
+	$(WIN_CXX) -shared $(STRIPFLAGS) $(WIN_LDFLAGS) -o $(WIN_HDS_FX_BIN) $(WIN_HDS_FX_OBJ) $(WIN_NAM_OBJS) $(WIN_LDLIBS)
 	@if [ -n "$(WIN_EXTRA_RUNTIME_DLLS)" ]; then cp -f $(WIN_EXTRA_RUNTIME_DLLS) .; fi
 
 run-backend: $(BIN)

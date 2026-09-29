@@ -1867,6 +1867,7 @@ int main(int argc, char **argv) {
     // hds.clap, has no flat N-port Input/Output concept (see this file's own HDS_FX_PORT_COUNT
     // comment above).
     g_gui_ctx.gui_host.fx = g_gui_ctx.knobs.fx;
+    g_gui_ctx.gui_host.fx_gr_db = g_gui_ctx.fx_gr_db;
     g_gui_ctx.gui_host.source_count = SOURCE_COUNT;
     g_gui_ctx.gui_host.source_label = hds_clap_source_label;
     // g_gui_ctx.sample_engine is otherwise left unused by this app (see HdsClapPlugin's own header
@@ -2234,8 +2235,7 @@ int main(int argc, char **argv) {
         static float buffer[BUFFER_SIZE * OUTPUT_MAX_CHANNELS];
         struct timespec render_t0, render_t1;
         clock_gettime(CLOCK_MONOTONIC, &render_t0);
-        float gr_db[FX_SLOT_COUNT];
-        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &g_gui_ctx.knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer, current_tempo_bpm, g_gui_ctx.ext_in_peak, NULL, gr_db);
+        float block_peak = render_audio_block(&g_sample_engine, &g_engine, voices, &g_gui_ctx.knobs, global_lfo_phases, capture_buffer, detected_input_channels, detected_output_channels, &midi_live, buffer, current_tempo_bpm, g_gui_ctx.ext_in_peak, NULL, g_gui_ctx.fx_gr_db);
         clock_gettime(CLOCK_MONOTONIC, &render_t1);
         double render_ms = (render_t1.tv_sec - render_t0.tv_sec) * 1000.0 + (render_t1.tv_nsec - render_t0.tv_nsec) / 1e6;
         double budget_ms = (block_size / (double)SAMPLE_RATE) * 1000.0;
@@ -2332,7 +2332,7 @@ int main(int argc, char **argv) {
             };
             for (int p = 0; p < EXT_IN_PAIR_COUNT; p++) status.ext_in_peak[p] = g_gui_ctx.ext_in_peak[p];
             status.midi_clock_locked = use_external_clock ? 1.0f : 0.0f;
-            for (int s = 0; s < FX_SLOT_COUNT; s++) status.fx_gain_reduction_db[s] = gr_db[s];
+            for (int s = 0; s < FX_SLOT_COUNT; s++) status.fx_gain_reduction_db[s] = g_gui_ctx.fx_gr_db[s];
             send_osc_status(osc_reply_addr, &status);
             send_seq_audio_status(&g_streams_state, osc_reply_addr);
             vu_decimator = 0;

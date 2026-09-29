@@ -406,6 +406,23 @@ static bool hds_fx_type_uses_sidechain(int fx_type) { return fx_type == FX_TYPE_
 // pattern hds_fx_type_uses_sidechain() already established.
 static bool hds_fx_type_uses_nam_paths(int fx_type) { return fx_type == FX_TYPE_NAM; }
 
+// The 7 FX types that report a live gain-reduction reading (see process_fx_chain()'s own switch
+// in fx_chain.c, the only place that fills gr_db_out[s] with anything other than the 0.0f
+// default) -- mirrors frontend.py's own FX_TYPE_GR_CAPABLE_INDICES exactly. Gates whether the GR
+// dB readout (see HdsFxRowLayout's own gr_label comment) is drawn on a given row at all: on every
+// other type host->fx_gr_db[s] is simply always 0.0f (process_fx_chain() zeroes it for them), so
+// this isn't strictly needed for correctness, but showing a permanent "0.0 dB" next to, say, a
+// reverb would misleadingly imply it's a dynamics processor.
+static bool hds_fx_type_is_gr_capable(int fx_type) {
+    switch (fx_type) {
+        case FX_TYPE_GATE: case FX_TYPE_LIMITER: case FX_TYPE_FETCOMP: case FX_TYPE_FAIRKID67:
+        case FX_TYPE_PEAKMAX: case FX_TYPE_OPTOCOMP: case FX_TYPE_DEESSER:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // The part of a path after the last '/', or the whole path if there's no '/' -- for a compact
 // pill label; the full path still lives in FXSlotParams.nam_model_path/nam_ir_path and is what
 // actually gets saved/loaded, this is purely a display truncation.
@@ -842,6 +859,11 @@ typedef struct {
     HdsFxRect nam_ir_pill;
     HdsFxRect output_pill;
     HdsFxRect mix_knob;
+    // Only meaningful (and only drawn) when hds_fx_type_is_gr_capable() is true for this row's own
+    // fx_type -- same "always-present rect, only sometimes meaningful" pattern as sidechain_pill/
+    // nam_model_pill above. Placed right after Mix, before Bypass -- matches frontend.py's own
+    // gr_label placement in its per-slot QHBoxLayout exactly (see that file's own gr_col comment).
+    HdsFxRect gr_label;
     HdsFxRect bypass_btn;
     HdsFxRect chain_btn;
     HdsFxRect up_btn;
@@ -855,6 +877,7 @@ typedef struct {
 #define HDS_FX_SIDECHAIN_W 68.0
 #define HDS_FX_PARAM_STRIDE 34.0
 #define HDS_FX_MIX_W 34.0
+#define HDS_FX_GR_W 34.0
 #define HDS_FX_BYPASS_W 24.0
 #define HDS_FX_CHAIN_W 20.0
 #define HDS_FX_UPDOWN_W 18.0
@@ -884,6 +907,8 @@ static void hds_fx_gui_compute_row_layout(int width, double y, HdsFxRowLayout *o
     x += HDS_FX_IO_PILL_W + HDS_FX_GAP;
     out->mix_knob = (HdsFxRect){x + HDS_FX_MIX_W / 2, y + HDS_FX_KNOB_CY_OFFSET, HDS_FX_GUI_KNOB_R, HDS_FX_GUI_KNOB_R};
     x += HDS_FX_MIX_W + HDS_FX_GAP;
+    out->gr_label = (HdsFxRect){x, y + 4, HDS_FX_GR_W, HDS_FX_GUI_ROW_H - 8};
+    x += HDS_FX_GR_W + HDS_FX_GAP;
     out->bypass_btn = (HdsFxRect){x, y + (HDS_FX_GUI_ROW_H - HDS_FX_BYPASS_W) / 2, HDS_FX_BYPASS_W, HDS_FX_BYPASS_W};
     x += HDS_FX_BYPASS_W + HDS_FX_GAP;
     out->chain_btn = (HdsFxRect){x, y + (HDS_FX_GUI_ROW_H - HDS_FX_BYPASS_W) / 2, HDS_FX_CHAIN_W, HDS_FX_BYPASS_W};
@@ -1455,6 +1480,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         hds_fx_centered_text(cr, params_cx, HDS_FX_COLUMN_HEADER_Y, "PARAMS");
         hds_fx_centered_text(cr, ref.output_pill.x + ref.output_pill.w / 2, HDS_FX_COLUMN_HEADER_Y, "OUT");
         hds_fx_centered_text(cr, ref.mix_knob.x, HDS_FX_COLUMN_HEADER_Y, "MIX");
+        hds_fx_centered_text(cr, ref.gr_label.x + ref.gr_label.w / 2, HDS_FX_COLUMN_HEADER_Y, "GR");
         hds_fx_centered_text(cr, ref.bypass_btn.x + ref.bypass_btn.w / 2, HDS_FX_COLUMN_HEADER_Y, "BY");
         hds_fx_centered_text(cr, ref.chain_btn.x + ref.chain_btn.w / 2, HDS_FX_COLUMN_HEADER_Y, "CH");
     }
@@ -1587,6 +1613,23 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         }
 
         hds_fx_draw_knob(cr, L.mix_knob.x, L.mix_knob.y, L.mix_knob.w, slot->mix / 100.0f, false, y, NULL, NULL);
+
+        // Per-slot GR (gain reduction) dB readout -- see hds_fx_type_is_gr_capable()'s own comment
+        // and HdsFxGuiHost.fx_gr_db's own comment. Only drawn for a GR-capable type on a host that
+        // actually supplied live data; mirrors frontend.py's own gr_label exactly (a tiny "GR"
+        // caption above a bold amber value, "%.1f" with no unit -- see its own gr_label comment).
+        if (p->fx_gr_db && hds_fx_type_is_gr_capable(fx_type)) {
+            cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+            cairo_set_font_size(cr, 8);
+            hds_fx_rgb(cr, 0.45, 0.45, 0.48);
+            hds_fx_centered_text(cr, L.gr_label.x + L.gr_label.w / 2, L.gr_label.y + 8, "GR");
+            char gr_buf[16];
+            snprintf(gr_buf, sizeof(gr_buf), "%.1f", (double)p->fx_gr_db[s]);
+            cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+            cairo_set_font_size(cr, 10);
+            hds_fx_rgb(cr, 0.71, 0.54, 0.0);
+            hds_fx_centered_text(cr, L.gr_label.x + L.gr_label.w / 2, L.gr_label.y + L.gr_label.h - 3, gr_buf);
+        }
 
         bool bypassed = slot->bypass != 0.0f;
         hds_fx_rounded_rect(cr, L.bypass_btn.x, L.bypass_btn.y, L.bypass_btn.w, L.bypass_btn.h, 3);

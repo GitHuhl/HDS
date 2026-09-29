@@ -32,4 +32,15 @@ typedef struct {
     // "--" placeholder); a host that sets source_count > 0 must also set source_label.
     int source_count;
     void (*source_label)(int idx, char *buf, size_t buflen); // pure function of idx, no host state needed
+
+    // [FX_SLOT_COUNT], or NULL -- each slot's most recent gain-reduction reading in dB (0 = no
+    // reduction), refreshed every process()/audio-callback by whichever host owns this pool (see
+    // clap_plugin.c's/hds_standalone.c's/hds_fx_plugin.c's own persistent fx_gr_db array, fed from
+    // process_fx_chain()'s own gr_db_out out-param -- fx_chain.c's own comment on gr_db_out). Only
+    // meaningful for the 7 GR-capable FX types (Gate/Limiter/FetComp/FairKid67/PeakMax/OptoComp/
+    // DeEsser -- see fx_chain.c's own process_fx_chain() switch); hds_fx_gui_draw.c only ever reads
+    // this, never writes it, same "raw pointer into real host state" convention as every other
+    // field here. NULL means this host doesn't have live GR data (there is currently no such host,
+    // but the same defensive NULL-check convention as source_count/port_input_stereo etc. applies).
+    float *fx_gr_db;
 } HdsFxGuiHost;

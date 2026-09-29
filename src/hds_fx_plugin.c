@@ -178,7 +178,7 @@ typedef struct {
     float port_input_off[HDS_FX_PORT_COUNT];
     float port_output_off[HDS_FX_PORT_COUNT];
 
-    float gr_db_scratch[FX_SLOT_COUNT]; // required non-NULL out-param, not yet exposed to the host/GUI -- shared across all 8 ports' own calls, same convention as backend.c's own gr_db_out (see render_audio_block)
+    float gr_db_scratch[FX_SLOT_COUNT]; // required non-NULL out-param, exposed to the GUI via gui_host.fx_gr_db below -- shared across all 8 ports' own calls, same convention as backend.c's own gr_db_out (see render_audio_block)
 
     // Every slot's own last-computed post-mix output, in POOL-SLOT order -- see process_fx_chain()'s
     // own slot_out_l/r comment. Persists across blocks like fx_engine[] itself, never reset to 0.
@@ -788,6 +788,7 @@ static const clap_plugin_t *hds_fx_factory_create_plugin(const clap_plugin_facto
     p->gui_host.port_output_channel = p->port_output_channel;
     p->gui_host.port_input_off = p->port_input_off;
     p->gui_host.port_output_off = p->port_output_off;
+    p->gui_host.fx_gr_db = p->gr_db_scratch;
     p->gui_host.gui_window = NULL;
 
     p->plugin.desc = &k_descriptor;

@@ -3,7 +3,7 @@
 // own function parameter TYPE, which a rename would need to touch mechanically everywhere for no
 // functional gain) this is now the SHARED top-level context struct for BOTH hosts of this native
 // Cairo GUI: the CLAP plugin (clap_plugin.c, which populates and reads every field) and the
-// standalone app (hds_standalone.c, which only touches .knobs/.gui_host/.ext_in_peak PLUS a
+// standalone app (hds_standalone.c, which only touches .knobs/.gui_host/.ext_in_peak/.fx_gr_db PLUS a
 // handful of small, purpose-specific scratch fields added since (sfz_browser_result/
 // sfz_browser_target_osc, scl_browser_result, record_folder -- see each field's own comment) that
 // exist specifically so a standalone-only tab's own draw-file code has somewhere per-instance to
@@ -98,6 +98,17 @@ typedef struct {
     // own comment -- so this only actually updates (stays non-zero) while the Routing tab is the
     // active tab, matching the standalone app's own perf-gating intent exactly.
     float ext_in_peak[EXT_IN_PAIR_COUNT];
+
+    // Same convention as ext_in_peak just above, for the FX tab's own per-slot GR (gain reduction)
+    // meters: process_fx_chain()'s own gr_db_out out-param is a per-call LOCAL scratch array (see
+    // its own comment in fx_chain.c) that used to only ever reach the OSC status message for the
+    // old Qt frontend's own /hds/status/fx_gr/<slot> listener -- there was nowhere for the native
+    // Cairo GUI to read it from at all. This array is that missing persistent home: copied from the
+    // scratch array at the end of every process() call (clap_plugin.c) or audio callback
+    // (hds_standalone.c), then handed to hds_fx_gui_draw.c via gui_host.fx_gr_db (see
+    // HdsFxGuiHost's own comment) so the FX tab can draw a live per-slot dB readout, same as
+    // frontend.py's own fx_gr_labels.
+    float fx_gr_db[FX_SLOT_COUNT];
 
     // CLAP params extension (see HDS_CLAP_PARAMS/hds_clap_push_changed_params further down) --
     // one shadow value per exposed param, used purely to detect an OSC/GUI-driven change so it
