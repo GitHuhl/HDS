@@ -29,8 +29,9 @@
 // hds_load_program_file_to_combi_lane() directly (backend.c) -- no OSC round-trip, no frontend
 // needed, matching how every other control in this native GUI reads/writes p->knobs in-process.
 // Deliberately does NOT load sfz_file (a Program's own sampled-oscillator zones): this native GUI
-// has no Mapping tab yet (a separate, deliberately deferred piece of work) -- see
-// hds_apply_program_fields_to_combi_lane()'s own comment in backend.c.
+// has no way to assign a Combi lane's own Multisample zones at all yet (the Play tab's own
+// per-oscillator "Load .sfz..." button only ever targets Single Program mode's own SINGLE_PROGRAM_
+// SLOT, never a Combi lane) -- see hds_apply_program_fields_to_combi_lane()'s own comment below.
 // The list is capped at HDS_COMBI_PROGRAM_LIST_MAX entries with no scrolling -- a deliberate v1
 // scale limit (see this file's own dropdown renderer): comfortably covers real-world use (a few
 // dozen saved Programs) without building a second scrollable-list mechanism just for this.
@@ -59,10 +60,10 @@
 // in-process equivalent for the native GUI, applying straight into `knobs` since the GUI and the
 // audio thread already share it.
 // Deliberately does NOT touch sfz_file (a Program's own per-oscillator sampled zones) -- this
-// native GUI has no Mapping tab yet (a separate, deliberately deferred piece of work), so a Combi
-// lane picked here gets every synthesis field (oscillators/filters/LFOs/EGs/arp/etc.) but keeps
-// whatever sample zones (if any) that lane already owned; loading a Program that itself relies on
-// sampled oscillators is a known, documented gap until the Mapping tab exists.
+// native GUI has no way to assign a Combi lane's own Multisample zones at all yet (see this file's
+// own header comment), so a Combi lane picked here gets every synthesis field (oscillators/
+// filters/LFOs/EGs/arp/etc.) but keeps whatever sample zones (if any) that lane already owned;
+// loading a Program that itself relies on sampled oscillators is a known, documented gap.
 static void hds_apply_program_fields_to_combi_lane(SynthSharedControls *knobs, const HdsJsonValue *fields_obj, int lane_idx) {
     if (!fields_obj || fields_obj->type != HDS_JSON_OBJECT) return;
     for (const HdsJsonMember *m = fields_obj->first_member; m; m = m->next) {

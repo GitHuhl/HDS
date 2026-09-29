@@ -1,8 +1,9 @@
 // hds_clap_gui_draw.c: hds.clap's own top-level GUI shell -- a persistent left sidebar (see
 // hds_clap_global_draw.c's own header comment: frontend.py's always-visible "Global
 // Configurations" panel, ported here as a fixed-width column beside the tab area rather than a
-// tab of its own) plus a tab bar (mirroring frontend.py's QTabWidget order exactly: Play, Filters,
-// LFOs, Envelopes, FX, Routing, Devices, Recording, Mapping, Sequencer) with per-tab dispatch.
+// tab of its own) plus a tab bar (mirroring frontend.py's QTabWidget order: Play, Filters,
+// LFOs, Envelopes, FX, Routing, Devices, Recording, Sequencer -- MINUS Mapping and Sequencer, see
+// below) with per-tab dispatch.
 // Platform-agnostic like hds_fx_gui_draw.c itself (plain cairo_t*, no Xlib) -- hds_clap_gui_x11.c
 // is this file's own platform shim, same split for the same reason.
 //
@@ -30,10 +31,12 @@
 // view is real, substantial follow-up work, tracked as its own task.
 //
 // Every OTHER tab is a placeholder for now (a centered "not yet built" label) -- each becomes real
-// content in its own later commit (see the task list this session tracks). Mapping is a
-// PERMANENT placeholder for the time being: explicit product decision, not a stand-in for
-// unfinished work -- the Sample Zone editor/mapping grid is deliberately out of scope until told
-// otherwise.
+// content in its own later commit (see the task list this session tracks). There used to be a
+// PERMANENT Mapping placeholder here too (a Sample Zone editor/mapping grid, deliberately out of
+// scope) -- removed entirely once native SFZ loading (the Play tab's own per-oscillator "Load
+// .sfz..." button, see hds_clap_play_draw.c) made it moot: there's no longer any native-GUI
+// workflow this tab would need to serve. frontend.py's own Mapping tab (SamplerMappingGrid) is
+// untouched by this -- it's a separate, still-functional legacy UI, not part of this native shell.
 //
 // #include'd by clap_plugin.c after hds_fx_gui_draw.c (needs HdsFxGuiViewState/hds_fx_gui_render/
 // hds_fx_gui_on_*) and hds_clap_play_draw.c (needs HdsClapPlayViewState), and after
@@ -59,13 +62,14 @@ typedef enum {
 #ifdef HDS_STANDALONE_GUI_ENABLED
     HDS_CLAP_TAB_RECORDING,
 #endif
-    HDS_CLAP_TAB_MAPPING,
     HDS_CLAP_TAB_COUNT
 } HdsClapTab;
 
 // Order and labels match frontend.py's own addTab() call sequence (self.tab_widget.addTab calls,
-// ~line 5564 onward) -- see this file's own header comment -- MINUS Recording and Sequencer,
-// which don't exist here at all (not even as a placeholder tab): both are 100% standalone-only
+// ~line 5564 onward) -- see this file's own header comment -- MINUS Mapping, Recording, and
+// Sequencer, none of which exist here at all (not even as a placeholder tab): Mapping's own
+// native-GUI placeholder was removed once the Play tab's per-oscillator "Load .sfz..." button made
+// it moot (see this file's own header comment); Recording/Sequencer are 100% standalone-only
 // (WavRecorder/the record_enable writer thread, and the Sequencer transport/lane/MIDI-playback
 // workflow respectively -- see clap_plugin_process()'s own comment on the latter), per explicit
 // product direction -- a DAW host already owns both recording and sequencing for its plugins.
@@ -78,7 +82,6 @@ static const char *const HDS_CLAP_TAB_LABELS[HDS_CLAP_TAB_COUNT] = {
 #ifdef HDS_STANDALONE_GUI_ENABLED
     "Recording",
 #endif
-    "Mapping",
 };
 
 typedef struct {
@@ -241,9 +244,6 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
             hds_clap_recording_render(cr, p, &vs->recording_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
 #endif
-        case HDS_CLAP_TAB_MAPPING:
-            hds_clap_gui_render_placeholder(cr, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Mapping (Sample Zone editor) -- not available in this GUI yet");
-            break;
         default:
             hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Coming soon");
             break;
