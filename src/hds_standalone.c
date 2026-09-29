@@ -1293,6 +1293,16 @@ typedef struct {
     _Atomic uint32_t frames_written;
 } RecordEngine;
 
+// Promoted to file scope (was a local `static`/plain local inside main() until the Recording tab's
+// own native-GUI port needed to read them too -- see hds_clap_recording_draw.c's own header
+// comment): record_engine already had static storage duration either way (its own ring buffer is
+// far too large for main()'s stack, see main()'s own comment at its declaration site), so this is
+// purely a visibility change, not a lifetime one. record_gather didn't strictly need static storage
+// inside main() itself (a plain local declared once before an infinite loop already keeps its value
+// across iterations), but needs file scope for the exact same cross-function-visibility reason.
+static RecordEngine record_engine;
+static RecordGatherState record_gather;
+
 // Gathers one block's worth of frames from the synth's own post-FX stereo output and the raw
 // N-channel capture buffer, per the SELECTION FROZEN AT RECORD-START (sel->sel_* -- not the live
 // knobs, so a checkbox toggled mid-take can't desync the interleaving the writer thread's file
@@ -1739,6 +1749,10 @@ static void hds_scan_midi_devices(HdsDeviceList *out) {
 #include "hds_clap_routing_draw.c"
 #include "hds_clap_devices_draw.c"
 #include "hds_clap_global_draw.c"
+// Needs record_engine/record_gather (file-scope statics defined earlier in this same TU, right
+// after RecordEngine's own type definition) and HDS_STANDALONE_GUI_ENABLED (forced 1 for this
+// build by the Makefile) -- see hds_clap_recording_draw.c's own header comment.
+#include "hds_clap_recording_draw.c"
 #include "hds_clap_gui_draw.c"
 #include "hds_standalone_gui_x11.c"
 #endif
@@ -2019,18 +2033,17 @@ int main(int argc, char **argv) {
     snprintf(applied_input_device, sizeof(applied_input_device), "%s", g_gui_ctx.knobs.input_device);
     float applied_audio_latency_ms = g_gui_ctx.knobs.audio_latency_ms;
 
-    // Recording engine: `record_ring`/writer thread state must be static -- RecordEngine embeds
-    // a RECORD_RING_CAPACITY(1<<22)-float ring buffer (16MB), far too large for main()'s stack.
-    // The writer thread is started once here and lives for the process's whole lifetime; the
-    // audio thread only ever talks to it through record_engine's atomics/ring (see the
-    // REALTIME SAFETY comment above the WAV recording section).
-    static RecordEngine record_engine;
+    // Recording engine: record_engine/record_gather are file-scope statics now (see their own
+    // declaration comment, right after RecordEngine's own type definition) -- the writer thread is
+    // started once here and lives for the process's whole lifetime; the audio thread only ever
+    // talks to it through record_engine's atomics/ring (see the REALTIME SAFETY comment above the
+    // WAV recording section).
     memset(&record_engine, 0, sizeof(record_engine));
+    memset(&record_gather, 0, sizeof(record_gather));
     bool record_writer_thread_ok = (pthread_create(&record_engine.thread, NULL, record_writer_thread_main, &record_engine) == 0);
     if (!record_writer_thread_ok) {
         fprintf(stderr, "[record] failed to start writer thread -- recording will be unavailable this session\n");
     }
-    RecordGatherState record_gather = {0};
     bool applied_record_enable = false;
     int recorder_input_channels_at_start = 0; // detected_input_channels when recording began, for the mid-take device-change safety check
     uint64_t record_last_reported_drops = 0;

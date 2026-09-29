@@ -59,7 +59,7 @@ static void hds_fx_gui_browser_refresh(HdsFxBrowser *b) {
     // comment) -- an existing regular file with the WRONG extension (or none) is deliberately left
     // to fall through to the directory-listing attempt below, which will then simply fail to
     // opendir() it and fall back to home/"/", same as any other bad typed path.
-    if (b->path_bar_commit_attempt) {
+    if (!b->folder_mode && b->path_bar_commit_attempt) {
         b->path_bar_commit_attempt = false;
         struct stat st;
         if (hds_fx_path_has_ext(b->dir, b->ext) && stat(b->dir, &st) == 0 && S_ISREG(st.st_mode)) {
@@ -68,6 +68,7 @@ static void hds_fx_gui_browser_refresh(HdsFxBrowser *b) {
             return;
         }
     }
+    b->path_bar_commit_attempt = false; // folder_mode: a typed path always falls through to the directory-listing attempt below, same as any other non-file path
 
     DIR *d = b->dir[0] ? opendir(b->dir) : NULL;
     if (!d) {
@@ -94,7 +95,10 @@ static void hds_fx_gui_browser_refresh(HdsFxBrowser *b) {
         struct stat st;
         if (stat(full, &st) != 0) continue; // e.g. a broken symlink -- just skip it
         bool is_dir = S_ISDIR(st.st_mode);
-        if (!is_dir && !hds_fx_path_has_ext(de->d_name, b->ext)) continue; // filtered out
+        if (!is_dir) {
+            if (b->folder_mode) continue; // folder_mode never lists plain files, only subdirectories to navigate into
+            if (!hds_fx_path_has_ext(de->d_name, b->ext)) continue; // filtered out
+        }
         snprintf(sort_buf[n].name, sizeof(sort_buf[n].name), "%s", de->d_name);
         sort_buf[n].is_dir = is_dir;
         n++;

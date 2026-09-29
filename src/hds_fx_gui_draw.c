@@ -627,6 +627,11 @@ typedef struct {
     char title[64]; // header text, e.g. "Select NAM Model (*.nam)" -- set at open time too
     char *dest;
     size_t dest_len;
+    // Folder-picking mode (hds_fx_gui_browser_open_folder()): lists only subdirectories (no
+    // extension filtering at all) and adds a "Choose This Folder" button that commits the CURRENTLY
+    // listed directory (b->dir itself) rather than any one entry -- the Recording tab's own output
+    // folder is the one thing in this GUI that needs an existing DIRECTORY picked, not a file.
+    bool folder_mode;
 
     // dir is the authoritative current directory while NOT editing the path bar; WHILE editing
     // (path_bar_editing) it doubles as the live typed buffer instead (same "one buffer serves both
@@ -1181,6 +1186,7 @@ static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFx
 typedef struct {
     HdsFxRect panel;
     HdsFxRect close_btn;
+    HdsFxRect choose_btn; // only meaningful in folder_mode -- "Choose This Folder"
     HdsFxRect path_bar;
     HdsFxRect up_row; // only meaningful when show_up
     bool show_up;
@@ -1201,6 +1207,7 @@ static void hds_fx_browser_compute_layout(const HdsFxGuiViewState *vs, HdsFxBrow
     out->panel.h = ph;
 
     out->close_btn = (HdsFxRect){out->panel.x + out->panel.w - 26, out->panel.y + 6, 20, 20};
+    out->choose_btn = (HdsFxRect){out->panel.x + out->panel.w - 26 - 130, out->panel.y + 4, 124, 22};
     out->path_bar = (HdsFxRect){out->panel.x + HDS_FX_BROWSER_MARGIN, out->panel.y + HDS_FX_BROWSER_TITLE_H,
                                  out->panel.w - 2 * HDS_FX_BROWSER_MARGIN, HDS_FX_BROWSER_PATHBAR_H};
     double list_top = out->path_bar.y + out->path_bar.h + 4.0;
@@ -1240,6 +1247,25 @@ static void hds_fx_gui_browser_open(HdsFxGuiViewState *vs, const char *ext, cons
     b->needs_refresh = true;
 }
 
+// Same idea as hds_fx_gui_browser_open() but for picking an existing DIRECTORY instead of a file
+// matching one extension -- see HdsFxBrowser's own folder_mode comment. `dest` already holds a
+// folder path (never a file path), so it seeds the starting directory directly rather than through
+// hds_fx_dirname() (which would incorrectly strip its last path component).
+// __attribute__((unused)): only ever called from the Recording tab's own folder picker
+// (hds_clap_recording_draw.c), which is standalone-only -- unused (and correctly so, same posture
+// as hds_fx_draw_mute_pill() above) in both CLAP plugin builds.
+__attribute__((unused)) static void hds_fx_gui_browser_open_folder(HdsFxGuiViewState *vs, const char *title, char *dest, size_t dest_len) {
+    HdsFxBrowser *b = &vs->browser;
+    memset(b, 0, sizeof(*b));
+    b->open = true;
+    b->folder_mode = true;
+    snprintf(b->title, sizeof(b->title), "%s", title);
+    b->dest = dest;
+    b->dest_len = dest_len;
+    hds_fx_safe_copy(b->dir, sizeof(b->dir), dest);
+    b->needs_refresh = true;
+}
+
 static void hds_fx_gui_browser_close(HdsFxGuiViewState *vs) { vs->browser.open = false; }
 
 // Handles every click while the browser is open -- called EXCLUSIVELY (see
@@ -1253,6 +1279,11 @@ static bool hds_fx_gui_browser_on_click(HdsFxGuiViewState *vs, double x, double 
 
     if (!hds_fx_rect_contains(&L.panel, x, y)) { hds_fx_gui_browser_close(vs); return true; }
     if (hds_fx_rect_contains(&L.close_btn, x, y)) { hds_fx_gui_browser_close(vs); return true; }
+    if (b->folder_mode && hds_fx_rect_contains(&L.choose_btn, x, y)) {
+        hds_fx_safe_copy(b->dest, b->dest_len, b->dir);
+        hds_fx_gui_browser_close(vs);
+        return true;
+    }
     if (hds_fx_rect_contains(&L.path_bar, x, y)) { b->path_bar_editing = true; return true; }
 
     // Any other click while the path bar was mid-edit abandons that edit (reverts to the last
@@ -1324,6 +1355,16 @@ static void hds_fx_gui_render_browser(cairo_t *cr, const HdsFxGuiViewState *vs) 
     cairo_set_font_size(cr, 12);
     hds_fx_rgb(cr, 0.75, 0.75, 0.78);
     hds_fx_centered_text(cr, L.close_btn.x + L.close_btn.w / 2, L.close_btn.y + L.close_btn.h / 2 + 4, "X");
+
+    if (b->folder_mode) {
+        hds_fx_rgb(cr, 0.18, 0.42, 0.22);
+        hds_fx_rounded_rect(cr, L.choose_btn.x, L.choose_btn.y, L.choose_btn.w, L.choose_btn.h, 3);
+        cairo_fill(cr);
+        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+        cairo_set_font_size(cr, 11);
+        hds_fx_rgb(cr, 0.9, 0.98, 0.92);
+        hds_fx_centered_text(cr, L.choose_btn.x + L.choose_btn.w / 2, L.choose_btn.y + L.choose_btn.h / 2 + 4, "Choose This Folder");
+    }
 
     // Path bar -- `dir` doubles as the live typed buffer while path_bar_editing (see HdsFxBrowser's
     // own comment), with a trailing cursor "_" exactly like the old inline path editor drew.

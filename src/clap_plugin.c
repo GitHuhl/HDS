@@ -114,6 +114,11 @@ static void hds_clap_build_osc_dispatch_table_once(void) {
 #include "hds_clap_routing_draw.c"
 #include "hds_clap_devices_draw.c"
 #include "hds_clap_global_draw.c"
+// hds_clap_recording_draw.c compiles to nothing in this TU (HDS_STANDALONE_GUI_ENABLED is never
+// defined here -- see that file's own header comment) but is still #include'd unconditionally,
+// same convention as every other hds_clap_*_draw.c file, right before hds_clap_gui_draw.c since
+// that file's own HDS_CLAP_TAB_RECORDING dispatch needs its types/functions declared already.
+#include "hds_clap_recording_draw.c"
 #include "hds_clap_gui_draw.c"
 #ifdef _WIN32
 #include "hds_clap_gui_win32.c"

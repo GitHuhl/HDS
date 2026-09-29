@@ -56,6 +56,9 @@ typedef enum {
     HDS_CLAP_TAB_FX,
     HDS_CLAP_TAB_ROUTING,
     HDS_CLAP_TAB_DEVICES,
+#ifdef HDS_STANDALONE_GUI_ENABLED
+    HDS_CLAP_TAB_RECORDING,
+#endif
     HDS_CLAP_TAB_MAPPING,
     HDS_CLAP_TAB_COUNT
 } HdsClapTab;
@@ -71,7 +74,11 @@ typedef enum {
 // placement exactly. See hds_clap_global_draw.c's own header comment and this file's own header
 // comment on how the sidebar and this tab bar compose together.
 static const char *const HDS_CLAP_TAB_LABELS[HDS_CLAP_TAB_COUNT] = {
-    "Play", "Filters", "LFOs", "Envelopes", "FX", "Routing", "Devices", "Mapping",
+    "Play", "Filters", "LFOs", "Envelopes", "FX", "Routing", "Devices",
+#ifdef HDS_STANDALONE_GUI_ENABLED
+    "Recording",
+#endif
+    "Mapping",
 };
 
 typedef struct {
@@ -98,6 +105,9 @@ typedef struct {
     HdsClapRoutingViewState routing_view;     // same convention -- see hds_clap_routing_draw.c's own header comment
     HdsClapDevicesViewState devices_view;      // same convention -- see hds_clap_devices_draw.c's own header comment
     HdsClapGlobalViewState global_view;        // same convention -- see hds_clap_global_draw.c's own header comment
+#ifdef HDS_STANDALONE_GUI_ENABLED
+    HdsClapRecordingViewState recording_view;  // same convention -- see hds_clap_recording_draw.c's own header comment (standalone-only tab)
+#endif
 } HdsClapGuiViewState;
 
 static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
@@ -116,6 +126,9 @@ static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
     hds_clap_routing_view_state_init(&vs->routing_view);
     hds_clap_devices_view_state_init(&vs->devices_view);
     hds_clap_global_view_state_init(&vs->global_view);
+#ifdef HDS_STANDALONE_GUI_ENABLED
+    hds_clap_recording_view_state_init(&vs->recording_view);
+#endif
 }
 
 typedef struct { double x, y, w, h; } HdsClapTabRect;
@@ -223,6 +236,11 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
         case HDS_CLAP_TAB_DEVICES:
             hds_clap_devices_render(cr, p, &vs->devices_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
+#ifdef HDS_STANDALONE_GUI_ENABLED
+        case HDS_CLAP_TAB_RECORDING:
+            hds_clap_recording_render(cr, p, &vs->recording_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            break;
+#endif
         case HDS_CLAP_TAB_MAPPING:
             hds_clap_gui_render_placeholder(cr, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Mapping (Sample Zone editor) -- not available in this GUI yet");
             break;
@@ -299,6 +317,10 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
             return hds_clap_routing_on_button_press(p, &vs->routing_view, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
         case HDS_CLAP_TAB_DEVICES:
             return hds_clap_devices_on_button_press(p, &vs->devices_view, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
+#ifdef HDS_STANDALONE_GUI_ENABLED
+        case HDS_CLAP_TAB_RECORDING:
+            return hds_clap_recording_on_button_press(p, &vs->recording_view, &vs->fx_view, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
+#endif
         default:
             return true;
     }
@@ -323,6 +345,9 @@ static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_motion(p, &vs->envelopes_view, tab_area_w, tab_x, y - HDS_CLAP_TAB_BAR_H);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_motion(&vs->routing_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
     else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_motion(&vs->devices_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
+#ifdef HDS_STANDALONE_GUI_ENABLED
+    else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_motion(&vs->recording_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
+#endif
 }
 
 static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
@@ -335,6 +360,9 @@ static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_button_release(&vs->envelopes_view);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_button_release(&vs->routing_view);
     else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_button_release(&vs->devices_view);
+#ifdef HDS_STANDALONE_GUI_ENABLED
+    else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_button_release(&vs->recording_view);
+#endif
 }
 
 static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int action, char ch) {
@@ -350,6 +378,9 @@ static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_scroll(&vs->fx_view, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_scroll(&vs->lfos_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_scroll(&vs->envelopes_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
+#ifdef HDS_STANDALONE_GUI_ENABLED
+    else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_scroll(&vs->recording_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
+#endif
 }
 
 static void hds_clap_gui_on_resize(HdsClapGuiViewState *vs, int w, int h) {

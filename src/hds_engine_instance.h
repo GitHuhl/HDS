@@ -3,17 +3,21 @@
 // own function parameter TYPE, which a rename would need to touch mechanically everywhere for no
 // functional gain) this is now the SHARED top-level context struct for BOTH hosts of this native
 // Cairo GUI: the CLAP plugin (clap_plugin.c, which populates and reads every field) and the
-// standalone app (hds_standalone.c, which only ever touches the same three fields every
-// hds_clap_*_draw.c file itself actually reads: .knobs, .gui_host, .ext_in_peak -- confirmed
-// directly, not assumed: `grep -rhoE "\bp->[a-zA-Z_]+" src/hds_clap_*_draw.c | sort -u` returns
-// exactly those three). Every other field here (the CLAP host pointer, this instance's own OSC
-// server/ports, the per-instance sample/engine/voice state, the CLAP params shadow, etc.) exists
-// because clap_plugin.c's own multi-instance design needs it -- the standalone app is single-
-// instance and already has its own equivalent state as plain globals (g_engine, g_sample_engine,
-// g_streams_state, etc., see hds_standalone.c), so it simply leaves those fields unused rather
-// than duplicating or rewiring them. Splitting this into a smaller GUI-only struct and a CLAP-only
-// wrapper would be the more "proper" long-term shape, but would mean changing the parameter type
-// on every single draw file's every function -- real, worthwhile follow-up, not attempted here.
+// standalone app (hds_standalone.c, which only touches .knobs/.gui_host/.ext_in_peak PLUS a
+// handful of small, purpose-specific scratch fields added since (sfz_browser_result/
+// sfz_browser_target_osc, scl_browser_result, record_folder -- see each field's own comment) that
+// exist specifically so a standalone-only tab's own draw-file code has somewhere per-instance to
+// keep a transient file-picker result; unlike every OTHER field below, these are read/written by
+// BOTH hosts' shared draw files, just genuinely exercised (opened a browser, picked something) only
+// from the standalone side today). Every other field here (the CLAP host pointer, this instance's
+// own OSC server/ports, the per-instance sample/engine/voice state, the CLAP params shadow, etc.)
+// exists because clap_plugin.c's own multi-instance design needs it -- the standalone app is
+// single-instance and already has its own equivalent state as plain globals (g_engine,
+// g_sample_engine, g_streams_state, etc., see hds_standalone.c), so it simply leaves those fields
+// unused rather than duplicating or rewiring them. Splitting this into a smaller GUI-only struct
+// and a CLAP-only wrapper would be the more "proper" long-term shape, but would mean changing the
+// parameter type on every single draw file's every function -- real, worthwhile follow-up, not
+// attempted here.
 //
 // #include'd by clap_plugin.c (which populates the CLAP-specific fields) and hds_standalone.c
 // (which only ever touches the three fields above) -- both AFTER backend.c (needs
@@ -170,4 +174,14 @@ typedef struct {
     // frame and feeds a non-empty pick straight into hds_tuning_load_scl() (backend.c), then clears
     // it. No per-oscillator target needed here (unlike SFZ): a scale is one session-level setting.
     char scl_browser_result[SAMPLE_PATH_LEN];
+
+    // The Recording tab's own remembered output folder (standalone-only tab, see
+    // hds_clap_recording_draw.c) -- unlike sfz_browser_result/scl_browser_result above, this is NOT
+    // a one-shot transient pick: it's the folder every subsequent take gets written into, so the
+    // shared file browser's own `dest` points DIRECTLY at this field (no separate poll-and-clear
+    // step needed, since picking a new folder has no immediate action to trigger -- it only matters
+    // the next time Record is pressed). Defaults to "~/HDS_Recordings" the first time the Recording
+    // tab renders (see that file's own lazy-init comment), mirroring frontend.py's own
+    // self.record_folder default exactly.
+    char record_folder[RECORD_PATH_LEN];
 } HdsClapPlugin;

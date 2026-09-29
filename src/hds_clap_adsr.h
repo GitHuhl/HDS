@@ -145,8 +145,12 @@ static inline void adsr_calculate_geometry(AdsrEnvelopeState *e, double w, doubl
 
 // Mirrors InteractiveADSREnvelope.paintEvent() exactly: same background, same path (moveTo the
 // "start" node if present else the raw x0,y0 origin, lineTo every remaining point), same curve
-// color/width, same handle radius/colors (white+teal border when active_node, teal+bg border
-// otherwise). Caller must have already translated the cairo context to this widget's own (0,0).
+// width, same handle radius (white+accent border when active_node, accent+bg border otherwise).
+// The curve/handle color itself does NOT mirror the old frontend's own teal -- it was swapped to
+// match the same blue used for every knob's own value arc elsewhere in this GUI (see
+// hds_fx_draw_knob_arc's own 0.45/0.68/0.95 in hds_fx_gui_draw.c), for visual consistency across
+// the native GUI rather than carrying over the old UI's own accent color verbatim. Caller must
+// have already translated the cairo context to this widget's own (0,0).
 static inline void adsr_draw(cairo_t *cr, AdsrEnvelopeState *e, double w, double h) {
     adsr_calculate_geometry(e, w, h);
 
@@ -165,7 +169,7 @@ static inline void adsr_draw(cairo_t *cr, AdsrEnvelopeState *e, double w, double
     for (int i = start_idx; i < e->point_count; i++) {
         cairo_line_to(cr, e->point_x[i], e->point_y[i]);
     }
-    cairo_set_source_rgb(cr, 0x00 / 255.0, 0xad / 255.0, 0xb5 / 255.0);
+    cairo_set_source_rgb(cr, 0.45, 0.68, 0.95);
     cairo_set_line_width(cr, 2.0);
     cairo_stroke(cr);
 
@@ -174,12 +178,12 @@ static inline void adsr_draw(cairo_t *cr, AdsrEnvelopeState *e, double w, double
         if (i == e->active_node) {
             cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
         } else {
-            cairo_set_source_rgb(cr, 0x00 / 255.0, 0xad / 255.0, 0xb5 / 255.0);
+            cairo_set_source_rgb(cr, 0.45, 0.68, 0.95);
         }
         cairo_arc(cr, e->point_x[i], e->point_y[i], handle_radius, 0, 2 * M_PI);
         cairo_fill_preserve(cr);
         if (i == e->active_node) {
-            cairo_set_source_rgb(cr, 0x00 / 255.0, 0xad / 255.0, 0xb5 / 255.0);
+            cairo_set_source_rgb(cr, 0.45, 0.68, 0.95);
             cairo_set_line_width(cr, 1.5);
         } else {
             cairo_set_source_rgb(cr, 0x1e / 255.0, 0x1e / 255.0, 0x24 / 255.0);
