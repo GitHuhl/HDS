@@ -5887,7 +5887,15 @@ static void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     slot->xfout_lovel = rec->xfout_lovel; slot->xfout_hivel = rec->xfout_hivel;
     slot->xfin_lokey = rec->xfin_lokey; slot->xfin_hikey = rec->xfin_hikey;
     slot->xfout_lokey = rec->xfout_lokey; slot->xfout_hikey = rec->xfout_hikey;
-    slot->drum_bus = rec->drum_bus;
+    // drum_bus deliberately NOT copied here, unlike every field above -- this in-place branch
+    // fires for an ordinary "/hds/zone/upsert" (the 19-float wire, zone_record_wire_set_sfz_
+    // defaults() always zeroes rec->drum_bus for that path since it's not one of the 19), so
+    // copying it here would silently stomp whatever "/hds/zone/drum_bus" (or the owning SFZ's
+    // own hds_drum_bus= opcode, on a fresh load -- see drain_pending_sample_loads()'s own copy)
+    // most recently set back to 0 the instant a frontend edits ANY other cheap field (Tune/Gain/
+    // Pan/Round-Robin/loop points) on the same zone. Leaving this slot field untouched here keeps
+    // it exactly what the dedicated non-wire assignment last set, same "stays off the wire"
+    // posture as SampleSlot.drum_bus's own comment describes.
 }
 
 static void apply_zone_remove(HdsSampleEngine *se, int32_t zone_id) {

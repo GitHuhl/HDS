@@ -94,9 +94,12 @@ A few notable addresses:
   (`/hds/fx/<slot>/source`) and output-routing (`/hds/routing/<source>/out/<pair>`)
   machinery as every other source — Drum Bus 1..24 sit at source ids
   `COMBI_PROGRAM_COUNT + 1 + EXT_IN_PAIR_COUNT` upward. Also settable per-zone
-  via the non-standard SFZ opcode `hds_drum_bus=<1-24>`. No dedicated native-
-  GUI zone assignment yet (OSC/SFZ-only) — the FX and Routing tabs already
-  show/label Drum Bus sources correctly.
+  via the non-standard SFZ opcode `hds_drum_bus=<1-24>`. `frontend.py`'s
+  Mapping tab exposes this as a "Drum Bus" spinner in the Zone Inspector
+  (sends `/hds/zone/drum_bus` directly, separately from the ordinary zone
+  upsert); the FX and Routing tabs already show/label Drum Bus sources
+  correctly too. No dedicated native-GUI (Cairo) zone assignment yet —
+  OSC/SFZ/`frontend.py`-only for now.
 
 A CLAP plugin instance runs its own embedded OSC server too (default
 `9010`/`9011`, incrementing per instance), so `frontend.py` can drive a
