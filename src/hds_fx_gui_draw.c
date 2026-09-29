@@ -148,6 +148,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
     static const char *const deesser[] = {"Freq", "Thresh", "Ratio", "Attack", "Releas", "Listen"};
     static const char *const hardtune[] = {"Key", "Scale", "Target", "Amount", "Retune", "Track", "Voice", "VibRt", "VibDp", "VibSrc"};
     static const char *const fdnverb[] = {"Decay", "Size", "PreDly", "Damp", "Diffus", "ModRt", "ModDp", "ERLvl", "ERDcy", "Freeze"};
+    static const char *const ssl4k[] = {"HPFrq", "LFFrq", "LFGan", "LMFrq", "LMGan", "LMQ", "HMFrq", "HMGan", "HFFrq", "HFGan", "E/G"};
 
     const char *const *table = NULL;
     int count = 0;
@@ -172,6 +173,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
         case FX_TYPE_DEESSER: table = deesser; count = 6; break;
         case FX_TYPE_HARDTUNE: table = hardtune; count = 10; break;
         case FX_TYPE_FDNVERB: table = fdnverb; count = 10; break;
+        case FX_TYPE_SSL4K: table = ssl4k; count = 11; break;
         default: return "";
     }
     if (idx < 0 || idx >= count) return "";

@@ -2212,6 +2212,110 @@ static void run_fx_eq3(FXSlotEngine *engine, const FXSlotParams *params, float *
     *r = sr;
 }
 
+// --- FX_TYPE_SSL4K -- see its own comment in fx_types.h for the param map and design summary. ---
+
+// 0.0-1.0 fraction -> [lo_hz, hi_hz], log-spaced -- same musical-taper reasoning as
+// fx_eq3_fraction_to_hz() above, just with each band's own frequency range instead of one fixed
+// 20-20000Hz span (the console's own bands each only sweep a fraction of the full audio range).
+static inline float ssl4k_fraction_to_hz(float fraction, float lo_hz, float hi_hz) {
+    fraction = fmaxf(0.0f, fminf(1.0f, fraction));
+    return lo_hz * powf(hi_hz / lo_hz, fraction);
+}
+
+typedef struct {
+    float z1[4][2], z2[4][2]; // [band][channel] -- 0=LF Shelf, 1=LMF Bell, 2=HMF Bell, 3=HF Shelf
+    EqBiquadCoeffs hpf_coeffs;
+    float hpf_z1[2], hpf_z2[2];
+} FxSsl4kState;
+
+// 2-pole (12dB/oct) Butterworth high-pass, Q=0.7071 (maximally flat passband, the standard HPF
+// alignment) -- same RBJ-cookbook HPF form already used for FairKid67's own output-transformer
+// coloration (fk67_xfmr2_init's own hpf_coeffs, just above), reused here as a plain audible HPF
+// rather than a fixed sub-audio corner.
+static void ssl4k_compute_hpf_coeffs(EqBiquadCoeffs *c, float freq_hz) {
+    const float fs = (float)SAMPLE_RATE;
+    const float w0 = 2.0f * (float)M_PI * fmaxf(20.0f, fminf(2000.0f, freq_hz)) / fs;
+    const float alpha = sinf(w0) / (2.0f * 0.70710678f);
+    const float cosw0 = cosf(w0);
+    const float a0 = 1.0f + alpha;
+    c->b0 = ((1.0f + cosw0) * 0.5f) / a0;
+    c->b1 = -(1.0f + cosw0) / a0;
+    c->b2 = c->b0;
+    c->a1 = (-2.0f * cosw0) / a0;
+    c->a2 = (1.0f - alpha) / a0;
+}
+
+static void run_fx_ssl4k(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxSsl4kState *st = (FxSsl4kState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxSsl4kState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+
+    // Console (E/G) -- see fx_types.h's own comment: this selects the LMF/HMF top-of-range
+    // (G sweeps noticeably higher on both, per its own reputation as the "extended range,
+    // brighter/smoother" revision) and how aggressively gain narrows a bell band's own bandwidth
+    // and drives the saturation stage (E: punchier/more aggressive on both counts).
+    const bool console_g = (int)(fmaxf(0.0f, fminf(1.0f, params->param[10])) * 1.0f + 0.5f) != 0;
+    const float lmf_hi_hz = console_g ? 7000.0f : 2500.0f;
+    const float hmf_hi_hz = console_g ? 12000.0f : 7000.0f;
+    const float q_narrow_rate = console_g ? 0.02f : 0.05f;
+    const float sat_drive_rate = console_g ? 0.015f : 0.03f;
+
+    EqBandParams bands[4];
+    bands[0].freq = ssl4k_fraction_to_hz(params->param[1], 30.0f, 450.0f);
+    bands[0].gain_db = -16.0f + fmaxf(0.0f, fminf(1.0f, params->param[2])) * 32.0f;
+    bands[0].q = 0.707f; // ignored for shelf bands -- see compute_eq_band_coeffs()'s own comment
+
+    bands[1].freq = ssl4k_fraction_to_hz(params->param[3], 200.0f, lmf_hi_hz);
+    bands[1].gain_db = -16.0f + fmaxf(0.0f, fminf(1.0f, params->param[4])) * 32.0f;
+    const float lmf_q_base = 0.3f + fmaxf(0.0f, fminf(1.0f, params->param[5])) * 2.7f;
+
+    bands[2].freq = ssl4k_fraction_to_hz(params->param[6], 600.0f, hmf_hi_hz);
+    bands[2].gain_db = -16.0f + fmaxf(0.0f, fminf(1.0f, params->param[7])) * 32.0f;
+    const float hmf_q_base = 0.7f; // no dedicated Q knob for this band (matches the real console's own HMF, which is fixed-bandwidth on several revisions) -- still narrows/widens dynamically with gain below
+
+    bands[3].freq = ssl4k_fraction_to_hz(params->param[8], 1500.0f, 16000.0f);
+    bands[3].gain_db = -16.0f + fmaxf(0.0f, fminf(1.0f, params->param[9])) * 32.0f;
+    bands[3].q = 0.707f; // ignored for shelf bands
+
+    // Proportional/"dynamic" bandwidth: as a bell band's own |gain| rises, its Q narrows --
+    // a broad boost/cut at low gain, a surgical one at high gain, the "musical", self-scaling
+    // bandwidth behavior this whole console style is known for (as opposed to a plain fixed-Q
+    // parametric EQ, where the same Q sounds proportionally wider at low gain and narrower at high
+    // gain purely as a side effect of the gain itself, with no compensation). This own curve/rate
+    // is an original choice here, not measured or reverse-engineered from any specific unit.
+    bands[1].q = fmaxf(0.15f, lmf_q_base / (1.0f + q_narrow_rate * fabsf(bands[1].gain_db)));
+    bands[2].q = fmaxf(0.15f, hmf_q_base / (1.0f + q_narrow_rate * fabsf(bands[2].gain_db)));
+
+    ssl4k_compute_hpf_coeffs(&st->hpf_coeffs, ssl4k_fraction_to_hz(params->param[0], 20.0f, 500.0f));
+
+    // bands[] index -> compute_eq_band_coeffs()'s own band_index (0=Low Shelf, 1=Mid Peak,
+    // 2=High Shelf): LF is a Low Shelf, LMF/HMF are both Mid Peak (bell) bands, HF is a High Shelf.
+    static const int SSL4K_EQ_BAND_INDEX[4] = {0, 1, 1, 2};
+    float sl = run_eq_biquad(*l, &st->hpf_coeffs, &st->hpf_z1[0], &st->hpf_z2[0]);
+    float sr = run_eq_biquad(*r, &st->hpf_coeffs, &st->hpf_z1[1], &st->hpf_z2[1]);
+    for (int band = 0; band < 4; band++) {
+        EqBiquadCoeffs c = compute_eq_band_coeffs(&bands[band], SSL4K_EQ_BAND_INDEX[band]);
+        sl = run_eq_biquad(sl, &c, &st->z1[band][0], &st->z2[band][0]);
+        sr = run_eq_biquad(sr, &c, &st->z1[band][1], &st->z2[band][1]);
+    }
+
+    // Always-on, subtle saturation standing in for the real console's own transformer/op-amp
+    // stage -- a normalized tanh soft-clip (drive in, 1/tanh(drive) back out keeps it unity-gain
+    // at DC/low level, so this never quietly pads the signal), whose drive scales with how hard
+    // this slot's own bands are being pushed (the sum of every band's own |gain_db|, on top of a
+    // small fixed baseline so even a flat/0dB setting still imparts a touch of console character).
+    // Purely an original stand-in for a general, widely-described trait of this console style, not
+    // a measured/reverse-engineered circuit model of any specific unit.
+    const float total_boost_db = fabsf(bands[0].gain_db) + fabsf(bands[1].gain_db) + fabsf(bands[2].gain_db) + fabsf(bands[3].gain_db);
+    const float drive = 1.015f + sat_drive_rate * total_boost_db;
+    const float inv_tanh_drive = 1.0f / tanhf(drive);
+    *l = tanhf(drive * sl) * inv_tanh_drive;
+    *r = tanhf(drive * sr) * inv_tanh_drive;
+}
+
 // --- FX_TYPE_LIMITER: a digital brick-wall peak limiter --- see FX_TYPE_LIMITER's own comment
 // above for the param map and why this is an original implementation of the same technique the
 // master bus safety limiter below already uses, not a literal port of anything. Both channels
@@ -4731,6 +4835,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                     break;
                 case FX_TYPE_HARDTUNE: run_fx_hardtune(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_FDNVERB: run_fx_fdnverb(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
+                case FX_TYPE_SSL4K: run_fx_ssl4k(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through

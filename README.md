@@ -147,7 +147,11 @@ Up to 32 shared slots, each independently routable, each settable to any of:
   (highpass into a density/waveshaping saturator), PointyGuitar (amp-style
   distortion), GuitarConditioner, Cabs2 (speaker-cabinet tone shaping),
   DeEsser (split-band), HardTune (real-time pitch correction, with an
-  optional LFO-routable vibrato).
+  optional LFO-routable vibrato), SSL4K (large-format-console-style 4-band
+  + HPF channel EQ, E/G switch, gain-proportional bandwidth on the two bell
+  bands, always-on saturation stage — an original design built on this
+  engine's own RBJ-cookbook biquad math, not a port of any specific plugin;
+  see `FX_TYPE_SSL4K`'s own comment in `src/fx_types.h`).
 - **Time-based**: Ensemble (fixed-delay chorus), CreamCoat (FDN reverb),
   FDNVerb (algorithmic reverb), StereoChorus, StereoDoubler (micro-pitch
   detune), TapeDelay2 (tape echo, with optional stereo ping-pong).

@@ -505,6 +505,26 @@ static inline float run_eq_biquad(float input, const EqBiquadCoeffs *c, float *z
 // together), giving a knob that responds linearly, the way every other knob in this effect (and
 // this whole engine) does.
 #define FX_TYPE_FDNVERB 21
+// An original design (not ported from any single codebase) modeling the general, publicly-
+// documented behavior of a classic large-format console's E/G-series channel EQ: 4 bands + HPF,
+// RBJ-cookbook shelf/peak biquads (compute_eq_band_coeffs/run_eq_biquad above -- the exact same
+// math FX_TYPE_EQ3 already uses, just with per-band frequency ranges/Q behavior matched to this
+// hardware style instead of a plain generic 3-band EQ), plus two specific console characteristics
+// widely described as this design's signature: bandwidth that narrows as a bell band's own gain
+// increases ("proportional Q" -- see run_fx_ssl4k()'s own comment for the exact formula, a
+// deliberately chosen, non-reverse-engineered curve, not lifted from any specific implementation),
+// and a subtle always-on saturation stage standing in for the real hardware's transformer/op-amp
+// coloration, whose drive scales with how hard the bands are pushed. param[0] HPF Freq (20-500Hz,
+// 2-pole/12dB-oct Butterworth), param[1] LF Freq (30-450Hz, shelf) param[2] LF Gain (+-16dB),
+// param[3] LMF Freq (200Hz-2.5kHz on E / 200Hz-7kHz on G, bell), param[4] LMF Gain (+-16dB),
+// param[5] LMF Q (bandwidth, 0.3-3.0 base value before the proportional-Q adjustment), param[6]
+// HMF Freq (600Hz-7kHz on E / 600Hz-12kHz on G, bell, fixed base Q), param[7] HMF Gain (+-16dB),
+// param[8] HF Freq (1.5kHz-16kHz, shelf), param[9] HF Gain (+-16dB), param[10] Console (choice:
+// 0=E, 1=G -- E narrows bandwidth more aggressively under gain and drives the saturation stage
+// harder, matching E's reputation as the punchier/more aggressive of the two; G's bell bands stay
+// wider-bandwidth and its saturation is gentler, matching G's reputation as the smoother, more
+// "hi-fi" revision). See run_fx_ssl4k().
+#define FX_TYPE_SSL4K 22
 // Raised from 8 (originally sized for every earlier port's needs) to fit FX_TYPE_POINTYGUITAR's
 // 10 real params without dropping any of them -- unlike Density3's redundant internal Dry/Wet
 // (already covered by this slot's own generic Mix below) or TapeDelay2's kept Dry/Wet, none of
@@ -513,7 +533,11 @@ static inline float run_eq_biquad(float input, const EqBiquadCoeffs *c, float *z
 // A purely additive, backward-compatible wire change: every existing effect's own param[0..7]
 // addresses are untouched, param[8]/param[9] are simply new addresses (defaulting to 0.0, like
 // any other never-set knob) that no earlier-ported effect type ever reads.
-#define FX_SLOT_PARAM_COUNT 10
+//
+// Raised again, 10 -> 11, for FX_TYPE_SSL4K's own E/G console switch (param[10]) -- same
+// purely-additive reasoning as the raise above: every existing effect's param[0..9] addresses are
+// untouched, param[10] is simply a new address no earlier-ported effect type ever reads.
+#define FX_SLOT_PARAM_COUNT 11
 typedef struct {
     float fx_type;
     float param[FX_SLOT_PARAM_COUNT];
