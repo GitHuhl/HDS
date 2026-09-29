@@ -139,10 +139,13 @@ straight through to Qt.
 
 Up to 32 shared slots, each independently routable, each settable to any of:
 
-- **Dynamics**: Gate, Limiter (brick-wall), FetComp (1176-style FET
-  compressor), FairKid67 (Fairchild 670-style tube leveling amp), PeakMax
-  (lookahead limiter/maximizer), OptoComp (LA-2A-style optical compressor)
-  — all report live gain-reduction metering back to the GUI.
+- **Dynamics**: Gate (Schmitt-trigger hysteresis + a Hold timer, both in
+  addition to the usual Threshold/Attack/Release/Range, so a signal
+  hovering right at Threshold doesn't chatter open/closed the way a
+  single fixed threshold does), Limiter (brick-wall), FetComp (1176-style
+  FET compressor), FairKid67 (Fairchild 670-style tube leveling amp),
+  PeakMax (lookahead limiter/maximizer), OptoComp (LA-2A-style optical
+  compressor) — all report live gain-reduction metering back to the GUI.
 - **Tone**: EQ3 (3-band), MultiFilter (wide-range steep filter), Density3
   (highpass into a density/waveshaping saturator), PointyGuitar (amp-style
   distortion), GuitarConditioner, Cabs2 (speaker-cabinet tone shaping),

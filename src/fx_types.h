@@ -234,9 +234,19 @@ static inline float run_eq_biquad(float input, const EqBiquadCoeffs *c, float *z
 // above threshold), param[2] Release (5..500ms -- how fast it closes once below threshold, slow
 // enough to avoid audibly chopping a decaying note's own tail), param[3] Range (0..-80dB -- how
 // much the signal is attenuated while closed; 0 makes this whole effect a no-op by design, a real
-// "Range" knob's own honest zero position, not a magic bypass case). Both channels always share
-// one gain value (see run_fx_gate()'s own comment) so the stereo image is never skewed by one side
-// gating independently of the other.
+// "Range" knob's own honest zero position, not a magic bypass case), param[4] Hysteresis (0..12dB
+// -- once open, the gate only re-closes after the signal drops this many dB BELOW Threshold, not
+// at Threshold itself; the standard Schmitt-trigger fix for a signal hovering right at Threshold
+// chattering open/closed on every little fluctuation -- see run_fx_gate()'s own comment for the
+// open/close state machine), param[5] Hold (0..500ms -- once the signal actually does drop below
+// the (Threshold - Hysteresis) close point, the gate stays fully open this much longer before its
+// Release ramp even starts, so a single quiet gap inside an otherwise-sustained sound can't
+// re-trigger the gate mid-phrase). Both channels always share one gain value (see run_fx_gate()'s
+// own comment) so the stereo image is never skewed by one side gating independently of the other.
+// hds_fx_dropdown_apply() seeds Hysteresis to a typical hardware-gate default (see its own
+// comment) the moment a slot is first switched to this type, since 0 (this param's own honest
+// "off" position, like Range's) is a worse default for a brand-new gate than most players would
+// expect -- every other param here still starts at its own honest zero/minimum.
 #define FX_TYPE_GATE 11
 // The Program's own post-filter 3-band EQ (see EqBandParams/compute_eq_band_coeffs/run_eq_biquad
 // above), ported here unchanged -- same RBJ Audio-EQ-Cookbook biquad forms, same Low Shelf/Mid

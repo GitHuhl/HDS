@@ -138,7 +138,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
     static const char *const pointyguitar[] = {"Drive", "Presnc", "High", "Mid", "Low", "Sub", "HSpkr", "LSpkr", "Gate", "Outpt"};
     static const char *const cabs2[] = {"Lowpas", "Hipass"};
     static const char *const nam[] = {"InGain", "OutGan", "Cab"};
-    static const char *const gate[] = {"Thresh", "Attack", "Releas", "Range"};
+    static const char *const gate[] = {"Thresh", "Attack", "Releas", "Range", "Hyst", "Hold"};
     static const char *const eq3[] = {"LoFreq", "LoGain", "MidFrq", "MidGan", "MidQ", "HiFreq", "HiGain"};
     static const char *const limiter[] = {"Ceil", "InGain", "Releas"};
     static const char *const fetcomp[] = {"Input", "Outpt", "Ratio", "Attack", "Releas", "Limit", "Char", "Iron"};
@@ -163,7 +163,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
         case FX_TYPE_POINTYGUITAR: table = pointyguitar; count = 10; break;
         case FX_TYPE_CABS2: table = cabs2; count = 2; break;
         case FX_TYPE_NAM: table = nam; count = 3; break;
-        case FX_TYPE_GATE: table = gate; count = 4; break;
+        case FX_TYPE_GATE: table = gate; count = 6; break;
         case FX_TYPE_EQ3: table = eq3; count = 7; break;
         case FX_TYPE_LIMITER: table = limiter; count = 3; break;
         case FX_TYPE_FETCOMP: table = fetcomp; count = 8; break;
@@ -1086,9 +1086,16 @@ static int hds_fx_dropdown_current_index(const HdsFxGuiHost *p, int kind, int ro
 // different port choice, so switching away from Off later returns to whatever port was last set.
 static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
     switch (kind) {
-        case HDS_FX_DROPDOWN_TYPE:
-            p->fx[row].fx_type = (float)HDS_FX_SELECTABLE_TYPES[idx];
+        case HDS_FX_DROPDOWN_TYPE: {
+            int new_type = HDS_FX_SELECTABLE_TYPES[idx];
+            p->fx[row].fx_type = (float)new_type;
+            // Every param otherwise starts at its own honest zero -- but Gate's Hysteresis (param[4],
+            // 0..12dB) has no useful "off" reading for a freshly-loaded gate the way Range's 0 does, so
+            // seed it to a typical hardware-gate value (~3dB) the moment a slot is switched to Gate,
+            // matching what a real gate pedal/rack unit ships with rather than a chattery 0dB default.
+            if (new_type == FX_TYPE_GATE) p->fx[row].param[4] = 0.25f;
             return;
+        }
         case HDS_FX_DROPDOWN_INPUT: {
             int base = 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT;
             if (idx >= base) {

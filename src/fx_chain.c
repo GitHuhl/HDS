@@ -2125,6 +2125,16 @@ typedef struct {
                  // 0.0, which would wrongly gate the very first block's audio before any real
                  // envelope has been established), fixed up on first use below.
     bool initialized;
+    // Schmitt-trigger open/close state (see this section's own header comment on Hysteresis) --
+    // which of the two thresholds (Threshold itself, or Threshold-Hysteresis) governs the NEXT
+    // transition depends on which state the gate is already in, so this can't be derived fresh
+    // from the instantaneous peak alone the way the old single-threshold version could.
+    bool gate_open;
+    // Hold countdown, in samples (see this section's own header comment on Hold) -- counts down
+    // only while gate_open is true AND the signal has actually dropped below the close threshold;
+    // refilled back to the full Hold time on every sample that's still above the close threshold,
+    // so a sustained signal never "uses up" hold time it might need for its own next brief dip.
+    float hold_samples_left;
     float last_gr_db; // -20*log10(gain), clamped >=0 -- this slot's current gain reduction in dB,
                         // read back by process_fx_chain() for the /hds/status/fx_gr/<slot> meter.
 } FxGateState;
@@ -2136,17 +2146,36 @@ static void run_fx_gate(FXSlotEngine *engine, const FXSlotParams *params, float 
         engine->state = st;
         if (!st) return; // allocation failure -- leave this sample untouched this call
     }
-    if (!st->initialized) { st->gain = 1.0f; st->initialized = true; } // open by default, not closed
+    if (!st->initialized) { st->gain = 1.0f; st->gate_open = true; st->initialized = true; } // open by default, not closed
 
     float threshold_db = -60.0f + fmaxf(0.0f, fminf(1.0f, params->param[0])) * 60.0f;
     float attack_ms = 0.1f + fmaxf(0.0f, fminf(1.0f, params->param[1])) * 19.9f;
     float release_ms = 5.0f + fmaxf(0.0f, fminf(1.0f, params->param[2])) * 495.0f;
     float range_db = -80.0f * fmaxf(0.0f, fminf(1.0f, params->param[3]));
+    float hysteresis_db = fmaxf(0.0f, fminf(1.0f, params->param[4])) * 12.0f;
+    float hold_ms = fmaxf(0.0f, fminf(1.0f, params->param[5])) * 500.0f;
 
-    float threshold_lin = powf(10.0f, threshold_db / 20.0f);
+    // Schmitt trigger: a CLOSED gate only reopens once the signal reaches the (higher) Threshold
+    // itself; an OPEN gate only starts to close once the signal drops below the (lower) Threshold
+    // - Hysteresis point. A signal hovering anywhere between those two points is stable in
+    // whichever state the gate is already in -- the standard fix for a signal sitting right at a
+    // single fixed threshold chattering open/closed on every small fluctuation.
+    float open_threshold_lin = powf(10.0f, threshold_db / 20.0f);
+    float close_threshold_lin = powf(10.0f, (threshold_db - hysteresis_db) / 20.0f);
     float range_lin = powf(10.0f, range_db / 20.0f);
     float peak = fmaxf(fabsf(*l), fabsf(*r));
-    float target_gain = (peak >= threshold_lin) ? 1.0f : range_lin;
+    float hold_samples = hold_ms * 0.001f * (float)SAMPLE_RATE;
+
+    if (!st->gate_open) {
+        if (peak >= open_threshold_lin) { st->gate_open = true; st->hold_samples_left = hold_samples; }
+    } else if (peak >= close_threshold_lin) {
+        st->hold_samples_left = hold_samples; // still legitimately open -- keep Hold fully topped up
+    } else if (st->hold_samples_left > 0.0f) {
+        st->hold_samples_left -= 1.0f; // below the close point, but still within its own Hold window
+    } else {
+        st->gate_open = false; // Hold expired with the signal still below the close point
+    }
+    float target_gain = st->gate_open ? 1.0f : range_lin;
 
     // Same "instant attack, exponential release toward target" shape as the master bus limiter
     // below, just with both directions smoothed here (a gate's own attack must still be a short
