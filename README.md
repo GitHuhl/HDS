@@ -75,6 +75,15 @@ A few notable addresses:
   instance switcher for scanning multiple running instances/ports).
 - `/hds/subscribe` — register for periodic `/hds/status/*` pushes.
 - `/hds/zone/*` — the Sample Bank (SFZ/WAVE_SAMPLE zone upsert/remove/load).
+  First-class SFZ opcode support: round-robin (`seq_length`/`seq_position`,
+  independent of `group=`), real choke groups (`group=`/`off_by=`),
+  keyswitching (`sw_lokey`/`sw_hikey`/`sw_last`/`sw_default`), `trigger=`
+  (`attack`/`release`/`release_key`/`first`/`legato`), velocity/key crossfade
+  layering (`xfin_*`/`xfout_*`), `lorand`/`hirand`, `amp_velcurve_<N>`,
+  `delay`, `rt_decay`, `loop_crossfade`, `#define` macros, and a per-zone amp
+  envelope (`ampeg_*`) that's either fully used as-is or fully overridden by
+  the oscillator's own Amp EG via its "Use Amp EG" checkbox (Multisample
+  oscillators only) — never blended.
 
 A CLAP plugin instance runs its own embedded OSC server too (default
 `9010`/`9011`, incrementing per instance), so `frontend.py` can drive a

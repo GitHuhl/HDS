@@ -690,6 +690,24 @@ typedef struct {
     float vco4_mute;
     float vco4_pulse_width; // dual-duty Pulse Width/Tilt, mirrors vco3_pulse_width
 
+    // SFZ per-zone amp envelope override, one checkbox per oscillator (shown in the native GUI
+    // only while that oscillator's own Shape is Multisample/WAVE_SAMPLE -- irrelevant, and hidden,
+    // otherwise). Strictly EITHER/OR, never a blend of the two (explicit user direction): OFF
+    // (0, the default) means a currently-playing zone that sets ANY ampeg_* opcode of its own
+    // (SampleSlot.has_own_ampeg) uses that envelope ENTIRELY, with SFZ's own per-stage defaults for
+    // whatever it doesn't set -- this Program's own eg[0..3]/eg_mode[0..3] knobs are not consulted
+    // at all for that note. ON (1) makes this oscillator ALWAYS use this Program's own Amp EG
+    // (eg[N]/eg_mode[N]) for every note, exactly as if the zone had no ampeg_* opcodes at all,
+    // regardless of what its own SFZ actually declares. A zone that sets NO ampeg_* opcodes at all
+    // is completely unaffected by this switch either way -- the Program's own Amp EG is what plays
+    // it, exactly as it always has. See compute_zone_owned_eg_rates()/handle_note_on's own
+    // eg-init block and the tick_adsr call sites in render_audio_block for where this is actually
+    // consulted.
+    float vco1_force_own_amp_eg;
+    float vco2_force_own_amp_eg;
+    float vco3_force_own_amp_eg;
+    float vco4_force_own_amp_eg;
+
     // Pitch Bend range, in semitones, applied equally to both oscillators. Separately
     // specifiable up/down since real-world PB ranges are often asymmetric (e.g. a guitar-style
     // patch bending up a whole step but down a minor third). See pb_bend_cents in
@@ -1161,6 +1179,23 @@ static float compute_current_tempo_bpm(const SynthSharedControls *knobs, double 
     return (float)bpm;
 }
 
+// Everything tick_adsr() needs BESIDES the envelope instance's own dynamic state -- moved ahead of
+// its original position (just below compute_eg_derived_rates(), further down) so SynthVoice can
+// hold one of these directly per oscillator for the SFZ per-zone amp envelope override (see
+// ProgramState.vco1_force_own_amp_eg's own comment) -- a plain forward-reference would work too,
+// but C doesn't have those for typedefs, so the type itself has to move.
+typedef struct {
+    int mode;
+    float atk_level;
+    float peak_level;
+    float sustain_level;
+    float attack_rate;
+    float decay_rate;
+    float release_rate_per_level; // multiply by env->release_level for the actual release decrement
+    float t_dly;
+    float t_hld;
+} EGDerivedRates;
+
 typedef struct {
     EnvelopeState state;
     int env_type; // 0:ADSR, 1:AR, 2:AD, 3:ASR, 4:AHD, 5:DADSR, 6:AHDSR
@@ -1275,6 +1310,24 @@ typedef struct {
     double vco4_sample_ptr;
     bool vco4_sample_preroll;
 
+    // SFZ first-class opcode support (appended) -- one crossfade-LAYER partner stream per
+    // oscillator (see find_matching_sample_slot's own comment: a zone using xfin_*/xfout_* can
+    // sound simultaneously with a second, paired zone, each independently mixed by its own static
+    // xfade gain captured at this note's own start_sample_osc() call) plus a delayed-start
+    // countdown (SFZ's delay=, in frames at SAMPLE_RATE -- render_audio_block holds this
+    // oscillator's output at silence, without touching its already-claimed stream/ptr/preroll at
+    // all, until this reaches 0). -1 layer stream / gain 1.0 primary / 0.0 layer / 0 delay
+    // reproduces today's exact pre-crossfade-layering, pre-delay behavior byte-for-byte for every
+    // zone that never sets xfin_*/xfout_*/delay= at all -- the vast majority, by construction.
+    int vco1_layer_sample_stream;      double vco1_layer_sample_ptr;      bool vco1_layer_sample_preroll;
+    float vco1_xfade_gain;             float vco1_layer_xfade_gain;       int vco1_sample_delay_remaining;
+    int vco2_layer_sample_stream;      double vco2_layer_sample_ptr;      bool vco2_layer_sample_preroll;
+    float vco2_xfade_gain;             float vco2_layer_xfade_gain;       int vco2_sample_delay_remaining;
+    int vco3_layer_sample_stream;      double vco3_layer_sample_ptr;      bool vco3_layer_sample_preroll;
+    float vco3_xfade_gain;             float vco3_layer_xfade_gain;       int vco3_sample_delay_remaining;
+    int vco4_layer_sample_stream;      double vco4_layer_sample_ptr;      bool vco4_layer_sample_preroll;
+    float vco4_xfade_gain;             float vco4_layer_xfade_gain;       int vco4_sample_delay_remaining;
+
     // Per-Key LFO state (see PackLfoParams.per_key_mode) -- one independent phase/decimation
     // state per LFO slot, PER VOICE, used only for LFOs actually in Per-Key mode (meaningless/
     // unread otherwise, exactly like vco*_sample_stream above when that oscillator isn't
@@ -1284,6 +1337,19 @@ typedef struct {
     int lfo_decim_counter[LFO_COUNT];
     float lfo_decim_last_value[LFO_COUNT];
     float lfo_decim_target_value[LFO_COUNT];
+
+    // SFZ per-zone amp envelope override (see ProgramState.vco1_force_own_amp_eg's own comment):
+    // when the zone this oscillator's currently-claimed stream belongs to sets its own ampeg_*
+    // opcodes AND the Program's own override checkbox is off, vco1_using_own_ampeg is true and
+    // vco1_own_eg_rates (computed once at this note's own start_sample_osc() call, via
+    // compute_zone_owned_eg_rates()) is what render_audio_block's tick_adsr() call actually
+    // consults INSTEAD of the Program's own shared eg_rates[program][0] -- see that call site's own
+    // comment. false/unused (this whole feature's ordinary, unaffected state) for every oscillator
+    // whose zone sets no ampeg_* opcodes at all, or isn't even WAVE_SAMPLE.
+    bool vco1_using_own_ampeg; EGDerivedRates vco1_own_eg_rates;
+    bool vco2_using_own_ampeg; EGDerivedRates vco2_own_eg_rates;
+    bool vco3_using_own_ampeg; EGDerivedRates vco3_own_eg_rates;
+    bool vco4_using_own_ampeg; EGDerivedRates vco4_own_eg_rates;
 } SynthVoice;
 // FIXED: Restored 'p->s' to reference sustain data properties correctly
 // Everything tick_adsr() needs BESIDES the envelope instance's own dynamic state (current_level/
@@ -1296,18 +1362,8 @@ typedef struct {
 // fminf clamps and divisions, recomputed identically for every voice sharing the same EG slot)
 // was a real, measured bottleneck that scaled directly with polyphony -- confirmed the dominant
 // single cost in a profile of a plain two-oscillator patch at moderate voice counts, well before
-// oscillator/filter work alone would explain any strain.
-typedef struct {
-    int mode;
-    float atk_level;
-    float peak_level;
-    float sustain_level;
-    float attack_rate;
-    float decay_rate;
-    float release_rate_per_level; // multiply by env->release_level for the actual release decrement
-    float t_dly;
-    float t_hld;
-} EGDerivedRates;
+// oscillator/filter work alone would explain any strain. (EGDerivedRates itself now lives above,
+// just ahead of ADSR -- see that typedef's own comment for why it had to move.)
 
 static void compute_eg_derived_rates(const PackEGParams *p, int mode, EGDerivedRates *out) {
     out->mode = mode;
@@ -2457,6 +2513,45 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_PSCALAR_AT("/hds/combi/6/vco4/pulse_width", vco4_pulse_width, 6),
     OSC_PSCALAR_AT("/hds/combi/7/vco4/pulse_width", vco4_pulse_width, 7),
 
+    // SFZ per-zone amp envelope override checkboxes -- see ProgramState.vco1_force_own_amp_eg's
+    // own comment.
+    OSC_PSCALAR("/hds/vco1/force_own_amp_eg", vco1_force_own_amp_eg),
+    OSC_PSCALAR_AT("/hds/combi/0/vco1/force_own_amp_eg", vco1_force_own_amp_eg, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco1/force_own_amp_eg", vco1_force_own_amp_eg, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco1/force_own_amp_eg", vco1_force_own_amp_eg, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco1/force_own_amp_eg", vco1_force_own_amp_eg, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco1/force_own_amp_eg", vco1_force_own_amp_eg, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco1/force_own_amp_eg", vco1_force_own_amp_eg, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco1/force_own_amp_eg", vco1_force_own_amp_eg, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco1/force_own_amp_eg", vco1_force_own_amp_eg, 7),
+    OSC_PSCALAR("/hds/vco2/force_own_amp_eg", vco2_force_own_amp_eg),
+    OSC_PSCALAR_AT("/hds/combi/0/vco2/force_own_amp_eg", vco2_force_own_amp_eg, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco2/force_own_amp_eg", vco2_force_own_amp_eg, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco2/force_own_amp_eg", vco2_force_own_amp_eg, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco2/force_own_amp_eg", vco2_force_own_amp_eg, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco2/force_own_amp_eg", vco2_force_own_amp_eg, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco2/force_own_amp_eg", vco2_force_own_amp_eg, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco2/force_own_amp_eg", vco2_force_own_amp_eg, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco2/force_own_amp_eg", vco2_force_own_amp_eg, 7),
+    OSC_PSCALAR("/hds/vco3/force_own_amp_eg", vco3_force_own_amp_eg),
+    OSC_PSCALAR_AT("/hds/combi/0/vco3/force_own_amp_eg", vco3_force_own_amp_eg, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco3/force_own_amp_eg", vco3_force_own_amp_eg, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco3/force_own_amp_eg", vco3_force_own_amp_eg, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco3/force_own_amp_eg", vco3_force_own_amp_eg, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco3/force_own_amp_eg", vco3_force_own_amp_eg, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco3/force_own_amp_eg", vco3_force_own_amp_eg, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco3/force_own_amp_eg", vco3_force_own_amp_eg, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco3/force_own_amp_eg", vco3_force_own_amp_eg, 7),
+    OSC_PSCALAR("/hds/vco4/force_own_amp_eg", vco4_force_own_amp_eg),
+    OSC_PSCALAR_AT("/hds/combi/0/vco4/force_own_amp_eg", vco4_force_own_amp_eg, 0),
+    OSC_PSCALAR_AT("/hds/combi/1/vco4/force_own_amp_eg", vco4_force_own_amp_eg, 1),
+    OSC_PSCALAR_AT("/hds/combi/2/vco4/force_own_amp_eg", vco4_force_own_amp_eg, 2),
+    OSC_PSCALAR_AT("/hds/combi/3/vco4/force_own_amp_eg", vco4_force_own_amp_eg, 3),
+    OSC_PSCALAR_AT("/hds/combi/4/vco4/force_own_amp_eg", vco4_force_own_amp_eg, 4),
+    OSC_PSCALAR_AT("/hds/combi/5/vco4/force_own_amp_eg", vco4_force_own_amp_eg, 5),
+    OSC_PSCALAR_AT("/hds/combi/6/vco4/force_own_amp_eg", vco4_force_own_amp_eg, 6),
+    OSC_PSCALAR_AT("/hds/combi/7/vco4/force_own_amp_eg", vco4_force_own_amp_eg, 7),
+
     OSC_ARRAY("/hds/ext_in/%d/enable", ext_in_enable, EXT_IN_PAIR_COUNT),
     OSC_ARRAY("/hds/ext_in/%d/gain", ext_in_gain, EXT_IN_PAIR_COUNT),
     OSC_ARRAY("/hds/ext_in/%d/stereo", ext_in_stereo, EXT_IN_PAIR_COUNT),
@@ -3468,6 +3563,8 @@ static void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].vco2_unison_saw_detune = 25.0f; knobs->programs[0].vco2_unison_saw_width = 50.0f;
     knobs->programs[0].mono_glide_random = 0.0f;
     knobs->programs[0].vco1_mute = 0.0f; knobs->programs[0].vco2_mute = 0.0f;
+    knobs->programs[0].vco1_force_own_amp_eg = 0.0f; knobs->programs[0].vco2_force_own_amp_eg = 0.0f;
+    knobs->programs[0].vco3_force_own_amp_eg = 0.0f; knobs->programs[0].vco4_force_own_amp_eg = 0.0f;
     knobs->programs[0].hard_sync_mode = 0.0f;
     // Arpeggiator: off by default (byte-identical to today's behavior for every existing
     // patch), Up/1 octave/1-8/70% gate/no Hold when a user does turn it on.
@@ -3625,6 +3722,16 @@ static void init_voice(SynthVoice *voice) {
     voice->vco2_sample_stream = -1; voice->vco2_sample_ptr = 0.0; voice->vco2_sample_preroll = false;
     voice->vco3_sample_stream = -1; voice->vco3_sample_ptr = 0.0; voice->vco3_sample_preroll = false;
     voice->vco4_sample_stream = -1; voice->vco4_sample_ptr = 0.0; voice->vco4_sample_preroll = false;
+    voice->vco1_layer_sample_stream = -1; voice->vco1_layer_sample_ptr = 0.0; voice->vco1_layer_sample_preroll = false;
+    voice->vco2_layer_sample_stream = -1; voice->vco2_layer_sample_ptr = 0.0; voice->vco2_layer_sample_preroll = false;
+    voice->vco3_layer_sample_stream = -1; voice->vco3_layer_sample_ptr = 0.0; voice->vco3_layer_sample_preroll = false;
+    voice->vco4_layer_sample_stream = -1; voice->vco4_layer_sample_ptr = 0.0; voice->vco4_layer_sample_preroll = false;
+    voice->vco1_xfade_gain = 1.0f; voice->vco1_layer_xfade_gain = 0.0f; voice->vco1_sample_delay_remaining = 0;
+    voice->vco2_xfade_gain = 1.0f; voice->vco2_layer_xfade_gain = 0.0f; voice->vco2_sample_delay_remaining = 0;
+    voice->vco3_xfade_gain = 1.0f; voice->vco3_layer_xfade_gain = 0.0f; voice->vco3_sample_delay_remaining = 0;
+    voice->vco4_xfade_gain = 1.0f; voice->vco4_layer_xfade_gain = 0.0f; voice->vco4_sample_delay_remaining = 0;
+    voice->vco1_using_own_ampeg = false; voice->vco2_using_own_ampeg = false;
+    voice->vco3_using_own_ampeg = false; voice->vco4_using_own_ampeg = false;
     for (int l = 0; l < LFO_COUNT; l++) {
         voice->lfo_phase[l] = 0.0f;
         voice->lfo_decim_counter[l] = 0;
@@ -3732,6 +3839,31 @@ static void mono_stack_remove(MonoNoteStack *stack, int note) {
 // which loaded slot a given (note, velocity) actually plays -- is the real per-note/velocity
 // mapping system (SFZ-style): see find_matching_sample_slot() and the Mapping tab in frontend.py.
 
+// HDS_SFZ_TRIGGER_*: SampleSlot.trigger_type/ZoneRecordWire.trigger_type values, mirroring SFZ's
+// own trigger= opcode. ATTACK (0, the default -- every zone that never sets trigger= at all, and
+// every zone built by the OSC-driven Mapping-tab path, which doesn't carry this opcode) is the
+// ordinary note-on match every pre-existing zone already behaves as. RELEASE/RELEASE_KEY fire on
+// note-off instead of note-on (see fire_release_trigger_zones()'s own comment). FIRST/LEGATO
+// restrict an ordinary note-on match to only the first key of a phrase / only an overlapping
+// legato note (see hds_sfz_trigger_matches_note_context()).
+#define HDS_SFZ_TRIGGER_ATTACK      0
+#define HDS_SFZ_TRIGGER_RELEASE     1
+#define HDS_SFZ_TRIGGER_RELEASE_KEY 2
+#define HDS_SFZ_TRIGGER_FIRST       3
+#define HDS_SFZ_TRIGGER_LEGATO      4
+
+// SFZ_MAX_VELCURVE_POINTS: amp_velcurve_<N>=<value> sets one (velocity, gain) breakpoint on a
+// custom velocity response curve -- the spec allows up to 128 (one per MIDI velocity value), but
+// real-world libraries that use this opcode at all set a small handful of breakpoints (a soft
+// "knee" or two), so a generous-but-bounded table trades an essentially unreachable ceiling for a
+// fixed, small footprint. A file that genuinely sets more than this many distinct breakpoints on
+// one region -- vanishingly rare -- just has its excess points ignored (logged), the same "skip,
+// don't crash" posture unparseable opcodes elsewhere in this file already have. Needed by both
+// SampleSlot (just below) and SfzRegion (further down) -- moved ahead of both rather than left by
+// SfzRegion's own declaration alone, which used to compile only by accident (SampleSlot's own
+// velcurve_point[]/velcurve_gain[] happened to be read before that #define was ever reached).
+#define SFZ_MAX_VELCURVE_POINTS 16
+
 // One loaded sample file's metadata plus its RAM pre-roll cache. Loaded via load_sample_slot(),
 // called from the audio thread only when the corresponding wire-protocol sample-slot path
 // actually changes (see the live-reload check in main()) -- never touched by the disk thread.
@@ -3810,6 +3942,90 @@ typedef struct {
     unsigned int playback_end_frame;
     float *pre_roll_l;
     float *pre_roll_r;
+
+    // --- SFZ first-class opcode support (appended) -- all pre-resolved by hds_load_sfz_for_osc()
+    // (which already applies SFZ's own per-opcode defaults for anything a zone doesn't set) before
+    // ever reaching this struct, same "no has_* flags stored past the parser" convention as
+    // loop_enabled/loop_release_exit/playback_end_frame above. ---
+
+    // loop_crossfade: -1 = not explicitly set by this zone -- keep the engine's own fixed
+    // SAMPLE_XFADE_SIZE crossfade (today's exact behavior, a practical click-avoidance measure
+    // that predates real loop_crossfade= support). >=0 = this zone's own explicit crossfade
+    // length in frames, INCLUDING 0 (an explicit "hard cut, no crossfade" author choice) -- see
+    // render_sample_osc's own loop-splice comment.
+    int loop_crossfade_frames;
+
+    // seq_length/seq_position: round-robin cycling, decoupled from `group` entirely now (a zone
+    // needs only seq_length>0 to participate -- no group= required, matching real SFZ semantics;
+    // see find_matching_sample_slot's own comment on why bucketing by group used to be wrong).
+    // seq_length 0 = not part of any sequence. seq_position 0 = unspecified (falls back to
+    // file/array-encounter order among tied siblings); >0 = this zone's own explicit 1-based
+    // ordinal.
+    int seq_length;
+    int seq_position;
+
+    // lorand/hirand: alternative/complementary random-variation matching -- a zone only matches
+    // when a per-note-on random draw in [0,1) falls inside [lorand,hirand). Defaults to the full
+    // range (0.0/1.0) when the zone doesn't set them, i.e. "always matches on this axis."
+    float lorand, hirand;
+
+    // choke_group/choke_off_by: SFZ's REAL group=/off_by= (e.g. a closed hi-hat's off_by=
+    // matching an open hi-hat's own group= chokes every currently-sounding voice from that
+    // group the instant the closed hat triggers) -- see apply_choke_group()'s own comment. 0 =
+    // none for either. Completely independent of seq_length/seq_position above.
+    int choke_group;
+    int choke_off_by;
+
+    // trigger_type: HDS_SFZ_TRIGGER_* -- attack (ordinary note-on, the default every pre-existing
+    // zone already behaves as), release/release_key (fires on note-off instead -- see
+    // fire_release_trigger_zones), first/legato (restricts an ordinary note-on match to only the
+    // first key of a phrase / only an overlapping legato note).
+    int trigger_type;
+
+    // sw_lokey/sw_hikey/sw_last: keyswitching. -1 on any field = that bound is unset. A zone that
+    // sets NONE of these three is never keyswitch-gated (matches on every ordinary note exactly as
+    // before). A zone that sets any of them only matches while this (owner_program, assigned_osc)
+    // pair's own tracked keyswitch_note (see HdsPendingLoadState.keyswitch_note) falls inside
+    // [sw_lokey,sw_hikey], or equals sw_last exactly when that's the only one given. See
+    // hds_sfz_zone_requires_keyswitch()/hds_sfz_keyswitch_matches().
+    int sw_lokey, sw_hikey, sw_last;
+
+    // rt_decay: extra release-stage decay (dB/second), meaningful only on a trigger=release zone
+    // -- see fire_release_trigger_zones's own comment. 0 = none.
+    float rt_decay;
+
+    // delay_seconds: silence this long after note-on before this zone's own stream actually
+    // starts (0 = immediate, today's exact default) -- see start_sample_osc's own delay-arming
+    // comment.
+    float delay_seconds;
+
+    // ampeg_*: this zone's OWN complete amp envelope, in SFZ's own units and already defaulted
+    // (see HdsAmpEgOverride's own comment for the full "zone's own envelope OR the Program's,
+    // never blended" design) -- has_own_ampeg is false when the zone set NONE of the ampeg_*
+    // opcodes at all (the ordinary, unaffected case: the Program's own Amp EG is used exactly as
+    // it always has been, regardless of vco1_force_own_amp_eg).
+    bool has_own_ampeg;
+    float ampeg_delay, ampeg_attack, ampeg_hold, ampeg_decay, ampeg_sustain, ampeg_release, ampeg_start;
+
+    // note_polyphony: caps how many voices may simultaneously hold a claimed stream against THIS
+    // one zone_id -- see start_sample_osc's own gate. 0 = unlimited (today's exact default).
+    int note_polyphony;
+
+    // amp_velcurve_N: a custom, piecewise-linear velocity-to-gain response curve -- see
+    // sfz_velcurve_gain()'s own comment. velcurve_count 0 = no custom curve at all (the ordinary,
+    // unaffected case -- velocity affects level only via whatever the Program's own voice
+    // amplitude already does, exactly as before).
+    int velcurve_count;
+    int velcurve_point[SFZ_MAX_VELCURVE_POINTS];
+    float velcurve_gain[SFZ_MAX_VELCURVE_POINTS];
+
+    // xfin_*/xfout_* (velocity, then key): crossfade LAYERING -- unlike an ordinary lovel/hivel
+    // hard boundary (exactly one zone ever matches), a zone with these set can sound
+    // SIMULTANEOUSLY with a neighboring zone across the shared boundary range, mixed by a linear
+    // gain ramp -- see render_sample_osc's own crossfade-layer mixing comment. -1 on any field =
+    // that crossfade edge is unset (no layering on that axis for this zone).
+    int xfin_lovel, xfin_hivel, xfout_lovel, xfout_hivel;
+    int xfin_lokey, xfin_hikey, xfout_lokey, xfout_hikey;
 } SampleSlot;
 
 // Part of the multi-instance refactor's HdsEngineState consolidation (see its main definition,
@@ -4003,7 +4219,7 @@ static bool load_sample_slot(HdsSampleEngine *se, int index, const char *path, i
 // 0-1 fractions ZoneRecordWire actually carries. Deliberately a small, independent duplicate of
 // load_sample_slot()'s chunk-walk rather than a shared sub-helper both call -- load_sample_slot()
 // is a heavily-exercised, already-correct hot path; this keeps that function untouched.
-static bool read_wav_frame_count(const char *path, unsigned int *out_total_frames) {
+static bool read_wav_frame_count(const char *path, unsigned int *out_total_frames, unsigned int *out_sample_rate) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
     char chunk_id[4];
@@ -4024,7 +4240,8 @@ static bool read_wav_frame_count(const char *path, unsigned int *out_total_frame
     SAMPLE_CHECK_READ(&byte_rate, 4, 1, f);
     SAMPLE_CHECK_READ(&block_align, 2, 1, f);
     SAMPLE_CHECK_READ(&bits_per_sample, 2, 1, f);
-    (void)audio_format; (void)sample_rate; (void)byte_rate; (void)block_align;
+    (void)audio_format; (void)byte_rate; (void)block_align;
+    if (out_sample_rate) *out_sample_rate = sample_rate;
     if (subchunk1_size > 16) fseek(f, subchunk1_size - 16, SEEK_CUR);
     SAMPLE_CHECK_READ(chunk_id, 1, 4, f);
     while (strncmp(chunk_id, "data", 4) != 0) {
@@ -4063,6 +4280,9 @@ static bool read_wav_frame_count(const char *path, unsigned int *out_total_frame
 // pitch_keycenter as note-name-or-int; loop_start/loop_end/offset/end as frame counts, which need
 // total_frames -- only known once sample= resolves -- before they can become a 0-1 fraction).
 #define SFZ_TEXT_FIELD_LEN 32
+// SFZ_MAX_VELCURVE_POINTS itself now lives up near SampleSlot's own velcurve_point[]/velcurve_gain[]
+// fields (which need it too, and are declared well before this point in the file) -- see that
+// #define's own comment, unchanged.
 typedef struct {
     bool has_sample;              char sample[SAMPLE_PATH_LEN];
     bool has_key;                  char key[SFZ_TEXT_FIELD_LEN];
@@ -4075,6 +4295,7 @@ typedef struct {
     bool has_loop_mode;            char loop_mode[24];
     bool has_loop_start;           char loop_start[SFZ_TEXT_FIELD_LEN];
     bool has_loop_end;             char loop_end[SFZ_TEXT_FIELD_LEN];
+    bool has_loop_crossfade;       float loop_crossfade; // seconds
     bool has_offset;               char offset[SFZ_TEXT_FIELD_LEN];
     bool has_end;                  char end[SFZ_TEXT_FIELD_LEN];
     bool has_tune;                 float tune;
@@ -4082,8 +4303,96 @@ typedef struct {
     bool has_volume;               float volume;
     bool has_pan;                  float pan;
     bool has_direction;            char direction[16];
-    bool has_group;                char group[SFZ_TEXT_FIELD_LEN];
-    bool has_seq_length;           // presence only, matches "group= AND seq_length=" round-robin gate
+    // group=/off_by=: real SFZ polyphony/choke-group semantics (e.g. a closed hi-hat region's
+    // off_by= matching an open hi-hat region's own group= chokes the open hat the instant the
+    // closed one triggers) -- see apply_choke_group()'s own comment. Deliberately NOT the same
+    // thing round-robin cycling uses any more (see seq_length/seq_position below and
+    // hds_load_sfz_for_osc's own comment on why bucketing by group= was never spec-correct in the
+    // first place). Real SFZ group ids are always plain non-negative integers.
+    bool has_group;                int group;
+    bool has_off_by;               int off_by;
+    bool has_seq_length;           int seq_length;
+    // seq_position (1-based): explicit round-robin ordinal. Without this, cycling order can only
+    // ever be "the order regions happen to appear in the file" -- usually the same thing, but not
+    // guaranteed, and not what the opcode is actually FOR. Defaults to 0 (meaning "unspecified,
+    // fall back to file-encounter order") -- see find_matching_sample_slot's own comment.
+    bool has_seq_position;         int seq_position;
+    // lorand/hirand: an alternative (or complementary -- both can be set on the same region) to
+    // round-robin, matching only when a per-note-on random draw in [0,1) falls inside [lorand,
+    // hirand). Defaults to the full [0,1) range when unset, i.e. "always matches on this axis."
+    bool has_lorand;               float lorand;
+    bool has_hirand;               float hirand;
+    // trigger=: "attack" (default, unset) is the ordinary note-on match every existing zone
+    // already gets; "release"/"release_key" fire on note-OFF instead (see
+    // fire_release_trigger_zones()'s own comment); "first"/"legato" restrict an ordinary note-on
+    // match to only the first key of a phrase / only an overlapping legato note respectively (the
+    // same distinction Mono Legato already tracks per-Program -- see
+    // hds_sfz_trigger_matches_note_context()).
+    bool has_trigger;              char trigger[16];
+    // sw_lokey/sw_hikey/sw_last/sw_default: keyswitching -- see HdsEngineState.keyswitch_note's
+    // own comment and hds_sfz_trigger_matches_keyswitch(). A key inside [sw_lokey,sw_hikey] is a
+    // keyswitch trigger for this Program's own oscillator, not an ordinary playable note: pressing
+    // it updates keyswitch_note and produces no sound of its own (matches every real keyswitch
+    // library's own convention). Regions that specify sw_lokey/sw_hikey (on ANY region in the
+    // file, control-block-wide in practice, but tracked per-region here rather than adding a THIRD
+    // accumulator scope, since <global>/<group> inheritance already gets it into ordinary regions
+    // as if it were any other opcode) become eligible for an ordinary note only while the last
+    // keyswitch pressed falls inside the region's OWN declared keyswitch range from sw_default
+    // (used before ANY keyswitch has ever been pressed) or sw_last (a legacy-but-common single-
+    // value alternative to the lokey/hikey pair, meaning "matches only this exact keyswitch note").
+    bool has_sw_lokey;             char sw_lokey[SFZ_TEXT_FIELD_LEN];
+    bool has_sw_hikey;             char sw_hikey[SFZ_TEXT_FIELD_LEN];
+    bool has_sw_last;              char sw_last[SFZ_TEXT_FIELD_LEN];
+    bool has_sw_default;           char sw_default[SFZ_TEXT_FIELD_LEN];
+    // xfin_lovel/xfin_hivel, xfout_lovel/xfout_hivel (+ the xfin_lokey/xfin_hikey/xfout_lokey/
+    // xfout_hikey key-range equivalents): velocity/key-range CROSSFADE layering -- see
+    // render_sample_osc's own crossfade-layer mixing comment and SampleSlot.xfade_*'s own fields.
+    // Unlike a hard lovel/hivel boundary (one zone or the other, never both), these let two (or
+    // more) regions BOTH sound simultaneously across a shared boundary range, mixed by a linear
+    // gain ramp -- e.g. a soft velocity layer fading out exactly as a hard layer fades in, instead
+    // of an audible hard switch at one fixed velocity.
+    bool has_xfin_lovel;           int xfin_lovel;
+    bool has_xfin_hivel;           int xfin_hivel;
+    bool has_xfout_lovel;          int xfout_lovel;
+    bool has_xfout_hivel;          int xfout_hivel;
+    bool has_xfin_lokey;           char xfin_lokey[SFZ_TEXT_FIELD_LEN];
+    bool has_xfin_hikey;           char xfin_hikey[SFZ_TEXT_FIELD_LEN];
+    bool has_xfout_lokey;          char xfout_lokey[SFZ_TEXT_FIELD_LEN];
+    bool has_xfout_hikey;          char xfout_hikey[SFZ_TEXT_FIELD_LEN];
+    // rt_decay: extra release-stage decay (dB/second) applied only to a trigger=release zone,
+    // scaled by how long the original note was actually held -- see fire_release_trigger_zones()'s
+    // own comment. Meaningless on an ordinary attack-triggered zone.
+    bool has_rt_decay;             float rt_decay;
+    // delay: seconds to wait after note-on before this region's own playback actually starts
+    // (silence, not a slow attack) -- see start_sample_osc's own delay-arming comment.
+    bool has_delay;                float delay;
+    // ampeg_*: per-zone amp envelope -- strictly EITHER this zone's own SFZ-defined envelope OR
+    // the Program's own Play-tab Amp EG for this oscillator, never a blend of the two (see
+    // ProgramState.vco1_force_own_amp_eg's own comment for the one explicit switch between them).
+    // When this zone's own envelope is the one in effect, any ampeg_* stage it does NOT set uses
+    // SFZ's own standard default for that stage (0 for delay/attack/hold/decay/start, 100 for
+    // sustain, an effectively-instant release) -- never the Program's own per-stage knob value.
+    // ampeg_start is SFZ's name for the envelope's own starting level (0-100), the same "Attack
+    // Start Level" concept PackEGParams.al already has.
+    bool has_ampeg_delay;          float ampeg_delay;   // seconds
+    bool has_ampeg_attack;         float ampeg_attack;  // seconds
+    bool has_ampeg_hold;           float ampeg_hold;    // seconds
+    bool has_ampeg_decay;          float ampeg_decay;   // seconds
+    bool has_ampeg_sustain;        float ampeg_sustain; // 0-100
+    bool has_ampeg_release;        float ampeg_release; // seconds
+    bool has_ampeg_start;          float ampeg_start;   // 0-100
+    // note_polyphony: caps how many voices may simultaneously hold a claimed stream against THIS
+    // one zone (by zone_id) -- see start_sample_osc's own note_polyphony gate. 0/unset = no cap
+    // (today's own unlimited behavior).
+    bool has_note_polyphony;       int note_polyphony;
+    // amp_velcurve_<N>=<value>: a custom, non-linear velocity-to-gain response curve, as explicit
+    // (velocity 0-127, gain 0-1) breakpoints -- piecewise-linearly interpolated between them at
+    // note-on (see sfz_velcurve_gain()). velcurve_point/velcurve_gain run in parallel, always kept
+    // sorted by ascending point as opcodes are applied (sfz_apply_opcode's own insertion-sort) so
+    // sfz_velcurve_gain() never needs to sort at note-on time.
+    int velcurve_count;
+    int velcurve_point[SFZ_MAX_VELCURVE_POINTS];
+    float velcurve_gain[SFZ_MAX_VELCURVE_POINTS];
 } SfzRegion;
 
 #define SFZ_MAX_REGIONS_PER_FILE 65536
@@ -4261,6 +4570,7 @@ static void sfz_apply_opcode(SfzRegion *r, const char *key, const char *value) {
     else if (strcasecmp(key, "loop_mode") == 0) { r->has_loop_mode = true; sfz_set_text_field(r->loop_mode, sizeof(r->loop_mode), value); }
     else if (strcasecmp(key, "loop_start") == 0) { r->has_loop_start = true; sfz_set_text_field(r->loop_start, sizeof(r->loop_start), value); }
     else if (strcasecmp(key, "loop_end") == 0) { r->has_loop_end = true; sfz_set_text_field(r->loop_end, sizeof(r->loop_end), value); }
+    else if (strcasecmp(key, "loop_crossfade") == 0) { r->has_loop_crossfade = true; r->loop_crossfade = (float)atof(value); }
     else if (strcasecmp(key, "offset") == 0) { r->has_offset = true; sfz_set_text_field(r->offset, sizeof(r->offset), value); }
     else if (strcasecmp(key, "end") == 0) { r->has_end = true; sfz_set_text_field(r->end, sizeof(r->end), value); }
     else if (strcasecmp(key, "tune") == 0 || strcasecmp(key, "pitch") == 0) {
@@ -4271,10 +4581,57 @@ static void sfz_apply_opcode(SfzRegion *r, const char *key, const char *value) {
     else if (strcasecmp(key, "volume") == 0) { r->has_volume = true; r->volume = (float)atof(value); }
     else if (strcasecmp(key, "pan") == 0) { r->has_pan = true; r->pan = (float)atof(value); }
     else if (strcasecmp(key, "direction") == 0) { r->has_direction = true; sfz_set_text_field(r->direction, sizeof(r->direction), value); }
-    else if (strcasecmp(key, "group") == 0) { r->has_group = true; sfz_set_text_field(r->group, sizeof(r->group), value); }
-    else if (strcasecmp(key, "seq_length") == 0) { r->has_seq_length = true; }
-    // Any other opcode (ADSR, filter, curve, etc.) is silently ignored -- out of scope for HDS's
-    // own zone model, same posture _build_zones_from_sfz's own opcode table already has.
+    else if (strcasecmp(key, "group") == 0) { r->has_group = true; r->group = atoi(value); }
+    else if (strcasecmp(key, "off_by") == 0 || strcasecmp(key, "offby") == 0) { r->has_off_by = true; r->off_by = atoi(value); }
+    else if (strcasecmp(key, "seq_length") == 0) { r->has_seq_length = true; r->seq_length = atoi(value); }
+    else if (strcasecmp(key, "seq_position") == 0) { r->has_seq_position = true; r->seq_position = atoi(value); }
+    else if (strcasecmp(key, "lorand") == 0) { r->has_lorand = true; r->lorand = (float)atof(value); }
+    else if (strcasecmp(key, "hirand") == 0) { r->has_hirand = true; r->hirand = (float)atof(value); }
+    else if (strcasecmp(key, "trigger") == 0) { r->has_trigger = true; sfz_set_text_field(r->trigger, sizeof(r->trigger), value); }
+    else if (strcasecmp(key, "sw_lokey") == 0) { r->has_sw_lokey = true; sfz_set_text_field(r->sw_lokey, sizeof(r->sw_lokey), value); }
+    else if (strcasecmp(key, "sw_hikey") == 0) { r->has_sw_hikey = true; sfz_set_text_field(r->sw_hikey, sizeof(r->sw_hikey), value); }
+    else if (strcasecmp(key, "sw_last") == 0) { r->has_sw_last = true; sfz_set_text_field(r->sw_last, sizeof(r->sw_last), value); }
+    else if (strcasecmp(key, "sw_default") == 0) { r->has_sw_default = true; sfz_set_text_field(r->sw_default, sizeof(r->sw_default), value); }
+    else if (strcasecmp(key, "xfin_lovel") == 0) { r->has_xfin_lovel = true; r->xfin_lovel = atoi(value); }
+    else if (strcasecmp(key, "xfin_hivel") == 0) { r->has_xfin_hivel = true; r->xfin_hivel = atoi(value); }
+    else if (strcasecmp(key, "xfout_lovel") == 0) { r->has_xfout_lovel = true; r->xfout_lovel = atoi(value); }
+    else if (strcasecmp(key, "xfout_hivel") == 0) { r->has_xfout_hivel = true; r->xfout_hivel = atoi(value); }
+    else if (strcasecmp(key, "xfin_lokey") == 0) { r->has_xfin_lokey = true; sfz_set_text_field(r->xfin_lokey, sizeof(r->xfin_lokey), value); }
+    else if (strcasecmp(key, "xfin_hikey") == 0) { r->has_xfin_hikey = true; sfz_set_text_field(r->xfin_hikey, sizeof(r->xfin_hikey), value); }
+    else if (strcasecmp(key, "xfout_lokey") == 0) { r->has_xfout_lokey = true; sfz_set_text_field(r->xfout_lokey, sizeof(r->xfout_lokey), value); }
+    else if (strcasecmp(key, "xfout_hikey") == 0) { r->has_xfout_hikey = true; sfz_set_text_field(r->xfout_hikey, sizeof(r->xfout_hikey), value); }
+    else if (strcasecmp(key, "rt_decay") == 0) { r->has_rt_decay = true; r->rt_decay = (float)atof(value); }
+    else if (strcasecmp(key, "delay") == 0) { r->has_delay = true; r->delay = (float)atof(value); }
+    else if (strcasecmp(key, "ampeg_delay") == 0) { r->has_ampeg_delay = true; r->ampeg_delay = (float)atof(value); }
+    else if (strcasecmp(key, "ampeg_attack") == 0) { r->has_ampeg_attack = true; r->ampeg_attack = (float)atof(value); }
+    else if (strcasecmp(key, "ampeg_hold") == 0) { r->has_ampeg_hold = true; r->ampeg_hold = (float)atof(value); }
+    else if (strcasecmp(key, "ampeg_decay") == 0) { r->has_ampeg_decay = true; r->ampeg_decay = (float)atof(value); }
+    else if (strcasecmp(key, "ampeg_sustain") == 0) { r->has_ampeg_sustain = true; r->ampeg_sustain = (float)atof(value); }
+    else if (strcasecmp(key, "ampeg_release") == 0) { r->has_ampeg_release = true; r->ampeg_release = (float)atof(value); }
+    else if (strcasecmp(key, "ampeg_start") == 0) { r->has_ampeg_start = true; r->ampeg_start = (float)atof(value); }
+    else if (strcasecmp(key, "note_polyphony") == 0) { r->has_note_polyphony = true; r->note_polyphony = atoi(value); }
+    else if (strncasecmp(key, "amp_velcurve_", 13) == 0) {
+        // amp_velcurve_<N>=<value> -- a dynamic opcode NAME, not a fixed one: the velocity point
+        // is embedded in the key itself. Kept sorted by ascending point as each one is applied (a
+        // plain insertion, never more than SFZ_MAX_VELCURVE_POINTS long) so sfz_velcurve_gain()
+        // can binary/linear-scan it directly at note-on without needing its own sort pass.
+        int point = atoi(key + 13);
+        if (point < 0) point = 0; else if (point > 127) point = 127;
+        float gain = (float)atof(value);
+        int insert_at = r->velcurve_count;
+        for (int i = 0; i < r->velcurve_count; i++) {
+            if (r->velcurve_point[i] == point) { r->velcurve_gain[i] = gain; return; } // re-set of the same point -- replace in place, don't grow
+            if (r->velcurve_point[i] > point) { insert_at = i; break; }
+        }
+        if (r->velcurve_count >= SFZ_MAX_VELCURVE_POINTS) return; // table full -- see SFZ_MAX_VELCURVE_POINTS's own comment
+        for (int i = r->velcurve_count; i > insert_at; i--) { r->velcurve_point[i] = r->velcurve_point[i - 1]; r->velcurve_gain[i] = r->velcurve_gain[i - 1]; }
+        r->velcurve_point[insert_at] = point;
+        r->velcurve_gain[insert_at] = gain;
+        r->velcurve_count++;
+    }
+    // Any other opcode (filter, curve, MIDI CC modulation, etc.) is silently ignored -- out of
+    // scope for HDS's own zone model, same posture _build_zones_from_sfz's own opcode table
+    // already has.
 }
 
 // Tokenizes one already-comment-stripped, #include-blanked text buffer into <global>/<group>/
@@ -4374,6 +4731,78 @@ static void sfz_tokenize_and_apply(const char *text, const char *base_dir, SfzRe
     }
 }
 
+// "#define $NAME value" -- SFZ's own macro-substitution mechanism, letting a file parameterize
+// repeated values (velocity splits, tuning offsets, ...) instead of typing them out per region.
+// Scoped to the ONE file that declares it (not threaded into #include'd children, unlike
+// out_default_path being explicitly NOT threaded either -- see sfz_parse_file_recursive's own
+// comment on that) -- the same "cover the common, single-file case; a cross-file macro is rare
+// enough not to be worth the extra plumbing" posture. Without this at all, a file using #define
+// would have every opcode referencing "$NAME" fail its own numeric parse (atoi/atof silently
+// read 0 from a string starting with '$'), corrupting that opcode instead of just not honoring
+// the shorthand.
+#define SFZ_MAX_DEFINES 64
+typedef struct { char name[SFZ_TEXT_FIELD_LEN]; char value[SFZ_TEXT_FIELD_LEN]; } SfzDefine;
+
+// Substitutes every "$NAME" occurrence in `src` with its #define'd value, returning a freshly
+// malloc'd buffer (caller frees) sized to fit exactly -- computed via one length-counting pass
+// before the real copy pass, rather than an oversized guess, since macro values can be either
+// longer or shorter than their own name. Returns NULL (meaning "nothing to substitute, keep using
+// the original buffer unchanged") when define_count is 0, so the overwhelmingly common
+// no-#define-at-all file pays zero allocation cost for this feature. Matches longest name first
+// (sorted once, up front) so a shorter macro that happens to prefix a longer one (e.g. $VEL
+// against $VELOCITY) never wins by accident, and only ever matches a WHOLE "$NAME" token --
+// requires the character immediately after the name to not itself continue an identifier.
+static char *sfz_substitute_defines(const char *src, size_t src_len, const SfzDefine *defines, int define_count, size_t *out_len) {
+    if (define_count <= 0) return NULL;
+    SfzDefine sorted[SFZ_MAX_DEFINES];
+    memcpy(sorted, defines, sizeof(SfzDefine) * (size_t)define_count);
+    for (int i = 1; i < define_count; i++) {
+        SfzDefine key = sorted[i]; int j = i - 1;
+        while (j >= 0 && strlen(sorted[j].name) < strlen(key.name)) { sorted[j + 1] = sorted[j]; j--; }
+        sorted[j + 1] = key;
+    }
+
+    size_t out_size = 0;
+    for (size_t i = 0; i < src_len;) {
+        int matched = -1;
+        if (src[i] == '$') {
+            for (int d = 0; d < define_count; d++) {
+                size_t nlen = strlen(sorted[d].name);
+                if (nlen > 0 && i + nlen <= src_len && strncmp(src + i, sorted[d].name, nlen) == 0) {
+                    char next = (i + nlen < src_len) ? src[i + nlen] : '\0';
+                    if (!isalnum((unsigned char)next) && next != '_') { matched = d; break; }
+                }
+            }
+        }
+        if (matched >= 0) { out_size += strlen(sorted[matched].value); i += strlen(sorted[matched].name); }
+        else { out_size++; i++; }
+    }
+
+    char *dst = (char *)malloc(out_size + 1);
+    if (!dst) return NULL;
+    size_t w = 0;
+    for (size_t i = 0; i < src_len;) {
+        int matched = -1;
+        if (src[i] == '$') {
+            for (int d = 0; d < define_count; d++) {
+                size_t nlen = strlen(sorted[d].name);
+                if (nlen > 0 && i + nlen <= src_len && strncmp(src + i, sorted[d].name, nlen) == 0) {
+                    char next = (i + nlen < src_len) ? src[i + nlen] : '\0';
+                    if (!isalnum((unsigned char)next) && next != '_') { matched = d; break; }
+                }
+            }
+        }
+        if (matched >= 0) {
+            size_t vlen = strlen(sorted[matched].value);
+            memcpy(dst + w, sorted[matched].value, vlen); w += vlen;
+            i += strlen(sorted[matched].name);
+        } else { dst[w++] = src[i]; i++; }
+    }
+    dst[w] = '\0';
+    *out_len = out_size;
+    return dst;
+}
+
 // Reads `path`, strips "//" comments and blanks "#include \"...\"" lines (mirrors _parse_sfz's
 // own two-pass shape: strip/tokenize first, separately re-scan the raw text for #include lines
 // and recurse into each). Cycle guard: `visited_realpaths` is a caller-owned array of
@@ -4404,11 +4833,13 @@ static void sfz_parse_file_recursive(const char *path, SfzRegion *out_regions, i
     char *last_slash = strrchr(sfz_dir, '/');
     if (last_slash) *last_slash = '\0'; else snprintf(sfz_dir, sizeof(sfz_dir), ".");
 
-    // Strip "//" comments (blank to end of line) and collect+blank "#include \"...\"" lines, in
-    // one forward pass over the mutable buffer.
+    // Strip "//" comments (blank to end of line), collect+blank "#include \"...\"" lines, and
+    // collect+blank "#define $NAME value" lines, in one forward pass over the mutable buffer.
     #define SFZ_MAX_INCLUDES_PER_FILE 64
     char include_paths[SFZ_MAX_INCLUDES_PER_FILE][SAMPLE_PATH_LEN];
     int include_count = 0;
+    SfzDefine defines[SFZ_MAX_DEFINES];
+    int define_count = 0;
     for (size_t i = 0; i < read_n; i++) {
         if (buf[i] == '/' && i + 1 < read_n && buf[i + 1] == '/') {
             while (i < read_n && buf[i] != '\n') buf[i++] = ' ';
@@ -4427,10 +4858,39 @@ static void sfz_parse_file_recursive(const char *path, SfzRegion *out_regions, i
                     i = k;
                 }
             }
+        } else if (buf[i] == '#' && strncmp(buf + i, "#define", 7) == 0 && (i + 7 >= read_n || isspace((unsigned char)buf[i + 7]))) {
+            size_t line_start = i;
+            size_t j = i + 7;
+            while (j < read_n && buf[j] != '\n' && isspace((unsigned char)buf[j])) j++;
+            if (j < read_n && buf[j] == '$') {
+                size_t name_start = j;
+                while (j < read_n && (isalnum((unsigned char)buf[j]) || buf[j] == '_')) j++;
+                size_t name_len = j - name_start;
+                while (j < read_n && buf[j] != '\n' && isspace((unsigned char)buf[j])) j++;
+                size_t value_start = j;
+                while (j < read_n && !isspace((unsigned char)buf[j])) j++;
+                size_t value_len = j - value_start;
+                size_t line_end = j;
+                while (line_end < read_n && buf[line_end] != '\n') line_end++;
+                if (define_count < SFZ_MAX_DEFINES && name_len > 0 && name_len < sizeof(defines[0].name) && value_len < sizeof(defines[0].value)) {
+                    memcpy(defines[define_count].name, buf + name_start, name_len); defines[define_count].name[name_len] = '\0';
+                    memcpy(defines[define_count].value, buf + value_start, value_len); defines[define_count].value[value_len] = '\0';
+                    define_count++;
+                }
+                for (size_t z = line_start; z < line_end; z++) buf[z] = ' '; // blank the whole directive
+                i = line_end;
+            }
         }
     }
 
-    sfz_tokenize_and_apply(buf, sfz_dir, out_regions, max_regions, io_region_count, out_default_path, out_default_path_len);
+    size_t expanded_len = 0;
+    char *expanded = sfz_substitute_defines(buf, read_n, defines, define_count, &expanded_len);
+    if (expanded) {
+        sfz_tokenize_and_apply(expanded, sfz_dir, out_regions, max_regions, io_region_count, out_default_path, out_default_path_len);
+        free(expanded);
+    } else {
+        sfz_tokenize_and_apply(buf, sfz_dir, out_regions, max_regions, io_region_count, out_default_path, out_default_path_len);
+    }
     free(buf);
 
     for (int inc = 0; inc < include_count; inc++) {
@@ -4955,7 +5415,55 @@ typedef struct {
     // appended (19th float), same convention. See SampleSlot.owner_program.
     float owner_program;
     char path[SAMPLE_PATH_LEN];
+
+    // --- SFZ first-class opcode support (appended) -- deliberately in-memory-only, NOT part of
+    // the OSC wire byte protocol above: zone_upsert_handler's own "19 consecutive floats" loop
+    // never touches these, so every OSC-driven zone (the frontend Mapping tab, the Python SFZ
+    // importer) always gets them from zone_record_wire_set_sfz_defaults() below, i.e. "every one
+    // of these SFZ-only features is off for this zone" -- only hds_load_sfz_for_osc()'s own
+    // native parser ever sets these fields to anything else. Field meanings mirror SampleSlot's
+    // own fields of the same names exactly (this struct is just apply_zone_upsert()'s transient
+    // input, copied field-for-field into the matching SampleSlot on a successful load). ---
+    int loop_crossfade_frames; // -1 = unset (keep the engine's own fixed crossfade)
+    int seq_length, seq_position;
+    float lorand, hirand; // defaults 0.0/1.0 (the full, "always matches" range)
+    int choke_group, choke_off_by;
+    int trigger_type; // HDS_SFZ_TRIGGER_*
+    int sw_lokey, sw_hikey, sw_last; // -1 = unset
+    float rt_decay;
+    float delay_seconds;
+    int has_own_ampeg; // 0/1, same OSC-safe "plain int, not bool" convention as unpitched/reverse/... above
+    float ampeg_delay, ampeg_attack, ampeg_hold, ampeg_decay, ampeg_sustain, ampeg_release, ampeg_start;
+    int note_polyphony;
+    int velcurve_count;
+    int velcurve_point[SFZ_MAX_VELCURVE_POINTS];
+    float velcurve_gain[SFZ_MAX_VELCURVE_POINTS];
+    int xfin_lovel, xfin_hivel, xfout_lovel, xfout_hivel; // -1 = unset
+    int xfin_lokey, xfin_hikey, xfout_lokey, xfout_hikey; // -1 = unset
 } ZoneRecordWire;
+
+// Fills every SFZ-first-class field of `rec` with "this feature is off for this zone" -- the
+// state every OSC-driven zone (never carries these opcodes at all) must end up in. Called first by
+// both zone_upsert_handler() (whose own core-19-floats loop leaves them untouched afterward) and
+// hds_load_sfz_for_osc() (which then overwrites the ones its own parsed SfzRegion actually sets),
+// so neither call site can forget a field and leave it as uninitialized stack garbage.
+static void zone_record_wire_set_sfz_defaults(ZoneRecordWire *rec) {
+    rec->loop_crossfade_frames = -1;
+    rec->seq_length = 0; rec->seq_position = 0;
+    rec->lorand = 0.0f; rec->hirand = 1.0f;
+    rec->choke_group = 0; rec->choke_off_by = 0;
+    rec->trigger_type = HDS_SFZ_TRIGGER_ATTACK;
+    rec->sw_lokey = -1; rec->sw_hikey = -1; rec->sw_last = -1;
+    rec->rt_decay = 0.0f;
+    rec->delay_seconds = 0.0f;
+    rec->has_own_ampeg = 0;
+    rec->ampeg_delay = 0.0f; rec->ampeg_attack = 0.0f; rec->ampeg_hold = 0.0f; rec->ampeg_decay = 0.0f;
+    rec->ampeg_sustain = 100.0f; rec->ampeg_release = 0.0f; rec->ampeg_start = 0.0f;
+    rec->note_polyphony = 0;
+    rec->velcurve_count = 0;
+    rec->xfin_lovel = -1; rec->xfin_hivel = -1; rec->xfout_lovel = -1; rec->xfout_hivel = -1;
+    rec->xfin_lokey = -1; rec->xfin_hikey = -1; rec->xfout_lokey = -1; rec->xfout_hikey = -1;
+}
 
 // A zone whose file needs (re)loading, queued rather than loaded immediately -- see
 // drain_pending_sample_loads()'s comment. A plain ring buffer, audio-thread-only (both the
@@ -4975,6 +5483,28 @@ typedef struct {
     bool loop_release_exit;
     float end_frac;
     int assigned_osc; // 0-3 -- see SampleSlot.assigned_osc
+
+    // --- SFZ first-class opcode support (appended) -- carried through the queue exactly like
+    // every other per-zone field above, then copied onto the SampleSlot once the load actually
+    // completes (see drain_pending_sample_loads()). Field meanings mirror SampleSlot's own fields
+    // of the same names exactly; see ZoneRecordWire's matching block for the OSC-safe defaults an
+    // ordinary (non-SFZ-native) zone always carries here. ---
+    int loop_crossfade_frames;
+    int seq_length, seq_position;
+    float lorand, hirand;
+    int choke_group, choke_off_by;
+    int trigger_type;
+    int sw_lokey, sw_hikey, sw_last;
+    float rt_decay;
+    float delay_seconds;
+    bool has_own_ampeg;
+    float ampeg_delay, ampeg_attack, ampeg_hold, ampeg_decay, ampeg_sustain, ampeg_release, ampeg_start;
+    int note_polyphony;
+    int velcurve_count;
+    int velcurve_point[SFZ_MAX_VELCURVE_POINTS];
+    float velcurve_gain[SFZ_MAX_VELCURVE_POINTS];
+    int xfin_lovel, xfin_hivel, xfout_lovel, xfout_hivel;
+    int xfin_lokey, xfin_hikey, xfout_lokey, xfout_hikey;
 } PendingSampleLoad;
 #define PENDING_SAMPLE_LOAD_CAPACITY 4096
 // How many queued sample loads (each a bounded, one-file blocking file-open+pre-roll-decode) the
@@ -4984,6 +5514,24 @@ typedef struct {
 // thread for its own load duration -- this bounds how many such stalls can pile up per block, not
 // how long any single one can take).
 #define SAMPLE_LOADS_PER_BLOCK 1
+
+// trigger=release/release_key: a small fixed pool of one-shot "release tail" players, entirely
+// independent of the ordinary voices[]/SynthVoice.vcoN_sample_stream playback path -- see
+// fire_release_trigger_zones()'s own comment. 16 simultaneous release-triggered samples across the
+// whole engine is generous for what this opcode is actually used for in practice (piano key-
+// release noise, mechanical thumps, etc., usually a handful of overlapping notes' tails at once).
+#define HDS_RELEASE_TAIL_POOL_SIZE 16
+typedef struct {
+    bool active;
+    int stream_idx;       // claimed SampleStream pool index, or -1 (inactive)
+    double ptr;
+    bool preroll;
+    int owner_program;    // which mixed_l[]/mixed_r[] bus this player's output sums into
+    float play_hz;         // fixed at fire time -- see fire_release_trigger_zones's own comment
+    float gain;             // current linear gain, decayed every sample by decay_per_sample below
+    float decay_per_sample; // rt_decay=, converted from dB/sec to a per-sample linear multiplier;
+                            // 1.0f (no decay at all) for a zone that doesn't set rt_decay=.
+} HdsReleaseTailPlayer;
 
 // This tier (see HdsSampleSlotState's own comment for why this is split into several structs):
 // the throttled sample-load queue plus round-robin cycling state, grouped together since both
@@ -4999,6 +5547,23 @@ typedef struct HdsPendingLoadState {
     // Programs sharing the same oscillator + round_robin_group number cycle independently too,
     // same reasoning as the oscillator dimension's own comment.
     unsigned int round_robin_hit_count[SINGLE_PROGRAM_SLOT + 1][4][MAX_ROUND_ROBIN_GROUPS + 1];
+
+    // Keyswitching (sw_lokey/sw_hikey/sw_last/sw_default) state -- one tracked "last keyswitch
+    // note pressed" per (owner_program, assigned_osc) pair, same scoping reasoning as
+    // round_robin_hit_count just above. Stored as note+1 (0 = "no keyswitch pressed yet on this
+    // (Program, oscillator), and no sw_default= was set by its SFZ either" -- the BSS/calloc zero
+    // state every never-touched pair starts in) so a real keyswitch note 0 can still be
+    // represented without needing a separate "is this valid" flag alongside it. See
+    // hds_sfz_zone_requires_keyswitch()/hds_sfz_keyswitch_matches() and handle_note_on's own
+    // keyswitch-interception block.
+    int keyswitch_note_plus1[SINGLE_PROGRAM_SLOT + 1][4];
+
+    // trigger=release/release_key one-shot players (see fire_release_trigger_zones()'s own
+    // comment) -- a small fixed pool, entirely independent of voices[]/MAX_VOICES (a release-
+    // triggered sample plays out on its own, with no amp EG, pitch modulation, or filter routing
+    // of its own, after the ordinary voice that triggered it has already moved on into its own
+    // release phase or even been stolen/reused for something else entirely).
+    HdsReleaseTailPlayer release_tails[HDS_RELEASE_TAIL_POOL_SIZE];
 } HdsPendingLoadState;
 
 // Clamps a wire-carried oscillator index (a plain float, like every other OSC-carried enum in
@@ -5040,6 +5605,29 @@ static void enqueue_pending_sample_load(HdsSampleEngine *se, int slot_index, con
     p->loop_release_exit = rec->loop_release_exit != 0.0f;
     p->end_frac = rec->end_frac;
     p->assigned_osc = clamp_assigned_osc(rec->assigned_osc);
+    // SFZ first-class opcode support -- straight field-for-field carry-through, see
+    // ZoneRecordWire's own matching block for what each one means and its OSC-safe default.
+    p->loop_crossfade_frames = rec->loop_crossfade_frames;
+    p->seq_length = rec->seq_length; p->seq_position = rec->seq_position;
+    p->lorand = rec->lorand; p->hirand = rec->hirand;
+    p->choke_group = rec->choke_group; p->choke_off_by = rec->choke_off_by;
+    p->trigger_type = rec->trigger_type;
+    p->sw_lokey = rec->sw_lokey; p->sw_hikey = rec->sw_hikey; p->sw_last = rec->sw_last;
+    p->rt_decay = rec->rt_decay;
+    p->delay_seconds = rec->delay_seconds;
+    p->has_own_ampeg = rec->has_own_ampeg != 0;
+    p->ampeg_delay = rec->ampeg_delay; p->ampeg_attack = rec->ampeg_attack; p->ampeg_hold = rec->ampeg_hold;
+    p->ampeg_decay = rec->ampeg_decay; p->ampeg_sustain = rec->ampeg_sustain; p->ampeg_release = rec->ampeg_release;
+    p->ampeg_start = rec->ampeg_start;
+    p->note_polyphony = rec->note_polyphony;
+    p->velcurve_count = rec->velcurve_count;
+    for (int i = 0; i < rec->velcurve_count && i < SFZ_MAX_VELCURVE_POINTS; i++) {
+        p->velcurve_point[i] = rec->velcurve_point[i]; p->velcurve_gain[i] = rec->velcurve_gain[i];
+    }
+    p->xfin_lovel = rec->xfin_lovel; p->xfin_hivel = rec->xfin_hivel;
+    p->xfout_lovel = rec->xfout_lovel; p->xfout_hivel = rec->xfout_hivel;
+    p->xfin_lokey = rec->xfin_lokey; p->xfin_hikey = rec->xfin_hikey;
+    p->xfout_lokey = rec->xfout_lokey; p->xfout_hikey = rec->xfout_hikey;
     se->pending->pending_load_tail = (se->pending->pending_load_tail + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
     se->pending->pending_load_count++;
 }
@@ -5116,6 +5704,29 @@ static void drain_pending_sample_loads(HdsSampleEngine *se) {
             slot->reverse = p->reverse;
             slot->loop_release_exit = p->loop_release_exit;
             apply_playback_end(slot, p->end_frac);
+            // SFZ first-class opcode support -- straight field-for-field carry-through from the
+            // queued load, same convention as every field just above.
+            slot->loop_crossfade_frames = p->loop_crossfade_frames;
+            slot->seq_length = p->seq_length; slot->seq_position = p->seq_position;
+            slot->lorand = p->lorand; slot->hirand = p->hirand;
+            slot->choke_group = p->choke_group; slot->choke_off_by = p->choke_off_by;
+            slot->trigger_type = p->trigger_type;
+            slot->sw_lokey = p->sw_lokey; slot->sw_hikey = p->sw_hikey; slot->sw_last = p->sw_last;
+            slot->rt_decay = p->rt_decay;
+            slot->delay_seconds = p->delay_seconds;
+            slot->has_own_ampeg = p->has_own_ampeg;
+            slot->ampeg_delay = p->ampeg_delay; slot->ampeg_attack = p->ampeg_attack; slot->ampeg_hold = p->ampeg_hold;
+            slot->ampeg_decay = p->ampeg_decay; slot->ampeg_sustain = p->ampeg_sustain; slot->ampeg_release = p->ampeg_release;
+            slot->ampeg_start = p->ampeg_start;
+            slot->note_polyphony = p->note_polyphony;
+            slot->velcurve_count = p->velcurve_count;
+            for (int i = 0; i < p->velcurve_count && i < SFZ_MAX_VELCURVE_POINTS; i++) {
+                slot->velcurve_point[i] = p->velcurve_point[i]; slot->velcurve_gain[i] = p->velcurve_gain[i];
+            }
+            slot->xfin_lovel = p->xfin_lovel; slot->xfin_hivel = p->xfin_hivel;
+            slot->xfout_lovel = p->xfout_lovel; slot->xfout_hivel = p->xfout_hivel;
+            slot->xfin_lokey = p->xfin_lokey; slot->xfin_hikey = p->xfin_hikey;
+            slot->xfout_lokey = p->xfout_lokey; slot->xfout_hikey = p->xfout_hikey;
         } else {
             fprintf(stderr, "[samples] failed to load queued sample '%s' (zone_id %d)\n", p->path, p->zone_id);
             se->slots->sample_slots[p->slot_index].active = false;
@@ -5204,6 +5815,29 @@ static void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     slot->reverse = rec->reverse != 0.0f;
     slot->loop_release_exit = rec->loop_release_exit != 0.0f;
     apply_playback_end(slot, rec->end_frac);
+    // SFZ first-class opcode support -- same field-for-field carry-through as the fresh-load path
+    // in drain_pending_sample_loads() above (this in-place branch just skips the reload itself).
+    slot->loop_crossfade_frames = rec->loop_crossfade_frames;
+    slot->seq_length = rec->seq_length; slot->seq_position = rec->seq_position;
+    slot->lorand = rec->lorand; slot->hirand = rec->hirand;
+    slot->choke_group = rec->choke_group; slot->choke_off_by = rec->choke_off_by;
+    slot->trigger_type = rec->trigger_type;
+    slot->sw_lokey = rec->sw_lokey; slot->sw_hikey = rec->sw_hikey; slot->sw_last = rec->sw_last;
+    slot->rt_decay = rec->rt_decay;
+    slot->delay_seconds = rec->delay_seconds;
+    slot->has_own_ampeg = rec->has_own_ampeg != 0;
+    slot->ampeg_delay = rec->ampeg_delay; slot->ampeg_attack = rec->ampeg_attack; slot->ampeg_hold = rec->ampeg_hold;
+    slot->ampeg_decay = rec->ampeg_decay; slot->ampeg_sustain = rec->ampeg_sustain; slot->ampeg_release = rec->ampeg_release;
+    slot->ampeg_start = rec->ampeg_start;
+    slot->note_polyphony = rec->note_polyphony;
+    slot->velcurve_count = rec->velcurve_count;
+    for (int i = 0; i < rec->velcurve_count && i < SFZ_MAX_VELCURVE_POINTS; i++) {
+        slot->velcurve_point[i] = rec->velcurve_point[i]; slot->velcurve_gain[i] = rec->velcurve_gain[i];
+    }
+    slot->xfin_lovel = rec->xfin_lovel; slot->xfin_hivel = rec->xfin_hivel;
+    slot->xfout_lovel = rec->xfout_lovel; slot->xfout_hivel = rec->xfout_hivel;
+    slot->xfin_lokey = rec->xfin_lokey; slot->xfin_hikey = rec->xfin_hikey;
+    slot->xfout_lokey = rec->xfout_lokey; slot->xfout_hikey = rec->xfout_hikey;
 }
 
 static void apply_zone_remove(HdsSampleEngine *se, int32_t zone_id) {
@@ -5228,6 +5862,7 @@ static int zone_upsert_handler(const char *path, const char *types, lo_arg **arg
     (void)path; (void)types; (void)argc; (void)msg;
     HdsSampleEngine *se = (HdsSampleEngine *)user_data;
     ZoneRecordWire rec;
+    zone_record_wire_set_sfz_defaults(&rec); // this path never carries SFZ opcodes -- see that function's own comment
     rec.zone_id = argv[0]->i;
     float *f = &rec.root_note; // root_note..owner_program are 19 consecutive floats
     for (int i = 0; i < 19; i++) f[i] = argv[1 + i]->f;
@@ -5279,14 +5914,25 @@ static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_pr
         return 0;
     }
 
-    // group=+seq_length= round-robin compaction, local to this one load -- mirrors the Python
-    // importer's own per-file round_robin_ids dict: each distinct qualifying group= value seen in
-    // THIS file gets its own small sequential id (1, 2, 3, ...), since SFZ's own group numbers can
-    // collide across unrelated articulations/files.
-    #define SFZ_MAX_SEEN_GROUPS 64
-    char seen_group_names[SFZ_MAX_SEEN_GROUPS][SFZ_TEXT_FIELD_LEN];
-    int seen_group_ids[SFZ_MAX_SEEN_GROUPS];
-    int seen_group_count = 0;
+    // seq_length=-based round-robin bucketing, local to this one load, DECOUPLED from group=
+    // entirely (see SfzRegion.has_group's own comment on why bucketing by group used to be wrong:
+    // real SFZ content routinely uses the seq_length=/seq_position= idiom with no group= opcode at
+    // all, which the old code silently never cycled). A "bucket" is just every region in this file
+    // sharing the exact same (lokey,hikey,lovel,hivel) match range AND seq_length>0 -- the way
+    // round-robin variants are actually authored in practice (same trigger range, different
+    // sample=). seq_position (see below) then orders cycling within a bucket explicitly.
+    typedef struct { int lokey, hikey, minvel, maxvel, bucket_id; } SfzSeqBucket;
+    #define SFZ_MAX_SEQ_BUCKETS 4096
+    SfzSeqBucket *seq_buckets = (SfzSeqBucket *)malloc(sizeof(SfzSeqBucket) * SFZ_MAX_SEQ_BUCKETS);
+    int seq_bucket_count = 0;
+
+    // sw_default=: the keyswitch state a (Program, oscillator) pair starts in before any real
+    // keyswitch note has ever been pressed -- see HdsPendingLoadState.keyswitch_note_plus1's own
+    // comment. Applied once, after the region loop below, from the first region that sets it
+    // (matches every real keyswitch library's own convention of declaring this once, control-
+    // block-wide, even though HDS tracks it per-region like any other inherited opcode).
+    bool have_sw_default = false;
+    int sw_default_note = -1;
 
     int queued = 0;
     for (int i = 0; i < region_count; i++) {
@@ -5315,8 +5961,8 @@ static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_pr
             // "no_loop"/"one_shot"/anything else: loop_enabled stays false.
         }
 
-        unsigned int total_frames = 0;
-        read_wav_frame_count(r->sample, &total_frames); // best-effort -- 0 leaves every frac below at its safe default
+        unsigned int total_frames = 0, sample_rate = 44100;
+        read_wav_frame_count(r->sample, &total_frames, &sample_rate); // best-effort -- 0/44100 leaves every frac/frame count below at its safe default
 
         float loop_start_frac = 0.0f, loop_end_frac = 1.0f, offset_frac = 0.0f, end_frac = 1.0f;
         if (r->has_loop_start) sfz_frame_to_frac(r->loop_start, total_frames, &loop_start_frac);
@@ -5324,20 +5970,55 @@ static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_pr
         if (r->has_offset) sfz_frame_to_frac(r->offset, total_frames, &offset_frac);
         if (r->has_end) sfz_frame_to_frac(r->end, total_frames, &end_frac);
 
-        int round_robin_group = 0;
-        if (r->has_group && r->has_seq_length) {
+        int round_robin_group = 0, seq_position = 0;
+        if (r->has_seq_length && r->seq_length > 0) {
             int found = -1;
-            for (int g = 0; g < seen_group_count; g++) if (strcmp(seen_group_names[g], r->group) == 0) { found = g; break; }
-            if (found < 0 && seen_group_count < SFZ_MAX_SEEN_GROUPS) {
-                found = seen_group_count;
-                snprintf(seen_group_names[found], sizeof(seen_group_names[found]), "%s", r->group);
-                seen_group_ids[found] = seen_group_count + 1;
-                seen_group_count++;
+            for (int b = 0; b < seq_bucket_count; b++) {
+                if (seq_buckets[b].lokey == lokey && seq_buckets[b].hikey == hikey &&
+                    seq_buckets[b].minvel == min_vel && seq_buckets[b].maxvel == max_vel) { found = b; break; }
             }
-            if (found >= 0) round_robin_group = seen_group_ids[found];
+            if (found < 0 && seq_bucket_count < SFZ_MAX_SEQ_BUCKETS) {
+                found = seq_bucket_count;
+                seq_buckets[found].lokey = lokey; seq_buckets[found].hikey = hikey;
+                seq_buckets[found].minvel = min_vel; seq_buckets[found].maxvel = max_vel;
+                seq_buckets[found].bucket_id = seq_bucket_count + 1;
+                seq_bucket_count++;
+            }
+            if (found >= 0) round_robin_group = seq_buckets[found].bucket_id;
+            seq_position = r->has_seq_position ? r->seq_position : 0;
         }
 
+        // group=/off_by=: the REAL SFZ choke-group opcodes now, completely independent of the
+        // round-robin bucketing above -- passed through as their raw SFZ ids (0 = none), see
+        // apply_choke_group()'s own comment for how they're actually enforced at note-on.
+        int choke_group = r->has_group ? r->group : 0; if (choke_group < 0) choke_group = 0;
+        int choke_off_by = r->has_off_by ? r->off_by : 0; if (choke_off_by < 0) choke_off_by = 0;
+
+        int trigger_type = HDS_SFZ_TRIGGER_ATTACK;
+        if (r->has_trigger) {
+            if (strcasecmp(r->trigger, "release") == 0) trigger_type = HDS_SFZ_TRIGGER_RELEASE;
+            else if (strcasecmp(r->trigger, "release_key") == 0) trigger_type = HDS_SFZ_TRIGGER_RELEASE_KEY;
+            else if (strcasecmp(r->trigger, "first") == 0) trigger_type = HDS_SFZ_TRIGGER_FIRST;
+            else if (strcasecmp(r->trigger, "legato") == 0) trigger_type = HDS_SFZ_TRIGGER_LEGATO;
+            // "attack"/anything else: stays HDS_SFZ_TRIGGER_ATTACK.
+        }
+
+        int sw_lokey = r->has_sw_lokey ? sfz_note_to_number(r->sw_lokey) : -1;
+        int sw_hikey = r->has_sw_hikey ? sfz_note_to_number(r->sw_hikey) : -1;
+        int sw_last = r->has_sw_last ? sfz_note_to_number(r->sw_last) : -1;
+        if (!have_sw_default && r->has_sw_default) {
+            int sd = sfz_note_to_number(r->sw_default);
+            if (sd >= 0) { sw_default_note = sd; have_sw_default = true; }
+        }
+
+        bool has_own_ampeg = r->has_ampeg_delay || r->has_ampeg_attack || r->has_ampeg_hold ||
+                              r->has_ampeg_decay || r->has_ampeg_sustain || r->has_ampeg_release || r->has_ampeg_start;
+
+        int loop_crossfade_frames = r->has_loop_crossfade ? (int)(r->loop_crossfade * (float)sample_rate + 0.5f) : -1;
+        if (loop_crossfade_frames < 0 && r->has_loop_crossfade) loop_crossfade_frames = 0;
+
         ZoneRecordWire rec;
+        zone_record_wire_set_sfz_defaults(&rec); // every field this region doesn't explicitly set below keeps its "feature off" default
         rec.zone_id = g_next_native_zone_id--;
         rec.root_note = is_drum ? 60.0f : (float)key_center;
         rec.min_note = (float)lokey; rec.max_note = (float)hikey;
@@ -5357,8 +6038,50 @@ static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_pr
         rec.owner_program = (float)owner_program;
         snprintf(rec.path, SAMPLE_PATH_LEN, "%s", r->sample);
 
+        rec.loop_crossfade_frames = loop_crossfade_frames;
+        rec.seq_length = r->has_seq_length ? r->seq_length : 0;
+        rec.seq_position = seq_position;
+        rec.lorand = r->has_lorand ? r->lorand : 0.0f;
+        rec.hirand = r->has_hirand ? r->hirand : 1.0f;
+        rec.choke_group = choke_group; rec.choke_off_by = choke_off_by;
+        rec.trigger_type = trigger_type;
+        rec.sw_lokey = sw_lokey; rec.sw_hikey = sw_hikey; rec.sw_last = sw_last;
+        rec.rt_decay = r->has_rt_decay ? r->rt_decay : 0.0f;
+        rec.delay_seconds = r->has_delay ? r->delay : 0.0f;
+        rec.has_own_ampeg = has_own_ampeg ? 1 : 0;
+        rec.ampeg_delay = r->has_ampeg_delay ? r->ampeg_delay : 0.0f;
+        rec.ampeg_attack = r->has_ampeg_attack ? r->ampeg_attack : 0.0f;
+        rec.ampeg_hold = r->has_ampeg_hold ? r->ampeg_hold : 0.0f;
+        rec.ampeg_decay = r->has_ampeg_decay ? r->ampeg_decay : 0.0f;
+        rec.ampeg_sustain = r->has_ampeg_sustain ? r->ampeg_sustain : 100.0f;
+        rec.ampeg_release = r->has_ampeg_release ? r->ampeg_release : 0.0f;
+        rec.ampeg_start = r->has_ampeg_start ? r->ampeg_start : 0.0f;
+        rec.note_polyphony = r->has_note_polyphony ? r->note_polyphony : 0;
+        rec.velcurve_count = r->velcurve_count;
+        for (int vc = 0; vc < r->velcurve_count && vc < SFZ_MAX_VELCURVE_POINTS; vc++) {
+            rec.velcurve_point[vc] = r->velcurve_point[vc]; rec.velcurve_gain[vc] = r->velcurve_gain[vc];
+        }
+        rec.xfin_lovel = r->has_xfin_lovel ? r->xfin_lovel : -1;
+        rec.xfin_hivel = r->has_xfin_hivel ? r->xfin_hivel : -1;
+        rec.xfout_lovel = r->has_xfout_lovel ? r->xfout_lovel : -1;
+        rec.xfout_hivel = r->has_xfout_hivel ? r->xfout_hivel : -1;
+        rec.xfin_lokey = r->has_xfin_lokey ? sfz_note_to_number(r->xfin_lokey) : -1;
+        rec.xfin_hikey = r->has_xfin_hikey ? sfz_note_to_number(r->xfin_hikey) : -1;
+        rec.xfout_lokey = r->has_xfout_lokey ? sfz_note_to_number(r->xfout_lokey) : -1;
+        rec.xfout_hikey = r->has_xfout_hikey ? sfz_note_to_number(r->xfout_hikey) : -1;
+
         apply_zone_upsert(se, &rec);
         queued++;
+    }
+    free(seq_buckets);
+    #undef SFZ_MAX_SEQ_BUCKETS
+
+    // Apply sw_default= (if this file set one anywhere) as this (Program, oscillator) pair's
+    // starting keyswitch state -- a fresh load always resets it, matching "loading a new
+    // instrument replaces the old one's state entirely," the same posture apply_zone_remove's own
+    // catalog-reuse comment already established for the sample catalog itself.
+    if (have_sw_default && owner_program <= SINGLE_PROGRAM_SLOT && osc_index >= 0 && osc_index < 4) {
+        se->pending->keyswitch_note_plus1[owner_program][osc_index] = sw_default_note + 1;
     }
     return queued;
 }
@@ -5407,7 +6130,123 @@ static int zone_load_sfz_handler(const char *path, const char *types, lo_arg **a
 // with no round_robin_group set is undefined/arbitrary either way), never a correctness one: which
 // zone(s) match a given note+velocity, and how many round-robin members exist among them, are
 // unaffected by array position.
-static int find_matching_sample_slot(HdsSampleEngine *se, int assigned_osc, int owner_program, int note, int velocity) {
+// True when `note` is a keyswitch key for at least one zone currently assigned to this
+// (owner_program, assigned_osc) pair -- an incoming note-on at this note number should update
+// this pair's own tracked keyswitch state (HdsPendingLoadState.keyswitch_note_plus1) and produce
+// NO sound of its own on this oscillator, rather than being treated as an ordinary playable note.
+// Mirrors every real keyswitch sample library's own convention. See start_sample_osc's own
+// interception of this at note-on.
+static bool hds_sfz_is_keyswitch_note(HdsSampleEngine *se, int assigned_osc, int owner_program, int note) {
+    for (int i = 0; i < se->slots->sample_slot_count; i++) {
+        SampleSlot *slot = &se->slots->sample_slots[i];
+        if (!slot->active || !slot->loaded) continue;
+        if (slot->assigned_osc != assigned_osc || slot->owner_program != owner_program) continue;
+        if (slot->sw_lokey < 0 && slot->sw_hikey < 0 && slot->sw_last < 0) continue;
+        int lo, hi;
+        if (slot->sw_lokey >= 0 || slot->sw_hikey >= 0) {
+            lo = (slot->sw_lokey >= 0) ? slot->sw_lokey : slot->sw_hikey;
+            hi = (slot->sw_hikey >= 0) ? slot->sw_hikey : slot->sw_lokey;
+        } else { lo = hi = slot->sw_last; }
+        if (note >= lo && note <= hi) return true;
+    }
+    return false;
+}
+
+// True when `slot` isn't keyswitch-gated at all (the ordinary, unaffected case: matches on every
+// note exactly as it always has), or IS gated and this (owner_program, assigned_osc) pair's own
+// currently-tracked keyswitch state satisfies its declared sw_lokey/sw_hikey/sw_last range. See
+// HdsPendingLoadState.keyswitch_note_plus1's own comment for the "never pressed, no sw_default
+// either" 0 sentinel this treats as "never matches."
+static bool hds_sfz_keyswitch_matches(HdsSampleEngine *se, const SampleSlot *slot) {
+    if (slot->sw_lokey < 0 && slot->sw_hikey < 0 && slot->sw_last < 0) return true;
+    int plus1 = se->pending->keyswitch_note_plus1[slot->owner_program][slot->assigned_osc];
+    if (plus1 <= 0) return false;
+    int current = plus1 - 1;
+    if (slot->sw_lokey >= 0 || slot->sw_hikey >= 0) {
+        int lo = (slot->sw_lokey >= 0) ? slot->sw_lokey : slot->sw_hikey;
+        int hi = (slot->sw_hikey >= 0) ? slot->sw_hikey : slot->sw_lokey;
+        return current >= lo && current <= hi;
+    }
+    return current == slot->sw_last;
+}
+
+// True when `slot` declares ANY crossfade-layering opcode (xfin_*/xfout_*, velocity or key axis)
+// -- the gate on whether find_matching_sample_slot() even considers pairing it with a second,
+// simultaneously-sounding zone at all. A zone that never sets these is completely unaffected by
+// this whole feature, by construction (this always returns false for it).
+static bool sfz_has_crossfade(const SampleSlot *slot) {
+    return slot->xfin_lovel >= 0 || slot->xfin_hivel >= 0 || slot->xfout_lovel >= 0 || slot->xfout_hivel >= 0 ||
+           slot->xfin_lokey >= 0 || slot->xfin_hikey >= 0 || slot->xfout_lokey >= 0 || slot->xfout_hikey >= 0;
+}
+
+// This zone's own linear crossfade gain (0-1) at this note-on's (note, velocity) -- the product of
+// up to 4 independent ramps (fade-in/fade-out, each on the velocity axis and the key axis; a zone
+// not using a given axis/direction at all contributes a factor of 1.0 for it, unaffected). Static
+// for the life of a note: SFZ evaluates a crossfade once, at the triggering note-on, never
+// per-sample -- see SynthVoice.vco1_xfade_gain's own comment.
+static float sfz_xfade_gain(const SampleSlot *slot, int note, int velocity) {
+    float g = 1.0f;
+    if (slot->xfin_lovel >= 0 && slot->xfin_hivel >= 0 && slot->xfin_hivel > slot->xfin_lovel) {
+        if (velocity <= slot->xfin_lovel) g *= 0.0f;
+        else if (velocity < slot->xfin_hivel) g *= (float)(velocity - slot->xfin_lovel) / (float)(slot->xfin_hivel - slot->xfin_lovel);
+    }
+    if (slot->xfout_lovel >= 0 && slot->xfout_hivel >= 0 && slot->xfout_hivel > slot->xfout_lovel) {
+        if (velocity >= slot->xfout_hivel) g *= 0.0f;
+        else if (velocity > slot->xfout_lovel) g *= 1.0f - (float)(velocity - slot->xfout_lovel) / (float)(slot->xfout_hivel - slot->xfout_lovel);
+    }
+    if (slot->xfin_lokey >= 0 && slot->xfin_hikey >= 0 && slot->xfin_hikey > slot->xfin_lokey) {
+        if (note <= slot->xfin_lokey) g *= 0.0f;
+        else if (note < slot->xfin_hikey) g *= (float)(note - slot->xfin_lokey) / (float)(slot->xfin_hikey - slot->xfin_lokey);
+    }
+    if (slot->xfout_lokey >= 0 && slot->xfout_hikey >= 0 && slot->xfout_hikey > slot->xfout_lokey) {
+        if (note >= slot->xfout_hikey) g *= 0.0f;
+        else if (note > slot->xfout_lokey) g *= 1.0f - (float)(note - slot->xfout_lokey) / (float)(slot->xfout_hikey - slot->xfout_lokey);
+    }
+    return g;
+}
+
+// amp_velcurve_<N>=<value>: this zone's own custom, piecewise-linear velocity-to-gain response
+// curve -- SFZ_MAX_VELCURVE_POINTS breakpoints, always kept sorted by ascending velocity as
+// sfz_apply_opcode's own insertion-sort applies them, so this never needs to sort. Returns 1.0
+// (no effect at all) for every zone with velcurve_count 0 -- the ordinary, unaffected case for
+// every zone that never sets amp_velcurve_N at all -- so this is always safe to multiply into a
+// zone's own static per-note gain unconditionally.
+static float sfz_velcurve_gain(const SampleSlot *slot, int velocity) {
+    if (slot->velcurve_count <= 0) return 1.0f;
+    int last = slot->velcurve_count - 1;
+    if (velocity <= slot->velcurve_point[0]) return slot->velcurve_gain[0];
+    if (velocity >= slot->velcurve_point[last]) return slot->velcurve_gain[last];
+    for (int i = 0; i < last; i++) {
+        int p0 = slot->velcurve_point[i], p1 = slot->velcurve_point[i + 1];
+        if (velocity < p0 || velocity > p1) continue;
+        if (p1 == p0) return slot->velcurve_gain[i];
+        float t = (float)(velocity - p0) / (float)(p1 - p0);
+        return slot->velcurve_gain[i] + t * (slot->velcurve_gain[i + 1] - slot->velcurve_gain[i]);
+    }
+    return 1.0f; // unreachable given velcurve_point[] is sorted and spans [point[0], point[last]]
+}
+
+// Finds the zone (if any) covering (note, velocity) on this (assigned_osc, owner_program) pair.
+// `is_first_key_of_phrase` gates trigger=first/legato zones (see HDS_SFZ_TRIGGER_* -- ordinary
+// trigger=attack zones, the vast majority, are unaffected by it either way); trigger=release/
+// release_key zones never match here at all (they only ever fire from fire_release_trigger_zones()
+// on note-off). On a successful match, also resolves an optional CROSSFADE-LAYER partner (see
+// sfz_has_crossfade()'s own comment): *out_layer_slot_idx is set to a second zone that should
+// sound SIMULTANEOUSLY with the primary, mixed by *out_primary_gain/*out_layer_gain, or left at -1
+// (gain 1.0/0.0) when the primary doesn't use crossfade layering at all -- the ordinary, unaffected
+// case for every zone that never sets xfin_*/xfout_*, by construction.
+static int find_matching_sample_slot(HdsSampleEngine *se, int assigned_osc, int owner_program, int note, int velocity,
+                                      bool is_first_key_of_phrase, int *out_layer_slot_idx, float *out_primary_gain, float *out_layer_gain) {
+    if (out_layer_slot_idx) *out_layer_slot_idx = -1;
+    if (out_primary_gain) *out_primary_gain = 1.0f;
+    if (out_layer_gain) *out_layer_gain = 0.0f;
+
+    // One shared per-note-on random draw for every lorand/hirand-gated zone this call considers --
+    // drawn once, not once per candidate, so a zone using it is evaluated against the exact same
+    // "dice roll" as every other candidate zone in this same note-on, matching real SFZ semantics
+    // (one random draw per note, not one per region).
+    float rand_draw = (float)rand() / ((float)RAND_MAX + 1.0f);
+
     long best_area = -1; // -1 sentinel: "no candidate yet", distinct from a real zero-area zone
     int first_best_idx = -1;
     int tie_count = 0;
@@ -5418,58 +6257,193 @@ static int find_matching_sample_slot(HdsSampleEngine *se, int assigned_osc, int 
         if (slot->owner_program != owner_program) continue;
         if (note < slot->min_note || note > slot->max_note) continue;
         if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
+        // Only actually filters when the pair genuinely describes a real sub-range (hirand >
+        // lorand) -- a defensive posture, not just an optimization: it means a bare zero-
+        // initialized ZoneRecordWire/SampleSlot (lorand=hirand=0.0, what any caller that forgets
+        // zone_record_wire_set_sfz_defaults() would end up with) still always matches on this axis,
+        // instead of a 0.0/0.0 pair being misread as "never matches" (rand_draw is always >= 0.0).
+        if (slot->hirand > slot->lorand && (rand_draw < slot->lorand || rand_draw >= slot->hirand)) continue;
+        if (slot->trigger_type == HDS_SFZ_TRIGGER_RELEASE || slot->trigger_type == HDS_SFZ_TRIGGER_RELEASE_KEY) continue;
+        if (slot->trigger_type == HDS_SFZ_TRIGGER_FIRST && !is_first_key_of_phrase) continue;
+        if (slot->trigger_type == HDS_SFZ_TRIGGER_LEGATO && is_first_key_of_phrase) continue;
+        if (!hds_sfz_keyswitch_matches(se, slot)) continue;
         long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
         if (best_area < 0 || area < best_area) { best_area = area; first_best_idx = i; tie_count = 1; }
         else if (area == best_area) { tie_count++; }
     }
     if (tie_count == 0) return -1;
-    if (tie_count == 1) return first_best_idx;
 
-    int group = se->slots->sample_slots[first_best_idx].round_robin_group;
-    if (group <= 0) return first_best_idx;
-
-    int member_count = 0;
-    for (int i = 0; i < se->slots->sample_slot_count; i++) {
-        SampleSlot *slot = &se->slots->sample_slots[i];
-        if (!slot->active || !slot->loaded) continue;
-        if (slot->assigned_osc != assigned_osc) continue;
-        if (slot->owner_program != owner_program) continue;
-        if (note < slot->min_note || note > slot->max_note) continue;
-        if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
-        long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
-        if (area == best_area && slot->round_robin_group == group) member_count++;
-    }
-    if (member_count <= 1) return first_best_idx;
-
-    int group_idx = group;
-    if (group_idx < 1) group_idx = 1; else if (group_idx > MAX_ROUND_ROBIN_GROUPS) group_idx = MAX_ROUND_ROBIN_GROUPS;
-    unsigned int hit = se->pending->round_robin_hit_count[owner_program][assigned_osc][group_idx]++;
-    unsigned int target_ordinal = hit % (unsigned int)member_count;
-    unsigned int ordinal = 0;
-    for (int i = 0; i < se->slots->sample_slot_count; i++) {
-        SampleSlot *slot = &se->slots->sample_slots[i];
-        if (!slot->active || !slot->loaded) continue;
-        if (slot->assigned_osc != assigned_osc) continue;
-        if (slot->owner_program != owner_program) continue;
-        if (note < slot->min_note || note > slot->max_note) continue;
-        if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
-        long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
-        if (area == best_area && slot->round_robin_group == group) {
-            if (ordinal == target_ordinal) return i;
-            ordinal++;
+    int primary_idx = first_best_idx;
+    if (tie_count > 1) {
+        int group = se->slots->sample_slots[first_best_idx].round_robin_group;
+        if (group > 0) {
+            int member_count = 0;
+            for (int i = 0; i < se->slots->sample_slot_count; i++) {
+                SampleSlot *slot = &se->slots->sample_slots[i];
+                if (!slot->active || !slot->loaded) continue;
+                if (slot->assigned_osc != assigned_osc || slot->owner_program != owner_program) continue;
+                if (note < slot->min_note || note > slot->max_note) continue;
+                if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
+                long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
+                if (area == best_area && slot->round_robin_group == group) member_count++;
+            }
+            if (member_count > 1) {
+                int group_idx = group;
+                if (group_idx < 1) group_idx = 1; else if (group_idx > MAX_ROUND_ROBIN_GROUPS) group_idx = MAX_ROUND_ROBIN_GROUPS;
+                unsigned int hit = se->pending->round_robin_hit_count[owner_program][assigned_osc][group_idx]++;
+                unsigned int target_ordinal = hit % (unsigned int)member_count;
+                // Walk members in seq_position order (an explicit 1-based ordinal; members that
+                // don't set it, seq_position 0, sort after every member that does, in their own
+                // slot-array/file-encounter order) -- picks the target_ordinal-th member by
+                // repeatedly finding the next-smallest (seq_position, slot index) key strictly
+                // after the last one picked. O(member_count^2) worst case, fine at the small
+                // (typically 2-8) member counts round-robin groups actually have in practice.
+                long last_key_seq = -1; int last_key_idx = -1;
+                int chosen = -1;
+                for (unsigned int step = 0; step <= target_ordinal; step++) {
+                    long best_key_seq = LONG_MAX; int best_key_idx = INT_MAX; int best_slot_i = -1;
+                    for (int i = 0; i < se->slots->sample_slot_count; i++) {
+                        SampleSlot *slot = &se->slots->sample_slots[i];
+                        if (!slot->active || !slot->loaded) continue;
+                        if (slot->assigned_osc != assigned_osc || slot->owner_program != owner_program) continue;
+                        if (note < slot->min_note || note > slot->max_note) continue;
+                        if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
+                        long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
+                        if (area != best_area || slot->round_robin_group != group) continue;
+                        long key_seq = slot->seq_position > 0 ? (long)slot->seq_position : LONG_MAX;
+                        if (key_seq < last_key_seq || (key_seq == last_key_seq && i <= last_key_idx)) continue;
+                        if (key_seq < best_key_seq || (key_seq == best_key_seq && i < best_key_idx)) { best_key_seq = key_seq; best_key_idx = i; best_slot_i = i; }
+                    }
+                    if (best_slot_i < 0) break; // shouldn't happen given member_count > 0, but keeps this loop safe
+                    last_key_seq = best_key_seq; last_key_idx = best_key_idx;
+                    chosen = best_slot_i;
+                }
+                if (chosen >= 0) primary_idx = chosen;
+            }
         }
     }
-    return first_best_idx; // unreachable given member_count > 0, but keeps the compiler happy
+
+    if (out_primary_gain) *out_primary_gain = sfz_xfade_gain(&se->slots->sample_slots[primary_idx], note, velocity);
+    if (sfz_has_crossfade(&se->slots->sample_slots[primary_idx]) && out_layer_slot_idx) {
+        int best_layer = -1; float best_layer_gain = 0.0f;
+        for (int i = 0; i < se->slots->sample_slot_count; i++) {
+            if (i == primary_idx) continue;
+            SampleSlot *slot = &se->slots->sample_slots[i];
+            if (!slot->active || !slot->loaded) continue;
+            if (slot->assigned_osc != assigned_osc || slot->owner_program != owner_program) continue;
+            if (note < slot->min_note || note > slot->max_note) continue;
+            if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
+            if (!sfz_has_crossfade(slot)) continue;
+            if (!hds_sfz_keyswitch_matches(se, slot)) continue;
+            float g = sfz_xfade_gain(slot, note, velocity);
+            if (g > best_layer_gain) { best_layer_gain = g; best_layer = i; }
+        }
+        if (best_layer >= 0 && best_layer_gain > 0.001f) {
+            *out_layer_slot_idx = best_layer;
+            if (out_layer_gain) *out_layer_gain = best_layer_gain;
+        }
+    }
+    return primary_idx;
 }
 
 // Starts (or restarts) an oscillator's sample playback for a fresh note -- releases whatever
 // stream it might already hold (a retrigger/voice-steal case) and claims a new one if
-// find_matching_sample_slot finds a zone covering this note+velocity. Leaves *stream_idx at -1
-// (silent) if nothing matches or the stream pool is exhausted, rather than failing the whole
-// note-on.
-static void start_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr, bool *preroll, int assigned_osc, int owner_program, int note, int velocity) {
-    if (*stream_idx >= 0) { release_sample_stream(se, *stream_idx); *stream_idx = -1; }
-    int slot_idx = find_matching_sample_slot(se, assigned_osc, owner_program, note, velocity);
+// Counts how many currently-claimed streams are playing a zone with this exact zone_id -- the
+// note_polyphony= gate (start_sample_osc's own comment on where this is used). O(MAX_SAMPLE_
+// STREAMS), fine at note-on rate (not per-sample).
+static int count_active_streams_for_zone(HdsSampleEngine *se, int32_t zone_id) {
+    int count = 0;
+    for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
+        SampleStream *stream = &se->streams->sample_streams[i];
+        if (!stream->in_use) continue;
+        int slot_idx = atomic_load_explicit(&stream->slot_index, memory_order_relaxed);
+        if (se->slots->sample_slots[slot_idx].zone_id == zone_id) count++;
+    }
+    return count;
+}
+
+// SFZ's real group=/off_by= choke groups: the instant a zone with choke_off_by>0 triggers, every
+// currently-sounding stream anywhere in this SAME owner_program whose OWN zone declares that exact
+// choke_group is cut immediately (release_sample_stream(), the same hard, immediate stop a stream
+// exhausting its ring already gets -- render_sample_osc sees stream->in_use go false on its very
+// next call and returns silence right then, no separate envelope-release ramp). This is genuinely
+// independent of round-robin's own (unrelated) group concept -- see SampleSlot.choke_group's own
+// comment. A no-op (off_by<=0) for every zone that doesn't use choke groups at all, by construction.
+static void apply_choke_group(HdsSampleEngine *se, int owner_program, int off_by_group) {
+    if (off_by_group <= 0) return;
+    for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
+        SampleStream *stream = &se->streams->sample_streams[i];
+        if (!stream->in_use) continue;
+        int slot_idx = atomic_load_explicit(&stream->slot_index, memory_order_relaxed);
+        SampleSlot *slot = &se->slots->sample_slots[slot_idx];
+        if (slot->owner_program != owner_program) continue;
+        if (slot->choke_group != off_by_group) continue;
+        release_sample_stream(se, i);
+    }
+}
+
+// SFZ per-zone amp envelope override: builds a full EGDerivedRates directly from a zone's own
+// ampeg_* fields (already SFZ-defaulted by hds_load_sfz_for_osc -- see SampleSlot.has_own_ampeg's
+// own comment), bypassing compute_eg_derived_rates()/its 7-mode PackEGParams abstraction entirely.
+// That abstraction can't express delay AND hold simultaneously (only mode 5/DADSR gets a nonzero
+// t_dly, only mode 4/6 get a nonzero t_hld) -- real SFZ content can set ampeg_delay and ampeg_hold
+// together freely, so this computes both unconditionally instead. mode is fixed at 6 purely as an
+// env_type/diagnostic label (tick_adsr's own mode==1/2/3/4 special-cases -- AR/ASR skipping decay,
+// AD/AHD skipping sustain and going idle -- do not apply to an SFZ envelope, which always has a
+// real, distinct decay+sustain+release regardless of what sustain level it happens to be at).
+static void compute_zone_owned_eg_rates(const SampleSlot *slot, EGDerivedRates *out) {
+    out->mode = 6;
+    out->sustain_level = fmaxf(0.0f, fminf(1.0f, slot->ampeg_sustain / 100.0f));
+    out->atk_level = fmaxf(0.0f, fminf(1.0f, slot->ampeg_start / 100.0f));
+    out->peak_level = 1.0f; // SFZ's ampeg_* has no "peak level" opcode of its own -- always full-swing
+    out->t_dly = fmaxf(0.0f, slot->ampeg_delay);
+    out->t_hld = fmaxf(0.0f, slot->ampeg_hold);
+    float t_att = fmaxf(0.001f, slot->ampeg_attack);
+    float t_dec = fmaxf(0.001f, slot->ampeg_decay);
+    // SFZ's own release default (0, an unset ampeg_release) would divide into a literal instant
+    // drop -- floored at 5ms, an inaudible but non-degenerate ramp, rather than a true 0 that could
+    // click or (at exactly 0) divide by zero.
+    float t_rel = fmaxf(0.005f, slot->ampeg_release);
+    out->attack_rate = fmaxf(0.0f, out->peak_level - out->atk_level) / (t_att * SAMPLE_RATE);
+    out->decay_rate = fmaxf(0.0f, out->peak_level - out->sustain_level) / (t_dec * SAMPLE_RATE);
+    out->release_rate_per_level = 1.0f / (t_rel * SAMPLE_RATE);
+}
+
+// SFZ per-zone amp envelope override resolution (see ProgramState.vco1_force_own_amp_eg's own
+// comment) -- looks up the zone a just-claimed stream belongs to (if any) and decides whether this
+// note's oscillator should use THAT zone's own ampeg_* envelope instead of the Program's shared
+// one. Returns false (out_rates left untouched) for every oscillator not currently playing a zone
+// with its own ampeg_* opcodes at all, or with the override checkbox forcing the Program's own EG
+// -- the ordinary, unaffected case for the vast majority of zones/Programs.
+static bool resolve_zone_owned_ampeg(HdsSampleEngine *se, int stream_idx, bool force_own_amp_eg, EGDerivedRates *out_rates) {
+    if (stream_idx < 0 || force_own_amp_eg) return false;
+    int slot_idx = atomic_load_explicit(&se->streams->sample_streams[stream_idx].slot_index, memory_order_relaxed);
+    SampleSlot *slot = &se->slots->sample_slots[slot_idx];
+    if (!slot->has_own_ampeg) return false;
+    compute_zone_owned_eg_rates(slot, out_rates);
+    return true;
+}
+
+// Shared "where does this envelope INSTANCE start" logic for handle_note_on's own EG-init block --
+// factored out once the SFZ per-zone amp envelope override needed a second, parallel source of
+// truth (a zone's own compute_zone_owned_eg_rates() output) alongside the Program's own knob-driven
+// eg_mode[]/eg[] -- see ProgramState.vco1_force_own_amp_eg's own comment. Behavior is byte-
+// identical to the original inline code when use_own_ampeg is false, the ordinary case.
+static void init_amp_eg_start(ADSR *eg, bool use_own_ampeg, const EGDerivedRates *own_rates, int prog_mode, const PackEGParams *prog_eg) {
+    if (use_own_ampeg) {
+        eg->state = (own_rates->t_dly > 0.0f) ? STATE_DELAY : STATE_ATTACK;
+        eg->current_level = (own_rates->t_dly > 0.0f) ? 0.0f : own_rates->atk_level;
+    } else {
+        eg->state = (prog_mode == 5) ? STATE_DELAY : STATE_ATTACK;
+        eg->current_level = (prog_mode == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog_eg->al / 100.0f));
+    }
+}
+
+// Shared "claim this one zone and seed its playback position" logic -- used identically for the
+// primary zone and an optional crossfade-layer partner (see find_matching_sample_slot's own
+// comment), since both are just independent DFD streams from find_matching_sample_slot's point of
+// view. Returns the claimed stream index (or -1 if slot_idx < 0 or the pool is exhausted).
+static int start_one_sample_stream(HdsSampleEngine *se, double *ptr, bool *preroll, int slot_idx) {
     unsigned int start_frame = 0;
     if (slot_idx >= 0) {
         SampleSlot *slot = &se->slots->sample_slots[slot_idx];
@@ -5501,7 +6475,122 @@ static void start_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr, 
         *ptr = 0.0;
         *preroll = true;
     }
-    *stream_idx = (slot_idx >= 0) ? claim_sample_stream(se, slot_idx, start_frame) : -1;
+    return (slot_idx >= 0) ? claim_sample_stream(se, slot_idx, start_frame) : -1;
+}
+
+// find_matching_sample_slot finds a zone covering this note+velocity. Leaves *stream_idx at -1
+// (silent) if nothing matches or the stream pool is exhausted, rather than failing the whole
+// note-on. `is_first_key_of_phrase` gates trigger=first/legato zones -- see
+// find_matching_sample_slot's own comment (irrelevant, and harmless to pass either way, for every
+// ordinary trigger=attack zone). *out_xfade_gain/*out_layer_xfade_gain and the layer_* trio are an
+// optional CROSSFADE-LAYER partner stream (see SynthVoice.vco1_layer_sample_stream's own comment);
+// pass NULL for all four when a caller doesn't support layering at all (none currently do, but the
+// option costs nothing). *out_delay_frames (SFZ's delay=, in frames at SAMPLE_RATE) is 0 for the
+// ordinary, unaffected case -- the caller is responsible for actually holding playback silent for
+// that many samples once a stream is claimed (see SynthVoice.vco1_sample_delay_remaining's own
+// comment); this function claims the stream/seeds its ring position immediately either way, since
+// the disk thread filling ahead of an still-silent oscillator is harmless.
+static void start_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr, bool *preroll, int assigned_osc, int owner_program, int note, int velocity,
+                              bool is_first_key_of_phrase, int *out_delay_frames,
+                              int *layer_stream_idx, double *layer_ptr, bool *layer_preroll,
+                              float *out_xfade_gain, float *out_layer_xfade_gain) {
+    if (*stream_idx >= 0) { release_sample_stream(se, *stream_idx); *stream_idx = -1; }
+    if (layer_stream_idx && *layer_stream_idx >= 0) { release_sample_stream(se, *layer_stream_idx); *layer_stream_idx = -1; }
+    if (out_delay_frames) *out_delay_frames = 0;
+    if (out_xfade_gain) *out_xfade_gain = 1.0f;
+    if (out_layer_xfade_gain) *out_layer_xfade_gain = 0.0f;
+
+    // Keyswitching interception: a note-on landing inside ANY loaded zone's own declared keyswitch
+    // range on this (owner_program, assigned_osc) pair updates that pair's tracked state and
+    // produces NO sound of its own -- see hds_sfz_is_keyswitch_note's own comment. Matches every
+    // real keyswitch library's own convention; a total no-op for every instrument that never uses
+    // sw_lokey/sw_hikey/sw_last at all, by construction.
+    if (hds_sfz_is_keyswitch_note(se, assigned_osc, owner_program, note)) {
+        se->pending->keyswitch_note_plus1[owner_program][assigned_osc] = note + 1;
+        *ptr = 0.0; *preroll = true;
+        return;
+    }
+
+    int layer_idx = -1; float primary_gain = 1.0f, layer_gain = 0.0f;
+    int slot_idx = find_matching_sample_slot(se, assigned_osc, owner_program, note, velocity, is_first_key_of_phrase, &layer_idx, &primary_gain, &layer_gain);
+
+    if (slot_idx >= 0) {
+        SampleSlot *slot = &se->slots->sample_slots[slot_idx];
+        if (slot->note_polyphony > 0 && count_active_streams_for_zone(se, slot->zone_id) >= slot->note_polyphony) {
+            slot_idx = -1; layer_idx = -1; // at this zone's own polyphony cap -- stays silent rather than stealing an older voice
+        } else {
+            if (slot->choke_off_by > 0) apply_choke_group(se, owner_program, slot->choke_off_by);
+            if (out_delay_frames) *out_delay_frames = (int)(slot->delay_seconds * (float)SAMPLE_RATE + 0.5f);
+        }
+    }
+
+    // amp_velcurve_N (see sfz_velcurve_gain's own comment): folded into this same static per-note
+    // gain multiplier as the crossfade-layer gain above, rather than a separate SynthVoice field --
+    // both are just "a static, note-on-computed gain this zone's own render output gets scaled by
+    // for the life of the note," so there's nothing to gain from tracking them independently. 1.0
+    // (no effect) for every zone that never sets amp_velcurve_N at all.
+    if (out_xfade_gain) *out_xfade_gain = primary_gain * (slot_idx >= 0 ? sfz_velcurve_gain(&se->slots->sample_slots[slot_idx], velocity) : 1.0f);
+    *stream_idx = start_one_sample_stream(se, ptr, preroll, slot_idx);
+
+    if (layer_stream_idx && layer_ptr && layer_preroll) {
+        if (layer_idx >= 0) {
+            SampleSlot *lslot = &se->slots->sample_slots[layer_idx];
+            if (lslot->note_polyphony > 0 && count_active_streams_for_zone(se, lslot->zone_id) >= lslot->note_polyphony) layer_idx = -1;
+        }
+        if (out_layer_xfade_gain) *out_layer_xfade_gain = (layer_idx >= 0) ? layer_gain * sfz_velcurve_gain(&se->slots->sample_slots[layer_idx], velocity) : 0.0f;
+        *layer_stream_idx = start_one_sample_stream(se, layer_ptr, layer_preroll, layer_idx);
+    }
+}
+
+// SFZ trigger=release/release_key: fires at NOTE-OFF (see trigger_voice_release's own call site),
+// completely independent of the ordinary voice/oscillator that's simultaneously entering its own
+// release phase -- a release-triggered zone plays out with no amp EG, pitch modulation, or filter
+// routing of its own (matching every real sampler's own "release samples are a fire-and-forget
+// effect layer, not a normal voice" convention), using a small fixed pool
+// (HdsReleaseTailPlayer/HDS_RELEASE_TAIL_POOL_SIZE) rather than stealing a real polyphony voice.
+// Only ever matches a zone whose own trigger= is release/release_key -- see HDS_SFZ_TRIGGER_*'s
+// own comment; a complete no-op for every ordinary (trigger=attack, the vast majority) zone.
+// Picks the smallest-area matching zone, same tie-break rule as find_matching_sample_slot's own
+// first pass, but WITHOUT that function's round-robin/crossfade-layer machinery -- release
+// triggers are typically a single mechanical-noise layer per note range, not a variant pool.
+// rt_decay= (if the winning zone sets it) is applied here as a flat, elapsed-real-time dB/sec
+// decay on the release tail's own playback level; it does NOT additionally scale by how long the
+// original note was actually held (a further refinement real SFZ implementations sometimes add) --
+// a documented, narrower scope than the spec's full behavior, not a bug.
+static void fire_release_trigger_zones(HdsSampleEngine *se, int assigned_osc, int owner_program, int note, int velocity) {
+    long best_area = -1;
+    int best_idx = -1;
+    for (int i = 0; i < se->slots->sample_slot_count; i++) {
+        SampleSlot *slot = &se->slots->sample_slots[i];
+        if (!slot->active || !slot->loaded) continue;
+        if (slot->assigned_osc != assigned_osc || slot->owner_program != owner_program) continue;
+        if (slot->trigger_type != HDS_SFZ_TRIGGER_RELEASE && slot->trigger_type != HDS_SFZ_TRIGGER_RELEASE_KEY) continue;
+        if (note < slot->min_note || note > slot->max_note) continue;
+        if (velocity < slot->min_velocity || velocity > slot->max_velocity) continue;
+        long area = (long)(slot->max_note - slot->min_note + 1) * (long)(slot->max_velocity - slot->min_velocity + 1);
+        if (best_area < 0 || area < best_area) { best_area = area; best_idx = i; }
+    }
+    if (best_idx < 0) return;
+
+    int player_idx = -1;
+    for (int i = 0; i < HDS_RELEASE_TAIL_POOL_SIZE; i++) {
+        if (!se->pending->release_tails[i].active) { player_idx = i; break; }
+    }
+    if (player_idx < 0) return; // pool exhausted -- drop this one release tail rather than steal an already-playing one
+
+    SampleSlot *slot = &se->slots->sample_slots[best_idx];
+    HdsReleaseTailPlayer *rt = &se->pending->release_tails[player_idx];
+    double ptr = 0.0; bool preroll = true;
+    int stream_idx = start_one_sample_stream(se, &ptr, &preroll, best_idx);
+    if (stream_idx < 0) return; // pool exhausted (SampleStream side) -- nothing to play
+    rt->active = true;
+    rt->stream_idx = stream_idx;
+    rt->ptr = ptr;
+    rt->preroll = preroll;
+    rt->owner_program = owner_program;
+    rt->play_hz = slot->unpitched ? (440.0f * powf(2.0f, (float)(slot->root_note - 69) / 12.0f)) : (440.0f * powf(2.0f, (float)(note - 69) / 12.0f));
+    rt->gain = 1.0f;
+    rt->decay_per_sample = (slot->rt_decay > 0.0f) ? powf(10.0f, -slot->rt_decay / 20.0f / (float)SAMPLE_RATE) : 1.0f;
 }
 
 // Called once per active voice per sample from render_audio_block, right after the EG tick loop
@@ -5513,17 +6602,33 @@ static void release_idle_sample_streams(HdsSampleEngine *se, SynthVoice *voice) 
         release_sample_stream(se, voice->vco1_sample_stream);
         voice->vco1_sample_stream = -1;
     }
+    if (voice->vco1_eg.state == STATE_IDLE && voice->vco1_layer_sample_stream >= 0) {
+        release_sample_stream(se, voice->vco1_layer_sample_stream);
+        voice->vco1_layer_sample_stream = -1;
+    }
     if (voice->vco2_eg.state == STATE_IDLE && voice->vco2_sample_stream >= 0) {
         release_sample_stream(se, voice->vco2_sample_stream);
         voice->vco2_sample_stream = -1;
+    }
+    if (voice->vco2_eg.state == STATE_IDLE && voice->vco2_layer_sample_stream >= 0) {
+        release_sample_stream(se, voice->vco2_layer_sample_stream);
+        voice->vco2_layer_sample_stream = -1;
     }
     if (voice->vco3_eg.state == STATE_IDLE && voice->vco3_sample_stream >= 0) {
         release_sample_stream(se, voice->vco3_sample_stream);
         voice->vco3_sample_stream = -1;
     }
+    if (voice->vco3_eg.state == STATE_IDLE && voice->vco3_layer_sample_stream >= 0) {
+        release_sample_stream(se, voice->vco3_layer_sample_stream);
+        voice->vco3_layer_sample_stream = -1;
+    }
     if (voice->vco4_eg.state == STATE_IDLE && voice->vco4_sample_stream >= 0) {
         release_sample_stream(se, voice->vco4_sample_stream);
         voice->vco4_sample_stream = -1;
+    }
+    if (voice->vco4_eg.state == STATE_IDLE && voice->vco4_layer_sample_stream >= 0) {
+        release_sample_stream(se, voice->vco4_layer_sample_stream);
+        voice->vco4_layer_sample_stream = -1;
     }
 }
 
@@ -5633,10 +6738,20 @@ static float render_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr
         unsigned int idx1 = (idx0 + 1) & SAMPLE_RING_MASK;
 
         unsigned int frames_left = available - int_ptr;
-        if (slot->loop_enabled && frames_left <= (unsigned int)SAMPLE_XFADE_SIZE && frames_left > 1) {
-            float fade_in = (float)(SAMPLE_XFADE_SIZE - frames_left) / (float)SAMPLE_XFADE_SIZE;
+        // SFZ loop_crossfade=: this zone's own explicit loop-splice crossfade width in frames, in
+        // place of the engine's fixed SAMPLE_XFADE_SIZE default -- see SampleSlot.loop_crossfade_
+        // frames' own comment. -1 (unset) reproduces today's exact fixed-width behavior. Clamped to
+        // SAMPLE_XFADE_SIZE regardless (never widened) since the ring-starvation safety margin just
+        // above and apply_loop_points()'s own minimum loop length are both sized against that same
+        // fixed constant -- a zone asking for a longer crossfade than that gets the engine's own
+        // maximum instead of risking either safety margin.
+        unsigned int effective_xfade = (unsigned int)SAMPLE_XFADE_SIZE;
+        if (slot->loop_crossfade_frames >= 0) effective_xfade = (unsigned int)slot->loop_crossfade_frames;
+        if (effective_xfade > (unsigned int)SAMPLE_XFADE_SIZE) effective_xfade = (unsigned int)SAMPLE_XFADE_SIZE;
+        if (slot->loop_enabled && effective_xfade > 0 && frames_left <= effective_xfade && frames_left > 1) {
+            float fade_in = (float)(effective_xfade - frames_left) / (float)effective_xfade;
             float fade_out = 1.0f - fade_in;
-            unsigned int widx0 = (r_ptr + int_ptr + (unsigned int)SAMPLE_XFADE_SIZE) & SAMPLE_RING_MASK;
+            unsigned int widx0 = (r_ptr + int_ptr + effective_xfade) & SAMPLE_RING_MASK;
             unsigned int widx1 = (widx0 + 1) & SAMPLE_RING_MASK;
             float base_l = stream->ring_l[idx0] + frac * (stream->ring_l[idx1] - stream->ring_l[idx0]);
             float wrap_l = stream->ring_l[widx0] + frac * (stream->ring_l[widx1] - stream->ring_l[widx0]);
@@ -6039,29 +7154,50 @@ static void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthShared
         // WAVE_SAMPLE: (re)claim a DFD stream for whichever oscillator is currently set to it,
         // and release any stream a stolen/retriggered voice was still holding from a previous
         // note even if this new note doesn't need one -- see start_sample_osc()'s comment.
+        // Note: trigger=legato zones (see HDS_SFZ_TRIGGER_LEGATO) can only ever match on this
+        // call, gated is_first_key_of_phrase==false -- but this whole block only runs when
+        // is_first_key_of_phrase is TRUE (Mono Legato's own overlapping-note glide path never
+        // reaches start_sample_osc at all, by original design: it deliberately never retriggers
+        // the sample oscillator, only glides pitch on the already-running stream). A genuinely
+        // legato-triggered zone is therefore a documented, narrow limitation, not a bug: it's
+        // parsed and matched correctly everywhere is_first_key_of_phrase reaches false, which
+        // today is nowhere. trigger=first zones are unaffected (Poly mode, the common case,
+        // always has is_first_key_of_phrase true here).
         if ((WaveType)((int)prog->vco1_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, 0, target_program, note, velocity);
-        } else if (voices[slot].vco1_sample_stream >= 0) {
-            release_sample_stream(se, voices[slot].vco1_sample_stream);
-            voices[slot].vco1_sample_stream = -1;
+            start_sample_osc(se, &voices[slot].vco1_sample_stream, &voices[slot].vco1_sample_ptr, &voices[slot].vco1_sample_preroll, 0, target_program, note, velocity,
+                              is_first_key_of_phrase, &voices[slot].vco1_sample_delay_remaining,
+                              &voices[slot].vco1_layer_sample_stream, &voices[slot].vco1_layer_sample_ptr, &voices[slot].vco1_layer_sample_preroll,
+                              &voices[slot].vco1_xfade_gain, &voices[slot].vco1_layer_xfade_gain);
+        } else {
+            if (voices[slot].vco1_sample_stream >= 0) { release_sample_stream(se, voices[slot].vco1_sample_stream); voices[slot].vco1_sample_stream = -1; }
+            if (voices[slot].vco1_layer_sample_stream >= 0) { release_sample_stream(se, voices[slot].vco1_layer_sample_stream); voices[slot].vco1_layer_sample_stream = -1; }
         }
         if ((WaveType)((int)prog->vco2_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, 1, target_program, note, velocity);
-        } else if (voices[slot].vco2_sample_stream >= 0) {
-            release_sample_stream(se, voices[slot].vco2_sample_stream);
-            voices[slot].vco2_sample_stream = -1;
+            start_sample_osc(se, &voices[slot].vco2_sample_stream, &voices[slot].vco2_sample_ptr, &voices[slot].vco2_sample_preroll, 1, target_program, note, velocity,
+                              is_first_key_of_phrase, &voices[slot].vco2_sample_delay_remaining,
+                              &voices[slot].vco2_layer_sample_stream, &voices[slot].vco2_layer_sample_ptr, &voices[slot].vco2_layer_sample_preroll,
+                              &voices[slot].vco2_xfade_gain, &voices[slot].vco2_layer_xfade_gain);
+        } else {
+            if (voices[slot].vco2_sample_stream >= 0) { release_sample_stream(se, voices[slot].vco2_sample_stream); voices[slot].vco2_sample_stream = -1; }
+            if (voices[slot].vco2_layer_sample_stream >= 0) { release_sample_stream(se, voices[slot].vco2_layer_sample_stream); voices[slot].vco2_layer_sample_stream = -1; }
         }
         if ((WaveType)((int)prog->vco3_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, 2, target_program, note, velocity);
-        } else if (voices[slot].vco3_sample_stream >= 0) {
-            release_sample_stream(se, voices[slot].vco3_sample_stream);
-            voices[slot].vco3_sample_stream = -1;
+            start_sample_osc(se, &voices[slot].vco3_sample_stream, &voices[slot].vco3_sample_ptr, &voices[slot].vco3_sample_preroll, 2, target_program, note, velocity,
+                              is_first_key_of_phrase, &voices[slot].vco3_sample_delay_remaining,
+                              &voices[slot].vco3_layer_sample_stream, &voices[slot].vco3_layer_sample_ptr, &voices[slot].vco3_layer_sample_preroll,
+                              &voices[slot].vco3_xfade_gain, &voices[slot].vco3_layer_xfade_gain);
+        } else {
+            if (voices[slot].vco3_sample_stream >= 0) { release_sample_stream(se, voices[slot].vco3_sample_stream); voices[slot].vco3_sample_stream = -1; }
+            if (voices[slot].vco3_layer_sample_stream >= 0) { release_sample_stream(se, voices[slot].vco3_layer_sample_stream); voices[slot].vco3_layer_sample_stream = -1; }
         }
         if ((WaveType)((int)prog->vco4_shape) == WAVE_SAMPLE) {
-            start_sample_osc(se, &voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, 3, target_program, note, velocity);
-        } else if (voices[slot].vco4_sample_stream >= 0) {
-            release_sample_stream(se, voices[slot].vco4_sample_stream);
-            voices[slot].vco4_sample_stream = -1;
+            start_sample_osc(se, &voices[slot].vco4_sample_stream, &voices[slot].vco4_sample_ptr, &voices[slot].vco4_sample_preroll, 3, target_program, note, velocity,
+                              is_first_key_of_phrase, &voices[slot].vco4_sample_delay_remaining,
+                              &voices[slot].vco4_layer_sample_stream, &voices[slot].vco4_layer_sample_ptr, &voices[slot].vco4_layer_sample_preroll,
+                              &voices[slot].vco4_xfade_gain, &voices[slot].vco4_layer_xfade_gain);
+        } else {
+            if (voices[slot].vco4_sample_stream >= 0) { release_sample_stream(se, voices[slot].vco4_sample_stream); voices[slot].vco4_sample_stream = -1; }
+            if (voices[slot].vco4_layer_sample_stream >= 0) { release_sample_stream(se, voices[slot].vco4_layer_sample_stream); voices[slot].vco4_layer_sample_stream = -1; }
         }
         for(int c=0; c<2; c++) { for(int f=0; f<5; f++) { voices[slot].f_low[c][f][0]=0.0f; voices[slot].f_low[c][f][1]=0.0f; voices[slot].f_band[c][f][0]=0.0f; voices[slot].f_band[c][f][1]=0.0f; } }
         for (int l = 0; l < LFO_COUNT; l++) {
@@ -6079,15 +7215,26 @@ static void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthShared
             }
         }
 
-        int m0 = (int)prog->eg_mode[0]; voices[slot].vco1_eg.state = (m0 == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco1_eg.current_level = (m0 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->eg[0].al / 100.0f));
-        int m1 = (int)prog->eg_mode[1]; voices[slot].vco2_eg.state = (m1 == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco2_eg.current_level = (m1 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->eg[1].al / 100.0f));
+        // SFZ per-zone amp envelope override: resolve, per oscillator, whether the zone just
+        // (re)claimed above sets its own ampeg_* opcodes and the Program's own override checkbox
+        // isn't forcing its shared EG instead -- see ProgramState.vco1_force_own_amp_eg's own
+        // comment. False (own_eg_rates untouched/unused) for every oscillator not currently playing
+        // such a zone, which then falls through to the Program's own eg_mode[]/eg[] exactly as
+        // before, byte-identical to pre-this-feature behavior.
+        voices[slot].vco1_using_own_ampeg = resolve_zone_owned_ampeg(se, voices[slot].vco1_sample_stream, prog->vco1_force_own_amp_eg != 0.0f, &voices[slot].vco1_own_eg_rates);
+        voices[slot].vco2_using_own_ampeg = resolve_zone_owned_ampeg(se, voices[slot].vco2_sample_stream, prog->vco2_force_own_amp_eg != 0.0f, &voices[slot].vco2_own_eg_rates);
+        voices[slot].vco3_using_own_ampeg = resolve_zone_owned_ampeg(se, voices[slot].vco3_sample_stream, prog->vco3_force_own_amp_eg != 0.0f, &voices[slot].vco3_own_eg_rates);
+        voices[slot].vco4_using_own_ampeg = resolve_zone_owned_ampeg(se, voices[slot].vco4_sample_stream, prog->vco4_force_own_amp_eg != 0.0f, &voices[slot].vco4_own_eg_rates);
+
+        int m0 = (int)prog->eg_mode[0];
+        init_amp_eg_start(&voices[slot].vco1_eg, voices[slot].vco1_using_own_ampeg, &voices[slot].vco1_own_eg_rates, m0, &prog->eg[0]);
+        int m1 = (int)prog->eg_mode[1];
+        init_amp_eg_start(&voices[slot].vco2_eg, voices[slot].vco2_using_own_ampeg, &voices[slot].vco2_own_eg_rates, m1, &prog->eg[1]);
         // Osc 3/4 Amp envelopes: eg[2]/eg_mode[2] and eg[3]/eg_mode[3].
-        int mn = (int)prog->eg_mode[2]; voices[slot].vco3_eg.state = (mn == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco3_eg.current_level = (mn == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->eg[2].al / 100.0f));
-        int m3 = (int)prog->eg_mode[3]; voices[slot].vco4_eg.state = (m3 == 5) ? STATE_DELAY : STATE_ATTACK;
-        voices[slot].vco4_eg.current_level = (m3 == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->eg[3].al / 100.0f));
+        int mn = (int)prog->eg_mode[2];
+        init_amp_eg_start(&voices[slot].vco3_eg, voices[slot].vco3_using_own_ampeg, &voices[slot].vco3_own_eg_rates, mn, &prog->eg[2]);
+        int m3 = (int)prog->eg_mode[3];
+        init_amp_eg_start(&voices[slot].vco4_eg, voices[slot].vco4_using_own_ampeg, &voices[slot].vco4_own_eg_rates, m3, &prog->eg[3]);
         for(int e=0; e<ASSIGNABLE_EG_COUNT; e++) {
             int me = (int)prog->eg_mode[4 + e]; voices[slot].assign_eg[e].state = (me == 5) ? STATE_DELAY : STATE_ATTACK;
             voices[slot].assign_eg[e].current_level = (me == 5) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->eg[4 + e].al / 100.0f));
@@ -6116,6 +7263,23 @@ static void trigger_voice_release(HdsSampleEngine *se, SynthVoice *voice) {
     request_sample_stream_release(se, voice->vco2_sample_stream);
     request_sample_stream_release(se, voice->vco3_sample_stream);
     request_sample_stream_release(se, voice->vco4_sample_stream);
+    // Crossfade-layer partner streams (SFZ xfin_*/xfout_*) need the exact same loop_sustain
+    // release notification as the primary stream above -- see SynthVoice.vco1_layer_sample_stream's
+    // own comment. A no-op for every oscillator without an active layer partner (stream -1).
+    request_sample_stream_release(se, voice->vco1_layer_sample_stream);
+    request_sample_stream_release(se, voice->vco2_layer_sample_stream);
+    request_sample_stream_release(se, voice->vco3_layer_sample_stream);
+    request_sample_stream_release(se, voice->vco4_layer_sample_stream);
+    // SFZ trigger=release/release_key: fire any matching release-tail zone on every oscillator,
+    // using this voice's own held note/velocity/Program -- see fire_release_trigger_zones's own
+    // comment. A no-op (nothing found) on every oscillator whose catalog has no trigger=release
+    // zone at all, the ordinary, unaffected case for every voice that never used one.
+    if (voice->midi_note >= 0) {
+        fire_release_trigger_zones(se, 0, voice->program_index, voice->midi_note, voice->midi_velocity);
+        fire_release_trigger_zones(se, 1, voice->program_index, voice->midi_note, voice->midi_velocity);
+        fire_release_trigger_zones(se, 2, voice->program_index, voice->midi_note, voice->midi_velocity);
+        fire_release_trigger_zones(se, 3, voice->program_index, voice->midi_note, voice->midi_velocity);
+    }
 }
 
 static void handle_note_off(HdsSampleEngine *se, SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int target_program, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
@@ -7960,11 +9124,17 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             int pidx = voices[v].program_index;
             const ProgramState *prog = &knobs->programs[pidx];
 
+            // SFZ per-zone amp envelope override (see ProgramState.vco1_force_own_amp_eg's own
+            // comment): a voice whose vcoN_using_own_ampeg is true ticks against ITS OWN
+            // vcoN_own_eg_rates (computed once at this note's own note-on) instead of this
+            // Program's shared eg_rates[pidx][e] -- unaffected (always the Program's own shared
+            // rates) for every oscillator not currently playing a zone with its own ampeg_*
+            // opcodes, and for every assignable EG (e>=4), which this override never touches.
             for(int e=0; e<ENV_COUNT; e++) {
-                if(e==0) tick_adsr(&voices[v].vco1_eg, &eg_rates[pidx][e], eg_sustain_chase_rate);
-                else if(e==1) tick_adsr(&voices[v].vco2_eg, &eg_rates[pidx][e], eg_sustain_chase_rate);
-                else if(e==2) tick_adsr(&voices[v].vco3_eg, &eg_rates[pidx][e], eg_sustain_chase_rate);
-                else if(e==3) tick_adsr(&voices[v].vco4_eg, &eg_rates[pidx][e], eg_sustain_chase_rate);
+                if(e==0) tick_adsr(&voices[v].vco1_eg, voices[v].vco1_using_own_ampeg ? &voices[v].vco1_own_eg_rates : &eg_rates[pidx][e], eg_sustain_chase_rate);
+                else if(e==1) tick_adsr(&voices[v].vco2_eg, voices[v].vco2_using_own_ampeg ? &voices[v].vco2_own_eg_rates : &eg_rates[pidx][e], eg_sustain_chase_rate);
+                else if(e==2) tick_adsr(&voices[v].vco3_eg, voices[v].vco3_using_own_ampeg ? &voices[v].vco3_own_eg_rates : &eg_rates[pidx][e], eg_sustain_chase_rate);
+                else if(e==3) tick_adsr(&voices[v].vco4_eg, voices[v].vco4_using_own_ampeg ? &voices[v].vco4_own_eg_rates : &eg_rates[pidx][e], eg_sustain_chase_rate);
                 else tick_adsr(&voices[v].assign_eg[e-4], &eg_rates[pidx][e], eg_sustain_chase_rate);
             }
             release_idle_sample_streams(se, &voices[v]); // WAVE_SAMPLE: free any DFD stream this voice's oscillator(s) no longer need
@@ -8325,6 +9495,17 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             double *sample_ptr_ptr[4] = { &voices[v].vco1_sample_ptr, &voices[v].vco2_sample_ptr, &voices[v].vco3_sample_ptr, &voices[v].vco4_sample_ptr };
             bool *sample_preroll_ptr[4] = { &voices[v].vco1_sample_preroll, &voices[v].vco2_sample_preroll, &voices[v].vco3_sample_preroll, &voices[v].vco4_sample_preroll };
             float *pending_sync_correction_ptr[4] = { &vco1_dummy_sync_correction, &voices[v].vco2_pending_sync_correction, &voices[v].vco3_pending_sync_correction, &voices[v].vco4_pending_sync_correction };
+            // SFZ first-class opcode support: crossfade-LAYER partner stream + static xfade gains
+            // (see find_matching_sample_slot's own comment) and the delayed-start countdown (SFZ's
+            // delay=) -- only ever non-default for a WAVE_SAMPLE oscillator whose currently-claimed
+            // zone actually uses xfin_*/xfout_*/delay=; every other oscillator's own entries here
+            // are simply never consulted below.
+            int *layer_stream_ptr[4] = { &voices[v].vco1_layer_sample_stream, &voices[v].vco2_layer_sample_stream, &voices[v].vco3_layer_sample_stream, &voices[v].vco4_layer_sample_stream };
+            double *layer_sample_ptr_ptr[4] = { &voices[v].vco1_layer_sample_ptr, &voices[v].vco2_layer_sample_ptr, &voices[v].vco3_layer_sample_ptr, &voices[v].vco4_layer_sample_ptr };
+            bool *layer_preroll_ptr[4] = { &voices[v].vco1_layer_sample_preroll, &voices[v].vco2_layer_sample_preroll, &voices[v].vco3_layer_sample_preroll, &voices[v].vco4_layer_sample_preroll };
+            float xfade_gain_arr[4] = { voices[v].vco1_xfade_gain, voices[v].vco2_xfade_gain, voices[v].vco3_xfade_gain, voices[v].vco4_xfade_gain };
+            float layer_xfade_gain_arr[4] = { voices[v].vco1_layer_xfade_gain, voices[v].vco2_layer_xfade_gain, voices[v].vco3_layer_xfade_gain, voices[v].vco4_layer_xfade_gain };
+            int *sample_delay_remaining_ptr[4] = { &voices[v].vco1_sample_delay_remaining, &voices[v].vco2_sample_delay_remaining, &voices[v].vco3_sample_delay_remaining, &voices[v].vco4_sample_delay_remaining };
 
             // Vol-based gain used ONLY for FM modulator scaling (ignores mute, matching the
             // original gain2_for_fm's "muting the sound must not silence the FM modulator"
@@ -8348,6 +9529,15 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             for (int slot = 0; slot < 4; slot++) {
                 int osc = alg->render_order[slot];
                 if (shape_arr[osc] == WAVE_OFF) { *pending_sync_correction_ptr[osc] = 0.0f; continue; } // WAVE_OFF: skip render entirely (phase advances unconditionally below)
+                // SFZ delay=: hold this oscillator fully silent for its own remaining delay frames,
+                // without touching its already-claimed stream/ptr/preroll (or its layer partner's)
+                // at all -- they resume exactly where start_sample_osc seeded them once this hits 0.
+                // A total no-op (0 remaining) for every zone that never sets delay= at all.
+                if (shape_arr[osc] == WAVE_SAMPLE && *sample_delay_remaining_ptr[osc] > 0) {
+                    (*sample_delay_remaining_ptr[osc])--;
+                    osc_out[osc] = 0.0f; osc_side_l[osc] = 0.0f; osc_side_r[osc] = 0.0f;
+                    continue;
+                }
                 float modulator_sum = 0.0f;
                 for (int e = 0; e < alg->edge_count; e++) {
                     if (alg->edges[e].to_osc != osc) continue;
@@ -8368,6 +9558,25 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                     mono_noise_flag_arr[osc], mono_noise_out[pidx][osc],
                     curve_drive_arr[osc],
                     &osc_side_l[osc], &osc_side_r[osc]);
+                // SFZ crossfade-LAYER mixing (xfin_*/xfout_*): scale the primary zone's own output
+                // by its static per-note xfade gain, then mix in an optional second, simultaneously
+                // -sounding partner zone's own independent stream at ITS OWN static gain -- see
+                // find_matching_sample_slot's own comment. xfade_gain_arr[osc] is always exactly
+                // 1.0 and layer_stream_ptr[osc] always -1 for every zone that never sets xfin_*/
+                // xfout_* at all, reproducing today's exact pre-crossfade-layering output
+                // byte-for-byte in that (vast majority) case.
+                if (shape_arr[osc] == WAVE_SAMPLE) {
+                    osc_out[osc] *= xfade_gain_arr[osc];
+                    osc_side_l[osc] *= xfade_gain_arr[osc];
+                    osc_side_r[osc] *= xfade_gain_arr[osc];
+                    if (*layer_stream_ptr[osc] >= 0) {
+                        float layer_l = 0.0f, layer_r = 0.0f;
+                        float layer_mono = render_sample_osc(se, layer_stream_ptr[osc], layer_sample_ptr_ptr[osc], layer_preroll_ptr[osc], hz_arr[osc], &layer_l, &layer_r);
+                        osc_out[osc] += layer_mono * layer_xfade_gain_arr[osc];
+                        osc_side_l[osc] += layer_l * layer_xfade_gain_arr[osc];
+                        osc_side_r[osc] += layer_r * layer_xfade_gain_arr[osc];
+                    }
+                }
                 modulator_output[osc] = osc_out[osc] * gain_for_fm_arr[osc] * eg_level_arr[osc];
             }
 
@@ -8611,6 +9820,22 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // fast slider drag), which applied instantly is a real discontinuity in a continuous
         // audio signal -- an audible click, not just a theoretical one. Chasing it removes the
         // discontinuity while still reaching the target in ~10ms, imperceptible as a fade.
+        // SFZ trigger=release/release_key one-shot players (see fire_release_trigger_zones's own
+        // comment) -- summed directly into their own owner_program's mixed_l/r bus, exactly like
+        // any of that Program's own voices, so they pick up the exact same master_volume/EQ/FX/
+        // routing pipeline everything else on that bus already gets. A no-op scan (every player
+        // inactive) for every session that never uses trigger=release at all, the ordinary case.
+        for (int rt_i = 0; rt_i < HDS_RELEASE_TAIL_POOL_SIZE; rt_i++) {
+            HdsReleaseTailPlayer *rt = &se->pending->release_tails[rt_i];
+            if (!rt->active) continue;
+            float rl = 0.0f, rr = 0.0f;
+            render_sample_osc(se, &rt->stream_idx, &rt->ptr, &rt->preroll, rt->play_hz, &rl, &rr);
+            if (rt->stream_idx < 0) { rt->active = false; continue; } // reached its own natural end-of-file
+            rt->gain *= rt->decay_per_sample;
+            mixed_l[rt->owner_program] += rl * rt->gain;
+            mixed_r[rt->owner_program] += rr * rt->gain;
+        }
+
         *master_volume_smoothed += (knobs->master_volume - *master_volume_smoothed) * master_volume_chase_rate;
         float bus_l[SOURCE_COUNT], bus_r[SOURCE_COUNT];
         float combi_mix_l = 0.0f, combi_mix_r = 0.0f;

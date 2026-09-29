@@ -939,7 +939,21 @@ static void clap_plugin_reset(const clap_plugin_t *plugin) {
         if (v->vco2_sample_stream >= 0) release_sample_stream(&p->sample_engine, v->vco2_sample_stream);
         if (v->vco3_sample_stream >= 0) release_sample_stream(&p->sample_engine, v->vco3_sample_stream);
         if (v->vco4_sample_stream >= 0) release_sample_stream(&p->sample_engine, v->vco4_sample_stream);
+        // Crossfade-layer partner streams (SFZ xfin_*/xfout_*) are a second, fully independent
+        // pool claim per oscillator -- see SynthVoice.vco1_layer_sample_stream's own comment. Leak
+        // exactly as above if not released here too before init_voice() wipes them back to -1.
+        if (v->vco1_layer_sample_stream >= 0) release_sample_stream(&p->sample_engine, v->vco1_layer_sample_stream);
+        if (v->vco2_layer_sample_stream >= 0) release_sample_stream(&p->sample_engine, v->vco2_layer_sample_stream);
+        if (v->vco3_layer_sample_stream >= 0) release_sample_stream(&p->sample_engine, v->vco3_layer_sample_stream);
+        if (v->vco4_layer_sample_stream >= 0) release_sample_stream(&p->sample_engine, v->vco4_layer_sample_stream);
         init_voice(v);
+    }
+    // trigger=release/release_key one-shot players (see fire_release_trigger_zones's own comment)
+    // are a completely separate pool from voices[] -- release them here too, same leak reasoning
+    // as the per-voice streams just above.
+    for (int i = 0; i < HDS_RELEASE_TAIL_POOL_SIZE; i++) {
+        HdsReleaseTailPlayer *rt = &p->pending_load_state.release_tails[i];
+        if (rt->active) { release_sample_stream(&p->sample_engine, rt->stream_idx); rt->active = false; }
     }
     for (int i = 0; i <= COMBI_PROGRAM_COUNT; i++) p->mono_stacks[i] = (MonoNoteStack){0};
     memset(p->global_lfo_phases, 0, sizeof(p->global_lfo_phases));

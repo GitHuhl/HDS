@@ -47,7 +47,7 @@
 typedef struct {
     float *shape, *vol, *pan, *mute, *fine_tune, *pitch_offset /* NULL for osc 0 */,
           *phase_offset, *pulse_width, *unison_detune, *unison_width,
-          *pitch, *mono_noise, *vel_to_amp, *curve_drive;
+          *pitch, *mono_noise, *vel_to_amp, *curve_drive, *force_own_amp_eg;
 } HdsPlayOscFields;
 
 static void hds_play_osc_fields(ProgramState *prog, int osc, HdsPlayOscFields *f) {
@@ -60,6 +60,7 @@ static void hds_play_osc_fields(ProgramState *prog, int osc, HdsPlayOscFields *f
             f->unison_detune = &prog->vco1_unison_saw_detune; f->unison_width = &prog->vco1_unison_saw_width;
             f->pitch = &prog->vco1_pitch; f->mono_noise = NULL; // Osc1 has no mono_noise field (see backend.c)
             f->vel_to_amp = &prog->vco1_vel_to_amp; f->curve_drive = &prog->vco1_curve_drive;
+            f->force_own_amp_eg = &prog->vco1_force_own_amp_eg;
             break;
         case 1:
             f->shape = &prog->vco2_shape; f->vol = &prog->vco2_vol; f->pan = &prog->vco2_pan;
@@ -68,6 +69,7 @@ static void hds_play_osc_fields(ProgramState *prog, int osc, HdsPlayOscFields *f
             f->unison_detune = &prog->vco2_unison_saw_detune; f->unison_width = &prog->vco2_unison_saw_width;
             f->pitch = &prog->vco2_pitch; f->mono_noise = NULL;
             f->vel_to_amp = &prog->vco2_vel_to_amp; f->curve_drive = &prog->vco2_curve_drive;
+            f->force_own_amp_eg = &prog->vco2_force_own_amp_eg;
             break;
         case 2:
             f->shape = &prog->vco3_shape; f->vol = &prog->vco3_vol; f->pan = &prog->vco3_pan;
@@ -76,6 +78,7 @@ static void hds_play_osc_fields(ProgramState *prog, int osc, HdsPlayOscFields *f
             f->unison_detune = &prog->vco3_unison_saw_detune; f->unison_width = &prog->vco3_unison_saw_width;
             f->pitch = &prog->vco3_pitch; f->mono_noise = &prog->vco3_mono_noise;
             f->vel_to_amp = &prog->vco3_vel_to_amp; f->curve_drive = &prog->vco3_curve_drive;
+            f->force_own_amp_eg = &prog->vco3_force_own_amp_eg;
             break;
         default: // case 3
             f->shape = &prog->vco4_shape; f->vol = &prog->vco4_vol; f->pan = &prog->vco4_pan;
@@ -84,6 +87,7 @@ static void hds_play_osc_fields(ProgramState *prog, int osc, HdsPlayOscFields *f
             f->unison_detune = &prog->vco4_unison_saw_detune; f->unison_width = &prog->vco4_unison_saw_width;
             f->pitch = &prog->vco4_pitch; f->mono_noise = &prog->vco4_mono_noise;
             f->vel_to_amp = &prog->vco4_vel_to_amp; f->curve_drive = &prog->vco4_curve_drive;
+            f->force_own_amp_eg = &prog->vco4_force_own_amp_eg;
             break;
     }
 }
@@ -655,6 +659,7 @@ static void hds_clap_play_mode_toggle_rects(HdsFxRect *single_r, HdsFxRect *comb
 typedef struct {
     HdsFxRect shape_pill;
     HdsFxRect sfz_load_btn;  // Multisample shape only -- see hds_play_compute_osc_layout()'s own comment
+    HdsFxRect force_own_amp_eg_chk; // Multisample shape only -- see ProgramState.vco1_force_own_amp_eg's own comment
     HdsFxRect pulse_knob;    // Pulse Width (Pulse shape) or Tilt (Noise shape)
     HdsFxRect mono_chk;      // Noise shape only
     HdsFxRect curve_knob;    // Curve (Saw/Triangle/RevSaw) or Drive (Sine)
@@ -683,6 +688,11 @@ static void hds_play_compute_osc_layout(int osc, int shape, double col_x, double
     // knob. See hds_clap_play_on_button_press()'s own comment for what clicking it actually does.
     if (shape == WAVE_SAMPLE) {
         out->sfz_load_btn = (HdsFxRect){col_x, y, HDS_PLAY_OSC_COL_W, HDS_PLAY_CHECK_H};
+        y += HDS_PLAY_CHECK_H + 4.0;
+        // SFZ per-zone amp envelope override checkbox -- only meaningful (and only shown) while
+        // this oscillator is actually Multisample, same posture as the .sfz loader button right
+        // above it. See ProgramState.vco1_force_own_amp_eg's own comment for what it does.
+        out->force_own_amp_eg_chk = (HdsFxRect){col_x, y, HDS_PLAY_OSC_COL_W, HDS_PLAY_CHECK_H};
         y += HDS_PLAY_CHECK_H + 4.0;
     }
 
@@ -1136,6 +1146,10 @@ static void hds_play_render_osc_strip(cairo_t *cr, HdsClapPlugin *p, HdsClapPlay
     if (L.sfz_load_btn.w > 0) {
         hds_fx_draw_pill(cr, L.sfz_load_btn.x, L.sfz_load_btn.y, L.sfz_load_btn.w, L.sfz_load_btn.h, "Load .sfz\xe2\x80\xa6", false, false);
     }
+    if (L.force_own_amp_eg_chk.w > 0) {
+        bool force_own = f.force_own_amp_eg && *f.force_own_amp_eg != 0.0f;
+        hds_fx_draw_pill(cr, L.force_own_amp_eg_chk.x, L.force_own_amp_eg_chk.y, L.force_own_amp_eg_chk.w, L.force_own_amp_eg_chk.h, "Use Amp EG", force_own, false);
+    }
 
     hds_play_draw_osc_knob(cr, &L.pulse_knob, f.pulse_width, HDS_PLAY_KNOB_PULSE, shape);
     if (L.mono_chk.w > 0) {
@@ -1336,6 +1350,10 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
         }
         if (L.mono_chk.w > 0 && hds_play_rect_contains(&L.mono_chk, x, y)) {
             if (button == 1 && f.mono_noise) *f.mono_noise = (*f.mono_noise != 0.0f) ? 0.0f : 1.0f;
+            return true;
+        }
+        if (L.force_own_amp_eg_chk.w > 0 && hds_play_rect_contains(&L.force_own_amp_eg_chk, x, y)) {
+            if (button == 1 && f.force_own_amp_eg) *f.force_own_amp_eg = (*f.force_own_amp_eg != 0.0f) ? 0.0f : 1.0f;
             return true;
         }
         if (hds_play_rect_contains(&L.mute_btn, x, y)) {
