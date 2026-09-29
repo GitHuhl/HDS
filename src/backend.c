@@ -4526,6 +4526,25 @@ typedef struct {
                                        // below 0), so this flag stands in for "already read frame
                                        // 0 of a non-looping reverse zone, nothing further to give."
                                        // Reset false on SAMPLE_CMD_START.
+    // Disk-thread-owned write, audio-thread-owned read (render_sample_osc) -- the ONLY reliable
+    // way to tell "the ring is under-filled because this non-looping zone has genuinely finished"
+    // apart from "the ring is under-filled because this freshly-claimed stream hasn't been
+    // serviced by the disk thread yet" (or the disk thread is just behind -- e.g. busy servicing
+    // many OTHER freshly-claimed streams from a burst of rapidly-retriggered notes). Before this
+    // flag existed, render_sample_osc's own ring-starvation check (available < SAMPLE_XFADE_SIZE+2)
+    // treated BOTH cases identically and released the stream on either one -- almost always
+    // harmless (a real note-on gets a full pre_roll_frames head start before it ever needs the
+    // ring, plenty of time for the disk thread to catch up under ordinary load), but under a
+    // stress-test burst of many simultaneous/rapid retriggers across multiple Multisample
+    // oscillators, the single shared disk thread can fall far enough behind that a brand new
+    // stream's ring is STILL EMPTY by the time playback reaches it -- indistinguishable, before
+    // this flag, from "reached the real end of the file," so the voice's sample playback got
+    // silently killed the instant it should have started: a note that looks like it triggered
+    // (envelope attacking normally) but is never actually audible. Set true by the disk thread at
+    // the exact moment it determines there is truly nothing left (forward: disk_read_frame_pos
+    // reaches slot->playback_end_frame; reverse: the existing disk_reverse_exhausted trip above);
+    // reset false on SAMPLE_CMD_START, same as disk_reverse_exhausted.
+    _Atomic bool disk_reached_eof;
     _Atomic bool release_requested;  // audio-thread-owned write (request_sample_stream_release(),
                                        // called once from trigger_voice_release() at the owning
                                        // voice's STATE_RELEASE transition), disk-thread-owned read
@@ -4726,6 +4745,7 @@ static void *sample_disk_thread_main(void *arg) {
                 st->active_slot_index = atomic_load_explicit(&st->slot_index, memory_order_acquire);
                 st->active_start_frame = atomic_load_explicit(&st->start_frame, memory_order_acquire);
                 st->disk_reverse_exhausted = false;
+                atomic_store_explicit(&st->disk_reached_eof, false, memory_order_relaxed);
                 SampleSlot *slot = (st->active_slot_index >= 0 && st->active_slot_index < SAMPLE_SLOT_CAPACITY) ? &se->slots->sample_slots[st->active_slot_index] : NULL;
                 if (slot && slot->loaded) {
                     st->disk_file_handle = fopen(slot->file_path, "rb");
@@ -4827,6 +4847,7 @@ static void *sample_disk_thread_main(void *arg) {
                         st->disk_read_frame_pos = slot->loop_end - 1;
                     } else if (st->disk_read_frame_pos == 0) {
                         st->disk_reverse_exhausted = true;
+                        atomic_store_explicit(&st->disk_reached_eof, true, memory_order_release);
                         break;
                     } else {
                         st->disk_read_frame_pos--;
@@ -4836,6 +4857,10 @@ static void *sample_disk_thread_main(void *arg) {
                 if (loop_active && st->disk_read_frame_pos >= slot->loop_end) {
                     st->disk_read_frame_pos = slot->loop_start;
                 } else if (!loop_active && st->disk_read_frame_pos >= slot->playback_end_frame) {
+                    // Genuinely nothing left, not just "hasn't been serviced yet" -- see
+                    // disk_reached_eof's own comment for why render_sample_osc needs this
+                    // distinction rather than inferring EOF from ring-starvation alone.
+                    atomic_store_explicit(&st->disk_reached_eof, true, memory_order_release);
                     continue; // nothing left to stream -- render_sample_osc handles end-of-sample itself
                 }
 
@@ -5542,11 +5567,18 @@ static float render_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr
         unsigned int available = (w_ptr - r_ptr) & SAMPLE_RING_MASK;
 
         if (available < (unsigned int)(SAMPLE_XFADE_SIZE + 2)) {
-            if (!slot->loop_enabled) {
-                // Natural end of a non-looping sample -- release the stream cleanly rather than
-                // read past what's actually been written. A genuinely-behind disk thread on a
-                // LOOPING sample instead just holds silent below rather than tearing the voice
-                // down (vanishingly rare given the pre-roll head start and the ring's depth).
+            // Ring starvation alone does NOT mean "reached the end of the file" -- it's also
+            // exactly what a freshly-claimed stream's ring looks like before the (single, shared)
+            // disk thread has gotten around to filling it, which can genuinely take a while under
+            // a burst of many simultaneous/rapid retriggers across several Multisample
+            // oscillators (see disk_reached_eof's own comment). Only release for a non-looping
+            // zone once the disk thread has explicitly confirmed there's truly nothing left;
+            // otherwise -- exactly like the always-silent-hold behavior a looping zone already
+            // gets below -- just hold silent and wait for it to catch up. This is what used to
+            // silently and permanently kill a note the instant it should have started audibly
+            // playing, under exactly the kind of stress-test load that makes the disk thread fall
+            // behind.
+            if (!slot->loop_enabled && atomic_load_explicit(&stream->disk_reached_eof, memory_order_acquire)) {
                 release_sample_stream(se, *stream_idx);
                 *stream_idx = -1;
                 *ptr_inout = ptr; *preroll_inout = preroll;
