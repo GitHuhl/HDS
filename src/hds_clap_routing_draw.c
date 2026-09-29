@@ -108,37 +108,51 @@ static int hds_routing_ext_in_pair(int src) { return src - COMBI_PROGRAM_COUNT -
 
 // --- Drum Bus Key Routing: a compact, low-footprint way to actually assign Sample Bank zones to
 // Drum Buses from the GUI (see DRUM_BUS_COUNT's own comment in backend.c) -- the only other way is
-// hand-editing an SFZ file's own hds_drum_bus= opcode or raw OSC. One 7 (natural note letter) x 8
-// (octave) checkbox grid, reused for whichever Drum Bus the stepper above it currently selects
-// (rather than a separate 56-checkbox grid per bus, which would be 24x the footprint for the same
-// information) -- ticking a cell assigns every zone (Single Program scope, any oscillator) whose
-// key range covers that note to the selected bus; unticking sets those same zones back to 0 (off).
-// Operates directly on the live Sample Bank catalog via p->sample_engine.slots -- both hosts'
-// sample_engine.slots always points at the SAME struct the audio thread itself reads (see
-// HdsSampleEngine's own comment), so this is a real, immediate, in-process struct write, no OSC
-// round-trip needed and no reload required. ---
+// hand-editing an SFZ file's own hds_drum_bus= opcode or raw OSC. One full 12 (chromatic note,
+// naturals A-G plus the 5 sharps -- A#/C#/D#/F#/G#, no B#/E# since B-C and E-F are already a
+// semitone apart) x 8 (octave) checkbox grid, reused for whichever Drum Bus the stepper above it
+// currently selects (rather than a separate 96-checkbox grid per bus, which would be 24x the
+// footprint for the same information) -- ticking a cell assigns every zone (Single Program scope,
+// any oscillator) whose key range covers that note to the selected bus; unticking sets those same
+// zones back to 0 (off). Operates directly on the live Sample Bank catalog via
+// p->sample_engine.slots -- both hosts' sample_engine.slots always points at the SAME struct the
+// audio thread itself reads (see HdsSampleEngine's own comment), so this is a real, immediate,
+// in-process struct write, no OSC round-trip needed and no reload required. ---
 #define HDS_ROUTING_DB_MARGIN_TOP 26.0
 #define HDS_ROUTING_DB_TITLE_H 18.0
 #define HDS_ROUTING_DB_STEPPER_H 22.0
 #define HDS_ROUTING_DB_STEPPER_GAP 8.0
 #define HDS_ROUTING_DB_COLHDR_H 16.0
-#define HDS_ROUTING_DB_CELL_W 32.0
+#define HDS_ROUTING_DB_CELL_W 30.0
 #define HDS_ROUTING_DB_CELL_H 22.0
 #define HDS_ROUTING_DB_CELL_PAD 3.0
 #define HDS_ROUTING_DB_ROWLBL_W 26.0
-#define HDS_ROUTING_DB_COLS 7
-#define HDS_ROUTING_DB_ROWS 8
+#define HDS_ROUTING_DB_COLS 12
+// Octave -1 through 9 (11 rows) -- the full real MIDI note range (0-127), not just a convenient
+// subset. Octave -1's 12 notes are MIDI 0-11 and octave 9's would be 120-131, but MIDI stops at
+// 127 (G9) -- see hds_routing_db_note_valid()'s own comment for how the 4 cells past G9
+// (G#9/A9/A#9/B9) are excluded instead of silently computing an out-of-range note.
+#define HDS_ROUTING_DB_ROWS 11
 
-// Natural note letters, exactly the order asked for (A B C D E F G left-to-right), each mapped to
-// its own standard scientific-pitch semitone offset within an octave (C=0 .. B=11) so the actual
-// MIDI note computed per cell is correct regardless of this display order.
-static const char HDS_ROUTING_DB_LETTERS[HDS_ROUTING_DB_COLS] = {'A', 'B', 'C', 'D', 'E', 'F', 'G'};
-static const int HDS_ROUTING_DB_SEMITONE[HDS_ROUTING_DB_COLS] = {9, 11, 0, 2, 4, 5, 7};
+// Every chromatic note, natural letters in the order first asked for (A B C D E F G) with each
+// sharp inserted right after its own natural (A# after A, C# after C, ...) -- each mapped to its
+// own standard scientific-pitch semitone offset within an octave (C=0 .. B=11) so the actual MIDI
+// note computed per cell is correct regardless of this display order.
+static const char *HDS_ROUTING_DB_LABELS[HDS_ROUTING_DB_COLS] = {"A", "A#", "B", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#"};
+static const int HDS_ROUTING_DB_SEMITONE[HDS_ROUTING_DB_COLS] = {9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7, 8};
 
-// col 0-6 = note letter (A-G), row 0-7 = octave 1-8 (row 0 = octave 1, at the top).
+// col 0-11 = chromatic note (see HDS_ROUTING_DB_LABELS), row 0-10 = octave -1..9 (row 0 = octave
+// -1, at the top -- so octave = row - 1, and since MIDI note = (octave+1)*12+semitone, that's just
+// row*12+semitone, no separate octave variable needed).
 static int hds_routing_db_note(int col, int row) {
-    int octave = row + 1;
-    return (octave + 1) * 12 + HDS_ROUTING_DB_SEMITONE[col];
+    return row * 12 + HDS_ROUTING_DB_SEMITONE[col];
+}
+
+// False only for the 4 cells past G9 (MIDI 127, the real top of the MIDI note range) that the
+// last row's own 12-column width would otherwise compute as 128-131 -- G#9/A9/A#9/B9 don't exist.
+// Every other cell in the grid (octave -1's 12 notes are MIDI 0-11, the real bottom) is valid.
+static bool hds_routing_db_note_valid(int col, int row) {
+    return hds_routing_db_note(col, row) <= 127;
 }
 
 typedef struct {
@@ -294,19 +308,26 @@ static void hds_clap_routing_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRoutin
         cairo_set_font_size(cr, 9.0);
         hds_fx_rgb(cr, 0.5, 0.5, 0.53);
         for (int col = 0; col < HDS_ROUTING_DB_COLS; col++) {
-            char letter[2] = {HDS_ROUTING_DB_LETTERS[col], '\0'};
-            hds_fx_centered_text(cr, DL.cell[col][0].x + DL.cell[col][0].w / 2.0, DL.cell[col][0].y - HDS_ROUTING_DB_COLHDR_H / 2.0, letter);
+            hds_fx_centered_text(cr, DL.cell[col][0].x + DL.cell[col][0].w / 2.0, DL.cell[col][0].y - HDS_ROUTING_DB_COLHDR_H / 2.0, HDS_ROUTING_DB_LABELS[col]);
         }
         for (int row = 0; row < HDS_ROUTING_DB_ROWS; row++) {
-            char oct[4]; snprintf(oct, sizeof(oct), "%d", row + 1);
+            char oct[4]; snprintf(oct, sizeof(oct), "%d", row - 1);
             hds_fx_centered_text(cr, HDS_ROUTING_MARGIN + HDS_ROUTING_DB_ROWLBL_W / 2.0, DL.cell[0][row].y + DL.cell[0][row].h / 2.0 + 3.0, oct);
         }
 
         for (int col = 0; col < HDS_ROUTING_DB_COLS; col++) {
             for (int row = 0; row < HDS_ROUTING_DB_ROWS; row++) {
+                HdsFxRect *c = &DL.cell[col][row];
+                if (!hds_routing_db_note_valid(col, row)) {
+                    // Past G9 (MIDI 127) -- see hds_routing_db_note_valid()'s own comment. Drawn as
+                    // a plain empty well, not a real cell: no fill, no checkmark, no click target.
+                    hds_fx_rgba(cr, 1, 1, 1, 0.05);
+                    cairo_new_path(cr); cairo_set_line_width(cr, 1.0);
+                    cairo_rectangle(cr, c->x + 0.5, c->y + 0.5, c->w - 1, c->h - 1); cairo_stroke(cr);
+                    continue;
+                }
                 int note = hds_routing_db_note(col, row);
                 bool on = hds_routing_db_note_on(&p->sample_engine, note, vs->drum_bus_selected);
-                HdsFxRect *c = &DL.cell[col][row];
                 hds_fx_rgb(cr, on ? 0.20 : 0.16, on ? 0.55 : 0.16, on ? 0.28 : 0.19);
                 cairo_new_path(cr); cairo_rectangle(cr, c->x, c->y, c->w, c->h); cairo_fill(cr);
                 hds_fx_rgba(cr, 1, 1, 1, 0.12);
@@ -342,6 +363,7 @@ static bool hds_clap_routing_on_button_press(HdsClapPlugin *p, HdsClapRoutingVie
         }
         for (int col = 0; col < HDS_ROUTING_DB_COLS; col++) {
             for (int row = 0; row < HDS_ROUTING_DB_ROWS; row++) {
+                if (!hds_routing_db_note_valid(col, row)) continue; // past G9/MIDI 127 -- not a real cell, see its own comment
                 if (hds_play_rect_contains(&DL.cell[col][row], x, y)) {
                     if (button == 1) hds_routing_db_toggle_note(&p->sample_engine, hds_routing_db_note(col, row), vs->drum_bus_selected);
                     return true;
