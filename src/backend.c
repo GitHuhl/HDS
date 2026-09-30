@@ -8794,6 +8794,13 @@ static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, Hds
         int note = data1 + (int)lroundf(knobs->transpose_semitones);
         if (note < 0) note = 0; else if (note > 127) note = 127;
         bool is_note_on = (type == HDS_MIDI_NOTE_ON);
+        // Feeds FX_TYPE_BROADCAST_DELAY's On-Air Override MIDI Trigger mode (see
+        // g_bcastdly_notes_held's own comment in fx_chain.c) -- deliberately the rawest possible
+        // choke point (every note-on/off this function is ever called with, regardless of which
+        // Combi lane or Arp routing it goes on to take below), so "any MIDI key press" means
+        // literally any key, not just ones actually reaching a voice.
+        if (is_note_on) g_bcastdly_notes_held++;
+        else if (g_bcastdly_notes_held > 0) g_bcastdly_notes_held--;
         if ((int)knobs->performance_mode == 1) {
             // Combi mode: live dispatch fans out to every Combi lane whose own MIDI channel
             // matches (0 = Omni) -- a separate, parallel mechanism from Sequencer's own

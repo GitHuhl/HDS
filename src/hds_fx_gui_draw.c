@@ -119,7 +119,7 @@ static int hds_fx_type_param_count(int fx_type) {
         /* STEREODOUBLER */ 2, /* TAPEDELAY2 */ 7, /* POINTYGUITAR */ 10, /* GUITARCONDITIONER */ 0,
         /* CABS2 */ 2, /* NAM */ 3, /* GATE */ 6, /* EQ3 */ 7, /* LIMITER */ 3, /* FETCOMP */ 8,
         /* FAIRKID67 */ 8, /* PEAKMAX */ 7, /* MULTIFILTER */ 4, /* OPTOCOMP */ 5, /* DEESSER */ 6,
-        /* HARDTUNE */ 10, /* FDNVERB */ 10, /* SSL4K */ 11, /* DBX160 */ 5, /* BROADCAST_DELAY */ 6,
+        /* HARDTUNE */ 10, /* FDNVERB */ 10, /* SSL4K */ 11, /* DBX160 */ 5, /* BROADCAST_DELAY */ 7,
     };
     if (fx_type < 0 || fx_type >= (int)(sizeof(counts) / sizeof(counts[0]))) return 0;
     return counts[fx_type];
@@ -153,7 +153,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
     static const char *const fdnverb[] = {"Decay", "Size", "PreDly", "Damp", "Diffus", "ModRt", "ModDp", "ERLvl", "ERDcy", "Freeze"};
     static const char *const ssl4k[] = {"HPFrq", "LFFrq", "LFGan", "LMFrq", "LMGan", "LMQ", "HMFrq", "HMGan", "HFFrq", "HFGan", "E/G"};
     static const char *const dbx160[] = {"Thresh", "Ratio", "Makeup", "Sat", "SC-HP"};
-    static const char *const bcastdly[] = {"Delay", "Dump7s", "Dmp15s", "Dmp30s", "Rstock", "OnAir"};
+    static const char *const bcastdly[] = {"Delay", "Dump7s", "Dmp15s", "Dmp30s", "Rstock", "OnAir", "Vol"};
 
     const char *const *table = NULL;
     int count = 0;
@@ -180,7 +180,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
         case FX_TYPE_FDNVERB: table = fdnverb; count = 10; break;
         case FX_TYPE_SSL4K: table = ssl4k; count = 11; break;
         case FX_TYPE_DBX160: table = dbx160; count = 5; break;
-        case FX_TYPE_BROADCAST_DELAY: table = bcastdly; count = 6; break;
+        case FX_TYPE_BROADCAST_DELAY: table = bcastdly; count = 7; break;
         default: return "";
     }
     if (idx < 0 || idx >= count) return "";
@@ -430,7 +430,7 @@ static void hds_fx_type_param_value_text(int fx_type, int idx, float frac, char 
         case FX_TYPE_BROADCAST_DELAY:
             if (idx == 0) { hds_fx_fmt_sec_linear(frac, 0.0f, (float)HDS_BCASTDLY_MAX_SEC, buf, buflen); return; } // Delay
             if (idx == 4) { hds_fx_fmt_plain(frac, 1.0f, 25.0f, "%", buf, buflen); return; } // Restock Speed
-            break; // idx 1-3 (the Dump buttons) are custom-drawn, never reach this function
+            break; // idx 1-3 (Dump) and idx 5 (On-Air Override) are custom-drawn buttons, never reach this function; idx 6 (Volume) falls through to the plain percent default below
         default: break;
     }
     hds_fx_fmt_percent(frac, buf, buflen);
@@ -643,6 +643,13 @@ static int hds_fx_slot_output_target(int row, int list_pos) {
 #define HDS_FX_DROPDOWN_OUTPUT 4
 #define HDS_FX_DROPDOWN_SOURCE 5 // the Source-combo Input header for a host with no port model -- see HdsFxGuiHost's own comment
 #define HDS_FX_DROPDOWN_OUT_PAIR 6 // the Source-combo Output pill's own single-pick routing choice -- see HdsFxGuiHost's own source_routing_flat comment
+// FX_TYPE_BROADCAST_DELAY's On-Air Override mode -- opened by a RIGHT-click on the button itself
+// (every other dropdown here opens on any click; this is the one exception, since a plain click on
+// that button means something else entirely -- see hds_fx_gui_on_button_press()'s own comment) --
+// not anchored to a knob/pill rect the generic layout already computes, but to the button's own
+// rect built the same way hds_fx_bcastdly_dump_btn_rect() always has. See fx_types.h's own param[7]
+// comment for what Normal/MIDI Trigger/Disabled each actually do.
+#define HDS_FX_DROPDOWN_ONAIR_MODE 7
 
 typedef struct { double x, y, w, h; } HdsFxRect;
 
@@ -999,19 +1006,27 @@ static void hds_fx_draw_dump_button(cairo_t *cr, const HdsFxRect *r, const char 
 // orange rather than red: this one doesn't discard anything or need the Dump buttons' own
 // press-confirmation weight -- it's live audio replacement for as long as it's held, and releasing
 // it is instant and lossless (see run_fx_broadcastdelay()'s own comment). Brighter while actually
-// held (`active`) for the same reason a real illuminated panic switch lights up under your thumb.
-static void hds_fx_draw_onair_button(cairo_t *cr, const HdsFxRect *r, bool active) {
+// held (`active`) for the same reason a real illuminated panic switch lights up under your thumb --
+// meaningful only in Normal mode (see param[7]'s own comment in fx_types.h); MIDI Trigger mode
+// deliberately gets no live "currently sounding" glow of its own (nothing here can safely read the
+// audio thread's own gate state -- see g_bcastdly_notes_held's own comment for why that stays a
+// plain audio-side global, not something round-tripped back into a param a GUI thread also writes).
+// `disabled` grays it out (Mode == Disabled) same as hds_fx_draw_dump_button()'s own palette.
+static void hds_fx_draw_onair_button(cairo_t *cr, const HdsFxRect *r, bool active, bool disabled) {
     cairo_new_path(cr);
     cairo_rectangle(cr, r->x, r->y, r->w, r->h);
-    if (active) hds_fx_rgb(cr, 1.0, 0.55, 0.0);
+    if (disabled) hds_fx_rgb(cr, 0.16, 0.16, 0.18);
+    else if (active) hds_fx_rgb(cr, 1.0, 0.55, 0.0);
     else hds_fx_rgb(cr, 0.68, 0.40, 0.05);
     cairo_fill_preserve(cr);
-    hds_fx_rgb(cr, 1.0, 0.78, 0.35);
+    if (disabled) hds_fx_rgb(cr, 0.32, 0.32, 0.35);
+    else hds_fx_rgb(cr, 1.0, 0.78, 0.35);
     cairo_set_line_width(cr, 1.3);
     cairo_stroke(cr);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 9.5);
-    hds_fx_rgb(cr, 1.0, 1.0, 1.0);
+    if (disabled) hds_fx_rgb(cr, 0.42, 0.42, 0.45);
+    else hds_fx_rgb(cr, 1.0, 1.0, 1.0);
     hds_fx_centered_text(cr, r->x + r->w / 2.0, r->y + r->h / 2.0 - 1.0, "1000");
     hds_fx_centered_text(cr, r->x + r->w / 2.0, r->y + r->h / 2.0 + 12.0, "Hz");
 }
@@ -1128,6 +1143,7 @@ static int hds_fx_dropdown_option_count(const HdsFxGuiHost *p, int kind) {
         case HDS_FX_DROPDOWN_SIDECHAIN: return 1 + HDS_FX_PORT_COUNT; // "Same as Source" + 8
         case HDS_FX_DROPDOWN_SOURCE: return p->source_count + (FX_SLOT_COUNT - 1); // no Off/Mono/Stereo suboptions -- matches frontend.py's own plain Source combo, plus the same slot-output section INPUT gets
         case HDS_FX_DROPDOWN_OUT_PAIR: return 1 + p->output_pair_count; // Off (clears every pair) + one entry per real output pair
+        case HDS_FX_DROPDOWN_ONAIR_MODE: return 3; // Normal, MIDI Trigger, Disabled -- see fx_types.h's own param[7] comment
         default: return 0;
     }
 }
@@ -1170,6 +1186,11 @@ static void hds_fx_dropdown_option_label(const HdsFxGuiHost *p, int kind, int ro
         case HDS_FX_DROPDOWN_OUT_PAIR:
             if (idx == 0) snprintf(buf, buflen, "Off");
             else snprintf(buf, buflen, "Out %d", idx); // idx 1..N -> pair idx-1, 1-based display
+            return;
+        case HDS_FX_DROPDOWN_ONAIR_MODE:
+            if (idx == 0) snprintf(buf, buflen, "Normal (Mouse Hold)");
+            else if (idx == 1) snprintf(buf, buflen, "Trigger via MIDI Key");
+            else snprintf(buf, buflen, "Disable");
             return;
         default: buf[0] = 0; return;
     }
@@ -1220,6 +1241,10 @@ static int hds_fx_dropdown_current_index(const HdsFxGuiHost *p, int kind, int ro
             }
             return 0; // nothing enabled for this source -- "Off"
         }
+        case HDS_FX_DROPDOWN_ONAIR_MODE: {
+            int m = (int)(p->fx[row].param[7] + 0.5f);
+            return (m < 0 || m > 2) ? 0 : m;
+        }
         default: return -1;
     }
 }
@@ -1239,10 +1264,11 @@ static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
             if (new_type == FX_TYPE_GATE) p->fx[row].param[4] = 0.25f;
             // FX_TYPE_BROADCAST_DELAY's Delay (param[0]) has no useful "off" reading at 0s either --
             // seed it to a real, usable 30s (half of the 0-60s range) so all three dump buttons have
-            // something to work with the moment this slot is switched on, and seed Restock Speed
+            // something to work with the moment this slot is switched on, seed Restock Speed
             // (param[4]) to a moderate, clearly-audible-if-you-listen-for-it default rather than its
-            // own honest-but-glacial 1% minimum.
-            if (new_type == FX_TYPE_BROADCAST_DELAY) { p->fx[row].param[0] = 0.5f; p->fx[row].param[4] = 0.4f; }
+            // own honest-but-glacial 1% minimum, and seed On-Air Override Volume (param[6]) to the
+            // 50% the button's own spec asks for rather than its own honest-but-silent 0%.
+            if (new_type == FX_TYPE_BROADCAST_DELAY) { p->fx[row].param[0] = 0.5f; p->fx[row].param[4] = 0.4f; p->fx[row].param[6] = 0.5f; }
             return;
         }
         case HDS_FX_DROPDOWN_INPUT: {
@@ -1296,6 +1322,13 @@ static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
             }
             return;
         }
+        case HDS_FX_DROPDOWN_ONAIR_MODE:
+            p->fx[row].param[7] = (float)idx;
+            // Switching to Disabled kills any override already sounding via the plain mouse-hold
+            // gate right away, rather than leaving param[5] at 1.0 until some future release event
+            // that (now that Disabled ignores param[5] entirely) may never actually come.
+            if (idx == 2) p->fx[row].param[5] = 0.0f;
+            return;
         default: return;
     }
 }
@@ -1308,6 +1341,7 @@ static double hds_fx_dropdown_width(int kind) {
         case HDS_FX_DROPDOWN_SIDECHAIN: return 110.0;
         case HDS_FX_DROPDOWN_SOURCE: return 120.0; // "Program 8"/"Ext In 8"/"Combi Mix"/"Slot 32 Out" -- widest names in the list
         case HDS_FX_DROPDOWN_INPUT: return 120.0; // wide enough for "Slot 32 Out" alongside the plain port list -- see hds_fx_slot_output_target()'s own comment
+        case HDS_FX_DROPDOWN_ONAIR_MODE: return 165.0; // "Trigger via MIDI Key" is the widest label in this list
         default: return 90.0; // Output
     }
 }
@@ -1750,7 +1784,8 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
             if (is_bcastdly && i == 5) {
                 HdsFxRect btn;
                 hds_fx_bcastdly_dump_btn_rect(col_x, y, &btn);
-                hds_fx_draw_onair_button(cr, &btn, slot->param[5] != 0.0f);
+                int onair_mode = (int)(slot->param[7] + 0.5f);
+                hds_fx_draw_onair_button(cr, &btn, onair_mode == 0 && slot->param[5] != 0.0f, onair_mode == 2);
                 continue;
             }
             // Normalize against this param's own real STORAGE range (see
@@ -2014,6 +2049,18 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
         vs->dropdown.kind = HDS_FX_DROPDOWN_SIDECHAIN; vs->dropdown.row = row; vs->dropdown.anchor = L.sidechain_pill;
         return true;
     }
+    // On-Air Override's mode menu -- RIGHT-click only (button==1 on this same rect means something
+    // else entirely: hold-to-engage in Normal mode -- see the per-param loop's own i==5 handling
+    // just below). Reachable regardless of the button's own current mode/disabled state, since this
+    // is the only way back to Normal from either MIDI Trigger or Disabled.
+    if (button == 3 && hds_fx_type_is_broadcast_delay((int)p->fx[row].fx_type)) {
+        HdsFxRect onair_btn;
+        hds_fx_bcastdly_dump_btn_rect(hds_fx_bcastdly_col_x(L.param_knob[0].x, 5), row_y, &onair_btn);
+        if (hds_fx_rect_contains(&onair_btn, x, y)) {
+            vs->dropdown.kind = HDS_FX_DROPDOWN_ONAIR_MODE; vs->dropdown.row = row; vs->dropdown.anchor = onair_btn;
+            return true;
+        }
+    }
     if (hds_fx_type_uses_nam_paths((int)p->fx[row].fx_type)) {
         if (hds_fx_rect_contains(&L.nam_model_pill, x, y)) { hds_fx_gui_browser_open(vs, ".nam", "Select NAM Model (*.nam)", p->fx[row].nam_model_path, SAMPLE_PATH_LEN); return true; }
         if (hds_fx_rect_contains(&L.nam_ir_pill, x, y)) { hds_fx_gui_browser_open(vs, ".wav", "Select Cab IR (*.wav)", p->fx[row].nam_ir_path, SAMPLE_PATH_LEN); return true; }
@@ -2077,10 +2124,17 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
             // hds_fx_gui_on_button_release() -- which gets no x/y of its own -- knows which row to
             // clear back to 0.0 on release). See run_fx_broadcastdelay()'s own comment for why this
             // has to be a live hold, not an edge-triggered one-shot like the Dump buttons above.
+            // Mouse-hold only actually does anything in Normal mode (param[7]==0) -- in MIDI Trigger
+            // mode it's replaced entirely by the live MIDI-key gate, and in Disabled it's grayed out
+            // and inert, same "still consumes the click, just doesn't fire" convention the Dump
+            // buttons use at Delay=0.
             if (is_bcastdly && i == 5) {
                 HdsFxRect btn;
                 hds_fx_bcastdly_dump_btn_rect(col_x, row_y, &btn);
-                if (hds_fx_rect_contains(&btn, x, y)) { p->fx[row].param[5] = 1.0f; vs->tone_override_row = row; return true; }
+                if (hds_fx_rect_contains(&btn, x, y)) {
+                    if ((int)(p->fx[row].param[7] + 0.5f) == 0) { p->fx[row].param[5] = 1.0f; vs->tone_override_row = row; }
+                    return true;
+                }
                 continue;
             }
             HdsFxRect knob_rect = L.param_knob[i]; knob_rect.x = col_x;

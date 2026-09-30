@@ -4766,6 +4766,20 @@ static void run_fx_fdnverb(FXSlotEngine *engine, const FXSlotParams *params, flo
     *r = er_result[1] + fdn_out_r;
 }
 
+// Engine-wide count of MIDI notes CURRENTLY held (incremented/decremented at dispatch_midi_event()'s
+// own single note-on/off choke point in backend.c, same "static global fx_chain.c owns, backend.c
+// writes directly because #include makes them one translation unit" pattern g_hardtune_held_note
+// etc. already use above for HardTune's own live-MIDI vibrato) -- exists purely to feed
+// FX_TYPE_BROADCAST_DELAY's On-Air Override MIDI Trigger mode (param[7]==1, see
+// run_fx_broadcastdelay()'s own comment): that mode engages the override for as long as this is
+// nonzero, i.e. for as long as ANY note anywhere is currently held, not any particular one. Declared
+// here rather than back with the other HardTune globals since nothing else needs it. A build with no
+// note port at all (hds_fx.clap -- see its own header comment on why) never calls
+// dispatch_midi_event(), so this simply sits at a permanent, honest 0 there -- MIDI Trigger mode is
+// still selectable in that build for GUI parity, it just never fires, exactly like the Dump-button/
+// On-Air Override plumbing hds_fx_plugin.c already documents needing no MIDI at all.
+static int g_bcastdly_notes_held = 0;
+
 // --- FX_TYPE_BROADCAST_DELAY: an original implementation of the on-air "profanity delay"/dump
 // buffer -- see this effect's own FX_TYPE_BROADCAST_DELAY comment in fx_types.h for the full
 // param map and the restocking design's overall rationale. Buffer sized for the full 60s max
@@ -4869,18 +4883,26 @@ static void run_fx_broadcastdelay(FXSlotEngine *engine, const FXSlotParams *para
     *l = st->buf_l[read_i0] * (1.0f - frac) + st->buf_l[read_i1] * frac;
     *r = st->buf_r[read_i0] * (1.0f - frac) + st->buf_r[read_i1] * frac;
 
-    // "On-Air Override" tone (param[5], held for as long as the GUI button is down): a LIVE
-    // self-censoring tool, deliberately NOT a delayed one. This whole effect's point is that its
-    // output lags the live input by however many seconds the Delay knob sets -- so overriding what
-    // feeds INTO the buffer wouldn't reach the output until the delay caught up, long after whatever
-    // prompted the button press in the first place. Overriding the OUTPUT sample directly instead
-    // makes it instant, exactly like a real on-air panic button. The buffer write/read above still
-    // ran completely untouched (still fed from the real live input), so releasing the button picks
-    // the delayed program audio back up exactly where it already was, with nothing lost or skipped.
-    bool tone_active = params->param[5] != 0.0f;
+    // "On-Air Override" tone: a LIVE self-censoring tool, deliberately NOT a delayed one. This whole
+    // effect's point is that its output lags the live input by however many seconds the Delay knob
+    // sets -- so overriding what feeds INTO the buffer wouldn't reach the output until the delay
+    // caught up, long after whatever prompted the override in the first place. Overriding the OUTPUT
+    // sample directly instead makes it instant, exactly like a real on-air panic button. The buffer
+    // write/read above still ran completely untouched (still fed from the real live input), so the
+    // instant the gate goes back to false the delayed program audio picks back up exactly where it
+    // already was, with nothing lost or skipped -- true whichever of the three param[7] modes below
+    // is actually driving that gate.
+    // param[7] Mode picks WHICH gate actually drives the tone -- see this file's own
+    // g_bcastdly_notes_held comment and fx_types.h's own param[7] comment. Normal (0, the default)
+    // is the plain mouse-hold gate (param[5]) already described above; MIDI Trigger (1) ignores
+    // param[5] entirely and follows the engine-wide "is any note held" counter instead; Disabled (2)
+    // forces the gate off no matter what either of those say.
+    int mode = (int)(params->param[7] + 0.5f);
+    bool tone_active = (mode == 2) ? false : (mode == 1) ? (g_bcastdly_notes_held > 0) : (params->param[5] != 0.0f);
     if (tone_active) {
         if (!st->tone_active_prev) st->tone_phase = 0.0f; // clean zero-crossing start each press, not an arbitrary leftover phase
-        *l = sinf(st->tone_phase) * 0.5f; // half volume, per this button's own spec
+        float vol = fmaxf(0.0f, fminf(1.0f, params->param[6])); // param[6] Volume -- see fx_types.h's own comment
+        *l = sinf(st->tone_phase) * vol;
         *r = *l;
         st->tone_phase += 2.0f * (float)M_PI * 1000.0f / (float)SAMPLE_RATE;
         if (st->tone_phase >= 2.0f * (float)M_PI) st->tone_phase -= 2.0f * (float)M_PI;

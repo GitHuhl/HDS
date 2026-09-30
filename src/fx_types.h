@@ -613,12 +613,26 @@ static inline float run_eq_biquad(float input, const EqBiquadCoeffs *c, float *z
 // clamped so a dump can never take the buffer below 0), param[4] Restock Speed (0..1 -- how
 // aggressively, and therefore how audible, the post-dump catch-up slowdown is; higher restocks
 // faster at the cost of a more noticeable brief pitch/time wobble on whatever's playing while it
-// catches up), param[5] On-Air Override (plain 0/1 gate, held for as long as the GUI button is
-// down -- not an edge-triggered one-shot like the Dump buttons): while nonzero,
-// run_fx_broadcastdelay() replaces this slot's OUTPUT with a continuous 1kHz tone at half
-// amplitude, live, deliberately NOT delayed like everything else this effect does -- see that
-// function's own comment on why the override has to hit the output directly rather than the
-// buffer's input to be useful for its actual purpose (an instant, on-the-spot self-censor).
+// catches up), param[5] On-Air Override (plain 0/1 gate -- meaningful only in Normal mode, see
+// param[7]; held for as long as the GUI button is down, not an edge-triggered one-shot like the
+// Dump buttons): while the effective gate (param[5] in Normal mode, or the live MIDI-key state in
+// MIDI Trigger mode) is nonzero, run_fx_broadcastdelay() replaces this slot's OUTPUT with a
+// continuous 1kHz tone at param[6]'s own amplitude, live, deliberately NOT delayed like everything
+// else this effect does -- see that function's own comment on why the override has to hit the
+// output directly rather than the buffer's input to be useful for its actual purpose (an instant,
+// on-the-spot self-censor). param[6] On-Air Override Volume (0..1, default 0.5 -- seeded on type
+// switch same as param[0]/param[4] below) -- the tone's own amplitude, replacing what used to be a
+// flat hardcoded 0.5. param[7] On-Air Override Mode (0 Normal -- the plain mouse-hold gate above;
+// 1 MIDI Trigger -- ignores param[5] entirely and instead engages for as long as ANY MIDI note is
+// currently held anywhere in this engine, via the engine-wide g_bcastdly_notes_held counter fx_chain.c's
+// own dispatch_midi_event() call site maintains (see that counter's own comment) -- lets the GUI
+// button's own mouse-hold be replaced by a MIDI controller, e.g. a foot switch mapped to a note; 2
+// Disabled -- the effective gate is forced false regardless of param[5]/MIDI, and the GUI button
+// grays out and stops responding to clicks, same visual convention as the Dump buttons at Delay=0.
+// Set via a right-click menu on the button itself, not a knob -- see
+// HDS_FX_DROPDOWN_ONAIR_MODE's own comment in hds_fx_gui_draw.c. Exists specifically so two
+// FX_TYPE_BROADCAST_DELAY slots can run at once with each one's On-Air Override independently
+// wired to whichever trigger source (or none) that particular instance actually needs.
 #define FX_TYPE_BROADCAST_DELAY 24
 #define FX_SLOT_PARAM_COUNT 11
 typedef struct {

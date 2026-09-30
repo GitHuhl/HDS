@@ -190,12 +190,23 @@ Up to 32 shared slots, each independently routable, each settable to any of:
   three Dump buttons gray out (and stop responding to clicks) whenever
   Delay is set to 0 — with nothing buffered, a dump would be a pure no-op,
   which also makes it easy to spot the effect is being used purely for the
-  On-Air Override below rather than as an actual delay. Also
-  has an orange "1000 Hz" On-Air Override button, held rather than clicked:
-  for as long as it's down, the OUTPUT is replaced live with a 1kHz tone at
-  half volume — deliberately not delayed like everything else this effect
-  does, so it works as an instant on-the-spot self-censor rather than
-  something that only reaches air several seconds later; see
+  On-Air Override below rather than as an actual delay. Also has an orange
+  "1000 Hz" On-Air Override button next to a Volume knob (0-100%, default
+  50%): held rather than clicked, for as long as it's down the OUTPUT is
+  replaced live with a 1kHz tone at the Volume knob's own amplitude —
+  deliberately not delayed like everything else this effect does, so it
+  works as an instant on-the-spot self-censor rather than something that
+  only reaches air several seconds later. Volume only ever scales that
+  tone's loudness (0% is a legitimate "silent but still engaged" setting,
+  e.g. for testing a trigger source without actually being heard) — it
+  never disables the button; that's a separate, explicit choice. Right-
+  clicking the button opens a 3-way mode menu: Normal (the default
+  mouse-hold above), Trigger via MIDI Key (ignores the mouse entirely and
+  engages for as long as ANY MIDI note anywhere is currently held — lets a
+  MIDI foot switch or pad replace the mouse), or Disable (grays the button
+  out and forces it off regardless of the mouse or MIDI). Exists so two
+  Broadcast Delay slots can run at once, each with its own On-Air Override
+  wired to whichever trigger (or none) that instance actually needs; see
   `FX_TYPE_BROADCAST_DELAY`'s own comment in `src/fx_types.h`).
 - **NAM**: Neural Amp Modeler — loads a trained `.nam` amp model plus an
   optional cabinet impulse response.
