@@ -643,12 +643,17 @@ static int hds_fx_slot_output_target(int row, int list_pos) {
 #define HDS_FX_DROPDOWN_OUTPUT 4
 #define HDS_FX_DROPDOWN_SOURCE 5 // the Source-combo Input header for a host with no port model -- see HdsFxGuiHost's own comment
 #define HDS_FX_DROPDOWN_OUT_PAIR 6 // the Source-combo Output pill's own single-pick routing choice -- see HdsFxGuiHost's own source_routing_flat comment
-// FX_TYPE_BROADCAST_DELAY's On-Air Override mode -- opened by a RIGHT-click on the button itself
+// FX_TYPE_BROADCAST_DELAY's On-Air Override options -- opened by a RIGHT-click on the button itself
 // (every other dropdown here opens on any click; this is the one exception, since a plain click on
 // that button means something else entirely -- see hds_fx_gui_on_button_press()'s own comment) --
 // not anchored to a knob/pill rect the generic layout already computes, but to the button's own
-// rect built the same way hds_fx_bcastdly_dump_btn_rect() always has. See fx_types.h's own param[7]
-// comment for what Normal/MIDI Trigger/Disabled each actually do.
+// rect built the same way hds_fx_bcastdly_dump_btn_rect() always has. Unlike every other dropdown
+// here, this isn't a mutually-exclusive single pick: its two rows (MIDI Trigger Enabled/param[8],
+// Disabled/param[7]) are independent checkable toggles, each showing its own current on/off state
+// as a checkmark prefix baked right into the label text (see hds_fx_dropdown_option_label()'s own
+// ONAIR_MODE case) rather than the single highlighted-row convention every other kind here uses --
+// current_index() returns -1 for this kind specifically so nothing gets that highlight treatment.
+// See fx_types.h's own param[5]/param[7]/param[8] comments for what each toggle actually does.
 #define HDS_FX_DROPDOWN_ONAIR_MODE 7
 
 typedef struct { double x, y, w, h; } HdsFxRect;
@@ -1007,11 +1012,11 @@ static void hds_fx_draw_dump_button(cairo_t *cr, const HdsFxRect *r, const char 
 // press-confirmation weight -- it's live audio replacement for as long as it's held, and releasing
 // it is instant and lossless (see run_fx_broadcastdelay()'s own comment). Brighter while actually
 // held (`active`) for the same reason a real illuminated panic switch lights up under your thumb --
-// meaningful only in Normal mode (see param[7]'s own comment in fx_types.h); MIDI Trigger mode
+// reflects the plain mouse-hold gate (param[5]) only; a MIDI Trigger (param[8]) engagement
 // deliberately gets no live "currently sounding" glow of its own (nothing here can safely read the
 // audio thread's own gate state -- see g_bcastdly_notes_held's own comment for why that stays a
 // plain audio-side global, not something round-tripped back into a param a GUI thread also writes).
-// `disabled` grays it out (Mode == Disabled) same as hds_fx_draw_dump_button()'s own palette.
+// `disabled` grays it out (param[7]) same as hds_fx_draw_dump_button()'s own palette.
 static void hds_fx_draw_onair_button(cairo_t *cr, const HdsFxRect *r, bool active, bool disabled) {
     cairo_new_path(cr);
     cairo_rectangle(cr, r->x, r->y, r->w, r->h);
@@ -1143,7 +1148,7 @@ static int hds_fx_dropdown_option_count(const HdsFxGuiHost *p, int kind) {
         case HDS_FX_DROPDOWN_SIDECHAIN: return 1 + HDS_FX_PORT_COUNT; // "Same as Source" + 8
         case HDS_FX_DROPDOWN_SOURCE: return p->source_count + (FX_SLOT_COUNT - 1); // no Off/Mono/Stereo suboptions -- matches frontend.py's own plain Source combo, plus the same slot-output section INPUT gets
         case HDS_FX_DROPDOWN_OUT_PAIR: return 1 + p->output_pair_count; // Off (clears every pair) + one entry per real output pair
-        case HDS_FX_DROPDOWN_ONAIR_MODE: return 3; // Normal, MIDI Trigger, Disabled -- see fx_types.h's own param[7] comment
+        case HDS_FX_DROPDOWN_ONAIR_MODE: return 2; // MIDI Trigger Enabled, Disabled -- two independent checkable toggles, see this kind's own comment
         default: return 0;
     }
 }
@@ -1187,11 +1192,17 @@ static void hds_fx_dropdown_option_label(const HdsFxGuiHost *p, int kind, int ro
             if (idx == 0) snprintf(buf, buflen, "Off");
             else snprintf(buf, buflen, "Out %d", idx); // idx 1..N -> pair idx-1, 1-based display
             return;
-        case HDS_FX_DROPDOWN_ONAIR_MODE:
-            if (idx == 0) snprintf(buf, buflen, "Normal (Mouse Hold)");
-            else if (idx == 1) snprintf(buf, buflen, "Trigger via MIDI Key");
-            else snprintf(buf, buflen, "Disable");
+        case HDS_FX_DROPDOWN_ONAIR_MODE: {
+            // Two independent checkable toggles, not a mutually-exclusive pick -- each row's own
+            // current on/off state is baked into the label itself as a checkmark prefix (this
+            // dropdown's own generic highlight is suppressed entirely, see
+            // hds_fx_dropdown_current_index()'s own ONAIR_MODE case) since the shared single-row
+            // highlight this file's every OTHER dropdown uses can only ever mark one row at a time.
+            bool on = (idx == 0) ? (p->fx[row].param[8] != 0.0f) : (p->fx[row].param[7] != 0.0f);
+            const char *label = (idx == 0) ? "Trigger via MIDI Key" : "Disable";
+            snprintf(buf, buflen, on ? "\xe2\x9c\x93 %s" : "%s", label);
             return;
+        }
         default: buf[0] = 0; return;
     }
 }
@@ -1241,10 +1252,11 @@ static int hds_fx_dropdown_current_index(const HdsFxGuiHost *p, int kind, int ro
             }
             return 0; // nothing enabled for this source -- "Off"
         }
-        case HDS_FX_DROPDOWN_ONAIR_MODE: {
-            int m = (int)(p->fx[row].param[7] + 0.5f);
-            return (m < 0 || m > 2) ? 0 : m;
-        }
+        // No single "current" row -- both are independent toggles, shown via their own checkmark
+        // prefix in the label text instead (see hds_fx_dropdown_option_label()'s own ONAIR_MODE
+        // case). -1 never matches any real idx (0..count-1), so the renderer's own
+        // `if (i == current)` highlight check simply never fires for this kind.
+        case HDS_FX_DROPDOWN_ONAIR_MODE: return -1;
         default: return -1;
     }
 }
@@ -1323,11 +1335,19 @@ static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
             return;
         }
         case HDS_FX_DROPDOWN_ONAIR_MODE:
-            p->fx[row].param[7] = (float)idx;
-            // Switching to Disabled kills any override already sounding via the plain mouse-hold
-            // gate right away, rather than leaving param[5] at 1.0 until some future release event
-            // that (now that Disabled ignores param[5] entirely) may never actually come.
-            if (idx == 2) p->fx[row].param[5] = 0.0f;
+            // Each row is an independent checkable toggle (idx 0 = MIDI Trigger Enabled/param[8],
+            // idx 1 = Disabled/param[7]) -- clicking one flips ONLY that flag, never sets a
+            // mutually-exclusive mode the way every other dropdown's apply() here does.
+            if (idx == 0) {
+                p->fx[row].param[8] = (p->fx[row].param[8] != 0.0f) ? 0.0f : 1.0f;
+            } else {
+                bool turning_on = p->fx[row].param[7] == 0.0f;
+                p->fx[row].param[7] = turning_on ? 1.0f : 0.0f;
+                // Turning Disabled ON kills any override already sounding via the plain mouse-hold
+                // gate right away, rather than leaving param[5] at 1.0 until some future release
+                // event that (now that Disabled forces the gate off regardless) may never come.
+                if (turning_on) p->fx[row].param[5] = 0.0f;
+            }
             return;
         default: return;
     }
@@ -1341,7 +1361,7 @@ static double hds_fx_dropdown_width(int kind) {
         case HDS_FX_DROPDOWN_SIDECHAIN: return 110.0;
         case HDS_FX_DROPDOWN_SOURCE: return 120.0; // "Program 8"/"Ext In 8"/"Combi Mix"/"Slot 32 Out" -- widest names in the list
         case HDS_FX_DROPDOWN_INPUT: return 120.0; // wide enough for "Slot 32 Out" alongside the plain port list -- see hds_fx_slot_output_target()'s own comment
-        case HDS_FX_DROPDOWN_ONAIR_MODE: return 165.0; // "Trigger via MIDI Key" is the widest label in this list
+        case HDS_FX_DROPDOWN_ONAIR_MODE: return 180.0; // "<checkmark> Trigger via MIDI Key" is the widest label in this list
         default: return 90.0; // Output
     }
 }
@@ -1784,8 +1804,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
             if (is_bcastdly && i == 5) {
                 HdsFxRect btn;
                 hds_fx_bcastdly_dump_btn_rect(col_x, y, &btn);
-                int onair_mode = (int)(slot->param[7] + 0.5f);
-                hds_fx_draw_onair_button(cr, &btn, onair_mode == 0 && slot->param[5] != 0.0f, onair_mode == 2);
+                hds_fx_draw_onair_button(cr, &btn, slot->param[5] != 0.0f, slot->param[7] != 0.0f);
                 continue;
             }
             // Normalize against this param's own real STORAGE range (see
@@ -2049,10 +2068,10 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
         vs->dropdown.kind = HDS_FX_DROPDOWN_SIDECHAIN; vs->dropdown.row = row; vs->dropdown.anchor = L.sidechain_pill;
         return true;
     }
-    // On-Air Override's mode menu -- RIGHT-click only (button==1 on this same rect means something
-    // else entirely: hold-to-engage in Normal mode -- see the per-param loop's own i==5 handling
-    // just below). Reachable regardless of the button's own current mode/disabled state, since this
-    // is the only way back to Normal from either MIDI Trigger or Disabled.
+    // On-Air Override's own menu -- RIGHT-click only (button==1 on this same rect means something
+    // else entirely: hold-to-engage -- see the per-param loop's own i==5 handling just below).
+    // Reachable regardless of the button's own current Disabled state, since this is the only way
+    // to turn Disabled back off.
     if (button == 3 && hds_fx_type_is_broadcast_delay((int)p->fx[row].fx_type)) {
         HdsFxRect onair_btn;
         hds_fx_bcastdly_dump_btn_rect(hds_fx_bcastdly_col_x(L.param_knob[0].x, 5), row_y, &onair_btn);
@@ -2124,15 +2143,15 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
             // hds_fx_gui_on_button_release() -- which gets no x/y of its own -- knows which row to
             // clear back to 0.0 on release). See run_fx_broadcastdelay()'s own comment for why this
             // has to be a live hold, not an edge-triggered one-shot like the Dump buttons above.
-            // Mouse-hold only actually does anything in Normal mode (param[7]==0) -- in MIDI Trigger
-            // mode it's replaced entirely by the live MIDI-key gate, and in Disabled it's grayed out
-            // and inert, same "still consumes the click, just doesn't fire" convention the Dump
-            // buttons use at Delay=0.
+            // Mouse-hold works regardless of whether MIDI Trigger (param[8]) is also enabled --
+            // the two are independent, additive gates, neither one takes the other away. Only
+            // Disabled (param[7]) grays this out and makes it inert, same "still consumes the
+            // click, just doesn't fire" convention the Dump buttons use at Delay=0.
             if (is_bcastdly && i == 5) {
                 HdsFxRect btn;
                 hds_fx_bcastdly_dump_btn_rect(col_x, row_y, &btn);
                 if (hds_fx_rect_contains(&btn, x, y)) {
-                    if ((int)(p->fx[row].param[7] + 0.5f) == 0) { p->fx[row].param[5] = 1.0f; vs->tone_override_row = row; }
+                    if (p->fx[row].param[7] == 0.0f) { p->fx[row].param[5] = 1.0f; vs->tone_override_row = row; }
                     return true;
                 }
                 continue;

@@ -4892,13 +4892,13 @@ static void run_fx_broadcastdelay(FXSlotEngine *engine, const FXSlotParams *para
     // instant the gate goes back to false the delayed program audio picks back up exactly where it
     // already was, with nothing lost or skipped -- true whichever of the three param[7] modes below
     // is actually driving that gate.
-    // param[7] Mode picks WHICH gate actually drives the tone -- see this file's own
-    // g_bcastdly_notes_held comment and fx_types.h's own param[7] comment. Normal (0, the default)
-    // is the plain mouse-hold gate (param[5]) already described above; MIDI Trigger (1) ignores
-    // param[5] entirely and follows the engine-wide "is any note held" counter instead; Disabled (2)
-    // forces the gate off no matter what either of those say.
-    int mode = (int)(params->param[7] + 0.5f);
-    bool tone_active = (mode == 2) ? false : (mode == 1) ? (g_bcastdly_notes_held > 0) : (params->param[5] != 0.0f);
+    // param[5] (mouse hold) and param[8] (MIDI Trigger Enabled, gating the engine-wide "is any note
+    // held" counter -- see this file's own g_bcastdly_notes_held comment) are independent, additive
+    // gates -- either one alone is enough to engage the tone, and enabling MIDI Trigger never takes
+    // the mouse away. param[7] Disabled overrides both: when true the gate is forced false no matter
+    // what either of them say. See fx_types.h's own param[5]/param[7]/param[8] comments.
+    bool tone_active = (params->param[7] != 0.0f) ? false
+        : (params->param[5] != 0.0f) || (params->param[8] != 0.0f && g_bcastdly_notes_held > 0);
     if (tone_active) {
         if (!st->tone_active_prev) st->tone_phase = 0.0f; // clean zero-crossing start each press, not an arbitrary leftover phase
         float vol = fmaxf(0.0f, fminf(1.0f, params->param[6])); // param[6] Volume -- see fx_types.h's own comment

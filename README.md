@@ -200,14 +200,16 @@ Up to 32 shared slots, each independently routable, each settable to any of:
   tone's loudness (0% is a legitimate "silent but still engaged" setting,
   e.g. for testing a trigger source without actually being heard) — it
   never disables the button; that's a separate, explicit choice. Right-
-  clicking the button opens a 3-way mode menu: Normal (the default
-  mouse-hold above), Trigger via MIDI Key (ignores the mouse entirely and
-  engages for as long as ANY MIDI note anywhere is currently held — lets a
-  MIDI foot switch or pad replace the mouse), or Disable (grays the button
-  out and forces it off regardless of the mouse or MIDI). Exists so two
-  Broadcast Delay slots can run at once, each with its own On-Air Override
-  wired to whichever trigger (or none) that instance actually needs; see
-  `FX_TYPE_BROADCAST_DELAY`'s own comment in `src/fx_types.h`).
+  clicking the button opens a small menu with two independent checkable
+  toggles (not a mutually-exclusive mode picker): Trigger via MIDI Key
+  (purely additive — engages for as long as ANY MIDI note anywhere is
+  currently held, alongside the mouse-hold, never replacing or blocking
+  it, so a MIDI foot switch/pad and the mouse both just work at the same
+  time) and Disable (the only one of the two that actually grays the
+  button out and forces it off, regardless of the mouse or MIDI). Exists
+  so two Broadcast Delay slots can run at once, each with its own On-Air
+  Override wired to whichever trigger source(s) that instance actually
+  needs; see `FX_TYPE_BROADCAST_DELAY`'s own comment in `src/fx_types.h`).
 - **NAM**: Neural Amp Modeler — loads a trained `.nam` amp model plus an
   optional cabinet impulse response.
 
