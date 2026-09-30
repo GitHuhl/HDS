@@ -3962,6 +3962,13 @@ typedef struct {
     bool reverse;             // plays the file/loop region backward -- see sample_disk_thread_main
     unsigned int data_start_offset;
     unsigned int total_frames;
+    unsigned int sample_rate_hz; // this WAV's own fmt-chunk sample rate -- see render_sample_osc's
+                                  // own comment for why this must scale the pre-roll/ring read-
+                                  // pointer's advance rate: it is a COMPLETELY different thing from
+                                  // musical pitch (a 44.1kHz file played back frame-for-frame at
+                                  // this engine's fixed 48kHz output rate comes out ~1.47 semitones
+                                  // sharp and finishes early, regardless of what MIDI note asked for
+                                  // it -- a real-time-clock mismatch, not a tuning one).
     unsigned short num_channels;
     unsigned short bits_per_sample;
     unsigned short audio_format; // WAV fmt tag: 1 = PCM integer, 3 = IEEE float
@@ -4163,7 +4170,7 @@ static bool load_sample_slot(HdsSampleEngine *se, int index, const char *path, i
     SAMPLE_CHECK_READ(&byte_rate, 4, 1, f);
     SAMPLE_CHECK_READ(&block_align, 2, 1, f);
     SAMPLE_CHECK_READ(&bits_per_sample, 2, 1, f);
-    (void)sample_rate; (void)byte_rate; (void)block_align;
+    (void)byte_rate; (void)block_align;
 
     if (audio_format != 1 && audio_format != 3) {
         fprintf(stderr, "[sample] '%s': unsupported WAV format tag %u (need 1=PCM or 3=float)\n", path, audio_format);
@@ -4201,6 +4208,7 @@ static bool load_sample_slot(HdsSampleEngine *se, int index, const char *path, i
     snprintf(slot->file_path, SAMPLE_PATH_LEN, "%s", path);
     slot->root_note = root_note;
     slot->total_frames = total_frames;
+    slot->sample_rate_hz = sample_rate;
     slot->num_channels = num_channels;
     slot->bits_per_sample = bits_per_sample;
     slot->audio_format = audio_format;
@@ -6787,15 +6795,27 @@ static float render_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr
     SampleSlot *slot = &se->slots->sample_slots[atomic_load_explicit(&stream->slot_index, memory_order_relaxed)];
     if (!slot->loaded) { if (out_l_ptr) *out_l_ptr = 0.0f; if (out_r_ptr) *out_r_ptr = 0.0f; return 0.0f; }
 
+    // The pre-roll/ring read-pointer advances by `ratio` FILE FRAMES per OUTPUT sample, so if this
+    // file wasn't recorded at this engine's own fixed SAMPLE_RATE, reading it 1 file-frame-per-
+    // output-sample (ratio 1.0) does not actually reproduce it at its own native rate -- a 44.1kHz
+    // file read that way comes out ~1.47 semitones sharp and finishes early on a 48kHz engine,
+    // regardless of what musical pitch was asked for. rate_comp corrects that mismatch; it is
+    // multiplied into EVERY case below (including `unpitched`, whose own "always plays at its
+    // native recorded rate" comment already stated this exact intent -- rate_comp is what actually
+    // achieves it instead of only being true by coincidence when a file happens to already be
+    // 48kHz). 0 (a SampleSlot never routed through load_sample_slot(), e.g. some direct test setup)
+    // falls back to 1.0 -- "assume it matches" is the only sane default with no real rate to go on.
+    float rate_comp = (slot->sample_rate_hz > 0) ? ((float)slot->sample_rate_hz / (float)SAMPLE_RATE) : 1.0f;
     float ratio;
     if (slot->unpitched) {
-        ratio = 1.0f; // DRUM (Unpitched) -- always plays at its native recorded rate
+        ratio = rate_comp; // DRUM (Unpitched) -- always plays at its native recorded rate
     } else {
         // Deliberately always standard 12-TET here, never hds_note_to_hz() -- see that function's
         // own comment for why WAVE_SAMPLE's root-note reference is a documented microtuning scope
         // boundary rather than an oversight.
         float root_hz = 440.0f * powf(2.0f, (float)(slot->root_note - 69) / 12.0f);
         ratio = (root_hz > 1.0f) ? fmaxf(0.01f, hz / root_hz) : 1.0f;
+        ratio *= rate_comp;
     }
     // Per-zone fine tune (cents) -- applied even when unpitched, a nudge independent of the
     // root-note-relative pitch tracking `unpitched` specifically disables.

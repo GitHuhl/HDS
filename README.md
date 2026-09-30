@@ -70,6 +70,10 @@ A few notable addresses:
   instance switcher for scanning multiple running instances/ports).
 - `/hds/subscribe` — register for periodic `/hds/status/*` pushes.
 - `/hds/zone/*` — the Sample Bank (SFZ/WAVE_SAMPLE zone upsert/remove/load).
+  Loaded WAVs are correctly speed/pitch-compensated for their own actual
+  sample rate against this engine's fixed 48kHz internal rate (a 44.1kHz
+  file, or any other rate, plays at its real recorded speed/pitch, not
+  whatever a naive frame-for-frame read at 48kHz would produce).
   First-class SFZ opcode support: round-robin (`seq_length`/`seq_position`,
   independent of `group=`), real choke groups (`group=`/`off_by=`),
   keyswitching (`sw_lokey`/`sw_hikey`/`sw_last`/`sw_default`), `trigger=`
