@@ -186,7 +186,12 @@ Up to 32 shared slots, each independently routable, each settable to any of:
   hair slower than real time for a while — a Restock Speed knob controls
   how aggressively (and how audibly) that catch-up happens. A color-coded
   readout (green = fully buffered/safe to dump again, red = still
-  restocking) shows exactly how much dump time is currently available; see
+  restocking) shows exactly how much dump time is currently available. Also
+  has an orange "1000 Hz" On-Air Override button, held rather than clicked:
+  for as long as it's down, the OUTPUT is replaced live with a 1kHz tone at
+  half volume — deliberately not delayed like everything else this effect
+  does, so it works as an instant on-the-spot self-censor rather than
+  something that only reaches air several seconds later; see
   `FX_TYPE_BROADCAST_DELAY`'s own comment in `src/fx_types.h`).
 - **NAM**: Neural Amp Modeler — loads a trained `.nam` amp model plus an
   optional cabinet impulse response.

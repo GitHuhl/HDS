@@ -350,10 +350,10 @@ static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
 #endif
 }
 
-static void hds_clap_gui_on_button_release(HdsClapGuiViewState *vs) {
+static void hds_clap_gui_on_button_release(HdsClapPlugin *p, HdsClapGuiViewState *vs) {
     // Same "unconditional, each side no-ops on its own" reasoning as on_motion just above.
     hds_clap_global_on_button_release(&vs->global_view);
-    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_button_release(&vs->fx_view);
+    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_button_release(&p->gui_host, &vs->fx_view);
     else if (vs->active_tab == HDS_CLAP_TAB_PLAY) { hds_clap_play_on_button_release(&vs->play_view); hds_clap_combi_on_button_release(&vs->combi_view); }
     else if (vs->active_tab == HDS_CLAP_TAB_FILTERS) hds_clap_filters_on_button_release(&vs->filters_view);
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_button_release(&vs->lfos_view);

@@ -119,7 +119,7 @@ static int hds_fx_type_param_count(int fx_type) {
         /* STEREODOUBLER */ 2, /* TAPEDELAY2 */ 7, /* POINTYGUITAR */ 10, /* GUITARCONDITIONER */ 0,
         /* CABS2 */ 2, /* NAM */ 3, /* GATE */ 6, /* EQ3 */ 7, /* LIMITER */ 3, /* FETCOMP */ 8,
         /* FAIRKID67 */ 8, /* PEAKMAX */ 7, /* MULTIFILTER */ 4, /* OPTOCOMP */ 5, /* DEESSER */ 6,
-        /* HARDTUNE */ 10, /* FDNVERB */ 10, /* SSL4K */ 11, /* DBX160 */ 5, /* BROADCAST_DELAY */ 5,
+        /* HARDTUNE */ 10, /* FDNVERB */ 10, /* SSL4K */ 11, /* DBX160 */ 5, /* BROADCAST_DELAY */ 6,
     };
     if (fx_type < 0 || fx_type >= (int)(sizeof(counts) / sizeof(counts[0]))) return 0;
     return counts[fx_type];
@@ -153,7 +153,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
     static const char *const fdnverb[] = {"Decay", "Size", "PreDly", "Damp", "Diffus", "ModRt", "ModDp", "ERLvl", "ERDcy", "Freeze"};
     static const char *const ssl4k[] = {"HPFrq", "LFFrq", "LFGan", "LMFrq", "LMGan", "LMQ", "HMFrq", "HMGan", "HFFrq", "HFGan", "E/G"};
     static const char *const dbx160[] = {"Thresh", "Ratio", "Makeup", "Sat", "SC-HP"};
-    static const char *const bcastdly[] = {"Delay", "Dump7s", "Dmp15s", "Dmp30s", "Rstock"};
+    static const char *const bcastdly[] = {"Delay", "Dump7s", "Dmp15s", "Dmp30s", "Rstock", "OnAir"};
 
     const char *const *table = NULL;
     int count = 0;
@@ -180,7 +180,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
         case FX_TYPE_FDNVERB: table = fdnverb; count = 10; break;
         case FX_TYPE_SSL4K: table = ssl4k; count = 11; break;
         case FX_TYPE_DBX160: table = dbx160; count = 5; break;
-        case FX_TYPE_BROADCAST_DELAY: table = bcastdly; count = 5; break;
+        case FX_TYPE_BROADCAST_DELAY: table = bcastdly; count = 6; break;
         default: return "";
     }
     if (idx < 0 || idx >= count) return "";
@@ -730,6 +730,13 @@ typedef struct {
     double drag_start_y;
     float drag_start_value;
 
+    // FX_TYPE_BROADCAST_DELAY's On-Air Override button (param[5]) is HELD, not clicked -- live for
+    // exactly as long as the mouse button stays down, same real-world behavior as a physical panic
+    // button. -1 when nothing is held; otherwise the row whose param[5] this view press set to 1.0,
+    // so hds_fx_gui_on_button_release() (which gets no x/y of its own -- see its own comment) knows
+    // which row's param[5] to clear back to 0.0 on release.
+    int tone_override_row;
+
     HdsFxDropdown dropdown;
 
     // FX_TYPE_NAM's own Model/IR path fields are the only free-text-adjacent inputs anywhere in
@@ -744,6 +751,7 @@ static void hds_fx_gui_view_state_init(HdsFxGuiViewState *vs) {
     vs->window_h = HDS_FX_GUI_DEFAULT_H;
     vs->hover_row = -1;
     vs->drag_kind = 0;
+    vs->tone_override_row = -1;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -951,12 +959,13 @@ static void hds_fx_bcastdly_dump_btn_rect(double knob_cx, double row_y, HdsFxRec
 // FX_TYPE_BROADCAST_DELAY's widened (1.5x) Dump buttons don't fit in the shared, 34px-wide knob
 // columns every other FX type's params share (adjacent columns overlap by 8px) -- but doubling the
 // column pitch to spread them out (an earlier attempt) left visibly too much dead air between them.
-// This type only uses 5 of the 11 param columns anyway (Delay, Dump7s, Dmp15s, Dmp30s, Rstock;
-// columns 5-10 sit unused, same as when it doesn't touch the NAM-path pills that reuse them for other
-// types), so instead of snapping to that grid at all, Dump7s/Dmp15s/Dmp30s/Rstock are laid out at
-// their own fixed HDS_FX_BCASTDLY_BTN_PITCH from Delay's own column -- just wide enough for a real
-// gap, not a whole spare column's worth of one. `i` itself still indexes the real param[] storage
-// everywhere else, so this has zero effect on the wire protocol or saved state.
+// This type only uses 6 of the 11 param columns anyway (Delay, Dump7s, Dmp15s, Dmp30s, Rstock,
+// On-Air Override; columns 6-10 sit unused, same as when it doesn't touch the NAM-path pills that
+// reuse them for other types), so instead of snapping to that grid at all, Dump7s/Dmp15s/Dmp30s/
+// Rstock/On-Air are laid out at their own fixed HDS_FX_BCASTDLY_BTN_PITCH from Delay's own column --
+// just wide enough for a real gap, not a whole spare column's worth of one. `i` itself still indexes
+// the real param[] storage everywhere else, so this has zero effect on the wire protocol or saved
+// state.
 static double hds_fx_bcastdly_col_x(double delay_col_x, int i) {
     return delay_col_x + i * HDS_FX_BCASTDLY_BTN_PITCH; // i==0 (Delay) -> itself, unchanged
 }
@@ -974,6 +983,28 @@ static void hds_fx_draw_dump_button(cairo_t *cr, const HdsFxRect *r, const char 
     hds_fx_rgb(cr, 1.0, 1.0, 1.0);
     hds_fx_centered_text(cr, r->x + r->w / 2.0, r->y + r->h / 2.0 - 1.0, line1);
     hds_fx_centered_text(cr, r->x + r->w / 2.0, r->y + r->h / 2.0 + 12.0, line2);
+}
+
+// On-Air Override (param[5]) -- same big-rectangle treatment as the Dump buttons above (a live
+// momentary switch is exactly the kind of "hit this NOW" control that pattern was built for), but
+// orange rather than red: this one doesn't discard anything or need the Dump buttons' own
+// press-confirmation weight -- it's live audio replacement for as long as it's held, and releasing
+// it is instant and lossless (see run_fx_broadcastdelay()'s own comment). Brighter while actually
+// held (`active`) for the same reason a real illuminated panic switch lights up under your thumb.
+static void hds_fx_draw_onair_button(cairo_t *cr, const HdsFxRect *r, bool active) {
+    cairo_new_path(cr);
+    cairo_rectangle(cr, r->x, r->y, r->w, r->h);
+    if (active) hds_fx_rgb(cr, 1.0, 0.55, 0.0);
+    else hds_fx_rgb(cr, 0.68, 0.40, 0.05);
+    cairo_fill_preserve(cr);
+    hds_fx_rgb(cr, 1.0, 0.78, 0.35);
+    cairo_set_line_width(cr, 1.3);
+    cairo_stroke(cr);
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 9.5);
+    hds_fx_rgb(cr, 1.0, 1.0, 1.0);
+    hds_fx_centered_text(cr, r->x + r->w / 2.0, r->y + r->h / 2.0 - 1.0, "1000");
+    hds_fx_centered_text(cr, r->x + r->w / 2.0, r->y + r->h / 2.0 + 12.0, "Hz");
 }
 
 static void hds_fx_gui_compute_row_layout(int width, double y, HdsFxRowLayout *out) {
@@ -1705,6 +1736,14 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
                 hds_fx_draw_dump_button(cr, &btn, "DUMP", line2);
                 continue;
             }
+            // On-Air Override (param[5]): same big momentary-button treatment, orange instead of
+            // red -- see hds_fx_draw_onair_button()'s own comment.
+            if (is_bcastdly && i == 5) {
+                HdsFxRect btn;
+                hds_fx_bcastdly_dump_btn_rect(col_x, y, &btn);
+                hds_fx_draw_onair_button(cr, &btn, slot->param[5] != 0.0f);
+                continue;
+            }
             // Normalize against this param's own real STORAGE range (see
             // hds_fx_type_param_range()'s own comment -- every param is 0.0-1.0 except
             // FX_TYPE_MULTIFILTER's Reso, which is 0-100) before either drawing the knob's arc or
@@ -2017,6 +2056,18 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
                 if (hds_fx_rect_contains(&btn, x, y)) { p->fx[row].param[i] += 1.0f; return true; }
                 continue;
             }
+            // On-Air Override (param[5]): HELD, not clicked -- set to 1.0 for as long as the mouse
+            // button stays down, same idiom hds_fx_gui_on_motion()'s own knob-drag uses (start state
+            // here, real per-frame state lives in vs->tone_override_row so
+            // hds_fx_gui_on_button_release() -- which gets no x/y of its own -- knows which row to
+            // clear back to 0.0 on release). See run_fx_broadcastdelay()'s own comment for why this
+            // has to be a live hold, not an edge-triggered one-shot like the Dump buttons above.
+            if (is_bcastdly && i == 5) {
+                HdsFxRect btn;
+                hds_fx_bcastdly_dump_btn_rect(col_x, row_y, &btn);
+                if (hds_fx_rect_contains(&btn, x, y)) { p->fx[row].param[5] = 1.0f; vs->tone_override_row = row; return true; }
+                continue;
+            }
             HdsFxRect knob_rect = L.param_knob[i]; knob_rect.x = col_x;
             if (hds_fx_knob_contains(&knob_rect, x, y)) {
                 vs->drag_kind = 2; vs->drag_row = row; vs->drag_param_index = i;
@@ -2062,7 +2113,17 @@ static void hds_fx_gui_on_motion(HdsFxGuiHost *p, HdsFxGuiViewState *vs, double 
     }
 }
 
-static void hds_fx_gui_on_button_release(HdsFxGuiViewState *vs) { vs->drag_kind = 0; }
+static void hds_fx_gui_on_button_release(HdsFxGuiHost *p, HdsFxGuiViewState *vs) {
+    vs->drag_kind = 0;
+    // On-Air Override (param[5]) is HELD -- see hds_fx_gui_on_button_press()'s own comment on this
+    // button. Unconditional and independent of where the mouse actually is now (it may have moved
+    // off the row, or even off the window, while still held) -- the button is released the instant
+    // the mouse button comes up, full stop, same as a real momentary switch.
+    if (vs->tone_override_row >= 0) {
+        p->fx[vs->tone_override_row].param[5] = 0.0f;
+        vs->tone_override_row = -1;
+    }
+}
 
 // Named key actions the platform shim (hds_fx_gui_x11.c) translates a real X11 KeyPress into --
 // keeps this file free of any X11 type, the same "zero windowing references" discipline this

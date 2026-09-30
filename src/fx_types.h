@@ -613,7 +613,12 @@ static inline float run_eq_biquad(float input, const EqBiquadCoeffs *c, float *z
 // clamped so a dump can never take the buffer below 0), param[4] Restock Speed (0..1 -- how
 // aggressively, and therefore how audible, the post-dump catch-up slowdown is; higher restocks
 // faster at the cost of a more noticeable brief pitch/time wobble on whatever's playing while it
-// catches up).
+// catches up), param[5] On-Air Override (plain 0/1 gate, held for as long as the GUI button is
+// down -- not an edge-triggered one-shot like the Dump buttons): while nonzero,
+// run_fx_broadcastdelay() replaces this slot's OUTPUT with a continuous 1kHz tone at half
+// amplitude, live, deliberately NOT delayed like everything else this effect does -- see that
+// function's own comment on why the override has to hit the output directly rather than the
+// buffer's input to be useful for its actual purpose (an instant, on-the-spot self-censor).
 #define FX_TYPE_BROADCAST_DELAY 24
 #define FX_SLOT_PARAM_COUNT 11
 typedef struct {

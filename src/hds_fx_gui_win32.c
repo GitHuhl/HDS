@@ -106,7 +106,7 @@ static LRESULT CALLBACK hds_fx_gui_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARA
             return 0;
         case WM_LBUTTONUP:
         case WM_RBUTTONUP:
-            if (w) hds_fx_gui_on_button_release(&w->view);
+            if (w) hds_fx_gui_on_button_release(w->plugin, &w->view);
             return 0;
         case WM_MOUSEMOVE:
             if (w) hds_fx_gui_on_motion(w->plugin, &w->view, (double)GET_X_LPARAM(lp), (double)GET_Y_LPARAM(lp));

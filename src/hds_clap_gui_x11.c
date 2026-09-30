@@ -72,7 +72,7 @@ static void hds_clap_gui_pump_events(HdsClapGuiWindow *w) {
                 }
                 break;
             case ButtonRelease:
-                if (ev.xbutton.button != 4 && ev.xbutton.button != 5) hds_clap_gui_on_button_release(&w->view);
+                if (ev.xbutton.button != 4 && ev.xbutton.button != 5) hds_clap_gui_on_button_release(w->plugin, &w->view);
                 break;
             case MotionNotify:
                 hds_clap_gui_on_motion(w->plugin, &w->view, (double)ev.xmotion.x, (double)ev.xmotion.y);

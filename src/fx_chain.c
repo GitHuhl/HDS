@@ -4799,6 +4799,8 @@ typedef struct {
     // moment playback starts.
     float last_dump7, last_dump15, last_dump30;
     float dump_avail_sec; // = current_delay_samples / SAMPLE_RATE, read back by process_fx_chain() for the dump-availability meter, same convention as last_gr_db
+    float tone_phase; // "On-Air Override" 1kHz tone (param[5]) -- see run_fx_broadcastdelay()'s own comment
+    bool tone_active_prev; // edge-detect so each fresh press restarts the tone at a clean zero-crossing instead of an arbitrary leftover phase
 } FxBroadcastDelayState;
 
 static void run_fx_broadcastdelay(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
@@ -4866,6 +4868,24 @@ static void run_fx_broadcastdelay(FXSlotEngine *engine, const FXSlotParams *para
     float frac = (float)(read_pos_f - floor(read_pos_f));
     *l = st->buf_l[read_i0] * (1.0f - frac) + st->buf_l[read_i1] * frac;
     *r = st->buf_r[read_i0] * (1.0f - frac) + st->buf_r[read_i1] * frac;
+
+    // "On-Air Override" tone (param[5], held for as long as the GUI button is down): a LIVE
+    // self-censoring tool, deliberately NOT a delayed one. This whole effect's point is that its
+    // output lags the live input by however many seconds the Delay knob sets -- so overriding what
+    // feeds INTO the buffer wouldn't reach the output until the delay caught up, long after whatever
+    // prompted the button press in the first place. Overriding the OUTPUT sample directly instead
+    // makes it instant, exactly like a real on-air panic button. The buffer write/read above still
+    // ran completely untouched (still fed from the real live input), so releasing the button picks
+    // the delayed program audio back up exactly where it already was, with nothing lost or skipped.
+    bool tone_active = params->param[5] != 0.0f;
+    if (tone_active) {
+        if (!st->tone_active_prev) st->tone_phase = 0.0f; // clean zero-crossing start each press, not an arbitrary leftover phase
+        *l = sinf(st->tone_phase) * 0.5f; // half volume, per this button's own spec
+        *r = *l;
+        st->tone_phase += 2.0f * (float)M_PI * 1000.0f / (float)SAMPLE_RATE;
+        if (st->tone_phase >= 2.0f * (float)M_PI) st->tone_phase -= 2.0f * (float)M_PI;
+    }
+    st->tone_active_prev = tone_active;
 
     st->write_pos++;
     if (st->write_pos >= HDS_BCASTDLY_MAX_SAMPLES) st->write_pos = 0;
