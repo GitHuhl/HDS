@@ -14,10 +14,25 @@
 //     WM_DELETE_WINDOW/a real title bar from the window manager) -- there is no host to call
 //     set_parent()/show() on this process's behalf, so create() does both steps itself.
 //   - No CLAP host timer-support extension exists to drive repaints/event pumping (there's no
-//     CLAP host at all) -- hds_standalone_gui_pump() takes that role instead, called once per
-//     iteration of hds_standalone.c's own main loop (right alongside its existing
-//     lo_server_recv_noblock() OSC poll), throttled to ~30Hz internally via a monotonic clock so
-//     it costs nothing extra on the many loop iterations between redraws.
+//     CLAP host at all) -- hds_standalone_gui_create() spawns this window's OWN dedicated pthread
+//     (hds_standalone_gui_thread_main()) instead, polling X11 events at ~100Hz and redrawing at
+//     ~30Hz via a monotonic clock, entirely independent of hds_standalone.c's own main loop.
+//     DELIBERATE, and not merely a convenience: that main loop's audio-write call can legitimately
+//     block for real stretches of time (PipeWire backpressure waiting out a graph reconfiguration,
+//     e.g. another app's patchbay tool reconnecting nodes) -- see write_audio_block()'s own
+//     comment. Before this window ran on its own thread, that same blocking call sat directly
+//     between successive calls to this file's own pump function, so a multi-second PipeWire stall
+//     froze the entire GUI (window stops redrawing, stops responding to input) for that whole
+//     stretch, even though audio itself kept flowing from the ring's own already-buffered content.
+//     Two independent standing priorities for this whole codebase, in order: (1) the realtime
+//     audio-producing path must never be made to wait on anything GUI-related, and (2) the GUI
+//     must never be at the mercy of that path's own occasional, unavoidable stalls -- a GUI-domain
+//     hang and an audio-domain hang must never be able to cause each other. Cross-thread state
+//     access (this thread and hds_standalone.c's own main/audio thread both touch g_gui_ctx.knobs)
+//     is accepted, unsynchronized "benign race" territory on purpose -- the exact same convention
+//     hds.clap's own host-UI-thread-vs-audio-thread split already relies on for plain control
+//     parameters (a knob read a block late/early is inaudible; a mutex on the audio thread is not
+//     acceptable at any cost, so no lock is used here either).
 //   - Closing the window (the WM's own close button, via WM_DELETE_WINDOW) sets g_synth_running
 //     to false -- the same clean-shutdown path SIGINT (Ctrl+C) already triggers (see
 //     handle_sigint() in backend.c) -- rather than only hiding the window with the process still
@@ -36,6 +51,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <cairo/cairo-xlib.h>
+#include <pthread.h>
 
 #include "hds_fx_gui_browser.c" // hds_fx_gui_browser_refresh() -- reused verbatim, same as hds_clap_gui_x11.c's own identical include
 
@@ -51,6 +67,14 @@ typedef struct {
     cairo_t *backbuffer_cr;
     HdsClapGuiViewState view;
     struct timespec last_redraw;
+    // This window's own dedicated event-pump/redraw thread -- see this file's own header comment
+    // for why it must never share a thread with hds_standalone.c's own audio-producing main loop.
+    // should_stop is written exactly once (by hds_standalone_gui_destroy(), from the main thread,
+    // strictly before pthread_join()) and only ever read by the thread's own loop condition -- the
+    // same single-writer/plain-flag convention g_synth_running itself already uses for its own
+    // cross-context (signal handler) stop signal, not a new pattern introduced here.
+    pthread_t thread;
+    volatile bool should_stop;
 } HdsStandaloneGuiWindow;
 
 static HdsStandaloneGuiWindow *g_standalone_gui_window = NULL;
@@ -73,9 +97,9 @@ static void hds_standalone_gui_redraw(HdsStandaloneGuiWindow *w) {
     clock_gettime(CLOCK_MONOTONIC, &w->last_redraw);
 }
 
-// Returns true once this process should exit (the window's own close button was clicked) --
-// hds_standalone_gui_pump()'s caller (hds_standalone.c's own main loop) checks this exactly like
-// it already checks g_synth_running elsewhere, since this function sets that same flag itself.
+// The window's own close button (WM_DELETE_WINDOW) sets g_synth_running to false directly -- the
+// main/audio thread's own `while (g_synth_running)` loop condition (hds_standalone.c) already polls
+// that same flag every iteration for the SIGINT/Ctrl+C case, so this needs no separate signaling.
 static void hds_standalone_gui_pump_events(HdsStandaloneGuiWindow *w) {
     while (XPending(w->display) > 0) {
         XEvent ev;
@@ -120,6 +144,9 @@ static void hds_standalone_gui_pump_events(HdsStandaloneGuiWindow *w) {
     }
 }
 
+static void *hds_standalone_gui_thread_main(void *arg);
+static void hds_standalone_gui_destroy_window(HdsStandaloneGuiWindow *w);
+
 static bool hds_standalone_gui_create(HdsClapPlugin *p) {
     if (g_standalone_gui_window) return true;
 
@@ -155,33 +182,60 @@ static bool hds_standalone_gui_create(HdsClapPlugin *p) {
     clock_gettime(CLOCK_MONOTONIC, &w->last_redraw);
 
     g_standalone_gui_window = w;
+
+    if (pthread_create(&w->thread, NULL, hds_standalone_gui_thread_main, w) != 0) {
+        fprintf(stderr, "[hds] gui create: pthread_create failed -- continuing headless.\n");
+        hds_standalone_gui_destroy_window(w); // window/Cairo state only -- see its own comment
+        g_standalone_gui_window = NULL;
+        return false;
+    }
     return true;
 }
 
-// Called once per hds_standalone.c main-loop iteration -- a no-op (just XPending's own cheap
-// check) on every iteration that isn't due for a redraw yet, so this costs nothing extra on the
-// many iterations between repaints. ~30Hz: plenty for a knob/pill GUI that isn't animating
-// anything continuously, and matches hds_clap_gui_x11.c's own 33ms CLAP host timer interval.
-static void hds_standalone_gui_pump(void) {
-    HdsStandaloneGuiWindow *w = g_standalone_gui_window;
-    if (!w) return;
-    hds_standalone_gui_pump_events(w);
-    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-    double elapsed_ms = (now.tv_sec - w->last_redraw.tv_sec) * 1000.0 + (now.tv_nsec - w->last_redraw.tv_nsec) / 1e6;
-    if (elapsed_ms >= 33.0) {
-        hds_fx_gui_browser_refresh(&w->view.fx_view.browser); // reused verbatim -- see this file's own header comment
-        hds_standalone_gui_redraw(w);
+// This window's own event-pump/redraw loop, running on its own dedicated thread -- see this
+// file's own header comment for why it must never run on hds_standalone.c's own main/audio thread.
+// Polls X11 at ~100Hz (input feels responsive) but only actually redraws at ~30Hz (matching
+// hds_clap_gui_x11.c's own CLAP-host timer interval -- plenty for a knob/pill GUI, nothing here
+// animates continuously). The 10ms sleep between polls is this thread's own pacing, replacing what
+// used to be free pacing borrowed from the main loop's own per-block cadence.
+static void *hds_standalone_gui_thread_main(void *arg) {
+    HdsStandaloneGuiWindow *w = (HdsStandaloneGuiWindow *)arg;
+    while (!w->should_stop && g_synth_running) {
+        hds_standalone_gui_pump_events(w);
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed_ms = (now.tv_sec - w->last_redraw.tv_sec) * 1000.0 + (now.tv_nsec - w->last_redraw.tv_nsec) / 1e6;
+        if (elapsed_ms >= 33.0) {
+            hds_fx_gui_browser_refresh(&w->view.fx_view.browser); // reused verbatim -- see this file's own header comment
+            hds_standalone_gui_redraw(w);
+        }
+        struct timespec sleep_ts = { .tv_sec = 0, .tv_nsec = 10L * 1000L * 1000L };
+        nanosleep(&sleep_ts, NULL);
     }
+    return NULL;
 }
 
-static void hds_standalone_gui_destroy(void) {
-    HdsStandaloneGuiWindow *w = g_standalone_gui_window;
-    if (!w) return;
+// The window/Cairo/X11 teardown itself, shared by both the normal shutdown path
+// (hds_standalone_gui_destroy(), after joining the thread) and hds_standalone_gui_create()'s own
+// failure path above (pthread_create failing after the window already exists, no thread to join).
+static void hds_standalone_gui_destroy_window(HdsStandaloneGuiWindow *w) {
     if (w->backbuffer_cr) cairo_destroy(w->backbuffer_cr);
     if (w->backbuffer) cairo_surface_destroy(w->backbuffer);
     if (w->cr) cairo_destroy(w->cr);
     if (w->surface) cairo_surface_destroy(w->surface);
     if (w->display) { XDestroyWindow(w->display, w->win); XCloseDisplay(w->display); }
     free(w);
+}
+
+// Normal shutdown path (process exiting, g_synth_running already false, or about to be) -- signals
+// the thread to stop and JOINS it before touching any X11/Cairo resource, so the thread can never
+// be mid-XNextEvent/mid-redraw against a display connection this call is simultaneously tearing
+// down. Safe to call with the thread already exited on its own (g_synth_running went false first,
+// e.g. Ctrl+C) -- pthread_join on an already-finished thread returns immediately either way.
+static void hds_standalone_gui_destroy(void) {
+    HdsStandaloneGuiWindow *w = g_standalone_gui_window;
+    if (!w) return;
+    w->should_stop = true;
+    pthread_join(w->thread, NULL);
+    hds_standalone_gui_destroy_window(w);
     g_standalone_gui_window = NULL;
 }

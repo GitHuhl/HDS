@@ -1765,9 +1765,10 @@ static void hds_scan_midi_devices(HdsDeviceList *out) {
 // struct. Every other HdsClapPlugin field (the CLAP host pointer, per-instance sample/engine/voice
 // state, ...) stays unused here -- this app already has its own equivalent state as separate
 // globals/locals (g_engine, g_sample_engine, voices[], ...), exactly as that same header comment
-// discloses. File-scope static (not a main()-local), since hds_standalone_gui_pump() (called from
-// main()'s own loop) and hds_standalone_gui_create()/destroy() all need to reach it too, and this
-// process has exactly one instance of everything -- no per-instance addressing to thread through.
+// discloses. File-scope static (not a main()-local), since hds_standalone_gui_x11.c's own GUI
+// thread (spawned by hds_standalone_gui_create(), joined by hds_standalone_gui_destroy()) needs to
+// reach it too, and this process has exactly one instance of everything -- no per-instance
+// addressing to thread through.
 // (No separate view-state global needed here -- hds_standalone_gui_x11.c's own HdsStandaloneGuiWindow
 // struct already owns its HdsClapGuiViewState internally, initialized inside
 // hds_standalone_gui_create(), the same way hds.clap's own HdsClapGuiWindow does.)
@@ -1896,10 +1897,15 @@ int main(int argc, char **argv) {
 
     // Non-threaded lo_server, polled once per audio block from the main loop below (see the
     // "while (lo_server_recv_noblock(...))" call site) -- deliberately NOT lo_server_thread, so
-    // only this thread ever touches g_gui_ctx.knobs/g_sample_slots, exactly like the poll_*_socket()
-    // functions this replaces. The zone methods are registered with explicit type strings (liblo
-    // tries the most specific registration first), the knob table's generic method last with
-    // path=NULL/type=NULL as the catch-all for everything else.
+    // OSC dispatch never competes with this same loop's own audio work for CPU time, exactly like
+    // the poll_*_socket() functions this replaces. This is no longer the ONLY thread touching
+    // g_gui_ctx.knobs/g_sample_slots when --gui is active -- hds_standalone_gui_x11.c's own
+    // dedicated GUI thread reads/writes the same fields directly (see its own header comment for
+    // why it must run independently of this loop) -- a deliberate, accepted "benign race" on plain
+    // control values, the same convention hds.clap's own host-UI-thread/audio-thread split already
+    // relies on; nothing here takes a lock, and nothing here ever will. The zone methods are
+    // registered with explicit type strings (liblo tries the most specific registration first), the
+    // knob table's generic method last with path=NULL/type=NULL as the catch-all for everything else.
     build_osc_dispatch_table(); // once, before any message can arrive -- see its own comment for why
     char osc_listen_port_str[16]; snprintf(osc_listen_port_str, sizeof(osc_listen_port_str), "%d", osc_listen_port);
     lo_server osc_server = lo_server_new_with_proto(osc_listen_port_str, LO_UDP, osc_error_handler);
@@ -2101,9 +2107,10 @@ int main(int argc, char **argv) {
         // zone_remove_handler write directly into g_gui_ctx.knobs/g_sample_slots as each message is
         // dispatched, so nothing further is needed here once this returns 0 (no more pending).
         while (lo_server_recv_noblock(osc_server, 0) > 0) {}
-#if HDS_STANDALONE_GUI_ENABLED
-        hds_standalone_gui_pump(); // no-op if --gui was never passed (g_standalone_gui_window stays NULL) -- see its own comment
-#endif
+        // No GUI pump call here on purpose -- when --gui is active, the window pumps/redraws
+        // itself on its own dedicated thread (see hds_standalone_gui_x11.c's own header comment)
+        // so this loop's own occasional PipeWire backpressure stalls (write_audio_block(), below)
+        // can never freeze it, and the GUI can never delay this loop either.
         poll_stdin_control(&g_gui_ctx.knobs, &g_sample_engine); // arrow keys: Up/Down = master volume, Left/Right = Program cycle -- see its own comment
         poll_seq_audio_load_requests(&g_streams_state, &g_gui_ctx.knobs); // spawns a loader thread if a lane's audio_path changed
         // poll_fx_nam_requests() itself now runs once per block from inside render_audio_block
