@@ -5,8 +5,6 @@
 ##   make clap             -> ./hds.clap            (Linux CLAP plugin)
 ##   make hds-fx           -> ./hds_fx.clap         (standalone multi-FX CLAP plugin -- needs Cairo +
 ##                                                    X11, see pkgs.cairo/pkgs.xorg.libX11 below)
-##   python3 src/frontend.py                        (PySide6 GUI -- see the auto-venv shellHook below)
-##
 ##   make arm64            -> synth_engine-arm64    (aarch64 Linux, e.g. Raspberry Pi 5)
 ##
 ##   make clap-windows     -> hds-windows.clap      (Windows CLAP plugin, cross-built from Linux --
@@ -125,16 +123,6 @@ pkgs.mkShell {
     pkgs.cairo
     pkgs.xorg.libX11
 
-    # --- Python frontend (python3 src/frontend.py) --- PySide6/python-osc's exact pinned
-    # versions (see requirements.txt) aren't reliably both present/current in every nixpkgs
-    # channel, so this shell provides just the interpreter + pip and lets the shellHook below
-    # manage a local .venv/ from requirements.txt directly -- the same versions anyone running
-    # `pip install -r requirements.txt` outside Nix would get, rather than whatever nixpkgs
-    # happens to carry this week.
-    pkgs.python3
-    pkgs.python3Packages.pip
-    pkgs.python3Packages.virtualenv
-
     # --- Raspberry Pi 5 / aarch64 Linux cross-build (make arm64) ---
     # aarch64.stdenv.cc installs its binaries under the aarch64-unknown-linux-gnu- prefix (gcc,
     # g++, ar, ...) -- no bare `gcc`/`g++` names, so this can sit directly on PATH alongside the
@@ -199,7 +187,7 @@ pkgs.mkShell {
   ];
 
   shellHook = ''
-    echo "HDS dev shell -- native Linux build, CLAP plugin, Python frontend, and Raspberry Pi 5"
+    echo "HDS dev shell -- native Linux build, CLAP plugin, and Raspberry Pi 5"
     echo "backend cross-build all ready."
     echo
     echo "  make            -> ./synth_engine   (pkg-config auto-detects PipeWire -- run with"
@@ -297,26 +285,5 @@ pkgs.mkShell {
     # inside this port's own dev environment -- worth confirming with `ls` on the actual path
     # `nix-shell` resolves this to, the first time this target is built for real).
     export ARM64_BUNDLE_LIBS="${aarch64.liblo}/lib/liblo.so.7 ${aarch64.stdenv.cc.cc.lib}/lib/libstdc++.so.6 ${aarch64.stdenv.cc.cc.lib}/lib/libgcc_s.so.1"
-
-    # Auto-provision a local venv for the PySide6 frontend, matching requirements.txt exactly --
-    # created once, reused (and only re-synced when requirements.txt actually changes) on every
-    # later `nix-shell` entry. Kept out of Nix's own package set deliberately -- see the buildInputs
-    # comment above.
-    if [ ! -d .venv ]; then
-      echo "Creating .venv/ for src/frontend.py's dependencies (PySide6, numpy, python-osc)..."
-      python3 -m venv .venv
-    fi
-    if [ requirements.txt -nt .venv/.requirements-installed ] 2>/dev/null || [ ! -f .venv/.requirements-installed ]; then
-      if .venv/bin/pip install --quiet -r requirements.txt; then
-        touch .venv/.requirements-installed
-      else
-        echo "WARNING: pip install failed (see above) -- src/frontend.py's deps are NOT ready." >&2
-        echo "         Fix your network/pip config and re-enter this shell to retry." >&2
-      fi
-    fi
-    export PATH="$PWD/.venv/bin:$PATH"
-    if [ -f .venv/.requirements-installed ]; then
-      echo "  python3 src/frontend.py   (.venv/ activated on PATH -- PySide6 etc. ready)"
-    fi
   '';
 }

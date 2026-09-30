@@ -491,9 +491,6 @@ hds-fx-windows: $(WIN_HDS_FX_OBJ) $(WIN_NAM_OBJS)
 run-backend: $(BIN)
 	./$(BIN)
 
-run-frontend:
-	python3 src/frontend.py
-
 clean:
 	rm -f $(BIN) $(CLAP_BIN) $(HDS_FX_BIN) $(ARM64_BIN)
 	rm -rf $(ARM64_LIBDIR) $(BUILD_DIR)
