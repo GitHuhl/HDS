@@ -30,15 +30,19 @@
 static const int HDS_DEV_BLOCKSIZE_VALUES[HDS_DEV_BLOCKSIZE_COUNT] = {32, 64, 128, 256, 512, 1024};
 
 #ifdef HDS_STANDALONE_GUI_ENABLED
-// Mirrors frontend.py's own _LATENCY_PRESETS exactly.
-#define HDS_DEV_LATENCY_COUNT 5
+// Six presets spanning the real usable range: Ultra/Extra Snappy trade safety margin for the
+// lowest latency -- worth pairing either with a smaller Block Size (below) on hardware/drivers
+// that can actually sustain it, see the warning this file renders under the Latency pill whenever
+// one of those two is selected. Safe/Extra Safe trade the reverse way for marginal, occasional CPU
+// overruns. See audio_latency_ms's own comment in backend.c for what this control actually does.
+#define HDS_DEV_LATENCY_COUNT 6
 static const char *const HDS_DEV_LATENCY_LABELS[HDS_DEV_LATENCY_COUNT] = {
-    "Extra Snappy (5ms)", "Snappy (15ms)", "Normal (25ms)", "Safe (50ms)", "Extra Safe (100ms)",
+    "Ultra Snappy (5ms)", "Extra Snappy (10ms)", "Snappy (15ms)", "Normal (25ms)", "Safe (50ms)", "Extra Safe (100ms)",
 };
-static const float HDS_DEV_LATENCY_VALUES[HDS_DEV_LATENCY_COUNT] = {5.0f, 15.0f, 25.0f, 50.0f, 100.0f};
+static const float HDS_DEV_LATENCY_VALUES[HDS_DEV_LATENCY_COUNT] = {5.0f, 10.0f, 15.0f, 25.0f, 50.0f, 100.0f};
 
 static int hds_dev_latency_index(float ms) {
-    int best = 2; float best_d = 1e9f; // default to Normal (25ms) if nothing matches exactly
+    int best = 3; float best_d = 1e9f; // default to Normal (25ms) if nothing matches exactly
     for (int i = 0; i < HDS_DEV_LATENCY_COUNT; i++) {
         float d = fabsf(HDS_DEV_LATENCY_VALUES[i] - ms);
         if (d < best_d) { best_d = d; best = i; }
@@ -216,6 +220,13 @@ static void hds_clap_devices_render(cairo_t *cr, HdsClapPlugin *p, HdsClapDevice
     int lat_idx = hds_dev_latency_index(p->knobs.audio_latency_ms);
     bool lat_dd_open = (vs->dropdown_kind == HDS_DEV_DROPDOWN_LATENCY);
     hds_fx_draw_pill(cr, L.latency_pill.x, L.latency_pill.y, L.latency_pill.w, L.latency_pill.h, HDS_DEV_LATENCY_LABELS[lat_idx], lat_dd_open, false);
+    if (lat_idx <= 1) { // Ultra/Extra Snappy -- leaves little to no margin above the Block Size itself
+        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_ITALIC, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 8.5);
+        hds_fx_rgb(cr, 0.75, 0.55, 0.3);
+        hds_fx_left_text(cr, L.latency_pill.x + L.latency_pill.w + 8.0, L.latency_pill.y + L.latency_pill.h / 2 + 3.0,
+                          "may glitch on some hardware -- try a smaller Block Size too");
+    }
 #endif
 
     // Whichever dropdown (if any) is open draws LAST, on top of everything else.
