@@ -10,9 +10,12 @@ CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
 # enough effort (a stripped binary's function boundaries/args are still recoverable via a decompiler,
 # just unnamed) -- it just raises the floor past "nm/objdump immediately hands you every symbol".
 STRIPFLAGS := -s
-# WavPack recording is disabled for now (see HDS_WAVPACK_ENABLED in src/hds_standalone.c) --
-# -lwavpack dropped from here to match; re-add it alongside flipping that flag back to 1.
-LDLIBS := -lasound -lm -lpthread -llo
+# WavPack recording (see HDS_WAVPACK_ENABLED in src/hds_standalone.c) -- -lwavpack added back
+# here, same shared LDLIBS list $(BIN)/hds.clap both already link (see -lasound's own precedent
+# just above: hds.clap links it too despite never touching audio device I/O itself, since nothing
+# here is worth a second near-duplicate LDLIBS variable over). Only synth_engine's own translation
+# unit (hds_standalone.c) references any WavPack symbol at all.
+LDLIBS := -lasound -lm -lpthread -llo -lwavpack
 
 # --- Optional PipeWire backend (native libpipewire client, alongside the always-present ALSA
 # backend -- see hds_standalone.c's "Audio platform shim" section) -- auto-detected via pkg-config

@@ -922,7 +922,7 @@ typedef struct {
 
 #define HDS_FX_ROW_MARGIN 10.0
 #define HDS_FX_NUM_W 22.0
-#define HDS_FX_TYPE_W 128.0
+#define HDS_FX_TYPE_W 103.0
 #define HDS_FX_IO_PILL_W 78.0
 #define HDS_FX_SIDECHAIN_W 68.0
 #define HDS_FX_PARAM_STRIDE 34.0
@@ -942,7 +942,7 @@ typedef struct {
 // itself to. `knob_cx` is that column's own knob-center x (HdsFxRowLayout.param_knob[idx].x),
 // passed in rather than re-deriving the stride math here.
 static void hds_fx_bcastdly_dump_btn_rect(double knob_cx, double row_y, HdsFxRect *out) {
-    double w = HDS_FX_PARAM_STRIDE - 6.0;
+    double w = (HDS_FX_PARAM_STRIDE - 6.0) * 1.5; // 1.5x this column's own default knob-slot width -- deliberately wider than its own column, slightly overlapping neighboring columns, so this reads as a real, prominent button rather than just a wide knob
     *out = (HdsFxRect){knob_cx - w / 2.0, row_y + 6.0, w, HDS_FX_GUI_ROW_H - 12.0};
 }
 

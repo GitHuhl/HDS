@@ -1019,6 +1019,37 @@ typedef struct {
     // writing" even when the frontend sent a real path.
     float record_format;
 
+    // WavPack-specific encoding options (Recording tab) -- meaningless when record_format is WAV,
+    // harmless dead floats on that path (same posture as an FX slot's own param[] entries an
+    // effect that doesn't use them simply ignores). See wavpack_recorder_start()'s own comment in
+    // hds_standalone.c for exactly how each maps onto libwavpack's WavpackConfig.
+    //
+    // 0 = Lossless (default -- the same bit-exact guarantee WAV itself gives, just compressed).
+    // 1 = Hybrid: a smaller, genuinely LOSSY .wv file targeting record_wavpack_hybrid_bitrate's own
+    // rate -- WITH, if record_wavpack_correction_file is also on, a second .wvc file that together
+    // with the .wv reconstructs the original losslessly (the .wv alone still plays back fine on
+    // its own, just lossy). This is WavPack's own well-known "hybrid" design, not something this
+    // port invented -- answers "lossy/hybrid vs. lossless" as a single 2-way choice, since in
+    // WavPack those really are the same underlying switch.
+    float record_wavpack_hybrid;
+    // Only meaningful when record_wavpack_hybrid != 0 -- see its own comment above. Also sets
+    // WavPack's own CONFIG_OPTIMIZE_WVC flag automatically when on (maximizes hybrid compression
+    // quality), matching what WavPack's own reference CLI (-c) already does whenever a correction
+    // file is requested -- not exposed as a separate knob since it's not a real, independent choice.
+    float record_wavpack_correction_file;
+    // Hybrid mode's own target bitrate, in bits per sample (WavPack's own native unit for this,
+    // avoiding the separate CONFIG_BITRATE_KBPS flag) -- 2.0-24.0 is a typical usable "hybrid
+    // lossy" range; only meaningful when record_wavpack_hybrid != 0.
+    float record_wavpack_hybrid_bitrate;
+    // Compression level: 0=Fast, 1=Normal (WavPack's own default -- no flag needed), 2=High,
+    // 3=Very High -- WavPack's own CONFIG_FAST_FLAG/CONFIG_HIGH_FLAG/CONFIG_VERY_HIGH_FLAG, a
+    // speed/ratio tradeoff independent of hybrid vs. lossless (applies to either). Deliberately NOT
+    // exposing WavPack's separate "extra processing" (-x) modes -- explicitly not intended for
+    // real-time encoding (see CONFIG_EXTRA_MODE's own header comment in wavpack.h), and this
+    // recorder runs on a live writer thread, same "no real-time-hostile options" posture as
+    // everything else in it.
+    float record_wavpack_compression_level;
+
     // --- Sample Bank (DFD/WAVE_SAMPLE) + Mapping tab zones ---
     // The Sample Bank itself (which files are loaded, their key/velocity zones, loop points,
     // round-robin groups) is NOT part of this struct -- it travels over its own dedicated,
@@ -2660,6 +2691,10 @@ static const OscParamEntry OSC_PARAMS[] = {
     OSC_SCALAR("/hds/record/downmix_stereo", record_downmix_stereo),
     OSC_ARRAY("/hds/record/channel/%d/enable", record_input_channel_enable, RECORD_MAX_CHANNELS),
     OSC_SCALAR("/hds/record/format", record_format),
+    OSC_SCALAR("/hds/record/wavpack_hybrid", record_wavpack_hybrid),
+    OSC_SCALAR("/hds/record/wavpack_correction_file", record_wavpack_correction_file),
+    OSC_SCALAR("/hds/record/wavpack_hybrid_bitrate", record_wavpack_hybrid_bitrate),
+    OSC_SCALAR("/hds/record/wavpack_compression_level", record_wavpack_compression_level),
 
     OSC_PSCALAR("/hds/tempo/bpm", tempo_bpm),
     OSC_PSCALAR_AT("/hds/combi/0/tempo/bpm", tempo_bpm, 0),
@@ -3702,6 +3737,10 @@ static void init_default_controls(SynthSharedControls *knobs) {
     for (int c = 0; c < RECORD_MAX_CHANNELS; c++) knobs->record_input_channel_enable[c] = 0.0f;
     knobs->record_path[0] = '\0';
     knobs->record_format = 0.0f; // WAV
+    knobs->record_wavpack_hybrid = 0.0f; // Lossless
+    knobs->record_wavpack_correction_file = 0.0f;
+    knobs->record_wavpack_hybrid_bitrate = 4.0f; // bits/sample -- a common "near-transparent hybrid" target
+    knobs->record_wavpack_compression_level = 1.0f; // Normal
     knobs->programs[0].tempo_bpm = 120.0f; // a common, neutral default tempo
     knobs->programs[0].tempo_marker_count = 0.0f; // no tempo map programmed -- tempo_bpm alone applies
     for (int t = 0; t < TEMPO_MARKER_MAX; t++) { knobs->programs[0].tempo_marker_time[t] = 0.0f; knobs->programs[0].tempo_marker_bpm[t] = 0.0f; }

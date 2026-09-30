@@ -380,7 +380,7 @@ static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_scroll(&vs->envelopes_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_scroll(&vs->routing_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
 #ifdef HDS_STANDALONE_GUI_ENABLED
-    else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_scroll(&vs->recording_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
+    else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_scroll(p, &vs->recording_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
 #endif
 }
 

@@ -230,6 +230,18 @@ clicked, and true many-to-many routing is still the Routing tab's job.
 that plugin's per-Combi-Program CLAP ports instead, so there's nothing for
 this pill to control there, and it stays blank.
 
+Recording tab: format choices are WAV (Multichannel, formerly labeled
+"Multichannel WAV") or WavPack. Selecting WavPack exposes its own controls
+below the format pills — Lossless/Hybrid, a Correction File toggle (only
+live in Hybrid mode: pairs a `.wvc` file with the `.wv` so the two together
+losslessly reconstruct the original, while the `.wv` alone stays a smaller
+lossy file), a 4-step Compression Level (Fast/Normal/High/Very High), and
+an 8-preset Hybrid Bitrate (bits/sample, 2-24) used only in Hybrid mode.
+
+Global sidebar: a hardcoded 160px pixel width (`HDS_CLAP_GLOBAL_SIDEBAR_W`
+in `src/hds_clap_global_draw.c`), not a percentage — every control inside
+it sizes itself as a fraction of that constant.
+
 ## Platform notes
 
 - **Raspberry Pi / aarch64 Linux**: `make arm64` cross-compiles

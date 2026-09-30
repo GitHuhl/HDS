@@ -2,10 +2,10 @@
 // hds_clap_gui_draw.c's own header comment on why both are 100% standalone-only: a DAW host already
 // owns recording/sequencing for its plugins, so hds.clap has no equivalent tab at all). Ports
 // frontend.py's own Recording tab: which sources to capture (the synth's own post-FX stereo output,
-// and/or up to RECORD_MAX_CHANNELS raw Input-device channels), Multichannel-WAV vs Stereo-Downmix,
-// WAV vs WavPack (WavPack stays disabled here too -- see HDS_WAVPACK_ENABLED in hds_standalone.c,
-// same reason frontend.py's own WavPack radio is disabled), an output folder, and the actual
-// Record/Stop control with a live elapsed-time/error readout.
+// and/or up to RECORD_MAX_CHANNELS raw Input-device channels), Multichannel vs Stereo-Downmix, WAV
+// vs WavPack (see HDS_WAVPACK_ENABLED in hds_standalone.c) with WavPack's own Lossless/Hybrid,
+// Correction File, Compression Level and (Hybrid-only) target bitrate controls, an output folder,
+// and the actual Record/Stop control with a live elapsed-time/error readout.
 //
 // This file's own content is ENTIRELY wrapped in #ifdef HDS_STANDALONE_GUI_ENABLED: it reads
 // record_engine/record_gather directly (file-scope statics in hds_standalone.c, promoted from
@@ -41,12 +41,25 @@ typedef struct {
     HdsFxRect channel_cb[RECORD_MAX_CHANNELS];
     HdsFxRect mode_multichannel_pill, mode_downmix_pill;
     HdsFxRect format_wav_pill, format_wavpack_pill;
+    // WavPack-only controls -- always given a real rect (same "always-present, only sometimes
+    // meaningful" pattern hds_fx_gui_draw.c's own sidechain_pill/nam_model_pill already use), but
+    // this whole row pair only actually occupies vertical space (see wavpack_selected below) when
+    // format_wavpack_pill is the current selection -- no point reserving blank rows under a WAV
+    // recording no WavPack knob can do anything to.
+    HdsFxRect wp_lossless_pill, wp_hybrid_pill;
+    HdsFxRect wp_correction_pill, wp_compression_pill, wp_bitrate_pill;
     HdsFxRect folder_field, browse_btn;
     HdsFxRect record_btn;
     double content_h;
 } HdsRecordingLayout;
 
-static void hds_clap_recording_compute_layout(double scroll_offset_px, HdsRecordingLayout *out) {
+// wavpack_selected: whether the two WavPack-option rows (wp_lossless_pill.. wp_bitrate_pill) exist
+// in the layout at all this call -- false collapses them to zero height, same as though they
+// weren't there, so switching back to plain WAV doesn't leave a dead gap. See this file's own
+// hds_clap_recording_render()/on_button_press() for the single shared call each always makes with
+// the SAME `p->knobs.record_format != 0.0f` value, so draw and hit-test can never disagree about
+// which rows currently exist.
+static void hds_clap_recording_compute_layout(double scroll_offset_px, bool wavpack_selected, HdsRecordingLayout *out) {
     memset(out, 0, sizeof(*out));
     double y = 56.0 - scroll_offset_px; // below this file's own header text block
 
@@ -68,6 +81,17 @@ static void hds_clap_recording_compute_layout(double scroll_offset_px, HdsRecord
     out->format_wavpack_pill = (HdsFxRect){HDS_REC_MARGIN + 76.0, y, 150.0, HDS_REC_PILL_H};
     y += HDS_REC_PILL_H + HDS_REC_ROW_GAP;
 
+    if (wavpack_selected) {
+        out->wp_lossless_pill = (HdsFxRect){HDS_REC_MARGIN, y, 90.0, HDS_REC_PILL_H};
+        out->wp_hybrid_pill = (HdsFxRect){HDS_REC_MARGIN + 96.0, y, 90.0, HDS_REC_PILL_H};
+        y += HDS_REC_PILL_H + HDS_REC_ROW_GAP;
+
+        out->wp_correction_pill = (HdsFxRect){HDS_REC_MARGIN, y, 170.0, HDS_REC_PILL_H};
+        out->wp_compression_pill = (HdsFxRect){HDS_REC_MARGIN + 176.0, y, 130.0, HDS_REC_PILL_H};
+        out->wp_bitrate_pill = (HdsFxRect){HDS_REC_MARGIN + 312.0, y, 170.0, HDS_REC_PILL_H};
+        y += HDS_REC_PILL_H + HDS_REC_ROW_GAP;
+    }
+
     out->folder_field = (HdsFxRect){HDS_REC_MARGIN, y, 420.0, HDS_REC_PILL_H};
     out->browse_btn = (HdsFxRect){HDS_REC_MARGIN + 426.0, y, 90.0, HDS_REC_PILL_H};
     y += HDS_REC_PILL_H + 28.0;
@@ -87,10 +111,11 @@ static void hds_recording_ensure_folder_default(HdsClapPlugin *p, HdsClapRecordi
 }
 
 // Mirrors frontend.py's own _generate_record_filename() exactly: HDS_<timestamp>.<ext> inside the
-// remembered folder, ext chosen by record_format (WAV only in practice -- see this file's own
-// header comment on why WavPack stays disabled). Called once, right before the record_enable 0->1
-// edge the backend itself watches for (see hds_standalone.c's own comment on why record_path must
-// already hold the real target before that edge fires).
+// remembered folder, ext chosen by record_format (WAV or WavPack's own "wv" -- a WavPack Hybrid
+// correction file, if requested, is a separate ".wvc" derived from this same path at record-start
+// time, see wavpack_recorder_start()'s own comment in hds_standalone.c). Called once, right before
+// the record_enable 0->1 edge the backend itself watches for (see hds_standalone.c's own comment
+// on why record_path must already hold the real target before that edge fires).
 static void hds_recording_generate_path(HdsClapPlugin *p) {
     mkdir(p->record_folder, 0755); // tolerates an already-existing folder (errno EEXIST) same as os.makedirs(exist_ok=True)
     time_t t = time(NULL);
@@ -135,10 +160,11 @@ static void hds_clap_recording_render(cairo_t *cr, HdsClapPlugin *p, HdsClapReco
     hds_fx_left_text(cr, HDS_REC_MARGIN, 20.0 - vs->scroll_offset_px,
                       "Record the synth's own output, raw channels from the Input device (Devices tab), or both");
     hds_fx_left_text(cr, HDS_REC_MARGIN, 34.0 - vs->scroll_offset_px,
-                      "together -- to a genuine multichannel WAV file or downmixed to stereo.");
+                      "together -- to a genuine multichannel file (WAV or WavPack) or downmixed to stereo.");
 
+    bool wavpack_selected = p->knobs.record_format != 0.0f;
     HdsRecordingLayout L;
-    hds_clap_recording_compute_layout(vs->scroll_offset_px, &L);
+    hds_clap_recording_compute_layout(vs->scroll_offset_px, wavpack_selected, &L);
 
     bool synth_out_on = p->knobs.record_include_synth_output != 0.0f;
     hds_fx_draw_pill(cr, L.synth_output_cb.x, L.synth_output_cb.y, L.synth_output_cb.w, L.synth_output_cb.h,
@@ -152,12 +178,35 @@ static void hds_clap_recording_render(cairo_t *cr, HdsClapPlugin *p, HdsClapReco
     }
 
     bool downmix = p->knobs.record_downmix_stereo != 0.0f;
-    hds_fx_draw_pill(cr, L.mode_multichannel_pill.x, L.mode_multichannel_pill.y, L.mode_multichannel_pill.w, L.mode_multichannel_pill.h, "Multichannel WAV", !downmix, false);
+    hds_fx_draw_pill(cr, L.mode_multichannel_pill.x, L.mode_multichannel_pill.y, L.mode_multichannel_pill.w, L.mode_multichannel_pill.h, "Multichannel", !downmix, false);
     hds_fx_draw_pill(cr, L.mode_downmix_pill.x, L.mode_downmix_pill.y, L.mode_downmix_pill.w, L.mode_downmix_pill.h, "Stereo Downmix", downmix, false);
 
-    bool wavpack = p->knobs.record_format != 0.0f; // always false in practice -- see this file's own header comment
-    hds_fx_draw_pill(cr, L.format_wav_pill.x, L.format_wav_pill.y, L.format_wav_pill.w, L.format_wav_pill.h, "WAV", !wavpack, false);
-    hds_fx_draw_pill(cr, L.format_wavpack_pill.x, L.format_wavpack_pill.y, L.format_wavpack_pill.w, L.format_wavpack_pill.h, "WavPack (disabled)", false, true);
+    hds_fx_draw_pill(cr, L.format_wav_pill.x, L.format_wav_pill.y, L.format_wav_pill.w, L.format_wav_pill.h, "WAV", !wavpack_selected, false);
+    hds_fx_draw_pill(cr, L.format_wavpack_pill.x, L.format_wavpack_pill.y, L.format_wavpack_pill.w, L.format_wavpack_pill.h, "WavPack", wavpack_selected, false);
+
+    if (wavpack_selected) {
+        bool hybrid = p->knobs.record_wavpack_hybrid != 0.0f;
+        hds_fx_draw_pill(cr, L.wp_lossless_pill.x, L.wp_lossless_pill.y, L.wp_lossless_pill.w, L.wp_lossless_pill.h, "Lossless", !hybrid, false);
+        hds_fx_draw_pill(cr, L.wp_hybrid_pill.x, L.wp_hybrid_pill.y, L.wp_hybrid_pill.w, L.wp_hybrid_pill.h, "Hybrid", hybrid, false);
+
+        bool correction = p->knobs.record_wavpack_correction_file != 0.0f;
+        // Correction File only means anything in Hybrid mode (see record_wavpack_correction_file's
+        // own comment in backend.c) -- greyed out (disabled=true) rather than hidden in Lossless
+        // mode, same "always visible, sometimes inert" convention as every other conditionally-
+        // meaningful control in this codebase.
+        hds_fx_draw_pill(cr, L.wp_correction_pill.x, L.wp_correction_pill.y, L.wp_correction_pill.w, L.wp_correction_pill.h,
+                          "Correction File (.wvc)", correction, !hybrid);
+
+        int compression_level = (int)p->knobs.record_wavpack_compression_level;
+        static const char *const compression_labels[] = {"Fast", "Normal", "High", "Very High"};
+        char compression_buf[24];
+        snprintf(compression_buf, sizeof(compression_buf), "Compression: %s", compression_labels[(compression_level >= 0 && compression_level < 4) ? compression_level : 1]);
+        hds_fx_draw_pill(cr, L.wp_compression_pill.x, L.wp_compression_pill.y, L.wp_compression_pill.w, L.wp_compression_pill.h, compression_buf, false, false);
+
+        char bitrate_buf[24];
+        snprintf(bitrate_buf, sizeof(bitrate_buf), "Bitrate: %.1f b/smp", (double)p->knobs.record_wavpack_hybrid_bitrate);
+        hds_fx_draw_pill(cr, L.wp_bitrate_pill.x, L.wp_bitrate_pill.y, L.wp_bitrate_pill.w, L.wp_bitrate_pill.h, bitrate_buf, false, !hybrid);
+    }
 
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
     cairo_new_path(cr); cairo_rectangle(cr, L.folder_field.x, L.folder_field.y, L.folder_field.w, L.folder_field.h); cairo_fill(cr);
@@ -211,10 +260,30 @@ static void hds_clap_recording_render(cairo_t *cr, HdsClapPlugin *p, HdsClapReco
     cairo_restore(cr);
 }
 
+// Compression level (0=Fast..3=Very High) cycles forward and wraps -- see its own comment in
+// backend.c. Bitrate cycles through a fixed set of common "hybrid lossy" targets rather than a
+// draggable knob: this tab has no existing knob-drag machinery, and a small preset list already
+// covers the practical range (2 = aggressively lossy, 24 = near-lossless) without adding one.
+static const float HDS_REC_WP_BITRATE_PRESETS[] = {2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f, 16.0f, 24.0f};
+#define HDS_REC_WP_BITRATE_PRESET_COUNT (int)(sizeof(HDS_REC_WP_BITRATE_PRESETS) / sizeof(HDS_REC_WP_BITRATE_PRESETS[0]))
+
+static void hds_recording_cycle_wavpack_bitrate(HdsClapPlugin *p) {
+    float current = p->knobs.record_wavpack_hybrid_bitrate;
+    int idx = 0;
+    float best_diff = 1e9f;
+    for (int i = 0; i < HDS_REC_WP_BITRATE_PRESET_COUNT; i++) {
+        float diff = fabsf(HDS_REC_WP_BITRATE_PRESETS[i] - current);
+        if (diff < best_diff) { best_diff = diff; idx = i; }
+    }
+    idx = (idx + 1) % HDS_REC_WP_BITRATE_PRESET_COUNT;
+    p->knobs.record_wavpack_hybrid_bitrate = HDS_REC_WP_BITRATE_PRESETS[idx];
+}
+
 static bool hds_clap_recording_on_button_press(HdsClapPlugin *p, HdsClapRecordingViewState *vs, HdsFxGuiViewState *fxvs, double x, double y, int button) {
     if (button != 1) return true;
+    bool wavpack_selected = p->knobs.record_format != 0.0f;
     HdsRecordingLayout L;
-    hds_clap_recording_compute_layout(vs->scroll_offset_px, &L);
+    hds_clap_recording_compute_layout(vs->scroll_offset_px, wavpack_selected, &L);
 
     if (hds_play_rect_contains(&L.synth_output_cb, x, y)) {
         p->knobs.record_include_synth_output = (p->knobs.record_include_synth_output != 0.0f) ? 0.0f : 1.0f;
@@ -229,7 +298,26 @@ static bool hds_clap_recording_on_button_press(HdsClapPlugin *p, HdsClapRecordin
     if (hds_play_rect_contains(&L.mode_multichannel_pill, x, y)) { p->knobs.record_downmix_stereo = 0.0f; return true; }
     if (hds_play_rect_contains(&L.mode_downmix_pill, x, y)) { p->knobs.record_downmix_stereo = 1.0f; return true; }
     if (hds_play_rect_contains(&L.format_wav_pill, x, y)) { p->knobs.record_format = 0.0f; return true; }
-    // format_wavpack_pill: deliberately no click handler at all -- see this file's own header comment on why WavPack stays disabled.
+    if (hds_play_rect_contains(&L.format_wavpack_pill, x, y)) { p->knobs.record_format = 1.0f; return true; }
+    if (wavpack_selected) {
+        if (hds_play_rect_contains(&L.wp_lossless_pill, x, y)) { p->knobs.record_wavpack_hybrid = 0.0f; return true; }
+        if (hds_play_rect_contains(&L.wp_hybrid_pill, x, y)) { p->knobs.record_wavpack_hybrid = 1.0f; return true; }
+        // Correction File only does anything in Hybrid mode (the pill itself is drawn greyed out
+        // in Lossless mode) -- same "gate the click, not just the paint" posture the rest of this
+        // codebase already applies to every other conditionally-meaningful control.
+        if (p->knobs.record_wavpack_hybrid != 0.0f && hds_play_rect_contains(&L.wp_correction_pill, x, y)) {
+            p->knobs.record_wavpack_correction_file = (p->knobs.record_wavpack_correction_file != 0.0f) ? 0.0f : 1.0f;
+            return true;
+        }
+        if (hds_play_rect_contains(&L.wp_compression_pill, x, y)) {
+            p->knobs.record_wavpack_compression_level = (float)(((int)p->knobs.record_wavpack_compression_level + 1) % 4);
+            return true;
+        }
+        if (p->knobs.record_wavpack_hybrid != 0.0f && hds_play_rect_contains(&L.wp_bitrate_pill, x, y)) {
+            hds_recording_cycle_wavpack_bitrate(p);
+            return true;
+        }
+    }
     if (hds_play_rect_contains(&L.browse_btn, x, y)) {
         hds_fx_gui_browser_open_folder(fxvs, "Recordings Folder", p->record_folder, sizeof(p->record_folder));
         return true;
@@ -251,9 +339,9 @@ static bool hds_clap_recording_on_button_press(HdsClapPlugin *p, HdsClapRecordin
 static void hds_clap_recording_on_button_release(HdsClapRecordingViewState *vs) { (void)vs; }
 static void hds_clap_recording_on_motion(HdsClapRecordingViewState *vs, double x, double y) { (void)vs; (void)x; (void)y; }
 
-static void hds_clap_recording_on_scroll(HdsClapRecordingViewState *vs, double window_h, int delta) {
+static void hds_clap_recording_on_scroll(HdsClapPlugin *p, HdsClapRecordingViewState *vs, double window_h, int delta) {
     HdsRecordingLayout L;
-    hds_clap_recording_compute_layout(0.0, &L);
+    hds_clap_recording_compute_layout(0.0, p->knobs.record_format != 0.0f, &L);
     double max_scroll = L.content_h - window_h;
     if (max_scroll < 0.0) max_scroll = 0.0;
     vs->scroll_offset_px -= delta * 24.0;

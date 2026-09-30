@@ -43,11 +43,12 @@
 #include <sys/un.h>
 #include <termios.h> // raw-mode stdin for the interactive arrow-key CLI controls (see poll_stdin_control)
 
-// WavPack recording is disabled for now (commented out via this single guard, not deleted --
-// flip to 1, re-add -lwavpack to the Makefile's LDLIBS, and re-enable the frontend.py format
-// radio button to bring it back). See WavPackRecorder further down for the real implementation
-// this guards, kept intact behind #if HDS_WAVPACK_ENABLED rather than removed.
-#define HDS_WAVPACK_ENABLED 0
+// WavPack recording -- re-enabled (see WavPackRecorder further down for the real implementation;
+// -lwavpack is back in the Makefile's LDLIBS, and the native Recording tab's WavPack pill is a
+// real, clickable format choice again -- see hds_clap_recording_draw.c). The #if guard itself is
+// kept (not deleted) purely so a build on a system with no libwavpack-dev available can still flip
+// this back to 0 and drop -lwavpack to keep building headless-WAV-only.
+#define HDS_WAVPACK_ENABLED 1
 #if HDS_WAVPACK_ENABLED
 #include <wavpack/wavpack.h>
 #endif
@@ -1127,23 +1128,25 @@ static void wav_recorder_stop(WavRecorder *rec) {
     fprintf(stderr, "[record] stopped: %u frames (%.2fs), %d channel(s)\n", rec->frames_written, rec->frames_written / (float)SAMPLE_RATE, rec->channels);
 }
 
-// --- WavPack recording: an additional lossless format alongside WAV, reusing the exact same
-// RecordRing/writer-thread architecture unchanged -- same wait-free push from the audio thread,
-// same writer-thread-only file I/O discipline as WavRecorder above. WavPack (like FLAC)
-// losslessly compresses integer PCM, not float, so incoming float samples are converted to
-// 24-bit (packed in int32_t) just before handing them to the encoder. Uses libwavpack's
-// callback-based block output (WavpackOpenFileOutput) rather than the RIFF-style
-// open-now/backpatch-on-stop approach WAV uses -- WavPack's own format has no equivalent
-// backpatch step, so the encoder is simply flushed and closed on stop.
+// --- WavPack recording: an additional lossless (or, in Hybrid mode, lossy-with-an-optional-
+// lossless-correction-file) format alongside WAV, reusing the exact same RecordRing/writer-thread
+// architecture unchanged -- same wait-free push from the audio thread, same writer-thread-only
+// file I/O discipline as WavRecorder above. WavPack (like FLAC) losslessly compresses integer PCM,
+// not float, so incoming float samples are converted to 24-bit (packed in int32_t) just before
+// handing them to the encoder. Uses libwavpack's callback-based block output
+// (WavpackOpenFileOutput) rather than the RIFF-style open-now/backpatch-on-stop approach WAV
+// uses -- WavPack's own format has no equivalent backpatch step, so the encoder is simply flushed
+// and closed on stop.
 //
-// DISABLED for now (HDS_WAVPACK_ENABLED, defined near the top of this file, is 0) -- kept intact
-// below rather than deleted so it can come back with a one-line flip. Below the real
-// implementation is a small stub with the identical signatures/struct shape, so every call site
-// (record_writer_drain, record_writer_thread_main) needs zero changes either way. ---
+// Below the real implementation is a small stub with the identical signatures/struct shape (used
+// only if HDS_WAVPACK_ENABLED is ever flipped back to 0, e.g. building on a system with no
+// libwavpack-dev), so every call site (record_writer_drain, record_writer_thread_main) needs zero
+// changes either way. ---
 #if HDS_WAVPACK_ENABLED
 typedef struct {
     WavpackContext *ctx;
     FILE *file;
+    FILE *file_wvc; // the optional lossless correction file -- see wavpack_recorder_start()'s own comment on hybrid/correction_file; NULL whenever one wasn't requested
     int channels;
     uint32_t frames_written;
     bool active;
@@ -1154,22 +1157,46 @@ typedef struct {
 } WavPackRecorder;
 
 // libwavpack's WavpackBlockOutput callback: just appends the encoder's already-formatted block
-// bytes to our file. Writer-thread-only (the encoder calls this synchronously from inside
-// WavpackPackSamples/WavpackFlushSamples, both called only from the writer thread).
+// bytes to whichever file `id` names -- the SAME callback serves both the main .wv output and the
+// optional .wvc correction-file output (WavpackOpenFileOutput takes one callback but two separate
+// `id`s, one per stream; the encoder itself decides which one a given block belongs to). Writer-
+// thread-only (the encoder calls this synchronously from inside WavpackPackSamples/
+// WavpackFlushSamples, both called only from the writer thread).
 static int wavpack_block_output(void *id, void *data, int32_t bcount) {
     FILE *f = (FILE *)id;
     return fwrite(data, 1, (size_t)bcount, f) == (size_t)bcount;
 }
 
-static bool wavpack_recorder_start(WavPackRecorder *rec, const char *path, bool include_synth_output, bool downmix_stereo, const bool *input_channel_enable, int input_channel_count) {
+// hybrid/correction_file/hybrid_bitrate/compression_level mirror SynthSharedControls'
+// record_wavpack_* fields exactly -- see their own comments in backend.c for what each means and
+// why "lossy/hybrid vs. lossless" collapses to the single `hybrid` bool. compression_level is
+// 0=Fast/1=Normal/2=High/3=Very High (anything else clamps to Normal).
+static bool wavpack_recorder_start(WavPackRecorder *rec, const char *path, bool include_synth_output, bool downmix_stereo, const bool *input_channel_enable, int input_channel_count,
+                                    bool hybrid, bool correction_file, float hybrid_bitrate, int compression_level) {
     int channels = wav_recorder_compute_channels(include_synth_output, downmix_stereo, input_channel_enable, input_channel_count);
     if (channels <= 0) { fprintf(stderr, "[record] cannot start (WavPack): no channels selected\n"); return false; }
 
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "[record] failed to open '%s' for writing: %s\n", path, strerror(errno)); return false; }
 
-    WavpackContext *ctx = WavpackOpenFileOutput(wavpack_block_output, f, NULL);
-    if (!ctx) { fprintf(stderr, "[record] WavpackOpenFileOutput failed\n"); fclose(f); return false; }
+    // A correction file only makes sense alongside Hybrid mode (see record_wavpack_correction_file's
+    // own comment) -- named exactly like WavPack's own reference CLI does, the same base path with
+    // a trailing 'c' appended to the extension ("foo.wv" -> "foo.wvc").
+    bool want_wvc = hybrid && correction_file;
+    FILE *f_wvc = NULL;
+    if (want_wvc) {
+        char wvc_path[RECORD_PATH_LEN + 1];
+        // %.*s bounds the copied path explicitly to RECORD_PATH_LEN-1 chars -- same reasoning as
+        // hds_recording_generate_path()'s own comment in hds_clap_recording_draw.c: without this,
+        // GCC can't rule out the trailing 'c' overflowing a same-sized buffer (path itself is
+        // already <= RECORD_PATH_LEN-1 chars by construction, so this never actually truncates).
+        snprintf(wvc_path, sizeof(wvc_path), "%.*sc", RECORD_PATH_LEN - 1, path);
+        f_wvc = fopen(wvc_path, "wb");
+        if (!f_wvc) { fprintf(stderr, "[record] failed to open '%s' for writing: %s\n", wvc_path, strerror(errno)); fclose(f); return false; }
+    }
+
+    WavpackContext *ctx = WavpackOpenFileOutput(wavpack_block_output, f, f_wvc);
+    if (!ctx) { fprintf(stderr, "[record] WavpackOpenFileOutput failed\n"); fclose(f); if (f_wvc) fclose(f_wvc); return false; }
 
     WavpackConfig config; memset(&config, 0, sizeof(config));
     config.bytes_per_sample = 3;   // 24-bit PCM, packed 3 bytes/sample into each int32_t
@@ -1177,16 +1204,29 @@ static bool wavpack_recorder_start(WavPackRecorder *rec, const char *path, bool 
     config.num_channels = channels;
     config.sample_rate = SAMPLE_RATE;
 
+    if (hybrid) {
+        config.flags |= CONFIG_HYBRID_FLAG;
+        config.bitrate = fmaxf(2.0f, fminf(24.0f, hybrid_bitrate));
+        if (want_wvc) config.flags |= CONFIG_CREATE_WVC | CONFIG_OPTIMIZE_WVC; // CONFIG_OPTIMIZE_WVC: matches the reference CLI's own "-c" behavior, see this effect's own comment in backend.c
+    }
+    switch (compression_level) {
+        case 0: config.flags |= CONFIG_FAST_FLAG; break;
+        case 2: config.flags |= CONFIG_HIGH_FLAG; break;
+        case 3: config.flags |= CONFIG_VERY_HIGH_FLAG; break;
+        default: break; // 1 (Normal) or anything unrecognized -- WavPack's own default, no flag needed
+    }
+
     // (uint32_t)-1 total_samples signals "length not known in advance" (this is a live, streamed
     // recording of unknown duration) -- WavPack supports this the same way its CLI does when
     // encoding from a pipe/stdin.
     if (!WavpackSetConfiguration(ctx, &config, (uint32_t)-1) || !WavpackPackInit(ctx)) {
         fprintf(stderr, "[record] WavPack configuration/init failed: %s\n", WavpackGetErrorMessage(ctx));
-        WavpackCloseFile(ctx); fclose(f); return false;
+        WavpackCloseFile(ctx); fclose(f); if (f_wvc) fclose(f_wvc); return false;
     }
 
     rec->ctx = ctx;
     rec->file = f;
+    rec->file_wvc = f_wvc;
     rec->channels = channels;
     rec->frames_written = 0;
     rec->active = true;
@@ -1226,10 +1266,11 @@ static void wavpack_recorder_write(WavPackRecorder *rec, const float *interleave
 static void wavpack_recorder_stop(WavPackRecorder *rec) {
     if (!rec->active) return;
     WavpackFlushSamples(rec->ctx);
-    WavpackCloseFile(rec->ctx);
+    WavpackCloseFile(rec->ctx); // frees the WavpackContext only -- both FILE*s below are ours to close, same as WAV's own fclose after its backpatch
     rec->ctx = NULL;
     fclose(rec->file);
     rec->file = NULL;
+    if (rec->file_wvc) { fclose(rec->file_wvc); rec->file_wvc = NULL; }
     rec->active = false;
     fprintf(stderr, "[record] stopped (WavPack): %u frames (%.2fs), %d channel(s)\n", rec->frames_written, rec->frames_written / (float)SAMPLE_RATE, rec->channels);
 }
@@ -1241,8 +1282,10 @@ typedef struct {
     uint32_t frames_written;
     bool active;
 } WavPackRecorder;
-static bool wavpack_recorder_start(WavPackRecorder *rec, const char *path, bool include_synth_output, bool downmix_stereo, const bool *input_channel_enable, int input_channel_count) {
+static bool wavpack_recorder_start(WavPackRecorder *rec, const char *path, bool include_synth_output, bool downmix_stereo, const bool *input_channel_enable, int input_channel_count,
+                                    bool hybrid, bool correction_file, float hybrid_bitrate, int compression_level) {
     (void)rec; (void)path; (void)include_synth_output; (void)downmix_stereo; (void)input_channel_enable; (void)input_channel_count;
+    (void)hybrid; (void)correction_file; (void)hybrid_bitrate; (void)compression_level;
     fprintf(stderr, "[record] WavPack support is currently disabled (HDS_WAVPACK_ENABLED=0) -- recording not started\n");
     return false;
 }
@@ -1286,6 +1329,13 @@ typedef struct {
     bool cmd_input_channel_enable[RECORD_MAX_CHANNELS];
     int cmd_input_channel_count;
     int cmd_record_format; // RecordFormat: 0=WAV, 1=WavPack
+    // WavPack-only encoding options, frozen at the same record-start edge as everything else
+    // above -- see record_wavpack_hybrid/correction_file/hybrid_bitrate/compression_level's own
+    // comments in backend.c. Harmless, unread when cmd_record_format is WAV.
+    bool cmd_wavpack_hybrid;
+    bool cmd_wavpack_correction_file;
+    float cmd_wavpack_hybrid_bitrate;
+    int cmd_wavpack_compression_level;
 
     // Writer thread -> audio thread status, polled for the GUI's EngineStatus feedback.
     _Atomic bool is_active;
@@ -1392,7 +1442,9 @@ static void *record_writer_thread_main(void *arg) {
             bool ok;
             if (eng->cmd_record_format == 1) {
                 ok = wavpack_recorder_start(&wprec, eng->cmd_path, eng->cmd_include_synth_output, eng->cmd_downmix_stereo,
-                                             eng->cmd_input_channel_enable, eng->cmd_input_channel_count);
+                                             eng->cmd_input_channel_enable, eng->cmd_input_channel_count,
+                                             eng->cmd_wavpack_hybrid, eng->cmd_wavpack_correction_file,
+                                             eng->cmd_wavpack_hybrid_bitrate, eng->cmd_wavpack_compression_level);
             } else {
                 ok = wav_recorder_start(&rec, eng->cmd_path, eng->cmd_include_synth_output, eng->cmd_downmix_stereo,
                                          eng->cmd_input_channel_enable, eng->cmd_input_channel_count);
@@ -2301,6 +2353,10 @@ int main(int argc, char **argv) {
                 record_engine.cmd_downmix_stereo = sel_downmix_stereo;
                 record_engine.cmd_input_channel_count = detected_input_channels;
                 record_engine.cmd_record_format = (int)g_gui_ctx.knobs.record_format;
+                record_engine.cmd_wavpack_hybrid = g_gui_ctx.knobs.record_wavpack_hybrid != 0.0f;
+                record_engine.cmd_wavpack_correction_file = g_gui_ctx.knobs.record_wavpack_correction_file != 0.0f;
+                record_engine.cmd_wavpack_hybrid_bitrate = g_gui_ctx.knobs.record_wavpack_hybrid_bitrate;
+                record_engine.cmd_wavpack_compression_level = (int)g_gui_ctx.knobs.record_wavpack_compression_level;
                 for (int c = 0; c < RECORD_MAX_CHANNELS; c++) record_engine.cmd_input_channel_enable[c] = sel_input_channel[c];
 
                 record_gather.sel_include_synth_output = sel_include_synth_output;

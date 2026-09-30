@@ -26,9 +26,9 @@
 ## header comments for that GUI-porting story). The ImGui/GLFW touch client (hds_pi_touch) is gone
 ## for good too -- the Pi target is backend-only now (synth_engine-arm64, no GUI client for that
 ## target). See git history if that one's ever revived.
-## WavPack recording support is disabled for now too (commented out via HDS_WAVPACK_ENABLED in
-## src/backend.c, not deleted) -- pkgs.wavpack/aarch64.wavpack are left in buildInputs below since
-## re-enabling it needs nothing from this file to change, only that one flag flipped back.
+## WavPack recording support is enabled (HDS_WAVPACK_ENABLED in src/hds_standalone.c) --
+## pkgs.wavpack/aarch64.wavpack in buildInputs below is what actually provides it; nothing else in
+## this file needed to change when it was turned back on.
 ## `pkgs` is pinned to a fixed nixpkgs-24.05 release tarball (URL + content hash below) rather
 ## than the unpinned `<nixpkgs>` this file used to use. Root-caused directly: two `nix-shell`
 ## entries against unpinned `<nixpkgs>` -- one on this build machine, one on a developer's own
@@ -104,9 +104,8 @@ pkgs.mkShell {
     pkgs.gnumake
     pkgs.alsa-lib          # backend.c's audio I/O (ALSA) -- headers + lib in one nixpkgs derivation
     pkgs.liblo              # the OSC control protocol (backend.c's embedded control surface)
-    pkgs.wavpack             # NOT currently linked -- WavPack recording is disabled (see
-                              # HDS_WAVPACK_ENABLED in src/backend.c); left here so re-enabling it
-                              # needs no shell.nix change, just that one flag flipped back.
+    pkgs.wavpack             # WavPack recording (Recording tab) -- see HDS_WAVPACK_ENABLED in
+                              # src/hds_standalone.c and -lwavpack in the Makefile's own LDLIBS.
     pkgs.pipewire            # backend.c's OPTIONAL native PipeWire backend (--backend pipewire,
                               # alongside the always-present ALSA backend above -- see
                               # HDS_PIPEWIRE_ENABLED in src/backend.c). The Makefile auto-detects
@@ -144,7 +143,12 @@ pkgs.mkShell {
     aarch64.stdenv.cc
     aarch64.alsa-lib
     aarch64.liblo
-    aarch64.wavpack   # NOT currently linked (see pkgs.wavpack's own comment above)
+    aarch64.wavpack   # NOT currently linked for this arm64 (Raspberry Pi) target specifically --
+                      # ARM64_LDFLAGS in the Makefile has no -lwavpack, and arm64-libs/ has no
+                      # libwavpack.so bundled for the Pi's own runtime yet. The native Linux build
+                      # (pkgs.wavpack above) IS linked -- see its own comment. Left here so wiring
+                      # up the Pi target later needs no shell.nix change, just the Makefile/bundling
+                      # work (mirroring how liblo is already cross-built/bundled for it).
     pkgs.patchelf   # rewrites the Nix store RPATH/interpreter the cross linker bakes into arm64 --
                      # those store paths don't exist on the Pi. The Makefile's arm64 rule runs
                      # `patchelf --set-rpath '$ORIGIN/arm64-libs' --set-interpreter

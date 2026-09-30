@@ -53,7 +53,7 @@
 // QScrollArea (setMaximumWidth(276), its content capped at 260) exactly: a permanent, constant-
 // width column, not a panel that grows/shrinks with the rest of the window. hds_clap_gui_draw.c
 // reads this same constant to know where the tab bar/content region starts.
-#define HDS_CLAP_GLOBAL_SIDEBAR_W 210.0 // ~75% of the previous 280 -- little in this panel is genuinely wide (a couple of side-by-side knob pairs, some pill labels), so it doesn't need a full-width column
+#define HDS_CLAP_GLOBAL_SIDEBAR_W 160.0 // a hardcoded pixel width (not a percentage of window_w -- see this file's own header comment); every sub-element below is laid out as a fraction of this one constant, so this is the only place a new width needs to change
 
 #define HDS_GLOBAL_DROPDOWN_NONE 0
 #define HDS_GLOBAL_DROPDOWN_HARDSYNC 1
