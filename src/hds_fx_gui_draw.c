@@ -970,17 +970,26 @@ static double hds_fx_bcastdly_col_x(double delay_col_x, int i) {
     return delay_col_x + i * HDS_FX_BCASTDLY_BTN_PITCH; // i==0 (Delay) -> itself, unchanged
 }
 
-static void hds_fx_draw_dump_button(cairo_t *cr, const HdsFxRect *r, const char *line1, const char *line2) {
+// `disabled` grays this out (same fill/text palette hds_fx_draw_pill_kind() already uses for a
+// disabled pill, so this reads as "off" the same consistent way every other disabled control in
+// this GUI does) -- for FX_TYPE_BROADCAST_DELAY's own Dump buttons, true whenever the Delay knob
+// (param[0]) is at 0: with no nominal delay to speak of, there's nothing buffered for a dump to
+// ever remove, so pressing one would be a pure no-op. Gates the click, not just the paint -- see
+// this file's own call site in hds_fx_gui_on_button_press().
+static void hds_fx_draw_dump_button(cairo_t *cr, const HdsFxRect *r, const char *line1, const char *line2, bool disabled) {
     cairo_new_path(cr);
     cairo_rectangle(cr, r->x, r->y, r->w, r->h);
-    hds_fx_rgb(cr, 0.72, 0.10, 0.10);
+    if (disabled) hds_fx_rgb(cr, 0.16, 0.16, 0.18);
+    else hds_fx_rgb(cr, 0.72, 0.10, 0.10);
     cairo_fill_preserve(cr);
-    hds_fx_rgb(cr, 0.97, 0.35, 0.32);
+    if (disabled) hds_fx_rgb(cr, 0.32, 0.32, 0.35);
+    else hds_fx_rgb(cr, 0.97, 0.35, 0.32);
     cairo_set_line_width(cr, 1.3);
     cairo_stroke(cr);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 9.5);
-    hds_fx_rgb(cr, 1.0, 1.0, 1.0);
+    if (disabled) hds_fx_rgb(cr, 0.42, 0.42, 0.45);
+    else hds_fx_rgb(cr, 1.0, 1.0, 1.0);
     hds_fx_centered_text(cr, r->x + r->w / 2.0, r->y + r->h / 2.0 - 1.0, line1);
     hds_fx_centered_text(cr, r->x + r->w / 2.0, r->y + r->h / 2.0 + 12.0, line2);
 }
@@ -1733,7 +1742,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
                 HdsFxRect btn;
                 hds_fx_bcastdly_dump_btn_rect(col_x, y, &btn);
                 const char *line2 = (i == 1) ? "7s" : (i == 2) ? "15s" : "30s";
-                hds_fx_draw_dump_button(cr, &btn, "DUMP", line2);
+                hds_fx_draw_dump_button(cr, &btn, "DUMP", line2, slot->param[0] <= 0.0f);
                 continue;
             }
             // On-Air Override (param[5]): same big momentary-button treatment, orange instead of
@@ -2049,11 +2058,17 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
             double col_x = is_bcastdly ? hds_fx_bcastdly_col_x(L.param_knob[0].x, i) : L.param_knob[i].x; // must mirror the draw side exactly -- see hds_fx_bcastdly_col_x()'s own comment
             // FX_TYPE_BROADCAST_DELAY's Dump 7s/15s/30s buttons: a plain click-to-fire, same
             // one-shot-counter idiom as SeqLaneState.audio_preview_trigger (see fx_types.h's own
-            // comment on param[1..3]) -- increments the param, never starts a knob drag.
+            // comment on param[1..3]) -- increments the param, never starts a knob drag. Grayed out
+            // (see hds_fx_draw_dump_button()'s own comment) AND inert whenever Delay (param[0]) is
+            // 0 -- still consumes the click (so it can never fall through to whatever knob would
+            // otherwise sit at this column), just doesn't fire.
             if (is_bcastdly && (i == 1 || i == 2 || i == 3)) {
                 HdsFxRect btn;
                 hds_fx_bcastdly_dump_btn_rect(col_x, row_y, &btn);
-                if (hds_fx_rect_contains(&btn, x, y)) { p->fx[row].param[i] += 1.0f; return true; }
+                if (hds_fx_rect_contains(&btn, x, y)) {
+                    if (p->fx[row].param[0] > 0.0f) p->fx[row].param[i] += 1.0f;
+                    return true;
+                }
                 continue;
             }
             // On-Air Override (param[5]): HELD, not clicked -- set to 1.0 for as long as the mouse

@@ -186,7 +186,11 @@ Up to 32 shared slots, each independently routable, each settable to any of:
   hair slower than real time for a while — a Restock Speed knob controls
   how aggressively (and how audibly) that catch-up happens. A color-coded
   readout (green = fully buffered/safe to dump again, red = still
-  restocking) shows exactly how much dump time is currently available. Also
+  restocking) shows exactly how much dump time is currently available. The
+  three Dump buttons gray out (and stop responding to clicks) whenever
+  Delay is set to 0 — with nothing buffered, a dump would be a pure no-op,
+  which also makes it easy to spot the effect is being used purely for the
+  On-Air Override below rather than as an actual delay. Also
   has an orange "1000 Hz" On-Air Override button, held rather than clicked:
   for as long as it's down, the OUTPUT is replaced live with a 1kHz tone at
   half volume — deliberately not delayed like everything else this effect
