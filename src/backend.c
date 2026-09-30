@@ -4866,7 +4866,7 @@ static char *sfz_substitute_defines(const char *src, size_t src_len, const SfzDe
 // _parse_sfz's own `_visited` set exactly. `io_region_count` is threaded through every recursive
 // call (not a global) so regions from every #include'd file land in the SAME out_regions array,
 // continuing to append rather than each recursion starting its own separate count.
-static void sfz_parse_file_recursive(const char *path, SfzRegion *out_regions, int max_regions, int *io_region_count, char *out_default_path, size_t out_default_path_len, char (*visited_realpaths)[PATH_MAX], int *visited_count, int max_visited) {
+static void sfz_parse_file_recursive(const char *path, SfzRegion *out_regions, int max_regions, int *io_region_count, char *out_default_path, size_t out_default_path_len, char (*visited_realpaths)[PATH_MAX], int *visited_count, int max_visited, SfzDefine *defines, int *define_count) {
     char resolved[PATH_MAX];
     if (!realpath(path, resolved)) { fprintf(stderr, "[sfz] failed to resolve '%s'\n", path); return; }
     for (int i = 0; i < *visited_count; i++) if (strcmp(visited_realpaths[i], resolved) == 0) return; // cycle
@@ -4891,11 +4891,19 @@ static void sfz_parse_file_recursive(const char *path, SfzRegion *out_regions, i
 
     // Strip "//" comments (blank to end of line), collect+blank "#include \"...\"" lines, and
     // collect+blank "#define $NAME value" lines, in one forward pass over the mutable buffer.
+    // `defines`/`define_count` are the CALLER's own arrays (see this function's own signature), not
+    // fresh per-file locals -- the real SFZ spec treats #include as literal text concatenation (an
+    // included file is pasted in at its #include's own position and the whole tree parsed as one
+    // document), so a #define appearing before an #include is standard-documented to apply to
+    // everything that #include brings in too. A master kit file that #defines each drum's own key
+    // macro before #including a generic per-instrument fragment (exactly this kit's own layout)
+    // depends on that: this file's #defines are appended onto the SAME growing array the caller
+    // already populated, and get passed on unchanged into any #include this file has of its own, so
+    // the propagation direction (parent -> child, and via the shared array, sibling -> later
+    // sibling) matches a real concatenate-then-parse pass instead of resetting to empty per file.
     #define SFZ_MAX_INCLUDES_PER_FILE 64
     char include_paths[SFZ_MAX_INCLUDES_PER_FILE][SAMPLE_PATH_LEN];
     int include_count = 0;
-    SfzDefine defines[SFZ_MAX_DEFINES];
-    int define_count = 0;
     for (size_t i = 0; i < read_n; i++) {
         if (buf[i] == '/' && i + 1 < read_n && buf[i + 1] == '/') {
             while (i < read_n && buf[i] != '\n') buf[i++] = ' ';
@@ -4919,7 +4927,15 @@ static void sfz_parse_file_recursive(const char *path, SfzRegion *out_regions, i
             size_t j = i + 7;
             while (j < read_n && buf[j] != '\n' && isspace((unsigned char)buf[j])) j++;
             if (j < read_n && buf[j] == '$') {
-                size_t name_start = j;
+                size_t name_start = j; // kept pointing AT the '$' -- sfz_substitute_defines() matches
+                                        // a stored name against "$NAME" text verbatim, so the '$'
+                                        // itself must be part of the stored name, not skipped over
+                j++; // advance PAST the '$' before scanning identifier characters -- buf[j] here is
+                     // '$' itself, which is neither alnum nor '_', so leaving this out made the scan
+                     // loop below never advance at all: name_len was always 0 and no #define was
+                     // ever actually captured, in any file (this is the real bug behind "why is
+                     // every $KEY macro in my SFZ still literally '$KEY' after loading" -- nothing
+                     // to do with #include scope, which is a SEPARATE fix elsewhere in this function).
                 while (j < read_n && (isalnum((unsigned char)buf[j]) || buf[j] == '_')) j++;
                 size_t name_len = j - name_start;
                 while (j < read_n && buf[j] != '\n' && isspace((unsigned char)buf[j])) j++;
@@ -4928,10 +4944,10 @@ static void sfz_parse_file_recursive(const char *path, SfzRegion *out_regions, i
                 size_t value_len = j - value_start;
                 size_t line_end = j;
                 while (line_end < read_n && buf[line_end] != '\n') line_end++;
-                if (define_count < SFZ_MAX_DEFINES && name_len > 0 && name_len < sizeof(defines[0].name) && value_len < sizeof(defines[0].value)) {
-                    memcpy(defines[define_count].name, buf + name_start, name_len); defines[define_count].name[name_len] = '\0';
-                    memcpy(defines[define_count].value, buf + value_start, value_len); defines[define_count].value[value_len] = '\0';
-                    define_count++;
+                if (*define_count < SFZ_MAX_DEFINES && name_len > 0 && name_len < sizeof(defines[0].name) && value_len < sizeof(defines[0].value)) {
+                    memcpy(defines[*define_count].name, buf + name_start, name_len); defines[*define_count].name[name_len] = '\0';
+                    memcpy(defines[*define_count].value, buf + value_start, value_len); defines[*define_count].value[value_len] = '\0';
+                    (*define_count)++;
                 }
                 for (size_t z = line_start; z < line_end; z++) buf[z] = ' '; // blank the whole directive
                 i = line_end;
@@ -4940,7 +4956,7 @@ static void sfz_parse_file_recursive(const char *path, SfzRegion *out_regions, i
     }
 
     size_t expanded_len = 0;
-    char *expanded = sfz_substitute_defines(buf, read_n, defines, define_count, &expanded_len);
+    char *expanded = sfz_substitute_defines(buf, read_n, defines, *define_count, &expanded_len);
     if (expanded) {
         sfz_tokenize_and_apply(expanded, sfz_dir, out_regions, max_regions, io_region_count, out_default_path, out_default_path_len);
         free(expanded);
@@ -4954,7 +4970,10 @@ static void sfz_parse_file_recursive(const char *path, SfzRegion *out_regions, i
         if (include_paths[inc][0] == '/') sfz_set_text_field(inc_path, sizeof(inc_path), include_paths[inc]);
         else sfz_join_path(inc_path, sizeof(inc_path), sfz_dir, include_paths[inc]);
         char inc_default_path[SAMPLE_PATH_LEN]; inc_default_path[0] = '\0';
-        sfz_parse_file_recursive(inc_path, out_regions, max_regions, io_region_count, inc_default_path, sizeof(inc_default_path), visited_realpaths, visited_count, max_visited);
+        // Same shared `defines`/`define_count` passed straight through -- see this function's own
+        // header comment on why propagating them (rather than each file starting a fresh, empty
+        // array) is what real concatenate-then-parse #define/#include scoping requires.
+        sfz_parse_file_recursive(inc_path, out_regions, max_regions, io_region_count, inc_default_path, sizeof(inc_default_path), visited_realpaths, visited_count, max_visited, defines, define_count);
         // A sub-file's own default_path= (if any) only applies to ITS OWN regions -- already
         // baked into them via the recursive call above, which passes sfz_dir derived from
         // inc_path's own directory. The outer file's out_default_path is left as whatever the
@@ -4971,7 +4990,12 @@ static int sfz_parse_file(const char *path, SfzRegion *out_regions, int max_regi
     char (*visited)[PATH_MAX] = (char (*)[PATH_MAX])malloc((size_t)SFZ_MAX_VISITED_FILES * PATH_MAX);
     if (!visited) return 0;
     int visited_count = 0;
-    sfz_parse_file_recursive(path, out_regions, max_regions, &region_count, out_default_path, out_default_path_len, visited, &visited_count, SFZ_MAX_VISITED_FILES);
+    // One shared, growing #define table for the WHOLE file tree -- see sfz_parse_file_recursive's
+    // own header comment for why this (not a fresh empty array per file) is what the SFZ spec's own
+    // #include-as-text-concatenation model requires.
+    SfzDefine defines[SFZ_MAX_DEFINES];
+    int define_count = 0;
+    sfz_parse_file_recursive(path, out_regions, max_regions, &region_count, out_default_path, out_default_path_len, visited, &visited_count, SFZ_MAX_VISITED_FILES, defines, &define_count);
     free(visited);
     return region_count;
 }
