@@ -1161,7 +1161,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
         float peak = render_audio_block(&p->sample_engine, &p->engine, p->voices, &p->knobs, p->global_lfo_phases,
                                          any_ext_in_connected ? p->ext_in_render_buf : NULL, any_ext_in_connected ? EXT_IN_PAIR_COUNT * 2 : 0,
                                          2, &p->midi_live, chunk_buffer, current_tempo_bpm, p->ext_in_peak,
-                                         any_prog_out_connected ? p->per_program_render_buf : NULL, p->fx_gr_db);
+                                         any_prog_out_connected ? p->per_program_render_buf : NULL, p->fx_gr_db, p->fx_dump_avail_sec);
         if (peak > block_peak) block_peak = peak;
 
         if (out) {
@@ -1289,6 +1289,7 @@ static const clap_plugin_t *clap_factory_create_plugin(const clap_plugin_factory
     p->gui_host.source_count = SOURCE_COUNT;
     p->gui_host.source_label = hds_clap_source_label;
     p->gui_host.fx_gr_db = p->fx_gr_db;
+    p->gui_host.fx_dump_avail_sec = p->fx_dump_avail_sec;
 
     p->plugin.desc = &k_descriptor;
     p->plugin.plugin_data = p;

@@ -8982,9 +8982,13 @@ static void apply_program_eq(HdsEngineState *engine, int p, const EqBiquadCoeffs
 // above): each slot's current gain-reduction reading in dB (0 for a bypassed/off/non-GR-capable
 // slot), zeroed here and refreshed every sample by process_fx_chain() -- so after this call returns,
 // it holds the LAST sample's readings, which is all the ~31Hz status tick (send_osc_status) needs.
-static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm, float ext_in_peak_out[EXT_IN_PAIR_COUNT], float *per_program_out, float gr_db_out[FX_SLOT_COUNT]) {
+// dump_avail_out[FX_SLOT_COUNT] (required, not NULL-able -- same convention/lifetime as gr_db_out
+// just above): each FX_TYPE_BROADCAST_DELAY slot's currently-buffered delay, in seconds (0 for
+// every other type), for that effect's own dump-availability meter.
+static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm, float ext_in_peak_out[EXT_IN_PAIR_COUNT], float *per_program_out, float gr_db_out[FX_SLOT_COUNT], float dump_avail_out[FX_SLOT_COUNT]) {
     float peak = 0.0f;
     for (int s = 0; s < FX_SLOT_COUNT; s++) gr_db_out[s] = 0.0f;
+    for (int s = 0; s < FX_SLOT_COUNT; s++) dump_avail_out[s] = 0.0f;
     // Routing tab's per-ext-in-pair VU meters (see gui_routing_tab_visible's own comment): a true
     // no-op -- not just "computed but ignored" -- whenever the Routing tab isn't on-screen, so
     // this costs nothing for the life of the process unless a player is actually looking at it.
@@ -10186,7 +10190,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // effect to.
         for (int src = 0; src < SOURCE_COUNT; src++) {
             if (!source_has_fx_slots[src]) continue;
-            process_fx_chain(knobs->fx, fx_engine, /* always Parallel, matches HDS FX */ 1, src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src], gr_db_out, engine->fx_slot_out_l, engine->fx_slot_out_r);
+            process_fx_chain(knobs->fx, fx_engine, /* always Parallel, matches HDS FX */ 1, src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src], gr_db_out, dump_avail_out, engine->fx_slot_out_l, engine->fx_slot_out_r);
         }
 
         // CLAP multi-out (see this function's own per_program_out comment) -- captured here,
@@ -10358,6 +10362,9 @@ typedef struct {
     // see render_audio_block's own gr_db_out comment and process_fx_chain's per-slot GR writes.
     // Only Gate/Limiter/FetComp(HT-76)/FairKid67(Fairchild 670) ever report nonzero here.
     float fx_gain_reduction_db[FX_SLOT_COUNT];
+    // Per-FX-slot currently-buffered delay, in seconds -- see render_audio_block's own
+    // dump_avail_out comment. Only FX_TYPE_BROADCAST_DELAY ever reports nonzero here.
+    float fx_dump_avail_sec[FX_SLOT_COUNT];
 } EngineStatus;
 
 // Sends the GUI-status snapshot as one OSC bundle (one UDP datagram, 8 messages) to the reply
@@ -10387,6 +10394,11 @@ static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
         char addr[40];
         snprintf(addr, sizeof(addr), "/hds/status/fx_gr/%d", s);
         m = lo_message_new(); lo_message_add_float(m, status->fx_gain_reduction_db[s]); lo_bundle_add_message(b, addr, m);
+    }
+    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+        char addr[48];
+        snprintf(addr, sizeof(addr), "/hds/status/fx_dump_avail/%d", s);
+        m = lo_message_new(); lo_message_add_float(m, status->fx_dump_avail_sec[s]); lo_bundle_add_message(b, addr, m);
     }
     lo_send_bundle(reply_addr, b);
     lo_bundle_free_recursive(b); // frees the bundle AND every message added to it

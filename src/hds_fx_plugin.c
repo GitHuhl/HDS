@@ -179,6 +179,7 @@ typedef struct {
     float port_output_off[HDS_FX_PORT_COUNT];
 
     float gr_db_scratch[FX_SLOT_COUNT]; // required non-NULL out-param, exposed to the GUI via gui_host.fx_gr_db below -- shared across all 8 ports' own calls, same convention as backend.c's own gr_db_out (see render_audio_block)
+    float dump_avail_scratch[FX_SLOT_COUNT]; // same convention as gr_db_scratch just above, for FX_TYPE_BROADCAST_DELAY's own dump-availability meter -- exposed via gui_host.fx_dump_avail_sec below
 
     // Every slot's own last-computed post-mix output, in POOL-SLOT order -- see process_fx_chain()'s
     // own slot_out_l/r comment. Persists across blocks like fx_engine[] itself, never reset to 0.
@@ -661,6 +662,7 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
     // gr_db_scratch zeroed once per block, then refreshed by whichever port's call owns each slot
     // this sample -- same convention as backend.c's own gr_db_out (see render_audio_block).
     for (int s = 0; s < FX_SLOT_COUNT; s++) p->gr_db_scratch[s] = 0.0f;
+    for (int s = 0; s < FX_SLOT_COUNT; s++) p->dump_avail_scratch[s] = 0.0f;
 
     float *in_l[HDS_FX_PORT_COUNT], *in_r[HDS_FX_PORT_COUNT], *out_l[HDS_FX_PORT_COUNT], *out_r[HDS_FX_PORT_COUNT];
     for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
@@ -708,7 +710,7 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
         }
         for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
             float l = sc_snapshot_l[port], r = sc_snapshot_r[port];
-            process_fx_chain(p->fx, p->fx_engine, /* always Parallel */ 1, port, sc_snapshot_l, sc_snapshot_r, &l, &r, p->gr_db_scratch, p->fx_slot_out_l, p->fx_slot_out_r);
+            process_fx_chain(p->fx, p->fx_engine, /* always Parallel */ 1, port, sc_snapshot_l, sc_snapshot_r, &l, &r, p->gr_db_scratch, p->dump_avail_scratch, p->fx_slot_out_l, p->fx_slot_out_r);
 
             if (p->port_output_off[port] != 0.0f) continue; // Off: this chain's Output goes nowhere
 
@@ -789,6 +791,7 @@ static const clap_plugin_t *hds_fx_factory_create_plugin(const clap_plugin_facto
     p->gui_host.port_input_off = p->port_input_off;
     p->gui_host.port_output_off = p->port_output_off;
     p->gui_host.fx_gr_db = p->gr_db_scratch;
+    p->gui_host.fx_dump_avail_sec = p->dump_avail_scratch;
     p->gui_host.gui_window = NULL;
 
     p->plugin.desc = &k_descriptor;

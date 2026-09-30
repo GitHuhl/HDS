@@ -4766,6 +4766,111 @@ static void run_fx_fdnverb(FXSlotEngine *engine, const FXSlotParams *params, flo
     *r = er_result[1] + fdn_out_r;
 }
 
+// --- FX_TYPE_BROADCAST_DELAY: an original implementation of the on-air "profanity delay"/dump
+// buffer -- see this effect's own FX_TYPE_BROADCAST_DELAY comment in fx_types.h for the full
+// param map and the restocking design's overall rationale. Buffer sized for the full 60s max
+// delay at this engine's own fixed SAMPLE_RATE -- a fixed array embedded in the state struct,
+// calloc'd once on first use, same convention FX_TYPE_TAPEDELAY2's own dL/dR arrays already use
+// for a (much smaller) fixed-size delay line.
+#define HDS_BCASTDLY_MAX_SEC 60
+#define HDS_BCASTDLY_MAX_SAMPLES (SAMPLE_RATE * HDS_BCASTDLY_MAX_SEC + 8) // +8 guard past the nominal max for the interpolated read never quite reaching the write cursor
+
+typedef struct {
+    float buf_l[HDS_BCASTDLY_MAX_SAMPLES];
+    float buf_r[HDS_BCASTDLY_MAX_SAMPLES];
+    int write_pos;
+    // The REAL, currently-buffered delay, in samples -- distinct from nominal_delay_samples (the
+    // Delay knob's own target, recomputed fresh from param[0] every call): this is what actually
+    // separates the write and read cursors right now, and is what a dump instantly shrinks and
+    // restocking gradually regrows back toward the nominal target. Fractional (not an int) because
+    // both restocking and ordinary knob glide move it by a sub-sample amount per sample -- and a
+    // real `double`, not `float`: at Restock Speed's own 1% minimum this accumulates a +0.01
+    // sample/sample increment while itself sitting at a value up to ~2.88M (60s at 48kHz), and
+    // float32's mantissa can't represent that increment at that magnitude at all (its own ULP is
+    // already ~0.016 samples by 144K and ~0.25 by 2.88M) -- confirmed by a real test showing the
+    // buffer restocking at 1.5x its intended rate, silently, from rounding alone. double's far
+    // larger mantissa keeps the true increment exact across this whole range.
+    double current_delay_samples;
+    bool restocking; // true only while actively recovering from a dump -- see run_fx_broadcastdelay()'s own comment on why this needs a separate, much slower rate than ordinary knob glide
+    // Edge-detect memory for the three one-shot dump buttons (param[1..3]) -- same idiom as
+    // SeqLaneState.audio_preview_trigger: seeded to whatever the incoming param already reads the
+    // instant this state is allocated (first call after a type switch, or a project/state reload),
+    // so a nonzero trigger value loaded from a saved project can never fire a phantom dump the
+    // moment playback starts.
+    float last_dump7, last_dump15, last_dump30;
+    float dump_avail_sec; // = current_delay_samples / SAMPLE_RATE, read back by process_fx_chain() for the dump-availability meter, same convention as last_gr_db
+} FxBroadcastDelayState;
+
+static void run_fx_broadcastdelay(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxBroadcastDelayState *st = (FxBroadcastDelayState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxBroadcastDelayState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+        st->last_dump7 = params->param[1];
+        st->last_dump15 = params->param[2];
+        st->last_dump30 = params->param[3];
+    }
+
+    double nominal_delay_samples = (double)fmaxf(0.0f, fminf(1.0f, params->param[0])) * (double)(HDS_BCASTDLY_MAX_SEC * SAMPLE_RATE);
+
+    // Dump buttons: an edge (any change, not just an increase, so this is robust even if a wire
+    // value ever wraps) instantly removes that many seconds of buffered delay, clamped so a dump
+    // can never go negative -- pressing 30s Dump with only 10s actually buffered just empties it.
+    if (params->param[1] != st->last_dump7)  { st->current_delay_samples = fmax(0.0, st->current_delay_samples - 7.0  * (double)SAMPLE_RATE); st->last_dump7  = params->param[1]; st->restocking = true; }
+    if (params->param[2] != st->last_dump15) { st->current_delay_samples = fmax(0.0, st->current_delay_samples - 15.0 * (double)SAMPLE_RATE); st->last_dump15 = params->param[2]; st->restocking = true; }
+    if (params->param[3] != st->last_dump30) { st->current_delay_samples = fmax(0.0, st->current_delay_samples - 30.0 * (double)SAMPLE_RATE); st->last_dump30 = params->param[3]; st->restocking = true; }
+
+    // Auto-restock (mandatory -- see fx_types.h's own comment for the full derivation): while
+    // recovering from a dump, current_delay_samples grows back toward nominal at Restock Speed's
+    // own slow, deliberately near-inaudible rate (the read cursor briefly falls a hair behind the
+    // write cursor, i.e. output plays back fractionally SLOWER than real time -- the opposite of
+    // "faster", which would only pull the two cursors closer together and drain the buffer
+    // further). Ordinary knob glide (the Delay knob simply being turned, no dump involved) uses a
+    // much faster fixed rate instead -- still smoothed enough to avoid a click, but fast enough
+    // that turning the knob actually feels responsive. All of this math is done in double (see
+    // current_delay_samples' own comment) -- float32 cannot hold a sub-1-sample increment at the
+    // magnitudes this accumulator reaches.
+    double restock_frac = (double)fmaxf(0.0f, fminf(1.0f, params->param[4]));
+    double restock_rate = 0.01 + restock_frac * 0.24; // 1%..25% of a sample per sample -- i.e. output runs 1-25% slower than real-time while restocking
+    const double knob_glide_rate = 240.0; // samples of delay-time change per sample processed -- covers the full 60s range in 0.25s, plenty responsive for a manual knob drag
+    if (st->current_delay_samples < nominal_delay_samples - 0.5) {
+        st->current_delay_samples += st->restocking ? restock_rate : knob_glide_rate;
+        if (st->current_delay_samples >= nominal_delay_samples) { st->current_delay_samples = nominal_delay_samples; st->restocking = false; }
+    } else if (st->current_delay_samples > nominal_delay_samples + 0.5) {
+        st->restocking = false; // shrinking the gap is always a knob action (Delay turned down), never a dump recovery
+        st->current_delay_samples -= knob_glide_rate;
+        if (st->current_delay_samples < nominal_delay_samples) st->current_delay_samples = nominal_delay_samples;
+    } else {
+        st->restocking = false; // caught all the way up
+    }
+    if (st->current_delay_samples < 0.0) st->current_delay_samples = 0.0;
+    if (st->current_delay_samples > (double)(HDS_BCASTDLY_MAX_SAMPLES - 4)) st->current_delay_samples = (double)(HDS_BCASTDLY_MAX_SAMPLES - 4);
+    st->dump_avail_sec = (float)(st->current_delay_samples / (double)SAMPLE_RATE);
+
+    st->buf_l[st->write_pos] = *l;
+    st->buf_r[st->write_pos] = *r;
+
+    // Linearly-interpolated read (current_delay_samples is fractional whenever restocking or
+    // gliding) -- the interpolation itself is what makes both of those sound like a smooth, tape-
+    // style time change rather than a stepped/aliased one. The read POSITION is computed in
+    // double (see current_delay_samples' own comment); only the final interpolation weight
+    // (`frac`) is narrowed to float, which is fine -- that's a 0.0-1.0 crossfade weight applied to
+    // audio samples, not an accumulator, so float precision there is exactly as good as everywhere
+    // else audio math in this file already uses it.
+    double read_pos_f = (double)st->write_pos - st->current_delay_samples;
+    while (read_pos_f < 0.0) read_pos_f += (double)HDS_BCASTDLY_MAX_SAMPLES;
+    int read_i0 = (int)read_pos_f;
+    if (read_i0 >= HDS_BCASTDLY_MAX_SAMPLES) read_i0 -= HDS_BCASTDLY_MAX_SAMPLES;
+    int read_i1 = read_i0 + 1; if (read_i1 >= HDS_BCASTDLY_MAX_SAMPLES) read_i1 = 0;
+    float frac = (float)(read_pos_f - floor(read_pos_f));
+    *l = st->buf_l[read_i0] * (1.0f - frac) + st->buf_l[read_i1] * frac;
+    *r = st->buf_r[read_i0] * (1.0f - frac) + st->buf_r[read_i1] * frac;
+
+    st->write_pos++;
+    if (st->write_pos >= HDS_BCASTDLY_MAX_SAMPLES) st->write_pos = 0;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -4869,7 +4974,7 @@ static void sync_fx_engine_types(const FXSlotParams fx_params[FX_SLOT_COUNT], FX
 // in the shared pool, independent of fx_source/chain_to_next's own same-source array-position
 // adjacency. A slot whose OWN source hasn't run yet this sample simply still holds last sample's
 // value here -- the same frozen-snapshot tradeoff sc_snapshot_l/r above already accepts.
-static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, const float sc_snapshot_l[SOURCE_COUNT], const float sc_snapshot_r[SOURCE_COUNT], float *l, float *r, float gr_db_out[FX_SLOT_COUNT], float slot_out_l[FX_SLOT_COUNT], float slot_out_r[FX_SLOT_COUNT]) {
+static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, const float sc_snapshot_l[SOURCE_COUNT], const float sc_snapshot_r[SOURCE_COUNT], float *l, float *r, float gr_db_out[FX_SLOT_COUNT], float dump_avail_out[FX_SLOT_COUNT], float slot_out_l[FX_SLOT_COUNT], float slot_out_r[FX_SLOT_COUNT]) {
     // A NaN/Inf sample reaching a slot is never a valid audio value, but several ported effects'
     // own persistent state (e.g. run_fx_tapedelay2's sweepL/R, accumulated from squared input) has
     // no boundary check of its own -- once poisoned, a non-finite value can propagate into a
@@ -4929,6 +5034,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
             // parallel_branch_count == 0 -- the exact same, already-correct "no owned slots"
             // passthrough this function's own finalization below already handles.
             gr_db_out[s] = 0.0f;
+            dump_avail_out[s] = 0.0f;
             continue_branch = false;
             slot_out_l[s] = parallel_in_l; slot_out_r[s] = parallel_in_r; // still publish something sane for any OTHER slot's input_from_slot pointed at this one
             continue;
@@ -4952,6 +5058,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
 
         float out_l, out_r;
         gr_db_out[s] = 0.0f; // default: bypassed/off/non-GR-capable -- overwritten below for the 4 GR-capable types
+        dump_avail_out[s] = 0.0f; // default: not a broadcast-delay slot -- overwritten below for FX_TYPE_BROADCAST_DELAY
         if (fx_params[s].bypass != 0.0f || type == FX_TYPE_OFF) {
             out_l = dry_l; out_r = dry_r; // pass-through, dry
         } else {
@@ -5005,6 +5112,10 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                 case FX_TYPE_DBX160:
                     run_fx_dbx160(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
                     if (fx_engine[s].state) gr_db_out[s] = ((FxDbx160State *)fx_engine[s].state)->last_gr_db;
+                    break;
+                case FX_TYPE_BROADCAST_DELAY:
+                    run_fx_broadcastdelay(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
+                    if (fx_engine[s].state) dump_avail_out[s] = ((FxBroadcastDelayState *)fx_engine[s].state)->dump_avail_sec;
                     break;
                 case FX_TYPE_OFF:
                 default:

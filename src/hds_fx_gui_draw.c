@@ -71,7 +71,7 @@ static const int HDS_FX_SELECTABLE_TYPES[] = {
     FX_TYPE_STEREODOUBLER, FX_TYPE_TAPEDELAY2, FX_TYPE_POINTYGUITAR, FX_TYPE_GUITARCONDITIONER,
     FX_TYPE_CABS2, FX_TYPE_NAM, FX_TYPE_GATE, FX_TYPE_EQ3, FX_TYPE_LIMITER, FX_TYPE_FETCOMP,
     FX_TYPE_FAIRKID67, FX_TYPE_PEAKMAX, FX_TYPE_MULTIFILTER, FX_TYPE_OPTOCOMP, FX_TYPE_DEESSER,
-    FX_TYPE_HARDTUNE, FX_TYPE_FDNVERB, FX_TYPE_SSL4K, FX_TYPE_DBX160,
+    FX_TYPE_HARDTUNE, FX_TYPE_FDNVERB, FX_TYPE_SSL4K, FX_TYPE_DBX160, FX_TYPE_BROADCAST_DELAY,
 };
 #define HDS_FX_SELECTABLE_TYPE_COUNT (int)(sizeof(HDS_FX_SELECTABLE_TYPES) / sizeof(HDS_FX_SELECTABLE_TYPES[0]))
 
@@ -106,6 +106,7 @@ static const char *hds_fx_type_name(int fx_type) {
         case FX_TYPE_FDNVERB: return "FDNVerb";
         case FX_TYPE_SSL4K: return "SSL4K";
         case FX_TYPE_DBX160: return "DBX160";
+        case FX_TYPE_BROADCAST_DELAY: return "BcastDly";
         default: return "?";
     }
 }
@@ -118,7 +119,7 @@ static int hds_fx_type_param_count(int fx_type) {
         /* STEREODOUBLER */ 2, /* TAPEDELAY2 */ 7, /* POINTYGUITAR */ 10, /* GUITARCONDITIONER */ 0,
         /* CABS2 */ 2, /* NAM */ 3, /* GATE */ 6, /* EQ3 */ 7, /* LIMITER */ 3, /* FETCOMP */ 8,
         /* FAIRKID67 */ 8, /* PEAKMAX */ 7, /* MULTIFILTER */ 4, /* OPTOCOMP */ 5, /* DEESSER */ 6,
-        /* HARDTUNE */ 10, /* FDNVERB */ 10, /* SSL4K */ 11, /* DBX160 */ 5,
+        /* HARDTUNE */ 10, /* FDNVERB */ 10, /* SSL4K */ 11, /* DBX160 */ 5, /* BROADCAST_DELAY */ 5,
     };
     if (fx_type < 0 || fx_type >= (int)(sizeof(counts) / sizeof(counts[0]))) return 0;
     return counts[fx_type];
@@ -152,6 +153,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
     static const char *const fdnverb[] = {"Decay", "Size", "PreDly", "Damp", "Diffus", "ModRt", "ModDp", "ERLvl", "ERDcy", "Freeze"};
     static const char *const ssl4k[] = {"HPFrq", "LFFrq", "LFGan", "LMFrq", "LMGan", "LMQ", "HMFrq", "HMGan", "HFFrq", "HFGan", "E/G"};
     static const char *const dbx160[] = {"Thresh", "Ratio", "Makeup", "Sat", "SC-HP"};
+    static const char *const bcastdly[] = {"Delay", "Dump7s", "Dmp15s", "Dmp30s", "Rstock"};
 
     const char *const *table = NULL;
     int count = 0;
@@ -178,6 +180,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
         case FX_TYPE_FDNVERB: table = fdnverb; count = 10; break;
         case FX_TYPE_SSL4K: table = ssl4k; count = 11; break;
         case FX_TYPE_DBX160: table = dbx160; count = 5; break;
+        case FX_TYPE_BROADCAST_DELAY: table = bcastdly; count = 5; break;
         default: return "";
     }
     if (idx < 0 || idx >= count) return "";
@@ -247,6 +250,9 @@ static void hds_fx_fmt_hz_linear(float frac, float lo_hz, float hi_hz, char *buf
 }
 static void hds_fx_fmt_sec_log(float frac, float lo_s, float hi_s, char *buf, size_t n) {
     snprintf(buf, n, "%.2fs", lo_s * powf(hi_s / lo_s, frac));
+}
+static void hds_fx_fmt_sec_linear(float frac, float lo_s, float hi_s, char *buf, size_t n) {
+    snprintf(buf, n, "%.1fs", lo_s + frac * (hi_s - lo_s));
 }
 static void hds_fx_fmt_semitones(float frac, float lo, float hi, char *buf, size_t n) {
     snprintf(buf, n, "%.2fst", lo + frac * (hi - lo));
@@ -421,6 +427,10 @@ static void hds_fx_type_param_value_text(int fx_type, int idx, float frac, char 
             if (idx == 3) { hds_fx_fmt_percent(frac, buf, buflen); return; }
             if (idx == 4) { hds_fx_fmt_hz_linear(frac, 20.0f, 300.0f, buf, buflen); return; }
             break;
+        case FX_TYPE_BROADCAST_DELAY:
+            if (idx == 0) { hds_fx_fmt_sec_linear(frac, 0.0f, (float)HDS_BCASTDLY_MAX_SEC, buf, buflen); return; } // Delay
+            if (idx == 4) { hds_fx_fmt_plain(frac, 1.0f, 25.0f, "%", buf, buflen); return; } // Restock Speed
+            break; // idx 1-3 (the Dump buttons) are custom-drawn, never reach this function
         default: break;
     }
     hds_fx_fmt_percent(frac, buf, buflen);
@@ -453,6 +463,14 @@ static bool hds_fx_type_is_gr_capable(int fx_type) {
             return false;
     }
 }
+
+// Gates FX_TYPE_BROADCAST_DELAY's own special-cased row furniture: param columns 1-3 (the Dump
+// buttons) render as big red momentary buttons instead of knobs, and the GR-label column (unused
+// by this non-GR-capable type, so free real estate -- see HdsFxRowLayout's own gr_label comment)
+// is repurposed as a color-coded "available dump time" readout. Kept as its own named predicate,
+// same convention as hds_fx_type_is_gr_capable/hds_fx_type_uses_sidechain above, rather than
+// inlining the fx_type comparison at each of its several call sites.
+static bool hds_fx_type_is_broadcast_delay(int fx_type) { return fx_type == FX_TYPE_BROADCAST_DELAY; }
 
 // The part of a path after the last '/', or the whole path if there's no '/' -- for a compact
 // pill label; the full path still lives in FXSlotParams.nam_model_path/nam_ir_path and is what
@@ -915,6 +933,34 @@ typedef struct {
 #define HDS_FX_UPDOWN_W 18.0
 #define HDS_FX_GAP 8.0
 
+// FX_TYPE_BROADCAST_DELAY's three Dump buttons (param columns 1-3) reuse the same column x-centers
+// the generic knob loop would otherwise put a tiny knob at, but are drawn/hit-tested as a single
+// big rectangle spanning nearly the whole row height instead -- deliberately as loud/obvious as
+// this GUI's compact row layout allows, since a dump button is a "hit this NOW" control, not
+// something to be found by squinting at a 10px knob. One shared helper computes the rect so draw
+// and hit-test can never disagree, same discipline every other control in this file already holds
+// itself to. `knob_cx` is that column's own knob-center x (HdsFxRowLayout.param_knob[idx].x),
+// passed in rather than re-deriving the stride math here.
+static void hds_fx_bcastdly_dump_btn_rect(double knob_cx, double row_y, HdsFxRect *out) {
+    double w = HDS_FX_PARAM_STRIDE - 6.0;
+    *out = (HdsFxRect){knob_cx - w / 2.0, row_y + 6.0, w, HDS_FX_GUI_ROW_H - 12.0};
+}
+
+static void hds_fx_draw_dump_button(cairo_t *cr, const HdsFxRect *r, const char *line1, const char *line2) {
+    cairo_new_path(cr);
+    cairo_rectangle(cr, r->x, r->y, r->w, r->h);
+    hds_fx_rgb(cr, 0.72, 0.10, 0.10);
+    cairo_fill_preserve(cr);
+    hds_fx_rgb(cr, 0.97, 0.35, 0.32);
+    cairo_set_line_width(cr, 1.3);
+    cairo_stroke(cr);
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 9.5);
+    hds_fx_rgb(cr, 1.0, 1.0, 1.0);
+    hds_fx_centered_text(cr, r->x + r->w / 2.0, r->y + r->h / 2.0 - 1.0, line1);
+    hds_fx_centered_text(cr, r->x + r->w / 2.0, r->y + r->h / 2.0 + 12.0, line2);
+}
+
 static void hds_fx_gui_compute_row_layout(int width, double y, HdsFxRowLayout *out) {
     memset(out, 0, sizeof(*out));
     double x = HDS_FX_ROW_MARGIN;
@@ -1136,6 +1182,12 @@ static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
             // seed it to a typical hardware-gate value (~3dB) the moment a slot is switched to Gate,
             // matching what a real gate pedal/rack unit ships with rather than a chattery 0dB default.
             if (new_type == FX_TYPE_GATE) p->fx[row].param[4] = 0.25f;
+            // FX_TYPE_BROADCAST_DELAY's Delay (param[0]) has no useful "off" reading at 0s either --
+            // seed it to a real, usable 30s (half of the 0-60s range) so all three dump buttons have
+            // something to work with the moment this slot is switched on, and seed Restock Speed
+            // (param[4]) to a moderate, clearly-audible-if-you-listen-for-it default rather than its
+            // own honest-but-glacial 1% minimum.
+            if (new_type == FX_TYPE_BROADCAST_DELAY) { p->fx[row].param[0] = 0.5f; p->fx[row].param[4] = 0.4f; }
             return;
         }
         case HDS_FX_DROPDOWN_INPUT: {
@@ -1627,6 +1679,15 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         }
 
         for (int i = 0; i < param_count; i++) {
+            // FX_TYPE_BROADCAST_DELAY's Dump 7s/15s/30s (param columns 1-3): a big red momentary
+            // button, not a knob -- see hds_fx_draw_dump_button()'s own comment.
+            if (hds_fx_type_is_broadcast_delay(fx_type) && (i == 1 || i == 2 || i == 3)) {
+                HdsFxRect btn;
+                hds_fx_bcastdly_dump_btn_rect(L.param_knob[i].x, y, &btn);
+                const char *line2 = (i == 1) ? "7s" : (i == 2) ? "15s" : "30s";
+                hds_fx_draw_dump_button(cr, &btn, "DUMP", line2);
+                continue;
+            }
             // Normalize against this param's own real STORAGE range (see
             // hds_fx_type_param_range()'s own comment -- every param is 0.0-1.0 except
             // FX_TYPE_MULTIFILTER's Reso, which is 0-100) before either drawing the knob's arc or
@@ -1715,6 +1776,37 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
             cairo_set_font_size(cr, 10);
             hds_fx_rgb(cr, 0.71, 0.54, 0.0);
             hds_fx_centered_text(cr, L.gr_label.x + L.gr_label.w / 2, L.gr_label.y + L.gr_label.h - 3, gr_buf);
+        }
+
+        // FX_TYPE_BROADCAST_DELAY's own "available dump time" readout -- reuses the same gr_label
+        // rect the GR meter above uses (this type isn't GR-capable, so that column is otherwise
+        // blank on this row, same "always-present rect, only sometimes meaningful" reuse pattern
+        // NAM's Model/IR pills already established for unused knob columns). Color runs green (the
+        // buffer is at or near its full nominal Delay -- every dump button is safe to press) down
+        // through amber to red (recently dumped and still restocking -- see fx_chain.c's own
+        // run_fx_broadcastdelay() comment) as the fraction of nominal actually buffered right now
+        // drops, giving an at-a-glance answer to "is it safe to hit dump again yet" without having
+        // to read the number at all.
+        if (p->fx_dump_avail_sec && hds_fx_type_is_broadcast_delay(fx_type)) {
+            float nominal_sec = fmaxf(0.0f, fminf(1.0f, slot->param[0])) * (float)HDS_BCASTDLY_MAX_SEC;
+            float avail_sec = p->fx_dump_avail_sec[s];
+            float full_frac = (nominal_sec > 0.01f) ? fminf(1.0f, avail_sec / nominal_sec) : 1.0f;
+            cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+            cairo_set_font_size(cr, 8);
+            hds_fx_rgb(cr, 0.45, 0.45, 0.48);
+            hds_fx_centered_text(cr, L.gr_label.x + L.gr_label.w / 2, L.gr_label.y + 8, "AVAIL");
+            char avail_buf[16];
+            snprintf(avail_buf, sizeof(avail_buf), "%.1fs", (double)avail_sec);
+            // Red (depleted) -> amber -> green (full), a plain two-segment lerp through amber at
+            // the midpoint -- simple, and the exact hue barely matters once the two clear endpoints
+            // (full = green = safe, empty = red = still restocking) read correctly at a glance.
+            double rr, gg, bb;
+            if (full_frac < 0.5f) { double t = (double)full_frac / 0.5; rr = 0.85; gg = 0.25 + t * (0.55 - 0.25); bb = 0.15; }
+            else { double t = ((double)full_frac - 0.5) / 0.5; rr = 0.85 - t * (0.85 - 0.15); gg = 0.55 + t * (0.80 - 0.55); bb = 0.15 + t * (0.20 - 0.15); }
+            cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+            cairo_set_font_size(cr, 10);
+            hds_fx_rgb(cr, rr, gg, bb);
+            hds_fx_centered_text(cr, L.gr_label.x + L.gr_label.w / 2, L.gr_label.y + L.gr_label.h - 3, avail_buf);
         }
 
         bool bypassed = slot->bypass != 0.0f;
@@ -1875,8 +1967,18 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
     if (hds_fx_rect_contains(&L.down_btn, x, y)) { if (button == 1 && !hds_fx_slot_participates_in_chain(p, row)) hds_fx_swap_slots(p, row, row + 1); return true; }
 
     if (button == 1) {
-        int param_count = hds_fx_type_param_count((int)p->fx[row].fx_type);
+        int row_type = (int)p->fx[row].fx_type;
+        int param_count = hds_fx_type_param_count(row_type);
         for (int i = 0; i < param_count; i++) {
+            // FX_TYPE_BROADCAST_DELAY's Dump 7s/15s/30s buttons: a plain click-to-fire, same
+            // one-shot-counter idiom as SeqLaneState.audio_preview_trigger (see fx_types.h's own
+            // comment on param[1..3]) -- increments the param, never starts a knob drag.
+            if (hds_fx_type_is_broadcast_delay(row_type) && (i == 1 || i == 2 || i == 3)) {
+                HdsFxRect btn;
+                hds_fx_bcastdly_dump_btn_rect(L.param_knob[i].x, row_y, &btn);
+                if (hds_fx_rect_contains(&btn, x, y)) { p->fx[row].param[i] += 1.0f; return true; }
+                continue;
+            }
             if (hds_fx_knob_contains(&L.param_knob[i], x, y)) {
                 vs->drag_kind = 2; vs->drag_row = row; vs->drag_param_index = i;
                 vs->drag_start_y = y; vs->drag_start_value = p->fx[row].param[i];

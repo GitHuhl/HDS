@@ -44,6 +44,11 @@ typedef struct {
     // but the same defensive NULL-check convention as source_count/port_input_stereo etc. applies).
     float *fx_gr_db;
 
+    // Same convention as fx_gr_db just above, for FX_TYPE_BROADCAST_DELAY's own per-slot dump-
+    // availability meter: each slot's currently-buffered delay, in seconds (0 for every other
+    // type). See process_fx_chain()'s own dump_avail_out out-param in fx_chain.c.
+    float *fx_dump_avail_sec;
+
     // A Source-combo host's (source_count > 0) own equivalent of a port-model host's Output picker
     // (port_output_channel above): a port-model host already has one CLAP port per port index, so
     // "where does this port's FX result go" is a single index into that same port space -- but a

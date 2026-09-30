@@ -168,7 +168,18 @@ Up to 32 shared slots, each independently routable, each settable to any of:
   see `FX_TYPE_SSL4K`'s own comment in `src/fx_types.h`).
 - **Time-based**: Ensemble (fixed-delay chorus), CreamCoat (FDN reverb),
   FDNVerb (algorithmic reverb), StereoChorus, StereoDoubler (micro-pitch
-  detune), TapeDelay2 (tape echo, with optional stereo ping-pong).
+  detune), TapeDelay2 (tape echo, with optional stereo ping-pong),
+  BroadcastDelay (an on-air "profanity delay"/dump buffer: a plain
+  continuously-running delay line, 0-60s, with three fixed Dump buttons
+  (7s/15s/30s) that instantly skip that much buffered audio before it
+  reaches the output — the classic broadcast-engineering safety-delay
+  workflow. Auto-restocks after a dump with no manual step: the buffer
+  regrows back to the nominal Delay setting on its own by playing back a
+  hair slower than real time for a while — a Restock Speed knob controls
+  how aggressively (and how audibly) that catch-up happens. A color-coded
+  readout (green = fully buffered/safe to dump again, red = still
+  restocking) shows exactly how much dump time is currently available; see
+  `FX_TYPE_BROADCAST_DELAY`'s own comment in `src/fx_types.h`).
 - **NAM**: Neural Amp Modeler — loads a trained `.nam` amp model plus an
   optional cabinet impulse response.
 

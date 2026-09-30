@@ -586,6 +586,35 @@ static inline float run_eq_biquad(float input, const EqBiquadCoeffs *c, float *z
 // stage only has to reject the ONE nearest set of spectral images, so the two 2nd-order sections
 // together give a steeper effective stopband than a single 2nd-order section would front-load all
 // of that rejection onto by itself.
+// An on-air "profanity delay"/broadcast-delay dump buffer: audio continuously runs through a
+// circular delay line (up to 60s), with three fixed "dump" buttons that instantly skip the
+// delay's own read pointer forward (discarding that much buffered audio) the moment something
+// needs to be cut before it reaches air -- the classic radio/TV delay-box workflow. Not ported
+// from any specific hardware/plugin -- an original implementation of that well-known, generic
+// broadcast-engineering technique.
+//
+// Auto-restocking (mandatory -- see run_fx_broadcastdelay()'s own comment for the derivation):
+// after a dump (or after the Delay knob itself is simply turned UP), the buffered delay sits
+// below the nominal Delay setting. Rather than leaving it there permanently (which would mean
+// every dump ratchets the safety margin down for good) or requiring a manual "recover" step, the
+// read pointer is made to advance very slightly SLOWER than the write pointer -- real time keeps
+// flowing in at a normal 1x rate, but played-back output falls behind it by a hair, so the GAP
+// between them (which is exactly what "the delay" means) grows back on its own, with no user
+// action needed. This is the same restocking trick real on-air delay units use, and it's the
+// opposite of "playing faster": speeding up the read side would only drain the buffer further,
+// since it would pull the read pointer even closer to the write pointer. A separate, much faster
+// glide handles ordinary Delay-knob changes (both up and down) so turning the knob feels
+// responsive; only a post-dump shortfall uses the slow, deliberately-inaudible restock rate.
+//
+// param[0] Delay (0-60s, nominal/target delay -- how far behind live the output normally sits),
+// param[1] Dump 7s, param[2] Dump 15s, param[3] Dump 30s (each an edge-triggered one-shot
+// counter, same idiom as SeqLaneState.audio_preview_trigger -- the GUI increments it by 1 on
+// every click; run_fx_broadcastdelay() detects the change and instantly drops that much delay,
+// clamped so a dump can never take the buffer below 0), param[4] Restock Speed (0..1 -- how
+// aggressively, and therefore how audible, the post-dump catch-up slowdown is; higher restocks
+// faster at the cost of a more noticeable brief pitch/time wobble on whatever's playing while it
+// catches up).
+#define FX_TYPE_BROADCAST_DELAY 24
 #define FX_SLOT_PARAM_COUNT 11
 typedef struct {
     float fx_type;

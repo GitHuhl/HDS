@@ -115,6 +115,12 @@ typedef struct {
     // frontend.py's own fx_gr_labels.
     float fx_gr_db[FX_SLOT_COUNT];
 
+    // Same convention as fx_gr_db just above, for FX_TYPE_BROADCAST_DELAY's own per-slot dump-
+    // availability meter: render_audio_block's own dump_avail_out out-param writes directly into
+    // this persistent array (0 for every slot not currently running that type), handed to
+    // hds_fx_gui_draw.c via gui_host.fx_dump_avail_sec.
+    float fx_dump_avail_sec[FX_SLOT_COUNT];
+
     // CLAP params extension (see HDS_CLAP_PARAMS/hds_clap_push_changed_params further down) --
     // one shadow value per exposed param, used purely to detect an OSC/GUI-driven change so it
     // can be echoed to the host as an output event. Sized/initialized once the table itself is
