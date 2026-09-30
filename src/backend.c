@@ -9486,6 +9486,11 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             float mod_vco1_pulse_width = 0.0f, mod_vco2_pulse_width = 0.0f;
             float mod_vco3_amp = 0.0f, mod_vco3_pan = 0.0f, mod_vco3_tilt = 0.0f;
             float mod_vco4_amp = 0.0f, mod_vco4_pan = 0.0f, mod_vco4_tilt = 0.0f;
+            // Curve/Drive as a mod destination (targets 10-13, one per oscillator -- reclaimed from
+            // the retired 8-13 placeholder range, see hds_lfo_dest_label()'s own comment in
+            // hds_clap_play_draw.c). Applied directly (curve_drive is already -1..1, same convention
+            // Pan already uses above) at the curve_drive_arr construction below, clamped there.
+            float mod_vco1_curve = 0.0f, mod_vco2_curve = 0.0f, mod_vco3_curve = 0.0f, mod_vco4_curve = 0.0f;
 
             for (int l = 0; l < LFO_COUNT; l++) {
                 int target = (int)prog->lfo[l].dest_target;
@@ -9519,6 +9524,17 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                     case 5: mod_vco2_pitch += val * 100.0f; break;
                     case 6: mod_vco1_amp += val; break;
                     case 7: mod_vco2_amp += val; break;
+                    // Osc 3/4 Fine (reclaimed from the retired 8/9 placeholders) -- same smaller-
+                    // range pitch-mod convention as targets 4/5 above, just for the two oscillators
+                    // that never had an equivalent until now.
+                    case 8: mod_vco3_pitch += val * 100.0f; break;
+                    case 9: mod_vco4_pitch += val * 100.0f; break;
+                    // Osc 1-4 Curve/Drive (reclaimed from the retired 10-13 placeholders) -- see
+                    // mod_vco1_curve's own declaration comment above.
+                    case 10: mod_vco1_curve += val; break;
+                    case 11: mod_vco2_curve += val; break;
+                    case 12: mod_vco3_curve += val; break;
+                    case 13: mod_vco4_curve += val; break;
                     // FIXED: this used to check target 20/21 (which are actually "LFO 3/4 Depth"
                     // in the GUI's destination list), so FM Depth and Mix Balance (the real 22/23)
                     // could never be reached as destinations, while picking "LFO 3/4 Depth"
@@ -9580,6 +9596,12 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
                     case 5: mod_vco2_pitch += val * 100.0f; break;
                     case 6: mod_vco1_amp += val; break;
                     case 7: mod_vco2_amp += val; break;
+                    case 8: mod_vco3_pitch += val * 100.0f; break;
+                    case 9: mod_vco4_pitch += val * 100.0f; break;
+                    case 10: mod_vco1_curve += val; break;
+                    case 11: mod_vco2_curve += val; break;
+                    case 12: mod_vco3_curve += val; break;
+                    case 13: mod_vco4_curve += val; break;
                     case 22: fm_mod += val; break;
                     case 23: mix_bal += val; break;
                     case 24: mod_vco1_phase += val; break;
@@ -9772,7 +9794,15 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             float dt_arr[4] = { dt1, dt2, dt3, dt4 };
             float phase_offset_arr[4] = { phase_offset1, phase_offset2, phase_offset3, phase_offset4 };
             float pulse_or_tilt_arr[4] = { vco1_pulse_width_final, vco2_pulse_width_final, vco3_pulse_width_final, vco4_pulse_width_final };
-            float curve_drive_arr[4] = { prog->vco1_curve_drive, prog->vco2_curve_drive, prog->vco3_curve_drive, prog->vco4_curve_drive };
+            // Curve/Drive mod (targets 10-13, mod_vco1_curve etc. -- see that declaration's own
+            // comment) sums directly onto the base knob value, clamped to curve_drive's own real
+            // -1..1 storage range, same convention Pan already uses just below.
+            float curve_drive_arr[4] = {
+                fmaxf(-1.0f, fminf(1.0f, prog->vco1_curve_drive + mod_vco1_curve)),
+                fmaxf(-1.0f, fminf(1.0f, prog->vco2_curve_drive + mod_vco2_curve)),
+                fmaxf(-1.0f, fminf(1.0f, prog->vco3_curve_drive + mod_vco3_curve)),
+                fmaxf(-1.0f, fminf(1.0f, prog->vco4_curve_drive + mod_vco4_curve)),
+            };
             float unison_detune_arr[4] = { vco1_unison_detune_final, vco2_unison_detune_final, vco3_unison_detune_final, vco4_unison_detune_final };
             float hz_arr[4] = { hz1, hz2, hz3, hz4 };
             bool do_sync_arr[4] = { false, do_sync2, do_sync3, do_sync4 };

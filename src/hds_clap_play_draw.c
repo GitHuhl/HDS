@@ -251,14 +251,17 @@ static int hds_ctxmenu_hit_row(const HdsCtxMenu *m, const HdsCtxMenuRow *rows, i
 // EARLIER-included file, rather than in hds_clap_lfos_draw.c where it used to live, purely because
 // of the fixed single-TU #include order (see clap_plugin.c/hds_standalone.c): this file's own
 // "Modulate From" builder needs it, and can't reach forward into a later-included file. Indices
-// 8-13 and 84-89 are retired placeholders from a pre-simplification design (kept only so a target ID
-// already saved in an old patch still resolves to SOME row of this same list) -- shown as "--" and,
-// since nothing meaningful would happen selecting them, simply not offered for selection.
+// 84-89 are retired placeholders from a pre-simplification design (kept only so a target ID already
+// saved in an old patch still resolves to SOME row of this same list) -- shown as "--" and, since
+// nothing meaningful would happen selecting them, simply not offered for selection. Indices 8-13
+// used to be retired the exact same way but were reclaimed for Osc 3/4 Fine and Osc 1-4 Curve (see
+// HDS_PLAY_FINE_DEST_TARGET/HDS_PLAY_CURVE_DEST_TARGET's own comment) -- precisely the kind of reuse
+// this "keep the number reserved, never delete it" convention exists to make safe.
 #define HDS_LFO_DEST_COUNT 100
 static void hds_lfo_dest_label(int target, char *buf, size_t buflen) {
     static const char *const fixed[48] = {
         "None", "Osc 1 Pitch", "Osc 2 Pitch", "Osc 1+2 Pitch", "O1 Fine", "O2 Fine", "Osc 1 Amp", "Osc 2 Amp",
-        "--", "--", "--", "--", "--", "--", // 8-13: retired
+        "O3 Fine", "O4 Fine", "Osc 1 Curve", "Osc 2 Curve", "Osc 3 Curve", "Osc 4 Curve", // 8-13: reclaimed from "retired"
         "LFO 1 Rate", "LFO 2 Rate", "LFO 3 Rate", "LFO 4 Rate",
         "LFO 1 Dp", "LFO 2 Dp", "LFO 3 Dp", "LFO 4 Dp",
         "FM Depth", "Mix Balance",
@@ -298,9 +301,10 @@ static int hds_lfo_phase_dest_target(int idx) { return idx < 4 ? 28 + idx : 68 +
 // Phase), with a section header before each group, rather than frontend.py's own flat ascending
 // target-number order (0, 1, 2, 3, ... 99) -- pure display reorganization: the STORED value
 // (dest_target / eg_dest_target) is still the exact same target number hds_lfo_dest_label() above
-// already returns a label for, so an existing saved patch resolves identically either way. The 12
-// retired placeholder targets (8-13, 84-89 -- shown as "--" and never selectable) are dropped from
-// this list entirely instead of appearing as blank, unlabeled rows. Shared by the LFOs tab's own
+// already returns a label for, so an existing saved patch resolves identically either way. The 6
+// still-retired placeholder targets (84-89 -- shown as "--" and never selectable) are dropped from
+// this list entirely instead of appearing as blank, unlabeled rows (8-13 no longer belong to this
+// set -- see hds_lfo_dest_label()'s own comment on why they were reclaimed). Shared by the LFOs tab's own
 // Destination pill and the Envelopes tab's own assignable-EG Destination pill (hds_dest_list_render/
 // hds_dest_list_hit_test below) -- rebuilt fresh on every render/hit-test call, same "cheap, always
 // consistent, never a stale cache" convention every other dropdown in this GUI already uses.
@@ -330,8 +334,12 @@ static void hds_dest_list_build(HdsDestListRow *rows, int *count) {
     for (size_t i = 0; i < sizeof(pitch) / sizeof(pitch[0]); i++) hds_dest_list_add(rows, count, false, pitch[i], NULL);
 
     hds_dest_list_add(rows, count, true, -1, "Oscillator Fine / Detune");
-    static const int fine[] = {4, 5, 26, 27, 45, 46};
+    static const int fine[] = {4, 5, 8, 9, 26, 27, 45, 46};
     for (size_t i = 0; i < sizeof(fine) / sizeof(fine[0]); i++) hds_dest_list_add(rows, count, false, fine[i], NULL);
+
+    hds_dest_list_add(rows, count, true, -1, "Oscillator Curve / Drive");
+    static const int curve[] = {10, 11, 12, 13};
+    for (size_t i = 0; i < sizeof(curve) / sizeof(curve[0]); i++) hds_dest_list_add(rows, count, false, curve[i], NULL);
 
     hds_dest_list_add(rows, count, true, -1, "Oscillator Phase");
     static const int phase[] = {24, 25, 43, 44};
@@ -1286,6 +1294,21 @@ static void hds_clap_play_render(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewS
 static const int HDS_PLAY_PITCH_DEST_TARGET[4] = {1, 2, 41, 42};
 static const int HDS_PLAY_PHASE_DEST_TARGET[4] = {24, 25, 43, 44};
 static const int HDS_PLAY_PULSE_DEST_TARGET[4] = {34, 35, 38, 47};
+// Fine Tune/Curve/Volume/Pan's own "Modulate From" targets, same convention. Volume and Pan reuse
+// targets that already existed (Osc 1/2's own Amp/Pan slots from the original layout, Osc 3/4's own
+// later-appended ones) -- only the right-click menu itself is new, nothing to wire in backend.c.
+// Fine Tune reuses the existing smaller-range pitch-mod targets for Osc 1/2 (4, 5); Osc 3/4 never
+// had an equivalent, so 8/9 (two of the twelve retired 8-13/84-89 placeholder numbers -- see
+// hds_lfo_dest_label()'s own comment on why those exist to be reclaimed like this) now cover them.
+// Curve/Drive had no destination at all for any oscillator until now -- 10-13 (the remaining four
+// retired 8-13 slots) are newly assigned, one per oscillator. See render_audio_block()'s own LFO/EG
+// mod-application switch in backend.c (both copies -- LFOs and assignable EGs each dispatch
+// separately) for where 8-13 actually get consumed, and hds_dest_list_build()'s own comment for
+// where they became selectable in the shared Destination dropdown too.
+static const int HDS_PLAY_FINE_DEST_TARGET[4] = {4, 5, 8, 9};
+static const int HDS_PLAY_CURVE_DEST_TARGET[4] = {10, 11, 12, 13};
+static const int HDS_PLAY_VOL_DEST_TARGET[4] = {6, 7, 36, 39};
+static const int HDS_PLAY_PAN_DEST_TARGET[4] = {32, 33, 37, 40};
 
 // "1->All"/"Sync": one-shot and live copy of Amp EG 0 (Osc1)'s full state onto Amp EGs 1-3 --
 // mirrors frontend.py's own _copy_amp_eg_to_all()/_mirror_amp_eg_live() exactly (topology mode +
@@ -1363,16 +1386,20 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
         HdsPlayKnobMenu pulse_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, HDS_PLAY_PULSE_DEST_TARGET[osc]};
         HdsPlayKnobMenu phase_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, HDS_PLAY_PHASE_DEST_TARGET[osc]};
         HdsPlayKnobMenu pitch_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, HDS_PLAY_PITCH_DEST_TARGET[osc]};
+        HdsPlayKnobMenu fine_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, HDS_PLAY_FINE_DEST_TARGET[osc]};
+        HdsPlayKnobMenu curve_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, HDS_PLAY_CURVE_DEST_TARGET[osc]};
+        HdsPlayKnobMenu vol_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, HDS_PLAY_VOL_DEST_TARGET[osc]};
+        HdsPlayKnobMenu pan_menu = {HDS_CTXMENU_KIND_MODULATE_FROM, HDS_PLAY_PAN_DEST_TARGET[osc]};
         if (hds_play_try_osc_knob_click(vs, &L.pulse_knob, f.pulse_width, HDS_PLAY_KNOB_PULSE, shape, x, y, button, pulse_menu)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.curve_knob, f.curve_drive, HDS_PLAY_KNOB_CURVE, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.curve_knob, f.curve_drive, HDS_PLAY_KNOB_CURVE, shape, x, y, button, curve_menu)) return true;
         if (hds_play_try_osc_knob_click(vs, &L.pitch_off_knob, f.pitch_offset, HDS_PLAY_KNOB_PITCH_OFFSET, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.fine_knob, f.fine_tune, HDS_PLAY_KNOB_FINE, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.fine_knob, f.fine_tune, HDS_PLAY_KNOB_FINE, shape, x, y, button, fine_menu)) return true;
         if (hds_play_try_osc_knob_click(vs, &L.phase_knob, f.phase_offset, HDS_PLAY_KNOB_PHASE, shape, x, y, button, phase_menu)) return true;
         if (hds_play_try_osc_knob_click(vs, &L.pitch_knob, f.pitch, HDS_PLAY_KNOB_PITCH, shape, x, y, button, pitch_menu)) return true;
         if (hds_play_try_osc_knob_click(vs, &L.uni_width_knob, f.unison_width, HDS_PLAY_KNOB_UNI_WIDTH, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
         if (hds_play_try_osc_knob_click(vs, &L.uni_detune_knob, f.unison_detune, HDS_PLAY_KNOB_UNI_DETUNE, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.vol_knob, f.vol, HDS_PLAY_KNOB_VOL, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
-        if (hds_play_try_osc_knob_click(vs, &L.pan_knob, f.pan, HDS_PLAY_KNOB_PAN, shape, x, y, button, HDS_PLAY_NO_MENU)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.vol_knob, f.vol, HDS_PLAY_KNOB_VOL, shape, x, y, button, vol_menu)) return true;
+        if (hds_play_try_osc_knob_click(vs, &L.pan_knob, f.pan, HDS_PLAY_KNOB_PAN, shape, x, y, button, pan_menu)) return true;
     }
 
     double eg_top_y = hds_play_eg_top_y(prog);

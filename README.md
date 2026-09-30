@@ -231,11 +231,17 @@ project like any other parameter).
 
 Knobs: click-drag for a normal-sensitivity adjustment, double-click to
 reset to 0, right-click-drag for a 10x finer adjustment. A knob that also
-modulates something else (oscillator Pitch/Phase/Pulse-Width, Filter
-Cutoff/Resonance, LFO Rate/Depth/Phase) opens a "Modulate From" menu on a
-right-click that doesn't drag, letting any LFO or assignable EG target it
-directly — the same field its own Destination dropdown already sets, just
-a second way to reach it.
+modulates something else (oscillator Pitch/Phase/Pulse-Width/Fine
+Tune/Curve-Drive/Volume/Pan, Filter Cutoff/Resonance, LFO Rate/Depth/Phase)
+opens a "Modulate From" menu on a right-click that doesn't drag, letting
+any LFO or assignable EG target it directly — the same field its own
+Destination dropdown already sets, just a second way to reach it. Fine
+Tune and Curve/Drive are real modulation destinations in their own right
+(targets 4/5/8/9 and 10-13 in the shared destination numbering) — Osc 3/4
+Fine and all four oscillators' Curve/Drive didn't have one before and
+reclaim numbers from the destination scheme's retired-placeholder range
+(8-13; 84-89 are still retired) to add them without disturbing any other
+target's meaning.
 
 FX tab Output pill (standalone only): `hds_fx.clap`'s own 8-port model
 always had a per-chain Output picker right in its FX tab, since a port IS
