@@ -8877,6 +8877,7 @@ static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, Hds
             bool now_held = (knobs->programs[SINGLE_PROGRAM_SLOT].sustain_pedal_polarity != 0.0f) ? !raw_held : raw_held;
             if (midi_live->sustain_held && !now_held) handle_sustain_release(se, voices, knobs); // pedal just lifted
             midi_live->sustain_held = now_held;
+            g_bcastdly_sustain_held = now_held; // feeds On-Air Override MIDI Trigger mode -- see its own comment in fx_chain.c
         }
     } else if (type == HDS_MIDI_PITCH_BEND) {
         midi_live->pitch_bend = fmaxf(-1.0f, fminf(1.0f, value / 8192.0f));

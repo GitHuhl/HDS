@@ -629,11 +629,12 @@ static inline float run_eq_biquad(float input, const EqBiquadCoeffs *c, float *z
 // param[8]/MIDI say, AND the GUI button grays out and stops responding to mouse clicks entirely,
 // same visual convention as the Dump buttons at Delay=0 -- the only thing in this whole param map
 // that can take the button's own clickability away. param[8] On-Air Override MIDI Trigger Enabled
-// (plain 0/1): when true, ANY MIDI note currently held anywhere in this engine ALSO engages the
-// gate, via the engine-wide g_bcastdly_notes_held counter fx_chain.c's own dispatch_midi_event()
-// call site maintains (see that counter's own comment) -- purely additive, never a replacement for
-// the mouse: a MIDI foot switch or pad can trigger the same override the GUI button's own
-// mouse-hold does, at the same time, with neither one blocking the other. Both param[7] and
+// (plain 0/1): when true, ANY MIDI note currently held anywhere in this engine, OR the sustain
+// pedal (CC64) currently held, ALSO engages the gate -- via the engine-wide g_bcastdly_notes_held/
+// g_bcastdly_sustain_held state fx_chain.c's own dispatch_midi_event() call site maintains (see
+// each one's own comment) -- purely additive, never a replacement for the mouse: a MIDI foot
+// switch, pad, or a sustain pedal can trigger the same override the GUI button's own mouse-hold
+// does, at the same time, with none of them blocking each other. Both param[7] and
 // param[8] are set via a right-click menu on the button itself (two independent checkable toggles,
 // not a mutually-exclusive mode picker -- there's no separate "Normal" state to pick, since the
 // mouse simply always works unless param[7] says otherwise), not a knob -- see

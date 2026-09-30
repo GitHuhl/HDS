@@ -4780,6 +4780,16 @@ static void run_fx_fdnverb(FXSlotEngine *engine, const FXSlotParams *params, flo
 // On-Air Override plumbing hds_fx_plugin.c already documents needing no MIDI at all.
 static int g_bcastdly_notes_held = 0;
 
+// Same idea as g_bcastdly_notes_held just above, but for the sustain pedal (CC64) instead of note
+// events -- set directly from dispatch_midi_event()'s own CC64 handling in backend.c, right
+// alongside midi_live->sustain_held, using that same polarity-corrected "currently held" boolean
+// (not the raw CC value), so param[7]'s Inverted polarity setting is honored here too. On-Air
+// Override MIDI Trigger mode (param[8]) engages the tone whenever EITHER this or
+// g_bcastdly_notes_held is true -- a foot switch wired to CC64 (sustain) is just as valid a
+// hands-free trigger source as a held key, and the two are purely additive, same as every other
+// pair of gates this effect already combines.
+static bool g_bcastdly_sustain_held = false;
+
 // --- FX_TYPE_BROADCAST_DELAY: an original implementation of the on-air "profanity delay"/dump
 // buffer -- see this effect's own FX_TYPE_BROADCAST_DELAY comment in fx_types.h for the full
 // param map and the restocking design's overall rationale. Buffer sized for the full 60s max
@@ -4892,13 +4902,14 @@ static void run_fx_broadcastdelay(FXSlotEngine *engine, const FXSlotParams *para
     // instant the gate goes back to false the delayed program audio picks back up exactly where it
     // already was, with nothing lost or skipped -- true whichever of the three param[7] modes below
     // is actually driving that gate.
-    // param[5] (mouse hold) and param[8] (MIDI Trigger Enabled, gating the engine-wide "is any note
-    // held" counter -- see this file's own g_bcastdly_notes_held comment) are independent, additive
-    // gates -- either one alone is enough to engage the tone, and enabling MIDI Trigger never takes
-    // the mouse away. param[7] Disabled overrides both: when true the gate is forced false no matter
-    // what either of them say. See fx_types.h's own param[5]/param[7]/param[8] comments.
+    // param[5] (mouse hold) and param[8] (MIDI Trigger Enabled, gating "is any note held" OR "is the
+    // sustain pedal held" -- see g_bcastdly_notes_held/g_bcastdly_sustain_held's own comments) are
+    // independent, additive gates -- either one alone is enough to engage the tone, and enabling
+    // MIDI Trigger never takes the mouse away. param[7] Disabled overrides both: when true the gate
+    // is forced false no matter what either of them say. See fx_types.h's own param[5]/param[7]/
+    // param[8] comments.
     bool tone_active = (params->param[7] != 0.0f) ? false
-        : (params->param[5] != 0.0f) || (params->param[8] != 0.0f && g_bcastdly_notes_held > 0);
+        : (params->param[5] != 0.0f) || (params->param[8] != 0.0f && (g_bcastdly_notes_held > 0 || g_bcastdly_sustain_held));
     if (tone_active) {
         if (!st->tone_active_prev) st->tone_phase = 0.0f; // clean zero-crossing start each press, not an arbitrary leftover phase
         float vol = fmaxf(0.0f, fminf(1.0f, params->param[6])); // param[6] Volume -- see fx_types.h's own comment
