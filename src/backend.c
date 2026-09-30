@@ -809,17 +809,22 @@ typedef struct {
     float vco4_mono_noise;
 
     // Velocity -> Amp, per oscillator (-100..100, bipolar -- same convention as PackLfoParams'
-    // own vel_track knob). 0 (default) means a note's velocity has zero effect on this
-    // oscillator's output level, reproducing today's exact velocity-insensitive behavior; positive
-    // makes harder hits louder, negative makes harder hits quieter. Deliberately per-oscillator
-    // rather than one global depth: since all 4 oscillators already read the SAME note's velocity
-    // (MIDI gives one velocity per note-on, not per-oscillator), independent depths let a patch
-    // velocity-crossfade BETWEEN oscillator layers -- e.g. a sub layer staying constant while a
-    // brighter overtone layer fades in on harder hits -- not just scale the whole voice uniformly.
-    // Applied as a per-voice gain multiplier alongside each oscillator's own Amp EG in
-    // render_audio_block (see the vel_mult computation there), not as a mod-matrix destination --
-    // velocity is a one-shot value captured at note-on (voice->midi_velocity), not a continuously-
-    // varying signal like an LFO/EG, so it doesn't fit that per-sample-modulated system.
+    // own vel_track knob). 0 (default) means every velocity plays at this oscillator's full,
+    // undiminished output level (as if velocity were always 127) -- a note's OWN velocity has zero
+    // effect. Increasing the knob toward +100 progressively pulls the BOTTOM of the dynamic range
+    // down (velocity 127 always stays at that same full level regardless of depth; only softer
+    // hits get quieter, down to silence at velocity 0 and depth 100 -- an ordinary linear velocity
+    // curve). Negative depth mirrors this around the OTHER end instead: velocity 0 always stays at
+    // full level, and it's now the hardest hits that get pulled down toward silence as depth
+    // approaches -100. Deliberately per-oscillator rather than one global depth: since all 4
+    // oscillators already read the SAME note's velocity (MIDI gives one velocity per note-on, not
+    // per-oscillator), independent depths let a patch velocity-crossfade BETWEEN oscillator layers
+    // -- e.g. a sub layer staying constant while a brighter overtone layer fades in on harder hits
+    // -- not just scale the whole voice uniformly. Applied as a per-voice gain multiplier alongside
+    // each oscillator's own Amp EG in render_audio_block (see the vel_amp_mult_arr computation
+    // there), not as a mod-matrix destination -- velocity is a one-shot value captured at note-on
+    // (voice->midi_velocity), not a continuously-varying signal like an LFO/EG, so it doesn't fit
+    // that per-sample-modulated system.
     float vco1_vel_to_amp;
     float vco2_vel_to_amp;
     float vco3_vel_to_amp;
@@ -5649,6 +5654,17 @@ typedef struct HdsPendingLoadState {
     // keyswitch-interception block.
     int keyswitch_note_plus1[SINGLE_PROGRAM_SLOT + 1][4];
 
+    // poll_vco_shape_unload()'s own "last observed Shape" per (owner_program, oscillator) pair,
+    // same scoping/indexing convention as keyswitch_note_plus1 just above -- per-INSTANCE state
+    // (this struct, not a bare file-scope static) since two separate plugin instances in the same
+    // process (e.g. two hds.clap tracks) must never share or interfere with each other's own
+    // tracked shape transitions. -1 (never a real WaveType) is BSS/calloc's own zero-adjacent "not
+    // yet observed" sentinel would otherwise wrongly be -- 0 IS a real WaveType (WAVE_SAWTOOTH or
+    // similar) here, unlike keyswitch_note_plus1's own +1 encoding trick, so this is explicitly
+    // reset to -1 once by poll_vco_shape_unload() itself on first use instead, see its own comment.
+    float vco_shape_last[SINGLE_PROGRAM_SLOT + 1][4];
+    bool vco_shape_last_init;
+
     // trigger=release/release_key one-shot players (see fire_release_trigger_zones()'s own
     // comment) -- a small fixed pool, entirely independent of voices[]/MAX_VOICES (a release-
     // triggered sample plays out on its own, with no amp EG, pitch modulation, or filter routing
@@ -5954,6 +5970,22 @@ static void apply_zone_remove(HdsSampleEngine *se, int32_t zone_id) {
     }
 }
 
+// Removes every zone owned by ONE (oscillator, Program) pair -- shared by hds_load_sfz_for_osc()
+// (loading a new SFZ onto an oscillator always replaces whatever that same oscillator/Program had
+// before) and poll_vco_shape_unload() below (switching an oscillator's own Shape away from
+// WAVE_SAMPLE entirely). Scoped by owner_program too (not just osc_index) so clearing one Program's
+// own VCO1 zones never touches a DIFFERENT Program's own VCO1 zones that happen to share the same
+// oscillator index -- see SampleSlot.owner_program's own comment. Collects zone_ids first (a plain
+// forward scan while tombstoning in place is safe here too, same as apply_zone_remove's own loop,
+// but collecting first keeps this obviously correct regardless of how apply_zone_remove's own loop
+// shape might change later) -- a no-op scan over an already-empty catalog, the ordinary case.
+static void unload_zones_for_osc(HdsSampleEngine *se, int osc_index, int owner_program) {
+    for (int s = 0; s < se->slots->sample_slot_count; s++) {
+        SampleSlot *slot = &se->slots->sample_slots[s];
+        if (slot->active && slot->assigned_osc == osc_index && slot->owner_program == owner_program) apply_zone_remove(se, slot->zone_id);
+    }
+}
+
 // "/hds/zone/upsert" i + 19 f's + s -- zone_id + 19 floats in ZoneRecordWire's own field order
 // (root_note, min_note, max_note, min_velocity, max_velocity, unpitched, loop_start, loop_end,
 // loop_enabled, round_robin_group, tune_cents, gain_db, pan, start_offset_frac, reverse,
@@ -6018,17 +6050,8 @@ static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_pr
     owner_program = clamp_owner_program((float)owner_program);
 
     // Always "replace THIS PROGRAM's own zone set on this oscillator" -- a no-op at empty-catalog
-    // startup time, the real live-reload behavior for /hds/zone/load_sfz. Scoped by owner_program
-    // too (not just osc_index) so loading a new SFZ for one Program's own VCO1 doesn't remove a
-    // DIFFERENT Program's own VCO1 zones that happen to share the oscillator index -- see
-    // SampleSlot.owner_program's own comment. Collect ids first (a plain forward scan while
-    // tombstoning in place is safe here too, same as apply_zone_remove's own loop, but collecting
-    // first keeps this obviously correct regardless of how apply_zone_remove's own loop shape
-    // might change later).
-    for (int s = 0; s < se->slots->sample_slot_count; s++) {
-        SampleSlot *slot = &se->slots->sample_slots[s];
-        if (slot->active && slot->assigned_osc == osc_index && slot->owner_program == owner_program) apply_zone_remove(se, slot->zone_id);
-    }
+    // startup time, the real live-reload behavior for /hds/zone/load_sfz.
+    unload_zones_for_osc(se, osc_index, owner_program);
 
     char default_path[SAMPLE_PATH_LEN];
     int region_count = sfz_parse_file(sfz_path, g_sfz_parse_scratch, SFZ_MAX_REGIONS_PER_FILE, default_path, sizeof(default_path));
@@ -6213,6 +6236,40 @@ static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_pr
         se->pending->keyswitch_note_plus1[owner_program][osc_index] = sw_default_note + 1;
     }
     return queued;
+}
+
+// Detects an oscillator's own Shape knob (prog->vco{1-4}_shape) moving AWAY from WAVE_SAMPLE and
+// unloads whatever Multisample/SFZ zones that (oscillator, Program) pair still owns when it does --
+// a plain continuous knob has no "on change" event of its own (unlike /hds/zone/load_sfz, a real
+// discrete OSC method), so this polls once per block from the same non-realtime context that
+// already does this exact kind of work (drain_pending_sample_loads()'s own malloc/free calls,
+// called from main()'s loop in the standalone build and from process() in clap_plugin.c -- see
+// both call sites, always right next to drain_pending_sample_loads() itself). Without this, an
+// oscillator switched away from Multisample kept its whole catalog (RAM pre-roll buffers and all)
+// sitting there loaded but unused -- harmless to playback (find_matching_sample_slot() is only ever
+// consulted for an oscillator whose CURRENT Shape is WAVE_SAMPLE) but a real leak of both RAM and,
+// worse, of STALE STATE: it's exactly what let a trigger=release zone from the OLD Multisample
+// still fire on note-off after switching to a plain waveform (see trigger_voice_release()'s own
+// fix for the immediate symptom -- this is the same bug's other half, cleaning up the cause instead
+// of only guarding the effect). se->pending->vco_shape_last[p][o] uses -1 (never a real WaveType)
+// as "not yet observed" so the very first poll after startup/a fresh instance never unloads
+// anything -- see HdsPendingLoadState.vco_shape_last's own comment.
+static void poll_vco_shape_unload(HdsSampleEngine *se, const SynthSharedControls *knobs) {
+    if (!se->pending->vco_shape_last_init) {
+        for (int p = 0; p <= COMBI_PROGRAM_COUNT; p++) for (int o = 0; o < 4; o++) se->pending->vco_shape_last[p][o] = -1.0f;
+        se->pending->vco_shape_last_init = true;
+    }
+    for (int p = 0; p <= COMBI_PROGRAM_COUNT; p++) {
+        const ProgramState *prog = &knobs->programs[p];
+        const float shape_now[4] = { prog->vco1_shape, prog->vco2_shape, prog->vco3_shape, prog->vco4_shape };
+        for (int o = 0; o < 4; o++) {
+            float prev = se->pending->vco_shape_last[p][o];
+            if (prev >= 0.0f && (int)prev == WAVE_SAMPLE && (int)shape_now[o] != WAVE_SAMPLE) {
+                unload_zones_for_osc(se, o, p);
+            }
+            se->pending->vco_shape_last[p][o] = shape_now[o];
+        }
+    }
 }
 
 // "/hds/zone/load_sfz" i i s -- oscillator index (0-3), owner Program index (0-7 a Combi lane,
@@ -7429,15 +7486,21 @@ static void trigger_voice_release(HdsSampleEngine *se, SynthVoice *voice) {
     request_sample_stream_release(se, voice->vco2_layer_sample_stream);
     request_sample_stream_release(se, voice->vco3_layer_sample_stream);
     request_sample_stream_release(se, voice->vco4_layer_sample_stream);
-    // SFZ trigger=release/release_key: fire any matching release-tail zone on every oscillator,
-    // using this voice's own held note/velocity/Program -- see fire_release_trigger_zones's own
-    // comment. A no-op (nothing found) on every oscillator whose catalog has no trigger=release
-    // zone at all, the ordinary, unaffected case for every voice that never used one.
+    // SFZ trigger=release/release_key: fire any matching release-tail zone, using this voice's own
+    // held note/velocity/Program -- see fire_release_trigger_zones's own comment. Gated on this
+    // voice's own vco{N}_sample_stream actually being a live claimed stream (exactly what
+    // request_sample_stream_release above already reads, unchanged by that call -- it only flags
+    // the stream struct itself, never touches this field), NOT just "does this oscillator's slot
+    // catalog contain a matching zone": that catalog-only check used to fire a STALE multisample's
+    // own release zone even after the oscillator's Shape had been switched away to a plain
+    // waveform (an oscillator with no live sample stream can never have entered WAVE_SAMPLE
+    // playback for THIS voice in the first place, so this is a strictly narrower, correct
+    // condition, not a behavior change for any voice that actually is playing a sample).
     if (voice->midi_note >= 0) {
-        fire_release_trigger_zones(se, 0, voice->program_index, voice->midi_note, voice->midi_velocity);
-        fire_release_trigger_zones(se, 1, voice->program_index, voice->midi_note, voice->midi_velocity);
-        fire_release_trigger_zones(se, 2, voice->program_index, voice->midi_note, voice->midi_velocity);
-        fire_release_trigger_zones(se, 3, voice->program_index, voice->midi_note, voice->midi_velocity);
+        if (voice->vco1_sample_stream >= 0) fire_release_trigger_zones(se, 0, voice->program_index, voice->midi_note, voice->midi_velocity);
+        if (voice->vco2_sample_stream >= 0) fire_release_trigger_zones(se, 1, voice->program_index, voice->midi_note, voice->midi_velocity);
+        if (voice->vco3_sample_stream >= 0) fire_release_trigger_zones(se, 2, voice->program_index, voice->midi_note, voice->midi_velocity);
+        if (voice->vco4_sample_stream >= 0) fire_release_trigger_zones(se, 3, voice->program_index, voice->midi_note, voice->midi_velocity);
     }
 }
 
@@ -9767,14 +9830,20 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             float pan_l_arr[4] = { pan1_l, pan2_l, pan3_l, pan4_l };
             float pan_r_arr[4] = { pan1_r, pan2_r, pan3_r, pan4_r };
             // Velocity -> Amp (see ProgramState.vco{1-4}_vel_to_amp's own comment): a per-voice,
-            // per-oscillator gain multiplier, 1.0 at vel_to_amp=0 for every velocity (byte-
-            // identical to pre-existing behavior by construction) or at velocity=64 ("normal")
-            // regardless of depth. Clamped to non-negative -- an extreme depth at a very low
-            // velocity could otherwise go slightly negative and phase-invert the oscillator.
+            // per-oscillator gain multiplier. depth=0 is always exactly 1.0 (full level regardless
+            // of velocity). Positive depth anchors velocity 127 at that same 1.0 and pulls softer
+            // velocities down from there -- an ordinary velocity-sensitivity curve, reaching a
+            // straight 0..1 ramp at depth=100 (silent at velocity 0, unchanged/full at 127).
+            // Negative depth anchors velocity 0 at 1.0 instead and pulls HARDER velocities down --
+            // the mirror-image curve. Provably stays in [0,1] for every depth/velocity combination
+            // (dist below is always in [0,127], |depth fraction| in [0,1]), so no clamp is needed
+            // the way the old velocity-64-anchored formula's occasional small negative overshoot did.
             float vel_to_amp_arr[4] = { prog->vco1_vel_to_amp, prog->vco2_vel_to_amp, prog->vco3_vel_to_amp, prog->vco4_vel_to_amp };
             float vel_amp_mult_arr[4];
             for (int osc = 0; osc < 4; osc++) {
-                vel_amp_mult_arr[osc] = fmaxf(0.0f, 1.0f + (vel_to_amp_arr[osc] / 100.0f) * ((float)(voices[v].midi_velocity - 64) / 63.0f));
+                float depth = vel_to_amp_arr[osc] / 100.0f; // -1..1
+                float dist = (depth >= 0.0f) ? (127.0f - (float)voices[v].midi_velocity) : (float)voices[v].midi_velocity;
+                vel_amp_mult_arr[osc] = 1.0f - fabsf(depth) * dist / 127.0f;
             }
             float osc_l[4], osc_r[4];
             int drum_bus_arr[4] = { voices[v].vco1_drum_bus, voices[v].vco2_drum_bus, voices[v].vco3_drum_bus, voices[v].vco4_drum_bus };

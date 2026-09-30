@@ -73,7 +73,13 @@ A few notable addresses:
   Loaded WAVs are correctly speed/pitch-compensated for their own actual
   sample rate against this engine's fixed 48kHz internal rate (a 44.1kHz
   file, or any other rate, plays at its real recorded speed/pitch, not
-  whatever a naive frame-for-frame read at 48kHz would produce).
+  whatever a naive frame-for-frame read at 48kHz would produce). Switching
+  an oscillator's own Shape away from Multisample fully unloads whatever
+  zones it still owned (freeing their RAM pre-roll cache, not just leaving
+  them dormant) and — the same root cause fixed from the other direction —
+  a note's release no longer fires a stale `trigger=release` zone left
+  over from a Multisample that oscillator switched away from before the
+  note was released.
   First-class SFZ opcode support: round-robin (`seq_length`/`seq_position`,
   independent of `group=`), real choke groups (`group=`/`off_by=`),
   keyswitching (`sw_lokey`/`sw_hikey`/`sw_last`/`sw_default`), `trigger=`

@@ -1016,6 +1016,10 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
     // further down).
     poll_metronome(&p->engine, &p->knobs, current_tempo_bpm, (int)process->frames_count);
     drain_pending_sample_loads(&p->sample_engine);
+    // Detects any oscillator's own Shape switching away from Multisample and unloads whatever
+    // zones it still owns -- see poll_vco_shape_unload's own comment for why this can't be a
+    // discrete "on change" event the way /hds/zone/load_sfz is.
+    poll_vco_shape_unload(&p->sample_engine, &p->knobs);
 
     if (process->in_events) {
         uint32_t ev_count = process->in_events->size(process->in_events);

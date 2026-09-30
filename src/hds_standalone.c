@@ -2200,6 +2200,10 @@ int main(int argc, char **argv) {
         // SAMPLE_LOADS_PER_BLOCK entries per
         // block (see its #define for the real-time trade-off this bounds).
         drain_pending_sample_loads(&g_sample_engine);
+        // Detects any oscillator's own Shape switching away from Multisample and unloads whatever
+        // zones it still owns -- see poll_vco_shape_unload's own comment for why this can't be a
+        // discrete "on change" event the way /hds/zone/load_sfz is.
+        poll_vco_shape_unload(&g_sample_engine, &g_gui_ctx.knobs);
 
         process_midi_input(&g_streams_state, &g_engine, &g_sample_engine, seq_handle, voices, &g_gui_ctx.knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live, current_tempo_bpm);
         seq_playback_midi_events(&g_engine, &g_sample_engine, voices, &g_gui_ctx.knobs, global_lfo_phases, &mono_stacks[SINGLE_PROGRAM_SLOT], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets SINGLE_PROGRAM_SLOT)
