@@ -1979,7 +1979,26 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
         return true;
     }
     if (hds_fx_rect_contains(&L.bypass_btn, x, y)) { if (button == 1) p->fx[row].bypass = (p->fx[row].bypass != 0.0f) ? 0.0f : 1.0f; return true; }
-    if (hds_fx_rect_contains(&L.chain_btn, x, y)) { if (button == 1 && row < FX_SLOT_COUNT - 1) p->fx[row].chain_to_next = (p->fx[row].chain_to_next != 0.0f) ? 0.0f : 1.0f; return true; }
+    if (hds_fx_rect_contains(&L.chain_btn, x, y)) {
+        if (button == 1 && row < FX_SLOT_COUNT - 1) {
+            bool turning_on = p->fx[row].chain_to_next == 0.0f;
+            p->fx[row].chain_to_next = turning_on ? 1.0f : 0.0f;
+            if (turning_on) {
+                // A chain link only actually takes effect once the very next slot shares this
+                // slot's own fx_source (see hds_fx_next_same_source_slot()'s own comment -- the
+                // link is defined by ARRAY POSITION + matching fx_source, not by chain_to_next
+                // alone) -- so without this, turning Chain-to-Next on here would silently do
+                // nothing until the next row's own Input pill was ALSO clicked and set to match by
+                // hand. Auto-match it here instead, so one click is enough. Clears any explicit
+                // input_from_slot override on that row first -- it's about to become an ordinary
+                // chain continuation, not a cross-slot link, and the two are mutually exclusive
+                // (see hds_fx_slot_is_chain_head()'s own comment).
+                p->fx[row + 1].input_from_slot = -1.0f;
+                p->fx[row + 1].fx_source = p->fx[row].fx_source;
+            }
+        }
+        return true;
+    }
     if (hds_fx_rect_contains(&L.up_btn, x, y)) { if (button == 1 && !hds_fx_slot_participates_in_chain(p, row)) hds_fx_swap_slots(p, row, row - 1); return true; }
     if (hds_fx_rect_contains(&L.down_btn, x, y)) { if (button == 1 && !hds_fx_slot_participates_in_chain(p, row)) hds_fx_swap_slots(p, row, row + 1); return true; }
 
