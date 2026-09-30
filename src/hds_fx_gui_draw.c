@@ -942,8 +942,23 @@ typedef struct {
 // itself to. `knob_cx` is that column's own knob-center x (HdsFxRowLayout.param_knob[idx].x),
 // passed in rather than re-deriving the stride math here.
 static void hds_fx_bcastdly_dump_btn_rect(double knob_cx, double row_y, HdsFxRect *out) {
-    double w = (HDS_FX_PARAM_STRIDE - 6.0) * 1.5; // 1.5x this column's own default knob-slot width -- deliberately wider than its own column, slightly overlapping neighboring columns, so this reads as a real, prominent button rather than just a wide knob
+    double w = (HDS_FX_PARAM_STRIDE - 6.0) * 1.5; // 1.5x this column's own default knob-slot width -- see hds_fx_bcastdly_col_x()'s own comment for how the columns themselves were spaced to give this width real room instead of overlapping
     *out = (HdsFxRect){knob_cx - w / 2.0, row_y + 6.0, w, HDS_FX_GUI_ROW_H - 12.0};
+}
+
+#define HDS_FX_BCASTDLY_BTN_PITCH 48.0 // width (42, see hds_fx_bcastdly_dump_btn_rect) plus a plain 6px gap -- same gap convention HDS_FX_PARAM_STRIDE-6 already uses everywhere else, just applied to this row's own wider pitch instead of the shared 34px column grid
+
+// FX_TYPE_BROADCAST_DELAY's widened (1.5x) Dump buttons don't fit in the shared, 34px-wide knob
+// columns every other FX type's params share (adjacent columns overlap by 8px) -- but doubling the
+// column pitch to spread them out (an earlier attempt) left visibly too much dead air between them.
+// This type only uses 5 of the 11 param columns anyway (Delay, Dump7s, Dmp15s, Dmp30s, Rstock;
+// columns 5-10 sit unused, same as when it doesn't touch the NAM-path pills that reuse them for other
+// types), so instead of snapping to that grid at all, Dump7s/Dmp15s/Dmp30s/Rstock are laid out at
+// their own fixed HDS_FX_BCASTDLY_BTN_PITCH from Delay's own column -- just wide enough for a real
+// gap, not a whole spare column's worth of one. `i` itself still indexes the real param[] storage
+// everywhere else, so this has zero effect on the wire protocol or saved state.
+static double hds_fx_bcastdly_col_x(double delay_col_x, int i) {
+    return delay_col_x + i * HDS_FX_BCASTDLY_BTN_PITCH; // i==0 (Delay) -> itself, unchanged
 }
 
 static void hds_fx_draw_dump_button(cairo_t *cr, const HdsFxRect *r, const char *line1, const char *line2) {
@@ -1678,12 +1693,14 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
             hds_fx_draw_pill(cr, L.sidechain_pill.x, L.sidechain_pill.y, L.sidechain_pill.w, L.sidechain_pill.h, "\xe2\x80\x94", false, true);
         }
 
+        bool is_bcastdly = hds_fx_type_is_broadcast_delay(fx_type);
         for (int i = 0; i < param_count; i++) {
+            double col_x = is_bcastdly ? hds_fx_bcastdly_col_x(L.param_knob[0].x, i) : L.param_knob[i].x; // see hds_fx_bcastdly_col_x()'s own comment
             // FX_TYPE_BROADCAST_DELAY's Dump 7s/15s/30s (param columns 1-3): a big red momentary
             // button, not a knob -- see hds_fx_draw_dump_button()'s own comment.
-            if (hds_fx_type_is_broadcast_delay(fx_type) && (i == 1 || i == 2 || i == 3)) {
+            if (is_bcastdly && (i == 1 || i == 2 || i == 3)) {
                 HdsFxRect btn;
-                hds_fx_bcastdly_dump_btn_rect(L.param_knob[i].x, y, &btn);
+                hds_fx_bcastdly_dump_btn_rect(col_x, y, &btn);
                 const char *line2 = (i == 1) ? "7s" : (i == 2) ? "15s" : "30s";
                 hds_fx_draw_dump_button(cr, &btn, "DUMP", line2);
                 continue;
@@ -1697,7 +1714,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
             if (frac < 0.0f) frac = 0.0f; else if (frac > 1.0f) frac = 1.0f;
             char value_text[24];
             hds_fx_type_param_value_text(fx_type, i, frac, value_text, sizeof(value_text));
-            hds_fx_draw_knob(cr, L.param_knob[i].x, L.param_knob[i].y, L.param_knob[i].w, frac, false, y, hds_fx_type_param_label(fx_type, i), value_text);
+            hds_fx_draw_knob(cr, col_x, L.param_knob[i].y, L.param_knob[i].w, frac, false, y, hds_fx_type_param_label(fx_type, i), value_text);
         }
 
         // NAM's own Model/IR path pills -- see HdsFxRowLayout's own comment on nam_model_pill/
@@ -1969,17 +1986,20 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
     if (button == 1) {
         int row_type = (int)p->fx[row].fx_type;
         int param_count = hds_fx_type_param_count(row_type);
+        bool is_bcastdly = hds_fx_type_is_broadcast_delay(row_type);
         for (int i = 0; i < param_count; i++) {
+            double col_x = is_bcastdly ? hds_fx_bcastdly_col_x(L.param_knob[0].x, i) : L.param_knob[i].x; // must mirror the draw side exactly -- see hds_fx_bcastdly_col_x()'s own comment
             // FX_TYPE_BROADCAST_DELAY's Dump 7s/15s/30s buttons: a plain click-to-fire, same
             // one-shot-counter idiom as SeqLaneState.audio_preview_trigger (see fx_types.h's own
             // comment on param[1..3]) -- increments the param, never starts a knob drag.
-            if (hds_fx_type_is_broadcast_delay(row_type) && (i == 1 || i == 2 || i == 3)) {
+            if (is_bcastdly && (i == 1 || i == 2 || i == 3)) {
                 HdsFxRect btn;
-                hds_fx_bcastdly_dump_btn_rect(L.param_knob[i].x, row_y, &btn);
+                hds_fx_bcastdly_dump_btn_rect(col_x, row_y, &btn);
                 if (hds_fx_rect_contains(&btn, x, y)) { p->fx[row].param[i] += 1.0f; return true; }
                 continue;
             }
-            if (hds_fx_knob_contains(&L.param_knob[i], x, y)) {
+            HdsFxRect knob_rect = L.param_knob[i]; knob_rect.x = col_x;
+            if (hds_fx_knob_contains(&knob_rect, x, y)) {
                 vs->drag_kind = 2; vs->drag_row = row; vs->drag_param_index = i;
                 vs->drag_start_y = y; vs->drag_start_value = p->fx[row].param[i];
                 return true;
