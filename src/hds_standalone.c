@@ -1870,6 +1870,12 @@ int main(int argc, char **argv) {
     g_gui_ctx.gui_host.fx_gr_db = g_gui_ctx.fx_gr_db;
     g_gui_ctx.gui_host.source_count = SOURCE_COUNT;
     g_gui_ctx.gui_host.source_label = hds_clap_source_label;
+    // This build's own equivalent of a port-model host's Output picker -- see HdsFxGuiHost's own
+    // comment on source_routing_flat. SourceRouting's own single float array member means
+    // &source_routing[0].enable[0] is already SOURCE_COUNT*OUTPUT_PAIR_MAX contiguous floats, no
+    // separate flattened copy needed.
+    g_gui_ctx.gui_host.source_routing_flat = &g_gui_ctx.knobs.source_routing[0].enable[0];
+    g_gui_ctx.gui_host.output_pair_count = OUTPUT_PAIR_MAX;
     // g_gui_ctx.sample_engine is otherwise left unused by this app (see HdsClapPlugin's own header
     // comment: the standalone uses g_sample_engine, a plain global, instead) -- EXCEPT for this one
     // new use: hds_clap_play_draw.c's own Multisample "Load .sfz..." button (hds_play_poll_sfz_pick())

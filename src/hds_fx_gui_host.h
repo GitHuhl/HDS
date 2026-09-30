@@ -43,4 +43,24 @@ typedef struct {
     // field here. NULL means this host doesn't have live GR data (there is currently no such host,
     // but the same defensive NULL-check convention as source_count/port_input_stereo etc. applies).
     float *fx_gr_db;
+
+    // A Source-combo host's (source_count > 0) own equivalent of a port-model host's Output picker
+    // (port_output_channel above): a port-model host already has one CLAP port per port index, so
+    // "where does this port's FX result go" is a single index into that same port space -- but a
+    // Source-combo host's "source" (Program/Combi Mix/Ext In/Drum Bus) is a semantic bus, not a
+    // physical output, and where a SOURCE's post-FX audio actually reaches hardware is a genuinely
+    // many-to-many question (SynthSharedControls.source_routing's own comment in backend.c) the
+    // standalone build's dedicated Routing tab already answers in full. This pointer/count pair (or
+    // NULL/0, for hds_fx_plugin.c, which is a port-model host and has no use for this) lets the FX
+    // tab surface and SET that same real routing data directly -- source_routing_flat points at
+    // SOURCE_COUNT*output_pair_count contiguous floats (SynthSharedControls.source_routing is a
+    // flat array of `float enable[output_pair_count]` structs, so &source_routing[0].enable[0]
+    // already IS that contiguous layout; no copy, no separate model). Indexed here as
+    // source_routing_flat[source * output_pair_count + pair]. Picking a single pair from the FX
+    // tab's own Out pill (see hds_fx_gui_draw.c's own HDS_FX_DROPDOWN_OUT_PAIR) sets that source's
+    // routing to EXACTLY that one pair, clearing any others -- the same single-target semantics a
+    // port-model host's own port_output_channel already has; a user who wants true many-to-many
+    // routing for a source still has the Routing tab, untouched by this pill unless they click it.
+    float *source_routing_flat;
+    int output_pair_count;
 } HdsFxGuiHost;

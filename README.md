@@ -186,6 +186,21 @@ right-click that doesn't drag, letting any LFO or assignable EG target it
 directly — the same field its own Destination dropdown already sets, just
 a second way to reach it.
 
+FX tab Output pill (standalone only): `hds_fx.clap`'s own 8-port model
+always had a per-chain Output picker right in its FX tab, since a port IS
+its own physical CLAP output pair. `synth_engine`'s FX tab now has the
+same convenience for its Source-combo model (Program/Combi Mix/Ext In/Drum
+Bus, not a flat port) — the pill on a chain's own tail slot shows and sets
+which single real output pair that source's FX result goes to, reading
+and writing the exact same data the Routing tab's own source-to-output
+grid does (no separate model, no risk of the two disagreeing). It can only
+pick ONE pair at a time; a source already routed to several pairs at once
+keeps that setup (visible as e.g. "Out 1+") until this pill is actually
+clicked, and true many-to-many routing is still the Routing tab's job.
+`hds.clap` has no equivalent — a DAW host owns its own output routing via
+that plugin's per-Combi-Program CLAP ports instead, so there's nothing for
+this pill to control there, and it stays blank.
+
 ## Platform notes
 
 - **Raspberry Pi / aarch64 Linux**: `make arm64` cross-compiles

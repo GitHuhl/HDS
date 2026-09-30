@@ -624,6 +624,7 @@ static int hds_fx_slot_output_target(int row, int list_pos) {
 #define HDS_FX_DROPDOWN_SIDECHAIN 3
 #define HDS_FX_DROPDOWN_OUTPUT 4
 #define HDS_FX_DROPDOWN_SOURCE 5 // the Source-combo Input header for a host with no port model -- see HdsFxGuiHost's own comment
+#define HDS_FX_DROPDOWN_OUT_PAIR 6 // the Source-combo Output pill's own single-pick routing choice -- see HdsFxGuiHost's own source_routing_flat comment
 
 typedef struct { double x, y, w, h; } HdsFxRect;
 
@@ -1025,6 +1026,7 @@ static int hds_fx_dropdown_option_count(const HdsFxGuiHost *p, int kind) {
         case HDS_FX_DROPDOWN_OUTPUT: return 1 + HDS_FX_PORT_COUNT; // Off + 8 (always that port's real stereo pair)
         case HDS_FX_DROPDOWN_SIDECHAIN: return 1 + HDS_FX_PORT_COUNT; // "Same as Source" + 8
         case HDS_FX_DROPDOWN_SOURCE: return p->source_count + (FX_SLOT_COUNT - 1); // no Off/Mono/Stereo suboptions -- matches frontend.py's own plain Source combo, plus the same slot-output section INPUT gets
+        case HDS_FX_DROPDOWN_OUT_PAIR: return 1 + p->output_pair_count; // Off (clears every pair) + one entry per real output pair
         default: return 0;
     }
 }
@@ -1064,6 +1066,10 @@ static void hds_fx_dropdown_option_label(const HdsFxGuiHost *p, int kind, int ro
             snprintf(buf, buflen, "Slot %d Out", target + 1);
             return;
         }
+        case HDS_FX_DROPDOWN_OUT_PAIR:
+            if (idx == 0) snprintf(buf, buflen, "Off");
+            else snprintf(buf, buflen, "Out %d", idx); // idx 1..N -> pair idx-1, 1-based display
+            return;
         default: buf[0] = 0; return;
     }
 }
@@ -1104,6 +1110,14 @@ static int hds_fx_dropdown_current_index(const HdsFxGuiHost *p, int kind, int ro
             }
             int s = (int)p->fx[row].fx_source;
             return (s < 0 || s >= p->source_count) ? 0 : s;
+        }
+        case HDS_FX_DROPDOWN_OUT_PAIR: {
+            int src = (int)p->fx[row].fx_source;
+            if (src < 0 || src >= p->source_count) src = 0;
+            for (int op = 0; op < p->output_pair_count; op++) {
+                if (p->source_routing_flat[src * p->output_pair_count + op] != 0.0f) return op + 1;
+            }
+            return 0; // nothing enabled for this source -- "Off"
         }
         default: return -1;
     }
@@ -1161,6 +1175,20 @@ static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
             p->fx[row].input_from_slot = -1.0f; // picking a normal Source clears any slot-output override
             p->fx[row].fx_source = (float)idx;
             return;
+        case HDS_FX_DROPDOWN_OUT_PAIR: {
+            // Single-pick: clears every OTHER pair this source was routed to and sets exactly the
+            // one chosen here (or none, for "Off") -- see HdsFxGuiHost's own source_routing_flat
+            // comment for why this mirrors a port-model host's own single-choice Output picker
+            // rather than trying to be a second, cut-down copy of the Routing tab's real many-to-
+            // many grid. A user who wants that keeps using the Routing tab; this pill never runs
+            // unless explicitly clicked, so an existing multi-pair setup is never silently narrowed.
+            int src = (int)p->fx[row].fx_source;
+            if (src < 0 || src >= p->source_count) src = 0;
+            for (int op = 0; op < p->output_pair_count; op++) {
+                p->source_routing_flat[src * p->output_pair_count + op] = (idx == op + 1) ? 1.0f : 0.0f;
+            }
+            return;
+        }
         default: return;
     }
 }
@@ -1644,6 +1672,26 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
                 snprintf(outbuf, sizeof(outbuf), "Out %d", out_ch + 1); // always that port's own real stereo pair -- no Mono/Stereo choice, see the "Dropdowns" section's own comment
             }
             hds_fx_draw_pill(cr, L.output_pill.x, L.output_pill.y, L.output_pill.w, L.output_pill.h, outbuf, is_tail && !output_off, !is_tail);
+        } else if (p->source_routing_flat && p->output_pair_count > 0) {
+            // Source-combo host's own equivalent -- see HdsFxGuiHost's own source_routing_flat
+            // comment. Reads the REAL Routing-tab data directly (no separate copy): summarizes
+            // however many pairs this row's own source is currently routed to, since a source can
+            // legitimately be routed to several pairs at once (many-to-many, set from the Routing
+            // tab) even though this pill's own dropdown can only pick a single one at a time.
+            int src = (int)slot->fx_source;
+            if (src < 0 || src >= p->source_count) src = 0;
+            int enabled_count = 0, first_enabled = -1;
+            for (int op = 0; op < p->output_pair_count; op++) {
+                if (p->source_routing_flat[src * p->output_pair_count + op] != 0.0f) {
+                    enabled_count++;
+                    if (first_enabled < 0) first_enabled = op;
+                }
+            }
+            char outbuf[16];
+            if (enabled_count == 0) snprintf(outbuf, sizeof(outbuf), "Off");
+            else if (enabled_count == 1) snprintf(outbuf, sizeof(outbuf), "Out %d", first_enabled + 1);
+            else snprintf(outbuf, sizeof(outbuf), "Out %d+", first_enabled + 1); // multi-pair, set from the Routing tab
+            hds_fx_draw_pill(cr, L.output_pill.x, L.output_pill.y, L.output_pill.w, L.output_pill.h, outbuf, is_tail && enabled_count > 0, !is_tail);
         } else {
             // No flat N-port Output concept for this host either -- see the Input pill's own
             // comment just above (same reasoning, mirrored).
@@ -1815,6 +1863,10 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
     }
     if (p->port_output_channel && hds_fx_slot_is_chain_tail(p, row) && hds_fx_rect_contains(&L.output_pill, x, y)) {
         vs->dropdown.kind = HDS_FX_DROPDOWN_OUTPUT; vs->dropdown.row = row; vs->dropdown.anchor = L.output_pill;
+        return true;
+    }
+    if (!p->port_output_channel && p->source_routing_flat && hds_fx_slot_is_chain_tail(p, row) && hds_fx_rect_contains(&L.output_pill, x, y)) {
+        vs->dropdown.kind = HDS_FX_DROPDOWN_OUT_PAIR; vs->dropdown.row = row; vs->dropdown.anchor = L.output_pill;
         return true;
     }
     if (hds_fx_rect_contains(&L.bypass_btn, x, y)) { if (button == 1) p->fx[row].bypass = (p->fx[row].bypass != 0.0f) ? 0.0f : 1.0f; return true; }
