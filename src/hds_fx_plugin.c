@@ -178,7 +178,14 @@ typedef struct {
     float port_input_off[HDS_FX_PORT_COUNT];
     float port_output_off[HDS_FX_PORT_COUNT];
 
-    float gr_db_scratch[FX_SLOT_COUNT]; // required non-NULL out-param, exposed to the GUI via gui_host.fx_gr_db below -- shared across all 8 ports' own calls, same convention as backend.c's own gr_db_out (see render_audio_block)
+    float gr_db_scratch[FX_SLOT_COUNT]; // this block's own RAW reading, zeroed and refilled fresh every process() call -- NOT what the GUI reads directly (see gr_db_smoothed just below)
+    // Persistent, chased-toward-gr_db_scratch METER-BALLISTICS state -- exposed to the GUI via
+    // gui_host.fx_gr_db, same fast-attack/slow-release idea and same reason as backend.c's own
+    // gr_db_out (see render_audio_block's own comment on it): the raw per-sample reading changes
+    // too fast for a human to read the dB number off a live meter for any fast compressor (Gate,
+    // Limiter). Chased once per process() call, right after the per-sample port loop, using
+    // process->frames_count as this call's own block_size.
+    float gr_db_smoothed[FX_SLOT_COUNT];
     float dump_avail_scratch[FX_SLOT_COUNT]; // same convention as gr_db_scratch just above, for FX_TYPE_BROADCAST_DELAY's own dump-availability meter -- exposed via gui_host.fx_dump_avail_sec below
 
     // Every slot's own last-computed post-mix output, in POOL-SLOT order -- see process_fx_chain()'s
@@ -729,6 +736,18 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
         }
     }
 
+    // GR meter ballistics -- see gr_db_smoothed's own comment. Same formula/time constants as
+    // backend.c's own render_audio_block (~15ms attack, ~350ms release), just driven by this
+    // call's own frames_count instead of block_size.
+    {
+        const float gr_attack_rate = 1.0f - expf(-(float)process->frames_count / (SAMPLE_RATE * 0.015f));
+        const float gr_release_rate = 1.0f - expf(-(float)process->frames_count / (SAMPLE_RATE * 0.35f));
+        for (int s = 0; s < FX_SLOT_COUNT; s++) {
+            float rate = (p->gr_db_scratch[s] > p->gr_db_smoothed[s]) ? gr_attack_rate : gr_release_rate;
+            p->gr_db_smoothed[s] += (p->gr_db_scratch[s] - p->gr_db_smoothed[s]) * rate;
+        }
+    }
+
     hds_fx_push_changed_params(p, process->out_events);
     return CLAP_PROCESS_CONTINUE;
 }
@@ -790,7 +809,7 @@ static const clap_plugin_t *hds_fx_factory_create_plugin(const clap_plugin_facto
     p->gui_host.port_output_channel = p->port_output_channel;
     p->gui_host.port_input_off = p->port_input_off;
     p->gui_host.port_output_off = p->port_output_off;
-    p->gui_host.fx_gr_db = p->gr_db_scratch;
+    p->gui_host.fx_gr_db = p->gr_db_smoothed;
     p->gui_host.fx_dump_avail_sec = p->dump_avail_scratch;
     p->gui_host.gui_window = NULL;
 

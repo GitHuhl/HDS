@@ -8980,14 +8980,29 @@ static void apply_program_eq(HdsEngineState *engine, int p, const EqBiquadCoeffs
 // extra cost beyond one null check per sample.
 // gr_db_out[FX_SLOT_COUNT] (required, not NULL-able -- same convention as ext_in_peak_out just
 // above): each slot's current gain-reduction reading in dB (0 for a bypassed/off/non-GR-capable
-// slot), zeroed here and refreshed every sample by process_fx_chain() -- so after this call returns,
-// it holds the LAST sample's readings, which is all the ~31Hz status tick (send_osc_status) needs.
-// dump_avail_out[FX_SLOT_COUNT] (required, not NULL-able -- same convention/lifetime as gr_db_out
-// just above): each FX_TYPE_BROADCAST_DELAY slot's currently-buffered delay, in seconds (0 for
-// every other type), for that effect's own dump-availability meter.
+// slot). Unlike ext_in_peak_out/dump_avail_out, this is NOT a raw per-block value overwritten
+// from scratch every call -- it's persistent, caller-owned METER-BALLISTICS state, chased toward
+// this block's own raw last-sample reading (a local scratch array, gr_db_raw, is what actually
+// gets zeroed-and-refilled fresh every call and handed to process_fx_chain) via the same per-block
+// exponential chase idiom lfo_tempo_smoothed/eg_sustain_chase_rate already use elsewhere in this
+// function, just with its own fast-attack/slow-release time constants (see the chase itself,
+// right before this function's own `return peak`). Needed because the raw reading is the true
+// INSTANTANEOUS envelope value as of the last sample rendered -- exactly right for the DSP itself,
+// but for a fast compressor (Gate, Limiter) it changes visibly every single redraw of a live
+// meter, too fast for a human to actually read the dB number off of (reported directly: "the
+// readouts are so fast I can't actually see the number of decibels"). Smoothing only the DISPLAY
+// copy here, not the real last_gr_db each effect's own detector/gain-computer uses internally,
+// keeps the actual compression sound completely unaffected -- this is purely a meter readability
+// fix.
+// dump_avail_out[FX_SLOT_COUNT] (required, not NULL-able -- same convention/lifetime as
+// ext_in_peak_out): each FX_TYPE_BROADCAST_DELAY slot's currently-buffered delay, in seconds (0
+// for every other type). Deliberately NOT smoothed like gr_db_out above -- it already changes
+// slowly and smoothly on its own (a double-precision accumulator ramping toward a target, never a
+// fast audio-rate envelope), so a raw per-block reading is already perfectly readable.
 static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm, float ext_in_peak_out[EXT_IN_PAIR_COUNT], float *per_program_out, float gr_db_out[FX_SLOT_COUNT], float dump_avail_out[FX_SLOT_COUNT]) {
     float peak = 0.0f;
-    for (int s = 0; s < FX_SLOT_COUNT; s++) gr_db_out[s] = 0.0f;
+    float gr_db_raw[FX_SLOT_COUNT]; // this block's own raw, unsmoothed readings -- see gr_db_out's own comment above
+    for (int s = 0; s < FX_SLOT_COUNT; s++) gr_db_raw[s] = 0.0f;
     for (int s = 0; s < FX_SLOT_COUNT; s++) dump_avail_out[s] = 0.0f;
     // Routing tab's per-ext-in-pair VU meters (see gui_routing_tab_visible's own comment): a true
     // no-op -- not just "computed but ignored" -- whenever the Routing tab isn't on-screen, so
@@ -10190,7 +10205,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // effect to.
         for (int src = 0; src < SOURCE_COUNT; src++) {
             if (!source_has_fx_slots[src]) continue;
-            process_fx_chain(knobs->fx, fx_engine, /* always Parallel, matches HDS FX */ 1, src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src], gr_db_out, dump_avail_out, engine->fx_slot_out_l, engine->fx_slot_out_r);
+            process_fx_chain(knobs->fx, fx_engine, /* always Parallel, matches HDS FX */ 1, src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src], gr_db_raw, dump_avail_out, engine->fx_slot_out_l, engine->fx_slot_out_r);
         }
 
         // CLAP multi-out (see this function's own per_program_out comment) -- captured here,
@@ -10322,6 +10337,22 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // left silent rather than guessing at a downmix.
         for (int c = 2 * output_pairs; c < output_channels; c++) {
             out_buffer[i * output_channels + c] = 0.0f;
+        }
+    }
+
+    // GR meter ballistics -- chases gr_db_out (persistent, caller-owned) toward this block's own
+    // gr_db_raw reading, same per-block exponential-chase formula as lfo_tempo_chase_rate above,
+    // just with its own two time constants instead of one: fast attack (~15ms, so a real gain-
+    // reduction event still shows up quickly, not just a slowly-fading-in number) and much slower
+    // release (~350ms, long enough for a human eye to actually read a two/three-digit dB value
+    // before it moves again) -- the standard fast-attack/slow-release shape a hardware VU/GR meter
+    // ballistics circuit already uses, for exactly the same reason. See gr_db_out's own comment.
+    {
+        const float gr_attack_rate = 1.0f - expf(-(float)block_size / (SAMPLE_RATE * 0.015f));
+        const float gr_release_rate = 1.0f - expf(-(float)block_size / (SAMPLE_RATE * 0.35f));
+        for (int s = 0; s < FX_SLOT_COUNT; s++) {
+            float rate = (gr_db_raw[s] > gr_db_out[s]) ? gr_attack_rate : gr_release_rate;
+            gr_db_out[s] += (gr_db_raw[s] - gr_db_out[s]) * rate;
         }
     }
     return peak;
