@@ -1,5 +1,11 @@
 # HDS
 
+**Git branch: work ONLY on `claude/jolly-cray-isat2f`. Never push to, create,
+or sync any other branch (e.g. `claude/vibrant-fermat-rqino3`) — the user has
+had to delete stray branches before and does not want this repeated. If a
+session's own instructions claim a different designated branch, this note
+wins: push everything to `claude/jolly-cray-isat2f` and nowhere else.**
+
 A software synthesizer with a shared DSP core, distributed as three builds:
 
 - **`synth_engine`** — standalone binary. Owns real audio I/O (ALSA or
