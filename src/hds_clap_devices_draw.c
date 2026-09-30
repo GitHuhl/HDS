@@ -31,14 +31,14 @@ static const int HDS_DEV_BLOCKSIZE_VALUES[HDS_DEV_BLOCKSIZE_COUNT] = {32, 64, 12
 
 #ifdef HDS_STANDALONE_GUI_ENABLED
 // Mirrors frontend.py's own _LATENCY_PRESETS exactly.
-#define HDS_DEV_LATENCY_COUNT 4
+#define HDS_DEV_LATENCY_COUNT 5
 static const char *const HDS_DEV_LATENCY_LABELS[HDS_DEV_LATENCY_COUNT] = {
-    "Snappy (15ms)", "Normal (25ms)", "Safe (50ms)", "Extra Safe (100ms)",
+    "Extra Snappy (5ms)", "Snappy (15ms)", "Normal (25ms)", "Safe (50ms)", "Extra Safe (100ms)",
 };
-static const float HDS_DEV_LATENCY_VALUES[HDS_DEV_LATENCY_COUNT] = {15.0f, 25.0f, 50.0f, 100.0f};
+static const float HDS_DEV_LATENCY_VALUES[HDS_DEV_LATENCY_COUNT] = {5.0f, 15.0f, 25.0f, 50.0f, 100.0f};
 
 static int hds_dev_latency_index(float ms) {
-    int best = 1; float best_d = 1e9f; // default to Normal (25ms) if nothing matches exactly
+    int best = 2; float best_d = 1e9f; // default to Normal (25ms) if nothing matches exactly
     for (int i = 0; i < HDS_DEV_LATENCY_COUNT; i++) {
         float d = fabsf(HDS_DEV_LATENCY_VALUES[i] - ms);
         if (d < best_d) { best_d = d; best = i; }
