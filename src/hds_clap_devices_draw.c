@@ -3,7 +3,7 @@
 // behavior (voice-stealing ceiling, render-chunking) regardless of host, so they're built
 // unconditionally for hds.clap/hds_fx.clap/synth_engine alike.
 //
-// Everything else on frontend.py's own Audio/Devices tab -- ALSA output/input device pickers, the
+// Everything else on this Devices tab -- ALSA output/input device pickers, the
 // MIDI device picker, and Latency (ALSA buffer depth) -- is a standalone-app-only concept a CLAP
 // host already owns for its own plugins (device selection, buffer size, MIDI routing), so it's
 // compiled in only for synth_engine's own --gui, guarded by HDS_STANDALONE_GUI_ENABLED (defined
@@ -14,9 +14,8 @@
 // hds_standalone.c's own "Defensive: an empty device name..." comment) -- exactly the same
 // plain-field-write convention every other knob in this GUI already uses, no new plumbing needed.
 //
-// Block Size uses a fixed preset list (32/64/128/256/512/1024 samples, frontend.py's own
-// _BLOCK_SIZE_PRESETS) rather than a free-drag knob, matching its own QComboBox in frontend.py --
-// unlike a SpinBox's free integer range (Polyphony), a fixed small preset set is exactly the kind
+// Block Size uses a fixed preset list (32/64/128/256/512/1024 samples) rather than a free-drag
+// knob -- unlike Polyphony's own free integer range, a fixed small preset set is exactly the kind
 // of control this GUI already renders as a dropdown pill (Type/Slope/Waveform/Mode, ...) elsewhere.
 
 #define HDS_DEV_DROPDOWN_NONE 0

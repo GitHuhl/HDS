@@ -1,16 +1,16 @@
 // hds_clap_combi_draw.c: hds.clap's own Combi mode 8-lane mixer view (task #106) -- the Play tab's
 // own Mode toggle (Single/Combi, see hds_clap_play_draw.c's hds_clap_play_mode_toggle_rects() and
 // hds_clap_gui_draw.c's own HDS_CLAP_TAB_PLAY dispatch) switches into THIS view instead of the
-// oscillator/EG content when p->knobs.performance_mode == 1. Matches frontend.py's own
-// self.osc_combi_widget mixer-strip legend exactly: "#", "Level", "Pan", "Program", "MIDI Ch" --
-// one lane per programs[0..7]/seq_lanes[0..7] (COMBI_PROGRAM_COUNT), every lane independently
-// synthesizing, sharing one voice pool. backend.c's own render loop already does the real Combi
-// mixing unconditionally (see its "Combi lane Level/Pan" comment near active_program_count) --
+// oscillator/EG content when p->knobs.performance_mode == 1. A mixer-strip legend of "#", "Level",
+// "Pan", "Program", "MIDI Ch" -- one lane per programs[0..7]/seq_lanes[0..7] (COMBI_PROGRAM_COUNT),
+// every lane independently synthesizing, sharing one voice pool. backend.c's own render loop
+// already does the real Combi mixing unconditionally (see its "Combi lane Level/Pan" comment near
+// active_program_count) --
 // this file is purely the GUI half; simply flipping performance_mode via the Mode toggle is enough
 // to make a lane already carrying real programs[]/seq_lanes[] state audible.
 //
-// SCOPE for this pass: exactly the mixer-strip legend's own 5 columns. frontend.py's Combi view has
-// several further per-lane controls this file deliberately leaves out as real, separate follow-up
+// SCOPE for this pass: exactly the mixer-strip legend's own 5 columns. Several further per-lane
+// controls are left out as real, separate follow-up
 // work, not part of "the 8-lane mixer view" this task is scoped to: Key/Velocity zone (keyboard
 // split/velocity switch), Transpose, Save Combi/Load Combi (a whole separate .hdscombi-file format
 // referencing lanes BY NAME, itself session-level state), and the "Edit" button (jumps a lane's
@@ -21,9 +21,8 @@
 //
 // Program picker: a plain sorted dropdown of every ~/HDS_Programs/<name>/<name>.hdsprog (via
 // backend.c's own hds_scan_programs_folder(), re-scanned fresh on every open -- cheap, a small
-// local directory listing, never a hot path), NOT frontend.py's own nested-folder file browser --
-// every real Program lives flat under that one root, so a flat alphabetical list matches
-// frontend.py's own QComboBox exactly (_refresh_combi_program_combos()), and is far simpler than
+// local directory listing, never a hot path) -- every real Program lives flat under that one root,
+// so a flat alphabetical list is far simpler than
 // generalizing hds_fx_gui_browser.c's own directory-navigating browser (built for .nam/.wav models,
 // which can live anywhere) for a job that never needs navigation at all. Picking an entry calls
 // hds_load_program_file_to_combi_lane() directly (backend.c) -- no OSC round-trip, no frontend
@@ -36,11 +35,10 @@
 // scale limit (see this file's own dropdown renderer): comfortably covers real-world use (a few
 // dozen saved Programs) without building a second scrollable-list mechanism just for this.
 //
-// A picked name is cached here purely as a GUI-side label (matching frontend.py's own
-// combi_lane_program_choice) -- the backend has no "name of Program that produced these knob
-// values" concept, so this label is never part of a saved patch/session; a fresh GUI open shows
-// "(none)" for every lane regardless of what's actually loaded onto programs[], exactly like
-// frontend.py's own reconnect behavior.
+// A picked name is cached here purely as a GUI-side label -- the backend has no "name of Program
+// that produced these knob values" concept, so this label is never part of a saved patch/session;
+// a fresh GUI open shows "(none)" for every lane regardless of what's actually loaded onto
+// programs[].
 //
 // #include'd by clap_plugin.c right after hds_clap_play_draw.c (needs its HdsPlayKnobDrag/
 // hds_play_draw_knob()/hds_play_knob_hit_test()/hds_play_rect_contains()/hds_play_start_knob_drag()/
@@ -54,11 +52,9 @@
 // hds_load_program_file()'s own "reuse osc_dispatch_table, no OSC needed" posture in
 // hds_standalone.c (backend.c's own JSON reader + hds_scan_programs_folder() are shared with that
 // file; these two functions are CLAP-only, so they live here instead -- see backend.c's own
-// comment at the point they used to sit). Mirrors frontend.py's own
-// _apply_program_fields_to_combi_lane(), which does the same address-prefix rewrite (leading
-// "/hds" -> "/hds/combi/{lane_idx}") but over a live OSC bundle to a connected backend; this is the
-// in-process equivalent for the native GUI, applying straight into `knobs` since the GUI and the
-// audio thread already share it.
+// comment at the point they used to sit). Does the same address-prefix rewrite (leading
+// "/hds" -> "/hds/combi/{lane_idx}") an OSC-driven loader would, but in-process: applying straight
+// into `knobs` since the GUI and the audio thread already share it.
 // Deliberately does NOT touch sfz_file (a Program's own per-oscillator sampled zones) -- this
 // native GUI has no way to assign a Combi lane's own Multisample zones at all yet (see this file's
 // own header comment), so a Combi lane picked here gets every synthesis field (oscillators/

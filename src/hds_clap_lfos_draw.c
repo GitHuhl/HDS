@@ -1,21 +1,18 @@
 // hds_clap_lfos_draw.c: hds.clap's own LFOs tab -- all 16 PackLfoParams rows (Waveform/Curve-
-// Drive/Rate/Tempo-Sync/Depth/Phase/Key-Sync/Per-Key+Key-Track+Vel-Track/Destination), matching
-// frontend.py's own single scrollable list of 16 identical rows. Platform-agnostic like every
+// Drive/Rate/Tempo-Sync/Depth/Phase/Key-Sync/Per-Key+Key-Track+Vel-Track/Destination), one
+// scrollable list of 16 identical rows. Platform-agnostic like every
 // other tab file -- #include'd by clap_plugin.c after hds_clap_filters_draw.c, reusing the same
 // generic knob primitives (HdsPlayKnobDrag/hds_play_draw_knob/hds_play_knob_hit_test/
 // hds_play_start_knob_drag) that file already reuses from hds_clap_play_draw.c, rather than
 // duplicating them a third time.
 //
-// SCOPE for this pass: every control visible WITHOUT a right-click in frontend.py, same posture as
-// Play/Filters, PLUS Rate/Depth/Phase's own right-click "Modulate From" menu (hds_clap_play_draw.c's
-// generic HdsCtxMenu machinery, wired the same way as Play's oscillator Pitch/Phase/Pulse-Width and
-// Filters' Cutoff/Resonance). The Destination combo itself (100 real entries, `matrix_shared_routes`)
-// IS in scope too -- unlike Filter/Osc knobs, an LFO's whole reason to exist is routing its own
-// output somewhere, so this is the plain, always-visible way to do that, not a right-click extra.
-// Deliberately NOT here yet: Depth's own separate right-click "Modulation Source (CC)" menu
-// (mod_source_cc -- a live-MIDI multiplicative scale, unrelated to the additive "Modulate From"
-// routing). That field stays untouched by this pass's UI, same "don't reset what the Python GUI
-// already set" posture as Filters' own Key Track/ext-MIDI-CC deferral.
+// Rate and Phase each have their own right-click "Modulate From" menu, and Depth its own
+// right-click "Modulation Source (CC)" menu (HDS_CTXMENU_KIND_LFO_DEPTH -- mod_source_cc, a
+// live-MIDI multiplicative scale, unrelated to the additive "Modulate From" routing) -- all three
+// using hds_clap_play_draw.c's generic HdsCtxMenu machinery, the same way Play's oscillator
+// Pitch/Phase/Pulse-Width and Filters' Cutoff/Resonance already do. The Destination combo itself
+// (100 real entries) is always-visible, not a right-click extra -- unlike Filter/Osc knobs, an
+// LFO's whole reason to exist is routing its own output somewhere.
 //
 // hds_lfo_dest_label()/HDS_LFO_DEST_COUNT and the Destination dropdown's own grouped display order
 // (hds_dest_list_build/hds_dest_list_render/hds_dest_list_hit_test) now live in
@@ -36,8 +33,8 @@
 
 #define HDS_LFO_WAVE_COUNT 6
 static const char *const HDS_LFO_WAVE_NAMES[HDS_LFO_WAVE_COUNT] = {"Tri", "Sine", "RevSaw", "Sq", "Off", "Saw"};
-// Curve/Drive is meaningful only for these 4 shapes (Tri/Sine/RevSaw/Saw) -- matches
-// frontend.py's own wave-index-based show/hide exactly (indices 3=Sq/4=Off hide it).
+// Curve/Drive is meaningful only for these 4 shapes (Tri/Sine/RevSaw/Saw) -- indices 3=Sq/4=Off
+// hide it.
 static bool hds_lfo_wave_has_curve(int wave) { return wave == 0 || wave == 1 || wave == 2 || wave == 5; }
 
 #define HDS_LFO_KEYSYNC_COUNT 3

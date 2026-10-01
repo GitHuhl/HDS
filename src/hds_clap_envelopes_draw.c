@@ -8,28 +8,23 @@
 // uses -- this file reuses hds_lfo_dest_label()/HDS_LFO_DEST_COUNT/hds_dest_list_build() and
 // friends verbatim from hds_clap_play_draw.c rather than re-transcribing the list a second time).
 //
-// Layout mirrors frontend.py's own Envelopes tab exactly: 6 full-width ADSRPanel-equivalents
-// stacked vertically (NOT the Play tab's 4-across QHBoxLayout -- Amp EGs sit 4-up in their own
-// group box; assignable EGs stack one per row in a taller, scrollable list, same "doesn't fit,
-// needs scroll" situation the LFOs tab's own 16 rows already solved -- reuses that same whole-
-// list-scroll convention). Each panel's title row carries "EG N" + the Intensity knob + the
-// Destination pill (frontend.py's own `title_layout.addStretch()` then Int: label + dial + combo,
-// all in the ADSRPanel's own title bar, not a separate row) -- distinct from the Play tab's Amp
-// EG panels, whose title row instead carries a Vel->Amp knob (and, Osc1 only, the "1->All"/"Sync"
-// buttons) -- assignable EGs have none of that, they're pure modulation sources with no
-// oscillator of their own to scale and no live-mirror concept.
+// Layout: 6 full-width ADSRPanel-equivalents stacked vertically (NOT the Play tab's 4-across
+// layout -- Amp EGs sit 4-up in their own group; assignable EGs stack one per row in a taller,
+// scrollable list, same "doesn't fit, needs scroll" situation the LFOs tab's own 16 rows already
+// solved -- reuses that same whole-list-scroll convention). Each panel's title row carries "EG N"
+// + the Intensity knob + the Destination pill, all in the title bar, not a separate row --
+// distinct from the Play tab's Amp EG panels, whose title row instead carries a Vel->Amp knob
+// (and, Osc1 only, the "1->All"/"Sync" buttons) -- assignable EGs have none of that, they're pure
+// modulation sources with no oscillator of their own to scale and no live-mirror concept.
 //
-// SCOPE for this pass: same "everything visible without a right-click" cut as every prior tab.
-// The Intensity knob has no right-click menu at all in frontend.py (confirmed by reading every
-// setContextMenuCallback call site -- only Filter/Osc/LFO knobs get one), so nothing is deferred
-// there. The only deferred piece is the same one deferred everywhere else: each Destination-
-// targetable knob elsewhere (Filter Cutoff, LFO Rate/Depth/Phase, Osc Pitch/Phase/PulseWidth)
-// having its own right-click "Modulate From" menu that could list "EG 1".."EG 6" as a source --
-// that menu isn't wired up anywhere yet, on any tab, so an assignable EG's own Destination combo
-// (the ordinary, always-visible way it reaches a target) is the only routing path this native GUI
-// offers today, exactly like LFOs. The 🎲 "Randomize" button (frontend.py's own
-// randomize_assignable_egs) is also not ported -- a pure GUI convenience with no backend field of
-// its own, lowest priority of anything seen on any tab so far.
+// The Intensity knob has no right-click menu (only Filter/Osc/LFO knobs get one). Every
+// Destination-targetable knob elsewhere (Filter Cutoff, LFO Rate/Depth/Phase, Osc
+// Pitch/Phase/PulseWidth/Fine/Curve/Volume/Pan) has its own right-click "Modulate From" menu
+// listing "EG 1".."EG 6" as a source (hds_lfo_dest_label()/hds_dest_list_build() in
+// hds_clap_play_draw.c), so an assignable EG's own Destination combo here is one of two ways to
+// set up that same routing, not the only one -- same as LFOs. The 🎲 "Randomize" button is not
+// ported -- a pure GUI convenience with no backend field of its own, lowest priority of anything
+// seen on any tab so far.
 
 #define HDS_ENV_DROPDOWN_NONE 0
 #define HDS_ENV_DROPDOWN_MODE 1

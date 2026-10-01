@@ -3,8 +3,8 @@
 // output-routing section deliberately DIFFERS between the two hosts, gated by
 // HDS_STANDALONE_GUI_ENABLED (same per-TU macro convention as hds_clap_devices_draw.c's own
 // standalone-only sections): one row per real Source (the same 17, Program 1-8/Combi Mix/Ext In
-// 1-8, frontend.py's own SOURCE_NAMES list the FX tab's Source combo already ports -- see
-// hds_clap_source_label() in clap_plugin.c, reused here directly), each with, for the 8 Ext In rows
+// 1-8, the FX tab's own Source combo already uses -- see hds_clap_source_label() in clap_plugin.c,
+// reused here directly), each with, for the 8 Ext In rows
 // only, Enable/Gain/Stereo controls and a live VU meter, PLUS:
 //
 //   - hds.clap: a single Main Out toggle (source_routing[src].enable[0]) only. SCOPE DECISION
@@ -19,12 +19,12 @@
 //     by this GUI), so a save file or a future architecture change that actually wires up more CLAP
 //     outputs loses nothing.
 //   - the standalone app: the REAL, full 8-column source-to-output-pair grid (one checkbox per
-//     OUTPUT_PAIR_MAX column, exactly matching frontend.py's own Routing tab) -- its own
+//     OUTPUT_PAIR_MAX column) -- its own
 //     multichannel ALSA device genuinely makes every one of those 8 pairs audible (see
 //     render_audio_block()'s own output_pairs loop, driven by the real detected_output_channels).
-//     Not yet dynamically shown/hidden by the connected device's real channel count the way
-//     frontend.py's own _rebuild_routing_output_columns() does -- routing to a pair the device
-//     doesn't have is harmless (that same output_pairs clamp/zero-fill already discards it), so
+//     Not yet dynamically shown/hidden by the connected device's real channel count -- routing to
+//     a pair the device doesn't have is harmless (that same output_pairs clamp/zero-fill already
+//     discards it), so
 //     showing all 8 unconditionally is a correct, if not yet capability-aware, port. Tracked as
 //     real follow-up work, not attempted here.
 //
@@ -55,14 +55,13 @@ static void hds_clap_routing_view_state_init(HdsClapRoutingViewState *vs) {
 #define HDS_ROUTING_ROW_H 38.0
 #define HDS_ROUTING_KNOB_R 10.0
 
-// Standalone only: the real thing frontend.py's own Routing tab has always been (an 8-column,
-// many-to-many source-to-output-pair grid, one checkbox per OUTPUT_PAIR_MAX column -- see
-// SynthSharedControls.source_routing/OUTPUT_PAIR_MAX in backend.c) -- the standalone's own
-// multichannel ALSA device genuinely makes every one of the 8 pairs audible (render_audio_block's
-// own output_pairs = output_channels/2 loop), unlike hds.clap's hardcoded 2-channel process(). Not
-// dynamically shown/hidden by the currently-connected device's real channel count the way
-// frontend.py's own _rebuild_routing_output_columns() does (that needs a live detected-channel-count
-// field threaded into this draw file, real follow-up work) -- routing to a pair the connected
+// Standalone only: an 8-column, many-to-many source-to-output-pair grid, one checkbox per
+// OUTPUT_PAIR_MAX column -- see SynthSharedControls.source_routing/OUTPUT_PAIR_MAX in backend.c --
+// the standalone's own multichannel ALSA device genuinely makes every one of the 8 pairs audible
+// (render_audio_block's own output_pairs = output_channels/2 loop), unlike hds.clap's hardcoded
+// 2-channel process(). Not dynamically shown/hidden by the currently-connected device's real
+// channel count (that needs a live detected-channel-count field threaded into this draw file, real
+// follow-up work) -- routing to a pair the connected
 // device doesn't actually have is harmless (render_audio_block's own output_pairs clamp/zero-fill
 // already discards it), so showing all 8 unconditionally is a correct, if not yet
 // capability-aware, port.

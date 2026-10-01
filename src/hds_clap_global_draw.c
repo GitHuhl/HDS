@@ -1,16 +1,15 @@
-// hds_clap_global_draw.c: hds.clap's own persistent LEFT SIDEBAR -- ports frontend.py's own
-// always-visible "Global Configurations" panel (Voice Mode, Hard Sync, Pitch Bend Range,
+// hds_clap_global_draw.c: hds.clap's own persistent LEFT SIDEBAR -- the always-visible "Global
+// Configurations" panel (Voice Mode, Hard Sync, Pitch Bend Range,
 // Transpose, Microtuning, Sustain Pedal Polarity, FM Algorithm + depths, Glide Time/Random, Tempo,
-// Metronome, Arpeggiator) verbatim in both CONTENT and PLACEMENT: a fixed-width column down the
+// Metronome, Arpeggiator): a fixed-width column down the
 // left edge of the window, visible no matter which tab is active, not a tab of its own (an
-// earlier version of this port made it a "Global" tab instead -- wrong: frontend.py's own comment
-// at this panel's construction site is explicit that "there used to be a dedicated Global tab...
-// so the tab was removed" in favor of exactly this always-visible placement). Every control here
-// reads/writes p->knobs (SynthSharedControls, transpose/tuning/metronome -- session-level, matching
-// frontend.py's own _is_program_scope_address exclusions) or p->knobs.programs[SINGLE_PROGRAM_SLOT]
-// (everything else, Program-scoped) DIRECTLY, in-process -- unlike frontend.py's own OSC round trip
-// to a separate backend process, there is no transmit_knob_packet()-style bundling to replicate
-// here at all (see this repo's own README on the architecture difference between the standalone
+// earlier version of this port made it a "Global" tab instead -- wrong, since every tab would then
+// need to carry its own copy of these controls; this always-visible placement is correct). Every
+// control here reads/writes p->knobs (SynthSharedControls, transpose/tuning/metronome --
+// session-level) or p->knobs.programs[SINGLE_PROGRAM_SLOT]
+// (everything else, Program-scoped) DIRECTLY, in-process -- no OSC round trip to a separate backend
+// process, no bundling of any kind needed (see this repo's own README on the architecture
+// difference between the standalone
 // app and this in-process plugin).
 //
 // Deliberately NOT ported (disclosed scope boundary, not an oversight):
@@ -22,23 +21,22 @@
 //     so it IS ported below, reusing that same shared browser exactly like the Play tab's own
 //     Multisample ".sfz" loader does (hds_clap_play_draw.c) -- see this file's own Microtuning
 //     section further down.
-//   - Instance Switcher: a standalone-app-only concept (frontend.py's own OSC client can retarget
+//   - Instance Switcher: a standalone-app-only concept (an external OSC controller can retarget
 //     which separate backend PROCESS it talks to) -- this plugin has no separate backend process to
 //     switch to at all, so this control simply doesn't apply.
-//   - the live tempo readout label: frontend.py keeps a second read-only label in sync with the
-//     backend's OWN resolved tempo (which can diverge from the tempo_bpm knob once tempo markers
-//     are authored) via a live status-frame round trip. An EARLIER version of this comment claimed
-//     "the knob field IS what the audio engine reads every block, so nothing to build" -- true only
+//   - the live tempo readout label: a backend's OWN resolved tempo
+//     (which can diverge from the tempo_bpm knob once tempo markers
+//     are authored) isn't just that knob field's own value -- true only
 //     while Internal sync is selected; once a CLAP host's own transport tempo is in play
 //     (knobs.seq_sync_source == External, see the Tempo section's own Internal/DAW pill below and
 //     clap_plugin_process()'s own host-tempo-sync comment), the knob field is NOT what's actually
 //     running, so this pass DOES build a live readout for that case -- see host_tempo_bpm's own
 //     comment in hds_engine_instance.h.
 //   - Arp Octave Range/Rate/Hold: real, working, already-Program-scoped backend fields
-//     (arp_octave_range/arp_rate/arp_hold) with no widget in frontend.py's OWN Global panel either
-//     (a pre-existing gap in the Python reference, not something this port introduces or fixes).
-//   - The "Output" group box's VU meter, stacked below Global Configurations in frontend.py's own
-//     sidebar: a separate panel, not part of "Global Configurations" itself -- out of scope for
+//     (arp_octave_range/arp_rate/arp_hold) with no widget on this sidebar yet
+//     (a pre-existing gap, not something this port introduces or fixes).
+//   - The "Output" group box's VU meter, a separate panel, not part of "Global Configurations"
+//     itself -- out of scope for
 //     this port, real follow-up work (Master Volume itself, that same group box's other control,
 //     IS ported below -- as its own small section at the bottom of this sidebar rather than a
 //     separate panel, since there's no meter to justify a whole extra group box yet).
@@ -49,8 +47,7 @@
 // (which owns the tab-bar/tab-content region this sidebar sits beside -- see its own header comment
 // on how the two are composed together).
 
-// Fixed width, not resizable independently -- matches frontend.py's own left_sidebar_scroll
-// QScrollArea (setMaximumWidth(276), its content capped at 260) exactly: a permanent, constant-
+// Fixed width, not resizable independently: a permanent, constant-
 // width column, not a panel that grows/shrinks with the rest of the window. hds_clap_gui_draw.c
 // reads this same constant to know where the tab bar/content region starts.
 #define HDS_CLAP_GLOBAL_SIDEBAR_W 160.0 // a hardcoded pixel width (not a percentage of window_w -- see this file's own header comment); every sub-element below is laid out as a fraction of this one constant, so this is the only place a new width needs to change
@@ -64,7 +61,7 @@ typedef struct {
     int dropdown_kind; // HDS_GLOBAL_DROPDOWN_*
     HdsFxRect dropdown_anchor;
     HdsPlayKnobDrag knob_drag;
-    double scroll_offset_px; // the whole sidebar's own vertical scroll -- see hds_clap_lfos_draw.c's own identical field/convention; the stacked content is taller than a typical window, same as frontend.py's own left_sidebar_scroll QScrollArea
+    double scroll_offset_px; // the whole sidebar's own vertical scroll -- see hds_clap_lfos_draw.c's own identical field/convention; the stacked content is taller than a typical window
 } HdsClapGlobalViewState;
 
 static void hds_clap_global_view_state_init(HdsClapGlobalViewState *vs) { memset(vs, 0, sizeof(*vs)); }
@@ -91,10 +88,9 @@ static const char *const HDS_GLOBAL_FMALGO_NAMES[HDS_GLOBAL_FMALGO_COUNT] = {
     "9: 1->3->4", "10: Star", "11: Independent",
 };
 
-// 8 FM depth fields in a fixed order (matches frontend.py's own fm_depth_dials dict order, see
-// this file's own header comment) -- which ones are meaningful for a given algorithm mirrors
-// frontend.py's own FM_ALGORITHMS[n]["depths"] exactly (same "not every field applies to every
-// topology" convention as hds_clap_play_draw.c's own HDS_PLAY_EG_FIELD_ORDER).
+// 8 FM depth fields in a fixed order -- which ones are meaningful for a given algorithm (same "not
+// every field applies to every topology" convention as hds_clap_play_draw.c's own
+// HDS_PLAY_EG_FIELD_ORDER).
 #define HDS_GLOBAL_FM_DEPTH_COUNT 8
 static const char *const HDS_GLOBAL_FM_DEPTH_LABELS[HDS_GLOBAL_FM_DEPTH_COUNT] = {
     "2->1", "3->1", "3->2", "4->1",
@@ -141,10 +137,9 @@ static int hds_global_fm_depth_visible_fields(int algo, int *fields /* [8] */) {
     return n;
 }
 
-// One vertical column, top to bottom -- order matches frontend.py's own global_layout.addWidget()
-// call sequence exactly (Voice Mode -> Hard Sync -> Pitch Bend Range -> Transpose -> Microtuning ->
-// Sustain Pedal Polarity -> FM Algorithm -> Glide Time -> Glide Random -> Tempo -> Metronome ->
-// Arpeggiator), not the earlier 5-column-tab layout this port originally shipped with.
+// One vertical column, top to bottom (Voice Mode -> Hard Sync -> Pitch Bend Range -> Transpose ->
+// Microtuning -> Sustain Pedal Polarity -> FM Algorithm -> Glide Time -> Glide Random -> Tempo ->
+// Metronome -> Arpeggiator), not the earlier 5-column-tab layout this port originally shipped with.
 typedef struct {
     HdsFxRect poly_pill, mono_pill;
     HdsFxRect hardsync_pill;
@@ -286,7 +281,7 @@ static void hds_global_poll_scl_pick(HdsClapPlugin *p) {
 static void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalViewState *vs, double window_w, double window_h) {
     hds_global_poll_scl_pick(p);
     (void)window_w; // always HDS_CLAP_GLOBAL_SIDEBAR_W wide -- see this file's own header comment
-    hds_fx_rgb(cr, 0.12, 0.12, 0.145); // one shade lighter than the tab-content area, reads as a distinct panel (matches frontend.py's own bordered QGroupBox convention)
+    hds_fx_rgb(cr, 0.12, 0.12, 0.145); // one shade lighter than the tab-content area, reads as a distinct panel
     cairo_rectangle(cr, 0, 0, HDS_CLAP_GLOBAL_SIDEBAR_W, window_h);
     cairo_fill(cr);
 
@@ -334,8 +329,8 @@ static void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalV
     char freqtxt[16]; snprintf(freqtxt, sizeof(freqtxt), "%.1f Hz", p->knobs.tuning_reference_freq);
     hds_play_draw_knob(cr, L.tuning_freq_knob.x, L.tuning_freq_knob.y, L.tuning_freq_knob.w,
                         (float)((p->knobs.tuning_reference_freq - 20.0) / (2000.0 - 20.0)), false, "Ref Freq", freqtxt);
-    // Mirrors frontend.py's own tuning_scale_label text exactly ("No scale loaded (12-TET)" vs
-    // "Loaded: <basename>") -- see hds_tuning_load_scl()'s own g_tuning_table.loaded/description.
+    // "No scale loaded (12-TET)" vs "Loaded: <basename>" -- see hds_tuning_load_scl()'s own
+    // g_tuning_table.loaded/description.
     char scaletxt[144];
     if (g_tuning_table.loaded) snprintf(scaletxt, sizeof(scaletxt), "Loaded: %s", g_tuning_table.description);
     else snprintf(scaletxt, sizeof(scaletxt), "No scale loaded (12-TET)");

@@ -15,12 +15,16 @@
 // supplies both via CLAP's audio-ports/note-ports extensions (see the multi-out section below for
 // audio-ports specifically) -- but keeps its own control surface unchanged: this file starts its
 // own embedded OSC server (default ports 9010/9011, distinct from the standalone app's 9000/9001)
-// so frontend.py can drive it exactly as it drives the standalone app, just pointed at a different
-// port. The ~1150 knobs stay 100% OSC-driven; a CURATED subset of ~60 (see HDS_CLAP_PARAMS) is
+// so an external OSC controller can drive it exactly as it drives the standalone app, just pointed
+// at a different port. (The primary control surface is this plugin's own native embedded GUI --
+// see hds_clap_gui_x11.c/_win32.c's own k_gui_ext -- OSC remains available for external/scripted
+// control alongside it.) The ~1150 knobs stay 100% OSC-driven; a CURATED subset of ~60 (see
+// HDS_CLAP_PARAMS) is
 // ALSO exposed via a real `params` extension for host automation -- see that table's own comment
 // for why exhaustive (all ~1150) was deliberately not attempted. `state` (DAW project save/load)
-// is implemented too -- see its own section below. This project targets Linux only (see
-// shell.nix's own header comment), so there is no Windows build of this plugin, now or planned.
+// is implemented too -- see its own section below. This file itself is cross-compiled unchanged
+// for the Windows CLAP build too (mingw-w64, see the Makefile's clap-windows target and
+// hds_clap_gui_win32.c for that platform's own windowing shim).
 
 #include <stdarg.h>
 #include "../third_party/clap/include/clap/clap.h"
@@ -163,8 +167,9 @@ static bool clap_audio_ports_get(const clap_plugin_t *plugin, uint32_t index, bo
     info->in_place_pair = CLAP_INVALID_ID;
     if (is_input) {
         if (index >= (uint32_t)CLAP_INPUT_PORT_COUNT) return false;
-        // "Ext In 1".."Ext In 8" -- matches SOURCE_NAMES in frontend.py exactly, so an FX slot's
-        // Source dropdown and a DAW host's own port list name the same pair identically.
+        // "Ext In 1".."Ext In 8" -- matches hds_clap_source_label()'s own naming (see
+        // hds_engine_instance.h) exactly, so an FX slot's Source dropdown and a DAW host's own port
+        // list name the same pair identically.
         snprintf(info->name, sizeof(info->name), "Ext In %u", (unsigned int)(index + 1));
         info->flags = (index == 0) ? CLAP_AUDIO_PORT_IS_MAIN : 0;
         return true;
@@ -217,13 +222,12 @@ static const clap_plugin_note_ports_t k_note_ports_ext = {
 // to automate/ride live, not all ~1150 -- see this table's own field comments. Deliberately
 // scoped rather than exhaustive: backend.c's OSC_PARAMS[] (the single source of truth for every
 // knob's address/offset -- see its own comment) carries NO min/max/default metadata at all, since
-// nothing needed it before this -- every real range today lives only in frontend.py's widget
-// construction (e.g. PotentiometerKnob.setRange(...)). Exposing all ~1150 as CLAP params would
-// mean hand-authoring ~1150 rows of range metadata from scratch (a huge, error-prone undertaking
-// with no way to keep it in sync with frontend.py automatically), and would hand the host's own
-// automation-lane picker an unusably long flat list -- the same reason most commercial synth
-// plugins expose a curated "macro" parameter page rather than every internal register. This list
-// (~60 params, each range hand-verified against frontend.py's own widget construction) covers:
+// nothing needed it before this. Exposing all ~1150 as CLAP params would mean hand-authoring ~1150
+// rows of range metadata from scratch with no single existing source of truth to derive it from,
+// and would hand the host's own automation-lane picker an unusably long flat list -- the same
+// reason most commercial synth plugins expose a curated "macro" parameter page rather than every
+// internal register. This list (~60 params, each range hand-verified against this GUI's own knob
+// ranges) covers:
 // all 5 filters' Cutoff/Resonance, the post-filter 3-band EQ, each oscillator's Volume/Pan, each
 // oscillator's own Amp EG (Attack/Decay/Sustain/Release), all 12 FX slots' Mix, Master Volume, and
 // Transpose. Every entry addresses SINGLE_PROGRAM_SLOT (or a session-level field) exactly like an
@@ -584,8 +588,7 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
     cursor = first_newline + 1;
 
     // Clear whatever's currently loaded before applying the saved zones -- loading a project
-    // means "this project's own samples," not "add these on top of whatever was already there"
-    // (same posture frontend.py's own Program-load-with-SFZ path already established).
+    // means "this project's own samples," not "add these on top of whatever was already there."
     for (int s = 0; s < p->sample_slot_state.sample_slot_count; s++) {
         if (p->sample_slot_state.sample_slots[s].active) apply_zone_remove(&p->sample_engine, p->sample_slot_state.sample_slots[s].zone_id);
     }
@@ -674,15 +677,18 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
     // REVERTED: this used to also proactively push send_full_state_dump() here (and a matching
     // push in clap_plugin_activate()) to close the activate()/state.load() ordering race -- see
     // git history/README for the original reasoning. Backed out: an unsolicited push from here
-    // can arrive concurrently with a frontend's own in-flight /hds/request_state reply, and
+    // can arrive concurrently with a controller's own in-flight /hds/request_state reply, and
     // listen_for_status_frames() buffers every plain knob address into the SAME
     // _state_dump_buffer regardless of which request it logically belongs to (the wire protocol
     // has no request/response token to tell two overlapping dumps apart) -- so two dumps in
     // flight at once can interleave into one corrupted hybrid before either sentinel arrives,
     // which is worse than the original race, not a fix for it (confirmed: made the previously-
     // working close-and-reopen case intermittent too). The actual fix for the ordering race
-    // belongs on the frontend side instead, where retries can be sequenced one at a time -- see
-    // _begin_state_restore_guard()'s own comment in frontend.py.
+    // belongs on whichever controller sends /hds/request_state instead: it must serialize its own
+    // retries (never have two in flight at once) rather than this side attempting to guess when a
+    // dump is safe to send unsolicited. No controller in this repo currently implements that
+    // serialization (the one that used to, frontend.py, is gone) -- a real gap for any future
+    // controller that leans on this reply for DAW-patch-restore correctness, not just theoretical.
     return true;
 }
 
@@ -815,7 +821,7 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
         // specific handler for that address. /hds/request_state -- the entire "pull this
         // instance's live state on connect" mechanism a DAW-restored patch depends on -- was
         // silently, deterministically dead code from the moment it was added: not a race, not
-        // host-dependent, never worked once, regardless of any frontend.py-side fix. Registering
+        // host-dependent, never worked once, regardless of any controller-side fix. Registering
         // this catch-all LAST (after every specific method above) fixes it: liblo now reaches the
         // specific handler for any of those exact addresses first, and only truly falls through
         // to this catch-all for the ~1150 plain knob addresses that have no specific method of
@@ -1236,8 +1242,8 @@ static const clap_plugin_descriptor_t k_descriptor = {
     .manual_url = "",
     .support_url = "",
     .version = "1.0.0",
-    .description = "HDS synthesizer engine as a Linux CLAP instrument. OSC-controlled (frontend.py, "
-                    "default ports 9010/9011) -- no host-automatable parameters in this version.",
+    .description = "HDS synthesizer engine as a Linux CLAP instrument. Native embedded GUI, plus "
+                    "OSC control on ports 9010/9011 for external/scripted use.",
     .features = k_features,
 };
 

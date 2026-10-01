@@ -1,7 +1,8 @@
-// hds_clap_adsr.h: the Amp EG curve widget -- a Cairo port of frontend.py's own
-// InteractiveADSREnvelope (paintEvent/calculate_geometry/mousePressEvent/mouseMoveEvent). Every
-// constant, formula, and per-node drag rule below is copied verbatim from a standalone prototype
-// (adsr_widget.h) that was itself verified node-by-node against the Python source BEFORE being
+// hds_clap_adsr.h: the Amp EG curve widget -- originally a Cairo port of the old Qt frontend's own
+// InteractiveADSREnvelope (paintEvent/calculate_geometry/mousePressEvent/mouseMoveEvent), now the
+// only implementation. Every constant, formula, and per-node drag rule below is copied verbatim
+// from a standalone prototype (adsr_widget.h) that was itself verified node-by-node against that
+// Python source BEFORE being
 // wired into the real plugin here -- see hds_clap_play_draw.c's own header comment on how it's
 // actually used (the real source of truth is the backend's own PackEGParams/eg_mode fields; this
 // widget's own AdsrEnvelopeState is just a transient, per-render-call VIEW of them, converted by
@@ -24,9 +25,8 @@ typedef enum {
 } AdsrPointTag;
 
 typedef struct {
-    // env_type: 0=ADSR 1=AR 2=AD 3=ASR 4=AHD 5=DADSR 6=AHDSR -- same indices as frontend.py's
-    // combo_type ("ADSR","AR","AD","ASR","AHD","DADSR","AHDSR"), and the same indices this
-    // project's own backend.c stores directly in eg_mode[n].
+    // env_type: 0=ADSR 1=AR 2=AD 3=ASR 4=AHD 5=DADSR 6=AHDSR -- the same indices this project's
+    // own backend.c stores directly in eg_mode[n].
     int env_type;
     double delay, hold, attack, decay, sustain, release; // seconds (delay/hold/attack/decay/release), sustain 0..1
     double attack_level, attack_peak; // 0..1 fractions -- the (0,0) node's and the attack node's own level

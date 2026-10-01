@@ -850,9 +850,9 @@ static bool open_pcm_stream(const char *device_name, HdsStreamDirection stream, 
 #define HDS_DEVICE_PROMPT_MAX 32
 
 // Enumerates ALSA PCM device names (+ short descriptions) via snd_device_name_hint -- the same
-// information `aplay -L`/`arecord -L` print (frontend.py's own device dropdown already shells out
-// to those, see _list_alsa_devices() there), but through libasound directly, so this prompt needs
-// no external alsa-utils binary to be installed.
+// information `aplay -L`/`arecord -L` print (the native GUI's own device dropdown shells out to
+// those directly, see hds_scan_alsa_devices() below), but through libasound directly here, so this
+// prompt needs no external alsa-utils binary to be installed.
 static int enumerate_pcm_devices(HdsStreamDirection stream, char names[][AUDIO_DEVICE_NAME_LEN], char descs[][128], int max_devices) {
     void **hints = NULL;
     if (snd_device_name_hint(-1, "pcm", &hints) < 0) return 0;
@@ -1482,9 +1482,9 @@ static void *record_writer_thread_main(void *arg) {
 // comment (unchanged) and hds_apply_program_fields_to_combi_lane()'s comment for the Combi-lane
 // counterpart to hds_apply_program_fields() just below.
 
-// --- --program <path.hdsprog>: load a full Program (every field frontend.py's own Program Save
-// writes into "fields", scoped by _is_program_scope_address()) directly from the backend's own
-// local filesystem -- no frontend needs to ever connect, matching --sfz-vcoN's own posture. Reuses
+// --- --program <path.hdsprog>: load a full Program (every field within ProgramState's own
+// Save/Load boundary, see that struct's comment in backend.c) directly from the backend's own
+// local filesystem -- no controller needs to ever connect, matching --sfz-vcoN's own posture. Reuses
 // osc_dispatch_table (the exact same address->offset map generic_osc_handler() itself reads), so a
 // Program field can never mean something different here than it does live over OSC -- and reuses
 // hds_load_sfz_for_osc() for the "sfz_file" map, the exact same core --sfz-vcoN and
@@ -1521,9 +1521,8 @@ static void hds_apply_program_fields(SynthSharedControls *knobs, const HdsJsonVa
 }
 
 // sfz_file is {"<osc_index 0-3>": "<filename>"} -- filenames are relative to the .hdsprog's own
-// directory (exactly where Program Save wrote them, alongside the .hdsprog itself -- see
-// _pick_and_save_program()'s own sfz_map comment in frontend.py), so program_dir (the --program
-// path's own directory, resolved once by the caller) is joined on here.
+// directory (a saved Program's own .sfz files sit alongside the .hdsprog itself), so program_dir
+// (the --program path's own directory, resolved once by the caller) is joined on here.
 static void hds_apply_program_sfz_files(HdsSampleEngine *se, const HdsJsonValue *sfz_obj, const char *program_dir) {
     for (const HdsJsonMember *m = sfz_obj->first_member; m; m = m->next) {
         if (!m->key || m->value->type != HDS_JSON_STRING) continue;
@@ -1626,10 +1625,9 @@ static void hds_stdin_raw_mode_restore(void) {
 // same reasoning as the JSON reader's own relocation above.
 
 // Remembers the currently-loaded Program's name (best-effort -- seeded from --program at startup,
-// updated on every arrow-key cycle) so Left/Right can start cycling RELATIVE to it, matching
-// _cycle_program()'s own "if the current text matches a saved Program, cycle relative to it"
-// behavior in frontend.py -- an unrecognized/no current Program just starts at the first (Right) or
-// last (Left) saved Program instead, same as there.
+// updated on every arrow-key cycle) so Left/Right can start cycling RELATIVE to it if the current
+// name matches a saved Program -- an unrecognized/no current Program just starts at the first
+// (Right) or last (Left) saved Program instead.
 static char g_stdin_current_program_name[SAMPLE_PATH_LEN] = {0};
 
 static void hds_cycle_program(SynthSharedControls *knobs, HdsSampleEngine *se, int delta) {
@@ -1725,12 +1723,10 @@ static void poll_stdin_control(SynthSharedControls *knobs, HdsSampleEngine *se) 
 
 // Real ALSA/MIDI device enumeration for the native GUI's own Devices tab (standalone-only --
 // hds_clap_devices_draw.c's own header comment explains why hds.clap/hds_fx.clap never call these
-// at all: a CLAP host owns its own device selection). Mirrors frontend.py's own
-// _list_alsa_devices()/_list_midi_input_devices() exactly -- same tools (aplay/arecord -L,
-// aconnect -i), same parsing rules, same fallback-to-one-safe-entry-if-the-tool-is-missing
-// posture -- just done with popen()/fgets() instead of subprocess.run(), since this is C, not
-// Python. A real subprocess spawn+read, so only ever called from a "Rescan" click or the GUI's own
-// startup, never per-frame.
+// at all: a CLAP host owns its own device selection). Shells out to aplay/arecord -L and aconnect
+// -i via popen()/fgets() rather than using libasound directly (unlike enumerate_pcm_devices()
+// above), with a fallback to one safe entry if the tool itself is missing. A real subprocess
+// spawn+read, so only ever called from a "Rescan" click or the GUI's own startup, never per-frame.
 #define HDS_DEVLIST_MAX 24
 typedef struct {
     char names[HDS_DEVLIST_MAX][AUDIO_DEVICE_NAME_LEN];
@@ -1868,9 +1864,9 @@ int main(int argc, char **argv) {
     // ever connect" posture as --sfz-vcoN above.
     const char *cli_program_path = NULL;
     // --master-volume <0.0-1.0>: set the master volume once at startup -- independent of
-    // --program (a Program's own saved fields never include master_volume at all, see
-    // _is_program_scope_address()'s own comment in frontend.py, so there is no ordering to get
-    // right between the two flags: nothing about loading a Program can ever touch this value).
+    // --program (master_volume sits outside any Program's own field boundary, see ProgramState's
+    // comment in backend.c, so there is no ordering to get right between the two flags: nothing
+    // about loading a Program can ever touch this value).
     float cli_master_volume = 0.0f;
     bool cli_master_volume_set = false;
     // --gui: opt-in only (default OFF) -- this is the SAME headless OSC-controlled daemon it always
@@ -2050,8 +2046,7 @@ int main(int argc, char **argv) {
         // Program" behavior (see hds_cycle_program's own comment) -- just the basename minus its
         // extension, regardless of whether this path actually lives under ~/HDS_Programs. If it
         // doesn't match any name hds_scan_programs_folder() later finds, cycling gracefully falls
-        // back to starting at the first/last saved Program instead, same as an unrecognized name in
-        // frontend.py's own _cycle_program().
+        // back to starting at the first/last saved Program instead.
         const char *base = strrchr(cli_program_path, '/');
         base = base ? base + 1 : cli_program_path;
         snprintf(g_stdin_current_program_name, sizeof(g_stdin_current_program_name), "%s", base);

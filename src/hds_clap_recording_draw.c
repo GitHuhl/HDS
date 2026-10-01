@@ -1,7 +1,7 @@
 // hds_clap_recording_draw.c: the Recording tab -- standalone-app-only, like the Sequencer tab (see
 // hds_clap_gui_draw.c's own header comment on why both are 100% standalone-only: a DAW host already
-// owns recording/sequencing for its plugins, so hds.clap has no equivalent tab at all). Ports
-// frontend.py's own Recording tab: which sources to capture (the synth's own post-FX stereo output,
+// owns recording/sequencing for its plugins, so hds.clap has no equivalent tab at all). Covers
+// which sources to capture (the synth's own post-FX stereo output,
 // and/or up to RECORD_MAX_CHANNELS raw Input-device channels), Multichannel vs Stereo-Downmix, WAV
 // vs WavPack (see HDS_WAVPACK_ENABLED in hds_standalone.c) with WavPack's own Lossless/Hybrid,
 // Correction File, Compression Level and (Hybrid-only) target bitrate controls, an output folder,
@@ -21,7 +21,7 @@
 
 #ifdef HDS_STANDALONE_GUI_ENABLED
 
-#include <sys/stat.h> // mkdir() -- creating the output folder if it doesn't exist yet, same "os.makedirs(exist_ok=True)" posture frontend.py's own _generate_record_filename() has
+#include <sys/stat.h> // mkdir() -- creating the output folder if it doesn't exist yet
 
 typedef struct {
     bool folder_initialized; // lazy-inits p->record_folder to "~/HDS_Recordings" on first render -- see this file's own render function
@@ -110,8 +110,8 @@ static void hds_recording_ensure_folder_default(HdsClapPlugin *p, HdsClapRecordi
     snprintf(p->record_folder, sizeof(p->record_folder), "%s/HDS_Recordings", home ? home : "/tmp");
 }
 
-// Mirrors frontend.py's own _generate_record_filename() exactly: HDS_<timestamp>.<ext> inside the
-// remembered folder, ext chosen by record_format (WAV or WavPack's own "wv" -- a WavPack Hybrid
+// HDS_<timestamp>.<ext> inside the remembered folder, ext chosen by record_format (WAV or
+// WavPack's own "wv" -- a WavPack Hybrid
 // correction file, if requested, is a separate ".wvc" derived from this same path at record-start
 // time, see wavpack_recorder_start()'s own comment in hds_standalone.c). Called once, right before
 // the record_enable 0->1 edge the backend itself watches for (see hds_standalone.c's own comment
@@ -134,9 +134,8 @@ static void hds_recording_generate_path(HdsClapPlugin *p) {
     snprintf(p->knobs.record_path, RECORD_PATH_LEN, "%.*s/HDS_%.19s.%.3s", RECORD_PATH_LEN - 40, p->record_folder, stamp, ext);
 }
 
-// Same "gate the ability to START, never yank an in-progress take" posture as frontend.py's own
-// _update_record_button_enabled(): at least one source (Synth Output or any raw input channel) must
-// be selected before the Record button will do anything.
+// Gate the ability to START, never yank an in-progress take: at least one source (Synth Output or
+// any raw input channel) must be selected before the Record button will do anything.
 static bool hds_recording_any_source_selected(const HdsClapPlugin *p) {
     if (p->knobs.record_include_synth_output != 0.0f) return true;
     for (int c = 0; c < RECORD_MAX_CHANNELS; c++) if (p->knobs.record_input_channel_enable[c] != 0.0f) return true;
@@ -325,7 +324,7 @@ static bool hds_clap_recording_on_button_press(HdsClapPlugin *p, HdsClapRecordin
     if (hds_play_rect_contains(&L.record_btn, x, y)) {
         bool currently_recording = p->knobs.record_enable != 0.0f;
         if (!currently_recording) {
-            if (!hds_recording_any_source_selected(p)) return true; // matches frontend.py's own "button does nothing with no source selected" gating
+            if (!hds_recording_any_source_selected(p)) return true; // button does nothing with no source selected
             hds_recording_generate_path(p);
             p->knobs.record_enable = 1.0f;
         } else {

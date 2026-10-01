@@ -26,8 +26,8 @@
 // HdsSmfTrackImportContext/HdsSubscribeContext/HdsFxUploadContext, all defined there) and AFTER
 // hds_fx_gui_host.h (needs HdsFxGuiHost).
 
-// hds_clap_source_label: text for Source index `idx`, exactly matching frontend.py's own
-// SOURCE_NAMES construction (Program 1..COMBI_PROGRAM_COUNT, then Combi Mix, then Ext In
+// hds_clap_source_label: text for Source index `idx` (Program 1..COMBI_PROGRAM_COUNT, then Combi
+// Mix, then Ext In
 // 1..EXT_IN_PAIR_COUNT, then Drum Bus 1..DRUM_BUS_COUNT -- see DRUM_BUS_COUNT's own comment in
 // backend.c) so a slot's Source combo and a DAW host's own port names (see clap_plugin.c's own
 // clap_audio_ports_get()) name the same thing identically. Generic enough that the standalone
@@ -111,8 +111,7 @@ typedef struct {
     // Cairo GUI to read it from at all. This array is that missing persistent home: copied from the
     // scratch array at the end of every process() call (clap_plugin.c) or audio callback
     // (hds_standalone.c), then handed to hds_fx_gui_draw.c via gui_host.fx_gr_db (see
-    // HdsFxGuiHost's own comment) so the FX tab can draw a live per-slot dB readout, same as
-    // frontend.py's own fx_gr_labels.
+    // HdsFxGuiHost's own comment) so the FX tab can draw a live per-slot dB readout.
     float fx_gr_db[FX_SLOT_COUNT];
 
     // Same convention as fx_gr_db just above, for FX_TYPE_BROADCAST_DELAY's own per-slot dump-
@@ -203,7 +202,6 @@ typedef struct {
     // shared file browser's own `dest` points DIRECTLY at this field (no separate poll-and-clear
     // step needed, since picking a new folder has no immediate action to trigger -- it only matters
     // the next time Record is pressed). Defaults to "~/HDS_Recordings" the first time the Recording
-    // tab renders (see that file's own lazy-init comment), mirroring frontend.py's own
-    // self.record_folder default exactly.
+    // tab renders (see that file's own lazy-init comment).
     char record_folder[RECORD_PATH_LEN];
 } HdsClapPlugin;

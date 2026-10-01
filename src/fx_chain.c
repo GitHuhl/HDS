@@ -1133,8 +1133,9 @@ static void run_fx_tapedelay2(FXSlotEngine *engine, const FXSlotParams *params, 
     // strict subset of what Stereo Ping-Pong already does, and without the time divergence it's
     // the same easy-to-miss, barely-audible effect Ping-Pong originally shipped as (see this
     // effect's own comment history) -- no reason to keep a weaker redundant option once the
-    // stronger one exists. Only decoded when the slot's Type is actually this effect, per the
-    // "choice" param convention (see FX_TYPE_METADATA's own comment in frontend.py).
+    // stronger one exists. Only decoded when the slot's Type is actually this effect, per this
+    // codebase's usual "choice" param convention: a plain 0..1 fraction decoded into one of N
+    // discrete options, same idiom used throughout this file.
     bool stereo_pingpong = ((int)(fmaxf(0.0f, fminf(1.0f, params->param[6])) * 1.999f)) != 0;
 
     float baseSpeed = (powf(a, 4.0f) * 25.0f) + 1.0f;
@@ -2201,12 +2202,11 @@ typedef struct {
 
 // 0.0-1.0 fraction -> 20Hz-20kHz, log-spaced (equal knob distance = equal perceived pitch change,
 // same musical mapping a hardware EQ's own frequency knob uses) -- needed because, unlike the
-// Program EQ's own dedicated frontend dial (which is hardcoded directly to a 20-20000 Hz range,
-// see frontend.py's own eq_freq_dials), this FX slot's Freq params are two more generic P1-P10
-// dials like every other effect's params, which always transmit as a plain 0.0-1.0 fraction (see
-// FX_TYPE_METADATA's own comment in frontend.py) -- decoding that fraction into Hz is this
-// function's job, not the frontend's, matching how every other unit conversion in this file (dB,
-// ms, Q, ...) already happens backend-side.
+// Program EQ's own EqBandParams.freq field (a real Hz value directly, see that struct's own
+// comment in fx_types.h), this FX slot's Freq params are two more generic P1-P10 dials like every
+// other effect's params, which always transmit as a plain 0.0-1.0 fraction -- decoding that
+// fraction into Hz is this function's job, matching how every other unit conversion in this file
+// (dB, ms, Q, ...) already happens backend-side.
 static inline float fx_eq3_fraction_to_hz(float fraction) {
     fraction = fmaxf(0.0f, fminf(1.0f, fraction));
     return 20.0f * powf(1000.0f, fraction); // 20 * 1000^0 = 20Hz .. 20 * 1000^1 = 20000Hz

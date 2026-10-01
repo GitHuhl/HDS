@@ -13,8 +13,7 @@
 // (HdsFxPlugin for hds_fx.clap, or hds.clap's own plugin struct) actually owns the arrays, so this
 // same engine serves any such host unchanged.
 //
-// Layout model: modeled directly on the Standalone FX tab's own per-slot row (see frontend.py's own
-// FX_TAB construction, ~line 4919 onward) rather than a from-scratch paradigm -- ONE flat,
+// Layout model: ONE flat,
 // scrollable list of FX_SLOT_COUNT rows (32 -- see FX_SLOT_COUNT's own comment in hds_fx_plugin.c).
 // This is just a multi-FX: no "bus" concept anywhere, no global Series/Parallel switch (Parallel
 // mode's own existing chain_to_next semantics already reproduce plain Series exactly when every
@@ -127,9 +126,9 @@ static int hds_fx_type_param_count(int fx_type) {
 
 // Real, short per-param labels, ported directly from each FX_TYPE_*'s own doc comment in
 // fx_types.h (the authoritative description of what param[idx] actually does for that effect) --
-// abbreviated to fit this GUI's own compact knob column (frontend.py has room for a full combo-box
-// label; this flat list doesn't), never invented. Every knob is drawn with its own label directly
-// above it -- see hds_fx_draw_knob's own comment -- so nothing is ever a bare numbered pot.
+// abbreviated to fit this GUI's own compact knob column, never invented. Every knob is drawn with
+// its own label directly above it -- see hds_fx_draw_knob's own comment -- so nothing is ever a
+// bare numbered pot.
 static const char *hds_fx_type_param_label(int fx_type, int idx) {
     static const char *const ensemble[] = {"Depth", "Level"};
     static const char *const creamcoat[] = {"Select", "Regen", "DeRez", "PreDly", "Wet"};
@@ -449,7 +448,7 @@ static bool hds_fx_type_uses_nam_paths(int fx_type) { return fx_type == FX_TYPE_
 
 // The 8 FX types that report a live gain-reduction reading (see process_fx_chain()'s own switch
 // in fx_chain.c, the only place that fills gr_db_out[s] with anything other than the 0.0f
-// default) -- mirrors frontend.py's own FX_TYPE_GR_CAPABLE_INDICES exactly. Gates whether the GR
+// default). Gates whether the GR
 // dB readout (see HdsFxRowLayout's own gr_label comment) is drawn on a given row at all: on every
 // other type host->fx_gr_db[s] is simply always 0.0f (process_fx_chain() zeroes it for them), so
 // this isn't strictly needed for correctness, but showing a permanent "0.0 dB" next to, say, a
@@ -931,8 +930,7 @@ typedef struct {
     HdsFxRect mix_knob;
     // Only meaningful (and only drawn) when hds_fx_type_is_gr_capable() is true for this row's own
     // fx_type -- same "always-present rect, only sometimes meaningful" pattern as sidechain_pill/
-    // nam_model_pill above. Placed right after Mix, before Bypass -- matches frontend.py's own
-    // gr_label placement in its per-slot QHBoxLayout exactly (see that file's own gr_col comment).
+    // nam_model_pill above. Placed right after Mix, before Bypass.
     HdsFxRect gr_label;
     HdsFxRect bypass_btn;
     HdsFxRect chain_btn;
@@ -1146,7 +1144,7 @@ static int hds_fx_dropdown_option_count(const HdsFxGuiHost *p, int kind) {
         case HDS_FX_DROPDOWN_INPUT: return 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT + (FX_SLOT_COUNT - 1); // Off + 8 mono + 8 stereo + slot outputs
         case HDS_FX_DROPDOWN_OUTPUT: return 1 + HDS_FX_PORT_COUNT; // Off + 8 (always that port's real stereo pair)
         case HDS_FX_DROPDOWN_SIDECHAIN: return 1 + HDS_FX_PORT_COUNT; // "Same as Source" + 8
-        case HDS_FX_DROPDOWN_SOURCE: return p->source_count + (FX_SLOT_COUNT - 1); // no Off/Mono/Stereo suboptions -- matches frontend.py's own plain Source combo, plus the same slot-output section INPUT gets
+        case HDS_FX_DROPDOWN_SOURCE: return p->source_count + (FX_SLOT_COUNT - 1); // no Off/Mono/Stereo suboptions -- a plain Source combo, plus the same slot-output section INPUT gets
         case HDS_FX_DROPDOWN_OUT_PAIR: return 1 + p->output_pair_count; // Off (clears every pair) + one entry per real output pair
         case HDS_FX_DROPDOWN_ONAIR_MODE: return 2; // MIDI Trigger Enabled, Disabled -- two independent checkable toggles, see this kind's own comment
         default: return 0;
@@ -1882,8 +1880,8 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
 
         // Per-slot GR (gain reduction) dB readout -- see hds_fx_type_is_gr_capable()'s own comment
         // and HdsFxGuiHost.fx_gr_db's own comment. Only drawn for a GR-capable type on a host that
-        // actually supplied live data; mirrors frontend.py's own gr_label exactly (a tiny "GR"
-        // caption above a bold amber value, "%.1f" with no unit -- see its own gr_label comment).
+        // actually supplied live data: a tiny "GR" caption above a bold amber value, "%.1f" with no
+        // unit.
         if (p->fx_gr_db && hds_fx_type_is_gr_capable(fx_type)) {
             cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
             cairo_set_font_size(cr, 8);
@@ -1997,8 +1995,8 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
 // ---------------------------------------------------------------------------------------------
 
 // Slot reorder (Up/Down arrows): swaps two neighboring pool slots' whole FXSlotParams value --
-// type/params/mix/bypass/source/chain/sidechain all move together -- exactly matching frontend.py's
-// own _swap_fx_slots. FXSlotEngine is deliberately NOT touched: sync_fx_engine_types() already
+// type/params/mix/bypass/source/chain/sidechain all move together. FXSlotEngine is deliberately
+// NOT touched: sync_fx_engine_types() already
 // detects a type change at each index next block and reallocates accordingly, the same natural
 // reset an ordinary Type change already goes through -- there is nothing reorder-specific to do.
 // The caller (hds_fx_gui_on_button_press) is responsible for checking

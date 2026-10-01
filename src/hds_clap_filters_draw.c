@@ -1,25 +1,19 @@
 // hds_clap_filters_draw.c: hds.clap's own Filters tab -- the Chain Mode toggle, 5 flat
 // interchangeable filter slots (Freq/Res/Slope/Type), and the post-filter 3-band EQ (Low Shelf/
-// Mid Peak/High Shelf), matching frontend.py's own Filters tab layout (chain_mode_row + 5 stacked
-// "Filter N" group boxes + a "3-Band EQ (post-filter)" group box of 3 side-by-side bands, all in
-// one vertical column). Platform-agnostic like every other tab file (plain cairo_t*, no Xlib) --
+// Mid Peak/High Shelf), laid out as 5 stacked "Filter N" sections plus a "3-Band EQ (post-filter)"
+// section of 3 side-by-side bands, all in one vertical column. Platform-agnostic like every other
+// tab file (plain cairo_t*, no Xlib) --
 // #include'd by clap_plugin.c after hds_clap_play_draw.c, whose generic knob primitives
 // (HdsPlayKnobDrag/hds_play_draw_knob/hds_play_knob_hit_test/hds_play_start_knob_drag) this file
 // reuses directly rather than duplicating -- the exact same "generic primitive, reused verbatim by
 // a later tab file" pattern hds_clap_play_draw.c itself already used for hds_fx_gui_draw.c's own
 // hds_fx_draw_knob_arc()/hds_fx_rgb()/hds_fx_draw_pill().
 //
-// SCOPE for this pass: every control visible WITHOUT a right-click in frontend.py. Deliberately
-// NOT here yet, for the same reason Play tab's own "Modulate From" menu isn't (see that file's own
-// header comment -- it needs a real list of modulator sources, and the LFOs/Envelopes tabs that
-// would supply that list don't exist in this native GUI yet either): each Cutoff knob's own right-
-// click menu (Key Track preset + ext-MIDI CC source + "Modulate From"), and each Resonance knob's
-// own right-click "Modulate From" menu. The two Filter/Resonance right-click-only fields
-// (FilterParams.key_track/cutoff_mod_source_cc) keep whatever value they already have (0/-1 by
-// default -- see init_default_controls()) since nothing in this pass's UI ever touches them; a
-// user who set them via the Python GUI and then opens this one won't have them reset. EQ knobs
-// have no right-click menu in frontend.py at all (a post-filter EQ band's own 2-3 knobs are
-// constant for the whole block, never a mod-matrix destination -- see EqBandParams' own comment).
+// Each Cutoff knob has its own right-click menu (Key Track preset + ext-MIDI CC source +
+// "Modulate From", HDS_CTXMENU_KIND_FILTER_CUTOFF), and each Resonance knob its own right-click
+// "Modulate From" menu -- the same generic context-menu mechanism Play tab's own knobs use. EQ
+// knobs have no right-click menu at all (a post-filter EQ band's own 2-3 knobs are constant for
+// the whole block, never a mod-matrix destination -- see EqBandParams' own comment).
 
 #define HDS_FILT_DROPDOWN_NONE 0
 #define HDS_FILT_DROPDOWN_TYPE 1

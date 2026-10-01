@@ -1,14 +1,13 @@
 // hds_clap_gui_draw.c: hds.clap's own top-level GUI shell -- a persistent left sidebar (see
-// hds_clap_global_draw.c's own header comment: frontend.py's always-visible "Global
-// Configurations" panel, ported here as a fixed-width column beside the tab area rather than a
-// tab of its own) plus a tab bar (mirroring frontend.py's QTabWidget order: Play, Filters,
-// LFOs, Envelopes, FX, Routing, Devices, Recording, Sequencer -- MINUS Mapping and Sequencer, see
+// hds_clap_global_draw.c's own header comment: the always-visible "Global Configurations" panel,
+// a fixed-width column beside the tab area rather than a tab of its own) plus a tab bar (Play,
+// Filters, LFOs, Envelopes, FX, Routing, Devices, Recording -- MINUS Mapping and Sequencer, see
 // below) with per-tab dispatch.
 // Platform-agnostic like hds_fx_gui_draw.c itself (plain cairo_t*, no Xlib) -- hds_clap_gui_x11.c
 // is this file's own platform shim, same split for the same reason.
 //
 // Composition: the sidebar occupies x=[0, HDS_CLAP_GLOBAL_SIDEBAR_W), full window height, with NO
-// tab bar over it (frontend.py's own sidebar sits beside its QTabWidget, not inside it). The tab
+// tab bar over it. The tab
 // bar and every tab's own content occupy x=[HDS_CLAP_GLOBAL_SIDEBAR_W, window_w) instead -- see
 // hds_clap_gui_render()'s own cairo_translate() and every dispatch function's own x-offset
 // subtraction. HDS_CLAP_GUI_DEFAULT_W below already includes the sidebar's own width added on top
@@ -27,16 +26,15 @@
 // instance's own HdsClapPlugin directly (it needs ProgramState/PackEGParams fields no generic
 // HdsFxGuiHost view could expose, unlike the FX tab -- see hds_clap_play_draw.c's own header
 // comment on why it isn't shared with hds_fx.clap at all), through the same cairo_translate()
-// idiom as the FX tab. Single-Program mode only for now -- Combi mode's own separate 8-lane mixer
-// view is real, substantial follow-up work, tracked as its own task.
+// idiom as the FX tab. Combi mode's own separate 8-lane mixer view is real too (see
+// hds_clap_combi_draw.c), dispatched as a sibling of play_view rather than nested inside it.
 //
-// Every OTHER tab is a placeholder for now (a centered "not yet built" label) -- each becomes real
-// content in its own later commit (see the task list this session tracks). There used to be a
-// PERMANENT Mapping placeholder here too (a Sample Zone editor/mapping grid, deliberately out of
-// scope) -- removed entirely once native SFZ loading (the Play tab's own per-oscillator "Load
-// .sfz..." button, see hds_clap_play_draw.c) made it moot: there's no longer any native-GUI
-// workflow this tab would need to serve. frontend.py's own Mapping tab (SamplerMappingGrid) is
-// untouched by this -- it's a separate, still-functional legacy UI, not part of this native shell.
+// Every other listed tab (Filters, LFOs, Envelopes, Routing, Devices, Recording) has its own real
+// content now, each in its own draw file. There used to be a PERMANENT Mapping placeholder here
+// too (a Sample Zone editor/mapping grid, deliberately out of scope) -- removed entirely once
+// native SFZ loading (the Play tab's own per-oscillator "Load .sfz..." button, see
+// hds_clap_play_draw.c) made it moot: there's no longer any native-GUI workflow this tab would
+// need to serve, and no separate Mapping-tab UI exists anywhere else in this codebase either.
 //
 // #include'd by clap_plugin.c after hds_fx_gui_draw.c (needs HdsFxGuiViewState/hds_fx_gui_render/
 // hds_fx_gui_on_*) and hds_clap_play_draw.c (needs HdsClapPlayViewState), and after
@@ -65,17 +63,17 @@ typedef enum {
     HDS_CLAP_TAB_COUNT
 } HdsClapTab;
 
-// Order and labels match frontend.py's own addTab() call sequence (self.tab_widget.addTab calls,
-// ~line 5564 onward) -- see this file's own header comment -- MINUS Mapping, Recording, and
-// Sequencer, none of which exist here at all (not even as a placeholder tab): Mapping's own
+// Mapping and Sequencer never exist here at all (not even as a placeholder tab): Mapping's own
 // native-GUI placeholder was removed once the Play tab's per-oscillator "Load .sfz..." button made
-// it moot (see this file's own header comment); Recording/Sequencer are 100% standalone-only
-// (WavRecorder/the record_enable writer thread, and the Sequencer transport/lane/MIDI-playback
-// workflow respectively -- see clap_plugin_process()'s own comment on the latter), per explicit
-// product direction -- a DAW host already owns both recording and sequencing for its plugins.
+// it moot (see this file's own header comment); Sequencer is 100% standalone-only (the Sequencer
+// transport/lane/MIDI-playback workflow -- see clap_plugin_process()'s own comment), per explicit
+// product direction -- a DAW host already owns sequencing for its plugins. Recording is likewise
+// standalone-only (WavRecorder/the record_enable writer thread), which is why it's conditional on
+// HDS_STANDALONE_GUI_ENABLED both in the HdsClapTab enum above and the label array below, rather
+// than being excluded outright like Mapping/Sequencer.
 // "Global" is NOT a tab here at all (an earlier version of this port made it one) -- it lives in
-// the persistent left sidebar instead, alongside the tab bar/content, matching frontend.py's own
-// placement exactly. See hds_clap_global_draw.c's own header comment and this file's own header
+// the persistent left sidebar instead, alongside the tab bar/content. See
+// hds_clap_global_draw.c's own header comment and this file's own header
 // comment on how the sidebar and this tab bar compose together.
 static const char *const HDS_CLAP_TAB_LABELS[HDS_CLAP_TAB_COUNT] = {
     "Play", "Filters", "LFOs", "Envelopes", "FX", "Routing", "Devices",
@@ -156,9 +154,9 @@ static void hds_clap_gui_render_placeholder(cairo_t *cr, double w, double h, con
 
 static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewState *vs) {
     // Gates the Routing tab's own ext-in VU meters (see HdsClapPlugin.ext_in_peak's own comment) --
-    // mirrors frontend.py's own _on_main_tab_changed(), which sends /hds/gui/routing_tab_visible
-    // whenever the Routing tab becomes/stops being the active tab. Cheap and always correct to just
-    // set this on every redraw rather than hooking the tab-bar's own click handler specifically.
+    // set directly whenever the Routing tab becomes/stops being the active tab. Cheap and always
+    // correct to just set this on every redraw rather than hooking the tab-bar's own click handler
+    // specifically.
     p->knobs.gui_routing_tab_visible = (vs->active_tab == HDS_CLAP_TAB_ROUTING) ? 1.0f : 0.0f;
 
     // The persistent left sidebar -- full window height, no tab bar over it (see this file's own

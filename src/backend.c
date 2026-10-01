@@ -374,7 +374,9 @@ typedef struct {
     //   3. else -> normal Seq playback (or Audio-lane transport-driven playback), silenced by
     //      `mute` but still advancing in sync with the transport (so un-muting resumes exactly in
     //      step rather than picking up wherever it happened to be).
-    // All ignored entirely in Combi mode (see Combi's own hardcoded-Seq override in frontend.py).
+    // All ignored entirely in Combi mode -- performance_mode==1's own render path (see the "Combi
+    // lane Level/Pan" comment near active_program_count) never reads seq_mode/rec_armed/mute at
+    // all; only the Sequencer tab's own transport-driven playback (sequencer.c) does.
     float seq_mode;      // 0 = Seq, 1 = Off (a real bypass -- see precedence above)
     float mute;           // 0/1, independent of seq_mode/rec_armed (both Program/MIDI + Audio lanes)
     float rec_armed;      // 0/1, independent of seq_mode/mute (Program/MIDI lanes only -- Audio
@@ -419,145 +421,18 @@ typedef struct {
     float enable[OUTPUT_PAIR_MAX];
 } SourceRouting;
 
-// PACKET STRUCT: This is the exact byte layout the Python GUI packs.
-// BREAKING CHANGE (4-oscillator architecture): the envelope count grew from 6 to 7 (a new
-// dedicated Noise Osc Amp envelope was inserted as eg[2]/eg_mode[2], pushing the old EG 1-4
-// slots from eg[2..5] to eg[3..6]), and 10 new trailing float fields were added. The Python
-// side's struct.pack/unpack format MUST be regenerated to match -- this is not a compatible
-// wire change.
-// BREAKING CHANGE (filter overhaul): the old flat "3 stacked filters + 1 routing mode" section
-// (13 floats) was replaced by a 2-filter (A/B) architecture (23 floats) -- see the comment right
-// above the filter fields in this struct for the full layout. Running total after that change
-// was 151 float items:
-// 13 (baseline) + 56 (7 EGs * 8 params incl. attack start/peak level) + 23 (Filter A/B section, see below)
-// + 24 (4 LFOs * 6, incl. phase offset) + 4 (EG intensity) + 4 (EG dest target) + 7 (EG mode)
-// + 4 (unison saw width/detune) + 1 (mono glide randomization) + 2 (vco1/vco2 mute, decoupled from FM)
-// + 1 (hard sync) + 2 (vco1/vco2 phase offset)
-// + 2 (vco1/vco2 pulse width) + 4 (noise osc: vol/pan/mute/tilt) + 4 (sub osc: shape/vol/pan/mute) = 151
-// BREAKING CHANGE (FX bus + external input + device selection): added 2 floats (ext_in_enable,
-// ext_in_gain) + 132 floats (FX_SLOT_COUNT=12 slots * 11 floats each: fx_type, 8 generic params,
-// mix, bypass) + 2 fixed 64-byte device name strings (output_device, input_device -- not
-// floats; see AUDIO_DEVICE_NAME_LEN). Running total after that change was 285 float items + 128
-// string bytes.
-// BREAKING CHANGE (FX routing): added 1 float (fx_routing_mode, Series/Parallel -- see the
-// comment on that field). Running total after that change was 286 float items + 128 string
-// bytes.
-// BREAKING CHANGE (MIDI device selection): added 1 more fixed 64-byte string (midi_device --
-// not a float; see AUDIO_DEVICE_NAME_LEN). New total: 286 float items + 192 string bytes. The
-// Python side's struct.pack format changes from "286f64s64s" to "286f64s64s64s".
-// BREAKING CHANGE (pitch bend range, sustain pedal polarity, LFO Modulation Source): added 3
-// trailing floats (pb_range_up, pb_range_down, sustain_pedal_polarity) + grew PackLfoParams from
-// 6 to 7 fields (added mod_source_cc), i.e. +4 floats across the 4 LFOs = +7 floats total. New
-// total: 293 float items + 192 string bytes. The Python side's struct.pack format changes from
-// "286f64s64s64s" to "293f64s64s64s". (Mod matrix destinations 32-40, added the same round of
-// work, are new *values* an existing float (dest_target) can take -- they don't change the wire
-// layout.)
-// BREAKING CHANGE (6 assignable EGs, up from 4): ASSIGNABLE_EG_COUNT went 4 -> 6, so ENV_COUNT
-// (3 + ASSIGNABLE_EG_COUNT) went 7 -> 9. That grows eg[ENV_COUNT] by 2 entries (+16 floats, 8
-// params each) and eg_mode[ENV_COUNT] by 2 (+2 floats), plus eg_intensity/eg_dest_target each
-// grow from 4 to 6 elements (+2 floats each) -- total +22 floats. New total: 315 float items +
-// 192 string bytes. The Python side's struct.pack format changes from "293f64s64s64s" to
-// "315f64s64s64s".
-// BREAKING CHANGE (Filter A/B routing audit): filter_ab_routing_mode grew from a 2-way
-// Series/Parallel switch to a 3-way switch (0=Series A->B, 1=Series B->A [new], 2=Parallel
-// [was 1]), and Parallel's fixed 50/50 blend became the adjustable filter_ab_blend (+1 new
-// trailing float). New total: 316 float items + 192 string bytes. The Python side's
-// struct.pack format changes from "315f64s64s64s" to "316f64s64s64s".
-// BREAKING CHANGE (adjustable audio latency): added audio_latency_ms (+1 float), the Audio
-// tab's Latency control -- see open_pcm_stream(). New total: 317 float items + 192 string
-// bytes. The Python side's struct.pack format changes from "316f64s64s64s" to "317f64s64s64s".
-// BREAKING CHANGE (live polyphony + block size): MAX_VOICES and BUFFER_SIZE became hard
-// allocation ceilings (256 and 1024 respectively) instead of fixed values; added
-// active_voice_limit and block_size_frames (+2 floats), the Audio tab's Polyphony and Block
-// Size controls -- see effective_voice_limit()/effective_block_size(). New total: 319 float
-// items + 192 string bytes. The Python side's struct.pack format changes from "317f64s64s64s"
-// to "319f64s64s64s".
-// BREAKING CHANGE (Recording tab): added record_enable, record_include_synth_output,
-// record_downmix_stereo, record_input_channel_enable[RECORD_MAX_CHANNELS=16] (+19 floats) and
-// one new trailing fixed string, record_path[RECORD_PATH_LEN=256] (appended after midi_device,
-// so string bytes go from 192 to 448) -- see the WavRecorder functions/the recording block in
-// main(). New total: 338 float items + 448 string bytes. The Python side's struct.pack format
-// changes from "319f64s64s64s" to "338f64s64s64s256s".
-// BREAKING CHANGE (programmable Tempo): added tempo_bpm (the Tempo knob, global sidebar) +
-// tempo_marker_count + tempo_marker_time[TEMPO_MARKER_MAX=16] + tempo_marker_bpm[TEMPO_MARKER_MAX]
-// (+34 floats) -- see compute_current_tempo_bpm() and the Tempo section below. No new string
-// fields. New total: 372 float items + 448 string bytes. The Python side's struct.pack format
-// changes from "338f64s64s64s256s" to "372f64s64s64s256s".
-// BREAKING CHANGE (DFD sample playback / WAVE_SAMPLE): added sample_slot_root_note[
-// MAX_SAMPLE_SLOTS=16] (+16 floats) and one new trailing fixed string block,
-// sample_slot_path[MAX_SAMPLE_SLOTS][SAMPLE_PATH_LEN=256] (appended after record_path -- packs
-// as one flat 4096-byte blob, string bytes go from 448 to 4544) -- see load_sample_slot()/the
-// live-reload check in main(). This is deliberately the minimal wire shape needed to load and
-// test WAVE_SAMPLE end to end (see MAX_SAMPLE_SLOTS's comment) -- NOT the real per-note/velocity
-// zone mapping system, which is future work. New total: 388 float items + 4544 string bytes. The
-// Python side's struct.pack format changes from "372f64s64s64s256s" to "388f64s64s64s256s4096s".
-// BREAKING CHANGE (Sample Bank zone mapping / Mapping tab): added sample_slot_min_note[
-// MAX_SAMPLE_SLOTS], sample_slot_max_note[MAX_SAMPLE_SLOTS], sample_slot_min_velocity[
-// MAX_SAMPLE_SLOTS], sample_slot_max_velocity[MAX_SAMPLE_SLOTS], sample_slot_unpitched[
-// MAX_SAMPLE_SLOTS] (+80 floats, right after sample_slot_root_note[] -- see find_matching_
-// sample_slot()/apply_sample_slot_zone_metadata() and the Mapping tab in frontend.py). This is
-// the real per-note/velocity zone mapping the previous entry called out as future work: a note
-// now only sounds through a loaded slot whose key range AND velocity range both cover it
-// (find_matching_sample_slot()) -- a note outside every zone is silent, rather than the old
-// "nearest root note always plays something" behavior. sample_slot_unpitched (the Mapping tab's
-// Root Key dropdown's "DRUM (Unpitched)" entry) forces that slot's playback rate to 1.0 regardless
-// of which note in its zone triggered it, instead of pitch-shifting relative to root_note -- see
-// render_sample_osc's ratio calculation. No new string fields. New total: 468 float items + 4544
-// string bytes. The Python side's struct.pack format changes from "388f64s64s64s256s4096s" to
-// "468f64s64s64s256s4096s".
-// BREAKING CHANGE (Sampler feature expansion: loop editor + round-robin): added
-// sample_slot_loop_start[MAX_SAMPLE_SLOTS], sample_slot_loop_end[MAX_SAMPLE_SLOTS],
-// sample_slot_loop_enabled[MAX_SAMPLE_SLOTS], sample_slot_round_robin_group[MAX_SAMPLE_SLOTS]
-// (+64 floats, right after sample_slot_unpitched[]). Loop start/end travel as fractions (0.0-1.0)
-// of the file's own total_frames -- see apply_sample_slot_zone_metadata()'s conversion to real
-// frame indices and the Mapping tab's waveform loop editor in frontend.py, which never needs to
-// know a file's actual frame count. loop_enabled replaces load_sample_slot()'s old hardcoded
-// "always loop 40%-85%" default -- a slot with looping off now genuinely one-shots and releases
-// its stream at natural end (see render_sample_osc). round_robin_group lets several slots sharing
-// a group id and an overlapping zone cycle through each other on successive hits instead of the
-// same one always winning -- see find_matching_sample_slot(). No new string fields. New total:
-// 532 float items + 4544 string bytes. The Python side's struct.pack format changes from
-// "468f64s64s64s256s4096s" to "532f64s64s64s256s4096s".
-// BREAKING CHANGE (uncapped Sample Bank): removed every sample_slot_* field and the
-// sample_slot_path[][] blob entirely -- the whole Sample Bank now travels over its own dedicated,
-// event-driven socket (see zone_upsert_handler()/zone_remove_handler() and the
-// ZONE_OP_UPSERT/ZONE_OP_REMOVE messages), not this struct. It existed here only because the
-// catalog used to be capped at a small compile-time MAX_SAMPLE_SLOTS and could be broadcast in
-// full on every change like every other knob; a real multisample instrument's zone count has no
-// such product-facing cap now (see SAMPLE_SLOT_CAPACITY's comment), and resending thousands of
-// zones' worth of floats every time an unrelated filter knob moves was never sound design even
-// before the cap was lifted. apply_sample_slot_zone_metadata() and the MAX_SAMPLE_SLOTS-bounded
-// live-reload scan in main() are gone with it -- reconciliation now happens once per catalog
-// message, at receipt (or once a throttled deferred load completes), not every audio block. New
-// total: 372 float items + 448 string bytes (back to the shape just before the DFD/Sample Bank
-// work). The Python side's struct.pack format changes from "532f64s64s64s256s4096s" to
-// "372f64s64s64s256s".
-// BREAKING CHANGE (4-oscillator architecture + FM algorithms + dual Hard Sync + 16 LFOs +
-// WavPack recording): a large consolidated pass, folding in the still-undocumented "Osc3 +
-// initial FM algorithm fields" WIP work (fm_algorithm/fm_depth_3_1/fm_depth_3_2 + vco3_shape/
-// fine_tune/pitch_offset/phase_offset/unison_saw_detune/unison_saw_width -- vco3_vol/pan/mute/
-// pulse_width already existed, renamed in place from the old dedicated Noise oscillator's
-// noise_vol/pan/mute/tilt, net 0 field-count change) together with this pass's own additions:
-// - Sub retired outright, replaced by Osc4 -- a full peer of Osc1/2/3. vco4_vol/pan/mute/
-//   pulse_width (4, net 0 vs the old sub_shape/vol/pan/mute) plus 6 brand-new identity fields
-//   (vco4_shape/fine_tune/pitch_offset/phase_offset/unison_saw_detune/unison_saw_width).
-// - 5 new FM depth fields (fm_depth_4_1/4_3/1_2/3_4/1_3) for the 12-algorithm FM system: +5.
-// - ENV_COUNT (4 + ASSIGNABLE_EG_COUNT) grew from 9 to 10 for Osc4's own fixed amp envelope:
-//   eg[ENV_COUNT] +8 floats, eg_mode[ENV_COUNT] +1 float: +9.
-// - hard_sync renamed hard_sync_mode (0=Off/1=Parallel/2=Serial) -- net 0 field-count change.
-// - LFO_COUNT went 4 -> 16: PackLfoParams lfo[LFO_COUNT] (7 fields/LFO) grows by 12 LFOs * 7:
-//   +84. New wave_type value 4 = Off; LFOs 3-16 run at a decimated control rate -- neither
-//   changes the wire layout, only what values/behavior an existing field carries.
-// - record_format (WAV/WavPack format selector, Recording tab): +1.
-// Total added: 6 (vco3 identity) + 6 (vco4 identity) + 5 (new FM depths) + 9 (ENV_COUNT 9->10)
-// + 84 (LFO_COUNT 4->16) + 1 (record_format) = 111, plus the WIP work's fm_algorithm/
-// fm_depth_3_1/fm_depth_3_2 (+3, that WIP commit never updated this comment) = 114 floats. No
-// new string fields. New total: 486 float items + 448 string bytes. The Python side's
-// struct.pack format changes from "372f64s64s64s256s" to "486f64s64s64s256s".
+// ProgramState's own field layout below grew incrementally over many passes (4-oscillator
+// architecture, filter overhaul, FX bus, assignable EGs, Recording tab, Sample Bank zone mapping,
+// Sampler loop/round-robin, uncapped Sample Bank, 4-osc+FM+HardSync+16LFO consolidation, ...) --
+// see git history for the field-by-field record of each change, back when this struct's exact
+// byte layout had to match a hand-maintained Python struct.pack/unpack format one field at a time.
+// That constraint is gone now: every field is addressed by name over OSC (OSC_PARAMS[]), so
+// nothing on either end needs to agree on byte order or position, only on the address string.
 // One independently-synthesizing Program (oscillators, filters, EGs, LFOs, FM, tempo -- "the
-// patch"): everything frontend.py's _is_program_scope_address() already treats as Program-scoped
-// for Save/Load, reused verbatim as this struct's exact field boundary rather than re-deriving it
-// -- that boundary is already battle-tested by the save/load feature. Wrapping these fields in a
+// patch"): every field that belongs to a single patch's own Save/Load boundary lives here, in one
+// place, so nothing that ever reads or writes a .hdsprog file needs to re-derive that boundary
+// itself (see hds_load_program_file()'s own comment on the current reader side -- Save is still a
+// pending native-GUI feature, see README). Wrapping these fields in a
 // real ProgramState[COMBI_PROGRAM_COUNT + 1] array (instead of them living flat on
 // SynthSharedControls, as they did before Combi mode was real) is what makes independently-
 // configured, simultaneously-playing Programs possible: programs[0..7] are the 8 real Combi
@@ -575,10 +450,9 @@ typedef struct {
 // FX slots (fx[]/source_routing below), ext-in, and every other rig/
 // session-level field deliberately stay flat on SynthSharedControls, NOT in this struct -- those
 // are shared, physical-insert-like resources any Program (or the whole Combi stack) can be routed
-// into via fx_source, not part of any one patch. This is a small, deliberate refinement to
-// _is_program_scope_address's own current FX-slot handling (which still treats an FX slot's type/
-// mix/bypass/params as Program-scoped for Save/Load, a holdover from when there was only ever one
-// Program and the FX pool WAS that Program's own FX) -- see the "Real Combi mode" plan.
+// into via fx_source, not part of any one patch -- a deliberate refinement over an FX slot's
+// type/mix/bypass/params ever being treated as Program-scoped, a holdover from when there was only
+// ever one Program and the FX pool WAS that Program's own FX -- see the "Real Combi mode" plan.
 typedef struct {
     float is_polyphonic;
     float vco1_shape;
@@ -921,8 +795,8 @@ typedef struct {
     // redundant "why isn't this making sound" trap.
     float drum_bus_gain[DRUM_BUS_COUNT];
 
-    // Routing tab visibility (sent by the frontend on every QTabWidget.currentChanged, see
-    // frontend.py's own comment) -- gates render_audio_block's per-ext-in-pair peak metering
+    // Routing tab visibility (written directly by the native GUI's own tab-switch dispatch, see
+    // hds_clap_gui_draw.c) -- gates render_audio_block's per-ext-in-pair peak metering
     // (see ext_in_peak_out) so that cost is only ever paid while a player is actually looking at
     // the Routing tab's meters, not on every block for the life of the process. Session-level,
     // not Program-scoped -- a GUI-visibility flag, not a patch or even a rig property.
@@ -1009,14 +883,9 @@ typedef struct {
     // compression, ~40-60% smaller, converted to 24-bit PCM before encoding since WavPack -- like
     // FLAC -- losslessly compresses integer PCM, not float). Frozen into the writer thread's
     // RecordEngine.cmd_record_format at the same record-start edge as record_path, so a change
-    // mid-take never desyncs an already-open file. See wavpack_recorder_*/WavPackRecorder.
-    // Declared here (float #486, immediately before the 4 fixed-size string fields below) to
-    // match the Python side's "486f64s64s64s256s" packing order -- it was originally declared
-    // after record_path (the struct's actual last field), which put it 4 bytes into the string
-    // region once memcpy'd from the wire, shifting output_device/input_device/midi_device/
-    // record_path each by 4 bytes and truncating record_path's null-terminated content down to
-    // whatever garbage/zero bytes preceded it -- the cause of "[record] failed to open '' for
-    // writing" even when the frontend sent a real path.
+    // mid-take never desyncs an already-open file. See wavpack_recorder_*/WavPackRecorder. Its
+    // position in this struct carries no meaning -- every field is addressed by name via OSC_PARAMS'
+    // own offsetof(), never by wire position.
     float record_format;
 
     // WavPack-specific encoding options (Recording tab) -- meaningless when record_format is WAV,
@@ -1056,8 +925,9 @@ typedef struct {
     // event-driven socket instead (see zone_upsert_handler()/zone_remove_handler()
     // and the ZONE_OP_UPSERT/ZONE_OP_REMOVE messages), sent only when the catalog itself actually
     // changes, not broadcast in full on every unrelated knob turn like the fields in this struct
-    // are. See g_sample_slots[]/find_matching_sample_slot() for the backend-side catalog, and the
-    // Mapping tab in frontend.py for the editor.
+    // are. See g_sample_slots[]/find_matching_sample_slot() for the backend-side catalog; zones are
+    // populated via the /hds/zone/* OSC messages or by loading an .sfz file directly (the native
+    // GUI's own per-oscillator "Load .sfz..." button, or --sfz-vcoN at startup).
 
     // --- Combi/Sequencer scaffolding (data model + wire only -- see SEQ_LANE_COUNT's own
     // comment near the top of this file, and SeqLaneState's comment, for what this does and
@@ -1176,12 +1046,12 @@ typedef struct {
     // still reconnects automatically if that same-named device is unplugged and replugged.
     char midi_device[AUDIO_DEVICE_NAME_LEN];
 
-    // A user-settable label purely for the Instance Switcher's own scan results (see
+    // A user-settable label purely for an OSC controller's own instance-discovery scan results (see
     // ping_handler()/subscribe_handler() and README's own section on this) -- lets "port 9012" show
-    // up as "Track 3 Guitar Amp" instead. Session/rig identity, not patch content, so it's excluded
-    // from Program scope (_is_program_scope_address() in frontend.py) exactly like master_volume/
-    // transpose_semitones are -- loading a Program should never rename the instance it's loaded
-    // into. Empty by default; the frontend falls back to displaying host:port when empty.
+    // up as "Track 3 Guitar Amp" instead. Session/rig identity, not patch content, so it stays
+    // outside any Program's own field boundary exactly like master_volume/transpose_semitones do --
+    // loading a Program should never rename the instance it's loaded into. Empty by default; a
+    // controller displaying this falls back to host:port when empty.
     char instance_name[AUDIO_DEVICE_NAME_LEN];
 
     // Full filesystem path (not an ALSA device name, hence the bigger buffer than
@@ -3408,9 +3278,8 @@ static int hds_qsort_strcmp(const void *a, const void *b) {
     return strcmp(*(const char * const *)a, *(const char * const *)b);
 }
 
-// Sorted list of saved Program names -- one per ~/HDS_Programs/<name>/<name>.hdsprog subfolder,
-// mirroring _scan_programs_folder() in frontend.py exactly (same folder convention, same
-// alphabetical order) so hds_standalone.c's own arrow-key Program cycling and hds.clap's own native
+// Sorted list of saved Program names -- one per ~/HDS_Programs/<name>/<name>.hdsprog subfolder, in
+// alphabetical order, so hds_standalone.c's own arrow-key Program cycling and hds.clap's own native
 // Combi-lane Program picker (hds_clap_combi_draw.c) both see the identical list. Caller owns the
 // returned array (and each of its strings) via free(); returns NULL (out_count 0) if
 // ~/HDS_Programs doesn't exist or has no saved Programs.
@@ -3430,7 +3299,7 @@ static char **hds_scan_programs_folder(int *out_count) {
         char check_path[SAMPLE_PATH_LEN + 2 * (NAME_MAX + 1) + 16]; // root + "/" + d_name + "/" + d_name + ".hdsprog"
         snprintf(check_path, sizeof(check_path), "%s/%s/%s.hdsprog", root, ent->d_name, ent->d_name);
         FILE *f = fopen(check_path, "r");
-        if (!f) continue; // not a valid Program subfolder -- same test frontend.py's own scan uses
+        if (!f) continue; // not a valid Program subfolder -- a matching .hdsprog is the whole test
         fclose(f);
         if (count >= cap) {
             cap = cap ? cap * 2 : 8;
@@ -3483,10 +3352,10 @@ static void osc_error_handler(int num, const char *msg, const char *path) {
     fprintf(stderr, "[osc] liblo error %d (%s): %s\n", num, path ? path : "?", msg);
 }
 
-// --- "/hds/request_state": lets a frontend that just connected pull the CURRENT live state
+// --- "/hds/request_state": lets a controller that just connected pull the CURRENT live state
 // instead of blindly pushing its own GUI defaults (which used to silently overwrite, say, a DAW-
-// restored CLAP patch the instant frontend.py's old boot-time transmit_knob_packet() broadcast
-// landed -- see the fix that added this whole request/reply pair). Reuses osc_dispatch_table
+// restored CLAP patch the instant a naive boot-time broadcast of every knob's own default landed --
+// see the fix that added this whole request/reply pair). Reuses osc_dispatch_table
 // (the exact same address->offset map generic_osc_handler() itself reads), so this can never
 // name-drift from what the live knob addresses actually mean. ---
 
@@ -3538,29 +3407,28 @@ static int request_state_handler(const char *path, const char *types, lo_arg **a
     (void)path; (void)types; (void)argv; (void)argc;
     HdsStateRequestContext *ctx = (HdsStateRequestContext *)user_data;
     // Reply to whoever actually sent this request (lo_message_get_source), not ctx->reply_addr's
-    // own fixed, startup-configured target -- this is what lets a frontend pull an instance's full
-    // state regardless of whether it's the one --osc-reply-host/--osc-reply-port (or CLAP's own
-    // paired port) originally pointed at, e.g. the Instance Switcher scanning/connecting to a
-    // DIFFERENT already-running instance than whichever frontend it was launched alongside. The
-    // source address liblo hands back here is exactly the socket the request arrived FROM -- see
-    // frontend.py's own comment on sending this one message from status_sock directly, not the
-    // general osc_client, so that source is its real listening address, not an unrelated ephemeral
-    // send-only port nothing is listening on.
+    // own fixed, startup-configured target -- this is what lets a controller pull an instance's
+    // full state regardless of whether it's the one --osc-reply-host/--osc-reply-port (or CLAP's
+    // own paired port) originally pointed at, e.g. after scanning for and connecting to a
+    // DIFFERENT already-running instance than the one it started out pointed at (see ping_handler's
+    // own comment below). The source address liblo hands back here is exactly the socket the
+    // request arrived FROM, so a controller MUST send this one message from its own actual
+    // listening socket, not an unrelated ephemeral send-only port nothing is listening on.
     lo_address source = lo_message_get_source(msg);
     send_full_state_dump(source, ctx->knobs);
     return 0;
 }
 
-// --- Instance Switcher support: "/hds/ping" (discovery) and "/hds/subscribe" (redirect this
-// instance's own ongoing status pushes) --- see README's own "Instance Switcher" section for the
-// full design. Both are registered per-instance (not via the generic catch-all), same reasoning as
-// request_state above.
+// --- Multi-instance discovery: "/hds/ping" (discovery) and "/hds/subscribe" (redirect this
+// instance's own ongoing status pushes) -- for a controller managing more than one running
+// instance (e.g. one per track) to find and address each by its own instance_name. Both are
+// registered per-instance (not via the generic catch-all), same reasoning as request_state above.
 
-// A frontend scanning for reachable instances blasts this at a candidate host:port list and
+// A controller scanning for reachable instances blasts this at a candidate host:port list and
 // collects whoever answers within a short timeout -- "replied just now" IS the liveness proof,
 // no separate registry/heartbeat bookkeeping needed. Reply-to-sender (see request_state_handler's
-// own comment) -- frontend.py sends this from its own status_sock so the reply lands back at its
-// actual listening port, not an unrelated scan-only socket.
+// own comment) -- a controller MUST send this from its own actual listening socket so the reply
+// lands back at its real listening port, not an unrelated scan-only socket.
 static int ping_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argv; (void)argc;
     const SynthSharedControls *knobs = (const SynthSharedControls *)user_data;
@@ -3923,7 +3791,8 @@ static void mono_stack_remove(MonoNoteStack *stack, int note) {
 // Sample playback itself is adapted to HDS's own mature EG/filter/LFO/mod-matrix/FX-bus pipeline
 // (see render_sample_osc's comment) rather than bringing in a parallel one. Zone selection --
 // which loaded slot a given (note, velocity) actually plays -- is the real per-note/velocity
-// mapping system (SFZ-style): see find_matching_sample_slot() and the Mapping tab in frontend.py.
+// mapping system (SFZ-style): see find_matching_sample_slot(), populated via the /hds/zone/* OSC
+// messages or by loading an .sfz file directly.
 
 // HDS_SFZ_TRIGGER_*: SampleSlot.trigger_type/ZoneRecordWire.trigger_type values, mirroring SFZ's
 // own trigger= opcode. ATTACK (0, the default -- every zone that never sets trigger= at all, and
@@ -4316,8 +4185,8 @@ static bool load_sample_slot(HdsSampleEngine *se, int index, const char *path, i
 
 // Header-only counterpart to load_sample_slot()'s own RIFF chunk walk (same chunk-skip shape,
 // stopping right after reading data_size, with none of the pre-roll PCM decode that follows) --
-// the C-side SFZ parser's own equivalent of frontend.py's _wav_total_frames, needed to convert
-// loop_start=/loop_end=/offset=/end= (given in the SFZ file as absolute sample frames) into the
+// needed by the SFZ parser to convert loop_start=/loop_end=/offset=/end= (given in the SFZ file as
+// absolute sample frames) into the
 // 0-1 fractions ZoneRecordWire actually carries. Deliberately a small, independent duplicate of
 // load_sample_slot()'s chunk-walk rather than a shared sub-helper both call -- load_sample_slot()
 // is a heavily-exercised, already-correct hot path; this keeps that function untouched.
@@ -4363,20 +4232,16 @@ static bool read_wav_frame_count(const char *path, unsigned int *out_total_frame
 
 // ============================================================================
 // Native SFZ file parser -- lets the backend load a multisample instrument directly from a local
-// .sfz file, without any frontend ever having been connected (see the CLI --sfz-vcoN flags and
-// the /hds/zone/load_sfz OSC method, both further down, which are the two things that actually
-// call sfz_parse_file()/hds_load_sfz_for_osc()). Mirrors frontend.py's own _parse_sfz()/
-// _build_zones_from_sfz() opcode table and inheritance rules exactly (see each function's own
-// comment for the specific correspondence) so the two loading paths -- a frontend's rich,
-// warning-reporting Python import, and this backend-native path -- produce equivalent zones.
-// #define/$variable macros are NOT supported here either, matching the Python parser's own
-// documented limitation: a region using one is skipped (its sample= fails to resolve), never
-// crashed on or silently mis-mapped.
+// .sfz file, without any external controller ever having been connected (see the CLI --sfz-vcoN
+// flags and the /hds/zone/load_sfz OSC method, both further down, which are the two things that
+// actually call sfz_parse_file()/hds_load_sfz_for_osc()). #define/$variable macros are NOT
+// supported: a region using one is skipped (its sample= fails to resolve), never crashed on or
+// silently mis-mapped.
 // ============================================================================
 
-// One <region>'s recognized opcodes, built the same way the Python importer's per-region dict is
-// (SFZ inheritance: a region starts as a copy of its enclosing <group>/<global> and each opcode
-// line overwrites its own field, last-value-wins). A bounded struct-of-optional-fields instead of
+// One <region>'s recognized opcodes (SFZ inheritance: a region starts as a copy of its enclosing
+// <group>/<global> and each opcode line overwrites its own field, last-value-wins). A bounded
+// struct-of-optional-fields instead of
 // a generic string map, since HDS's supported opcode set is fixed and small. Text-valued fields
 // are used wherever the raw string needs deferred numeric interpretation (lokey/hikey/
 // pitch_keycenter as note-name-or-int; loop_start/loop_end/offset/end as frame counts, which need
@@ -4511,9 +4376,8 @@ typedef struct {
 // thread) -- same "audio-thread-only, no cross-thread sync needed" posture those already have.
 static SfzRegion g_sfz_parse_scratch[SFZ_MAX_REGIONS_PER_FILE];
 
-// Mirrors _sfz_note_to_number(): bare MIDI int, or a note name like "C4"/"F#3"/"Ab-1" (C4=60,
-// 's' accepted as an alternate sharp spelling same as the Python side). Returns -1 (the C
-// equivalent of Python's None here) on unparseable/out-of-range input.
+// Bare MIDI int, or a note name like "C4"/"F#3"/"Ab-1" (C4=60, 's' accepted as an alternate sharp
+// spelling). Returns -1 on unparseable/out-of-range input.
 static int sfz_note_to_number(const char *value) {
     if (!value || !*value) return -1;
     // Bare integer (allowing a leading '-' for the theoretical negative case, though notes are
@@ -4596,7 +4460,7 @@ static bool sfz_resolve_sample_path(const char *sample_value, const char *sfz_di
 
     // Case-insensitive filename fallback: only the basename needs matching (a sample= value with
     // its own subdirectory prefix that merely differs in case is rare enough not to be worth
-    // walking -- same practical scope the Python importer's own fallback covers).
+    // walking a full recursive search for).
     const char *base = strrchr(normalized, '/');
     base = base ? base + 1 : normalized;
     for (int d = 0; d < candidate_dir_count; d++) {
@@ -4826,8 +4690,8 @@ static void sfz_tokenize_and_apply(const char *text, const char *base_dir, SfzRe
                 // is both correct for multi-file libraries (each #include'd file's own regions
                 // resolve against ITS OWN directory, not the top-level file's) and cheaper than
                 // re-resolving per region. Left as the raw, unresolved value if resolution fails
-                // -- that zone's own load simply fails later (logged, slot deactivated), the same
-                // "skip, don't crash" outcome the Python importer's own warning-and-skip gives.
+                // -- that zone's own load simply fails later (logged, slot deactivated) rather than
+                // crashing on an unresolved path.
                 char resolved[SAMPLE_PATH_LEN];
                 if (sfz_resolve_sample_path(value, base_dir, out_default_path[0] ? out_default_path : NULL, resolved, sizeof(resolved))) {
                     snprintf(active->sample, sizeof(active->sample), "%s", resolved);
@@ -7776,8 +7640,8 @@ typedef struct {
 // impractical to ship over a control-protocol UDP connection, while a .nam model or cab IR is
 // typically well under a few MB -- small enough that "just send the bytes" is actually useful
 // rather than requiring a shared network filesystem. A same-machine load keeps using the plain
-// path fields above unchanged -- see frontend.py's _load_nam_model()/_load_nam_ir(), which only
-// switches to this upload protocol when the current target isn't local.
+// path fields above unchanged -- a controller only needs to switch to this upload protocol when
+// the current target isn't local.
 //
 // Three-message protocol, ONE shared receive buffer (see HdsEngineState's own field comment on why
 // not per-slot): upload_begin allocates/resets it, upload_chunk writes into it at an explicit byte
@@ -7786,8 +7650,9 @@ typedef struct {
 // writing anything to disk or touching a real FX slot's path at all. Unlike the periodic status
 // stream (fine to silently drop a stale value -- a fresher one is always coming), a truncated or
 // corrupted upload must never reach hds_nam_create()/the WAV loader as if it were the real file, so
-// a verification failure here just discards the buffer and reports it; frontend.py detects this
-// from the /hds/status/fx_upload_result reply and retries the WHOLE transfer from scratch --
+// a verification failure here just discards the buffer and reports it via the
+// /hds/status/fx_upload_result reply -- a controller detects this and retries the WHOLE transfer
+// from scratch --
 // simpler than a per-chunk ACK/retry scheme, and given how small these files are and how cheap a
 // retry is, a perfectly adequate answer to "OSC/UDP is not a reliable transport."
 //
@@ -8505,11 +8370,10 @@ static int song_import_smf_handler(const char *path, const char *types, lo_arg *
         snprintf(addr, sizeof(addr), "/hds/status/smf_import/marker/%d/label", i);
         m = lo_message_new(); lo_message_add_string(m, result.marker_label[i]); lo_bundle_add_message(b, addr, m);
     }
-    // Tempo map values, if applied -- so the frontend can cache them and keep echoing them back
-    // on every future transmit_knob_packet() call (which resends every knob's CURRENT value on
-    // any change, tempo markers included -- without its own cached copy, the very next unrelated
-    // knob tweak would blast the just-imported tempo map back to flat/zero; see frontend.py's own
-    // transmit_knob_packet() comment on this exact block).
+    // Tempo map values, if applied -- so a controller that resends every knob's own current value
+    // on any change (tempo markers included) can cache these and keep echoing them back, rather
+    // than blasting the just-imported tempo map back to flat/zero on the very next unrelated knob
+    // tweak for lack of its own cached copy.
     if (result.tempo_applied) {
         const ProgramState *prog = &ctx->knobs->programs[SINGLE_PROGRAM_SLOT];
         int n = (int)prog->tempo_marker_count;
@@ -9479,8 +9343,9 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
             float mod_vco1_phase = 0.0f, mod_vco2_phase = 0.0f, mod_vco3_phase = 0.0f, mod_vco4_phase = 0.0f;
             // Unison Saw Detune Width as a mod destination (new).
             float mod_vco1_unison_detune = 0.0f, mod_vco2_unison_detune = 0.0f, mod_vco3_unison_detune = 0.0f, mod_vco4_unison_detune = 0.0f;
-            // Pan/Pulse Width/Noise/Sub as mod destinations (targets 32-48 -- see the
-            // matrix_shared_routes comment in frontend.py for the full list). Pan mods are
+            // Pan/Pulse Width/Noise/Sub as mod destinations (targets 32-48 -- see
+            // hds_lfo_dest_label()/hds_dest_list_build() in hds_clap_play_draw.c for the full,
+            // current list of what each target number means). Pan mods are
             // applied directly (same convention as Phase); the rest get a scale factor sized so
             // a unity-depth LFO/EG sweeps the whole musically useful range.
             float mod_vco1_pan = 0.0f, mod_vco2_pan = 0.0f;
