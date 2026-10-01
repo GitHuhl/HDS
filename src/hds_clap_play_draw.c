@@ -1,37 +1,29 @@
 // hds_clap_play_draw.c: hds.clap's own Play tab -- the 4 oscillator strips (Shape/Pulse-Width-or-
 // Tilt/Curve-Drive/Pitch-Offset/Fine/Phase/Pitch/Unison/Vol/Mute/Pan) plus their 4 dedicated Amp
-// EGs, stacked BELOW the oscillator strips (one EG per column, directly under its own oscillator)
-// rather than frontend.py's own side-by-side "Oscillators" group box + "Dedicated Amplitude
-// Envelopes" group box -- a deliberate native-GUI layout departure, not a port of that arrangement
-// (frontend.py's own two-group-box layout is still the reference for every CONTROL this file
-// draws, just not for where the EG panels sit on screen). Platform-agnostic like hds_fx_gui_draw.c
+// EGs, stacked BELOW the oscillator strips (one EG per column, directly under its own oscillator).
+// Platform-agnostic like hds_fx_gui_draw.c
 // itself (plain cairo_t*, no Xlib) -- #include'd by clap_plugin.c after hds_clap_gui_draw.c and
 // hds_clap_adsr.h.
 //
-// SCOPE for this first pass (task #99): Single-Program mode only -- every control here reads/
+// Single-Program mode is this file's own direct content -- every control here reads/
 // writes p->knobs.programs[SINGLE_PROGRAM_SLOT] directly. Combi mode's own separate 8-lane mixer
-// view (Level/Pan fader per lane, Program-file picker, MIDI channel, key/velocity zone, per-lane
-// transpose -- an entirely different widget in frontend.py, `self.osc_combi_widget`, toggled by
-// the Play tab's own Mode radio row) is real, substantial, separate work -- its own follow-up task
-// -- so the Mode radio itself isn't built yet either (a toggle to a mode with no view built would
-// be a dead control). Two more things frontend.py's Play tab has that are deliberately NOT here
-// yet: the WaveformVisualizer preview (purely decorative, no backend field of its own) and the
-// right-click "Modulate From" context menu on Pulse-Width/Phase/Pitch (assigns an LFO/assignable-EG
-// as that knob's modulation source) -- the latter genuinely can't be built yet: it needs a list of
-// real modulator sources, and the LFOs/Envelopes tabs that would supply that list don't exist in
-// this native GUI yet either (see this repo's own task list -- they're next, in order).
+// view lives in hds_clap_combi_draw.c instead, dispatched as a sibling of this file by
+// hds_clap_gui_draw.c's own HDS_CLAP_TAB_PLAY handling, toggled by
+// this file's own Mode radio row (hds_clap_play_mode_toggle_rects()). The right-click
+// "Modulate From" context menu (assigns an LFO/assignable-EG
+// as a knob's modulation source) is wired on every destination-capable knob here (Pitch/Phase/
+// Pulse-Width/Fine/Curve/Volume/Pan), reusing the same generic HdsCtxMenu machinery and the
+// LFOs/Envelopes tabs' own destination list (hds_lfo_dest_label()/hds_dest_list_build() below).
+// Not built: a WaveformVisualizer preview (purely decorative, no backend field of its own).
 //
-// One deliberate widget-type simplification versus frontend.py, consistent with this whole native
-// GUI's own established interaction language (see hds_fx_gui_draw.c's own header comment: "Mix/
-// param knobs stay click-and-drag" -- there is no vertical-fader widget anywhere else in this GUI):
-// every numeric control here (including Vol and the 6 Amp-EG time/level dials, which are Python
-// QDial subclasses with their own log/cubic taper) is the exact same plain click-and-drag knob
+// Every numeric control here (including Vol and the 6 Amp-EG time/level dials) is the exact same
+// plain click-and-drag knob
 // hds_fx_gui_draw.c's own Mix/param knobs already are, dragging LINEARLY over that field's own
 // real backend-unit range -- same convention hds_fx_type_param_range()'s own knobs already use for
 // every FX param, several of which are just as perceptually non-linear in real use (a filter
 // cutoff, say) without a dedicated taper either. This changes how many drag-pixels one full sweep
-// takes, never the real value range or type. Pitch Offset/Fine Tune (QSpinBoxes in frontend.py,
-// not QDials) become knobs too, for the same one-interaction-model reason -- again the same real
+// takes, never the real value range or type. Pitch Offset/Fine Tune
+// become knobs too, for the same one-interaction-model reason -- again the same real
 // range, just dragged instead of typed/spun.
 
 #include "hds_clap_adsr.h"
@@ -95,7 +87,7 @@ static void hds_play_osc_fields(ProgramState *prog, int osc, HdsPlayOscFields *f
 static ProgramState *hds_play_program(HdsClapPlugin *p) { return &p->knobs.programs[SINGLE_PROGRAM_SLOT]; }
 
 // ---------------------------------------------------------------------------------------------
-// Shape combo -- OSC_SHAPE_NAMES from frontend.py, same indices as the WaveType enum (backend.c),
+// Shape combo -- same indices as the WaveType enum (backend.c),
 // load-bearing for saved patches so this order must never change.
 // ---------------------------------------------------------------------------------------------
 #define HDS_PLAY_SHAPE_COUNT 10
@@ -113,9 +105,8 @@ static const char *const HDS_PLAY_EGMODE_NAMES[HDS_PLAY_EGMODE_COUNT] = {
 
 // A knob's own right-click menu, if it has one -- stashed at right-press time (see
 // hds_play_start_knob_drag()) and consulted on release if the button never actually dragged.
-// kind==0 means "no menu": most knobs don't have one, exactly like frontend.py's own
-// PotentiometerKnob, where setContextMenuCallback() is only ever wired onto ~17 specific knob
-// instances (destination knobs: oscillator Pitch/Phase/Pulse-Width, Filter Cutoff/Resonance, LFO
+// kind==0 means "no menu": most knobs don't have one -- it's only wired onto destination-capable
+// knobs (oscillator Pitch/Phase/Pulse-Width/Fine/Curve/Volume/Pan, Filter Cutoff/Resonance, LFO
 // Rate/Depth/Phase) -- every other knob still gets double-click-reset and right-drag fine
 // adjustment, just no menu. kind/arg are interpreted entirely by whichever *_draw.c file opened
 // the menu (each file defines its own small kind-constant space); this struct itself stays
@@ -130,12 +121,11 @@ typedef struct {
     double lo, hi;       // that knob's own real backend-unit range
     double start_y, start_val;
 
-    // Right-click support (mirrors frontend.py's own PotentiometerKnob mousePressEvent/
-    // mouseMoveEvent/mouseReleaseEvent exactly): button is 0 (idle), 1 (left, dragging at normal
+    // Right-click support: button is 0 (idle), 1 (left, dragging at normal
     // sensitivity) or 3 (right -- either still a "was this a click or a drag" pending gesture, or
     // promoted to a fine-sensitivity drag once the pointer moves past the threshold). press_x/y is
     // where the right button went down; right_moved flips true the first time the pointer clears
-    // HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX from there (frontend.py's own manhattanLength() > 3 check).
+    // HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX from there.
     // A right-release with right_moved still false fires `menu` (if it has one) instead of having
     // done anything to the value -- a real "was this a click or a drag" gesture, not a fixed
     // click-vs-hold timer.
@@ -156,7 +146,7 @@ typedef struct {
 static bool hds_play_rect_contains(const HdsFxRect *r, double x, double y); // defined below
 
 // Generic right-click popup menu (checkable rows, optional section headers) -- reused by every
-// tab that ports one of frontend.py's "Modulate From"/Key Track/Mod Source menus. kind/arg are
+// tab that has its own "Modulate From"/Key Track/Mod Source menu. kind/arg are
 // opaque here; each opening file defines its own kind constants and rebuilds the same row list on
 // every render/hit-test call (like every other dropdown in this GUI) rather than caching it.
 #define HDS_CTXMENU_ROW_H 16.0
@@ -244,7 +234,7 @@ static int hds_ctxmenu_hit_row(const HdsCtxMenu *m, const HdsCtxMenuRow *rows, i
     return -1;
 }
 
-// The 100-entry Destination list (matrix_shared_routes in frontend.py) -- shared by every LFO row's
+// The 100-entry Destination list -- shared by every LFO row's
 // own Destination pill (hds_clap_lfos_draw.c) AND every assignable EG's own eg_dest_target
 // (hds_clap_envelopes_draw.c), plus this file's own "Modulate From" menu content below (which shows
 // an already-pointed-elsewhere source's current destination inline). Lives here, in an
@@ -288,8 +278,7 @@ static void hds_lfo_dest_label(int target, char *buf, size_t buflen) {
     else snprintf(buf, buflen, "Filter %d Res", f + 1);
 }
 // Rate/Depth/Phase's own right-click "Modulate From" menu target numbers (LFOs tab) and the same
-// LFO's own Destination-dropdown target (below) both need these, mirroring frontend.py's own
-// _lfo_rate_dest_target/_lfo_depth_dest_target/_lfo_phase_dest_target exactly (two ranges each:
+// LFO's own Destination-dropdown target (below) both need these (two ranges each:
 // LFO 1-4's original slots, LFO 5-16 appended after target 47).
 static int hds_lfo_rate_dest_target(int idx) { return idx < 4 ? 14 + idx : 44 + idx; }
 static int hds_lfo_depth_dest_target(int idx) { return idx < 4 ? 18 + idx : 56 + idx; }
@@ -298,7 +287,7 @@ static int hds_lfo_phase_dest_target(int idx) { return idx < 4 ? 28 + idx : 68 +
 // ---------------------------------------------------------------------------------------------
 // The Destination dropdown's shared DISPLAY order -- grouped by what a target actually modulates
 // (Oscillator Pitch/Fine-Detune/Phase/Pulse-Width/Amp-Pan-Tilt, Mix, Filters, LFO Rate/Depth/
-// Phase), with a section header before each group, rather than frontend.py's own flat ascending
+// Phase), with a section header before each group, rather than a flat ascending
 // target-number order (0, 1, 2, 3, ... 99) -- pure display reorganization: the STORED value
 // (dest_target / eg_dest_target) is still the exact same target number hds_lfo_dest_label() above
 // already returns a label for, so an existing saved patch resolves identically either way. The 6
@@ -443,12 +432,12 @@ static bool hds_dest_list_hit_test(const HdsFxRect *bg, double scroll_px, double
     return false;
 }
 
-// Generic "Modulate From" menu content -- mirrors frontend.py's own _populate_modulate_from_menu()
-// exactly: every LFO (16) + every assignable EG (6), each toggling that source's own Destination
+// Generic "Modulate From" menu content: every LFO (16) + every assignable EG (6), each toggling
+// that source's own Destination
 // field (PackLfoParams.dest_target / ProgramState.eg_dest_target[]) to `target`, or back to 0/None
 // if it was already pointed there. group 0 = LFO index, group 1 = assignable-EG index (see
 // hds_play_modsource_dest_ptr() below) -- opaque to HdsCtxMenuRow itself, meaningful only here.
-// Self-modulation (an LFO/EG targeting its own Rate/Depth/Phase) is allowed, same as frontend.py.
+// Self-modulation (an LFO/EG targeting its own Rate/Depth/Phase) is allowed.
 static float *hds_play_modsource_dest_ptr(ProgramState *prog, int group, int index) {
     return (group == 0) ? &prog->lfo[index].dest_target : &prog->eg_dest_target[index];
 }
@@ -491,15 +480,15 @@ static void hds_play_toggle_modulate_from(HdsClapPlugin *p, int target, int grou
     *dest = was_checked ? 0.0f : (float)target;
 }
 
-// Common "None/Mod Wheel/Breath/Foot/Expression/Channel Aftertouch" preset list -- mirrors
-// frontend.py's own _MOD_SOURCE_PRESETS exactly, shared by LFO Depth's own "Modulation Source
+// Common "None/Mod Wheel/Breath/Foot/Expression/Channel Aftertouch" preset list, shared by LFO
+// Depth's own "Modulation Source
 // (CC)" section and Filter Cutoff's own "Modulation Source (ext MIDI)" section below. Both fields
 // this sets (PackLfoParams.mod_source_cc / FilterParams.cutoff_mod_source_cc) share the same
-// -1=none/0-127=CC/128=aftertouch convention. frontend.py also offers a free-text "Custom CC..."
-// entry via a Qt input dialog -- this GUI has no text-entry widget anywhere (same disclosed-scope
-// boundary as Program Load/Save, see hds_clap_global_draw.c's own header comment), so a CC already
-// set that way from the Python GUI keeps whatever value it has, just without its own checked row
-// here; real follow-up work if a non-preset CC picker is ever needed.
+// -1=none/0-127=CC/128=aftertouch convention. This GUI has no text-entry widget anywhere (same
+// disclosed-scope boundary as Program Load/Save, see hds_clap_global_draw.c's own header comment),
+// so only these 6 presets are reachable here -- a non-preset CC value already baked into a saved
+// patch from some other source just shows with no row checked; real follow-up work if a
+// non-preset CC picker is ever needed.
 typedef struct { const char *label; float value; } HdsPresetOption;
 #define HDS_MOD_SOURCE_PRESET_COUNT 6
 static const HdsPresetOption HDS_MOD_SOURCE_PRESETS[HDS_MOD_SOURCE_PRESET_COUNT] = {
@@ -507,7 +496,7 @@ static const HdsPresetOption HDS_MOD_SOURCE_PRESETS[HDS_MOD_SOURCE_PRESET_COUNT]
     {"Foot Controller (CC4)", 4.0f}, {"Expression (CC11)", 11.0f}, {"Channel Aftertouch", 128.0f},
 };
 
-// Filter Cutoff's own "Key Track" preset list -- mirrors frontend.py's own _KEY_TRACK_PRESETS.
+// Filter Cutoff's own "Key Track" preset list.
 #define HDS_KEY_TRACK_PRESET_COUNT 4
 static const HdsPresetOption HDS_KEY_TRACK_PRESETS[HDS_KEY_TRACK_PRESET_COUNT] = {
     {"Off", 0.0f}, {"50%", 50.0f}, {"100%", 100.0f}, {"150%", 150.0f},
@@ -527,8 +516,8 @@ static int hds_filt_cutoff_dest_target(int idx) { return 90 + idx * 2; }
 #define HDS_CTXROW_GROUP_FILTER_MODSOURCE 4
 
 // LFO Depth's own right-click menu: "Modulation Source (CC)" (mod_source_cc, a live-MIDI
-// multiplicative scale on this LFO's own output) THEN the generic "Modulate From" section --
-// mirrors frontend.py's own _show_lfo_row_menu's 'depth' case exactly (same two-section shape).
+// multiplicative scale on this LFO's own output) THEN the generic "Modulate From" section (same
+// two-section shape).
 // `lfo_idx` doubles as both which LFO's own mod_source_cc to read/write AND (via
 // hds_lfo_depth_dest_target()) the Modulate From section's own target number.
 static void hds_play_build_lfo_depth_menu_rows(HdsClapPlugin *p, int lfo_idx, HdsCtxMenuRow *rows, int *count) {
@@ -544,8 +533,8 @@ static void hds_play_build_lfo_depth_menu_rows(HdsClapPlugin *p, int lfo_idx, Hd
 
 // Filter Cutoff's own right-click menu: "Key Track" preset list, THEN "Modulation Source (ext
 // MIDI)" (cutoff_mod_source_cc, an additive cutoff offset -- see FilterParams' own comment in
-// backend.c), THEN the generic "Modulate From" section -- mirrors frontend.py's own
-// _show_filter_cutoff_menu exactly (same three-section shape). `filt_idx` doubles as which
+// backend.c), THEN the generic "Modulate From" section (same three-section shape). `filt_idx`
+// doubles as which
 // filter's own key_track/cutoff_mod_source_cc to read/write AND (via
 // hds_filt_cutoff_dest_target()) the Modulate From section's own target number.
 static void hds_play_build_filter_cutoff_menu_rows(HdsClapPlugin *p, int filt_idx, HdsCtxMenuRow *rows, int *count) {
@@ -583,8 +572,8 @@ static void hds_play_build_ctxmenu_rows(HdsClapPlugin *p, const HdsCtxMenu *menu
 // existing dropdown check (same "consume the click, open list wins" precedence) -- closes the menu
 // unconditionally (a click anywhere, hit or miss, dismisses it, same as every dropdown in this GUI)
 // and applies whatever the hit row means first if one was hit. A preset row (Key Track/either
-// Modulation Source list) always SETS its own value on click, never toggles back off -- matching
-// frontend.py's own plain (not checkable-toggle) QAction wiring for those two menus.
+// Modulation Source list) always SETS its own value on click, never toggles back off, unlike a
+// "Modulate From" row.
 static bool hds_play_ctxmenu_handle_click(HdsClapPlugin *p, HdsCtxMenu *menu, double win_w, double win_h, double x, double y) {
     if (!menu->open) return false;
     HdsCtxMenuRow rows[HDS_CTXMENU_MAX_ROWS]; int count = 0;
@@ -766,16 +755,14 @@ typedef struct {
 #define HDS_PLAY_EG_FIELD_R   5
 
 // Per envelope-type, the ORDERED list of which fields are visible and in what left-to-right
-// on-screen order -- mirrors frontend.py's own ENV_TYPE_KNOB_ORDER exactly: its own ADSRPanel
-// docstring is explicit that it "physically shows, hides, and REORDERS knob columns on the screen
-// so the visible knobs always read left-to-right in the same order as the letters in the selected
-// envelope type's name." This is NOT the same as a fixed physical slot arrangement with per-slot
-// visibility toggling: that approach (this table's predecessor) silently broke ordering for AHD
-// and AHDSR specifically -- both names start with "A" (Attack), so Attack's dial must be the
-// LEFTMOST one visible, but Hold's own fixed field index (1) sits lower than Attack's (2), so
-// toggling visibility over fixed slots rendered Hold before Attack for exactly those two types.
-// -1 terminates a shorter row; each row has 6 entries (the max, DADSR/AHDSR), matching
-// HDS_PLAY_EGMODE_NAMES's own row order (ADSR, AR, AD, ASR, AHD, DADSR, AHDSR).
+// on-screen order: the visible knobs always read left-to-right in the same order as the letters
+// in the selected envelope type's name. This is NOT the same as a fixed physical slot arrangement
+// with per-slot visibility toggling: that approach (this table's predecessor) silently broke
+// ordering for AHD and AHDSR specifically -- both names start with "A" (Attack), so Attack's
+// dial must be the LEFTMOST one visible, but Hold's own fixed field index (1) sits lower than
+// Attack's (2), so toggling visibility over fixed slots rendered Hold before Attack for exactly
+// those two types. -1 terminates a shorter row; each row has 6 entries (the max, DADSR/AHDSR),
+// matching HDS_PLAY_EGMODE_NAMES's own row order (ADSR, AR, AD, ASR, AHD, DADSR, AHDSR).
 static const int HDS_PLAY_EG_FIELD_ORDER[HDS_PLAY_EGMODE_COUNT][6] = {
     /* ADSR  */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_DEC, HDS_PLAY_EG_FIELD_S, HDS_PLAY_EG_FIELD_R, -1, -1},
     /* AR    */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_R, -1, -1, -1, -1},
@@ -799,8 +786,8 @@ static void hds_play_compute_eg_layout(int eg_index, int env_type, double col_x,
     // Sync-All/Sync-Live (Osc 1's EG only -- see this struct's own field comments) live on the
     // title row itself, flush right: two small pill buttons fit there comfortably. The Velocity
     // knob is a DIFFERENT thing every one of the 4 EGs has (this synth's real vco{1-4}_vel_to_amp
-    // backend fields, all wired identically -- see frontend.py's own vco1_vel_to_amp, which is
-    // never special-cased away for Osc 1 either), so it gets its own row below the title, on EVERY
+    // backend fields, all wired identically -- never special-cased away for Osc 1 either), so it
+    // gets its own row below the title, on EVERY
     // column -- previously Osc 1's title row had no room left for both the two Sync buttons AND a
     // third knob, which silently dropped that knob (and, with it, any way to see or adjust Osc 1's
     // own velocity-to-amp amount) instead of finding it a row of its own. Giving all 4 columns the
@@ -952,11 +939,10 @@ static void hds_play_draw_osc_knob(cairo_t *cr, const HdsFxRect *r, float *targe
 #define HDS_PLAY_DOUBLE_CLICK_PX 4.0
 
 // button 1 (left): double-click (same knob, within HDS_PLAY_DOUBLE_CLICK_MS/PX of the last left
-// click) resets to 0 -- mirrors frontend.py's PotentiometerKnob.mouseDoubleClickEvent, which
-// always resets to a literal 0.0 regardless of range -- otherwise starts a normal drag. button 3
+// click) resets to a literal 0.0 regardless of range -- otherwise starts a normal drag. button 3
 // (right): recorded as pending; hds_play_apply_knob_drag()/hds_play_release_knob_drag() below
-// promote it to a fine-sensitivity drag once the pointer moves, or open `menu` on release if it
-// never did (frontend.py's own manhattanLength() > 3 click-vs-drag gesture).
+// promote it to a fine-sensitivity drag once the pointer moves past HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX,
+// or open `menu` on release if it never did (a simple click-vs-drag gesture test).
 static void hds_play_start_knob_drag(HdsPlayKnobDrag *drag, float *target, double lo, double hi, double x, double y, int button, HdsPlayKnobMenu menu) {
     if (!target) return;
     if (button == 3) {
@@ -989,10 +975,9 @@ static void hds_play_start_knob_drag(HdsPlayKnobDrag *drag, float *target, doubl
 // Called every motion event a knob_drag is in flight (button 1 or 3 -- idle button==0 means
 // drag->target is NULL and this is never reached). button 1 is the plain full-sensitivity drag this
 // file always had. button 3 stays a no-op (not yet a drag at all) until the pointer clears
-// HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX of its own ORIGINAL press point -- frontend.py's own
-// manhattanLength() > 3 promotion -- after which it applies the exact same linear mapping at 1/10th
-// sensitivity (frontend.py's sensitivity_scale=0.1), always measured from that same press point
-// (never a running last-position), matching PotentiometerKnob.mouseMoveEvent's own math exactly.
+// HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX of its own ORIGINAL press point, after which it applies the
+// exact same linear mapping at 1/10th sensitivity (HDS_PLAY_RIGHT_DRAG_SENSITIVITY), always
+// measured from that same press point (never a running last-position).
 static void hds_play_apply_knob_drag(HdsPlayKnobDrag *drag, double x, double y) {
     if (!drag->target) return;
     if (drag->button == 3) {
@@ -1289,8 +1274,8 @@ static void hds_clap_play_render(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewS
 // ---------------------------------------------------------------------------------------------
 
 // Oscillator Pitch/Phase/Pulse-Width's own "Modulate From" target numbers, one per oscillator
-// (0-3) -- the same 3 knob kinds frontend.py wires setContextMenuCallback() onto via
-// _show_dest_assign_menu(), matching hds_lfo_dest_label()'s own numbering exactly.
+// (0-3) -- these 3 knob kinds get their right-click menu wired up below, matching
+// hds_lfo_dest_label()'s own numbering exactly.
 static const int HDS_PLAY_PITCH_DEST_TARGET[4] = {1, 2, 41, 42};
 static const int HDS_PLAY_PHASE_DEST_TARGET[4] = {24, 25, 43, 44};
 static const int HDS_PLAY_PULSE_DEST_TARGET[4] = {34, 35, 38, 47};
@@ -1311,8 +1296,7 @@ static const int HDS_PLAY_VOL_DEST_TARGET[4] = {6, 7, 36, 39};
 static const int HDS_PLAY_PAN_DEST_TARGET[4] = {32, 33, 37, 40};
 
 // "1->All"/"Sync": one-shot and live copy of Amp EG 0 (Osc1)'s full state onto Amp EGs 1-3 --
-// mirrors frontend.py's own _copy_amp_eg_to_all()/_mirror_amp_eg_live() exactly (topology mode +
-// all 8 PackEGParams fields, nothing else).
+// the whole eg[] struct and eg_mode (topology mode + all field values), nothing else.
 static void hds_play_copy_eg0_to_all(ProgramState *prog) {
     for (int i = 1; i < 4; i++) {
         prog->eg[i] = prog->eg[0];
