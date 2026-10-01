@@ -26,14 +26,19 @@
 // poll_fx_nam_requests() itself once per block -- see hds_fx_plugin_process()'s own call, and
 // backend.c's render_audio_block for the equivalent shared fix on the synth's own side.
 //
-// HardTune's (FX_TYPE_HARDTUNE) live-MIDI vibrato control reads four small globals
-// (g_hardtune_held_note/g_hardtune_bend_semitones/g_hardtune_modwheel/g_hardtune_channel_pressure)
-// that backend.c's own MIDI dispatch normally feeds -- this plugin declares them too (see just
-// below fx_chain.c needs them to compile) but never writes them, since this plugin has no note-port
-// and never sees MIDI performance data. HardTune's pitch-correction itself works exactly as normal;
-// only its OPTIONAL vibrato-from-CC/pitch-bend feature is inert here, same "harmless, not wired up"
-// posture NAM used to have -- a real MIDI input port (for CC/pitch-bend modulation of FX params
-// generally, not just HardTune's vibrato) is a natural, separate future addition.
+// HardTune's (FX_TYPE_HARDTUNE) MIDI Target Source mode and its live-MIDI vibrato control both
+// read four small globals (g_hardtune_held_note/g_hardtune_bend_semitones/g_hardtune_modwheel/
+// g_hardtune_channel_pressure) that backend.c's own MIDI dispatch normally feeds -- this plugin
+// declares a real note-ports extension (k_note_ports_ext below, 1 input) and decodes
+// CLAP_EVENT_NOTE_ON/OFF/CLAP_EVENT_MIDI in process() to feed those same four globals itself (see
+// hds_fx_hardtune_note_on/off and the event-decode loop in hds_fx_plugin_process()), so both Target
+// Source: MIDI and the CC/pitch-bend-driven vibrato work here exactly as they do in hds.clap/
+// synth_engine. This used to be a real, confirmed gap (the globals existed only so fx_chain.c would
+// compile, never written anywhere in this file) -- Target Source: MIDI silently applied zero
+// correction, forever, with no indication anything was wrong. A host that never connects this
+// plugin's note port just leaves HardTune in the same state as before: Scale/Key mode is
+// unaffected either way, and MIDI-dependent modes simply see no note held / no live controller data
+// until one is.
 //
 // Multi-instance safety comes for free: process_fx_chain()/sync_fx_engine_types()/reset_fx_engine()
 // (see fx_chain.c) already take every piece of state as an explicit parameter and touch no globals
@@ -123,9 +128,10 @@
 
 // fx_chain.c's own g_hardtune_held_note/g_hardtune_bend_semitones/g_hardtune_modwheel/
 // g_hardtune_channel_pressure globals (declared there, not here -- see this file's own header
-// comment) are never written to by this plugin (no note-port, no MIDI performance data reaches
-// it), so HardTune's own vibrato-from-CC/pitch-bend feature simply stays inert at its defaults;
-// HardTune's actual pitch correction is unaffected.
+// comment) ARE written to by this plugin, from its own note-ports extension -- see
+// hds_fx_hardtune_note_on()/hds_fx_hardtune_note_off() and hds_fx_plugin_process()'s own event loop,
+// further down in this file (both need FXSlotParams/fx_chain.c's globals already in scope, so they
+// can't live any earlier than this #include).
 #include "fx_types.h"
 #include "fx_chain.c"
 #include "hds_fx_gui_host.h" // HdsFxGuiHost -- see its own header comment; HdsFxPlugin embeds one below
@@ -264,6 +270,72 @@ static const clap_plugin_audio_ports_t k_audio_ports_ext = {
     .count = hds_fx_audio_ports_count,
     .get = hds_fx_audio_ports_get,
 };
+
+// ---------------------------------------------------------------------------------------------
+// note-ports extension: 1 input, 0 outputs -- same shape as clap_plugin.c's own k_note_ports_ext.
+// Exists purely so a host can route MIDI performance data to FX_TYPE_HARDTUNE's own Target Source:
+// MIDI mode and its CC/pitch-bend-driven vibrato (see g_hardtune_held_note's own comment in
+// fx_chain.c, and this file's own header comment on why that mode used to be a confirmed dead end
+// here) -- every other FX type ignores note/MIDI events entirely, so leaving this port unconnected
+// is exactly as harmless as leaving any other optional port unconnected.
+// ---------------------------------------------------------------------------------------------
+
+static uint32_t hds_fx_note_ports_count(const clap_plugin_t *plugin, bool is_input) {
+    (void)plugin;
+    return is_input ? 1 : 0;
+}
+
+static bool hds_fx_note_ports_get(const clap_plugin_t *plugin, uint32_t index, bool is_input, clap_note_port_info_t *info) {
+    (void)plugin;
+    if (!is_input || index != 0) return false;
+    info->id = 0;
+    info->supported_dialects = CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI;
+    info->preferred_dialect = CLAP_NOTE_DIALECT_CLAP;
+    snprintf(info->name, sizeof(info->name), "%s", "MIDI In (HardTune)");
+    return true;
+}
+
+static const clap_plugin_note_ports_t k_note_ports_ext = {
+    .count = hds_fx_note_ports_count,
+    .get = hds_fx_note_ports_get,
+};
+
+// Minimal last-note-priority held-note tracker feeding FX_TYPE_HARDTUNE's own g_hardtune_held_note
+// (fx_chain.c) -- the same semantics as backend.c's mono_stack_push/mono_stack_remove against its
+// own MonoNoteStack/g_hardtune_note_stack, reimplemented locally since this file deliberately
+// doesn't pull in backend.c at all (see this file's own header comment) and has no Programs/voices
+// of its own to hang a bigger stack struct off of. -1 (via hds_fx_hardtune_note_off draining the
+// stack to empty) means "nothing held", matching g_hardtune_held_note's own documented sentinel.
+#define HDS_FX_HARDTUNE_STACK_SIZE 8
+static struct { int notes[HDS_FX_HARDTUNE_STACK_SIZE]; int count; } g_hds_fx_hardtune_notes = {0};
+
+static void hds_fx_hardtune_note_on(int note) {
+    for (int i = 0; i < g_hds_fx_hardtune_notes.count; i++) {
+        if (g_hds_fx_hardtune_notes.notes[i] == note) {
+            for (int j = i; j < g_hds_fx_hardtune_notes.count - 1; j++) g_hds_fx_hardtune_notes.notes[j] = g_hds_fx_hardtune_notes.notes[j + 1];
+            g_hds_fx_hardtune_notes.count--;
+            break;
+        }
+    }
+    if (g_hds_fx_hardtune_notes.count < HDS_FX_HARDTUNE_STACK_SIZE) {
+        g_hds_fx_hardtune_notes.notes[g_hds_fx_hardtune_notes.count++] = note;
+    } else {
+        for (int j = 0; j < HDS_FX_HARDTUNE_STACK_SIZE - 1; j++) g_hds_fx_hardtune_notes.notes[j] = g_hds_fx_hardtune_notes.notes[j + 1];
+        g_hds_fx_hardtune_notes.notes[HDS_FX_HARDTUNE_STACK_SIZE - 1] = note;
+    }
+    g_hardtune_held_note = (float)note;
+}
+
+static void hds_fx_hardtune_note_off(int note) {
+    for (int i = 0; i < g_hds_fx_hardtune_notes.count; i++) {
+        if (g_hds_fx_hardtune_notes.notes[i] == note) {
+            for (int j = i; j < g_hds_fx_hardtune_notes.count - 1; j++) g_hds_fx_hardtune_notes.notes[j] = g_hds_fx_hardtune_notes.notes[j + 1];
+            g_hds_fx_hardtune_notes.count--;
+            break;
+        }
+    }
+    g_hardtune_held_note = (g_hds_fx_hardtune_notes.count > 0) ? (float)g_hds_fx_hardtune_notes.notes[g_hds_fx_hardtune_notes.count - 1] : -1.0f;
+}
 
 // ---------------------------------------------------------------------------------------------
 // params extension: per-slot Mix -- same curated "expose Mix only, drive everything else (Type,
@@ -648,8 +720,40 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
         uint32_t n = process->in_events->size(process->in_events);
         for (uint32_t i = 0; i < n; i++) {
             const clap_event_header_t *hdr = process->in_events->get(process->in_events, i);
-            if (hdr->space_id == CLAP_CORE_EVENT_SPACE_ID && hdr->type == CLAP_EVENT_PARAM_VALUE) {
+            if (hdr->space_id != CLAP_CORE_EVENT_SPACE_ID) continue;
+            if (hdr->type == CLAP_EVENT_PARAM_VALUE) {
                 hds_fx_apply_param_event(p, (const clap_event_param_value_t *)hdr);
+            } else if (hdr->type == CLAP_EVENT_NOTE_ON || hdr->type == CLAP_EVENT_NOTE_OFF) {
+                // FX_TYPE_HARDTUNE's own Target Source: MIDI -- see hds_fx_hardtune_note_on/off's
+                // own comment. No Program/channel concept here to filter on, same "every note-on/
+                // off updates this regardless of context" posture handle_note_on/handle_note_off
+                // already use for g_hardtune_held_note in backend.c.
+                const clap_event_note_t *ev = (const clap_event_note_t *)hdr;
+                if (ev->key < 0 || ev->key > 127) continue; // wildcard note-on/off, not supported
+                if (hdr->type == CLAP_EVENT_NOTE_ON) hds_fx_hardtune_note_on((int)ev->key);
+                else hds_fx_hardtune_note_off((int)ev->key);
+            } else if (hdr->type == CLAP_EVENT_MIDI) {
+                const clap_event_midi_t *ev = (const clap_event_midi_t *)hdr;
+                unsigned char status = ev->data[0] & 0xF0;
+                // Same raw-byte decode convention backend.c's own dispatch_midi_event call sites
+                // already use (see clap_plugin.c's own process()) -- a Note On with velocity 0
+                // counts as Note Off.
+                if (status == 0x90 || status == 0x80) {
+                    bool is_note_on = (status == 0x90 && ev->data[2] > 0);
+                    if (is_note_on) hds_fx_hardtune_note_on(ev->data[1]);
+                    else hds_fx_hardtune_note_off(ev->data[1]);
+                } else if (status == 0xB0 && ev->data[1] == 1) {
+                    g_hardtune_modwheel = fmaxf(0.0f, fminf(1.0f, (float)ev->data[2] / 127.0f)); // CC1
+                } else if (status == 0xE0) {
+                    int bend14 = (int)ev->data[1] | ((int)ev->data[2] << 7);
+                    float pitch_bend = fmaxf(-1.0f, fminf(1.0f, (float)(bend14 - 8192) / 8192.0f));
+                    // Standard +/-2 semitone default (same default backend.c's own Program 0
+                    // ships, see pb_range_up/pb_range_down's own init) -- this plugin has no
+                    // Program/pb_range concept of its own to read a real range from.
+                    g_hardtune_bend_semitones = pitch_bend * 2.0f;
+                } else if (status == 0xD0) {
+                    g_hardtune_channel_pressure = fmaxf(0.0f, fminf(1.0f, (float)ev->data[1] / 127.0f));
+                }
             }
         }
     }
@@ -755,6 +859,7 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
 static const void *hds_fx_plugin_get_extension(const clap_plugin_t *plugin, const char *id) {
     (void)plugin;
     if (strcmp(id, CLAP_EXT_AUDIO_PORTS) == 0) return &k_audio_ports_ext;
+    if (strcmp(id, CLAP_EXT_NOTE_PORTS) == 0) return &k_note_ports_ext;
     if (strcmp(id, CLAP_EXT_PARAMS) == 0) return &k_params_ext;
     if (strcmp(id, CLAP_EXT_GUI) == 0) return &k_gui_ext;
     if (strcmp(id, CLAP_EXT_STATE) == 0) return &k_state_ext;
