@@ -186,20 +186,29 @@ static void hds_touch_ring_push(int action, int pointer_count, float x, float y)
 // Rewriting every tab file's own layout math to be responsive would be a large, invasive change
 // to files this port's own explicit "minimal deviation" mandate (and every other platform's own
 // regression safety) argues hard against. Instead, this window's logical WIDTH is held fixed
-// forever at HDS_ANDROID_GUI_LOGICAL_W (matching the effective width every tab's own layout was
-// actually designed and already tested against on desktop, see HDS_CLAP_GUI_DEFAULT_W's own
-// comment -- minus the sidebar-reserved width that constant still carries, since Android has
-// none at all) and hds_android_gui_redraw() computes ONE scale factor (real buffer width / this
-// constant) applied identically on both axes -- real on-device testing showed independent-per-
-// axis scaling visibly distorting round knobs into ellipses, and scaling less on X than a
-// width-only factor would (a phone's own landscape aspect ratio is wider than this GUI's ~3:2
-// design ratio) -- so this single factor is the one that actually maximizes real screen use
-// without distortion. The logical HEIGHT is NOT fixed: it is recomputed every frame as real
-// buffer height / this same scale (see hds_android_gui_redraw()), so whatever doesn't fit
+// forever at HDS_ANDROID_GUI_LOGICAL_W -- set to HDS_CLAP_GUI_DEFAULT_W itself (desktop's own
+// total default window width, tab content PLUS the Global sidebar alongside it -- see that
+// constant's own comment), not just the 1150 tab-content portion alone: Global is no longer its
+// own Android tab (see hds_clap_gui_draw.c's own header comment on the sidebar-everywhere-except-
+// FX revert), so the sidebar now eats real width out of THIS window on every tab but FX exactly
+// the way it already does on desktop, and the logical width budget has to include it too or every
+// non-FX tab's own fixed-pixel content gets clipped by hds_clap_gui_render()'s own tab_area_w clip
+// rect -- confirmed on a real device: with this constant left at the old 1150-only value, the
+// sidebar's own 260px bite out of that budget visibly clipped the right edge of every tab's
+// content instead of leaving genuine dead space, which read as "not scaled up enough" even though
+// the transform was already mapping the full logical width to the full real screen width. Tying
+// this to HDS_CLAP_GUI_DEFAULT_W directly (rather than a second hardcoded number) means the two
+// can never drift out of sync like this again. hds_android_gui_redraw() computes ONE scale factor
+// (real buffer width / this constant) applied identically on both axes -- real on-device testing
+// showed independent-per-axis scaling visibly distorting round knobs into ellipses, and scaling
+// less on X than a width-only factor would (a phone's own landscape aspect ratio is wider than
+// this GUI's ~3:2 design ratio) -- so this single factor is the one that actually maximizes real
+// screen use without distortion. The logical HEIGHT is NOT fixed: it is recomputed every frame as
+// real buffer height / this same scale (see hds_android_gui_redraw()), so whatever doesn't fit
 // vertically at this scale is already handled by each tab's own pre-existing scroll/clip
 // machinery, exactly as a short desktop window would be -- see
 // hds_android_gui_scroll_by_px()'s own comment for how that machinery is driven here.
-#define HDS_ANDROID_GUI_LOGICAL_W 1150
+#define HDS_ANDROID_GUI_LOGICAL_W ((int)HDS_CLAP_GUI_DEFAULT_W)
 
 // -----------------------------------------------------------------------------------------------
 typedef struct {
