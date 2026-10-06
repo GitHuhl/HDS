@@ -8,6 +8,9 @@ synth_engine-arm64
 # Cross-built Windows CLAP dependencies (Cairo/pixman/liblo) -- see tools/build_windows_deps.sh,
 # not checked in, same reasoning as /arm64-libs/ above.
 /third_party/win64-deps/
+# Cross-built Android dependencies (Cairo/pixman/freetype) -- see
+# tools/build_android_cairo_deps.sh, same reasoning as /third_party/win64-deps/ above.
+/third_party/android-deps/
 *.o
 # The whole build/ output dir, not just *.o inside it -- NAM_FLAGS_STAMP/ARM64_NAM_FLAGS_STAMP
 # (see Makefile) now also live here as plain non-.o stamp files, which *.o alone doesn't cover.

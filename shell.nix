@@ -325,5 +325,16 @@ pkgs.mkShell {
     export ANDROID_SDK_ROOT="${androidSdk}/libexec/android-sdk"
     export ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/${androidNdkVersion}"
     export PATH="$ANDROID_SDK_ROOT/build-tools/${androidBuildToolsVersion}:$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+
+    # tools/build_android_cairo_deps.sh cross-builds pixman/freetype/cairo for the NDK aarch64
+    # target from source (no such prebuilt Android libs exist anywhere) -- same "point straight at
+    # nixpkgs' own already-fetchurl'd, already-hash-pinned upstream tarball" posture as
+    # HDS_WIN_{PIXMAN,CAIRO}_SRC above, so this needs no URL-guessing of its own and tracks
+    # whatever pixman/freetype/cairo version this nixpkgs revision already carries (the exact same
+    # cairo 1.18.0/freetype 2.13.2 the native Linux build above already links against -- one
+    # version to think about, not two).
+    export HDS_ANDROID_PIXMAN_SRC="${pkgs.pixman.src}"
+    export HDS_ANDROID_FREETYPE_SRC="${pkgs.freetype.src}"
+    export HDS_ANDROID_CAIRO_SRC="${pkgs.cairo.src}"
   '';
 }
