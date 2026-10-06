@@ -8,6 +8,8 @@ import android.media.midi.MidiOutputPort;
 import android.media.midi.MidiReceiver;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.View;
+import android.view.WindowManager;
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -37,6 +39,16 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        // This is now a real playable instrument, not a backend test harness someone glances at
+        // occasionally -- the screen must never sleep mid-session on its own, same expectation
+        // any other instrument/DAW app sets. AndroidManifest.xml's own .NoActionBar.Fullscreen
+        // theme already drops the ActionBar and status bar at the window level; hideSystemUi()
+        // below additionally hides the navigation bar (which that theme alone does not touch) and
+        // is re-applied on every focus regain, since swiping in from a screen edge (or a system
+        // dialog taking focus) temporarily brings system bars back regardless of this flag.
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        hideSystemUi();
+
         setContentView(new HdsSurfaceView(this));
 
         boolean audioOk = NativeBridge.nativeInit();
@@ -44,6 +56,27 @@ public class MainActivity extends Activity {
                            : "AAudio stream failed to open -- check logcat for \"hds_native\".");
 
         scanAndConnectMidi();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) hideSystemUi();
+    }
+
+    // View.SYSTEM_UI_FLAG_* (not the newer WindowInsetsController, API 30+): deprecated since API
+    // 30 but still fully functional through the current target API, and this build's own minSdk
+    // (26, see tools/build_android_manual.sh's own MIN_API) would otherwise need two separate
+    // code paths for the same one-time immersive-mode setup -- not worth it for what this does.
+    @SuppressWarnings("deprecation")
+    private void hideSystemUi() {
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
     }
 
     private void scanAndConnectMidi() {

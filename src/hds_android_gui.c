@@ -46,18 +46,29 @@
 //     hds_clap_gui_on_*() call below runs on one thread only (this window's own), same
 //     "single-threaded against this struct" invariant hds_standalone_gui_x11.c's own thread
 //     already has against g_standalone_gui_window.
-//   - Swipe-to-scroll: there is no separate scroll-wheel input channel on a touchscreen the way
-//     X11's button 4/5 give hds_standalone_gui_x11.c's own pump_events() for free. A touch-move is
-//     the one and only drag channel, used for BOTH an active knob-drag (hds_clap_gui_on_motion(),
-//     called on every move exactly like a mouse-drag already is -- zero changes needed anywhere)
-//     AND, when no knob-drag is in flight (see hds_android_gui_knob_drag_active() below -- a
-//     small, tab-aware check reading each tab's own already-public `knob_drag.target`/`drag_kind`
-//     field, not a new field added to any of them), accumulated vertical pixels fed into the
-//     SAME hds_clap_gui_on_scroll(..., +-1) entry point X11's wheel already drives, at a fixed
-//     per-"click" pixel threshold -- see HDS_ANDROID_SWIPE_PX_PER_CLICK. No per-tab scroll math
-//     changes at all; this just decides WHEN to call an existing function, the same posture
-//     HDS_CLAP_SIDEBAR_RESERVED_W's own comment in hds_clap_gui_draw.c already takes for "only
-//     WHERE/WHEN, never WHAT."
+//   - Scroll vs. parameter, by finger count, not by heuristic: there is no separate scroll-wheel
+//     input channel on a touchscreen the way X11's button 4/5 give
+//     hds_standalone_gui_x11.c's own pump_events() for free, so a touch-move has to double as
+//     both a drag channel. Explicit product direction (not a guess): ONE finger only ever
+//     taps/drags a parameter (hds_clap_gui_on_button_press/_on_motion/_on_button_release, exactly
+//     like a mouse) and never scrolls; TWO OR MORE fingers only ever pan the active tab's own
+//     scroll position (hds_clap_gui_on_scroll(..., +-1), the SAME entry point X11's wheel already
+//     drives, at a fixed per-"click" pixel threshold -- see HDS_ANDROID_SWIPE_PX_PER_CLICK) and
+//     never touch a knob/param, however the gesture started. See
+//     hds_android_touch_ring_drain_and_dispatch()'s own comment for the sticky per-sequence
+//     gesture_mode this decision lives in. No per-tab scroll OR hit-test math changes at all --
+//     same posture HDS_CLAP_SIDEBAR_RESERVED_W's own comment in hds_clap_gui_draw.c already takes
+//     for "only WHERE/WHEN, never WHAT."
+//   - Scale-to-fill, not resize: every hds_clap_*_draw.c tab lays its own content out at fixed,
+//     absolute pixel positions (confirmed on a real device: a correctly-colored, correctly-drawn
+//     GUI confined to roughly the left third of the real screen, dead space past its own
+//     right/bottom edge) -- rewriting every tab's own layout to be responsive is a large,
+//     invasive change this port's own "minimal deviation" mandate argues against. Instead the
+//     view is held at one FIXED logical size forever (HDS_ANDROID_GUI_LOGICAL_W/H,
+//     hds_android_gui_init()) and hds_android_gui_redraw() applies a per-axis cairo_scale() to
+//     stretch that fixed canvas to fill whatever the real screen's own pixel dimensions are --
+//     touch coordinates are divided back down by the same two factors before ever reaching
+//     hds_clap_gui_on_*(), so hit-testing stays correct regardless of the real screen size.
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include <cairo/cairo-ft.h>
@@ -121,19 +132,53 @@ static bool hds_android_gui_fonts_init(void) {
 // window's own redraw thread consumer). Shape mirrors hds_android.c's own HdsMidiRingEvent/
 // g_midi_ring exactly (same capacity reasoning: a real finger produces nowhere near 64 touch
 // events between two ~33ms redraws).
-typedef struct { int action; float x, y; } HdsTouchRingEvent; // action: 0=down, 1=move, 2=up/cancel
+//
+// pointer_count carries one-finger-vs-multi-finger gesture separation (explicit product
+// direction, not this port's own earlier guess): a SINGLE finger only ever taps/drags parameters
+// (knobs, pills, tab switches) -- it never scrolls -- while TWO OR MORE fingers only ever pan the
+// active tab's own scroll position, never touching a knob/param no matter where they land. x/y is
+// the single pointer's own real-screen position when pointer_count==1, or the CENTROID (plain
+// average) of every active pointer when pointer_count>=2 -- computed once in
+// HdsSurfaceView.java's own onTouch() (far simpler there, with full MotionEvent access, than
+// reconstructing per-pointer coordinates from a flattened ring event here).
+typedef struct { int action; int pointer_count; float x, y; } HdsTouchRingEvent;
+// action: 0=sequence start (first finger down, pointer_count always 1), 1=move, 2=sequence end
+// (last finger up or ACTION_CANCEL), 3=pointer count changed mid-sequence (a finger added or
+// removed while at least one other is still down -- MotionEvent's own ACTION_POINTER_DOWN/_UP).
 #define HDS_TOUCH_RING_CAPACITY 64
 static HdsTouchRingEvent g_touch_ring[HDS_TOUCH_RING_CAPACITY];
 static atomic_uint g_touch_ring_head = 0;
 static atomic_uint g_touch_ring_tail = 0;
 
-static void hds_touch_ring_push(int action, float x, float y) {
+static void hds_touch_ring_push(int action, int pointer_count, float x, float y) {
     unsigned int head = atomic_load_explicit(&g_touch_ring_head, memory_order_relaxed);
     unsigned int next = (head + 1) % HDS_TOUCH_RING_CAPACITY;
     if (next == atomic_load_explicit(&g_touch_ring_tail, memory_order_acquire)) return; // full -- drop, never block the UI thread
-    g_touch_ring[head] = (HdsTouchRingEvent){ action, x, y };
+    g_touch_ring[head] = (HdsTouchRingEvent){ action, pointer_count, x, y };
     atomic_store_explicit(&g_touch_ring_head, next, memory_order_release);
 }
+
+// Every hds_clap_*_draw.c tab lays its own content out at fixed, absolute pixel positions (the
+// SAME files hds.clap/the standalone app already share -- see hds_clap_gui_draw.c's own header
+// comment) -- only the tab BAR itself divides evenly across whatever width it's given
+// (hds_clap_gui_tab_rect()). On a real phone's own much-wider-than-1150px landscape screen that
+// means most of the tab bar's real width-awareness buys nothing: the content below it stayed
+// exactly the size it was designed at, with dead space past its own right/bottom edge -- a real,
+// confirmed-on-device symptom (a screenshot showing a working, correctly-colored, correctly-drawn
+// GUI confined to roughly the left third of the real screen), not a rendering bug.
+//
+// Rewriting every tab file's own layout math to be responsive would be a large, invasive change
+// to files this port's own explicit "minimal deviation" mandate (and every other platform's own
+// regression safety) argues hard against. Instead, this window draws the WHOLE GUI at this one
+// fixed logical size (matching the effective width/height every tab's own layout was actually
+// designed and already tested against on desktop, see HDS_CLAP_GUI_DEFAULT_W/H's own comment --
+// minus the sidebar-reserved width those constants still carry, since Android has none at all),
+// then applies ONE uniform-per-axis cairo_scale() to stretch that logical canvas to fill the
+// real screen exactly, independently on X and Y -- "stretch to fill," not letterbox-with-empty-
+// bars. hds_clap_gui_on_resize() is therefore called ONCE, ever, with this fixed logical size
+// (hds_android_gui_init(), below) -- never with the real screen's own pixel dimensions.
+#define HDS_ANDROID_GUI_LOGICAL_W 1150
+#define HDS_ANDROID_GUI_LOGICAL_H 760
 
 // -----------------------------------------------------------------------------------------------
 typedef struct {
@@ -143,11 +188,27 @@ typedef struct {
     pthread_t thread;
     volatile bool should_stop;
 
-    // Swipe-to-scroll accumulator -- see this file's own header comment. Reset on every fresh
-    // touch-down (a new gesture starts a new accumulation; it would be wrong for a slow drag's
-    // leftover fractional pixels to carry into an unrelated later gesture).
-    bool touch_down;
-    float touch_last_y;
+    // Real-screen-pixels-per-logical-pixel, recomputed in hds_android_gui_redraw() whenever the
+    // locked buffer's own dimensions change -- the SAME factor cairo_scale() stretches rendering
+    // by, so touch dispatch (which only ever receives real screen coordinates from Java) can
+    // divide back down into the logical coordinate space every hds_clap_gui_on_*() call expects.
+    // Read and written only from this window's own redraw thread (recomputed during redraw,
+    // consumed by touch dispatch on the very next loop iteration, same thread either way) -- no
+    // synchronization needed, same posture as every other field below.
+    double scale_x, scale_y;
+
+    // Gesture-mode state -- explicit product direction, not a heuristic: a SINGLE finger only
+    // ever taps/drags a parameter (on_button_press/on_motion/on_button_release -- knobs, pills,
+    // tab switches); TWO OR MORE fingers only ever pan the active tab's own scroll position
+    // (on_scroll), never touching a knob/param no matter where they land. gesture_mode is
+    // "sticky" for the lifetime of one continuous touch sequence (first finger down to last
+    // finger up) -- see hds_android_touch_ring_drain_and_dispatch()'s own comment for exactly how
+    // it's set and why it never flips back from SCROLL to PARAM mid-sequence.
+    enum { HDS_ANDROID_TOUCH_NONE, HDS_ANDROID_TOUCH_PARAM, HDS_ANDROID_TOUCH_SCROLL } gesture_mode;
+    // Swipe accumulator (SCROLL mode only) -- reset every time gesture_mode (re-)enters SCROLL,
+    // so a baseline centroid jump at that instant never itself produces a scroll delta. Stored in
+    // LOGICAL (post-un-scale) units, same coordinate space as every hds_clap_gui_on_*() call.
+    double touch_last_y;
     double swipe_accum_px;
 } HdsAndroidGuiWindow;
 
@@ -157,39 +218,6 @@ static HdsAndroidGuiWindow *g_android_gui_window = NULL;
                                              // single reasonable constant across every tab (on_scroll
                                              // itself has no per-tab row-height parameter to scale
                                              // against), not tuned per-tab
-
-// Whether the active tab currently has a knob-drag (or the FX tab's own equivalent) in flight --
-// see this file's own header comment on why swipe-to-scroll checks this first. Reads each tab's
-// own already-public view-state field directly (every hds_clap_*_draw.c tab embeds a
-// `HdsPlayKnobDrag knob_drag;` with `.target` NULL when idle, except the FX tab, which uses its
-// own `drag_kind` -- see hds_fx_gui_draw.c's own HdsFxGuiViewState comment); no field is added to
-// any of those files for this.
-static bool hds_android_gui_knob_drag_active(HdsClapGuiViewState *vs) {
-    switch (vs->active_tab) {
-        case HDS_CLAP_TAB_PLAY:
-            // Checks both sub-views rather than branching on performance_mode: harmless (the
-            // inactive one's own knob_drag.target can never be non-NULL -- only the currently
-            // rendered/hit-tested sub-view ever starts a drag), and avoids needing a HdsClapPlugin*
-            // in this function's own signature just for this one check.
-            return vs->play_view.knob_drag.target != NULL || vs->combi_view.knob_drag.target != NULL;
-        case HDS_CLAP_TAB_FILTERS:
-            return vs->filters_view.knob_drag.target != NULL;
-        case HDS_CLAP_TAB_LFOS:
-            return vs->lfos_view.knob_drag.target != NULL;
-        case HDS_CLAP_TAB_ENVELOPES:
-            return vs->envelopes_view.knob_drag.target != NULL;
-        case HDS_CLAP_TAB_FX:
-            return vs->fx_view.drag_kind != 0; // the FX tab's own drag state uses a different shape -- see hds_fx_gui_draw.c's own HdsFxGuiViewState comment
-        case HDS_CLAP_TAB_ROUTING:
-            return vs->routing_view.knob_drag.target != NULL;
-        case HDS_CLAP_TAB_DEVICES:
-            return vs->devices_view.knob_drag.target != NULL;
-        case HDS_CLAP_TAB_GLOBAL:
-            return vs->global_view.knob_drag.target != NULL;
-        default:
-            return false;
-    }
-}
 
 static void *hds_android_gui_thread_main(void *arg);
 
@@ -204,6 +232,22 @@ static bool hds_android_gui_init(HdsClapPlugin *p) {
     if (!w) return false;
     w->plugin = p;
     hds_clap_gui_view_state_init(&w->view);
+    // Overrides hds_clap_gui_view_state_init()'s own default (HDS_CLAP_GUI_DEFAULT_W/H, which
+    // still carries the desktop sidebar's reserved width baked into its literal value -- see
+    // that constant's own comment) with this window's fixed logical canvas instead -- see
+    // HDS_ANDROID_GUI_LOGICAL_W/H's own comment. Called exactly once, ever: the view's logical
+    // size never changes again on Android, no matter what the real screen's own pixel dimensions
+    // are or how they change -- only scale_x/scale_y (hds_android_gui_redraw()) ever adapt to
+    // that.
+    hds_clap_gui_on_resize(&w->view, HDS_ANDROID_GUI_LOGICAL_W, HDS_ANDROID_GUI_LOGICAL_H);
+    // Neutral default, not left at calloc's own 0.0: touch dispatch divides real-screen
+    // coordinates by scale_x/scale_y (see hds_android_touch_ring_drain_and_dispatch()'s own
+    // comment) -- a touch event could in principle be queued and drained before this window's
+    // own redraw thread has run even once to compute the real factor (hds_android_gui_redraw()),
+    // which would otherwise divide by zero. 1.0 (i.e. "not yet scaled") is overwritten by the
+    // real factor within one frame of the first redraw either way.
+    w->scale_x = 1.0;
+    w->scale_y = 1.0;
     g_android_gui_window = w;
     return true;
 }
@@ -225,41 +269,74 @@ static void hds_android_gui_swap_rb_inplace(unsigned char *bits, int32_t width, 
     }
 }
 
+// Enters SCROLL mode (or re-baselines it if already in it): resets the swipe accumulator and
+// sets touch_last_y to logical_y, so the very next move's delta is measured from THIS instant,
+// never from wherever the pointer(s) happened to be before this baseline was set. If a
+// single-finger PARAM gesture was in flight (a knob being dragged, say) when a second finger
+// landed, releases it cleanly first -- exactly like lifting that one finger would have, so
+// nothing is ever left stuck mid-drag.
+static void hds_android_gui_enter_scroll_mode(HdsAndroidGuiWindow *w, double logical_y) {
+    if (w->gesture_mode == HDS_ANDROID_TOUCH_PARAM) {
+        hds_clap_gui_on_button_release(w->plugin, &w->view);
+    }
+    w->gesture_mode = HDS_ANDROID_TOUCH_SCROLL;
+    w->touch_last_y = logical_y;
+    w->swipe_accum_px = 0.0;
+}
+
 // Drains every touch event queued since the last frame (this window's own redraw thread only --
-// see this file's own header comment) and dispatches it. Always feeds on_motion unconditionally
-// on a move (so an in-flight knob-drag tracks the finger exactly like a mouse-drag already does,
-// zero per-tab changes needed) -- swipe-accumulation on top of that only when
-// hds_android_gui_knob_drag_active() says nothing is currently being dragged.
+// see this file's own header comment) and dispatches it, un-scaling every real-screen coordinate
+// into the view's own fixed logical space first (see HDS_ANDROID_GUI_LOGICAL_W/H's own comment).
+// gesture_mode keeps a single continuous touch sequence from ever driving BOTH a knob and a
+// scroll: it is decided once, then sticky for the rest of that sequence --
+//   - action 0 (sequence start) always arrives with pointer_count==1 (MotionEvent's own
+//     ACTION_DOWN contract) -- always enters PARAM mode and issues on_button_press. A single
+//     finger that never adds a second one only ever taps/drags, exactly as if this were a mouse.
+//   - action 3 (pointer count changed mid-sequence, a finger added or removed) moves to SCROLL
+//     mode the instant two or more fingers are down, however the sequence started -- and STAYS
+//     in SCROLL mode even if it drops back to one finger (lifting one of two scrolling fingers
+//     must never suddenly start dragging a knob under the remaining finger).
+//   - action 1 (move) dispatches on EITHER on_motion (PARAM) or the scroll accumulator (SCROLL),
+//     never both -- this is the whole point: a scroll gesture can never touch a param, and a
+//     param drag can never also scroll the list underneath it.
+//   - action 2 (sequence end) always calls on_button_release (itself a no-op if nothing was ever
+//     captured, e.g. a SCROLL-mode sequence -- same convention hds_standalone_gui_x11.c's own
+//     unconditional release call already relies on) and resets gesture_mode to NONE.
 static void hds_android_touch_ring_drain_and_dispatch(HdsAndroidGuiWindow *w) {
     unsigned int tail = atomic_load_explicit(&g_touch_ring_tail, memory_order_relaxed);
     unsigned int head = atomic_load_explicit(&g_touch_ring_head, memory_order_acquire);
     while (tail != head) {
         HdsTouchRingEvent ev = g_touch_ring[tail];
-        if (ev.action == 0) { // down
-            w->touch_down = true;
-            w->touch_last_y = ev.y;
-            w->swipe_accum_px = 0.0;
-            hds_clap_gui_on_button_press(w->plugin, &w->view, (double)ev.x, (double)ev.y, 1);
+        double x = (double)ev.x / w->scale_x;
+        double y = (double)ev.y / w->scale_y;
+        if (ev.action == 0) { // sequence start, always one finger
+            w->gesture_mode = HDS_ANDROID_TOUCH_PARAM;
+            hds_clap_gui_on_button_press(w->plugin, &w->view, x, y, 1);
+        } else if (ev.action == 3) { // pointer count changed mid-sequence
+            if (ev.pointer_count >= 2) hds_android_gui_enter_scroll_mode(w, y);
+            else if (w->gesture_mode == HDS_ANDROID_TOUCH_SCROLL) hds_android_gui_enter_scroll_mode(w, y); // still scrolling, just re-baseline
         } else if (ev.action == 1) { // move
-            hds_clap_gui_on_motion(w->plugin, &w->view, (double)ev.x, (double)ev.y);
-            if (w->touch_down && !hds_android_gui_knob_drag_active(&w->view)) {
-                // Natural/"content follows finger" convention (standard on touchscreens): dragging
-                // DOWN reveals content above (same direction as an X11 "scroll up" wheel click,
-                // on_scroll(..., +1) per hds_standalone_gui_x11.c's own pump_events() convention).
-                w->swipe_accum_px += (double)(ev.y - w->touch_last_y);
+            if (w->gesture_mode == HDS_ANDROID_TOUCH_PARAM) {
+                hds_clap_gui_on_motion(w->plugin, &w->view, x, y);
+            } else if (w->gesture_mode == HDS_ANDROID_TOUCH_SCROLL) {
+                // Natural/"content follows finger" convention (standard on touchscreens):
+                // dragging DOWN reveals content above (same direction as an X11 "scroll up"
+                // wheel click, on_scroll(..., +1) per hds_standalone_gui_x11.c's own
+                // pump_events() convention).
+                w->swipe_accum_px += (y - w->touch_last_y);
                 while (w->swipe_accum_px >= HDS_ANDROID_SWIPE_PX_PER_CLICK) {
-                    hds_clap_gui_on_scroll(w->plugin, &w->view, (double)ev.x, (double)ev.y, 1);
+                    hds_clap_gui_on_scroll(w->plugin, &w->view, x, y, 1);
                     w->swipe_accum_px -= HDS_ANDROID_SWIPE_PX_PER_CLICK;
                 }
                 while (w->swipe_accum_px <= -HDS_ANDROID_SWIPE_PX_PER_CLICK) {
-                    hds_clap_gui_on_scroll(w->plugin, &w->view, (double)ev.x, (double)ev.y, -1);
+                    hds_clap_gui_on_scroll(w->plugin, &w->view, x, y, -1);
                     w->swipe_accum_px += HDS_ANDROID_SWIPE_PX_PER_CLICK;
                 }
+                w->touch_last_y = y;
             }
-            w->touch_last_y = ev.y;
-        } else { // up/cancel
+        } else { // action 2: sequence end (last finger up, or ACTION_CANCEL)
             hds_clap_gui_on_button_release(w->plugin, &w->view);
-            w->touch_down = false;
+            w->gesture_mode = HDS_ANDROID_TOUCH_NONE;
             w->swipe_accum_px = 0.0;
         }
         tail = (tail + 1) % HDS_TOUCH_RING_CAPACITY;
@@ -269,20 +346,24 @@ static void hds_android_touch_ring_drain_and_dispatch(HdsAndroidGuiWindow *w) {
 
 // Draws directly into the locked ANativeWindow buffer's own memory -- a cairo_image_surface_t
 // wrapping that exact pointer, no separate render target, no copy (see this file's own header
-// comment). Resizes the view (hds_clap_gui_on_resize()) first if the buffer's own dimensions
-// changed since the last frame -- the one thing ANativeWindow itself can report that this app
-// doesn't otherwise learn about until the next lock (there is no ConfigureNotify-equivalent
-// pushed to this thread).
+// comment). The view itself is NEVER resized to the buffer's own real dimensions (see
+// HDS_ANDROID_GUI_LOGICAL_W/H's own comment on why) -- instead, scale_x/scale_y are recomputed
+// whenever the real buffer size changes (the one thing ANativeWindow itself can report that this
+// app doesn't otherwise learn about until the next lock, there being no ConfigureNotify-
+// equivalent pushed to this thread), and a per-axis cairo_scale() stretches the fixed logical
+// canvas to fill it exactly, independently on X and Y.
 static void hds_android_gui_redraw(HdsAndroidGuiWindow *w) {
     if (!w->window) return;
     ANativeWindow_Buffer buf;
     if (ANativeWindow_lock(w->window, &buf, NULL) != 0) return;
-    if (buf.width != w->view.window_w || buf.height != w->view.window_h) {
-        hds_clap_gui_on_resize(&w->view, buf.width, buf.height);
+    if (buf.width > 0 && buf.height > 0) {
+        w->scale_x = (double)buf.width / (double)HDS_ANDROID_GUI_LOGICAL_W;
+        w->scale_y = (double)buf.height / (double)HDS_ANDROID_GUI_LOGICAL_H;
     }
     cairo_surface_t *surface = cairo_image_surface_create_for_data(
         (unsigned char *)buf.bits, CAIRO_FORMAT_ARGB32, buf.width, buf.height, buf.stride * 4);
     cairo_t *cr = cairo_create(surface);
+    cairo_scale(cr, w->scale_x, w->scale_y);
     hds_clap_gui_render(cr, w->plugin, &w->view);
     cairo_surface_flush(surface);
     hds_android_gui_swap_rb_inplace((unsigned char *)buf.bits, buf.width, buf.height, buf.stride);
@@ -350,9 +431,13 @@ static void hds_android_gui_surface_destroyed(void) {
     w->window = NULL;
 }
 
-// action: 0=down, 1=move, 2=up/cancel (hds_android.c's own JNI entry point already collapses
-// MotionEvent's real ACTION_* constants down to this -- see that file's own comment).
-static void hds_android_gui_touch_event(int action, float x, float y) {
+// action: 0=sequence start, 1=move, 2=sequence end, 3=pointer count changed mid-sequence
+// (hds_android.c's own JNI entry point relays MotionEvent's real ACTION_* constants down to this
+// -- see that file's own comment). x/y are real, un-scaled screen coordinates (HdsSurfaceView.
+// java's own single-pointer coordinates, or its already-averaged multi-pointer centroid) --
+// hds_android_touch_ring_drain_and_dispatch() divides by scale_x/scale_y into this window's own
+// logical space before ever calling into hds_clap_gui_on_*().
+static void hds_android_gui_touch_event(int action, int pointer_count, float x, float y) {
     if (!g_android_gui_window) return;
-    hds_touch_ring_push(action, x, y);
+    hds_touch_ring_push(action, pointer_count, x, y);
 }

@@ -425,14 +425,17 @@ Java_com_hds_androidtest_NativeBridge_nativeSurfaceDestroyed(JNIEnv *env, jobjec
     hds_android_gui_surface_destroyed();
 }
 
-// action: HdsSurfaceView.java's own OnTouchListener already collapses MotionEvent's real
-// ACTION_* constants down to 0=down/1=move/2=up-or-cancel before calling this -- see that file's
-// own comment -- so hds_android_gui_touch_event() itself only ever needs to switch on three
-// values, not MotionEvent's full action-constant space (pointer-index-encoded multi-touch
-// actions included), none of which this single-finger-only GUI needs to tell apart.
+// action: HdsSurfaceView.java's own OnTouchListener collapses MotionEvent's real ACTION_*
+// constants down to 0=sequence-start/1=move/2=sequence-end/3=pointer-count-changed before
+// calling this -- see that file's own comment. pointerCount/x/y: one real finger's own
+// coordinates when pointerCount==1, or the plain centroid (average) of every active pointer,
+// already computed in Java, when pointerCount>=2 -- see hds_android_gui.c's own
+// hds_android_touch_ring_drain_and_dispatch() for how finger count alone decides whether a touch
+// sequence drives a parameter (one finger) or a scroll (two or more), per explicit product
+// direction.
 JNIEXPORT void JNICALL
-Java_com_hds_androidtest_NativeBridge_nativeTouchEvent(JNIEnv *env, jobject thiz, jint action, jfloat x, jfloat y) {
+Java_com_hds_androidtest_NativeBridge_nativeTouchEvent(JNIEnv *env, jobject thiz, jint action, jint pointerCount, jfloat x, jfloat y) {
     (void)env; (void)thiz;
-    hds_android_gui_touch_event((int)action, (float)x, (float)y);
+    hds_android_gui_touch_event((int)action, (int)pointerCount, (float)x, (float)y);
 }
 #endif

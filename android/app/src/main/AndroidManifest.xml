@@ -16,12 +16,19 @@
     <application
         android:label="HDS Backend Test"
         android:allowBackup="false">
+        <!-- .NoActionBar.Fullscreen, not plain Theme.Material.Light: the real native GUI
+             (HdsSurfaceView, see MainActivity.java's own header comment) fills the whole screen
+             now, so the system ActionBar the plain theme used to add above it (a real, visible
+             white bar, left over from when this build's only content was a status TextView) has
+             nowhere left to put anything, and Fullscreen additionally drops the status bar.
+             MainActivity.java's own immersive-mode call (hides the nav bar too, re-asserted on
+             every focus change) covers what this theme alone doesn't. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:screenOrientation="landscape"
             android:configChanges="orientation|screenSize|screenLayout"
-            android:theme="@android:style/Theme.Material.Light">
+            android:theme="@android:style/Theme.Material.Light.NoActionBar.Fullscreen">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

@@ -28,5 +28,5 @@ public final class NativeBridge {
     // the Surface handle and raw touch coordinates/action across the JNI boundary).
     public static native void nativeSurfaceCreated(Surface surface);
     public static native void nativeSurfaceDestroyed();
-    public static native void nativeTouchEvent(int action, float x, float y);
+    public static native void nativeTouchEvent(int action, int pointerCount, float x, float y);
 }
