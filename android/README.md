@@ -135,13 +135,20 @@ ever reads the other's index, and the audio thread drains the ring (applying eve
 at the top of its own callback, before `render_audio_block()` -- so neither thread can ever block
 on the other.
 
-While fixing this, two more real latency/glitch-resistance gaps got closed, not just the one bug
-that was reported: the stream now tries `AAUDIO_SHARING_MODE_EXCLUSIVE` first (the real dedicated
-hardware path most devices either grant immediately or refuse outright) and falls back to
-`SHARED` only if that's refused; and the buffer size is now explicitly grown to 2x
-`AAudioStream_getFramesPerBurst()` after opening (AAudio's own bare default leaves no headroom at
-all, and 2x bursts of slack is the standard Android audio latency guidance for a stream seeing
-underruns). `nativeInit()` now logs the sharing mode/performance mode/buffer size it actually got
+While fixing this, two AAudio tuning changes were tried alongside it -- and real on-device
+testing immediately showed BOTH made things worse, not better, which is exactly why they're
+documented here as reverted rather than left in: first, trying `AAUDIO_SHARING_MODE_EXCLUSIVE`
+before falling back to `SHARED` turned "stutter only under heavy chords" into constant
+dropouts/crunch -- reverted back to `SHARED` only, which is the mode that was actually confirmed
+working. Second, explicitly setting the buffer to a fixed `2x AAudioStream_getFramesPerBurst()`
+(the standard Android audio latency guidance for a stream seeing underruns) made things worse
+too, almost certainly because that fixed value happened to be SMALLER than whatever buffer size
+AAudio's own default had already picked -- silently shrinking the one thing that was already
+working, not growing it. Replaced with `AAudioStream_getBufferCapacityInFrames()` (the real
+ceiling the stream was opened with) instead of a guessed multiplier: this maximizes buffer
+headroom rather than picking a specific tradeoff point, the right call for a build whose purpose
+is proving basic correctness, not chasing the lowest possible latency. `nativeInit()` logs the
+sharing mode/performance mode/burst size/buffer size it actually got
 (`adb logcat -s hds_native`), and the audio callback logs `AAudioStream_getXRunCount()` roughly
 once a second -- a real, always-available signal for whether the device itself is still
 glitching, worth checking first before assuming any further dropout report is a new bug rather

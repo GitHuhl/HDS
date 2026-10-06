@@ -247,13 +247,15 @@ static aaudio_data_callback_result_t hds_android_audio_callback(
 // JNI entry points. Package/class match MainActivity.kt's own `NativeBridge` object -- see
 // android/app/src/main/java/.../NativeBridge.kt.
 
-// Builds and opens a stream with the given sharing mode -- factored out so nativeInit can try
-// EXCLUSIVE first (the real "dedicated hardware path," lower latency and better glitch
-// resistance than SHARED when the device grants it) and fall back to SHARED (always available,
-// just mixed through AudioFlinger instead of talking to the HAL directly) if it doesn't. A fresh
-// builder each attempt, matching AAudio's own documented usage (a builder is consumed by
-// openStream, not reusable across attempts).
-static aaudio_result_t hds_android_try_open(aaudio_sharing_mode_t sharing_mode, AAudioStream **out_stream) {
+// Builds and opens a SHARED stream. Previously tried AAUDIO_SHARING_MODE_EXCLUSIVE first (the
+// real dedicated-hardware path, in principle lower latency and more glitch-resistant than
+// SHARED) -- reverted after real on-device testing made things WORSE, not better: dropouts went
+// from "only under heavy chords" to "constantly," which points at EXCLUSIVE landing on a worse
+// HAL path on that device than AudioFlinger's own SHARED mixer, not at anything this file's own
+// code got wrong. SHARED is the one that was actually confirmed working (modulo the chord-stutter
+// bug fixed elsewhere in this file); EXCLUSIVE is not worth the risk for a build whose whole
+// point is proving basic correctness, not chasing the lowest possible latency.
+static aaudio_result_t hds_android_try_open(AAudioStream **out_stream) {
     AAudioStreamBuilder *builder = NULL;
     aaudio_result_t result = AAudio_createStreamBuilder(&builder);
     if (result != AAUDIO_OK) return result;
@@ -262,7 +264,7 @@ static aaudio_result_t hds_android_try_open(aaudio_sharing_mode_t sharing_mode, 
     AAudioStreamBuilder_setChannelCount(builder, 2);
     AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE);
     AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-    AAudioStreamBuilder_setSharingMode(builder, sharing_mode);
+    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setDataCallback(builder, hds_android_audio_callback, NULL);
     result = AAudioStreamBuilder_openStream(builder, out_stream);
     AAudioStreamBuilder_delete(builder);
@@ -274,31 +276,29 @@ Java_com_hds_androidtest_NativeBridge_nativeInit(JNIEnv *env, jobject thiz) {
     (void)env; (void)thiz;
     hds_android_engine_init();
 
-    // EXCLUSIVE first (see hds_android_try_open's own comment); most devices either grant it
-    // immediately or refuse outright (no partial/degraded EXCLUSIVE state to worry about), so one
-    // SHARED retry on failure is the whole fallback story.
-    aaudio_result_t result = hds_android_try_open(AAUDIO_SHARING_MODE_EXCLUSIVE, &g_stream);
+    aaudio_result_t result = hds_android_try_open(&g_stream);
     if (result != AAUDIO_OK || g_stream == NULL) {
-        HDS_LOGW("EXCLUSIVE open failed (result=%d), retrying SHARED", (int)result);
-        result = hds_android_try_open(AAUDIO_SHARING_MODE_SHARED, &g_stream);
-        if (result != AAUDIO_OK || g_stream == NULL) {
-            HDS_LOGW("SHARED open also failed (result=%d)", (int)result);
-            return JNI_FALSE;
-        }
+        HDS_LOGW("SHARED open failed (result=%d)", (int)result);
+        return JNI_FALSE;
     }
 
-    // Ask for extra buffer headroom beyond AAudio's own default -- the standard Android audio
-    // latency guidance for a stream that's seeing dropouts under load: grow the buffer in
-    // increments of framesPerBurst until stable, trading a small amount of added latency for
-    // glitch resistance. Fixed at 2x here (not iteratively tuned at runtime) since this is a
-    // basic-functionality test, not a latency-optimized product -- see android/README.md if this
-    // ever needs to go lower. setBufferSizeInFrames's return value is itself the buffer size
-    // AAudio actually applied (it can clamp), logged here rather than assumed.
+    // Maximize buffer headroom rather than picking a specific multiplier -- a previous version of
+    // this code set a fixed 2x framesPerBurst, confirmed on real hardware to make dropouts WORSE
+    // (constant, not just under heavy chords): 2x may well have been SMALLER than whatever buffer
+    // size AAudio's own default already picked, silently shrinking the one thing that was already
+    // working. AAudioStream_getBufferCapacityInFrames() is the real ceiling the stream was opened
+    // with (not a guess); setting the buffer to exactly that maximizes glitch resistance, trading
+    // away some latency -- the right tradeoff for a build whose whole point is proving basic
+    // correctness, not chasing the lowest possible latency. getFramesPerBurst() is logged for
+    // context only (not used to compute anything here anymore); setBufferSizeInFrames's return
+    // value is the buffer size AAudio actually applied (it can still clamp), logged rather than
+    // assumed.
     int32_t frames_per_burst = AAudioStream_getFramesPerBurst(g_stream);
-    int32_t actual_buffer_frames = AAudioStream_setBufferSizeInFrames(g_stream, frames_per_burst * 2);
-    HDS_LOGI("opened: sharing=%d performance=%d framesPerBurst=%d bufferFrames=%d",
+    int32_t buffer_capacity = AAudioStream_getBufferCapacityInFrames(g_stream);
+    int32_t actual_buffer_frames = AAudioStream_setBufferSizeInFrames(g_stream, buffer_capacity);
+    HDS_LOGI("opened: sharing=%d performance=%d framesPerBurst=%d bufferCapacity=%d bufferFrames=%d",
              (int)AAudioStream_getSharingMode(g_stream), (int)AAudioStream_getPerformanceMode(g_stream),
-             (int)frames_per_burst, (int)actual_buffer_frames);
+             (int)frames_per_burst, (int)buffer_capacity, (int)actual_buffer_frames);
 
     if (AAudioStream_requestStart(g_stream) != AAUDIO_OK) {
         AAudioStream_close(g_stream);
