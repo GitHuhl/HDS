@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<!-- package= here (not just build.gradle's namespace) because this build is currently assembled
+     by hand with aapt2/d8/apksigner, not Gradle/AGP (see android/README.md): AGP normally
+     derives this from build.gradle's own namespace instead; drop this if a real Gradle build
+     becomes possible here and AGP starts complaining about the two disagreeing. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.hds.androidtest">
 
-    <!-- Declares intent to use USB MIDI devices, not a runtime permission -- android.media.midi
+    <!-- Declares intent to use USB MIDI devices, not a runtime permission: android.media.midi
          itself needs none (unlike RECORD_AUDIO, which this app also never asks for: it never
          captures, only renders). required="false" so the app still installs on a device with no
          MIDI hardware feature flag at all; MidiManager.getDevices() is simply empty there. -->

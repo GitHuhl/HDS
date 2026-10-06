@@ -288,8 +288,9 @@ it sizes itself as a fraction of that constant.
   which backend it found. Falls back to ALSA-only if PipeWire isn't present.
 - **Android**: `src/hds_android.c` + `android/` is a headless backend-only
   test build (AAudio out, raw MIDI in via `android.media.midi`, no GUI, no
-  OSC). See `android/README.md` for what's verified, what's blocked, and
-  how to finish the build on a machine with the NDK.
+  OSC). `tools/build_android_manual.sh` produces a real signed APK. See
+  `android/README.md` for how the SDK/NDK get fetched, what's verified,
+  and the real D8 compatibility bug it works around.
 
 ## Third-party code
 

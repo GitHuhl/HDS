@@ -1,3 +1,11 @@
+// NOT actually usable in this sandbox right now -- google() resolves to https://dl.google.com/
+// dl/android/maven2/, which this sandbox's egress policy blocks (403), and maven.google.com
+// (tried as a substitute) turned out to just 301-redirect every path back to that same blocked
+// host (confirmed with curl -v, not assumed). So this Gradle project cannot resolve the
+// com.android.application plugin or any AndroidX artifact here. tools/build_android_manual.sh
+// builds a real APK anyway, bypassing Gradle/AGP entirely -- see android/README.md. This file
+// (and the rest of the Gradle project) is kept as the normal path for anyone building on a
+// machine with real network access, where google() genuinely resolves.
 pluginManagement {
     repositories {
         google()

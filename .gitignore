@@ -17,6 +17,14 @@ synth_engine-arm64
 /android/local.properties
 /android/.gradle/
 /android/.idea/
+/android/build/
 /android/app/build/
 /android/app/.cxx/
+# The compiled native lib is a build OUTPUT (same reasoning as every other entry in this file --
+# never commit a binary this repo's own tooling can produce), whether it lands here via
+# tools/build_android_manual.sh or a real externalNativeBuild/CMake run.
+/android/app/src/main/jniLibs/
+# nix-build's own output symlink when run from the repo root without -o -- same reasoning as
+# /build/ above, just Nix's own convention instead of this project's Makefile.
+/result
 

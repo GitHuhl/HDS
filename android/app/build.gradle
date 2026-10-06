@@ -1,6 +1,5 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android") version "1.9.24"
 }
 
 android {
@@ -17,14 +16,8 @@ android {
         versionName "0.1-backend-test"
 
         ndk {
-            // Pixel 8a is arm64 only -- no point building the other ABIs for a device-specific test.
+            // Pixel 8a is arm64 only -- no point packaging the other ABIs for a device-specific test.
             abiFilters "arm64-v8a"
-        }
-        externalNativeBuild {
-            cmake {
-                cppFlags ""
-                arguments "-DANDROID_STL=c++_shared"
-            }
         }
     }
 
@@ -37,18 +30,26 @@ android {
         }
     }
 
-    externalNativeBuild {
-        cmake {
-            path "src/main/cpp/CMakeLists.txt"
-            version "3.22.1"
+    // No externalNativeBuild here on purpose: app/src/main/cpp/CMakeLists.txt is kept as the
+    // documented, exact recipe for libhds_native.so, but this Gradle project packages a PREBUILT
+    // copy of that .so from app/src/main/jniLibs/arm64-v8a/ instead of invoking CMake/NDK itself
+    // every build -- same output, one less moving part in Gradle's own dependency graph. That .so
+    // is a build OUTPUT, never committed (see .gitignore) -- produce it with either
+    // tools/build_android_manual.sh (see android/README.md) or a real externalNativeBuild/CMake
+    // run before building this Gradle project, or this APK will have no native library at all.
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ["src/main/jniLibs"]
         }
     }
 
+    // Plain Java only (no Kotlin plugin) -- see NativeBridge.java's own header comment for why,
+    // and MainActivity.java's for a second, independent reason (a D8 version this sandbox
+    // happens to bundle crashes on certain class shapes; building this Gradle project elsewhere,
+    // with a properly AGP-matched D8/R8, may not need the -source/-target 8 downgrade
+    // tools/build_android_manual.sh applies for that reason specifically).
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
-    }
-    kotlinOptions {
-        jvmTarget = "17"
     }
 }
