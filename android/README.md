@@ -99,12 +99,34 @@ verify a lot (real compiler, real linker, real signature check) but never "does 
 on a phone" -- that step stays genuinely necessary, and finding a real bug through it is the
 expected, correct outcome of doing it, not a sign anything upstream was skipped.
 
+**A second real on-device bug, this time found by checking rather than waiting for the next
+crash**: after the `-lm` fix above, rather than ship another APK and wait for whatever the next
+missing symbol happened to be, every undefined dynamic symbol in the finished `.so` was listed
+directly (`nm -D -u`) and checked one by one against what's actually linked. 51 of them were
+libc/libm/liblog/libaaudio symbols (all genuinely satisfied -- confirmed, not assumed, by
+`nm -D` on the NDK's own stub libraries for a couple of the less obvious ones). Three were not:
+`hds_nam_create`/`hds_nam_process`/`hds_nam_destroy`, the C API over NeuralAmpModelerCore
+(`nam_bridge.h`/`.cpp`) that `backend.c`'s NAM FX type calls into -- never compiled or linked for
+Android at all, since the real implementation needs a cross-built C++/Eigen toolchain this build
+doesn't have. Unlike liblo, `nam_bridge.h` is pulled in via `#include "nam_bridge.h"` (a
+quote-include), which always resolves to the real header regardless of any `-I` path, so the
+header-shadowing trick `stub/lo/lo.h` uses doesn't apply here -- but the real header is pure
+`extern "C"` declarations with no C++ types exposed, so it's already safe to include as-is.
+`app/src/main/cpp/stub/nam_bridge_stub.c` instead provides the three function *bodies*, compiled
+as an ordinary second C source file: `hds_nam_create()` always returns `NULL`, which is already
+documented as the real contract's own "any failure, including an unreadable file" case, not a
+fabricated success -- NAM simply never has a model loaded on this build. Every other FX type
+(Gate, EQ3, Limiter, HT76, Fairchild670, PeakMax, LA2A, the multi-slope filter, DeEsser, HardTune,
+FDNVerb, DBX120X, BroadcastDelay) is pure C and fully functional.
+
 ## What's still unverified
 
 Everything above was verified for real (real compiler, real linker, real `apksigner` signature
-check, real `aapt2 dump badging` on the finished APK) in a sandboxed environment with no actual
-Android device or emulator attached, so the one thing this hasn't confirmed is runtime behavior
-on real hardware: does AAudio actually open the stream and produce audible sound, does
-`android.media.midi` actually hand this app real bytes from a real USB keyboard, does the engine
-hold up over an extended play session. That's exactly what installing the APK and plugging in a
-keyboard answers.
+check, real `aapt2 dump badging` on the finished APK, and now a real zero-undefined-symbols check
+via `nm -D -u`) in a sandboxed environment with no actual Android device or emulator attached, so
+the one thing none of this can confirm is runtime behavior itself: does AAudio actually open the
+stream and produce audible sound, does `android.media.midi` actually hand this app real bytes
+from a real USB keyboard, does the engine hold up over an extended play session. That's exactly
+what installing the APK and plugging in a keyboard answers -- and it's also exactly how the two
+bugs above were found, since neither a missing `DT_NEEDED` entry nor a missing symbol is
+something any of the build-time checks here can catch on their own.

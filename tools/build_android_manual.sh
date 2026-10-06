@@ -62,6 +62,11 @@ echo "=== Compiling the native engine (hds_android.c -> libhds_native.so) ==="
 "$NDK_CLANG" -c -std=gnu11 -O2 -fPIC -Wall -Wextra \
   -I "$ANDROID_DIR/app/src/main/cpp/stub" \
   "$ROOT/src/hds_android.c" -o "$WORK/hds_android.o"
+# nam_bridge_stub.c stands in for the real nam_bridge.cpp (NAM needs a C++/Eigen toolchain this
+# build doesn't have -- see that stub's own header comment for exactly what it does and doesn't
+# change). Plain C, compiled the same way as hds_android.c itself.
+"$NDK_CLANG" -c -std=gnu11 -O2 -fPIC -Wall -Wextra \
+  "$ANDROID_DIR/app/src/main/cpp/stub/nam_bridge_stub.c" -o "$WORK/nam_bridge_stub.o"
 #
 # -lm: required even though it LOOKS like the build-time link succeeds without it -- the NDK's
 # stub libm.so/libc.so both declare exp2f/log2f/etc. (used by HardTune/DBX120X's glide and pitch
@@ -71,8 +76,12 @@ echo "=== Compiling the native engine (hds_android.c -> libhds_native.so) ==="
 # `readelf -d`, and confirmed as the real bug via a real on-device crash log:
 # "UnsatisfiedLinkError: dlopen failed: cannot locate symbol exp2f". Link-time success on this
 # host proves nothing about runtime symbol resolution on an actual phone -- this is exactly why.
+# Every undefined dynamic symbol in the finished .so was checked after this (`nm -D -u`), not just
+# whatever the next crash happened to report -- see android/README.md for the full list this
+# caught (hds_nam_create/_process/_destroy, from nam_bridge_stub.o above) before it could crash a
+# second and third time the same way exp2f already had to.
 "$NDK_CLANG" -shared -o "$WORK/lib/arm64-v8a/libhds_native.so" \
-  "$WORK/hds_android.o" -llog -laaudio -lm
+  "$WORK/hds_android.o" "$WORK/nam_bridge_stub.o" -llog -laaudio -lm
 
 echo "=== Compiling the Java UI (javac, source/target 8 -- see MainActivity.java's own header
      comment for why: a non-static inner/anonymous class here crashes this SDK's bundled D8) ==="
