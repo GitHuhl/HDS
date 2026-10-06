@@ -6,6 +6,7 @@ import android.media.midi.MidiDeviceInfo;
 import android.media.midi.MidiManager;
 import android.media.midi.MidiOutputPort;
 import android.media.midi.MidiReceiver;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
@@ -48,6 +49,7 @@ public class MainActivity extends Activity {
         // dialog taking focus) temporarily brings system bars back regardless of this flag.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         hideSystemUi();
+        allowDrawingUnderDisplayCutout();
 
         setContentView(new HdsSurfaceView(this));
 
@@ -77,6 +79,25 @@ public class MainActivity extends Activity {
                         | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                         | View.SYSTEM_UI_FLAG_FULLSCREEN
                         | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+    }
+
+    // Without this, a device with a notch/camera cutout reserves that area as dead space even in
+    // a fullscreen window -- confirmed on a real device: a black region the real GUI's own
+    // hds_android_gui_redraw() never gets drawn into at all, because ANativeWindow's own buffer
+    // dimensions simply exclude it, not because the native scale-to-fill math is wrong.
+    // LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES (not _ALWAYS) is the standard choice for an app
+    // that is ALWAYS fullscreen like this one (see hideSystemUi() above) -- it lets content draw
+    // under the cutout specifically while in that state, which this Activity never leaves.
+    // API 28+ only (Build.VERSION_CODES.P) -- this build's own minSdk is 26 (see
+    // tools/build_android_manual.sh's own MIN_API), and the flag plus its whole LayoutParams
+    // field don't exist before P at all; a device below API 28 simply keeps the cutout
+    // letterboxed, same as it always was.
+    private void allowDrawingUnderDisplayCutout() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            WindowManager.LayoutParams attrs = getWindow().getAttributes();
+            attrs.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(attrs);
+        }
     }
 
     private void scanAndConnectMidi() {

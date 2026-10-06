@@ -59,16 +59,25 @@
 //     gesture_mode this decision lives in. No per-tab scroll OR hit-test math changes at all --
 //     same posture HDS_CLAP_SIDEBAR_RESERVED_W's own comment in hds_clap_gui_draw.c already takes
 //     for "only WHERE/WHEN, never WHAT."
-//   - Scale-to-fill, not resize: every hds_clap_*_draw.c tab lays its own content out at fixed,
-//     absolute pixel positions (confirmed on a real device: a correctly-colored, correctly-drawn
-//     GUI confined to roughly the left third of the real screen, dead space past its own
-//     right/bottom edge) -- rewriting every tab's own layout to be responsive is a large,
-//     invasive change this port's own "minimal deviation" mandate argues against. Instead the
-//     view is held at one FIXED logical size forever (HDS_ANDROID_GUI_LOGICAL_W/H,
-//     hds_android_gui_init()) and hds_android_gui_redraw() applies a per-axis cairo_scale() to
-//     stretch that fixed canvas to fill whatever the real screen's own pixel dimensions are --
-//     touch coordinates are divided back down by the same two factors before ever reaching
-//     hds_clap_gui_on_*(), so hit-testing stays correct regardless of the real screen size.
+//   - Scale-to-fill width, UNIFORMLY, not stretch: every hds_clap_*_draw.c tab lays its own
+//     content out at fixed, absolute pixel positions (confirmed on a real device: a correctly-
+//     colored, correctly-drawn GUI confined to roughly the left third of the real screen, dead
+//     space past its own right/bottom edge) -- rewriting every tab's own layout to be responsive
+//     is a large, invasive change this port's own "minimal deviation" mandate argues against.
+//     Instead the view's logical WIDTH is held fixed forever (HDS_ANDROID_GUI_LOGICAL_W) and
+//     hds_android_gui_redraw() computes ONE scale factor, real buffer width / that fixed logical
+//     width, applied identically on both axes (cairo_scale(cr, scale, scale)) -- a first version
+//     of this scaled X and Y independently to also fill the real screen's own height, which
+//     looked visibly wrong on a real device (circular knobs rendering as ellipses) and, by
+//     definition, stretched less on X than a width-only scale would have, since a phone's
+//     landscape aspect ratio is wider than this GUI's own ~1150x760 design ratio. The view's
+//     logical HEIGHT is instead recomputed every frame as real buffer height / that SAME scale --
+//     i.e. "however many logical pixels are actually visible at this scale," not a fixed value --
+//     so a tab whose content needs more vertical room than that already scrolls via its own
+//     existing on_scroll() machinery exactly as it would on a short desktop window, with nothing
+//     tab-specific added for it. Touch coordinates are divided back down by this same single
+//     scale factor before ever reaching hds_clap_gui_on_*(), so hit-testing stays correct at any
+//     real screen size.
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include <cairo/cairo-ft.h>
@@ -169,16 +178,21 @@ static void hds_touch_ring_push(int action, int pointer_count, float x, float y)
 //
 // Rewriting every tab file's own layout math to be responsive would be a large, invasive change
 // to files this port's own explicit "minimal deviation" mandate (and every other platform's own
-// regression safety) argues hard against. Instead, this window draws the WHOLE GUI at this one
-// fixed logical size (matching the effective width/height every tab's own layout was actually
-// designed and already tested against on desktop, see HDS_CLAP_GUI_DEFAULT_W/H's own comment --
-// minus the sidebar-reserved width those constants still carry, since Android has none at all),
-// then applies ONE uniform-per-axis cairo_scale() to stretch that logical canvas to fill the
-// real screen exactly, independently on X and Y -- "stretch to fill," not letterbox-with-empty-
-// bars. hds_clap_gui_on_resize() is therefore called ONCE, ever, with this fixed logical size
-// (hds_android_gui_init(), below) -- never with the real screen's own pixel dimensions.
+// regression safety) argues hard against. Instead, this window's logical WIDTH is held fixed
+// forever at HDS_ANDROID_GUI_LOGICAL_W (matching the effective width every tab's own layout was
+// actually designed and already tested against on desktop, see HDS_CLAP_GUI_DEFAULT_W's own
+// comment -- minus the sidebar-reserved width that constant still carries, since Android has
+// none at all) and hds_android_gui_redraw() computes ONE scale factor (real buffer width / this
+// constant) applied identically on both axes -- real on-device testing showed independent-per-
+// axis scaling visibly distorting round knobs into ellipses, and scaling less on X than a
+// width-only factor would (a phone's own landscape aspect ratio is wider than this GUI's ~3:2
+// design ratio) -- so this single factor is the one that actually maximizes real screen use
+// without distortion. The logical HEIGHT is NOT fixed: it is recomputed every frame as real
+// buffer height / this same scale (see hds_android_gui_redraw()), so whatever doesn't fit
+// vertically at this scale is already handled by each tab's own pre-existing scroll/clip
+// machinery, exactly as a short desktop window would be -- see HDS_ANDROID_SWIPE_PX_PER_CLICK's
+// own scroll-gesture comment for how that machinery is driven here.
 #define HDS_ANDROID_GUI_LOGICAL_W 1150
-#define HDS_ANDROID_GUI_LOGICAL_H 760
 
 // -----------------------------------------------------------------------------------------------
 typedef struct {
@@ -192,10 +206,12 @@ typedef struct {
     // locked buffer's own dimensions change -- the SAME factor cairo_scale() stretches rendering
     // by, so touch dispatch (which only ever receives real screen coordinates from Java) can
     // divide back down into the logical coordinate space every hds_clap_gui_on_*() call expects.
-    // Read and written only from this window's own redraw thread (recomputed during redraw,
-    // consumed by touch dispatch on the very next loop iteration, same thread either way) -- no
-    // synchronization needed, same posture as every other field below.
-    double scale_x, scale_y;
+    // One value, applied to both axes -- see HDS_ANDROID_GUI_LOGICAL_W's own comment on why a
+    // single uniform factor, not two independent ones. Read and written only from this window's
+    // own redraw thread (recomputed during redraw, consumed by touch dispatch on the very next
+    // loop iteration, same thread either way) -- no synchronization needed, same posture as every
+    // other field below.
+    double scale;
 
     // Gesture-mode state -- explicit product direction, not a heuristic: a SINGLE finger only
     // ever taps/drags a parameter (on_button_press/on_motion/on_button_release -- knobs, pills,
@@ -232,22 +248,19 @@ static bool hds_android_gui_init(HdsClapPlugin *p) {
     if (!w) return false;
     w->plugin = p;
     hds_clap_gui_view_state_init(&w->view);
-    // Overrides hds_clap_gui_view_state_init()'s own default (HDS_CLAP_GUI_DEFAULT_W/H, which
-    // still carries the desktop sidebar's reserved width baked into its literal value -- see
-    // that constant's own comment) with this window's fixed logical canvas instead -- see
-    // HDS_ANDROID_GUI_LOGICAL_W/H's own comment. Called exactly once, ever: the view's logical
-    // size never changes again on Android, no matter what the real screen's own pixel dimensions
-    // are or how they change -- only scale_x/scale_y (hds_android_gui_redraw()) ever adapt to
-    // that.
-    hds_clap_gui_on_resize(&w->view, HDS_ANDROID_GUI_LOGICAL_W, HDS_ANDROID_GUI_LOGICAL_H);
-    // Neutral default, not left at calloc's own 0.0: touch dispatch divides real-screen
-    // coordinates by scale_x/scale_y (see hds_android_touch_ring_drain_and_dispatch()'s own
-    // comment) -- a touch event could in principle be queued and drained before this window's
-    // own redraw thread has run even once to compute the real factor (hds_android_gui_redraw()),
-    // which would otherwise divide by zero. 1.0 (i.e. "not yet scaled") is overwritten by the
-    // real factor within one frame of the first redraw either way.
-    w->scale_x = 1.0;
-    w->scale_y = 1.0;
+    // hds_clap_gui_view_state_init()'s own default (HDS_CLAP_GUI_DEFAULT_W/H, desktop's own
+    // sidebar-inclusive default) is a harmless placeholder here -- hds_android_gui_redraw() sets
+    // the view's real logical width/height (HDS_ANDROID_GUI_LOGICAL_W fixed, height recomputed
+    // every frame -- see that constant's own comment) the moment the first frame has a real
+    // buffer to measure, well before anything is ever actually drawn or hit-tested.
+    //
+    // scale: neutral default, not left at calloc's own 0.0 -- touch dispatch divides real-screen
+    // coordinates by it (see hds_android_touch_ring_drain_and_dispatch()'s own comment), and a
+    // touch event could in principle be queued and drained before this window's own redraw
+    // thread has run even once to compute the real factor, which would otherwise divide by zero.
+    // 1.0 (i.e. "not yet scaled") is overwritten by the real factor within one frame of the first
+    // redraw either way.
+    w->scale = 1.0;
     g_android_gui_window = w;
     return true;
 }
@@ -286,7 +299,8 @@ static void hds_android_gui_enter_scroll_mode(HdsAndroidGuiWindow *w, double log
 
 // Drains every touch event queued since the last frame (this window's own redraw thread only --
 // see this file's own header comment) and dispatches it, un-scaling every real-screen coordinate
-// into the view's own fixed logical space first (see HDS_ANDROID_GUI_LOGICAL_W/H's own comment).
+// into the view's own logical space first (divides by the one uniform scale factor
+// hds_android_gui_redraw() computes -- see HDS_ANDROID_GUI_LOGICAL_W's own comment).
 // gesture_mode keeps a single continuous touch sequence from ever driving BOTH a knob and a
 // scroll: it is decided once, then sticky for the rest of that sequence --
 //   - action 0 (sequence start) always arrives with pointer_count==1 (MotionEvent's own
@@ -307,8 +321,8 @@ static void hds_android_touch_ring_drain_and_dispatch(HdsAndroidGuiWindow *w) {
     unsigned int head = atomic_load_explicit(&g_touch_ring_head, memory_order_acquire);
     while (tail != head) {
         HdsTouchRingEvent ev = g_touch_ring[tail];
-        double x = (double)ev.x / w->scale_x;
-        double y = (double)ev.y / w->scale_y;
+        double x = (double)ev.x / w->scale;
+        double y = (double)ev.y / w->scale;
         if (ev.action == 0) { // sequence start, always one finger
             w->gesture_mode = HDS_ANDROID_TOUCH_PARAM;
             hds_clap_gui_on_button_press(w->plugin, &w->view, x, y, 1);
@@ -346,24 +360,29 @@ static void hds_android_touch_ring_drain_and_dispatch(HdsAndroidGuiWindow *w) {
 
 // Draws directly into the locked ANativeWindow buffer's own memory -- a cairo_image_surface_t
 // wrapping that exact pointer, no separate render target, no copy (see this file's own header
-// comment). The view itself is NEVER resized to the buffer's own real dimensions (see
-// HDS_ANDROID_GUI_LOGICAL_W/H's own comment on why) -- instead, scale_x/scale_y are recomputed
-// whenever the real buffer size changes (the one thing ANativeWindow itself can report that this
-// app doesn't otherwise learn about until the next lock, there being no ConfigureNotify-
-// equivalent pushed to this thread), and a per-axis cairo_scale() stretches the fixed logical
-// canvas to fill it exactly, independently on X and Y.
+// comment). The view's logical WIDTH never changes (HDS_ANDROID_GUI_LOGICAL_W, fixed); its
+// logical HEIGHT and `scale` are both recomputed here whenever the real buffer size changes (the
+// one thing ANativeWindow itself can report that this app doesn't otherwise learn about until
+// the next lock, there being no ConfigureNotify-equivalent pushed to this thread) -- scale from
+// buffer width alone, height as whatever is actually visible at that scale -- then ONE uniform
+// cairo_scale() stretches the logical canvas to fill the real screen's width exactly, with no
+// axis distortion. See HDS_ANDROID_GUI_LOGICAL_W's own comment for why.
 static void hds_android_gui_redraw(HdsAndroidGuiWindow *w) {
     if (!w->window) return;
     ANativeWindow_Buffer buf;
     if (ANativeWindow_lock(w->window, &buf, NULL) != 0) return;
     if (buf.width > 0 && buf.height > 0) {
-        w->scale_x = (double)buf.width / (double)HDS_ANDROID_GUI_LOGICAL_W;
-        w->scale_y = (double)buf.height / (double)HDS_ANDROID_GUI_LOGICAL_H;
+        double new_scale = (double)buf.width / (double)HDS_ANDROID_GUI_LOGICAL_W;
+        int new_logical_h = (int)((double)buf.height / new_scale);
+        if (new_scale != w->scale || new_logical_h != w->view.window_h) {
+            w->scale = new_scale;
+            hds_clap_gui_on_resize(&w->view, HDS_ANDROID_GUI_LOGICAL_W, new_logical_h);
+        }
     }
     cairo_surface_t *surface = cairo_image_surface_create_for_data(
         (unsigned char *)buf.bits, CAIRO_FORMAT_ARGB32, buf.width, buf.height, buf.stride * 4);
     cairo_t *cr = cairo_create(surface);
-    cairo_scale(cr, w->scale_x, w->scale_y);
+    cairo_scale(cr, w->scale, w->scale);
     hds_clap_gui_render(cr, w->plugin, &w->view);
     cairo_surface_flush(surface);
     hds_android_gui_swap_rb_inplace((unsigned char *)buf.bits, buf.width, buf.height, buf.stride);
@@ -435,8 +454,8 @@ static void hds_android_gui_surface_destroyed(void) {
 // (hds_android.c's own JNI entry point relays MotionEvent's real ACTION_* constants down to this
 // -- see that file's own comment). x/y are real, un-scaled screen coordinates (HdsSurfaceView.
 // java's own single-pointer coordinates, or its already-averaged multi-pointer centroid) --
-// hds_android_touch_ring_drain_and_dispatch() divides by scale_x/scale_y into this window's own
-// logical space before ever calling into hds_clap_gui_on_*().
+// hds_android_touch_ring_drain_and_dispatch() divides by the current uniform `scale` into this
+// window's own logical space before ever calling into hds_clap_gui_on_*().
 static void hds_android_gui_touch_event(int action, int pointer_count, float x, float y) {
     if (!g_android_gui_window) return;
     hds_touch_ring_push(action, pointer_count, x, y);
