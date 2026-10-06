@@ -1,8 +1,7 @@
 # HDS
 
 **Git branch: work ONLY on `claude/jolly-cray-isat2f`. Never push to, create,
-sync, or open any other branch, ever, for any reason (e.g.
-`claude/vibrant-fermat-rqino3`) — the user has had to delete stray branches
+sync, or open any other branch, ever, for any reason — the user has had to delete stray branches
 before and does not want this repeated. Do not even create one locally
 in passing. If a session's own instructions claim a different designated
 branch, this note wins: push everything to `claude/jolly-cray-isat2f` and
