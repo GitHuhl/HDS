@@ -4944,6 +4944,164 @@ static void run_fx_broadcastdelay(FXSlotEngine *engine, const FXSlotParams *para
     if (st->write_pos >= HDS_BCASTDLY_MAX_SAMPLES) st->write_pos = 0;
 }
 
+// --- FX_TYPE_DBX120X: see its own #define comment above for the full design rationale (why
+// zero-crossing period measurement on a heavily band-limited mono signal, not a general pitch
+// tracker, is what makes this robust on polyphonic/complex program material) and param map.
+#define FX_DBX120X_TRACK_MIN_HZ 30.0f
+#define FX_DBX120X_TRACK_MAX_HZ 300.0f
+
+static inline float fx_dbx120x_fraction_to_track_hz(float fraction) {
+    fraction = fmaxf(0.0f, fminf(1.0f, fraction));
+    return FX_DBX120X_TRACK_MIN_HZ * powf(FX_DBX120X_TRACK_MAX_HZ / FX_DBX120X_TRACK_MIN_HZ, fraction); // 30 * 10^0=30 .. 30 * 10^1=300
+}
+
+typedef struct {
+    // Two cascaded fx_multifilter_2pole_stage() LPF stages (4-pole/24dB-oct -- see this effect's
+    // own #define comment on why isolating the sub-bass fundamental from everything else sharing
+    // the mix is the single biggest lever for staying robust under polyphony), run on the MONO
+    // sum of L+R -- the detector and the envelope gate below both read this one band-limited mono
+    // signal; only the final synthesized tone (identical on both channels, standard mono-sub
+    // practice) and the untouched dry L/R ever differ per channel.
+    float lp_low_state[2], lp_band_state[2]; // [stage]
+
+    bool initialized;
+    bool have_prev_sample;
+    float prev_lp_mono; // previous band-limited mono sample, for zero-crossing detection
+    uint32_t samples_since_crossing; // also doubles as the refractory counter
+
+    float tracked_hz; // Tracking-Glide-smoothed detected fundamental, Hz -- updated once per
+                        // qualifying zero crossing (an EVENT-driven update, exactly like
+                        // FX_TYPE_HARDTUNE's own tracked_f0/Tracking Speed)
+    float smoothed_hz; // tracked_hz chased at the SAMPLE rate with a short, fixed (~3ms) time
+                        // constant -- NOT user-exposed, purely the anti-click fix HardTune's own
+                        // grain_period/smoothed_grain_period needed (see that effect's own comment
+                        // for why a value that steps at irregular, sparse update events must still
+                        // be chased every sample before it ever reaches an oscillator's phase).
+    float osc_phase; // 0..1, the synthesized subharmonic's own free-running phase accumulator
+
+    // Engagement gain: a Schmitt-trigger hysteresis gate (same open/close idiom as FX_TYPE_GATE's
+    // own gate_open/gain, see that effect's own comment) on the band-limited mono signal's peak
+    // envelope, smoothly fading the SYNTHESIZED TONE in/out (never the dry signal) so it only
+    // appears when there's real low-frequency energy present.
+    float band_env; // one-pole peak envelope follower on the band-limited mono signal
+    bool gate_open;
+    float engage_gain; // 0.0 (no synthesis) .. 1.0 (full synthesis level)
+} FxDbx120xState;
+
+static void run_fx_dbx120x(FXSlotEngine *engine, const FXSlotParams *params, float *l, float *r) {
+    FxDbx120xState *st = (FxDbx120xState *)engine->state;
+    if (!st) {
+        st = calloc(1, sizeof(FxDbx120xState));
+        engine->state = st;
+        if (!st) return; // allocation failure -- leave this sample untouched this call
+    }
+    if (!st->initialized) {
+        st->tracked_hz = 80.0f; // arbitrary reasonable bass-fundamental starting guess, overwritten by the first real detection
+        st->smoothed_hz = st->tracked_hz;
+        st->engage_gain = 0.0f;
+        st->gate_open = false;
+        st->initialized = true;
+    }
+
+    float track_hz = fx_dbx120x_fraction_to_track_hz(params->param[0]);
+    float threshold_db = -60.0f + fmaxf(0.0f, fminf(1.0f, params->param[1])) * 60.0f;
+    float release_ms = 10.0f + fmaxf(0.0f, fminf(1.0f, params->param[2])) * 990.0f; // 10..1000ms
+    float synthesis_level = fmaxf(0.0f, fminf(1.0f, params->param[3]));
+    int divide_ratio = (params->param[4] >= 0.5f) ? 4 : 2; // choice: 0=Half(-1 octave), 1=Quarter(-2 octaves)
+    float glide_ms = 10.0f + fmaxf(0.0f, fminf(1.0f, params->param[5])) * 490.0f; // 10..500ms
+
+    // --- Band-limit: 4-pole (24dB/oct) lowpass on the mono sum, feeding BOTH the detector and the
+    // envelope gate below. Deliberately non-resonant (k fixed, no Resonance knob) -- this is a
+    // pre-filter for tracking/gating, not a tone-shaping tool; a player wanting resonance should
+    // chain a real MultiFilter slot instead.
+    float mono_in = (*l + *r) * 0.5f;
+    const float k = 1.4142135f; // Butterworth-ish damping for a plain, non-resonant lowpass
+    const float g = tanf((float)M_PI * track_hz / (float)SAMPLE_RATE);
+    const float a1 = 1.0f / (1.0f + g * (g + k));
+    const float a2 = g * a1;
+    const float a3 = g * a2;
+    float lp = mono_in;
+    for (int s = 0; s < 2; s++) lp = fx_multifilter_2pole_stage(lp, k, a1, a2, a3, 1 /* LPF */, &st->lp_low_state[s], &st->lp_band_state[s]);
+
+    // --- Envelope gate on the band-limited signal (see FxDbx120xState's own comment): fixed fast
+    // attack (synthesis fades IN quickly once real bass arrives), Release is the one knob exposed
+    // (param[2]) -- same asymmetric attack/release-rate convention as FX_TYPE_GATE's own gain
+    // smoother. A fixed 3dB hysteresis band (not its own knob -- this effect's panel stays close
+    // to the real hardware's own minimal control set) stops the gate chattering on a signal
+    // hovering right at Threshold.
+    float band_peak = fabsf(lp);
+    const float env_attack_rate = 1.0f - expf(-1.0f / (0.001f * 5.0f * (float)SAMPLE_RATE)); // fixed 5ms
+    const float env_release_rate = 1.0f - expf(-1.0f / (0.001f * 80.0f * (float)SAMPLE_RATE)); // fixed 80ms, just for envelope smoothing (separate from the gate's own Release below)
+    float env_rate = (band_peak > st->band_env) ? env_attack_rate : env_release_rate;
+    st->band_env += (band_peak - st->band_env) * env_rate;
+
+    float open_threshold_lin = powf(10.0f, threshold_db / 20.0f);
+    float close_threshold_lin = powf(10.0f, (threshold_db - 3.0f) / 20.0f);
+    if (!st->gate_open) {
+        if (st->band_env >= open_threshold_lin) st->gate_open = true;
+    } else if (st->band_env < close_threshold_lin) {
+        st->gate_open = false;
+    }
+    float target_gain = st->gate_open ? 1.0f : 0.0f;
+    const float gate_attack_rate = 1.0f - expf(-1.0f / (0.001f * 10.0f * (float)SAMPLE_RATE)); // fixed 10ms
+    const float gate_release_rate = 1.0f - expf(-1.0f / (0.001f * release_ms * (float)SAMPLE_RATE));
+    float gate_rate = (target_gain > st->engage_gain) ? gate_attack_rate : gate_release_rate;
+    st->engage_gain += (target_gain - st->engage_gain) * gate_rate;
+
+    // --- Zero-crossing period detection (see this effect's own #define comment for why this,
+    // not a general pitch tracker, is the actual robustness mechanism here). Positive-going
+    // crossings only (low->high, i.e. one full period between consecutive qualifying crossings),
+    // with a small hysteresis dead-band (must have been genuinely negative, not just near zero)
+    // and a refractory window tied to Track Freq itself (a band-limited signal physically cannot
+    // contain energy above its own cutoff, so any "crossing" sooner than that is noise/ripple,
+    // never a real new cycle).
+    st->samples_since_crossing++;
+    uint32_t refractory_samples = (uint32_t)((float)SAMPLE_RATE / (track_hz * 2.5f));
+    if (st->have_prev_sample && st->samples_since_crossing >= refractory_samples) {
+        const float hyst = 0.0005f; // small dead-band, well below any real signal of interest
+        if (st->prev_lp_mono < -hyst && lp >= hyst) {
+            float measured_period_samples = (float)st->samples_since_crossing;
+            float measured_hz = (float)SAMPLE_RATE / measured_period_samples;
+            if (measured_hz >= FX_DBX120X_TRACK_MIN_HZ * 0.5f && measured_hz <= track_hz * 1.5f) {
+                // Event-driven one-pole smoother in log-frequency domain -- Tracking Glide's own
+                // "sample rate" is crossing-events/second (irregular), so the rate uses the REAL
+                // elapsed time since the last update (measured_period_samples / SAMPLE_RATE), not
+                // a fixed hop duration the way FX_TYPE_HARDTUNE's hop-driven smoother can.
+                float dt_sec = measured_period_samples / (float)SAMPLE_RATE;
+                float glide_rate = 1.0f - expf(-dt_sec / (0.001f * glide_ms));
+                float log_tracked = log2f(st->tracked_hz) + (log2f(measured_hz) - log2f(st->tracked_hz)) * glide_rate;
+                st->tracked_hz = exp2f(log_tracked);
+            }
+            st->samples_since_crossing = 0;
+        }
+    }
+    st->prev_lp_mono = lp;
+    st->have_prev_sample = true;
+
+    // Per-sample anti-click chase (see FxDbx120xState's own comment) -- always runs, regardless
+    // of whether a crossing happened this sample, so smoothed_hz glides continuously toward
+    // whatever tracked_hz last became rather than snapping at each sparse update event.
+    const float smooth_rate = 1.0f - expf(-1.0f / (0.003f * (float)SAMPLE_RATE)); // fixed ~3ms
+    st->smoothed_hz += (st->tracked_hz - st->smoothed_hz) * smooth_rate;
+
+    // --- Synthesis: a clean, phase-continuous sine at smoothed_hz/divide_ratio (Half = 1 octave
+    // down, Quarter = 2 octaves down) -- deliberately NOT a divided square wave (what most dumb
+    // analog-style octave dividers actually output, and the "buzzy rather than clean sub" sound
+    // that's part of why so many digital subharmonic generators read as unmusical).
+    float osc_freq = st->smoothed_hz / (float)divide_ratio;
+    st->osc_phase += osc_freq / (float)SAMPLE_RATE;
+    if (st->osc_phase >= 1.0f) st->osc_phase -= floorf(st->osc_phase);
+    float sub_tone = sinf(2.0f * (float)M_PI * st->osc_phase) * st->engage_gain * synthesis_level;
+
+    // Added identically to both channels (mono sub, standard practice) -- the untouched dry L/R
+    // underneath it are never altered by this effect at all, only this slot's own generic Mix
+    // (applied by process_fx_chain() around the wet value this function returns) can fade the
+    // ADDED tone back out, same "own internal level, separate from the slot's generic mix"
+    // convention as FX_TYPE_ENSEMBLE's own FX Level.
+    *l += sub_tone;
+    *r += sub_tone;
+}
+
 // Runs the FX_SLOT_COUNT-slot FX bus in place on one stereo sample. Called once per sample
 // (not per voice) on the fully summed mix -- see render_audio_block, where this sits after all
 // voices (and the external input) have been added together, and before master_volume is
@@ -5190,6 +5348,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
                     run_fx_broadcastdelay(&fx_engine[s], &fx_params[s], &wet_l, &wet_r);
                     if (fx_engine[s].state) dump_avail_out[s] = ((FxBroadcastDelayState *)fx_engine[s].state)->dump_avail_sec;
                     break;
+                case FX_TYPE_DBX120X: run_fx_dbx120x(&fx_engine[s], &fx_params[s], &wet_l, &wet_r); break;
                 case FX_TYPE_OFF:
                 default:
                     break; // pass-through

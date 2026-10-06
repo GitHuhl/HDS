@@ -204,6 +204,19 @@ Up to 32 shared slots, each independently routable, each settable to any of:
   so two Broadcast Delay slots can run at once, each with its own On-Air
   Override wired to whichever trigger source(s) that instance actually
   needs; see `FX_TYPE_BROADCAST_DELAY`'s own comment in `src/fx_types.h`).
+- **Low end**: DBX120X, a subharmonic ("sub-bass") synthesizer. Unlike most
+  digital subharmonic generators (which run a general pitch tracker across
+  whatever's playing and fall apart on anything polyphonic), this one never
+  tries to resolve a single pitch out of a complex mix at all: it heavily
+  low-passes the signal first (Track Freq, 30-300Hz) so only the dominant
+  sub-bass fundamental survives, then measures its period by simple
+  zero-crossing counting — a technique that's structurally immune to the
+  octave-detection ambiguity a spectral/autocorrelation tracker suffers
+  from. Generates a clean sine tone (not a buzzy divided square wave) one
+  or two octaves down, gated in/out by Threshold/Release so it only
+  appears when there's real low-frequency energy present, with its own
+  Synthesis Level separate from the slot's generic Mix. See
+  `FX_TYPE_DBX120X`'s own comment in `src/fx_types.h`.
 - **NAM**: Neural Amp Modeler — loads a trained `.nam` amp model plus an
   optional cabinet impulse response.
 

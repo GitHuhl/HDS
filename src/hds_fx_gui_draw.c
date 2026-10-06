@@ -71,6 +71,7 @@ static const int HDS_FX_SELECTABLE_TYPES[] = {
     FX_TYPE_CABS2, FX_TYPE_NAM, FX_TYPE_GATE, FX_TYPE_EQ3, FX_TYPE_LIMITER, FX_TYPE_FETCOMP,
     FX_TYPE_FAIRKID67, FX_TYPE_PEAKMAX, FX_TYPE_MULTIFILTER, FX_TYPE_OPTOCOMP, FX_TYPE_DEESSER,
     FX_TYPE_HARDTUNE, FX_TYPE_FDNVERB, FX_TYPE_SSL4K, FX_TYPE_DBX160, FX_TYPE_BROADCAST_DELAY,
+    FX_TYPE_DBX120X,
 };
 #define HDS_FX_SELECTABLE_TYPE_COUNT (int)(sizeof(HDS_FX_SELECTABLE_TYPES) / sizeof(HDS_FX_SELECTABLE_TYPES[0]))
 
@@ -106,6 +107,7 @@ static const char *hds_fx_type_name(int fx_type) {
         case FX_TYPE_SSL4K: return "SSL4K";
         case FX_TYPE_DBX160: return "DBX160";
         case FX_TYPE_BROADCAST_DELAY: return "BcastDly";
+        case FX_TYPE_DBX120X: return "DBX120X";
         default: return "?";
     }
 }
@@ -119,6 +121,7 @@ static int hds_fx_type_param_count(int fx_type) {
         /* CABS2 */ 2, /* NAM */ 3, /* GATE */ 6, /* EQ3 */ 7, /* LIMITER */ 3, /* FETCOMP */ 8,
         /* FAIRKID67 */ 8, /* PEAKMAX */ 7, /* MULTIFILTER */ 4, /* OPTOCOMP */ 5, /* DEESSER */ 6,
         /* HARDTUNE */ 10, /* FDNVERB */ 10, /* SSL4K */ 11, /* DBX160 */ 5, /* BROADCAST_DELAY */ 7,
+        /* DBX120X */ 6,
     };
     if (fx_type < 0 || fx_type >= (int)(sizeof(counts) / sizeof(counts[0]))) return 0;
     return counts[fx_type];
@@ -153,6 +156,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
     static const char *const ssl4k[] = {"HPFrq", "LFFrq", "LFGan", "LMFrq", "LMGan", "LMQ", "HMFrq", "HMGan", "HFFrq", "HFGan", "E/G"};
     static const char *const dbx160[] = {"Thresh", "Ratio", "Makeup", "Sat", "SC-HP"};
     static const char *const bcastdly[] = {"Delay", "Dump7s", "Dmp15s", "Dmp30s", "Rstock", "OnAir", "Vol"};
+    static const char *const dbx120x[] = {"TrkFrq", "Thresh", "Releas", "SynLvl", "Octave", "Glide"};
 
     const char *const *table = NULL;
     int count = 0;
@@ -180,6 +184,7 @@ static const char *hds_fx_type_param_label(int fx_type, int idx) {
         case FX_TYPE_SSL4K: table = ssl4k; count = 11; break;
         case FX_TYPE_DBX160: table = dbx160; count = 5; break;
         case FX_TYPE_BROADCAST_DELAY: table = bcastdly; count = 7; break;
+        case FX_TYPE_DBX120X: table = dbx120x; count = 6; break;
         default: return "";
     }
     if (idx < 0 || idx >= count) return "";
@@ -297,6 +302,7 @@ static void hds_fx_type_param_value_text(int fx_type, int idx, float frac, char 
     static const char *const hardtune_target[] = {"SclKey", "MIDI"};
     static const char *const hardtune_voice[] = {"Bass", "Tenor", "Alto", "Soprano", "Wide"};
     static const char *const hardtune_vibsrc[] = {"None", "ModWhl", "AfterT"};
+    static const char *const dbx120x_octave[] = {"-1 Oct", "-2 Oct"};
 
     switch (fx_type) {
         case FX_TYPE_NAM:
@@ -430,6 +436,13 @@ static void hds_fx_type_param_value_text(int fx_type, int idx, float frac, char 
             if (idx == 0) { hds_fx_fmt_sec_linear(frac, 0.0f, (float)HDS_BCASTDLY_MAX_SEC, buf, buflen); return; } // Delay
             if (idx == 4) { hds_fx_fmt_plain(frac, 1.0f, 25.0f, "%", buf, buflen); return; } // Restock Speed
             break; // idx 1-3 (Dump) and idx 5 (On-Air Override) are custom-drawn buttons, never reach this function; idx 6 (Volume) falls through to the plain percent default below
+        case FX_TYPE_DBX120X:
+            if (idx == 0) { hds_fx_fmt_hz_log(frac, FX_DBX120X_TRACK_MIN_HZ, FX_DBX120X_TRACK_MAX_HZ, buf, buflen); return; }
+            if (idx == 1) { hds_fx_fmt_db(frac, -60.0f, 0.0f, buf, buflen); return; }
+            if (idx == 2) { hds_fx_fmt_ms(frac, 10.0f, 1000.0f, buf, buflen); return; }
+            if (idx == 4) { hds_fx_fmt_stepped(frac, dbx120x_octave, 2, buf, buflen); return; }
+            if (idx == 5) { hds_fx_fmt_ms(frac, 10.0f, 500.0f, buf, buflen); return; }
+            break; // idx 3 (Synthesis Level) is a genuine 0-100% fraction -- falls through to plain percent
         default: break;
     }
     hds_fx_fmt_percent(frac, buf, buflen);

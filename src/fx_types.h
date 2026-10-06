@@ -642,6 +642,51 @@ static inline float run_eq_biquad(float input, const EqBiquadCoeffs *c, float *z
 // FX_TYPE_BROADCAST_DELAY slots can run at once with each one's On-Air Override independently
 // wired to whichever trigger source(s) that particular instance actually needs.
 #define FX_TYPE_BROADCAST_DELAY 24
+// An original design (not ported from any single codebase, and NOT reverse-engineered from any
+// real dbx 120/120X-family schematic -- same posture as FX_TYPE_DBX160's own comment) modeling
+// the general, widely-known architectural idea behind that hardware family's subharmonic
+// synthesizer: rather than trying to run a general-purpose monophonic pitch tracker (YIN,
+// autocorrelation, etc.) across whatever program material arrives -- which is exactly where every
+// "unmusical on polyphonic material" digital subharmonic generator falls apart, since those
+// algorithms have to resolve ONE precise pitch out of a signal that may contain several, and they
+// fail by picking the wrong one, or the wrong octave, or chattering between candidates -- this
+// effect never attempts that at all. It heavily LOW-PASSES the signal first (param[0] Track Freq,
+// deliberately narrow, 30-300Hz) so that only the dominant sub-bass fundamental survives before
+// detection even starts: above that band, a polyphonic mix's own complexity (chords, vocals,
+// cymbals, whatever else is playing) is gone, and in practice there's rarely more than one real
+// fundamental with meaningful ENERGY left in a 30-300Hz window at any instant, even in dense
+// program material -- a kick drum and a bass guitar playing different notes still leaves one of
+// them clearly dominant moment to moment. Within that narrowed band, pitch is measured the same
+// simple, robust way analog octave dividers and the real hardware this models are built around:
+// zero-crossing period measurement (time between consecutive positive-going crossings, with a
+// refractory window tied to Track Freq itself to reject double-triggers/ripple), not spectral
+// analysis -- a technique that is structurally IMMUNE to the octave-detection ambiguity
+// autocorrelation/YIN-style trackers suffer from, because it never searches a lag range or scores
+// candidate periods at all; it just reads the waveform's own crossing rate directly. See
+// run_fx_dbx120x()'s own comment for the full per-sample mechanics, including how the detected
+// period is smoothed in TWO separate stages (an event-driven, user-controlled glide, then a short
+// fixed per-sample anti-click chase -- the same two-stage lesson HardTune's own grain_period/
+// smoothed_grain_period fix needed, applied here from the start) so the generated tone's pitch
+// never steps or clicks, only glides.
+//
+// The generated subharmonic itself is a clean, phase-continuous SINE tone (not a raw divided
+// square wave, which is what most dumb analog-style octave dividers actually output and which
+// reads as buzzy rather than a clean sub-bass layer) at exactly Half (param[4]=0, one octave down)
+// or Quarter (param[4]=1, two octaves down) of the tracked fundamental frequency, gated in/out by
+// param[1] Threshold/param[2] Release (a Schmitt-trigger hysteresis engagement gain, the same
+// open/close idiom FX_TYPE_GATE already uses, just gating how much synthesized tone is ADDED
+// rather than gating the dry signal itself) so it only appears when there's real low-frequency
+// energy present, never as a constant hum/rumble under silence or non-bass passages. param[3]
+// Synthesis Level (0-100%) is this effect's own internal gain on the generated tone before it's
+// summed with the untouched dry signal -- same "own internal level, separate from and applied in
+// addition to the slot's generic mix" convention as FX_TYPE_ENSEMBLE's own FX Level. param[5]
+// Tracking Glide (10-500ms) is the user-facing control for the actual polyphony/stability tradeoff
+// this whole design is built around: slower glide times make the tracked pitch far more resistant
+// to being knocked around by a few stray hits of other low-frequency content leaking through the
+// pre-filter, at the cost of responding more slowly to a genuinely new bass note; faster glide
+// times track a fast bass line more snappily but are more exposed to whatever else survives Track
+// Freq's own narrow window. See run_fx_dbx120x().
+#define FX_TYPE_DBX120X 25
 #define FX_SLOT_PARAM_COUNT 11
 typedef struct {
     float fx_type;
