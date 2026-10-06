@@ -4289,7 +4289,8 @@ typedef struct {
     int hop_counter;
 
     float tracked_f0;        // Tracking-Speed-smoothed detected pitch, Hz (held during unvoiced gaps)
-    float grain_period;      // current PSOLA grain period in samples, from tracked_f0 (held likewise)
+    float grain_period;      // current PSOLA grain period in samples, from tracked_f0 (held likewise) -- only ever updated once per HOP, see smoothed_grain_period's own comment
+    float smoothed_grain_period; // grain_period chased at the SAMPLE rate -- see its own comment at this effect's per-sample PSOLA block
     bool voiced;
 
     float hop_target_ratio;  // this hop's correction goal (1.0 = none), before Retune Speed smoothing
@@ -4328,6 +4329,7 @@ static void run_fx_hardtune(FXSlotEngine *engine, const FXSlotParams *params, fl
     if (!st->initialized) {
         st->tracked_f0 = 200.0f; // arbitrary reasonable starting guess, overwritten by the first real detection
         st->grain_period = (float)SAMPLE_RATE / st->tracked_f0;
+        st->smoothed_grain_period = st->grain_period;
         st->target_ratio = 1.0f;
         st->hop_target_ratio = 1.0f;
         st->phase = 0.0f;
@@ -4440,8 +4442,26 @@ static void run_fx_hardtune(FXSlotEngine *engine, const FXSlotParams *params, fl
     // physical motion already has -- a real-time performance control, not a quantized target.
     const float output_ratio = st->target_ratio * exp2f((g_hardtune_bend_semitones + vibrato_semitones) / 12.0f);
 
-    // --- PSOLA resynthesis: two Hann-crossfaded taps, phase wraps mod grain_period (see this
-    // effect's own top comment for why this never drifts unboundedly even under a sustained
+    // smoothed_grain_period chases grain_period at the SAMPLE rate, not the hop rate grain_period
+    // itself updates at (once per FX_HARDTUNE_YIN_HOP samples, in the analysis block above). This
+    // matters because every piece of math below -- the phase wrap boundary, frac_a/frac_b,
+    // offset_a/offset_b -- depends on grain_period, and a HELD vocal note's own detected period
+    // still wobbles by a sample or two hop-to-hop (ordinary YIN cycle-to-cycle jitter, not
+    // mistracking) -- stepping grain_period abruptly once per hop was a genuine, confirmed
+    // discontinuity in the PSOLA read position at every single hop boundary: a real click, not a
+    // perceptual artifact, repeating at the hop rate (100Hz at the default 10ms hop) and heard as a
+    // persistent "crunchy"/granular texture rather than one clean pop. A short (~3ms) one-pole chase
+    // here removes that step entirely for any ORDINARY jitter-scale change (a sample or two) --
+    // effectively fully settled well before the next hop, no audible pitch lag. A large, sudden
+    // real change (a genuine pitch jump, or a mistracked octave) takes a few hops to fully settle
+    // the rest of the way instead of one -- an intentional, inaudible trade: it only ever smooths
+    // where this value feeds a continuously-read PSOLA position, never anything perceived as a
+    // discrete pitch-correction decision (that's target_ratio/Retune Speed's own job, upstream).
+    const float period_smooth_rate = 1.0f - expf(-1.0f / (0.003f * (float)SAMPLE_RATE));
+    st->smoothed_grain_period += (st->grain_period - st->smoothed_grain_period) * period_smooth_rate;
+
+    // --- PSOLA resynthesis: two Hann-crossfaded taps, phase wraps mod smoothed_grain_period (see
+    // this effect's own top comment for why this never drifts unboundedly even under a sustained
     // non-1.0 ratio) ---
     // Phase advances by (output_ratio - 1), NOT output_ratio: the actual buffer read position is
     // write_pos + offset, and write_pos ITSELF already advances by 1 every sample (real time) --
@@ -4451,17 +4471,17 @@ static void run_fx_hardtune(FXSlotEngine *engine, const FXSlotParams *params, fl
     // correctly makes phase never move at all: a fixed offset behind write_pos is already a
     // transparent, undelayed-in-pitch copy, needing no wrapping/resets whatsoever.
     st->phase += (output_ratio - 1.0f);
-    if (st->phase >= st->grain_period) st->phase -= st->grain_period;
-    if (st->phase < 0.0f) st->phase += st->grain_period; // pitch-DOWN corrections drift phase negative
+    if (st->phase >= st->smoothed_grain_period) st->phase -= st->smoothed_grain_period;
+    if (st->phase < 0.0f) st->phase += st->smoothed_grain_period; // pitch-DOWN corrections drift phase negative
 
-    const float frac_a = st->phase / st->grain_period;
+    const float frac_a = st->phase / st->smoothed_grain_period;
     float frac_b = frac_a + 0.5f;
     if (frac_b >= 1.0f) frac_b -= 1.0f;
     const float win_a = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * frac_a);
     const float win_b = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * frac_b);
 
-    const float offset_a = -(float)FX_HARDTUNE_PSOLA_DELAY + (frac_a * st->grain_period - st->grain_period * 0.5f);
-    const float offset_b = -(float)FX_HARDTUNE_PSOLA_DELAY + (frac_b * st->grain_period - st->grain_period * 0.5f);
+    const float offset_a = -(float)FX_HARDTUNE_PSOLA_DELAY + (frac_a * st->smoothed_grain_period - st->smoothed_grain_period * 0.5f);
+    const float offset_b = -(float)FX_HARDTUNE_PSOLA_DELAY + (frac_b * st->smoothed_grain_period - st->smoothed_grain_period * 0.5f);
 
     *l = hardtune_read_interp(st->buf[0], st->write_pos, offset_a) * win_a
        + hardtune_read_interp(st->buf[0], st->write_pos, offset_b) * win_b;
