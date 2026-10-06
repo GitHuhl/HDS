@@ -182,6 +182,12 @@ pkgs.mkShell {
     # binary -- this project needs nothing JDK-version-specific (plain javac/keytool), so there's
     # no reason to prefer a from-source build's extra wait.
     pkgs.temurin-bin-21
+    # Assembles the final unsigned.apk (base resources + classes.dex + the native .so) -- same
+    # "never actually provided by this file" gap as temurin-bin-21 just above, caught the same
+    # way (a second real, reported failure on a clean machine: `zip: command not found`, this
+    # time further along, after a JDK was already on PATH). Not part of any stdenv default --
+    # confirmed directly by hitting this exact failure with everything else already working.
+    pkgs.zip
 
     # --- Windows CLAP plugins (make clap-windows / make hds-fx-windows) ---
     # mingw.stdenv.cc puts x86_64-w64-mingw32-gcc/-g++/-ar/-windres on PATH (the exact names both
