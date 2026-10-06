@@ -11,19 +11,20 @@ add_library(hds_native SHARED
     ${HDS_SRC_DIR}/hds_android.c
 )
 
-target_include_directories(hds_native PRIVATE ${HDS_SRC_DIR})
+# stub/lo/lo.h stands in for the real liblo for now -- backend.c #includes <lo/lo.h> directly for
+# its OSC control protocol (34 handler functions, ~70 call sites), none of which hds_android.c
+# ever actually invokes (nothing here starts a server or registers a handler), so this header
+# gives backend.c the real type/function shapes to compile and link cleanly against, as inert
+# no-ops, with zero changes to backend.c itself. See stub/lo/lo.h's own header comment for exactly
+# why and how to swap in the real, cross-built liblo later (a separate, contained step once basic
+# audio+MIDI is verified on a real phone) -- listed first so it's found ahead of anything else
+# that might also provide <lo/lo.h>.
+target_include_directories(hds_native PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/stub
+    ${HDS_SRC_DIR}
+)
 
 find_library(log-lib log)
 find_library(aaudio-lib aaudio)
 
-# TODO (blocked on NDK access, see android/README.md): backend.c #includes <lo/lo.h> directly
-# (its own OSC control protocol -- see backend.c's header comment), so this will fail to LINK,
-# not compile, until liblo is cross-built for android-arm64 and added here, e.g.:
-#   add_subdirectory(${HDS_SRC_DIR}/../third_party/liblo-android ${CMAKE_BINARY_DIR}/liblo)
-#   target_link_libraries(hds_native PRIVATE lo)
-# The existing third_party/win64-deps/src/liblo-0.31 tree is NOT reused as-is here: it's already
-# configured (config.status/Makefile) for the mingw-w64 cross-build from task #111, so pointing
-# this at it directly would link a Windows-configured liblo into an Android .so. A clean checkout
-# of that same liblo source, configured fresh for aarch64-linux-android via the NDK's own CMake
-# toolchain file, is a contained, separate step -- deliberately not guessed at here blind.
 target_link_libraries(hds_native PRIVATE ${log-lib} ${aaudio-lib})

@@ -13,10 +13,15 @@ separate decision from this).
   `android.media.midi` into `dispatch_midi_event()` calls, and run an AAudio output stream whose
   callback renders straight into AAudio's own buffer via `render_audio_block()` -- no Bitmap, no
   Java-side pixel or sample copy anywhere in the signal path.
-- `android/app/src/main/cpp/CMakeLists.txt` -- builds that one file. Links `aaudio`/`log`; **does
-  not yet link liblo** (see the TODO in that file -- `backend.c` pulls in `<lo/lo.h>` directly for
-  its OSC control protocol, so this will compile cleanly but fail at the link step until liblo is
-  cross-built for `android-arm64` and wired in there).
+- `android/app/src/main/cpp/CMakeLists.txt` -- builds that one file. Links `aaudio`/`log` only.
+  `backend.c` pulls in `<lo/lo.h>` directly for its OSC control protocol (34 handler functions,
+  ~70 call sites) that this build never actually uses (nothing here starts a server or registers
+  a handler) -- rather than cross-building real liblo for `android-arm64` right now, which is one
+  more variable this first test doesn't need, `stub/lo/lo.h` stands in for it: the real
+  type/function shapes so `backend.c` compiles and links completely unmodified, every body an
+  inert no-op. OSC is simply off for this build, not broken -- see that header's own comment for
+  exactly how to swap in the real, cross-built liblo later, once basic audio+MIDI is verified on
+  a real phone.
 - `android/app/src/main/java/com/hds/androidtest/` -- `NativeBridge.kt` (the JNI boundary, no
   logic) and `MainActivity.kt` (scans for a MIDI device via `MidiManager`, auto-connects, forwards
   raw bytes to native code, shows a one-line status so you can tell it's alive without `adb
@@ -28,11 +33,14 @@ separate decision from this).
 **Verified**: `src/hds_android.c` was syntax-checked with the host's own `gcc -fsyntax-only`
 against the *real* `backend.c`/`fx_chain.c` (not a mockup) -- every type, struct field, and
 function signature it calls (`render_audio_block`, `dispatch_midi_event`, `init_default_controls`,
-`HdsSampleEngine`, etc.) is the actual one, confirmed to match. The JNI/AAudio calls themselves
-were checked against hand-written stub headers with real NDK signatures (not invented), stored at
-`/tmp/.../scratchpad/ndk_stub/` for this session -- a genuine type-check, but it cannot catch
-anything the real NDK headers would (ABI details, deprecated-signature changes between NDK
-versions, etc.).
+`HdsSampleEngine`, etc.) is the actual one, confirmed to match. The same check, re-run with
+`stub/lo/lo.h` on the include path ahead of the host's own real liblo-dev headers (confirmed via
+`gcc -H`, not assumed), compiles clean too -- all 71 real `lo_*` call sites in `backend.c` resolve
+against the stub's signatures with zero warnings under `-Wall -Wextra`. The JNI/AAudio calls
+themselves were checked against hand-written stub headers with real NDK signatures (not
+invented), stored at `/tmp/.../scratchpad/ndk_stub/` for this session -- a genuine type-check, but
+it cannot catch anything the real NDK headers would (ABI details, deprecated-signature changes
+between NDK versions, etc.).
 
 **Unverified, because this sandbox cannot reach it**: the Gradle/Kotlin project was never built.
 This session's egress policy blocks `dl.google.com` (403, "policy denial") -- the only place the
@@ -51,11 +59,7 @@ cd android
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Before that works, do the one real remaining step noted in `CMakeLists.txt`'s TODO: a fresh
-`liblo` checkout configured for `android-arm64` via the NDK's own CMake toolchain file
-(`-DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake`), added as a linked target
-there. Everything else -- the engine, the MIDI parsing, the AAudio wiring, the Kotlin shell -- is
-already written.
+No other steps needed first -- liblo is stubbed out (see above), so this is the whole build.
 
 If this sandbox's own network policy can be configured to allow `dl.google.com` for a future
 session (see this session's environment docs for how environments configure egress), the build
