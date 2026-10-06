@@ -370,10 +370,10 @@ static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int a
 }
 
 static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int delta) {
-    if (vs->fx_view.browser.open) { hds_fx_gui_on_scroll(&vs->fx_view, delta); return; }
+    if (vs->fx_view.browser.open) { hds_fx_gui_on_scroll(&p->gui_host, &vs->fx_view, delta); return; }
     if (x < HDS_CLAP_GLOBAL_SIDEBAR_W) { hds_clap_global_on_scroll(p, &vs->global_view, vs->window_h, delta); return; }
     if (y < HDS_CLAP_TAB_BAR_H) return;
-    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_scroll(&vs->fx_view, delta);
+    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_scroll(&p->gui_host, &vs->fx_view, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_scroll(&vs->lfos_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_scroll(&vs->envelopes_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_scroll(&vs->routing_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);

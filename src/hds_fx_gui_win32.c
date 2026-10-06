@@ -112,7 +112,7 @@ static LRESULT CALLBACK hds_fx_gui_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARA
             if (w) hds_fx_gui_on_motion(w->plugin, &w->view, (double)GET_X_LPARAM(lp), (double)GET_Y_LPARAM(lp));
             return 0;
         case WM_MOUSEWHEEL:
-            if (w) hds_fx_gui_on_scroll(&w->view, GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1);
+            if (w) hds_fx_gui_on_scroll(w->plugin, &w->view, GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1);
             return 0;
         case WM_SIZE:
             if (w) {

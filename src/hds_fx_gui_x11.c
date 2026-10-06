@@ -111,8 +111,8 @@ static void hds_fx_gui_pump_events(HdsFxGuiWindow *w) {
         XNextEvent(w->display, &ev);
         switch (ev.type) {
             case ButtonPress:
-                if (ev.xbutton.button == 4) hds_fx_gui_on_scroll(&w->view, 1);
-                else if (ev.xbutton.button == 5) hds_fx_gui_on_scroll(&w->view, -1);
+                if (ev.xbutton.button == 4) hds_fx_gui_on_scroll(w->plugin, &w->view, 1);
+                else if (ev.xbutton.button == 5) hds_fx_gui_on_scroll(w->plugin, &w->view, -1);
                 else {
                     // Claim keyboard focus on every real click, not just when a NAM path field is
                     // hit -- a reparented (XEmbed-lite) child window doesn't receive KeyPress events

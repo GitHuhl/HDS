@@ -674,7 +674,21 @@ typedef struct {
     int kind;         // one of HDS_FX_DROPDOWN_* above; NONE when closed
     int row;          // which pool slot this dropdown belongs to
     HdsFxRect anchor; // the pill's own rect at the moment it was opened -- positions the list
+    int scroll;       // index of the first VISIBLE option -- see hds_fx_dropdown_visible_rows()'s
+                        // own comment. Always reset to 0 by hds_fx_dropdown_open() below; nothing
+                        // else should ever need to touch this field directly.
 } HdsFxDropdown;
+
+// The one place a dropdown is ever opened -- see every hds_fx_gui_on_button_press() call site
+// below. Exists specifically so scroll always starts at 0 on a fresh open; forgetting that reset
+// at any one of those call sites (there are several, one per pill/button kind) would otherwise
+// leave a stale scroll position left over from whichever OTHER dropdown happened to be open last.
+static void hds_fx_dropdown_open(HdsFxDropdown *dd, int kind, int row, HdsFxRect anchor) {
+    dd->kind = kind;
+    dd->row = row;
+    dd->anchor = anchor;
+    dd->scroll = 0;
+}
 
 // In-house file browser for FX_TYPE_NAM's Model/IR pills -- a real directory listing drawn with
 // this file's own Cairo primitives, not a subprocess (zenity/kdialog) and not a GTK/Qt widget. This
@@ -1377,24 +1391,64 @@ static double hds_fx_dropdown_width(int kind) {
     }
 }
 
+// How many option rows an open list can show at once before it needs to scroll -- fit to
+// whatever vertical space is actually available in THIS window (same "fit to available space"
+// posture HdsFxBrowserLayout's own visible_rows already uses for the file browser's list, not a
+// hardcoded constant), so a taller host window naturally shows more rows and a short one still
+// shows at least a few. Several of this GUI's own lists are genuinely long now -- the Input/
+// Source dropdowns' "Slot N Out" section alone is FX_SLOT_COUNT-1 (31) entries wide, on top of
+// whatever the rest of that list already has, and the Type dropdown has grown to 26+ entries as
+// more effects get ported in -- so letting every open list simply render every option, however
+// many there are, used to produce a list taller than the window itself: entries past the bottom
+// edge were simply unreachable, with no indication more existed at all. Capped at whichever is
+// smaller, the real option count or the space available; never less than 1 row even on a tiny
+// window.
+#define HDS_FX_DROPDOWN_MARGIN_PX 20.0 // breathing room off the window's own top/bottom edges
+static int hds_fx_dropdown_visible_rows(int count, int window_h) {
+    int fit = (int)(((double)window_h - HDS_FX_DROPDOWN_MARGIN_PX) / HDS_FX_DROPDOWN_ROW_H);
+    if (fit < 1) fit = 1;
+    return (count < fit) ? count : fit;
+}
+
 // The open list's own background rect -- flips to open ABOVE the anchor pill instead of below if
 // the list would otherwise run off the window's own bottom edge. Same geometry
 // hds_fx_dropdown_option_rect() below builds each individual option row from, so draw and
-// hit-test can never disagree about where anything is.
+// hit-test can never disagree about where anything is. Height is capped to however many rows
+// hds_fx_dropdown_visible_rows() says actually fit -- NOT a flat `count * ROW_H` the way this used
+// to work, which is exactly what let a long list run off the bottom of the window unscrollable.
 static void hds_fx_dropdown_bg_rect(const HdsFxGuiHost *p, const HdsFxDropdown *dd, int window_h, HdsFxRect *out) {
     int count = hds_fx_dropdown_option_count(p, dd->kind);
+    int visible_rows = hds_fx_dropdown_visible_rows(count, window_h);
     double w = hds_fx_dropdown_width(dd->kind);
-    double list_h = count * HDS_FX_DROPDOWN_ROW_H;
+    double list_h = visible_rows * HDS_FX_DROPDOWN_ROW_H;
     double below_y = dd->anchor.y + dd->anchor.h + 2.0;
     double y0 = (below_y + list_h > (double)window_h) ? (dd->anchor.y - list_h - 2.0) : below_y;
     if (y0 < 0.0) y0 = 0.0;
     *out = (HdsFxRect){dd->anchor.x, y0, w, list_h};
 }
 
+// idx is a real option index (0..count-1), not a row position within the visible window -- the
+// caller is responsible for only asking about indices actually in [dd->scroll, dd->scroll+
+// visible_rows) (see hds_fx_dropdown_visible_range() below); this function just maps whichever
+// index it's given to a Y position relative to dd->scroll, same as it always positioned rows
+// relative to 0 before scrolling existed.
 static void hds_fx_dropdown_option_rect(const HdsFxGuiHost *p, const HdsFxDropdown *dd, int window_h, int idx, HdsFxRect *out) {
     HdsFxRect bg;
     hds_fx_dropdown_bg_rect(p, dd, window_h, &bg);
-    *out = (HdsFxRect){bg.x, bg.y + idx * HDS_FX_DROPDOWN_ROW_H, bg.w, HDS_FX_DROPDOWN_ROW_H};
+    *out = (HdsFxRect){bg.x, bg.y + (idx - dd->scroll) * HDS_FX_DROPDOWN_ROW_H, bg.w, HDS_FX_DROPDOWN_ROW_H};
+}
+
+// The [first, last) range of option indices actually visible right now, given dd->scroll -- the
+// one place both the render loop and the click hit-test loop get this range from, so they can
+// never disagree about which rows are currently on screen.
+static void hds_fx_dropdown_visible_range(const HdsFxGuiHost *p, const HdsFxDropdown *dd, int window_h, int *first, int *last) {
+    int count = hds_fx_dropdown_option_count(p, dd->kind);
+    int visible_rows = hds_fx_dropdown_visible_rows(count, window_h);
+    *first = dd->scroll;
+    if (*first < 0) *first = 0;
+    if (*first > count - visible_rows) *first = (count > visible_rows) ? count - visible_rows : 0;
+    *last = *first + visible_rows;
+    if (*last > count) *last = count;
 }
 
 static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewState *vs) {
@@ -1402,6 +1456,8 @@ static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFx
     const HdsFxDropdown *dd = &vs->dropdown;
     int count = hds_fx_dropdown_option_count(p, dd->kind);
     int current = hds_fx_dropdown_current_index(p, dd->kind, dd->row);
+    int first, last;
+    hds_fx_dropdown_visible_range(p, dd, vs->window_h, &first, &last);
 
     HdsFxRect bg;
     hds_fx_dropdown_bg_rect(p, dd, vs->window_h, &bg);
@@ -1417,7 +1473,7 @@ static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFx
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 10.5);
-    for (int i = 0; i < count; i++) {
+    for (int i = first; i < last; i++) {
         HdsFxRect r;
         hds_fx_dropdown_option_rect(p, dd, vs->window_h, i, &r);
         if (i == current) {
@@ -1430,6 +1486,22 @@ static void hds_fx_gui_render_dropdown(cairo_t *cr, HdsFxGuiHost *p, const HdsFx
         hds_fx_dropdown_option_label(p, dd->kind, dd->row, i, label, sizeof(label));
         hds_fx_rgb(cr, i == current ? 0.92 : 0.78, i == current ? 0.95 : 0.78, i == current ? 0.92 : 0.81);
         hds_fx_left_text(cr, r.x + 6, r.y + r.h / 2 + 3.5, label);
+    }
+
+    // Scrollbar thumb, same visual idiom as the main slot list's own (see hds_fx_gui_render's own
+    // thumb a bit further down) -- only drawn at all when there's genuinely more than one
+    // screenful of options, so a short list looks exactly like it always did.
+    if (count > (last - first)) {
+        double track_x = bg.x + bg.w - 4.0;
+        double visible_frac = (double)(last - first) / (double)count;
+        double thumb_h = bg.h * visible_frac;
+        if (thumb_h < 12.0) thumb_h = 12.0;
+        double max_scroll_rows = (double)(count - (last - first));
+        double thumb_y = bg.y + (bg.h - thumb_h) * ((double)first / max_scroll_rows);
+        hds_fx_rgba(cr, 1, 1, 1, 0.35);
+        cairo_new_path(cr);
+        cairo_rectangle(cr, track_x, thumb_y, 3.0, thumb_h);
+        cairo_fill(cr);
     }
 }
 
@@ -2041,8 +2113,9 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
     }
 
     if (vs->dropdown.kind != HDS_FX_DROPDOWN_NONE) {
-        int count = hds_fx_dropdown_option_count(p, vs->dropdown.kind);
-        for (int i = 0; i < count; i++) {
+        int first, last;
+        hds_fx_dropdown_visible_range(p, &vs->dropdown, vs->window_h, &first, &last);
+        for (int i = first; i < last; i++) {
             HdsFxRect r;
             hds_fx_dropdown_option_rect(p, &vs->dropdown, vs->window_h, i, &r);
             if (hds_fx_rect_contains(&r, x, y)) {
@@ -2064,19 +2137,19 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
     hds_fx_gui_compute_row_layout(width, row_y, &L);
 
     if (hds_fx_rect_contains(&L.type_pill, x, y)) {
-        vs->dropdown.kind = HDS_FX_DROPDOWN_TYPE; vs->dropdown.row = row; vs->dropdown.anchor = L.type_pill;
+        hds_fx_dropdown_open(&vs->dropdown, HDS_FX_DROPDOWN_TYPE, row, L.type_pill);
         return true;
     }
     if (p->port_input_stereo && hds_fx_slot_is_chain_head(p, row) && hds_fx_rect_contains(&L.input_pill, x, y)) {
-        vs->dropdown.kind = HDS_FX_DROPDOWN_INPUT; vs->dropdown.row = row; vs->dropdown.anchor = L.input_pill;
+        hds_fx_dropdown_open(&vs->dropdown, HDS_FX_DROPDOWN_INPUT, row, L.input_pill);
         return true;
     }
     if (!p->port_input_stereo && p->source_count > 0 && hds_fx_slot_is_chain_head(p, row) && hds_fx_rect_contains(&L.input_pill, x, y)) {
-        vs->dropdown.kind = HDS_FX_DROPDOWN_SOURCE; vs->dropdown.row = row; vs->dropdown.anchor = L.input_pill;
+        hds_fx_dropdown_open(&vs->dropdown, HDS_FX_DROPDOWN_SOURCE, row, L.input_pill);
         return true;
     }
     if (hds_fx_type_uses_sidechain((int)p->fx[row].fx_type) && hds_fx_rect_contains(&L.sidechain_pill, x, y)) {
-        vs->dropdown.kind = HDS_FX_DROPDOWN_SIDECHAIN; vs->dropdown.row = row; vs->dropdown.anchor = L.sidechain_pill;
+        hds_fx_dropdown_open(&vs->dropdown, HDS_FX_DROPDOWN_SIDECHAIN, row, L.sidechain_pill);
         return true;
     }
     // On-Air Override's own menu -- RIGHT-click only (button==1 on this same rect means something
@@ -2087,7 +2160,7 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
         HdsFxRect onair_btn;
         hds_fx_bcastdly_dump_btn_rect(hds_fx_bcastdly_col_x(L.param_knob[0].x, 5), row_y, &onair_btn);
         if (hds_fx_rect_contains(&onair_btn, x, y)) {
-            vs->dropdown.kind = HDS_FX_DROPDOWN_ONAIR_MODE; vs->dropdown.row = row; vs->dropdown.anchor = onair_btn;
+            hds_fx_dropdown_open(&vs->dropdown, HDS_FX_DROPDOWN_ONAIR_MODE, row, onair_btn);
             return true;
         }
     }
@@ -2096,11 +2169,11 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
         if (hds_fx_rect_contains(&L.nam_ir_pill, x, y)) { hds_fx_gui_browser_open(vs, ".wav", "Select Cab IR (*.wav)", p->fx[row].nam_ir_path, SAMPLE_PATH_LEN); return true; }
     }
     if (p->port_output_channel && hds_fx_slot_is_chain_tail(p, row) && hds_fx_rect_contains(&L.output_pill, x, y)) {
-        vs->dropdown.kind = HDS_FX_DROPDOWN_OUTPUT; vs->dropdown.row = row; vs->dropdown.anchor = L.output_pill;
+        hds_fx_dropdown_open(&vs->dropdown, HDS_FX_DROPDOWN_OUTPUT, row, L.output_pill);
         return true;
     }
     if (!p->port_output_channel && p->source_routing_flat && hds_fx_slot_is_chain_tail(p, row) && hds_fx_rect_contains(&L.output_pill, x, y)) {
-        vs->dropdown.kind = HDS_FX_DROPDOWN_OUT_PAIR; vs->dropdown.row = row; vs->dropdown.anchor = L.output_pill;
+        hds_fx_dropdown_open(&vs->dropdown, HDS_FX_DROPDOWN_OUT_PAIR, row, L.output_pill);
         return true;
     }
     if (hds_fx_rect_contains(&L.bypass_btn, x, y)) { if (button == 1) p->fx[row].bypass = (p->fx[row].bypass != 0.0f) ? 0.0f : 1.0f; return true; }
@@ -2269,7 +2342,7 @@ static void hds_fx_gui_on_key(HdsFxGuiHost *p, HdsFxGuiViewState *vs, int action
 }
 
 // delta: +1 (wheel up / X11 Button4) or -1 (wheel down / X11 Button5).
-static void hds_fx_gui_on_scroll(HdsFxGuiViewState *vs, int delta) {
+static void hds_fx_gui_on_scroll(const HdsFxGuiHost *p, HdsFxGuiViewState *vs, int delta) {
     if (vs->browser.open) {
         HdsFxBrowserLayout L;
         hds_fx_browser_compute_layout(vs, &L);
@@ -2280,13 +2353,26 @@ static void hds_fx_gui_on_scroll(HdsFxGuiViewState *vs, int delta) {
         if (vs->browser.scroll > max_start) vs->browser.scroll = max_start;
         return;
     }
+    // An open dropdown's own list scrolls instead of the row list behind it -- its anchor rect
+    // stays exactly where it was opened (only the list CONTENT inside moves), so there's no longer
+    // a "floating, detached from its row" problem the way there would be if scrolling instead
+    // moved the anchor itself. Standard "a scroll while a modal list is open scrolls THAT list"
+    // convention (an HTML <select>, a native combobox, ...) -- never falls through to scrolling
+    // whatever's behind it.
+    if (vs->dropdown.kind != HDS_FX_DROPDOWN_NONE) {
+        int count = hds_fx_dropdown_option_count(p, vs->dropdown.kind);
+        int visible_rows = hds_fx_dropdown_visible_rows(count, vs->window_h);
+        int max_start = count - visible_rows;
+        if (max_start < 0) max_start = 0;
+        vs->dropdown.scroll -= delta;
+        if (vs->dropdown.scroll < 0) vs->dropdown.scroll = 0;
+        if (vs->dropdown.scroll > max_start) vs->dropdown.scroll = max_start;
+        return;
+    }
     vs->scroll_offset_px -= delta * (HDS_FX_GUI_ROW_H * 3.0);
     double max_scroll = hds_fx_gui_max_scroll(vs);
     if (vs->scroll_offset_px < 0.0) vs->scroll_offset_px = 0.0;
     if (vs->scroll_offset_px > max_scroll) vs->scroll_offset_px = max_scroll;
-    // A dropdown's own anchor rect is captured in absolute window coordinates at open time --
-    // scrolling the list would leave it floating, visually detached from the row it belongs to.
-    vs->dropdown.kind = HDS_FX_DROPDOWN_NONE;
 }
 
 static void hds_fx_gui_on_resize(HdsFxGuiViewState *vs, int w, int h) {
