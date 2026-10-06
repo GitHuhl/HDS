@@ -26,6 +26,11 @@
 typedef void *lo_address;
 typedef void *lo_message;
 typedef void *lo_bundle;
+// Needed only for hds_engine_instance.h's own HdsClapPlugin.osc_server field (the native-GUI
+// port's shared context type, see that header's own comment) -- never actually created by
+// anything on Android (no lo_server_new()/lo_server_thread_new() call site here either, same as
+// every other lo_* symbol this stub covers -- see this file's own header comment).
+typedef void *lo_server;
 
 // Field names/types match real liblo's lo_arg union closely enough for backend.c's handler bodies
 // to compile (argv[n]->f, ->i, ->s, ->blob.size/.data -- see this project's own grep of every field

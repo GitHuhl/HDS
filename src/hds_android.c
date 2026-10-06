@@ -29,6 +29,42 @@
 #define HDS_LOGW(...) __android_log_print(ANDROID_LOG_WARN, HDS_LOG_TAG, __VA_ARGS__)
 
 // -----------------------------------------------------------------------------------------------
+// Native GUI (HDS_ANDROID_GUI_ENABLED) -- the same Cairo-drawn tab bar hds.clap/the standalone
+// app already embed, this time drawn into a SurfaceView's own ANativeWindow -- see
+// hds_android_gui.c's own header comment for the real differences from hds_standalone_gui_x11.c.
+// hds_fx_gui_host.h/hds_engine_instance.h have no Cairo/Android dependency of their own (plain
+// struct definitions over backend.c's own types), same posture as hds_standalone.c's own
+// identical include -- but unlike that file, THIS build has no headless mode at all to keep
+// compiling when the GUI is left out, so every one of these includes (and the HdsClapPlugin
+// g_gui_ctx declaration just below) is gated on HDS_ANDROID_GUI_ENABLED end-to-end, not
+// unconditional the way hds_standalone.c's own are.
+#if defined(HDS_ANDROID_GUI_ENABLED)
+#include "../third_party/clap/include/clap/clap.h"
+#include "hds_fx_gui_host.h"
+#include "hds_engine_instance.h"
+// Mirrors clap_plugin.c's/hds_standalone.c's own identical #define -- this host likewise has no
+// flat N-port Input/Output concept (a slot's Input is which SOURCE feeds it), so SOURCE_COUNT is
+// the nearest analogous count.
+#define HDS_FX_PORT_COUNT SOURCE_COUNT
+#include "hds_fx_gui_draw.c"
+#include "hds_clap_play_draw.c"
+#include "hds_clap_combi_draw.c"
+#include "hds_clap_filters_draw.c"
+#include "hds_clap_lfos_draw.c"
+#include "hds_clap_envelopes_draw.c"
+#include "hds_clap_routing_draw.c"
+#include "hds_clap_devices_draw.c"
+#include "hds_clap_global_draw.c"
+// Compiles to nothing (HDS_STANDALONE_GUI_ENABLED is never defined here) but still #include'd
+// unconditionally, same convention clap_plugin.c/hds_standalone.c both already use -- see each
+// file's own identical comment: hds_clap_gui_draw.c's own HDS_CLAP_TAB_RECORDING dispatch needs
+// its types declared regardless.
+#include "hds_clap_recording_draw.c"
+#include "hds_clap_gui_draw.c"
+#include "hds_android_gui.c"
+#endif
+
+// -----------------------------------------------------------------------------------------------
 // Engine state -- one process-wide instance, same ownership shape as hds_standalone.c's own
 // g_sample_engine/g_engine globals (g_engine itself is already declared static inside backend.c --
 // see its own comment there -- so only the pieces backend.c does NOT already own for us are
@@ -37,14 +73,31 @@ static HdsSampleSlotState g_android_sample_slot_state;
 static HdsPendingLoadState g_android_pending_load_state;
 static HdsSampleEngine g_sample_engine = { &g_android_sample_slot_state, &g_streams_state, &g_android_pending_load_state };
 
+#if defined(HDS_ANDROID_GUI_ENABLED)
+// g_gui_ctx is a real, live, process-wide HdsClapPlugin -- g_gui_ctx.knobs IS the actual state
+// the audio engine reads every block, not a second copy, same design hds_standalone.c's own
+// g_gui_ctx already established (see that file's own header comment). The #define aliases below
+// make every EXISTING reference to g_knobs/g_fx_gr_db/g_fx_dump_avail_sec/g_ext_in_peak further
+// down in this file (predating the GUI port, written against plain top-level globals) resolve to
+// the real HdsClapPlugin fields the GUI draw files themselves read via `p->knobs`/`p->fx_gr_db`/
+// etc, with zero edits to any of those existing call sites -- same "rewrite every call site via
+// one #define" idiom hds_fx_gui_draw.c's own cairo_select_font_face substitution already uses.
+static HdsClapPlugin g_gui_ctx;
+#define g_knobs g_gui_ctx.knobs
+#define g_fx_gr_db g_gui_ctx.fx_gr_db
+#define g_fx_dump_avail_sec g_gui_ctx.fx_dump_avail_sec
+#define g_ext_in_peak g_gui_ctx.ext_in_peak
+#else
 static SynthSharedControls g_knobs;
+static float g_fx_gr_db[FX_SLOT_COUNT];
+static float g_fx_dump_avail_sec[FX_SLOT_COUNT];
+static float g_ext_in_peak[EXT_IN_PAIR_COUNT];
+#endif
+
 static SynthVoice g_voices[MAX_VOICES];
 static float g_global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
 static MonoNoteStack g_mono_stacks[COMBI_PROGRAM_COUNT + 1];
 static MidiLiveState g_midi_live;
-static float g_fx_gr_db[FX_SLOT_COUNT];
-static float g_fx_dump_avail_sec[FX_SLOT_COUNT];
-static float g_ext_in_peak[EXT_IN_PAIR_COUNT];
 // Fed to render_audio_block as a permanently-silent 2-channel "external input" -- same fallback
 // hds_standalone.c's own capture_buffer uses when no capture device is open, just permanent here
 // since this build never opens one. Sized to the hard per-block ceiling, same convention as that
@@ -65,6 +118,25 @@ static void hds_android_engine_init(void) {
     memset(g_fx_dump_avail_sec, 0, sizeof(g_fx_dump_avail_sec));
     memset(g_ext_in_peak, 0, sizeof(g_ext_in_peak));
     memset(g_ext_in_silence, 0, sizeof(g_ext_in_silence));
+#if defined(HDS_ANDROID_GUI_ENABLED)
+    // Wires the HdsFxGuiHost view onto this process's own real fx[] -- mirrors
+    // hds_standalone.c's own main()/clap_factory_create_plugin()'s identical lines exactly (see
+    // hds_engine_instance.h's own header comment on why this is the right shared context type).
+    g_gui_ctx.gui_host.fx = g_gui_ctx.knobs.fx;
+    g_gui_ctx.gui_host.fx_gr_db = g_gui_ctx.fx_gr_db;
+    g_gui_ctx.gui_host.fx_dump_avail_sec = g_gui_ctx.fx_dump_avail_sec;
+    g_gui_ctx.gui_host.source_count = SOURCE_COUNT;
+    g_gui_ctx.gui_host.source_label = hds_clap_source_label;
+    g_gui_ctx.gui_host.source_routing_flat = &g_gui_ctx.knobs.source_routing[0].enable[0];
+    g_gui_ctx.gui_host.output_pair_count = OUTPUT_PAIR_MAX;
+    // Same plain-struct-copy reasoning as hds_standalone.c's own identical line: HdsSampleEngine
+    // is just 3 pointers, both copies end up pointing at the SAME g_android_sample_slot_state/
+    // g_streams_state/g_android_pending_load_state globals g_sample_engine itself already wraps.
+    g_gui_ctx.sample_engine = g_sample_engine;
+    if (!hds_android_gui_init(&g_gui_ctx)) {
+        HDS_LOGW("gui init failed -- continuing with no GUI");
+    }
+#endif
     g_engine_initialized = true;
 }
 
@@ -323,9 +395,44 @@ Java_com_hds_androidtest_NativeBridge_nativeOnMidi(JNIEnv *env, jobject thiz, jb
 JNIEXPORT void JNICALL
 Java_com_hds_androidtest_NativeBridge_nativeShutdown(JNIEnv *env, jobject thiz) {
     (void)env; (void)thiz;
+#if defined(HDS_ANDROID_GUI_ENABLED)
+    // Defensive only -- HdsSurfaceView's own surfaceDestroyed() callback (see
+    // android/README.md) already calls nativeSurfaceDestroyed() before this normally runs;
+    // hds_android_gui_surface_destroyed() is itself a no-op if the window is already gone (see
+    // its own comment), so this is safe to call unconditionally here too.
+    hds_android_gui_surface_destroyed();
+#endif
     if (g_stream) {
         AAudioStream_requestStop(g_stream);
         AAudioStream_close(g_stream);
         g_stream = NULL;
     }
 }
+
+#if defined(HDS_ANDROID_GUI_ENABLED)
+// GUI JNI entry points -- match HdsSurfaceView.java's own SurfaceHolder.Callback/
+// View.OnTouchListener implementation (see android/README.md). `surface` is the
+// android.view.Surface SurfaceHolder.getSurface() returns.
+JNIEXPORT void JNICALL
+Java_com_hds_androidtest_NativeBridge_nativeSurfaceCreated(JNIEnv *env, jobject thiz, jobject surface) {
+    (void)thiz;
+    hds_android_gui_surface_created(env, surface);
+}
+
+JNIEXPORT void JNICALL
+Java_com_hds_androidtest_NativeBridge_nativeSurfaceDestroyed(JNIEnv *env, jobject thiz) {
+    (void)env; (void)thiz;
+    hds_android_gui_surface_destroyed();
+}
+
+// action: HdsSurfaceView.java's own OnTouchListener already collapses MotionEvent's real
+// ACTION_* constants down to 0=down/1=move/2=up-or-cancel before calling this -- see that file's
+// own comment -- so hds_android_gui_touch_event() itself only ever needs to switch on three
+// values, not MotionEvent's full action-constant space (pointer-index-encoded multi-touch
+// actions included), none of which this single-finger-only GUI needs to tell apart.
+JNIEXPORT void JNICALL
+Java_com_hds_androidtest_NativeBridge_nativeTouchEvent(JNIEnv *env, jobject thiz, jint action, jfloat x, jfloat y) {
+    (void)env; (void)thiz;
+    hds_android_gui_touch_event((int)action, (float)x, (float)y);
+}
+#endif
