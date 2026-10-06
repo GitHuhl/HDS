@@ -8,10 +8,18 @@ decision from this).
 **A real, signed, installable APK now exists.** Build it with:
 
 ```
-./tools/build_android_manual.sh
+nix-shell
+make android
 ```
 
-from the repo root. That produces `android/app/build/manual/hds-backend-test.apk`. Install it:
+from the repo root -- same entry point every other platform target in this project uses (see
+`shell.nix`'s own header comment). `nix-shell` puts the Android SDK/NDK on `PATH`
+(`ANDROID_SDK_ROOT`/`ANDROID_NDK_ROOT`, see `shell.nix`'s `androidSdk` binding) the same way it
+already does for the Windows/arm64 cross toolchains; `make android` then runs
+`tools/build_android_manual.sh` against them. (The script also works run directly, without
+`nix-shell` first -- it falls back to calling `nix-build` itself -- just slower, since it
+re-resolves the SDK/NDK derivation instead of reusing an already-entered shell's.) Either way
+this produces `android/app/build/manual/hds-backend-test.apk`. Install it:
 
 ```
 adb install -r android/app/build/manual/hds-backend-test.apk
@@ -77,6 +85,19 @@ of capturing it implicitly, specifically to avoid this. `tools/build_android_man
 compiles with `-source 8 -target 8`, which avoids a separate, unrelated `javac`/`d8` version
 mismatch. Building the real Gradle project on another machine, with a properly AGP-matched D8,
 may not need either workaround -- see `app/build.gradle`'s own comment.
+
+**A real on-device bug, found from an actual crash report, not predicted**: the very first
+installed build crashed immediately with `UnsatisfiedLinkError: dlopen failed: cannot locate
+symbol "exp2f"` (used by HardTune/DBX120X's own pitch-glide math). Root cause, confirmed via
+`readelf -d` on the built `.so`: the link command only passed `-llog -laaudio`, never `-lm`, so
+the finished library had no `NEEDED libm.so` entry at all. The build-time link still "succeeded"
+with no warning either way, because the NDK's own stub `libm.so`/`libc.so` both declare `exp2f`
+via Bionic's symbol-versioning scheme -- only the real split on an actual device exposed the
+missing dependency. Fixed by adding `-lm`; see `tools/build_android_manual.sh`'s own comment on
+that exact line for the full story. The general lesson this leaves behind: this sandbox can
+verify a lot (real compiler, real linker, real signature check) but never "does it actually run
+on a phone" -- that step stays genuinely necessary, and finding a real bug through it is the
+expected, correct outcome of doing it, not a sign anything upstream was skipped.
 
 ## What's still unverified
 

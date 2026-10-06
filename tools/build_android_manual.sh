@@ -15,10 +15,15 @@
 # `cd android && ./gradlew assembleDebug` after `gradle wrapper` (see android/README.md) is the
 # normal path and will work fine there, where google()/maven.google.com genuinely resolve.
 #
-# Requires: nix-build (this repo's own shell.nix already assumes Nix; see its own header comment
-# for the pinned nixpkgs-24.05 release android/nix/android-sdk.nix also pins). Everything else
-# (aapt2, javac, d8, apksigner, zipalign, the NDK clang, android.jar) comes from that one Nix
-# build -- no system Android SDK/NDK install needed at all.
+# Preferred entry point: `make android` (from the repo root), which runs inside `nix-shell` --
+# shell.nix's own androidSdk binding already exports ANDROID_SDK_ROOT/ANDROID_NDK_ROOT and puts
+# aapt2/d8/apksigner/zipalign and the NDK clang on PATH for every platform target the same way, so
+# this script just uses them directly when already set. Run directly without `nix-shell` (e.g.
+# `tools/build_android_manual.sh` on its own), it falls back to calling `nix-build` itself against
+# android/nix/android-sdk.nix -- slower (re-resolves the SDK/NDK derivation instead of reusing an
+# already-entered shell's), but self-sufficient. Either way: aapt2, javac, d8, apksigner, zipalign,
+# the NDK clang, and android.jar all come from that one real SDK/NDK -- no system Android SDK/NDK
+# install needed at all.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,12 +35,20 @@ TARGET_API=34
 BUILD_TOOLS_VERSION=34.0.0
 NDK_VERSION=26.1.10909125
 
-echo "=== Fetching Android SDK + NDK via Nix (cache.nixos.org, not dl.google.com) ==="
-SDK_ROOT="$(NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1 NIXPKGS_ALLOW_UNFREE=1 \
-  nix-build --no-out-link "$ANDROID_DIR/nix/android-sdk.nix")/libexec/android-sdk"
+if [ -n "${ANDROID_SDK_ROOT:-}" ] && [ -d "$ANDROID_SDK_ROOT" ]; then
+  echo "=== Using the Android SDK/NDK already on PATH (ANDROID_SDK_ROOT set -- inside nix-shell) ==="
+  SDK_ROOT="$ANDROID_SDK_ROOT"
+  NDK_ROOT="${ANDROID_NDK_ROOT:-$SDK_ROOT/ndk/$NDK_VERSION}"
+else
+  echo "=== ANDROID_SDK_ROOT not set -- not inside nix-shell. Falling back to a standalone"
+  echo "    nix-build (prefer \`make android\` or \`nix-shell\` first; see this script's own"
+  echo "    header comment for why) ==="
+  SDK_ROOT="$(NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1 NIXPKGS_ALLOW_UNFREE=1 \
+    nix-build --no-out-link "$ANDROID_DIR/nix/android-sdk.nix")/libexec/android-sdk"
+  NDK_ROOT="$SDK_ROOT/ndk/$NDK_VERSION"
+fi
 BUILD_TOOLS="$SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION"
 ANDROID_JAR="$SDK_ROOT/platforms/android-$TARGET_API/android.jar"
-NDK_ROOT="$SDK_ROOT/ndk/$NDK_VERSION"
 NDK_CLANG="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${MIN_API}-clang"
 echo "SDK: $SDK_ROOT"
 echo "NDK clang: $NDK_CLANG"
@@ -49,8 +62,17 @@ echo "=== Compiling the native engine (hds_android.c -> libhds_native.so) ==="
 "$NDK_CLANG" -c -std=gnu11 -O2 -fPIC -Wall -Wextra \
   -I "$ANDROID_DIR/app/src/main/cpp/stub" \
   "$ROOT/src/hds_android.c" -o "$WORK/hds_android.o"
+#
+# -lm: required even though it LOOKS like the build-time link succeeds without it -- the NDK's
+# stub libm.so/libc.so both declare exp2f/log2f/etc. (used by HardTune/DBX120X's glide and pitch
+# math) at build time via Bionic's symbol-versioning scheme, so the linker resolves the reference
+# either way with no error or warning. The real libm.so/libc.so split only exists on-DEVICE, and
+# without -lm here there's no DT_NEEDED libm.so entry in the finished .so -- confirmed via
+# `readelf -d`, and confirmed as the real bug via a real on-device crash log:
+# "UnsatisfiedLinkError: dlopen failed: cannot locate symbol exp2f". Link-time success on this
+# host proves nothing about runtime symbol resolution on an actual phone -- this is exactly why.
 "$NDK_CLANG" -shared -o "$WORK/lib/arm64-v8a/libhds_native.so" \
-  "$WORK/hds_android.o" -llog -laaudio
+  "$WORK/hds_android.o" -llog -laaudio -lm
 
 echo "=== Compiling the Java UI (javac, source/target 8 -- see MainActivity.java's own header
      comment for why: a non-static inner/anonymous class here crashes this SDK's bundled D8) ==="

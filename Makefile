@@ -228,7 +228,7 @@ ARM64_BIN := synth_engine-arm64
 # $ORIGIN-relative, i.e. "next to me".
 ARM64_LIBDIR := arm64-libs
 
-.PHONY: all run-backend run-frontend clean clean-windows clap hds-fx arm64 clap-windows hds-fx-windows FORCE
+.PHONY: all run-backend run-frontend clean clean-windows clap hds-fx arm64 clap-windows hds-fx-windows android FORCE
 
 all: $(BIN)
 
@@ -487,6 +487,18 @@ clap-windows: $(WIN_CLAP_OBJ) $(WIN_NAM_OBJS)
 hds-fx-windows: $(WIN_HDS_FX_OBJ) $(WIN_NAM_OBJS)
 	$(WIN_CXX) -shared $(STRIPFLAGS) $(WIN_LDFLAGS) -o $(WIN_HDS_FX_BIN) $(WIN_HDS_FX_OBJ) $(WIN_NAM_OBJS) $(WIN_LDLIBS)
 	@if [ -n "$(WIN_EXTRA_RUNTIME_DLLS)" ]; then cp -f $(WIN_EXTRA_RUNTIME_DLLS) .; fi
+
+# Android backend test (android/README.md): a real signed APK, built by hand with aapt2/javac/d8/
+# apksigner against the android SDK/NDK shell.nix's own androidSdk binding puts on PATH -- NOT a
+# compiled binary this Makefile tracks as a dependency the way every other target above is (no
+# .o/.c rule graph), since the actual work is cross-language (C -> .so, Java -> .dex, both zipped
+# together) and tools/build_android_manual.sh already encodes that whole pipeline -- this target
+# is just this project's usual `make <target>` entry point for it. Always re-runs (FORCE,
+# .PHONY) rather than tracking $(ANDROID_APK) as a real target: the script's own APK output
+# timestamp isn't a reliable signal for "needs rebuilding" the way a .o's mtime is, since it
+# depends on source files, the Java sources, AND the manifest all at once.
+android: FORCE
+	NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1 NIXPKGS_ALLOW_UNFREE=1 ./tools/build_android_manual.sh
 
 run-backend: $(BIN)
 	./$(BIN)

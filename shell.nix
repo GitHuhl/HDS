@@ -13,6 +13,14 @@
 ##                                                    first to cross-build Cairo/pixman/liblo into
 ##                                                    third_party/win64-deps/)
 ##
+##   make android          -> android/app/build/manual/hds-backend-test.apk (a real signed APK,
+##                                                    built by hand with aapt2/javac/d8/apksigner
+##                                                    against the androidSdk binding below -- see
+##                                                    android/README.md for the full story and
+##                                                    NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE/
+##                                                    NIXPKGS_ALLOW_UNFREE below for why both must
+##                                                    be exported before even entering this shell)
+##
 ## Scope note: the STANDALONE Windows build (synth_engine.exe, a second full audio/MIDI platform
 ## backend -- WASAPI alongside ALSA) is still dropped for good and never coming back -- that's a
 ## real, ongoing maintenance cost this project won't take on. The Windows CLAP plugins above are a
@@ -91,6 +99,23 @@ let
   # threading model in the first place.
   mingwMcfgthread = pkgs.pkgsCross.mingwW64.windows.mcfgthreads;
   mingw = pkgs.pkgsCross.mingwW64;
+
+  # android/nix/android-sdk.nix is the single source of truth for this (also used standalone by
+  # tools/build_android_manual.sh, when run outside this shell -- see that script's own comment on
+  # why it still falls back to calling nix-build itself in that case). Passing THIS file's own
+  # `pkgs` through via `{ inherit pkgs; }` instead of letting that file re-import its own pinned
+  # nixpkgs tarball a second time -- same nixpkgs revision either way (identical pin, see that
+  # file's own header comment), just one fetch/eval instead of two.
+  #
+  # NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1 and NIXPKGS_ALLOW_UNFREE=1 are NOT set here -- they're
+  # read from the environment at `pkgs` eval time (both are nixpkgs' own standard mechanism, not
+  # something this file invents), which means they must already be exported in the shell BEFORE
+  # running `nix-shell` itself, same as nixpkgs expects for any unfree/licensed package. The
+  # Makefile's own `android` target sets both for you; entering this shell directly (not via
+  # `make android`) needs them exported by hand first.
+  androidSdk = import ./android/nix/android-sdk.nix { inherit pkgs; };
+  androidNdkVersion = "26.1.10909125";
+  androidBuildToolsVersion = "34.0.0";
 in
 pkgs.mkShell {
   buildInputs = [
@@ -201,6 +226,8 @@ pkgs.mkShell {
     echo "    make clap-windows    -> hds-windows.clap"
     echo "    make hds-fx-windows  -> hds_fx-windows.clap"
     echo
+    echo "  make android    -> android/app/build/manual/hds-backend-test.apk (see android/README.md)"
+    echo
 
     # pkgsCross.mingwW64.stdenv.cc alone has no pthread.h/libwinpthread on its search path (see the
     # mingwPthreads binding's own comment above for why -- confirmed against nixpkgs' own source) --
@@ -285,5 +312,18 @@ pkgs.mkShell {
     # inside this port's own dev environment -- worth confirming with `ls` on the actual path
     # `nix-shell` resolves this to, the first time this target is built for real).
     export ARM64_BUNDLE_LIBS="${aarch64.liblo}/lib/liblo.so.7 ${aarch64.stdenv.cc.cc.lib}/lib/libstdc++.so.6 ${aarch64.stdenv.cc.cc.lib}/lib/libgcc_s.so.1"
+
+    # Android (make android / tools/build_android_manual.sh): unlike every other buildInputs
+    # entry above, androidSdk's own layout (composeAndroidPackages' output under
+    # libexec/android-sdk/...) has no top-level bin/ for nixpkgs' generic setup hooks to find on
+    # their own -- aapt2/d8/apksigner/zipalign live under build-tools/<ver>/, the NDK clang under
+    # ndk/<ver>/toolchains/llvm/prebuilt/linux-x86_64/bin/ -- so both are added to PATH here
+    # explicitly, same posture as ARM64_CFLAGS/WIN_EXTRA_CFLAGS above (an explicit path export,
+    # not reliance on buildInputs' automatic PATH injection). ANDROID_SDK_ROOT/ANDROID_NDK_ROOT
+    # are the same env var names tools/build_android_manual.sh checks for before falling back to
+    # running nix-build itself -- see that script's own comment.
+    export ANDROID_SDK_ROOT="${androidSdk}/libexec/android-sdk"
+    export ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/${androidNdkVersion}"
+    export PATH="$ANDROID_SDK_ROOT/build-tools/${androidBuildToolsVersion}:$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
   '';
 }
