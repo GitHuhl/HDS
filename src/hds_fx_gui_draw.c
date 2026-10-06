@@ -36,6 +36,42 @@
 #include <stdio.h>
 
 // ---------------------------------------------------------------------------------------------
+// Font selection -- a drop-in stand-in for cairo_select_font_face(), needed because Android has
+// no Fontconfig, and Cairo's own "toy font" backend (the thing cairo_select_font_face/
+// cairo_show_text use to turn a family NAME like "sans-serif" into real glyphs) is wired to a
+// null function pointer entirely when Cairo is built without Fontconfig -- confirmed directly in
+// Cairo's own source (src/cairo-ft-font.c's _cairo_ft_font_face_backend.create_for_toy), not
+// assumed. This is the ONE thing every draw file in this whole native GUI (hds_clap_gui_draw.c
+// and every hds_clap_*_draw.c it composes, all #include'd after this file) needed to change for
+// Android -- and thanks to this #define, none of them actually did: every existing
+// `cairo_select_font_face(cr, "sans-serif", slant, weight)` call site, in every one of those
+// files, is rewritten to call hds_font_select_face() instead, automatically, by the preprocessor,
+// with the exact same arguments and zero other changes anywhere.
+//
+// hds_font_select_face() must be defined (and must call the REAL cairo_select_font_face, by its
+// real name) BEFORE the #define below takes effect -- that's why the definition and the #define
+// are in this exact order, in this exact file: every other draw file in this codebase is
+// #include'd strictly after this one (see this file's own header comment + every host's own
+// #include order), so this is the one place in the whole codebase where "cairo_select_font_face"
+// still means the real library function.
+static void hds_font_select_face(cairo_t *cr, const char *family, cairo_font_slant_t slant, cairo_font_weight_t weight) {
+#if defined(HDS_ANDROID_GUI_ENABLED)
+    // family is always "sans-serif" at every real call site (checked) -- nothing to switch on.
+    // slant is dropped (Android ships two bundled font FACES -- regular and bold, see
+    // hds_android_gui.c's own comment on hds_android_font_regular/bold -- not four, so the one
+    // real italic use in this codebase, src/hds_clap_devices_draw.c's "Ultra/Extra Snappy" latency
+    // warning label, renders upright on Android instead of slanted; a real, accepted, minimal
+    // visual deviation, not an oversight).
+    (void)family; (void)slant;
+    extern cairo_font_face_t *hds_android_font_regular, *hds_android_font_bold;
+    cairo_set_font_face(cr, weight == CAIRO_FONT_WEIGHT_BOLD ? hds_android_font_bold : hds_android_font_regular);
+#else
+    cairo_select_font_face(cr, family, slant, weight);
+#endif
+}
+#define cairo_select_font_face hds_font_select_face
+
+// ---------------------------------------------------------------------------------------------
 // Layout constants
 // ---------------------------------------------------------------------------------------------
 #define HDS_FX_GUI_DEFAULT_W 1150
