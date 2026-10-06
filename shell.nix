@@ -170,6 +170,19 @@ pkgs.mkShell {
                      # what actually stops the binary from starting at all, not just a missing
                      # RPATH entry).
 
+    # --- Android (make android) ---
+    # tools/build_android_manual.sh drives javac directly (-source 8 -target 8, see that script's
+    # own comment on why) and keytool (first-run debug-keystore generation) -- NEITHER was ever
+    # actually provided by this file before now: every previous verification of `make android`
+    # happened to run on a host that already had a system JDK on PATH, which is NOT something
+    # `nix-shell` itself guaranteed -- confirmed as a real, reported gap (`javac: command not
+    # found`) on a clean machine with no system JDK at all. temurin-bin (a real, prebuilt OpenJDK,
+    # not nixpkgs' own `jdk`/`openjdk` source-built derivation) avoids a multi-minute from-source
+    # OpenJDK build the first time this shell is entered on a machine with no matching cached
+    # binary -- this project needs nothing JDK-version-specific (plain javac/keytool), so there's
+    # no reason to prefer a from-source build's extra wait.
+    pkgs.temurin-bin-21
+
     # --- Windows CLAP plugins (make clap-windows / make hds-fx-windows) ---
     # mingw.stdenv.cc puts x86_64-w64-mingw32-gcc/-g++/-ar/-windres on PATH (the exact names both
     # the Makefile's WIN_CC/WIN_CXX defaults and tools/build_windows_deps.sh's own cross-file
