@@ -4963,10 +4963,12 @@ typedef struct {
     // signal; only the final synthesized tone (identical on both channels, standard mono-sub
     // practice) and the untouched dry L/R ever differ per channel.
     float lp_low_state[2], lp_band_state[2]; // [stage]
+    float dc_lp; // dbx160_hpf()'s own lowpass-state convention -- see where it's applied below for why
 
     bool initialized;
-    bool have_prev_sample;
-    float prev_lp_mono; // previous band-limited mono sample, for zero-crossing detection
+    bool crossing_armed; // Schmitt-trigger "seen genuinely negative since the last crossing" latch
+                           // -- see the zero-crossing detection block's own comment for why this
+                           // replaced a naive single-previous-sample comparison.
     uint32_t samples_since_crossing; // also doubles as the refractory counter
 
     float tracked_hz; // Tracking-Glide-smoothed detected fundamental, Hz -- updated once per
@@ -5010,11 +5012,25 @@ static void run_fx_dbx120x(FXSlotEngine *engine, const FXSlotParams *params, flo
     int divide_ratio = (params->param[4] >= 0.5f) ? 4 : 2; // choice: 0=Half(-1 octave), 1=Quarter(-2 octaves)
     float glide_ms = 10.0f + fmaxf(0.0f, fminf(1.0f, params->param[5])) * 490.0f; // 10..500ms
 
-    // --- Band-limit: 4-pole (24dB/oct) lowpass on the mono sum, feeding BOTH the detector and the
-    // envelope gate below. Deliberately non-resonant (k fixed, no Resonance knob) -- this is a
-    // pre-filter for tracking/gating, not a tone-shaping tool; a player wanting resonance should
-    // chain a real MultiFilter slot instead.
+    // --- DC block first: a plain lowpass (see "Band-limit" just below) passes DC through at
+    // essentially unity gain -- it does NOT remove it. The zero-crossing detector further down
+    // depends on genuinely symmetric crossings through TRUE zero; any DC offset riding on the
+    // input (not unheard of from some interfaces/upstream plugins/asymmetric waveshaping elsewhere
+    // in a chain feeding this slot) would bias that reference point, which can suppress detected
+    // crossings outright (if the offset is large enough that the signal never actually goes
+    // negative) or skew their timing asymmetrically into a wrong period reading either way -- a
+    // real correctness gap, not a cosmetic one. Fixed at 5Hz (well below even Track Freq's own
+    // 30Hz floor, so it can never audibly touch real program material) using the same correctly-
+    // normalized one-pole DC-blocker already used for FX_TYPE_DBX160's own sidechain HPF (see
+    // dbx160_hpf's own comment).
     float mono_in = (*l + *r) * 0.5f;
+    const float dc_alpha = 1.0f - expf(-2.0f * (float)M_PI * 5.0f / (float)SAMPLE_RATE);
+    mono_in = dbx160_hpf(mono_in, &st->dc_lp, dc_alpha);
+
+    // --- Band-limit: 4-pole (24dB/oct) lowpass on the DC-blocked mono sum, feeding BOTH the
+    // detector and the envelope gate below. Deliberately non-resonant (k fixed, no Resonance knob)
+    // -- this is a pre-filter for tracking/gating, not a tone-shaping tool; a player wanting
+    // resonance should chain a real MultiFilter slot instead.
     const float k = 1.4142135f; // Butterworth-ish damping for a plain, non-resonant lowpass
     const float g = tanf((float)M_PI * track_hz / (float)SAMPLE_RATE);
     const float a1 = 1.0f / (1.0f + g * (g + k));
@@ -5055,28 +5071,40 @@ static void run_fx_dbx120x(FXSlotEngine *engine, const FXSlotParams *params, flo
     // and a refractory window tied to Track Freq itself (a band-limited signal physically cannot
     // contain energy above its own cutoff, so any "crossing" sooner than that is noise/ripple,
     // never a real new cycle).
+    //
+    // A proper two-state Schmitt trigger (crossing_armed), NOT a bare "compare this sample against
+    // the previous one" check -- a real, confirmed bug that WAS here: comparing only adjacent
+    // samples against the two fixed thresholds misses a crossing whenever the signal takes MORE
+    // THAN ONE sample to cross the dead-band itself (completely ordinary for a quieter or heavily
+    // attenuated signal moving slowly relative to the sample rate, not a contrived edge case) --
+    // e.g. sample N sits at +0.0002 (already above zero but short of +hyst) and sample N+1 jumps to
+    // +0.0023: neither "prev < -hyst" nor "this transition" fires, so that whole real cycle's
+    // crossing is silently dropped, corrupting the measured period for that cycle (and, caught on a
+    // live DC-offset test, happened to drop the SAME cycle repeatedly, landing on a steady half-
+    // frequency reading instead of occasional jitter). Tracking "have we been low enough at some
+    // point since the last crossing" as its own persistent boolean, armed the instant lp dips below
+    // -hyst and fired the instant it's armed AND lp rises past +hyst (however many samples that
+    // takes), is immune to this regardless of how slowly the signal crosses.
     st->samples_since_crossing++;
     uint32_t refractory_samples = (uint32_t)((float)SAMPLE_RATE / (track_hz * 2.5f));
-    if (st->have_prev_sample && st->samples_since_crossing >= refractory_samples) {
-        const float hyst = 0.0005f; // small dead-band, well below any real signal of interest
-        if (st->prev_lp_mono < -hyst && lp >= hyst) {
-            float measured_period_samples = (float)st->samples_since_crossing;
-            float measured_hz = (float)SAMPLE_RATE / measured_period_samples;
-            if (measured_hz >= FX_DBX120X_TRACK_MIN_HZ * 0.5f && measured_hz <= track_hz * 1.5f) {
-                // Event-driven one-pole smoother in log-frequency domain -- Tracking Glide's own
-                // "sample rate" is crossing-events/second (irregular), so the rate uses the REAL
-                // elapsed time since the last update (measured_period_samples / SAMPLE_RATE), not
-                // a fixed hop duration the way FX_TYPE_HARDTUNE's hop-driven smoother can.
-                float dt_sec = measured_period_samples / (float)SAMPLE_RATE;
-                float glide_rate = 1.0f - expf(-dt_sec / (0.001f * glide_ms));
-                float log_tracked = log2f(st->tracked_hz) + (log2f(measured_hz) - log2f(st->tracked_hz)) * glide_rate;
-                st->tracked_hz = exp2f(log_tracked);
-            }
-            st->samples_since_crossing = 0;
+    const float hyst = 0.0005f; // small dead-band, well below any real signal of interest
+    if (lp < -hyst) st->crossing_armed = true;
+    if (st->crossing_armed && lp >= hyst && st->samples_since_crossing >= refractory_samples) {
+        float measured_period_samples = (float)st->samples_since_crossing;
+        float measured_hz = (float)SAMPLE_RATE / measured_period_samples;
+        if (measured_hz >= FX_DBX120X_TRACK_MIN_HZ * 0.5f && measured_hz <= track_hz * 1.5f) {
+            // Event-driven one-pole smoother in log-frequency domain -- Tracking Glide's own
+            // "sample rate" is crossing-events/second (irregular), so the rate uses the REAL
+            // elapsed time since the last update (measured_period_samples / SAMPLE_RATE), not
+            // a fixed hop duration the way FX_TYPE_HARDTUNE's hop-driven smoother can.
+            float dt_sec = measured_period_samples / (float)SAMPLE_RATE;
+            float glide_rate = 1.0f - expf(-dt_sec / (0.001f * glide_ms));
+            float log_tracked = log2f(st->tracked_hz) + (log2f(measured_hz) - log2f(st->tracked_hz)) * glide_rate;
+            st->tracked_hz = exp2f(log_tracked);
         }
+        st->samples_since_crossing = 0;
+        st->crossing_armed = false;
     }
-    st->prev_lp_mono = lp;
-    st->have_prev_sample = true;
 
     // Per-sample anti-click chase (see FxDbx120xState's own comment) -- always runs, regardless
     // of whether a crossing happened this sample, so smoothed_hz glides continuously toward
