@@ -287,6 +287,10 @@ it sizes itself as a fraction of that constant.
   automatically by the build) — everything else statically links.
 - **PipeWire**: auto-detected at build time via pkg-config; `make` prints
   which backend it found. Falls back to ALSA-only if PipeWire isn't present.
+- **Android**: `src/hds_android.c` + `android/` is a headless backend-only
+  test build (AAudio out, raw MIDI in via `android.media.midi`, no GUI, no
+  OSC). See `android/README.md` for what's verified, what's blocked, and
+  how to finish the build on a machine with the NDK.
 
 ## Third-party code
 

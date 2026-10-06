@@ -1,0 +1,7 @@
+// Root build file. Deliberately minimal -- this project exists to answer one question (does the
+// real HDS DSP engine produce correct audio on a phone from a real MIDI keyboard), not to be a
+// template for the eventual full app. See android/README.md for what's proven and what's still
+// blocked.
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+}
