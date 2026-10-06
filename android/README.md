@@ -119,6 +119,34 @@ fabricated success -- NAM simply never has a model loaded on this build. Every o
 (Gate, EQ3, Limiter, HT76, Fairchild670, PeakMax, LA2A, the multi-slope filter, DeEsser, HardTune,
 FDNVerb, DBX120X, BroadcastDelay) is pure C and fully functional.
 
+**Stuttering/dropouts reported with 3+ notes held in each hand**: a real performance bug, found
+directly in the code rather than guessed at. The actual root cause wasn't a missing AAudio
+performance-mode flag (`AAUDIO_PERFORMANCE_MODE_LOW_LATENCY` was already requested from the
+start) -- it was a `pthread_mutex` shared between the AAudio realtime callback thread and
+Android's own MIDI Binder thread, guarding every call into the engine. Holding any lock inside a
+realtime audio callback is a textbook priority-inversion hazard: if the MIDI thread is holding it
+-- however briefly -- exactly when the callback fires, the callback stalls waiting, eating
+directly into its hard deadline. That matches the reported symptom precisely: a chord is several
+Note On messages arriving on the MIDI thread within the same few milliseconds, each one taking
+the lock. Fixed by replacing the mutex with a true lock-free single-producer/single-consumer
+ring buffer (`hds_midi_ring_push`/`hds_midi_ring_drain_and_dispatch` in `src/hds_android.c`): the
+MIDI thread only ever writes `head`, the audio thread only ever writes `tail`, each side only
+ever reads the other's index, and the audio thread drains the ring (applying every queued event)
+at the top of its own callback, before `render_audio_block()` -- so neither thread can ever block
+on the other.
+
+While fixing this, two more real latency/glitch-resistance gaps got closed, not just the one bug
+that was reported: the stream now tries `AAUDIO_SHARING_MODE_EXCLUSIVE` first (the real dedicated
+hardware path most devices either grant immediately or refuse outright) and falls back to
+`SHARED` only if that's refused; and the buffer size is now explicitly grown to 2x
+`AAudioStream_getFramesPerBurst()` after opening (AAudio's own bare default leaves no headroom at
+all, and 2x bursts of slack is the standard Android audio latency guidance for a stream seeing
+underruns). `nativeInit()` now logs the sharing mode/performance mode/buffer size it actually got
+(`adb logcat -s hds_native`), and the audio callback logs `AAudioStream_getXRunCount()` roughly
+once a second -- a real, always-available signal for whether the device itself is still
+glitching, worth checking first before assuming any further dropout report is a new bug rather
+than this same tradeoff needing to move further.
+
 ## What's still unverified
 
 Everything above was verified for real (real compiler, real linker, real `apksigner` signature
