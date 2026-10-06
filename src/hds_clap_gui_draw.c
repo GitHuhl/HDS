@@ -2,7 +2,13 @@
 // hds_clap_global_draw.c's own header comment: the always-visible "Global Configurations" panel,
 // a fixed-width column beside the tab area rather than a tab of its own) plus a tab bar (Play,
 // Filters, LFOs, Envelopes, FX, Routing, Devices, Recording -- MINUS Mapping and Sequencer, see
-// below) with per-tab dispatch.
+// below) with per-tab dispatch. The ONE exception: the sidebar is hidden specifically while the
+// FX tab is active (hds_clap_gui_sidebar_w() returns 0 there, HDS_CLAP_GLOBAL_SIDEBAR_W on every
+// other tab) -- that tab's own slot list (hds_fx_gui_draw.c, a 10-column table) genuinely needs
+// the width back, and Global's own settings aren't something anyone is toggling mid-FX-edit
+// anyway. Explicit product direction: an earlier pass made Global its own tab universally (and,
+// briefly, Android-only); this is the real, final shape, on every platform alike -- not
+// Android-specific (so it needed no HDS_ANDROID_GUI_ENABLED branching restored here at all).
 // Platform-agnostic like hds_fx_gui_draw.c itself (plain cairo_t*, no Xlib) -- hds_clap_gui_x11.c
 // is this file's own platform shim, same split for the same reason.
 //
@@ -52,17 +58,6 @@
 #define HDS_CLAP_GUI_MIN_W (740 + (int)HDS_CLAP_GLOBAL_SIDEBAR_W)
 #define HDS_CLAP_GUI_MIN_H 420
 
-// Every OTHER reference to HDS_CLAP_GLOBAL_SIDEBAR_W in THIS file (not hds_clap_global_draw.c,
-// whose own internal layout keeps using the real constant directly, unchanged -- see this file's
-// own header comment on HDS_CLAP_TAB_GLOBAL for why) goes through this instead: the real sidebar
-// width normally, or 0 on Android, where nothing reserves that strip at all -- Global is a tab
-// there instead (see directly below).
-#if defined(HDS_ANDROID_GUI_ENABLED)
-#define HDS_CLAP_SIDEBAR_RESERVED_W 0.0
-#else
-#define HDS_CLAP_SIDEBAR_RESERVED_W HDS_CLAP_GLOBAL_SIDEBAR_W
-#endif
-
 typedef enum {
     HDS_CLAP_TAB_PLAY = 0,
     HDS_CLAP_TAB_FILTERS,
@@ -74,11 +69,18 @@ typedef enum {
 #ifdef HDS_STANDALONE_GUI_ENABLED
     HDS_CLAP_TAB_RECORDING,
 #endif
-#ifdef HDS_ANDROID_GUI_ENABLED
-    HDS_CLAP_TAB_GLOBAL,
-#endif
     HDS_CLAP_TAB_COUNT
 } HdsClapTab;
+
+// Every reference to the sidebar's own reserved width in THIS file (not hds_clap_global_draw.c,
+// whose own internal layout keeps using HDS_CLAP_GLOBAL_SIDEBAR_W directly, unchanged) goes
+// through this instead: the real sidebar width on every tab except FX, where it's 0 -- that tab's
+// own slot list (hds_fx_gui_draw.c, a 10-column table) genuinely needs the width back, and
+// Global's own settings aren't something anyone is toggling mid-FX-edit anyway. See this file's
+// own header comment. Must come after the HdsClapTab enum above (it takes one as its parameter).
+static double hds_clap_gui_sidebar_w(HdsClapTab active_tab) {
+    return (active_tab == HDS_CLAP_TAB_FX) ? 0.0 : HDS_CLAP_GLOBAL_SIDEBAR_W;
+}
 
 // Mapping and Sequencer never exist here at all (not even as a placeholder tab): Mapping's own
 // native-GUI placeholder was removed once the Play tab's per-oscillator "Load .sfz..." button made
@@ -88,24 +90,15 @@ typedef enum {
 // standalone-only (WavRecorder/the record_enable writer thread), which is why it's conditional on
 // HDS_STANDALONE_GUI_ENABLED both in the HdsClapTab enum above and the label array below, rather
 // than being excluded outright like Mapping/Sequencer.
-// "Global" is a real tab ONLY on Android (HDS_ANDROID_GUI_ENABLED) -- everywhere else it's NOT a
-// tab at all (an earlier version of this port made it one, universally): it lives in the
-// persistent left sidebar instead, alongside the tab bar/content (see hds_clap_global_draw.c's
-// own header comment and this file's own header comment on how the sidebar and this tab bar
-// compose together). On a phone, a fixed-width sidebar eats a large fraction of an already-narrow
-// landscape screen permanently for settings touched rarely -- a tab, shown only when asked for,
-// fits that device shape better, matching this project's own explicit product direction for the
-// Android port. hds_clap_global_render()/_on_button_press()/_on_scroll() themselves are called
-// completely unchanged either way (not even a parameter differs) -- only WHERE and WHEN this file
-// calls them changes; see HDS_CLAP_SIDEBAR_RESERVED_W above and every site gated on
-// HDS_ANDROID_GUI_ENABLED below.
+// Global is never a tab of its own, on any platform: it lives in the persistent left sidebar,
+// alongside the tab bar/content, on every tab except FX (see hds_clap_gui_sidebar_w() above and
+// this file's own header comment). hds_clap_global_render()/_on_button_press()/_on_scroll()
+// themselves are called completely unchanged either way (not even a parameter differs) -- only
+// WHERE this file calls them changes.
 static const char *const HDS_CLAP_TAB_LABELS[HDS_CLAP_TAB_COUNT] = {
     "Play", "Filters", "LFOs", "Envelopes", "FX", "Routing", "Devices",
 #ifdef HDS_STANDALONE_GUI_ENABLED
     "Recording",
-#endif
-#ifdef HDS_ANDROID_GUI_ENABLED
-    "Global",
 #endif
 };
 
@@ -186,21 +179,23 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
     // specifically.
     p->knobs.gui_routing_tab_visible = (vs->active_tab == HDS_CLAP_TAB_ROUTING) ? 1.0f : 0.0f;
 
-#if !defined(HDS_ANDROID_GUI_ENABLED)
+    double sidebar_w = hds_clap_gui_sidebar_w(vs->active_tab);
+
     // The persistent left sidebar -- full window height, no tab bar over it (see this file's own
     // header comment). Drawn first, in the untranslated coordinate space (it starts at x=0).
-    // Android has no sidebar at all (HDS_CLAP_SIDEBAR_RESERVED_W is 0 there) -- Global is a tab
-    // instead, dispatched in the switch below like every other tab.
-    hds_clap_global_render(cr, p, &vs->global_view, HDS_CLAP_GLOBAL_SIDEBAR_W, vs->window_h);
-#endif
+    // Hidden (sidebar_w == 0) specifically while the FX tab is active -- that tab's own slot list
+    // genuinely needs the width back.
+    if (sidebar_w > 0.0) {
+        hds_clap_global_render(cr, p, &vs->global_view, sidebar_w, vs->window_h);
+    }
 
     // Everything else (tab bar + active tab's content) lives to the RIGHT of the sidebar --
     // translate once here so every tab's own render function keeps using plain (0,0)-relative
     // drawing exactly as it did before the sidebar existed, over a tab_area_w that already
     // excludes the sidebar's own width.
-    double tab_area_w = vs->window_w - HDS_CLAP_SIDEBAR_RESERVED_W;
+    double tab_area_w = vs->window_w - sidebar_w;
     cairo_save(cr);
-    cairo_translate(cr, HDS_CLAP_SIDEBAR_RESERVED_W, 0);
+    cairo_translate(cr, sidebar_w, 0);
 
     // Tab bar itself.
     hds_fx_rgb(cr, 0.14, 0.14, 0.17);
@@ -273,11 +268,6 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
             hds_clap_recording_render(cr, p, &vs->recording_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
             break;
 #endif
-#ifdef HDS_ANDROID_GUI_ENABLED
-        case HDS_CLAP_TAB_GLOBAL:
-            hds_clap_global_render(cr, p, &vs->global_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
-            break;
-#endif
         default:
             hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Coming soon");
             break;
@@ -306,20 +296,19 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
     // vs->browser.open before anything else, so this is safe to call with coordinates that may be
     // negative/out of its own usual range (a click on the sidebar, say) -- it just reads as "outside
     // the panel," which already means "close the browser," exactly the right behavior.
+    double sidebar_w = hds_clap_gui_sidebar_w(vs->active_tab);
     if (vs->fx_view.browser.open) {
-        return hds_fx_gui_on_button_press(&p->gui_host, &vs->fx_view, x - HDS_CLAP_SIDEBAR_RESERVED_W, y - HDS_CLAP_TAB_BAR_H, button);
+        return hds_fx_gui_on_button_press(&p->gui_host, &vs->fx_view, x - sidebar_w, y - HDS_CLAP_TAB_BAR_H, button);
     }
-#if !defined(HDS_ANDROID_GUI_ENABLED)
     // The persistent sidebar owns the whole left strip, full height -- checked FIRST, before the
     // tab bar's own y<BAR_H check, since the sidebar has no tab bar of its own at all (see this
-    // file's own header comment). No sidebar exists on Android at all -- Global is a tab instead,
-    // dispatched in the switch below.
-    if (x < HDS_CLAP_GLOBAL_SIDEBAR_W) {
+    // file's own header comment). Hidden on the FX tab (sidebar_w == 0 there), so this check
+    // naturally never matches any real coordinate while that tab is active.
+    if (sidebar_w > 0.0 && x < sidebar_w) {
         return hds_clap_global_on_button_press(p, &vs->global_view, &vs->fx_view, vs->window_h, x, y, button);
     }
-#endif
-    double tab_x = x - HDS_CLAP_SIDEBAR_RESERVED_W;
-    double tab_area_w = vs->window_w - HDS_CLAP_SIDEBAR_RESERVED_W;
+    double tab_x = x - sidebar_w;
+    double tab_area_w = vs->window_w - sidebar_w;
     if (y < HDS_CLAP_TAB_BAR_H) {
         for (int i = 0; i < HDS_CLAP_TAB_COUNT; i++) {
             HdsClapTabRect r;
@@ -358,27 +347,22 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
         case HDS_CLAP_TAB_RECORDING:
             return hds_clap_recording_on_button_press(p, &vs->recording_view, &vs->fx_view, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
 #endif
-#ifdef HDS_ANDROID_GUI_ENABLED
-        case HDS_CLAP_TAB_GLOBAL:
-            return hds_clap_global_on_button_press(p, &vs->global_view, &vs->fx_view, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
-#endif
         default:
             return true;
     }
 }
 
 static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y) {
-#if !defined(HDS_ANDROID_GUI_ENABLED)
     // Unconditional, not gated by x/active_tab: a drag that started in the sidebar (or the tab
     // area) must keep receiving motion even if the pointer strays outside that region afterward --
     // each handler already no-ops on its own if it has no drag in flight (same pattern every other
-    // per-tab on_motion in this dispatch already relies on). No sidebar exists on Android -- Global
-    // is a tab instead, handled by the plain tab dispatch below like every other tab.
+    // per-tab on_motion in this dispatch already relies on). Harmless to call even on the FX tab,
+    // where the sidebar isn't shown at all: there's no drag in flight on it to continue.
     hds_clap_global_on_motion(&vs->global_view, x, y);
-#endif
 
-    double tab_x = x - HDS_CLAP_SIDEBAR_RESERVED_W;
-    double tab_area_w = vs->window_w - HDS_CLAP_SIDEBAR_RESERVED_W;
+    double sidebar_w = hds_clap_gui_sidebar_w(vs->active_tab);
+    double tab_x = x - sidebar_w;
+    double tab_area_w = vs->window_w - sidebar_w;
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_motion(&p->gui_host, &vs->fx_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
     else if (vs->active_tab == HDS_CLAP_TAB_PLAY) {
         if ((int)p->knobs.performance_mode == 1) hds_clap_combi_on_motion(&vs->combi_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
@@ -391,9 +375,6 @@ static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_motion(&vs->devices_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
 #ifdef HDS_STANDALONE_GUI_ENABLED
     else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_motion(&vs->recording_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
-#endif
-#ifdef HDS_ANDROID_GUI_ENABLED
-    else if (vs->active_tab == HDS_CLAP_TAB_GLOBAL) hds_clap_global_on_motion(&vs->global_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
 #endif
 }
 
@@ -420,11 +401,9 @@ static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int a
 
 static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int delta) {
     if (vs->fx_view.browser.open) { hds_fx_gui_on_scroll(&p->gui_host, &vs->fx_view, delta); return; }
-#if !defined(HDS_ANDROID_GUI_ENABLED)
-    // No sidebar exists on Android -- Global is a tab instead, handled by the plain tab dispatch
-    // below like every other tab.
-    if (x < HDS_CLAP_GLOBAL_SIDEBAR_W) { hds_clap_global_on_scroll(p, &vs->global_view, vs->window_h, delta); return; }
-#endif
+    double sidebar_w = hds_clap_gui_sidebar_w(vs->active_tab);
+    // Hidden on the FX tab (sidebar_w == 0 there), so this naturally never matches while it's active.
+    if (sidebar_w > 0.0 && x < sidebar_w) { hds_clap_global_on_scroll(p, &vs->global_view, vs->window_h, delta); return; }
     if (y < HDS_CLAP_TAB_BAR_H) return;
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_scroll(&p->gui_host, &vs->fx_view, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_scroll(&vs->lfos_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
@@ -432,9 +411,6 @@ static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_scroll(&vs->routing_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
 #ifdef HDS_STANDALONE_GUI_ENABLED
     else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_scroll(p, &vs->recording_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
-#endif
-#ifdef HDS_ANDROID_GUI_ENABLED
-    else if (vs->active_tab == HDS_CLAP_TAB_GLOBAL) hds_clap_global_on_scroll(p, &vs->global_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
 #endif
 }
 

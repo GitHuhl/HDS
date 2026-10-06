@@ -1,6 +1,7 @@
 // hds_android_gui.c: the Android port's own native GUI window -- the SAME Cairo-drawn tab bar
-// (hds_clap_gui_draw.c, with Global folded in as its own tab here -- see that file's own
-// HDS_ANDROID_GUI_ENABLED comments) that hds.clap already embeds in a DAW host and
+// plus persistent Global sidebar (hds_clap_gui_draw.c -- see that file's own header comment;
+// not Android-specific at all, same shape as every other platform) that hds.clap already embeds
+// in a DAW host and
 // hds_standalone_gui_x11.c already opens as a top-level X11 window, now drawn straight into a
 // SurfaceView's own ANativeWindow buffer instead -- see this file's own hds_android_gui_redraw()
 // for exactly how "straight into" is literal here: no Java Bitmap, no intermediate surface of
@@ -46,18 +47,24 @@
 //     hds_clap_gui_on_*() call below runs on one thread only (this window's own), same
 //     "single-threaded against this struct" invariant hds_standalone_gui_x11.c's own thread
 //     already has against g_standalone_gui_window.
-//   - Scroll vs. parameter, by finger count, not by heuristic: there is no separate scroll-wheel
-//     input channel on a touchscreen the way X11's button 4/5 give
+//   - Scroll vs. parameter, by finger count AND dropdown state, not by heuristic: there is no
+//     separate scroll-wheel input channel on a touchscreen the way X11's button 4/5 give
 //     hds_standalone_gui_x11.c's own pump_events() for free, so a touch-move has to double as
-//     both a drag channel. Explicit product direction (not a guess): ONE finger only ever
-//     taps/drags a parameter (hds_clap_gui_on_button_press/_on_motion/_on_button_release, exactly
-//     like a mouse) and never scrolls; TWO OR MORE fingers only ever pan the active tab's own
-//     scroll position (hds_clap_gui_on_scroll(..., +-1), the SAME entry point X11's wheel already
-//     drives, at a fixed per-"click" pixel threshold -- see HDS_ANDROID_SWIPE_PX_PER_CLICK) and
-//     never touch a knob/param, however the gesture started. See
+//     both a drag channel. Explicit product direction (not a guess): ONE finger taps/drags a
+//     parameter (hds_clap_gui_on_button_press/_on_motion/_on_button_release, exactly like a
+//     mouse) UNLESS an open dropdown/popup list is directly under it, in which case that one
+//     finger scrolls the list instead (there's no param to drag under an open dropdown anyway --
+//     see hds_android_gui_dropdown_open()'s own comment); TWO OR MORE fingers always pan the
+//     active tab's own scroll position regardless of what's underneath. Both paths write
+//     straight into each tab's own existing float scroll field (scroll_offset_px/
+//     dest_scroll_px -- see hds_android_gui_scroll_by_px()'s own comment), continuously and 1:1
+//     with dragged pixels, not the discrete per-"click" hds_clap_gui_on_scroll(..., +-1) X11's
+//     wheel drives (an earlier version of this file called that instead, which real on-device
+//     testing showed feeling jumpy/stepped rather than smooth). See
 //     hds_android_touch_ring_drain_and_dispatch()'s own comment for the sticky per-sequence
-//     gesture_mode this decision lives in. No per-tab scroll OR hit-test math changes at all --
-//     same posture HDS_CLAP_SIDEBAR_RESERVED_W's own comment in hds_clap_gui_draw.c already takes
+//     gesture_mode the finger-count half of this decision lives in. No per-tab hit-test math
+//     changes at all -- same posture hds_clap_gui_sidebar_w()'s own comment in
+//     hds_clap_gui_draw.c already takes
 //     for "only WHERE/WHEN, never WHAT."
 //   - Scale-to-fill width, UNIFORMLY, not stretch: every hds_clap_*_draw.c tab lays its own
 //     content out at fixed, absolute pixel positions (confirmed on a real device: a correctly-
@@ -190,8 +197,8 @@ static void hds_touch_ring_push(int action, int pointer_count, float x, float y)
 // without distortion. The logical HEIGHT is NOT fixed: it is recomputed every frame as real
 // buffer height / this same scale (see hds_android_gui_redraw()), so whatever doesn't fit
 // vertically at this scale is already handled by each tab's own pre-existing scroll/clip
-// machinery, exactly as a short desktop window would be -- see HDS_ANDROID_SWIPE_PX_PER_CLICK's
-// own scroll-gesture comment for how that machinery is driven here.
+// machinery, exactly as a short desktop window would be -- see
+// hds_android_gui_scroll_by_px()'s own comment for how that machinery is driven here.
 #define HDS_ANDROID_GUI_LOGICAL_W 1150
 
 // -----------------------------------------------------------------------------------------------
@@ -215,25 +222,33 @@ typedef struct {
 
     // Gesture-mode state -- explicit product direction, not a heuristic: a SINGLE finger only
     // ever taps/drags a parameter (on_button_press/on_motion/on_button_release -- knobs, pills,
-    // tab switches); TWO OR MORE fingers only ever pan the active tab's own scroll position
-    // (on_scroll), never touching a knob/param no matter where they land. gesture_mode is
-    // "sticky" for the lifetime of one continuous touch sequence (first finger down to last
-    // finger up) -- see hds_android_touch_ring_drain_and_dispatch()'s own comment for exactly how
-    // it's set and why it never flips back from SCROLL to PARAM mid-sequence.
+    // tab switches) UNLESS an open dropdown/popup list (or the shared file browser) is directly
+    // under it, in which case that single finger scrolls THAT list instead -- there is no param
+    // to drag underneath an open dropdown anyway, and requiring a second/third finger just to
+    // scroll a small popup list is unnatural (explicit follow-up direction, not the original
+    // design). TWO OR MORE fingers always pan the active tab's own scroll position regardless of
+    // what's underneath, never touching a knob/param. gesture_mode itself only ever tracks the
+    // PARAM-vs-SCROLL finger-count distinction, "sticky" for the lifetime of one continuous touch
+    // sequence (first finger down to last finger up) -- see
+    // hds_android_touch_ring_drain_and_dispatch()'s own comment for exactly how it's set and why
+    // it never flips back from SCROLL to PARAM mid-sequence; the dropdown-open check is
+    // evaluated fresh on every move instead, since dropdown state can only ever actually change
+    // at a down event, never mid-drag.
     enum { HDS_ANDROID_TOUCH_NONE, HDS_ANDROID_TOUCH_PARAM, HDS_ANDROID_TOUCH_SCROLL } gesture_mode;
-    // Swipe accumulator (SCROLL mode only) -- reset every time gesture_mode (re-)enters SCROLL,
-    // so a baseline centroid jump at that instant never itself produces a scroll delta. Stored in
-    // LOGICAL (post-un-scale) units, same coordinate space as every hds_clap_gui_on_*() call.
+    // Baseline for this move's own scroll/drag delta -- set at the start of every touch sequence
+    // and re-baselined whenever gesture_mode (re-)enters SCROLL (so a baseline jump at that
+    // instant never itself produces a scroll delta). LOGICAL (post-un-scale) units.
     double touch_last_y;
-    double swipe_accum_px;
+    // Leftover fractional pixels for the two scrollable widgets indexed by a plain INTEGER row
+    // position rather than a continuous pixel offset (the FX tab's own file browser and
+    // dropdown lists, HdsFxBrowser.scroll/HdsFxDropdown.scroll) -- see
+    // hds_android_gui_scroll_by_px()'s own comment for why those two can't be scrolled with true
+    // 1:1 pixel smoothness the way every other scrollable list here now is. Reset alongside
+    // touch_last_y.
+    double row_accum_px;
 } HdsAndroidGuiWindow;
 
 static HdsAndroidGuiWindow *g_android_gui_window = NULL;
-
-#define HDS_ANDROID_SWIPE_PX_PER_CLICK 24.0 // one on_scroll() "click" per this many dragged pixels -- a
-                                             // single reasonable constant across every tab (on_scroll
-                                             // itself has no per-tab row-height parameter to scale
-                                             // against), not tuned per-tab
 
 static void *hds_android_gui_thread_main(void *arg);
 
@@ -282,19 +297,170 @@ static void hds_android_gui_swap_rb_inplace(unsigned char *bits, int32_t width, 
     }
 }
 
-// Enters SCROLL mode (or re-baselines it if already in it): resets the swipe accumulator and
-// sets touch_last_y to logical_y, so the very next move's delta is measured from THIS instant,
-// never from wherever the pointer(s) happened to be before this baseline was set. If a
-// single-finger PARAM gesture was in flight (a knob being dragged, say) when a second finger
-// landed, releases it cleanly first -- exactly like lifting that one finger would have, so
-// nothing is ever left stuck mid-drag.
+// Enters SCROLL mode (or re-baselines it if already in it): resets the row accumulator and sets
+// touch_last_y to logical_y, so the very next move's delta is measured from THIS instant, never
+// from wherever the pointer(s) happened to be before this baseline was set. If a single-finger
+// PARAM gesture was in flight (a knob being dragged, say) when a second finger landed, releases
+// it cleanly first -- exactly like lifting that one finger would have, so nothing is ever left
+// stuck mid-drag.
 static void hds_android_gui_enter_scroll_mode(HdsAndroidGuiWindow *w, double logical_y) {
     if (w->gesture_mode == HDS_ANDROID_TOUCH_PARAM) {
         hds_clap_gui_on_button_release(w->plugin, &w->view);
     }
     w->gesture_mode = HDS_ANDROID_TOUCH_SCROLL;
     w->touch_last_y = logical_y;
-    w->swipe_accum_px = 0.0;
+    w->row_accum_px = 0.0;
+}
+
+// Whether an open dropdown/popup list (or the shared file browser) currently owns input --
+// see this file's own header comment on why a single finger scrolls it directly instead of
+// needing a second/third finger the way scrolling a tab's own background content does. Reads
+// each tab's own already-public `dropdown_kind` field directly (every hds_clap_*_draw.c tab that
+// has one uses that exact name, `HDS_XXX_DROPDOWN_NONE` as its own "closed" sentinel -- see each
+// file's own declaration), plus the FX tab's own differently-shaped `dropdown.kind`/
+// `browser.open` -- no field added to any of those files for this. The Global sidebar is no
+// longer a tab of its own (see hds_clap_gui_draw.c's own header comment -- it's a persistent
+// sidebar shown alongside every tab except FX), so its own dropdown is checked independently,
+// gated on the touch actually being over the sidebar's own region (hds_clap_gui_sidebar_w(),
+// the exact same width hds_clap_gui_draw.c's own dispatch functions check against) rather than
+// on active_tab.
+static bool hds_android_gui_dropdown_open(HdsClapGuiViewState *vs, double x) {
+    if (vs->fx_view.browser.open || vs->fx_view.dropdown.kind != HDS_FX_DROPDOWN_NONE) return true;
+    double sidebar_w = hds_clap_gui_sidebar_w(vs->active_tab);
+    if (sidebar_w > 0.0 && x < sidebar_w) return vs->global_view.dropdown_kind != HDS_GLOBAL_DROPDOWN_NONE;
+    switch (vs->active_tab) {
+        case HDS_CLAP_TAB_PLAY:
+            return vs->play_view.dropdown_kind != HDS_PLAY_DROPDOWN_NONE || vs->combi_view.dropdown_kind != HDS_COMBI_DROPDOWN_NONE;
+        case HDS_CLAP_TAB_FILTERS:
+            return vs->filters_view.dropdown_kind != HDS_FILT_DROPDOWN_NONE;
+        case HDS_CLAP_TAB_LFOS:
+            return vs->lfos_view.dropdown_kind != HDS_LFO_DROPDOWN_NONE;
+        case HDS_CLAP_TAB_ENVELOPES:
+            return vs->envelopes_view.dropdown_kind != HDS_ENV_DROPDOWN_NONE;
+        case HDS_CLAP_TAB_DEVICES:
+            return vs->devices_view.dropdown_kind != HDS_DEV_DROPDOWN_NONE;
+        default:
+            return false; // FX handled above; Routing has no dropdown at all
+    }
+}
+
+// Smooth, continuous touch-scroll: writes each scrollable list's own existing float field
+// (scroll_offset_px / dest_scroll_px) directly, 1:1 with dragged logical pixels -- no row-
+// height-sized "clicks" the way a discrete mouse-wheel step is, which is exactly what made the
+// earlier on_scroll(+-1)-per-threshold touch scrolling feel jumpy/stepped on a real device.
+// Clamped with the SAME max-scroll formula each tab's own on_scroll() already uses, read
+// directly from already-public constants/helper functions (HDS_LFO_ROW_H, hds_fx_gui_max_scroll(),
+// hds_clap_routing_content_h(), ...) rather than re-derived -- this is purely an ADDITIONAL,
+// continuous-delta sibling path Android alone drives; zero changes to any tab's own on_scroll().
+//
+// The FX tab's own file browser and dropdown lists are the one exception: both are indexed by a
+// plain INTEGER row position (HdsFxBrowser.scroll/HdsFxDropdown.scroll), not a continuous pixel
+// offset, so true 1:1 smoothness isn't possible there without changing those fields' own type (a
+// shared-file change this port avoids) -- dragged pixels are instead accumulated (row_accum_px)
+// against that widget's own REAL row height (HDS_FX_BROWSER_ROW_H/HDS_FX_DROPDOWN_ROW_H, not a
+// generic guessed constant) before stepping the integer index by one, which is as smooth as an
+// integer-indexed list can be made.
+//
+// The Global sidebar is no longer a tab (see hds_clap_gui_draw.c's own header comment -- it's a
+// persistent sidebar shown alongside every tab except FX), so scrolling it is no longer keyed off
+// active_tab at all: `x` (the touch's own logical x, same as every hds_clap_gui_on_*() coordinate)
+// decides whether this drag is over the sidebar's own region (hds_clap_gui_sidebar_w(), the exact
+// same width hds_clap_gui_draw.c's own dispatch functions check against) BEFORE active_tab is
+// consulted for anything -- mirroring that file's own sidebar-first dispatch order exactly.
+static void hds_android_gui_scroll_by_px(HdsAndroidGuiWindow *w, double x, double delta_px) {
+    HdsClapGuiViewState *vs = &w->view;
+    double window_h = vs->window_h - HDS_CLAP_TAB_BAR_H;
+    double sidebar_w = hds_clap_gui_sidebar_w(vs->active_tab);
+    if (sidebar_w > 0.0 && x < sidebar_w) {
+        HdsClapGlobalViewState *gv = &vs->global_view;
+        ProgramState *prog = hds_play_program(w->plugin);
+        int algo = (int)prog->fm_algorithm;
+        if (algo < 0 || algo >= HDS_GLOBAL_FMALGO_COUNT) algo = 0;
+        HdsGlobalLayout L;
+        hds_clap_global_compute_layout(algo, 0.0, &L);
+        double max_scroll = L.content_h - vs->window_h;
+        if (max_scroll < 0.0) max_scroll = 0.0;
+        gv->scroll_offset_px -= delta_px;
+        if (gv->scroll_offset_px < 0.0) gv->scroll_offset_px = 0.0;
+        if (gv->scroll_offset_px > max_scroll) gv->scroll_offset_px = max_scroll;
+        return;
+    }
+    switch (vs->active_tab) {
+        case HDS_CLAP_TAB_FX: {
+            HdsFxGuiViewState *fv = &vs->fx_view;
+            if (fv->browser.open) {
+                w->row_accum_px -= delta_px;
+                HdsFxBrowserLayout L;
+                hds_fx_browser_compute_layout(fv, &L);
+                int max_start = fv->browser.entry_count - L.visible_rows;
+                if (max_start < 0) max_start = 0;
+                while (w->row_accum_px >= HDS_FX_BROWSER_ROW_H) { fv->browser.scroll++; w->row_accum_px -= HDS_FX_BROWSER_ROW_H; }
+                while (w->row_accum_px <= -HDS_FX_BROWSER_ROW_H) { fv->browser.scroll--; w->row_accum_px += HDS_FX_BROWSER_ROW_H; }
+                if (fv->browser.scroll < 0) fv->browser.scroll = 0;
+                if (fv->browser.scroll > max_start) fv->browser.scroll = max_start;
+                return;
+            }
+            if (fv->dropdown.kind != HDS_FX_DROPDOWN_NONE) {
+                w->row_accum_px -= delta_px;
+                int count = hds_fx_dropdown_option_count(&w->plugin->gui_host, fv->dropdown.kind);
+                int visible_rows = hds_fx_dropdown_visible_rows(count, fv->window_h);
+                int max_start = count - visible_rows;
+                if (max_start < 0) max_start = 0;
+                while (w->row_accum_px >= HDS_FX_DROPDOWN_ROW_H) { fv->dropdown.scroll++; w->row_accum_px -= HDS_FX_DROPDOWN_ROW_H; }
+                while (w->row_accum_px <= -HDS_FX_DROPDOWN_ROW_H) { fv->dropdown.scroll--; w->row_accum_px += HDS_FX_DROPDOWN_ROW_H; }
+                if (fv->dropdown.scroll < 0) fv->dropdown.scroll = 0;
+                if (fv->dropdown.scroll > max_start) fv->dropdown.scroll = max_start;
+                return;
+            }
+            fv->scroll_offset_px -= delta_px;
+            double max_scroll = hds_fx_gui_max_scroll(fv);
+            if (fv->scroll_offset_px < 0.0) fv->scroll_offset_px = 0.0;
+            if (fv->scroll_offset_px > max_scroll) fv->scroll_offset_px = max_scroll;
+            return;
+        }
+        case HDS_CLAP_TAB_LFOS: {
+            HdsClapLfosViewState *lv = &vs->lfos_view;
+            if (lv->dropdown_kind == HDS_LFO_DROPDOWN_DEST) {
+                lv->dest_scroll_px -= delta_px;
+                if (lv->dest_scroll_px < 0.0) lv->dest_scroll_px = 0.0;
+                return;
+            }
+            double content_h = HDS_LFO_HEADER_H + LFO_COUNT * HDS_LFO_ROW_H;
+            double max_scroll = content_h - window_h;
+            if (max_scroll < 0.0) max_scroll = 0.0;
+            lv->scroll_offset_px -= delta_px;
+            if (lv->scroll_offset_px < 0.0) lv->scroll_offset_px = 0.0;
+            if (lv->scroll_offset_px > max_scroll) lv->scroll_offset_px = max_scroll;
+            return;
+        }
+        case HDS_CLAP_TAB_ENVELOPES: {
+            HdsClapEnvelopesViewState *ev = &vs->envelopes_view;
+            if (ev->dropdown_kind == HDS_ENV_DROPDOWN_DEST) {
+                ev->dest_scroll_px -= delta_px;
+                if (ev->dest_scroll_px < 0.0) ev->dest_scroll_px = 0.0;
+                return;
+            }
+            double content_h = HDS_ENV_HEADER_H + ASSIGNABLE_EG_COUNT * HDS_ENV_PANEL_H;
+            double max_scroll = content_h - window_h;
+            if (max_scroll < 0.0) max_scroll = 0.0;
+            ev->scroll_offset_px -= delta_px;
+            if (ev->scroll_offset_px < 0.0) ev->scroll_offset_px = 0.0;
+            if (ev->scroll_offset_px > max_scroll) ev->scroll_offset_px = max_scroll;
+            return;
+        }
+        case HDS_CLAP_TAB_ROUTING: {
+            HdsClapRoutingViewState *rv = &vs->routing_view;
+            double content_h = hds_clap_routing_content_h();
+            double max_scroll = content_h - window_h;
+            if (max_scroll < 0.0) max_scroll = 0.0;
+            rv->scroll_offset_px -= delta_px;
+            if (rv->scroll_offset_px < 0.0) rv->scroll_offset_px = 0.0;
+            if (rv->scroll_offset_px > max_scroll) rv->scroll_offset_px = max_scroll;
+            return;
+        }
+        default:
+            return; // Play/Filters/Devices have no scrollable background content
+    }
 }
 
 // Drains every touch event queued since the last frame (this window's own redraw thread only --
@@ -302,17 +468,23 @@ static void hds_android_gui_enter_scroll_mode(HdsAndroidGuiWindow *w, double log
 // into the view's own logical space first (divides by the one uniform scale factor
 // hds_android_gui_redraw() computes -- see HDS_ANDROID_GUI_LOGICAL_W's own comment).
 // gesture_mode keeps a single continuous touch sequence from ever driving BOTH a knob and a
-// scroll: it is decided once, then sticky for the rest of that sequence --
+// background-content scroll: it is decided once, then sticky for the rest of that sequence --
 //   - action 0 (sequence start) always arrives with pointer_count==1 (MotionEvent's own
-//     ACTION_DOWN contract) -- always enters PARAM mode and issues on_button_press. A single
-//     finger that never adds a second one only ever taps/drags, exactly as if this were a mouse.
+//     ACTION_DOWN contract) -- always enters PARAM mode and issues on_button_press (this is also
+//     what opens/closes/selects-from a dropdown in the first place, and how a single-finger tap
+//     switches tabs). Baselines touch_last_y/row_accum_px unconditionally, so the very first move
+//     afterward -- whether it turns out to drag a param or scroll a just-opened dropdown -- has a
+//     correct delta from this exact instant, not a stale one.
 //   - action 3 (pointer count changed mid-sequence, a finger added or removed) moves to SCROLL
 //     mode the instant two or more fingers are down, however the sequence started -- and STAYS
 //     in SCROLL mode even if it drops back to one finger (lifting one of two scrolling fingers
 //     must never suddenly start dragging a knob under the remaining finger).
-//   - action 1 (move) dispatches on EITHER on_motion (PARAM) or the scroll accumulator (SCROLL),
-//     never both -- this is the whole point: a scroll gesture can never touch a param, and a
-//     param drag can never also scroll the list underneath it.
+//   - action 1 (move): hds_android_gui_dropdown_open() is checked FRESH on every move (unlike
+//     gesture_mode, dropdown state only ever actually changes at a down event, so this can never
+//     flicker mid-drag) -- SCROLL mode OR an open dropdown/browser both route into
+//     hds_android_gui_scroll_by_px(), continuous and smooth; PARAM mode with nothing open routes
+//     into on_motion(); never both for the same move, which is the whole point -- a scroll can
+//     never touch a param, and a param drag can never also scroll the list underneath it.
 //   - action 2 (sequence end) always calls on_button_release (itself a no-op if nothing was ever
 //     captured, e.g. a SCROLL-mode sequence -- same convention hds_standalone_gui_x11.c's own
 //     unconditional release call already relies on) and resets gesture_mode to NONE.
@@ -325,33 +497,28 @@ static void hds_android_touch_ring_drain_and_dispatch(HdsAndroidGuiWindow *w) {
         double y = (double)ev.y / w->scale;
         if (ev.action == 0) { // sequence start, always one finger
             w->gesture_mode = HDS_ANDROID_TOUCH_PARAM;
+            w->touch_last_y = y;
+            w->row_accum_px = 0.0;
             hds_clap_gui_on_button_press(w->plugin, &w->view, x, y, 1);
         } else if (ev.action == 3) { // pointer count changed mid-sequence
             if (ev.pointer_count >= 2) hds_android_gui_enter_scroll_mode(w, y);
             else if (w->gesture_mode == HDS_ANDROID_TOUCH_SCROLL) hds_android_gui_enter_scroll_mode(w, y); // still scrolling, just re-baseline
         } else if (ev.action == 1) { // move
-            if (w->gesture_mode == HDS_ANDROID_TOUCH_PARAM) {
-                hds_clap_gui_on_motion(w->plugin, &w->view, x, y);
-            } else if (w->gesture_mode == HDS_ANDROID_TOUCH_SCROLL) {
+            bool scroll_now = (w->gesture_mode == HDS_ANDROID_TOUCH_SCROLL) || hds_android_gui_dropdown_open(&w->view, x);
+            if (scroll_now) {
                 // Natural/"content follows finger" convention (standard on touchscreens):
                 // dragging DOWN reveals content above (same direction as an X11 "scroll up"
                 // wheel click, on_scroll(..., +1) per hds_standalone_gui_x11.c's own
-                // pump_events() convention).
-                w->swipe_accum_px += (y - w->touch_last_y);
-                while (w->swipe_accum_px >= HDS_ANDROID_SWIPE_PX_PER_CLICK) {
-                    hds_clap_gui_on_scroll(w->plugin, &w->view, x, y, 1);
-                    w->swipe_accum_px -= HDS_ANDROID_SWIPE_PX_PER_CLICK;
-                }
-                while (w->swipe_accum_px <= -HDS_ANDROID_SWIPE_PX_PER_CLICK) {
-                    hds_clap_gui_on_scroll(w->plugin, &w->view, x, y, -1);
-                    w->swipe_accum_px += HDS_ANDROID_SWIPE_PX_PER_CLICK;
-                }
-                w->touch_last_y = y;
+                // pump_events() convention -- hds_android_gui_scroll_by_px() itself subtracts,
+                // matching that same sign).
+                hds_android_gui_scroll_by_px(w, x, y - w->touch_last_y);
+            } else if (w->gesture_mode == HDS_ANDROID_TOUCH_PARAM) {
+                hds_clap_gui_on_motion(w->plugin, &w->view, x, y);
             }
+            w->touch_last_y = y;
         } else { // action 2: sequence end (last finger up, or ACTION_CANCEL)
             hds_clap_gui_on_button_release(w->plugin, &w->view);
             w->gesture_mode = HDS_ANDROID_TOUCH_NONE;
-            w->swipe_accum_px = 0.0;
         }
         tail = (tail + 1) % HDS_TOUCH_RING_CAPACITY;
     }
