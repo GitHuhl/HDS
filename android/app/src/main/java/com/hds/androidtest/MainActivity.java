@@ -7,17 +7,18 @@ import android.media.midi.MidiManager;
 import android.media.midi.MidiOutputPort;
 import android.media.midi.MidiReceiver;
 import android.os.Bundle;
-import android.view.Gravity;
-import android.widget.LinearLayout;
-import android.widget.TextView;
+import android.util.Log;
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicLong;
 
-// No layout XML, no custom drawing, no Cairo -- this build exists to answer one question (does
-// the real synth engine make correct sound on a phone from a real MIDI keyboard), not to be a
-// GUI. See android/README.md and this repo's own top-level README for why the GUI is a separate,
-// later decision. The one TextView below exists only so a quick glance confirms a MIDI device
-// connected and bytes are actually arriving, without needing `adb logcat` open.
+// The real native GUI (src/hds_clap_gui_draw.c, drawn straight into this Activity's one
+// HdsSurfaceView -- see that class's own header comment and hds_android_gui.c's own header
+// comment for the full architecture) now fills the whole screen; no layout XML, no other Java
+// widget of any kind. MIDI connection status, which used to be this Activity's only visible
+// content back when this build was a headless backend-only test (see android/README.md), now
+// just goes to logcat (Log.i, tag "HdsMidi") instead of a TextView -- the real GUI has nowhere
+// of its own to show it, and `adb logcat -s HdsMidi` already tells a developer everything the
+// old on-screen status line did.
 //
 // Plain Java, not Kotlin -- see NativeBridge.java's own header comment for why. Every nested
 // class below is `static`, taking `MainActivity activity` as an explicit constructor parameter
@@ -28,7 +29,7 @@ import java.util.concurrent.atomic.AtomicLong;
 // implicit outer reference entirely, via `static`, did). If a real Gradle/AGP build ever becomes
 // possible here with a newer, non-broken D8/R8, this restriction can be dropped.
 public class MainActivity extends Activity {
-    private TextView statusView;
+    private static final String TAG = "HdsMidi";
     private MidiDevice openDevice;
     private final AtomicLong bytesReceived = new AtomicLong(0);
 
@@ -36,20 +37,11 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        statusView = new TextView(this);
-        statusView.setTextSize(16f);
-        statusView.setGravity(Gravity.CENTER);
-        statusView.setPadding(32, 32, 32, 32);
-
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.addView(statusView);
-        setContentView(root);
+        setContentView(new HdsSurfaceView(this));
 
         boolean audioOk = NativeBridge.nativeInit();
-        statusView.setText(audioOk
-                ? "Audio engine running.\nScanning for MIDI devices..."
-                : "AAudio stream failed to open -- check logcat for \"hds_native\".");
+        Log.i(TAG, audioOk ? "Audio engine running. Scanning for MIDI devices..."
+                           : "AAudio stream failed to open -- check logcat for \"hds_native\".");
 
         scanAndConnectMidi();
     }
@@ -57,7 +49,7 @@ public class MainActivity extends Activity {
     private void scanAndConnectMidi() {
         MidiManager midiManager = (MidiManager) getSystemService(MIDI_SERVICE);
         if (midiManager == null) {
-            statusView.setText("No MidiManager on this device (android.software.midi feature missing).");
+            Log.i(TAG, "No MidiManager on this device (android.software.midi feature missing).");
             return;
         }
 
@@ -90,10 +82,6 @@ public class MainActivity extends Activity {
         return bytesReceived.addAndGet(count);
     }
 
-    void setStatusOnUiThread(String message) {
-        runOnUiThread(new SetStatus(this, message));
-    }
-
     static String deviceName(MidiDeviceInfo info) {
         String name = info.getProperties().getString(MidiDeviceInfo.PROPERTY_NAME);
         return name != null ? name : "MIDI device";
@@ -115,21 +103,6 @@ public class MainActivity extends Activity {
         if (openDevice != null) closeQuietly(openDevice);
         NativeBridge.nativeShutdown();
         super.onDestroy();
-    }
-
-    private static final class SetStatus implements Runnable {
-        private final MainActivity activity;
-        private final String message;
-
-        SetStatus(MainActivity activity, String message) {
-            this.activity = activity;
-            this.message = message;
-        }
-
-        @Override
-        public void run() {
-            activity.statusView.setText(message);
-        }
     }
 
     private static final class HotplugCallback extends MidiManager.DeviceCallback {
@@ -159,18 +132,18 @@ public class MainActivity extends Activity {
         @Override
         public void onDeviceOpened(MidiDevice device) {
             if (device == null) {
-                activity.setStatusOnUiThread("Failed to open MIDI device \"" + deviceName(info) + "\".");
+                Log.i(TAG, "Failed to open MIDI device \"" + deviceName(info) + "\".");
                 return;
             }
             MidiOutputPort port = device.openOutputPort(0);
             if (port == null) {
-                activity.setStatusOnUiThread("Opened \"" + deviceName(info) + "\" but its output port 0 wouldn't open.");
+                Log.i(TAG, "Opened \"" + deviceName(info) + "\" but its output port 0 wouldn't open.");
                 closeQuietly(device);
                 return;
             }
             activity.setOpenDevice(device);
             port.connect(new MidiRelay(activity, info));
-            activity.setStatusOnUiThread("Connected: " + deviceName(info) + "\nWaiting for notes...");
+            Log.i(TAG, "Connected: " + deviceName(info) + " -- waiting for notes...");
         }
     }
 
@@ -186,8 +159,7 @@ public class MainActivity extends Activity {
         @Override
         public void onSend(byte[] data, int offset, int count, long timestamp) {
             NativeBridge.nativeOnMidi(data, offset, count);
-            long total = activity.addBytesReceived(count);
-            activity.setStatusOnUiThread("Connected: " + deviceName(info) + "\nMIDI bytes received: " + total);
+            activity.addBytesReceived(count); // not re-logged per message -- see this class's own header comment on why status is logcat-only now
         }
     }
 }

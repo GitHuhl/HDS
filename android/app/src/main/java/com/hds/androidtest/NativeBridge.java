@@ -1,5 +1,7 @@
 package com.hds.androidtest;
 
+import android.view.Surface;
+
 // Thin JNI boundary -- matches hds_android.c's own `Java_com_hds_androidtest_NativeBridge_*`
 // function names exactly (see that file's header comment). Carries no logic of its own on
 // purpose: every real decision (MIDI decode, AAudio setup, the engine itself) lives in native
@@ -19,4 +21,12 @@ public final class NativeBridge {
     public static native boolean nativeInit();
     public static native void nativeOnMidi(byte[] data, int offset, int length);
     public static native void nativeShutdown();
+
+    // GUI entry points -- see HdsSurfaceView.java's own header comment and hds_android_gui.c's
+    // own header comment for the real architecture (straight into a locked ANativeWindow buffer
+    // via Cairo, no Java Bitmap, no pixel copy of any kind -- these three calls carry nothing but
+    // the Surface handle and raw touch coordinates/action across the JNI boundary).
+    public static native void nativeSurfaceCreated(Surface surface);
+    public static native void nativeSurfaceDestroyed();
+    public static native void nativeTouchEvent(int action, float x, float y);
 }

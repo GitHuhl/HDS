@@ -1,19 +1,27 @@
 # HDS Android backend test
 
 Answers one question: does the real HDS synth engine (`backend.c`/`fx_chain.c`) produce correct
-audio on a real phone from a real MIDI keyboard. No GUI, no OSC control, no Sequencer -- all
-deliberately deferred (see the top-level `README.md` for why the GUI in particular is a separate
-decision from this).
+audio on a real phone from a real MIDI keyboard. No OSC control, no Sequencer -- still
+deliberately deferred. The GUI itself is NO LONGER deferred -- see "The native GUI" below -- this
+is now the real, same `hds_clap_gui_draw.c` tab bar hds.clap/the standalone app already have,
+landscape-only, drawn straight into the phone's own screen.
 
-**A real, signed, installable APK now exists.** Build it with:
+**A real, signed, installable APK now exists.** First, ONCE per checkout, cross-build the GUI's
+own Cairo/FreeType/pixman (not needed before the GUI existed -- see "The native GUI" below):
 
 ```
 nix-shell
+tools/build_android_cairo_deps.sh
+```
+
+Then, same entry point every other platform target in this project uses (see `shell.nix`'s own
+header comment):
+
+```
 make android
 ```
 
-from the repo root -- same entry point every other platform target in this project uses (see
-`shell.nix`'s own header comment). `nix-shell` puts the Android SDK/NDK on `PATH`
+from the repo root. `nix-shell` puts the Android SDK/NDK on `PATH`
 (`ANDROID_SDK_ROOT`/`ANDROID_NDK_ROOT`, see `shell.nix`'s `androidSdk` binding) the same way it
 already does for the Windows/arm64 cross toolchains; `make android` then runs
 `tools/build_android_manual.sh` against them. (The script also works run directly, without
@@ -27,9 +35,13 @@ adb install -r android/app/build/manual/hds-backend-test.apk
 
 No Play Console signup, no developer verification -- this is a plain sideload, and GrapheneOS's
 installer doesn't defer to Google Play Services' Play Integrity gate the way stock Android now
-does. Plug in a USB MIDI keyboard (a USB-C-to-USB adapter if yours is USB-A), launch "HDS Backend
-Test", and it auto-connects to the first MIDI device it sees -- the on-screen status line shows
-the device name and a live MIDI byte count as you play.
+does. Plug in a USB MIDI keyboard (a USB-C-to-USB adapter if yours is USB-A), launch "HDS", and
+the real tab bar (Play/Filters/LFOs/Envelopes/FX/Routing/Devices/Global) fills the whole screen,
+locked to landscape -- play, tap/drag knobs and pills exactly like the desktop build, swipe
+vertically to scroll a tab past the screen's own bottom edge. MIDI connection status (device
+name, hotplug) now goes to `adb logcat -s HdsMidi` instead of an on-screen line -- the real GUI
+has nowhere of its own to show it, and the old status line was only ever there because this build
+had no GUI yet.
 
 ## Why there's a build script instead of `./gradlew assembleDebug`
 
@@ -154,14 +166,104 @@ once a second -- a real, always-available signal for whether the device itself i
 glitching, worth checking first before assuming any further dropout report is a new bug rather
 than this same tradeoff needing to move further.
 
+## The native GUI
+
+The real tab bar (`src/hds_clap_gui_draw.c` -- the SAME file hds.clap and the standalone app
+already embed) now fills the whole screen, landscape-only. Three real, non-obvious problems were
+found and fixed getting there, each confirmed directly rather than assumed:
+
+**Architecture: direct-buffer Cairo, no Java Bitmap, no pixel copy.** `src/hds_android_gui.c`
+locks the `SurfaceView`'s own `ANativeWindow` buffer (`ANativeWindow_lock`), wraps that EXACT
+memory in a `cairo_image_surface_t` (`cairo_image_surface_create_for_data`), calls
+`hds_clap_gui_render()` straight into it, then posts (`ANativeWindow_unlockAndPost`). There is no
+intermediate surface of this file's own, no Java-side `Bitmap`, and nothing ever crosses the JNI
+boundary as pixel data -- only a `Surface` handle (once, at `surfaceCreated`) and raw touch
+coordinates. This is deliberate, not incidental: an earlier "render to a bitmap, blit into a Java
+`Bitmap`" sketch was explicitly rejected as the wrong shape before any of this was written.
+
+**A real, confirmed pixel-format mismatch, not a hypothetical one.** Cairo's `CAIRO_FORMAT_ARGB32`
+is `B,G,R,A` in memory on a little-endian device (confirmed earlier in this port's own research,
+via `test_noFontconfig.c`'s own by-hand PPM writer, which has to permute B and R explicitly for
+exactly this reason) -- Android's `ANativeWindow` `RGBA_8888`/`RGBX_8888` formats are `R,G,B,A/X`
+(Android's own documented `Bitmap.Config.ARGB_8888` byte order, the same one OpenGL's
+`GL_RGBA`/`GL_UNSIGNED_BYTE` uses). There is no public `ANativeWindow` format matching Cairo's own
+byte order, so `hds_android_gui_redraw()` does one in-place R<->B byte swap over the SAME locked
+buffer Cairo just drew into, right before posting -- the one unavoidable translation between two
+pixel-format CONVENTIONS, not a second render pass or a copy to new memory.
+
+**Touch input via the same lock-free ring the MIDI path already proved.** Touch callbacks arrive
+on the UI thread; this window's own redraw happens on its own dedicated thread (spawned at
+`surfaceCreated`, joined at `surfaceDestroyed` -- mirrors `hds_standalone_gui_x11.c`'s own
+create/destroy ordering exactly). Rather than inventing new cross-thread synchronization, touch
+events are queued through an SPSC ring shaped identically to `hds_android.c`'s own
+`g_midi_ring`/`hds_midi_ring_push`/`_drain_and_dispatch` -- same proven pattern, new purpose.
+Swipe-to-scroll reuses the existing `hds_clap_gui_on_scroll(..., +-1)` entry point at a fixed
+24px-per-"click" threshold, firing only when `hds_android_gui_knob_drag_active()` says no tab's
+own knob-drag (or the FX tab's own `drag_kind`) is currently in flight -- a small, tab-aware check
+reading each tab's own already-public view-state field, not a new field added to any of them.
+
+**Two real build-time bugs, found by actually compiling, not assumed fixed.** (1)
+`hds_engine_instance.h`'s shared `HdsClapPlugin` struct has an `lo_server osc_server` field that
+`stub/lo/lo.h` had no type for at all (only `lo_address`/`lo_message`/`lo_bundle` -- nothing in
+`hds_android.c` ever needed `lo_server` before the GUI's own shared-context type pulled that
+header in) -- fixed with one more inert `typedef void *lo_server;`, never actually constructed
+with a real value, same posture as every other symbol that stub already covers. (2) This
+codebase's own draw files are inconsistent about `#include <cairo.h>` (`hds_clap_adsr.h`) vs.
+`#include <cairo/cairo.h>` (`hds_fx_gui_draw.c`) -- the native desktop build gets away with only
+the latter needing an explicit `-I` (confirmed directly: an apt-installed `libcairo2-dev` on THIS
+particular build host happens to put `cairo.h` on gcc's own default `/usr/include` search path,
+which the bare form resolves against purely by accident, not because the Makefile's own
+`pkg-config --cflags cairo` output is actually sufficient on its own), but the NDK's cross `clang`
+has no host-system fallback of any kind -- fixed by passing BOTH
+`third_party/android-deps/include` and `.../include/cairo` as separate `-I` flags, same two-path
+fix `WIN_CFLAGS` already uses in the Makefile for the identical dual-style situation on the
+Windows cross-build.
+
+`tools/build_android_cairo_deps.sh` (new, mirrors `tools/build_windows_deps.sh`) cross-builds
+FreeType/pixman/Cairo for this same NDK target via meson -- FreeType enabled, Fontconfig
+explicitly disabled (Cairo's own toy-font backend, `cairo_select_font_face()`, is wired to `NULL`
+without Fontconfig, confirmed directly in Cairo's own source; this GUI never calls it at all --
+see `hds_fx_gui_draw.c`'s own `hds_font_select_face()` macro substitution and
+`hds_android_gui.c`'s own `cairo_ft_font_face_create_for_ft_face()` call instead). Includes the
+one real, pre-existing (not Android-specific) Cairo build-script bug this port's own earlier
+research found: `src/cairo-ft-private.h` references the `FT_Color` type under an
+`HAVE_FT_COLR_V1` guard that's set whenever FreeType exports `FT_Palette_Select` (every FreeType
+>= 2.10), while the type itself is only pulled in under a different, unrelated
+`HAVE_FT_SVG_DOCUMENT` guard a few lines later -- patched with one `#include FT_COLOR_H`, applied
+idempotently (checked before inserting, so re-running the script is safe). Needs
+`shell.nix`'s new `HDS_ANDROID_{PIXMAN,FREETYPE,CAIRO}_SRC` exports (same already-hash-pinned
+nixpkgs-tarball posture `HDS_WIN_{PIXMAN,CAIRO}_SRC` already has for the Windows build) -- run
+once per checkout, output lives in `third_party/android-deps/` (gitignored, same as
+`third_party/win64-deps/`).
+
+The two DejaVu Sans fonts (`third_party/dejavu-fonts/`, vendored with their own `LICENSE`) are
+`.incbin`'d directly into `libhds_native.so`'s own `.rodata` by `embed_font.S` -- no
+`AAssetManager`/JNI asset-passing plumbing at all; `hds_android_gui.c` loads them via plain
+in-memory FreeType (`FT_New_Memory_Face` against the `.incbin` symbols' own start/end addresses).
+Confirmed for real: a standalone NDK `clang` assemble of `embed_font.S` produces exactly the
+expected symbol offsets (0 and each font file's own real byte size).
+
+**What this does NOT attempt**: the shared file browser (`hds_fx_gui_draw.c`'s own `HdsFxBrowser`
+-- NAM model/IR pickers, the Multisample `.sfz` loader, the Global "Load Scale" picker) is
+included and reachable exactly as on desktop, but nothing here has looked at whether its plain
+POSIX directory listing (`opendir`/`readdir`) actually reaches anything meaningful under
+Android's own scoped-storage rules on a real device -- a real, separate question for whenever
+loading a file on-device is actually tried, not assumed to already work. Physical-keyboard input
+(`hds_clap_gui_on_key()`) is also not wired to anything -- there's no on-screen keyboard call site
+anywhere in this GUI that would need it, same as every other tab.
+
 ## What's still unverified
 
 Everything above was verified for real (real compiler, real linker, real `apksigner` signature
-check, real `aapt2 dump badging` on the finished APK, and now a real zero-undefined-symbols check
-via `nm -D -u`) in a sandboxed environment with no actual Android device or emulator attached, so
-the one thing none of this can confirm is runtime behavior itself: does AAudio actually open the
-stream and produce audible sound, does `android.media.midi` actually hand this app real bytes
-from a real USB keyboard, does the engine hold up over an extended play session. That's exactly
-what installing the APK and plugging in a keyboard answers -- and it's also exactly how the two
-bugs above were found, since neither a missing `DT_NEEDED` entry nor a missing symbol is
-something any of the build-time checks here can catch on their own.
+check, real `aapt2 dump badging` on the finished APK, and a real zero-undefined-symbols check via
+`nm -D -u`, now covering the GUI's own cairo/freetype/pixman/`libandroid` dependencies too) in a
+sandboxed environment with no actual Android device or emulator attached, so the one thing none
+of this can confirm is runtime behavior itself: does AAudio actually open the stream and produce
+audible sound, does `android.media.midi` actually hand this app real bytes from a real USB
+keyboard, does the engine hold up over an extended play session, and now also: does the GUI
+actually render correctly on a real screen (in particular, is the R<->B byte-swap fix above
+actually right, and does touch/swipe feel reasonable) -- the color-channel-order claim above was
+derived from this port's own earlier `test_noFontconfig.c` research plus Android's own documented
+pixel format, not confirmed against an actual rendered frame on an actual device. That's exactly
+what installing the APK answers -- and it's also exactly how every bug documented on this page
+was found, since none of them are something a build-time check alone can catch.

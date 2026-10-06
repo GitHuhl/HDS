@@ -53,20 +53,53 @@ NDK_CLANG="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-and
 echo "SDK: $SDK_ROOT"
 echo "NDK clang: $NDK_CLANG"
 
+# The native GUI (hds_android_gui.c, HDS_ANDROID_GUI_ENABLED -- see that file's own header
+# comment and android/README.md) needs cairo/freetype/pixman cross-built for this same NDK
+# target first -- a real meson build (tools/build_android_cairo_deps.sh), not something this
+# aapt2/javac/d8 pipeline can produce itself, same relationship build_windows_deps.sh already has
+# to this script's own Windows-cross-build sibling. Required now, not optional: unlike liblo
+# (header-shadowed to an inert stub -- stub/lo/lo.h), there's no equivalent stub for Cairo's own
+# drawing API that would let the GUI compile but silently draw nothing.
+ANDROID_DEPS="$ROOT/third_party/android-deps"
+if [ ! -f "$ANDROID_DEPS/lib/libcairo.a" ]; then
+  echo "error: $ANDROID_DEPS/lib/libcairo.a not found." >&2
+  echo "Run 'tools/build_android_cairo_deps.sh' once first (inside nix-shell) to cross-build" >&2
+  echo "cairo/freetype/pixman for this NDK target, then re-run this script." >&2
+  exit 1
+fi
+
 rm -rf "$WORK"
 mkdir -p "$WORK/classes" "$WORK/lib/arm64-v8a"
 
 echo "=== Compiling the native engine (hds_android.c -> libhds_native.so) ==="
 # -fPIC: Android .so's must be position-independent (missed on the first attempt -- the linker
 # error that produced is a clear, unambiguous signal if this is ever dropped again).
-"$NDK_CLANG" -c -std=gnu11 -O2 -fPIC -Wall -Wextra \
+#
+# -I "$ANDROID_DEPS/include" AND -I "$ANDROID_DEPS/include/cairo" BOTH: this codebase's own
+# existing draw files are inconsistent about which of `#include <cairo.h>` (hds_clap_adsr.h) vs
+# `#include <cairo/cairo.h>` (hds_fx_gui_draw.c) they use -- the native desktop build gets away
+# with only the latter actually needing an explicit -I (gcc's own default `/usr/include` search
+# path happens to have a real apt-installed cairo there backing the bare form too, confirmed
+# directly, not assumed), but the NDK's cross clang has no such host-system fallback at all, so
+# both forms need an explicit -I here -- same two-path fix WIN_CFLAGS already uses in the
+# Makefile for the identical dual-style situation on the Windows cross-build.
+"$NDK_CLANG" -c -std=gnu11 -O2 -fPIC -Wall -Wextra -DHDS_ANDROID_GUI_ENABLED=1 \
   -I "$ANDROID_DIR/app/src/main/cpp/stub" \
+  -I "$ANDROID_DEPS/include" -I "$ANDROID_DEPS/include/cairo" \
+  -I "$ANDROID_DEPS/include/freetype2" -I "$ANDROID_DEPS/include/pixman-1" \
   "$ROOT/src/hds_android.c" -o "$WORK/hds_android.o"
 # nam_bridge_stub.c stands in for the real nam_bridge.cpp (NAM needs a C++/Eigen toolchain this
 # build doesn't have -- see that stub's own header comment for exactly what it does and doesn't
 # change). Plain C, compiled the same way as hds_android.c itself.
 "$NDK_CLANG" -c -std=gnu11 -O2 -fPIC -Wall -Wextra \
   "$ANDROID_DIR/app/src/main/cpp/stub/nam_bridge_stub.c" -o "$WORK/nam_bridge_stub.o"
+# embed_font.S: .incbin's the two DejaVu Sans TTFs (third_party/dejavu-fonts/) straight into this
+# .so's own .rodata -- see that file's own header comment for why the paths are passed as -D
+# defines rather than written into the .S file itself.
+"$NDK_CLANG" -c \
+  -DHDS_FONT_REGULAR_PATH="\"$ROOT/third_party/dejavu-fonts/DejaVuSans.ttf\"" \
+  -DHDS_FONT_BOLD_PATH="\"$ROOT/third_party/dejavu-fonts/DejaVuSans-Bold.ttf\"" \
+  "$ANDROID_DIR/app/src/main/cpp/embed_font.S" -o "$WORK/embed_font.o"
 #
 # -lm: required even though it LOOKS like the build-time link succeeds without it -- the NDK's
 # stub libm.so/libc.so both declare exp2f/log2f/etc. (used by HardTune/DBX120X's glide and pitch
@@ -79,16 +112,23 @@ echo "=== Compiling the native engine (hds_android.c -> libhds_native.so) ==="
 # Every undefined dynamic symbol in the finished .so was checked after this (`nm -D -u`), not just
 # whatever the next crash happened to report -- see android/README.md for the full list this
 # caught (hds_nam_create/_process/_destroy, from nam_bridge_stub.o above) before it could crash a
-# second and third time the same way exp2f already had to.
+# second and third time the same way exp2f already had to -- and the same audit was repeated after
+# adding the GUI's own cairo/freetype/pixman/landroid dependencies below.
+# -landroid: ANativeWindow_fromSurface/_lock/_unlockAndPost/_release/_setBuffersGeometry (the
+# GUI's own direct-buffer render pipeline -- see hds_android_gui.c's own header comment) live in
+# libandroid.so, not libaaudio.so/liblog.so.
 "$NDK_CLANG" -shared -o "$WORK/lib/arm64-v8a/libhds_native.so" \
-  "$WORK/hds_android.o" "$WORK/nam_bridge_stub.o" -llog -laaudio -lm
+  "$WORK/hds_android.o" "$WORK/nam_bridge_stub.o" "$WORK/embed_font.o" \
+  -L"$ANDROID_DEPS/lib" -lcairo -lfreetype -lpixman-1 \
+  -llog -laaudio -landroid -lm
 
 echo "=== Compiling the Java UI (javac, source/target 8 -- see MainActivity.java's own header
      comment for why: a non-static inner/anonymous class here crashes this SDK's bundled D8) ==="
 javac -source 8 -target 8 -nowarn -cp "$ANDROID_JAR" \
   -d "$WORK/classes" \
   "$ANDROID_DIR/app/src/main/java/com/hds/androidtest/MainActivity.java" \
-  "$ANDROID_DIR/app/src/main/java/com/hds/androidtest/NativeBridge.java"
+  "$ANDROID_DIR/app/src/main/java/com/hds/androidtest/NativeBridge.java" \
+  "$ANDROID_DIR/app/src/main/java/com/hds/androidtest/HdsSurfaceView.java"
 
 echo "=== Dexing ==="
 "$BUILD_TOOLS/d8" --output "$WORK" --min-api "$MIN_API" \
