@@ -37,6 +37,14 @@ public final class NativeBridge {
     // default is set lazily on its first render, but there's no reason to race that).
     public static native void nativeSetFilesDir(String path);
 
+    // File picker bridge (NAM Model/IR pills, the Play tab's .sfz, the Global sidebar's .scl) --
+    // see hds_android_gui.c's own "File picker bridge" section and MainActivity.java's own polling
+    // loop/onActivityResult for the full round trip. nativeConsumeFilePickerRequest returns a
+    // 2-element {ext, title} array or null; nativeFilePicked takes the real, already-copied-to-
+    // cache path (or null on cancel).
+    public static native String[] nativeConsumeFilePickerRequest();
+    public static native void nativeFilePicked(String path);
+
     // GUI entry points -- see HdsSurfaceView.java's own header comment and hds_android_gui.c's
     // own header comment for the real architecture (straight into a locked ANativeWindow buffer
     // via Cairo, no Java Bitmap, no pixel copy of any kind -- these three calls carry nothing but

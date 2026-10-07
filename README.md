@@ -297,10 +297,23 @@ it sizes itself as a fraction of that constant.
   channels, and its outputs get HDS's own multichannel routing, not a
   stereo downmix. There's no on-screen device picker (Android routes to
   whatever's plugged in/selected at the OS level; the Devices tab is
-  Polyphony + Block Size only here). `tools/build_android_manual.sh`
-  produces a real signed APK. See `android/README.md` for how the SDK/NDK
-  get fetched, what's verified, and the real D8 compatibility bug it works
-  around.
+  Polyphony + Block Size only here). File picking (NAM Model/IR, the Play
+  tab's .sfz, the Global sidebar's .scl) goes through the real Android
+  system picker (Storage Access Framework) rather than this GUI's own
+  in-house browser, which can't reach arbitrary user storage under scoped
+  storage — a picked file's real bytes are copied into an app-private
+  cache path first, so this fully supports any self-contained single file
+  (NAM model/IR, .scl), but a multi-sample .sfz with sample= paths relative
+  to its own directory won't resolve its sibling samples this way (see
+  `hds_fx_gui_draw.c`'s own `hds_fx_gui_browser_open()` comment — real
+  folder-tree support is a separate, not-yet-done follow-up). The
+  Recording tab's output folder is always this app's own real, writable,
+  permission-free app-private directory; its Browse button is a no-op on
+  this platform (SAF's folder-picking equivalent returns a `content://`
+  tree, not a POSIX path the recorder's own `fopen`/`fseek`-based WAV
+  writer could use). `tools/build_android_manual.sh` produces a real
+  signed APK. See `android/README.md` for how the SDK/NDK get fetched,
+  what's verified, and the real D8 compatibility bug it works around.
 
 ## Third-party code
 

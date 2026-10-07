@@ -762,4 +762,41 @@ Java_com_hds_androidtest_NativeBridge_nativeTouchEvent(JNIEnv *env, jobject thiz
     (void)env; (void)thiz;
     hds_android_gui_touch_event((int)action, (int)pointerCount, (float)x, (float)y);
 }
+
+// Polled by MainActivity.java's own short-interval Handler loop -- see hds_android_gui.c's own
+// "File picker bridge" section header comment for the full design. Returns a 2-element
+// {ext, title} String[] and clears the pending flag (atomically -- a concurrent second request
+// from the GUI thread, however unlikely between one poll and the next, can never be silently
+// dropped this way) if a file pick was requested since the last poll, or null if none was.
+JNIEXPORT jobjectArray JNICALL
+Java_com_hds_androidtest_NativeBridge_nativeConsumeFilePickerRequest(JNIEnv *env, jobject thiz) {
+    (void)thiz;
+    if (!atomic_exchange_explicit(&g_filepicker_pending, false, memory_order_acquire)) return NULL;
+    jclass string_class = (*env)->FindClass(env, "java/lang/String");
+    jobjectArray result = (*env)->NewObjectArray(env, 2, string_class, NULL);
+    (*env)->SetObjectArrayElement(env, result, 0, (*env)->NewStringUTF(env, g_filepicker_ext));
+    (*env)->SetObjectArrayElement(env, result, 1, (*env)->NewStringUTF(env, g_filepicker_title));
+    return result;
+}
+
+// Called by MainActivity.java's own onActivityResult() once the user has either picked a file (and
+// Java has already copied its real bytes into a real, app-private cache path -- a content:// Uri
+// from ACTION_OPEN_DOCUMENT is not a POSIX path and can't be handed to fopen()/this GUI's own
+// hds_fx_safe_copy() destination fields directly) or canceled the picker (path == NULL). Writes the
+// real cache path into whichever FXSlotParams/HdsClapPlugin field originally requested it
+// (g_filepicker_dest, stashed by hds_android_gui_request_file_pick()) -- a no-op on cancel, or if
+// there's no pending destination for some reason (never expected, but never worth crashing into).
+JNIEXPORT void JNICALL
+Java_com_hds_androidtest_NativeBridge_nativeFilePicked(JNIEnv *env, jobject thiz, jstring path) {
+    (void)thiz;
+    if (g_filepicker_dest && path != NULL) {
+        const char *utf = (*env)->GetStringUTFChars(env, path, NULL);
+        if (utf) {
+            snprintf(g_filepicker_dest, g_filepicker_dest_len, "%s", utf);
+            (*env)->ReleaseStringUTFChars(env, path, utf);
+        }
+    }
+    g_filepicker_dest = NULL;
+    g_filepicker_dest_len = 0;
+}
 #endif

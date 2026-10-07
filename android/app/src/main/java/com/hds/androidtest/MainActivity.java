@@ -2,7 +2,11 @@ package com.hds.androidtest;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
+import android.content.ContentResolver;
+import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
 import android.media.midi.MidiDevice;
@@ -10,12 +14,20 @@ import android.media.midi.MidiDeviceInfo;
 import android.media.midi.MidiManager;
 import android.media.midi.MidiOutputPort;
 import android.media.midi.MidiReceiver;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.OpenableColumns;
 import android.util.Log;
 import android.view.View;
 import android.view.WindowManager;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.concurrent.atomic.AtomicLong;
 
 // The real native GUI (src/hds_clap_gui_draw.c, drawn straight into this Activity's one
@@ -38,8 +50,14 @@ import java.util.concurrent.atomic.AtomicLong;
 public class MainActivity extends Activity {
     private static final String TAG = "HdsMidi";
     private static final int RECORD_AUDIO_REQUEST_CODE = 1;
+    private static final int FILE_PICKER_REQUEST_CODE = 2;
+    // See nativeConsumeFilePickerRequest()'s own comment (NativeBridge.java) and this class's own
+    // startFilePickerPoll() for why this is a plain polled Handler loop rather than a direct
+    // native->Java callback: a user clicking Browse/a NAM Model pill never notices this delay.
+    private static final long FILE_PICKER_POLL_MS = 150;
     private MidiDevice openDevice;
     private final AtomicLong bytesReceived = new AtomicLong(0);
+    private final Handler filePickerPollHandler = new Handler(Looper.getMainLooper());
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -71,7 +89,7 @@ public class MainActivity extends Activity {
         // files via a file manager or a USB cable, handy for actually retrieving a recording later)
         // and needs no runtime permission at all; getFilesDir() (pure internal storage) is the
         // fallback on the rare device where external storage isn't currently available.
-        java.io.File filesDir = getExternalFilesDir(null);
+        File filesDir = getExternalFilesDir(null);
         if (filesDir == null) filesDir = getFilesDir();
         NativeBridge.nativeSetFilesDir(filesDir.getAbsolutePath());
 
@@ -91,6 +109,123 @@ public class MainActivity extends Activity {
         }
 
         scanAndConnectMidi();
+
+        // See NativeBridge.java's own nativeConsumeFilePickerRequest() comment and
+        // hds_android_gui.c's own "File picker bridge" section for the full design: the GUI's own
+        // in-house file browser can't really browse Android storage, so hds_fx_gui_draw.c's own
+        // hds_fx_gui_browser_open() stashes a request instead, polled for here.
+        filePickerPollHandler.postDelayed(new FilePickerPoll(this), FILE_PICKER_POLL_MS);
+    }
+
+    // Started once from onCreate (see the postDelayed call there), re-posts itself after every
+    // check so it keeps running for the Activity's whole lifetime -- stopped in onDestroy via
+    // removeCallbacksAndMessages(null). A static nested class, not a lambda/anonymous Runnable:
+    // see this class's own header comment on the D8 bug a non-static inner/anonymous class with an
+    // implicit outer reference hits in this build's own toolchain.
+    private static final class FilePickerPoll implements Runnable {
+        private final MainActivity activity;
+        FilePickerPoll(MainActivity activity) { this.activity = activity; }
+
+        @Override
+        public void run() {
+            String[] request = NativeBridge.nativeConsumeFilePickerRequest();
+            if (request != null) activity.launchFilePicker(request[1]);
+            activity.filePickerPollHandler.postDelayed(this, FILE_PICKER_POLL_MS);
+        }
+    }
+
+    // ext (request[0]) isn't used to filter the system picker -- Storage Access Framework has no
+    // good way to filter by an arbitrary custom extension like ".nam" via MIME type, and showing
+    // everything (type("*/*")) is simpler and strictly more permissive than filtering wrong. title
+    // is logged only; the system picker shows its own UI chrome, not this app's.
+    void launchFilePicker(String title) {
+        Log.i(TAG, "Launching system file picker: " + title);
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        try {
+            startActivityForResult(intent, FILE_PICKER_REQUEST_CODE);
+        } catch (ActivityNotFoundException e) {
+            Log.w(TAG, "No document picker available on this device.");
+            NativeBridge.nativeFilePicked(null);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != FILE_PICKER_REQUEST_CODE) return;
+        Uri uri = (resultCode == RESULT_OK && data != null) ? data.getData() : null;
+        if (uri == null) {
+            NativeBridge.nativeFilePicked(null); // canceled, or no data -- see nativeFilePicked()'s own comment on this being a clean no-op
+            return;
+        }
+        // Off the UI thread: a content:// Uri can be backed by a slow/cloud provider (Google
+        // Drive, etc.), and this is the one-time cost of making SAF-reachable storage (which raw
+        // opendir()/readdir() never could reach at all) actually usable here.
+        new Thread(new FileCopyTask(this, uri)).start();
+    }
+
+    // Copies a picked content:// Uri's real bytes into a real, app-private cache path this GUI's
+    // own hds_fx_safe_copy()/fopen()-based loaders (NAM model, cab IR, .sfz, .scl) can actually
+    // open -- a content:// Uri itself is not a POSIX path and can never be handed to them directly.
+    // See hds_fx_gui_draw.c's own hds_fx_gui_browser_open() comment for the one real limitation
+    // this doesn't solve: a multi-sample .sfz referencing sibling sample files by a path relative
+    // to its own directory will still fail to resolve them, since only the one picked file itself
+    // is copied here, not a whole folder tree.
+    private static final class FileCopyTask implements Runnable {
+        private final MainActivity activity;
+        private final Uri uri;
+        FileCopyTask(MainActivity activity, Uri uri) { this.activity = activity; this.uri = uri; }
+
+        @Override
+        public void run() {
+            String path = null;
+            try {
+                path = copyUriToCache(activity, uri);
+            } catch (IOException e) {
+                Log.w(TAG, "Failed to copy picked file: " + e.getMessage());
+            }
+            NativeBridge.nativeFilePicked(path); // null on failure -- see nativeFilePicked()'s own comment on this being a clean no-op
+        }
+    }
+
+    private static String copyUriToCache(MainActivity activity, Uri uri) throws IOException {
+        ContentResolver resolver = activity.getContentResolver();
+        String displayName = queryDisplayName(resolver, uri);
+        File cacheDir = new File(activity.getCacheDir(), "file_picker");
+        if (!cacheDir.exists() && !cacheDir.mkdirs() && !cacheDir.exists()) {
+            throw new IOException("could not create cache directory " + cacheDir);
+        }
+        File destFile = new File(cacheDir, displayName);
+        try (InputStream in = resolver.openInputStream(uri);
+             OutputStream out = new FileOutputStream(destFile)) {
+            if (in == null) throw new IOException("openInputStream returned null for " + uri);
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        }
+        return destFile.getAbsolutePath();
+    }
+
+    // OpenableColumns.DISPLAY_NAME is the real original filename (with its real extension) a
+    // content:// Uri's own provider reports -- falls back to a fixed name if the provider can't
+    // answer (rare, but query() itself is documented to be allowed to return null).
+    private static String queryDisplayName(ContentResolver resolver, Uri uri) {
+        try (Cursor cursor = resolver.query(uri, null, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (idx >= 0) {
+                    String name = cursor.getString(idx);
+                    if (name != null && !name.isEmpty()) return name;
+                }
+            }
+        } catch (RuntimeException e) {
+            // Some providers throw rather than return gracefully on a malformed/revoked Uri --
+            // never worth crashing the whole pick over just a cosmetic filename.
+            Log.w(TAG, "Could not query display name: " + e.getMessage());
+        }
+        return "picked_file";
     }
 
     @Override
@@ -245,6 +380,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        filePickerPollHandler.removeCallbacksAndMessages(null);
         if (openDevice != null) closeQuietly(openDevice);
         NativeBridge.nativeShutdown();
         super.onDestroy();

@@ -1625,7 +1625,33 @@ static void hds_fx_browser_compute_layout(const HdsFxGuiViewState *vs, HdsFxBrow
 // (hds_fx_gui_x11.c) to actually list it on the very next poll, which happens before this same
 // tick's own redraw (see hds_fx_gui_on_timer()'s own ordering) -- so the very click that opens the
 // browser also sees a populated listing immediately, never one empty frame first.
+#if defined(HDS_ANDROID_GUI_ENABLED)
+// Real directory browsing (opendir()/readdir(), this file's own posture above) can't work against
+// arbitrary user storage under Android's scoped storage -- only this app's own sandboxed
+// directories are reachable that way, so this file's own in-house browser UI would have nothing
+// real to list there. Defined in hds_android_gui.c (that file owns every actual Android/JNI call,
+// same "platform shim does the real I/O, this file only owns state/drawing" split this file's own
+// header comment already establishes for X11) -- bridges to MainActivity.java's own
+// ACTION_OPEN_DOCUMENT (Storage Access Framework) system picker instead. See that function's own
+// comment for the full round trip back into `dest`.
+static void hds_android_gui_request_file_pick(const char *ext, const char *title, char *dest, size_t dest_len);
+#endif
+
 static void hds_fx_gui_browser_open(HdsFxGuiViewState *vs, const char *ext, const char *title, char *dest, size_t dest_len) {
+#if defined(HDS_ANDROID_GUI_ENABLED)
+    // Never opens this file's own in-house browser UI on Android -- see the forward declaration's
+    // own comment just above. NAM Model/IR and the Global sidebar's own .scl are self-contained
+    // single files, so the SAF-copy-to-cache round trip this bridges to is a complete, correct fix
+    // for them. A multi-sample .sfz with sample= paths relative to its OWN directory is NOT: only
+    // the one picked .sfz file itself gets copied, so any sibling sample it references by relative
+    // path will fail to resolve -- full SAF support for that (walking a picked DIRECTORY tree, not
+    // one file) is real, separate, out-of-scope follow-up work, not bundled into this fix. A
+    // self-contained single-file .sfz (sample= pointing at an absolute path, or none at all) still
+    // works correctly through this same path.
+    (void)vs;
+    hds_android_gui_request_file_pick(ext, title, dest, dest_len);
+    return;
+#endif
     HdsFxBrowser *b = &vs->browser;
     memset(b, 0, sizeof(*b));
     b->open = true;
@@ -1645,6 +1671,18 @@ static void hds_fx_gui_browser_open(HdsFxGuiViewState *vs, const char *ext, cons
 // (hds_clap_recording_draw.c), which is standalone-only -- unused (and correctly so, same posture
 // as hds_fx_draw_mute_pill() above) in both CLAP plugin builds.
 __attribute__((unused)) static void hds_fx_gui_browser_open_folder(HdsFxGuiViewState *vs, const char *title, char *dest, size_t dest_len) {
+#if defined(HDS_ANDROID_GUI_ENABLED)
+    // No real folder-tree WRITE support on Android: Storage Access Framework's directory-picking
+    // equivalent (ACTION_OPEN_DOCUMENT_TREE) returns a content:// tree Uri, not a POSIX path
+    // WavRecorder's own fopen()/fseek()-based WAV header backpatching (see recording_engine.c's own
+    // header comment) could use -- that would need rearchitecting recording's file I/O around
+    // ContentResolver.openOutputStream() instead, real, separate, out-of-scope follow-up work. The
+    // Recording tab's folder is always its own real, writable, permission-free app-private default
+    // on this platform instead (see hds_android.c's own g_android_files_dir comment) -- Browse is a
+    // silent no-op here rather than a picker that can't actually be used for writing.
+    (void)vs; (void)title; (void)dest; (void)dest_len;
+    return;
+#endif
     HdsFxBrowser *b = &vs->browser;
     memset(b, 0, sizeof(*b));
     b->open = true;

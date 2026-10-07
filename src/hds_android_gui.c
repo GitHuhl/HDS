@@ -93,7 +93,48 @@
 #include <pthread.h>
 #include <time.h>
 
-#include "hds_fx_gui_browser.c" // hds_fx_gui_browser_refresh() -- reused verbatim, same as hds_standalone_gui_x11.c's own identical include
+#include "hds_fx_gui_browser.c" // hds_fx_gui_browser_refresh() -- reused verbatim, same as hds_standalone_gui_x11.c's own identical include;
+                                 // never actually reached on this platform though (see this section's own comment just below) -- its
+                                 // real opendir()/readdir() calls would mostly fail against arbitrary user storage under Android's
+                                 // scoped storage anyway, which is exactly the bug this section fixes.
+
+// -----------------------------------------------------------------------------------------------
+// File picker bridge (Storage Access Framework) -- hds_fx_gui_draw.c's own hds_fx_gui_browser_open()
+// calls hds_android_gui_request_file_pick() below INSTEAD OF opening its own in-house opendir()/
+// readdir() browser UI on this platform (see that file's own forward-declaration comment): this
+// app's own sandboxed directories aside, arbitrary user storage (Downloads, a cloud-backed
+// provider, an SD card, ...) isn't reachable via raw POSIX calls under Android's scoped storage,
+// so that UI would have nothing real to list. The real picker is MainActivity.java's own
+// ACTION_OPEN_DOCUMENT system file picker instead, which can reach anything the OS itself can
+// (including cloud providers raw opendir() never could) and needs no storage permission at all.
+//
+// Request/response is a plain polled flag, not a direct native->Java call: the click that reaches
+// hds_fx_gui_browser_open() runs on THIS window's own dedicated redraw/input thread (see this
+// file's own header comment), which was never attached to the JVM and has no JNIEnv of its own --
+// attaching it just for this rare, non-realtime, one-off interaction would add real complexity
+// (a cached JavaVM*, AttachCurrentThread/DetachCurrentThread lifetime) for no benefit over a plain
+// flag MainActivity.java's own short-interval Handler polls via nativeConsumeFilePickerRequest()
+// (see hds_android.c's own JNI definition): a user clicking Browse/a NAM Model pill is never going
+// to notice a sub-200ms delay before the system picker appears.
+//
+// Deliberately NOT `static`/plain file-scope globals with no `extern` forward declaration anywhere
+// else needed: hds_fx_gui_draw.c's own forward declaration is of the FUNCTION below, not of these
+// fields directly, so (unlike hds_android.c's own g_android_files_dir, which hds_clap_recording_
+// draw.c reads as a bare global and therefore has this exact static/extern linkage constraint) no
+// matching linkage requirement applies to these.
+static _Atomic bool g_filepicker_pending = false;
+static char g_filepicker_ext[8];
+static char g_filepicker_title[64];
+static char *g_filepicker_dest = NULL;
+static size_t g_filepicker_dest_len = 0;
+
+static void hds_android_gui_request_file_pick(const char *ext, const char *title, char *dest, size_t dest_len) {
+    snprintf(g_filepicker_ext, sizeof(g_filepicker_ext), "%s", ext);
+    snprintf(g_filepicker_title, sizeof(g_filepicker_title), "%s", title);
+    g_filepicker_dest = dest;
+    g_filepicker_dest_len = dest_len;
+    atomic_store_explicit(&g_filepicker_pending, true, memory_order_release);
+}
 
 // -----------------------------------------------------------------------------------------------
 // Fonts: the two DejaVu Sans faces embed_font.S bakes directly into this .so's own .rodata (see
