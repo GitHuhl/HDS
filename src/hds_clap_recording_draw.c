@@ -108,8 +108,19 @@ static void hds_recording_ensure_folder_default(HdsClapPlugin *p, HdsClapRecordi
     if (vs->folder_initialized) return;
     vs->folder_initialized = true;
     if (p->record_folder[0]) return; // already set (e.g. a saved session) -- never stomp it
+#if defined(HDS_ANDROID_GUI_ENABLED)
+    // getenv("HOME")/"/tmp" (the desktop fallback just below) exist in neither form in a normal
+    // Android app process -- g_android_files_dir (declared in hds_android.c, before every GUI draw
+    // file is #include'd, so it's already visible here) is this platform's own real,
+    // always-writable directory instead (Context.getExternalFilesDir(null)/getFilesDir(), set via
+    // nativeSetFilesDir() before nativeInit()). Falls back to "/sdcard" only in the implausible
+    // case MainActivity.java's own call hasn't landed yet by the time this tab is first rendered --
+    // never actually expected to be hit in practice.
+    snprintf(p->record_folder, sizeof(p->record_folder), "%s/HDS_Recordings", g_android_files_dir[0] ? g_android_files_dir : "/sdcard");
+#else
     const char *home = getenv("HOME");
     snprintf(p->record_folder, sizeof(p->record_folder), "%s/HDS_Recordings", home ? home : "/tmp");
+#endif
 }
 
 // HDS_<timestamp>.<ext> inside the remembered folder, ext chosen by record_format (WAV or

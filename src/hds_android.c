@@ -19,6 +19,18 @@
 // falls back to when no capture device is open).
 #include "backend.c"
 
+// The app's own real, writable storage directory (Context.getExternalFilesDir(null), falling back
+// to getFilesDir() -- see MainActivity.java's own comment), set via nativeSetFilesDir() BEFORE
+// nativeInit(). Neither getenv("HOME") nor "/tmp" (hds_recording_ensure_folder_default()'s own
+// desktop fallback in hds_clap_recording_draw.c) exist in a normal Android app process -- without
+// this, the Recording tab's default folder would point nowhere writable and Record would silently
+// fail every time. This directory needs no runtime permission at all (it's always granted to the
+// app that owns it, scoped storage or not) -- unlike RECORD_AUDIO/ext-in below, which is about
+// CAPTURING audio, not writing files the app itself creates. Defined here, before every GUI draw
+// file is #include'd below, so hds_clap_recording_draw.c's own hds_recording_ensure_folder_default()
+// can just reference it directly, with no forward declaration needed anywhere.
+static char g_android_files_dir[RECORD_PATH_LEN] = "";
+
 // WAV/WavPack recording engine (RecordRing/WavRecorder/WavPackRecorder/RecordEngine/
 // RecordGatherState, the writer thread, record_engine/record_gather themselves) -- shared
 // verbatim with hds_standalone.c, see that file's own include-site comment. HDS_WAVPACK_ENABLED is
@@ -558,11 +570,11 @@ static aaudio_result_t hds_android_try_open_input(AAudioStream **out_stream, int
 }
 
 // Called from MainActivity.java's own AudioManager.getDevices() enumeration, BEFORE nativeInit()
-// -- stores which device id/channel count nativeInit() should open the OUTPUT stream against, and
-// which hds_android_gui_... no, which nativeOpenAudioInput() below should use for the INPUT
-// stream. Harmless to call more than once (e.g. if a device is hot-plugged later and Java
-// re-enumerates) -- just updates these globals; an already-open stream isn't itself reopened by
-// this call alone (see nativeOpenAudioInput's own comment on retrying).
+// -- stores which device id/channel count nativeInit()'s own OUTPUT stream open, and
+// nativeOpenAudioInput()'s own INPUT stream open, should use. Harmless to call more than once
+// (e.g. if a device is hot-plugged later and Java re-enumerates) -- just updates these globals; an
+// already-open stream isn't itself reopened by this call alone (see nativeOpenAudioInput's own
+// comment on retrying).
 JNIEXPORT void JNICALL
 Java_com_hds_androidtest_NativeBridge_nativeConfigureAudio(JNIEnv *env, jobject thiz,
     jint inputDeviceId, jint inputChannels, jint outputDeviceId, jint outputChannels) {
@@ -576,6 +588,21 @@ Java_com_hds_androidtest_NativeBridge_nativeConfigureAudio(JNIEnv *env, jobject 
     HDS_LOGI("configured: input device=%d channels=%d, output device=%d channels=%d",
              (int)g_requested_input_device_id, (int)g_requested_input_channels,
              (int)g_requested_output_device_id, (int)g_requested_output_channels);
+}
+
+// Called from MainActivity.java's own onCreate(), BEFORE nativeInit() -- stores the app's real,
+// writable storage directory (see this file's own g_android_files_dir comment) so
+// hds_clap_recording_draw.c's hds_recording_ensure_folder_default() has somewhere real to default
+// the Recording tab's folder to on this platform.
+JNIEXPORT void JNICALL
+Java_com_hds_androidtest_NativeBridge_nativeSetFilesDir(JNIEnv *env, jobject thiz, jstring path) {
+    (void)thiz;
+    const char *utf = (*env)->GetStringUTFChars(env, path, NULL);
+    if (utf) {
+        snprintf(g_android_files_dir, sizeof(g_android_files_dir), "%s", utf);
+        (*env)->ReleaseStringUTFChars(env, path, utf);
+        HDS_LOGI("files dir: %s", g_android_files_dir);
+    }
 }
 
 // Opens the INPUT stream against whatever nativeConfigureAudio() last stored, reading back

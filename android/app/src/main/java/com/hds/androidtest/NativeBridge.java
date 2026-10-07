@@ -31,6 +31,12 @@ public final class NativeBridge {
     public static native void nativeConfigureAudio(int inputDeviceId, int inputChannels, int outputDeviceId, int outputChannels);
     public static native boolean nativeOpenAudioInput();
 
+    // The app's own real, writable storage directory -- see MainActivity.java's own call site and
+    // hds_android.c's own g_android_files_dir comment for why the Recording tab needs this on a
+    // platform with no $HOME/tmp. MUST be called before nativeInit() (the Recording tab's folder
+    // default is set lazily on its first render, but there's no reason to race that).
+    public static native void nativeSetFilesDir(String path);
+
     // GUI entry points -- see HdsSurfaceView.java's own header comment and hds_android_gui.c's
     // own header comment for the real architecture (straight into a locked ANativeWindow buffer
     // via Cairo, no Java Bitmap, no pixel copy of any kind -- these three calls carry nothing but

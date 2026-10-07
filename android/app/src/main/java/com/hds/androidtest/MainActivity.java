@@ -64,6 +64,17 @@ public class MainActivity extends Activity {
         // comment and NativeBridge.java's own comment on nativeConfigureAudio.
         configureAudioDevices();
 
+        // Also before nativeInit(): the Recording tab's own default folder has nowhere sane to
+        // point to on Android otherwise (no $HOME, no writable /tmp in a normal app process) --
+        // see hds_android.c's own g_android_files_dir comment. getExternalFilesDir(null) is this
+        // app's own private-but-shared-storage directory (visible under Android/data/<package>/
+        // files via a file manager or a USB cable, handy for actually retrieving a recording later)
+        // and needs no runtime permission at all; getFilesDir() (pure internal storage) is the
+        // fallback on the rare device where external storage isn't currently available.
+        java.io.File filesDir = getExternalFilesDir(null);
+        if (filesDir == null) filesDir = getFilesDir();
+        NativeBridge.nativeSetFilesDir(filesDir.getAbsolutePath());
+
         boolean audioOk = NativeBridge.nativeInit();
         Log.i(TAG, audioOk ? "Audio engine running. Scanning for MIDI devices..."
                            : "AAudio stream failed to open -- check logcat for \"hds_native\".");
