@@ -81,12 +81,31 @@ static void hds_font_select_face(cairo_t *cr, const char *family, cairo_font_sla
 // Tall enough to fit, all strictly inside this one row's own bounds: a short label naming what the
 // knob actually does, the knob itself, and its current value -- see hds_fx_draw_knob's own comment
 // for why a bare unlabeled pot was wrong twice over (no name AND no visible value).
+//
+// Android-only: bigger than desktop's own 62/10 -- this tab's own row/column layout is already
+// proportional (each column's own width is a fraction of whatever tab_area_w it's handed, see this
+// file's own row-layout comment below), so it can't go through hds_clap_gui_draw.c's own generic
+// HDS_CLAP_GUI_CONTENT_BOOST cairo_scale() wrapper the way every fixed-pixel tab there does
+// (stretching it a second time would push its own rightmost column(s) past the real tab_area_w,
+// clipping them with no way to reach them back -- there's no horizontal scroll/pan anywhere in
+// this GUI). Bumped directly at the source instead, so every column stays exactly as proportional
+// as before (same real on-screen WIDTH) while each row simply becomes taller and each knob bigger
+// -- confirmed safe against HDS_FX_KNOB_TOP_LABEL_Y_OFFSET/HDS_FX_KNOB_CY_OFFSET/
+// HDS_FX_KNOB_VALUE_Y_OFFSET just below (fixed offsets from row top, not row-height-derived):
+// their own existing gaps already have headroom for a bigger knob radius and a taller row, with
+// no overlap. Desktop (hds.clap/hds_fx.clap) is untouched -- same values as always.
+#if defined(HDS_ANDROID_GUI_ENABLED)
+#define HDS_FX_GUI_ROW_H 78.0
+#define HDS_FX_GUI_HEADER_H 78.0
+#define HDS_FX_GUI_KNOB_R 13.0
+#else
 #define HDS_FX_GUI_ROW_H 62.0
 // Title row + a column-header strip naming every column (see hds_fx_gui_render's own header-row
 // drawing) -- a flat list with no per-group-box titles like the Standalone's own QGroupBoxes needs
 // this or a column is just an unlabeled row of controls.
 #define HDS_FX_GUI_HEADER_H 62.0
 #define HDS_FX_GUI_KNOB_R 10.0
+#endif
 // Vertical offsets of a row's own knob label/center/value, all measured from the row's own top --
 // fixed constants (not row_h/2-derived) so hds_fx_gui_compute_row_layout and the label/value draw
 // calls in hds_fx_draw_knob can never drift apart. 47 + text descent still clears comfortably

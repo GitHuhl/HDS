@@ -29,6 +29,7 @@ typedef struct {
     HdsFxRect dropdown_anchor;
     HdsPlayKnobDrag knob_drag; // reused verbatim from hds_clap_play_draw.c -- see this file's own header comment
     HdsCtxMenu ctx_menu;       // Cutoff's/Resonance's own "Modulate From" menu, if one is open
+    double scroll_offset_px;  // this tab's own vertical scroll -- same convention as hds_clap_lfos_draw.c's own identical field; 5 filter rows + the 3-band EQ section stack taller than a short window
 } HdsClapFiltersViewState;
 
 static void hds_clap_filters_view_state_init(HdsClapFiltersViewState *vs) {
@@ -48,8 +49,8 @@ typedef struct {
     HdsFxRect chain_mode_pill;
 } HdsFiltChainModeLayout;
 
-static void hds_clap_filters_compute_chain_mode_layout(HdsFiltChainModeLayout *out) {
-    out->chain_mode_pill = (HdsFxRect){HDS_FILT_MARGIN + 90.0, HDS_FILT_CONTENT_TOP, 150.0, 18.0};
+static void hds_clap_filters_compute_chain_mode_layout(double top_y, HdsFiltChainModeLayout *out) {
+    out->chain_mode_pill = (HdsFxRect){HDS_FILT_MARGIN + 90.0, top_y, 150.0, 18.0};
 }
 
 typedef struct {
@@ -79,7 +80,14 @@ static void hds_clap_filters_compute_eq_layout(int band, double col_x, double to
     if (band == 1) out->q_knob = (HdsFxRect){col_x + 130.0, y + HDS_FILT_KNOB_R + 9.0, HDS_FILT_KNOB_R, HDS_FILT_KNOB_R};
 }
 
-static double hds_clap_filters_eq_top_y(void) { return HDS_FILT_CONTENT_TOP + 30.0 + 5.0 * HDS_FILT_ROW_H + 20.0; }
+static double hds_clap_filters_eq_top_y(double scroll_offset_px) { return HDS_FILT_CONTENT_TOP - scroll_offset_px + 30.0 + 5.0 * HDS_FILT_ROW_H + 20.0; }
+
+// Total UNSCROLLED content height, for scroll clamping -- the EQ section's own bottom (band label
+// + freq/gain/[q] knob + its value text below, same ~17px margin hds_play_draw_knob() itself uses)
+// below hds_clap_filters_eq_top_y()'s own (unscrolled) top.
+static double hds_clap_filters_content_h(void) {
+    return hds_clap_filters_eq_top_y(0.0) + 26.0 + HDS_FILT_KNOB_R + 9.0 + HDS_FILT_KNOB_R + 17.0 + 10.0;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Render
@@ -117,19 +125,20 @@ static void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFilter
     cairo_fill(cr);
 
     ProgramState *prog = hds_play_program(p);
+    double content_top = HDS_FILT_CONTENT_TOP - vs->scroll_offset_px;
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.6, 0.6, 0.63);
-    hds_fx_left_text(cr, HDS_FILT_MARGIN, HDS_FILT_CONTENT_TOP + 12.0, "Chain Mode:");
+    hds_fx_left_text(cr, HDS_FILT_MARGIN, content_top + 12.0, "Chain Mode:");
 
     HdsFiltChainModeLayout cm;
-    hds_clap_filters_compute_chain_mode_layout(&cm);
+    hds_clap_filters_compute_chain_mode_layout(content_top, &cm);
     bool parallel = prog->filter_chain_mode != 0.0f;
     hds_fx_draw_pill(cr, cm.chain_mode_pill.x, cm.chain_mode_pill.y, cm.chain_mode_pill.w, cm.chain_mode_pill.h,
                       parallel ? "Parallel (Summed)" : "Series (1->2->3->4->5)", parallel, false);
 
-    double rows_top = HDS_FILT_CONTENT_TOP + 30.0;
+    double rows_top = content_top + 30.0;
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 9.5);
     for (int i = 0; i < 5; i++) {
@@ -160,7 +169,7 @@ static void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFilter
         hds_fx_draw_pill(cr, L.type_pill.x, L.type_pill.y, L.type_pill.w, L.type_pill.h, HDS_FILT_TYPE_NAMES[ftype], type_dd_open || ftype != 0, false);
     }
 
-    double eq_top = hds_clap_filters_eq_top_y();
+    double eq_top = hds_clap_filters_eq_top_y(vs->scroll_offset_px);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.6, 0.6, 0.63);
@@ -238,14 +247,15 @@ static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersVie
         return true;
     }
 
+    double content_top = HDS_FILT_CONTENT_TOP - vs->scroll_offset_px;
     HdsFiltChainModeLayout cm;
-    hds_clap_filters_compute_chain_mode_layout(&cm);
+    hds_clap_filters_compute_chain_mode_layout(content_top, &cm);
     if (hds_play_rect_contains(&cm.chain_mode_pill, x, y)) {
         if (button == 1) prog->filter_chain_mode = (prog->filter_chain_mode != 0.0f) ? 0.0f : 1.0f;
         return true;
     }
 
-    double rows_top = HDS_FILT_CONTENT_TOP + 30.0;
+    double rows_top = content_top + 30.0;
     for (int i = 0; i < 5; i++) {
         FilterParams *filt = &prog->filters[i];
         HdsFiltRowLayout L;
@@ -265,7 +275,7 @@ static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersVie
         }
     }
 
-    double eq_top = hds_clap_filters_eq_top_y();
+    double eq_top = hds_clap_filters_eq_top_y(vs->scroll_offset_px);
     for (int b = 0; b < 3; b++) {
         EqBandParams *band = &prog->eq_bands[b];
         double col_x = HDS_FILT_MARGIN + b * HDS_FILT_EQ_BAND_W;
@@ -282,6 +292,14 @@ static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersVie
 
 static void hds_clap_filters_on_motion(HdsClapFiltersViewState *vs, double x, double y) {
     hds_play_apply_knob_drag(&vs->knob_drag, x, y);
+}
+
+static void hds_clap_filters_on_scroll(HdsClapFiltersViewState *vs, double window_h, int delta) {
+    double max_scroll = hds_clap_filters_content_h() - window_h;
+    if (max_scroll < 0.0) max_scroll = 0.0;
+    vs->scroll_offset_px -= delta * HDS_FILT_ROW_H;
+    if (vs->scroll_offset_px < 0.0) vs->scroll_offset_px = 0.0;
+    if (vs->scroll_offset_px > max_scroll) vs->scroll_offset_px = max_scroll;
 }
 
 static void hds_clap_filters_on_button_release(HdsClapFiltersViewState *vs) {

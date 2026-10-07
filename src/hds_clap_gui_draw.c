@@ -72,80 +72,63 @@ typedef enum {
     HDS_CLAP_TAB_COUNT
 } HdsClapTab;
 
+// ONE uniform extra-zoom factor, applied identically to every tab's own content AND the Global
+// sidebar below -- see hds_clap_gui_tab_fill_scale()'s own fuller comment further down (defined
+// here, this early, purely so hds_clap_gui_sidebar_w() just below can also use it).
+#define HDS_CLAP_GUI_CONTENT_BOOST 1.3
+
 // Every reference to the sidebar's own reserved width in THIS file (not hds_clap_global_draw.c,
 // whose own internal layout keeps using HDS_CLAP_GLOBAL_SIDEBAR_W directly, unchanged) goes
 // through this instead: the real sidebar width on every tab except FX, where it's 0 -- that tab's
 // own slot list (hds_fx_gui_draw.c, a 10-column table) genuinely needs the width back, and
 // Global's own settings aren't something anyone is toggling mid-FX-edit anyway. See this file's
-// own header comment. Must come after the HdsClapTab enum above (it takes one as its parameter).
+// own header comment. Boosted by the SAME factor as every tab's own content (HDS_CLAP_GUI_CONTENT_
+// BOOST) -- see hds_clap_gui_render()'s own sidebar comment for the matching cairo_scale()/
+// hit-test divide that actually makes the sidebar's own controls bigger within this wider
+// reservation, not just reserve dead space the way a bare width bump alone would. Must come after
+// the HdsClapTab enum above (it takes one as its parameter).
 static double hds_clap_gui_sidebar_w(HdsClapTab active_tab) {
-    return (active_tab == HDS_CLAP_TAB_FX) ? 0.0 : HDS_CLAP_GLOBAL_SIDEBAR_W;
+    return (active_tab == HDS_CLAP_TAB_FX) ? 0.0 : (HDS_CLAP_GLOBAL_SIDEBAR_W * HDS_CLAP_GUI_CONTENT_BOOST);
 }
 
-// Most tabs here draw at FIXED absolute pixel positions and never stretch their own content to
-// fill whatever tab_area_w they're actually given -- confirmed on a real device: correctly drawn,
-// correctly colored, but simply too small, with plain unfilled background (not a clip edge)
-// covering the rest of the screen past each tab's own fixed content, because that content was
-// never asked to grow into the extra room at all. hds_clap_gui_tab_fill_scale() below is how this
-// file (not any individual tab file -- zero changes needed there) fixes that: an ADDITIONAL
-// uniform cairo_scale() applied only around the active tab's own content (after the sidebar/
-// tab-bar/BAR_H translates, which must stay crisp and tab_area_w-wide themselves), stretching
-// that tab's own real content width to actually fill tab_area_w.
+// hds_clap_gui_tab_fill_scale()/hds_clap_gui_tab_content_w(): apply HDS_CLAP_GUI_CONTENT_BOOST
+// (defined above, right before hds_clap_gui_sidebar_w()) to every tab's own content. NOT a
+// per-tab "stretch to exactly fill tab_area_w" measurement anymore -- an earlier version measured
+// each tab's own real content width individually and stretched it to exactly fill the available
+// area; confirmed on a real device this produced wildly inconsistent, visually broken results
+// precisely BECAUSE tabs differ so much in their own native density (Play's own four wide columns
+// stretched to a pleasant ~1.5x; Routing's and Filters' own much denser rows stretched to
+// ~1.65-1.77x and looked oversized/distorted; a measurement bug left LFOs at exactly 1.0x; FX and
+// Envelopes, excluded entirely as already-proportional, stayed at 1.0x with no boost at all) --
+// explicit, repeated, emphatic product direction after seeing all of them side by side: uniform
+// consistency across the whole app matters far more than each tab individually using every last
+// available pixel. A single shared constant can never drift back into that same inconsistency.
 //
-// Each width below is that tab's own ACTUAL rightmost drawn element (not a single shared "every
-// tab is 1150/1080 wide" guess -- confirmed by reading each file's own row/column layout math
-// directly, since they differ a lot: Play's 4 oscillator columns stop at ~660, LFOs' own row
-// background is an explicit 1080, Devices on CLAP/Android shows only Polyphony+Block Size at
-// ~290 -- its device/MIDI/latency pickers are HDS_STANDALONE_GUI_ENABLED-only). FX and Envelopes
-// are excluded (return tab_area_w itself, making the scale below always exactly 1.0 for them)
-// because their own layouts are already proportional -- FX's own row/column widths are computed
-// AS A FRACTION of whatever tab_area_w it's handed (see hds_fx_gui_draw.c's own row-layout
-// comment), and Envelopes' own panel_w is literally `window_w - 2*MARGIN` -- scaling either a
-// second time here would double them.
-static double hds_clap_gui_tab_content_w(HdsClapPlugin *p, HdsClapTab active_tab, double tab_area_w) {
-    switch (active_tab) {
-        case HDS_CLAP_TAB_FX:
-        case HDS_CLAP_TAB_ENVELOPES:
-            return tab_area_w;
-        case HDS_CLAP_TAB_PLAY:
-            // Combi mode is a sibling view (hds_clap_combi_draw.c) with its own, much wider,
-            // 8-lane layout (hds_combi_lane_x(7) + HDS_COMBI_LANE_W landing at ~1180) -- NOT
-            // Play's own 4-column one (HDS_PLAY_MARGIN + 4*HDS_PLAY_OSC_COL_W + 3*HDS_PLAY_OSC_GAP
-            // + a trailing margin, landing at ~660).
-            return ((int)p->knobs.performance_mode == 1) ? 1180.0 : 660.0;
-        case HDS_CLAP_TAB_FILTERS:
-            return 600.0; // per-filter row (type_pill's own right edge) and the 3-band EQ section below it land in the same ~590-600 range
-        case HDS_CLAP_TAB_LFOS:
-            return 1080.0; // HdsLfoRowLayout.row's own explicit width
-        case HDS_CLAP_TAB_ROUTING:
-#ifdef HDS_STANDALONE_GUI_ENABLED
-            return 1150.0; // standalone's own per-output-pair pill row (OUTPUT_PAIR_MAX wide) needs much more room
-#else
-            return 560.0; // CLAP/Android: a single mainout_pill + vu_bar only
-#endif
-        case HDS_CLAP_TAB_DEVICES:
-#ifdef HDS_STANDALONE_GUI_ENABLED
-            return 450.0; // standalone's own Output/Input/MIDI/Latency pickers
-#else
-            return 290.0; // CLAP/Android: Polyphony + Block Size only -- device pickers are standalone-only
-#endif
-#ifdef HDS_STANDALONE_GUI_ENABLED
-        case HDS_CLAP_TAB_RECORDING:
-            return 540.0; // folder_field + browse_btn's own right edge
-#endif
-        default:
-            return tab_area_w; // not yet individually measured -- a harmless no-stretch fallback, same as FX/Envelopes above
-    }
+// FX is the one exception: its own hds_fx_gui_render() reads vs->fx_view.window_w/h, a field set
+// ONCE by hds_clap_gui_on_resize() (real, un-boosted dimensions) rather than taking width/height
+// as plain per-call parameters the way every other tab here does, and that same field also sizes
+// the shared file browser modal -- there is no clean way to feed it a virtual narrower width the
+// way every other case below does without ALSO shrinking the browser. FX's own per-row size is
+// instead boosted directly at its own source (HDS_FX_GUI_ROW_H/HDS_FX_GUI_KNOB_R, Android-only --
+// see hds_fx_gui_draw.c's own comment there), so it keeps the same HDS_CLAP_GUI_CONTENT_BOOST
+// ballpark as everywhere else without going through this mechanism at all.
+static double hds_clap_gui_tab_fill_scale(HdsClapPlugin *p, HdsClapTab active_tab, double tab_area_w) {
+    (void)p; (void)tab_area_w;
+    return (active_tab == HDS_CLAP_TAB_FX) ? 1.0 : HDS_CLAP_GUI_CONTENT_BOOST;
 }
 
-// Never shrinks below 1.0: a tab_area_w NARROWER than the fixed design width relies on that tab's
-// own existing scroll/clip machinery instead (exactly like vertical overflow already does) --
-// squeezing content down to fit would make it just as hard to hit as the dead-space problem this
-// exists to fix in the first place.
-static double hds_clap_gui_tab_fill_scale(HdsClapPlugin *p, HdsClapTab active_tab, double tab_area_w) {
-    double content_w = hds_clap_gui_tab_content_w(p, active_tab, tab_area_w);
-    double s = tab_area_w / content_w;
-    return (s > 1.0) ? s : 1.0;
+// The virtual (pre-boost) width/height every non-FX tab's own render/hit-test functions are
+// called with -- exactly tab_area_w/BOOST, so that tab's own layout (whether genuinely
+// proportional, like Envelopes' `window_w - 2*MARGIN`, or fixed-absolute-pixel, like Play's 4
+// columns) fills that virtual canvas completely on its own terms, and the matching cairo_scale()
+// in hds_clap_gui_render() then stretches the WHOLE thing -- canvas and content alike -- back out
+// to fill the real tab_area_w exactly. A genuinely proportional tab (Envelopes) ends up with zero
+// dead space either way; a fixed-width one (Play, Filters, ...) ends up with whatever dead space
+// its own content doesn't fill at this new virtual size, same as it would at any other window
+// size -- never clipped, never squeezed, and every tab shares the exact same zoom level.
+static double hds_clap_gui_tab_content_w(HdsClapPlugin *p, HdsClapTab active_tab, double tab_area_w) {
+    (void)p;
+    return (active_tab == HDS_CLAP_TAB_FX) ? tab_area_w : (tab_area_w / HDS_CLAP_GUI_CONTENT_BOOST);
 }
 
 // Mapping and Sequencer never exist here at all (not even as a placeholder tab): Mapping's own
@@ -250,9 +233,17 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
     // The persistent left sidebar -- full window height, no tab bar over it (see this file's own
     // header comment). Drawn first, in the untranslated coordinate space (it starts at x=0).
     // Hidden (sidebar_w == 0) specifically while the FX tab is active -- that tab's own slot list
-    // genuinely needs the width back.
+    // genuinely needs the width back. Wrapped in the SAME HDS_CLAP_GUI_CONTENT_BOOST cairo_scale()
+    // every tab's own content gets (see hds_clap_gui_tab_fill_scale()'s own comment) -- sidebar_w
+    // already reserves the BOOSTED real width (hds_clap_gui_sidebar_w()'s own comment), so
+    // hds_clap_global_render() itself is called with the native, un-boosted
+    // HDS_CLAP_GLOBAL_SIDEBAR_W/height, and this scale stretches it to exactly fill that
+    // reservation -- same "virtual native canvas, one outer stretch" idiom as every other tab.
     if (sidebar_w > 0.0) {
-        hds_clap_global_render(cr, p, &vs->global_view, sidebar_w, vs->window_h);
+        cairo_save(cr);
+        cairo_scale(cr, HDS_CLAP_GUI_CONTENT_BOOST, HDS_CLAP_GUI_CONTENT_BOOST);
+        hds_clap_global_render(cr, p, &vs->global_view, HDS_CLAP_GLOBAL_SIDEBAR_W, vs->window_h / HDS_CLAP_GUI_CONTENT_BOOST);
+        cairo_restore(cr);
     }
 
     // Everything else (tab bar + active tab's content) lives to the RIGHT of the sidebar --
@@ -389,7 +380,9 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
     // file's own header comment). Hidden on the FX tab (sidebar_w == 0 there), so this check
     // naturally never matches any real coordinate while that tab is active.
     if (sidebar_w > 0.0 && x < sidebar_w) {
-        return hds_clap_global_on_button_press(p, &vs->global_view, &vs->fx_view, vs->window_h, x, y, button);
+        // Divides back into hds_clap_global_render()'s own native (un-boosted) coordinate space --
+        // same HDS_CLAP_GUI_CONTENT_BOOST divide every tab's own hit-test already applies.
+        return hds_clap_global_on_button_press(p, &vs->global_view, &vs->fx_view, vs->window_h / HDS_CLAP_GUI_CONTENT_BOOST, x / HDS_CLAP_GUI_CONTENT_BOOST, y / HDS_CLAP_GUI_CONTENT_BOOST, button);
     }
     double tab_x = x - sidebar_w;
     double tab_area_w = vs->window_w - sidebar_w;
@@ -450,8 +443,9 @@ static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     // area) must keep receiving motion even if the pointer strays outside that region afterward --
     // each handler already no-ops on its own if it has no drag in flight (same pattern every other
     // per-tab on_motion in this dispatch already relies on). Harmless to call even on the FX tab,
-    // where the sidebar isn't shown at all: there's no drag in flight on it to continue.
-    hds_clap_global_on_motion(&vs->global_view, x, y);
+    // where the sidebar isn't shown at all: there's no drag in flight on it to continue. Divided by
+    // the same HDS_CLAP_GUI_CONTENT_BOOST every other sidebar call site divides by.
+    hds_clap_global_on_motion(&vs->global_view, x / HDS_CLAP_GUI_CONTENT_BOOST, y / HDS_CLAP_GUI_CONTENT_BOOST);
 
     double sidebar_w = hds_clap_gui_sidebar_w(vs->active_tab);
     double tab_x = x - sidebar_w;
@@ -501,8 +495,10 @@ static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int a
 static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int delta) {
     if (vs->fx_view.browser.open) { hds_fx_gui_on_scroll(&p->gui_host, &vs->fx_view, delta); return; }
     double sidebar_w = hds_clap_gui_sidebar_w(vs->active_tab);
-    // Hidden on the FX tab (sidebar_w == 0 there), so this naturally never matches while it's active.
-    if (sidebar_w > 0.0 && x < sidebar_w) { hds_clap_global_on_scroll(p, &vs->global_view, vs->window_h, delta); return; }
+    // Hidden on the FX tab (sidebar_w == 0 there), so this naturally never matches while it's
+    // active. vs->window_h divided by the same HDS_CLAP_GUI_CONTENT_BOOST every other sidebar
+    // call site divides by.
+    if (sidebar_w > 0.0 && x < sidebar_w) { hds_clap_global_on_scroll(p, &vs->global_view, vs->window_h / HDS_CLAP_GUI_CONTENT_BOOST, delta); return; }
     if (y < HDS_CLAP_TAB_BAR_H) return;
     // See hds_clap_gui_on_button_press()'s own identical comment -- content_h keeps this tab's own
     // max-scroll math in the same NATIVE (pre-fill_scale) units its content_h-vs-content-height
@@ -513,6 +509,7 @@ static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_scroll(&p->gui_host, &vs->fx_view, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_PLAY && (int)p->knobs.performance_mode != 1)
         hds_clap_play_on_scroll(&vs->play_view, hds_play_program(p), content_h, delta);
+    else if (vs->active_tab == HDS_CLAP_TAB_FILTERS) hds_clap_filters_on_scroll(&vs->filters_view, content_h, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_scroll(&vs->lfos_view, content_h, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_scroll(&vs->envelopes_view, content_h, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_scroll(&vs->routing_view, content_h, delta);

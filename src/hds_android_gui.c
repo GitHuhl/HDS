@@ -423,9 +423,11 @@ static void hds_android_gui_scroll_by_px(HdsAndroidGuiWindow *w, double x, doubl
     // content-height comparison it's clamped against have to be divided back down into that
     // tab's own NATIVE (pre-stretch) units, or scrolling would drift out of sync with -- feel
     // faster/slower than, and eventually clamp at the wrong point relative to -- what's on
-    // screen. Always exactly 1.0 for FX (a harmless no-op division) and for the sidebar branch
-    // just below (which never reads it at all -- the sidebar isn't fill-scaled, see this file's
-    // own header comment).
+    // screen. Always exactly 1.0 for FX (a harmless no-op division). The sidebar branch just
+    // below uses the SAME idea but its own HDS_CLAP_GUI_CONTENT_BOOST constant instead (a
+    // different, independent factor from this tab-content fill_scale -- see
+    // hds_clap_gui_sidebar_w()'s own comment), since sidebar_w already reserves the BOOSTED real
+    // width regardless of which tab is active.
     double fill_scale = hds_clap_gui_tab_fill_scale(w->plugin, vs->active_tab, vs->window_w - sidebar_w);
     double visible_h = window_h / fill_scale; // NOT named content_h -- several cases below already declare their own content_h (that tab's own total content height, a different quantity) in their own nested scope
     double content_delta_px = delta_px / fill_scale;
@@ -436,9 +438,10 @@ static void hds_android_gui_scroll_by_px(HdsAndroidGuiWindow *w, double x, doubl
         if (algo < 0 || algo >= HDS_GLOBAL_FMALGO_COUNT) algo = 0;
         HdsGlobalLayout L;
         hds_clap_global_compute_layout(algo, 0.0, &L);
-        double max_scroll = L.content_h - vs->window_h;
+        double sidebar_visible_h = vs->window_h / HDS_CLAP_GUI_CONTENT_BOOST;
+        double max_scroll = L.content_h - sidebar_visible_h;
         if (max_scroll < 0.0) max_scroll = 0.0;
-        gv->scroll_offset_px -= delta_px;
+        gv->scroll_offset_px -= delta_px / HDS_CLAP_GUI_CONTENT_BOOST;
         if (gv->scroll_offset_px < 0.0) gv->scroll_offset_px = 0.0;
         if (gv->scroll_offset_px > max_scroll) gv->scroll_offset_px = max_scroll;
         return;
@@ -530,8 +533,17 @@ static void hds_android_gui_scroll_by_px(HdsAndroidGuiWindow *w, double x, doubl
             if (pv->scroll_offset_px > max_scroll) pv->scroll_offset_px = max_scroll;
             return;
         }
+        case HDS_CLAP_TAB_FILTERS: {
+            HdsClapFiltersViewState *flv = &vs->filters_view;
+            double max_scroll = hds_clap_filters_content_h() - visible_h;
+            if (max_scroll < 0.0) max_scroll = 0.0;
+            flv->scroll_offset_px -= content_delta_px;
+            if (flv->scroll_offset_px < 0.0) flv->scroll_offset_px = 0.0;
+            if (flv->scroll_offset_px > max_scroll) flv->scroll_offset_px = max_scroll;
+            return;
+        }
         default:
-            return; // Filters/Devices have no scrollable background content
+            return; // Devices has no scrollable background content
     }
 }
 
