@@ -612,6 +612,17 @@ typedef struct {
 
     bool amp_eg_live_sync;      // "Sync" toggle -- while true, every change to Amp EG 0 (Osc1) is
                                  // immediately mirrored onto Amp EGs 1-3, which are drawn disabled
+
+    // This tab's own vertical scroll -- stays permanently 0.0 (and so, by construction, changes
+    // nothing at all) on any host tall enough to show hds_play_content_h()'s own full content at
+    // once, which every desktop default window size already is; only needed once a host's own
+    // window got shorter than that (Android, see hds_android_gui_scroll_by_px()'s own PLAY case),
+    // which this file had never needed to support until then. Same convention every other
+    // scrollable tab here already uses (subtract from the layout's own fixed top-of-content
+    // constant, see every HDS_PLAY_CONTENT_TOP/hds_play_eg_top_y() call site in this file) rather
+    // than a cairo_translate(), so render and every hit-test function agree on row positions by
+    // construction, never by keeping two copies of the same arithmetic in sync.
+    double scroll_offset_px;
 } HdsClapPlayViewState;
 
 static void hds_clap_play_view_state_init(HdsClapPlayViewState *vs) {
@@ -1116,20 +1127,45 @@ static double hds_play_eg_top_y(ProgramState *prog) {
     return hds_play_osc_region_bottom_y(prog) + HDS_PLAY_REGION_GAP;
 }
 
+// Total UNSCROLLED content height (independent of vs->scroll_offset_px, which this never reads --
+// a scroll position obviously can't be part of the measurement it's itself clamped against) --
+// the tallest of the 4 Amp EG panels' own bottom-most dial row, same max-of-4-columns pattern
+// hds_play_osc_region_bottom_y() already established for the oscillator region above it. Knob
+// bottom edge approximated as center_y + radius + 17.0 (matches hds_play_draw_knob()'s own value-
+// text baseline, cy + radius + 9.0, plus that 8px font's own line height) -- a small constant
+// surplus here only ever means a few px of harmless extra scroll headroom, never clipped content,
+// so this doesn't need to be exact.
+static double hds_play_content_h(ProgramState *prog) {
+    double eg_top_y = hds_play_eg_top_y(prog);
+    double max_bottom = 0.0;
+    for (int i = 0; i < 4; i++) {
+        int env_type = (int)prog->eg_mode[i];
+        HdsPlayEgLayout L;
+        hds_play_compute_eg_layout(i, env_type, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, eg_top_y, &L);
+        int count = hds_play_eg_dial_count(env_type);
+        for (int d = 0; d < count; d++) {
+            double bottom = L.dial[d].y + L.dial[d].w + 17.0; // dial[d]: (x,y)=center, w=radius -- see this file's own knob-rect convention comment
+            if (bottom > max_bottom) max_bottom = bottom;
+        }
+    }
+    return max_bottom + 10.0; // small bottom margin, same spirit as every other margin in this file
+}
+
 static void hds_play_render_osc_strip(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewState *vs, int osc, double col_x) {
     ProgramState *prog = hds_play_program(p);
     HdsPlayOscFields f; hds_play_osc_fields(prog, osc, &f);
     int shape = (int)*f.shape;
+    double top_y = HDS_PLAY_CONTENT_TOP - vs->scroll_offset_px;
 
     HdsPlayOscLayout L;
-    hds_play_compute_osc_layout(osc, shape, col_x, HDS_PLAY_CONTENT_TOP, &L);
+    hds_play_compute_osc_layout(osc, shape, col_x, top_y, &L);
 
     char num[4]; snprintf(num, sizeof(num), "%d", osc + 1);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.55, 0.55, 0.58);
     char hdr[16]; snprintf(hdr, sizeof(hdr), "Osc %s", num);
-    hds_fx_left_text(cr, col_x, HDS_PLAY_CONTENT_TOP - 8.0, hdr);
+    hds_fx_left_text(cr, col_x, top_y - 8.0, hdr);
 
     bool shape_dd_open = (vs->dropdown_kind == HDS_PLAY_DROPDOWN_SHAPE && vs->dropdown_index == osc);
     hds_fx_draw_pill(cr, L.shape_pill.x, L.shape_pill.y, L.shape_pill.w, L.shape_pill.h,
@@ -1248,7 +1284,7 @@ static void hds_clap_play_render(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewS
     }
 
     ProgramState *prog = hds_play_program(p);
-    double eg_top_y = hds_play_eg_top_y(prog);
+    double eg_top_y = hds_play_eg_top_y(prog) - vs->scroll_offset_px;
     for (int i = 0; i < 4; i++) {
         hds_play_render_eg_panel(cr, p, vs, i, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, eg_top_y);
     }
@@ -1337,7 +1373,7 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
         HdsPlayOscFields f; hds_play_osc_fields(prog, osc, &f);
         int shape = (int)*f.shape;
         HdsPlayOscLayout L;
-        hds_play_compute_osc_layout(osc, shape, col_x, HDS_PLAY_CONTENT_TOP, &L);
+        hds_play_compute_osc_layout(osc, shape, col_x, HDS_PLAY_CONTENT_TOP - vs->scroll_offset_px, &L);
 
         if (hds_play_rect_contains(&L.shape_pill, x, y)) {
             vs->dropdown_kind = HDS_PLAY_DROPDOWN_SHAPE; vs->dropdown_index = osc; vs->dropdown_anchor = L.shape_pill;
@@ -1386,7 +1422,7 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
         if (hds_play_try_osc_knob_click(vs, &L.pan_knob, f.pan, HDS_PLAY_KNOB_PAN, shape, x, y, button, pan_menu)) return true;
     }
 
-    double eg_top_y = hds_play_eg_top_y(prog);
+    double eg_top_y = hds_play_eg_top_y(prog) - vs->scroll_offset_px;
     for (int i = 0; i < 4; i++) {
         int env_type = (int)prog->eg_mode[i];
         HdsPlayEgLayout L;
@@ -1461,7 +1497,7 @@ static void hds_clap_play_on_motion(HdsClapPlugin *p, HdsClapPlayViewState *vs, 
         int i = vs->adsr_drag_eg;
         int env_type = (int)prog->eg_mode[i];
         HdsPlayEgLayout L;
-        hds_play_compute_eg_layout(i, env_type, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, hds_play_eg_top_y(prog), &L);
+        hds_play_compute_eg_layout(i, env_type, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, hds_play_eg_top_y(prog) - vs->scroll_offset_px, &L);
         AdsrEnvelopeState adsr;
         hds_clap_adsr_load_from_backend(&adsr, &prog->eg[i], env_type);
         adsr.active_node = vs->adsr_active_node[i];
@@ -1479,4 +1515,18 @@ static void hds_clap_play_on_button_release(HdsClapPlayViewState *vs) {
         vs->ctx_menu = (HdsCtxMenu){true, anchor_x, anchor_y, menu.kind, menu.arg};
     }
     vs->adsr_drag_eg = -1;
+}
+
+// This tab's own background-content scroll (see HdsClapPlayViewState.scroll_offset_px's own
+// comment) -- same discrete-wheel-step convention as every other scrollable tab's own on_scroll()
+// (hds_clap_lfos_on_scroll() etc): one HDS_PLAY_KNOB_STRIDE per wheel click, the same vertical
+// space one knob row already reserves everywhere else in this file, so a wheel step moves roughly
+// one row at a time. Permanently a no-op (max_scroll clamps to 0) on any host tall enough to show
+// hds_play_content_h() in full, which every desktop default window size already is.
+static void hds_clap_play_on_scroll(HdsClapPlayViewState *vs, ProgramState *prog, double window_h, int delta) {
+    double max_scroll = hds_play_content_h(prog) - window_h;
+    if (max_scroll < 0.0) max_scroll = 0.0;
+    vs->scroll_offset_px -= delta * HDS_PLAY_KNOB_STRIDE;
+    if (vs->scroll_offset_px < 0.0) vs->scroll_offset_px = 0.0;
+    if (vs->scroll_offset_px > max_scroll) vs->scroll_offset_px = max_scroll;
 }

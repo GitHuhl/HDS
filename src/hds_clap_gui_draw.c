@@ -406,6 +406,8 @@ static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     if (sidebar_w > 0.0 && x < sidebar_w) { hds_clap_global_on_scroll(p, &vs->global_view, vs->window_h, delta); return; }
     if (y < HDS_CLAP_TAB_BAR_H) return;
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_scroll(&p->gui_host, &vs->fx_view, delta);
+    else if (vs->active_tab == HDS_CLAP_TAB_PLAY && (int)p->knobs.performance_mode != 1)
+        hds_clap_play_on_scroll(&vs->play_view, hds_play_program(p), vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_scroll(&vs->lfos_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_scroll(&vs->envelopes_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_scroll(&vs->routing_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);

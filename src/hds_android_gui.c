@@ -501,8 +501,22 @@ static void hds_android_gui_scroll_by_px(HdsAndroidGuiWindow *w, double x, doubl
             if (rv->scroll_offset_px > max_scroll) rv->scroll_offset_px = max_scroll;
             return;
         }
+        case HDS_CLAP_TAB_PLAY: {
+            // Combi mode (performance_mode==1) is a completely different sibling view
+            // (hds_clap_combi_draw.c) with no scroll_offset_px of its own yet -- a no-op here,
+            // same as it already is on desktop (hds_clap_gui_draw.c's own on_scroll dispatch
+            // guards this identically).
+            if ((int)w->plugin->knobs.performance_mode == 1) return;
+            HdsClapPlayViewState *pv = &vs->play_view;
+            double max_scroll = hds_play_content_h(hds_play_program(w->plugin)) - window_h;
+            if (max_scroll < 0.0) max_scroll = 0.0;
+            pv->scroll_offset_px -= delta_px;
+            if (pv->scroll_offset_px < 0.0) pv->scroll_offset_px = 0.0;
+            if (pv->scroll_offset_px > max_scroll) pv->scroll_offset_px = max_scroll;
+            return;
+        }
         default:
-            return; // Play/Filters/Devices have no scrollable background content
+            return; // Filters/Devices have no scrollable background content
     }
 }
 
