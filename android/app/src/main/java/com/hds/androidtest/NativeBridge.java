@@ -22,6 +22,15 @@ public final class NativeBridge {
     public static native void nativeOnMidi(byte[] data, int offset, int length);
     public static native void nativeShutdown();
 
+    // Audio device configuration -- see MainActivity.java's own AudioManager.getDevices()
+    // enumeration and hds_android.c's own header comment on real external audio input/
+    // multichannel USB support. nativeConfigureAudio MUST be called before nativeInit() (it only
+    // stores which device/channel-count nativeInit()'s own OUTPUT stream open should use);
+    // nativeOpenAudioInput can be called any time after (once at nativeInit(), opportunistically,
+    // and again from onRequestPermissionsResult once RECORD_AUDIO is actually granted).
+    public static native void nativeConfigureAudio(int inputDeviceId, int inputChannels, int outputDeviceId, int outputChannels);
+    public static native boolean nativeOpenAudioInput();
+
     // GUI entry points -- see HdsSurfaceView.java's own header comment and hds_android_gui.c's
     // own header comment for the real architecture (straight into a locked ANativeWindow buffer
     // via Cairo, no Java Bitmap, no pixel copy of any kind -- these three calls carry nothing but

@@ -1,6 +1,10 @@
 package com.hds.androidtest;
 
+import android.Manifest;
 import android.app.Activity;
+import android.content.pm.PackageManager;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
 import android.media.midi.MidiDevice;
 import android.media.midi.MidiDeviceInfo;
 import android.media.midi.MidiManager;
@@ -33,6 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
 // possible here with a newer, non-broken D8/R8, this restriction can be dropped.
 public class MainActivity extends Activity {
     private static final String TAG = "HdsMidi";
+    private static final int RECORD_AUDIO_REQUEST_CODE = 1;
     private MidiDevice openDevice;
     private final AtomicLong bytesReceived = new AtomicLong(0);
 
@@ -53,11 +58,86 @@ public class MainActivity extends Activity {
 
         setContentView(new HdsSurfaceView(this));
 
+        // MUST run before nativeInit(): tells the native OUTPUT stream which real device/channel
+        // count to open against (a class-compliant USB interface's own real channel count, not a
+        // hardcoded stereo guess) -- see hds_android.c's own "Real external audio input" header
+        // comment and NativeBridge.java's own comment on nativeConfigureAudio.
+        configureAudioDevices();
+
         boolean audioOk = NativeBridge.nativeInit();
         Log.i(TAG, audioOk ? "Audio engine running. Scanning for MIDI devices..."
                            : "AAudio stream failed to open -- check logcat for \"hds_native\".");
 
+        // RECORD_AUDIO is a dangerous (runtime) permission: nativeInit() above already tried
+        // nativeOpenAudioInput() opportunistically (succeeds immediately if a previous run already
+        // granted it), so this only matters the first time -- requestPermissions() shows the
+        // system dialog, and onRequestPermissionsResult below retries the native open once the
+        // user actually answers it. Until then (or if denied), ext-in/the Recording tab's raw
+        // Input Channel checkboxes simply stay silent -- see hds_android.c's own
+        // nativeOpenAudioInput() comment.
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, RECORD_AUDIO_REQUEST_CODE);
+        }
+
         scanAndConnectMidi();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != RECORD_AUDIO_REQUEST_CODE) return;
+        boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        Log.i(TAG, granted ? "RECORD_AUDIO granted -- opening the input stream."
+                           : "RECORD_AUDIO denied -- ext-in/Recording-tab raw input channels will stay silent.");
+        if (granted) NativeBridge.nativeOpenAudioInput();
+    }
+
+    // Picks the best real input/output device to open against: a class-compliant USB interface's
+    // OWN device id and real channel count if one is currently connected (TYPE_USB_DEVICE/
+    // TYPE_USB_HEADSET/TYPE_USB_ACCESSORY -- the three types Android reports a USB audio class
+    // device under, depending on how it enumerates), falling back to device id 0 (AAUDIO_UNSPECIFIED
+    // -- "let AAudio/the OS pick the current default route") at 2 channels otherwise, the exact
+    // behavior this app always had before real device targeting existed. See hds_android.c's own
+    // "Real external audio input" section header comment for why channel count isn't hardcoded to
+    // 2 anymore: AudioDeviceInfo.getChannelCounts() reports the device's own real supported counts,
+    // and this picks the largest (a genuinely multichannel interface is used as one, not downmixed).
+    private void configureAudioDevices() {
+        AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        int inputDeviceId = 0, inputChannels = 2;
+        int outputDeviceId = 0, outputChannels = 2;
+        if (audioManager != null) {
+            for (AudioDeviceInfo info : audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
+                if (isUsbAudioType(info.getType())) {
+                    inputDeviceId = info.getId();
+                    inputChannels = bestChannelCount(info);
+                    break; // first class-compliant USB input wins -- a real interface reports itself once
+                }
+            }
+            for (AudioDeviceInfo info : audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                if (isUsbAudioType(info.getType())) {
+                    outputDeviceId = info.getId();
+                    outputChannels = bestChannelCount(info);
+                    break;
+                }
+            }
+        }
+        NativeBridge.nativeConfigureAudio(inputDeviceId, inputChannels, outputDeviceId, outputChannels);
+    }
+
+    private static boolean isUsbAudioType(int type) {
+        return type == AudioDeviceInfo.TYPE_USB_DEVICE
+                || type == AudioDeviceInfo.TYPE_USB_HEADSET
+                || type == AudioDeviceInfo.TYPE_USB_ACCESSORY;
+    }
+
+    // getChannelCounts() returns every discrete count the device advertises support for (e.g. an
+    // 8-in interface might report {1, 2, 4, 6, 8}) -- the largest is the real "use every channel"
+    // count this app wants; an empty array (seen on some devices/API levels, meaning "no specific
+    // constraint") falls back to the same 2 this app always assumed.
+    private static int bestChannelCount(AudioDeviceInfo info) {
+        int best = 2;
+        for (int c : info.getChannelCounts()) if (c > best) best = c;
+        return best;
     }
 
     @Override

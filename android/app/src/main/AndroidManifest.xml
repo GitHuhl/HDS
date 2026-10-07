@@ -6,12 +6,20 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.hds.androidtest">
 
-    <!-- Declares intent to use USB MIDI devices, not a runtime permission: android.media.midi
-         itself needs none (unlike RECORD_AUDIO, which this app also never asks for: it never
-         captures, only renders). required="false" so the app still installs on a device with no
-         MIDI hardware feature flag at all; MidiManager.getDevices() is simply empty there. -->
+    <!-- Declares intent to use USB MIDI/audio devices, not a runtime permission: android.media.midi
+         itself needs none, and USB audio routing (a class-compliant interface's own input/output)
+         is handled entirely by AudioManager/AAudio at the OS level; this app never talks raw USB
+         itself, so no android.hardware.usb.* runtime permission is ever requested either.
+         required="false" so the app still installs on a device with no MIDI hardware feature flag
+         at all; MidiManager.getDevices() is simply empty there. -->
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <uses-feature android:name="android.software.midi" android:required="false" />
+
+    <!-- RECORD_AUDIO: a real runtime (dangerous) permission, requested from MainActivity.java's
+         own onCreate(), see that file's own comment. Without it, AAudio's own INPUT stream simply
+         fails to open (see hds_android.c's own nativeOpenAudioInput()), so ext-in/the Recording
+         tab's raw Input Channel checkboxes stay silent rather than the app failing to start. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
         android:label="HDS Backend Test"

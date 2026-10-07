@@ -1,25 +1,27 @@
-// hds_clap_recording_draw.c: the Recording tab -- standalone-app-only, like the Sequencer tab (see
-// hds_clap_gui_draw.c's own header comment on why both are 100% standalone-only: a DAW host already
-// owns recording/sequencing for its plugins, so hds.clap has no equivalent tab at all). Covers
-// which sources to capture (the synth's own post-FX stereo output,
+// hds_clap_recording_draw.c: the Recording tab -- standalone-app/Android-only, like the Sequencer
+// tab is standalone-only (see hds_clap_gui_draw.c's own header comment: a DAW host already owns
+// recording for its plugins, so hds.clap has no equivalent tab at all). Covers which sources to
+// capture (the synth's own post-FX stereo output,
 // and/or up to RECORD_MAX_CHANNELS raw Input-device channels), Multichannel vs Stereo-Downmix, WAV
-// vs WavPack (see HDS_WAVPACK_ENABLED in hds_standalone.c) with WavPack's own Lossless/Hybrid,
+// vs WavPack (see HDS_WAVPACK_ENABLED in recording_engine.c) with WavPack's own Lossless/Hybrid,
 // Correction File, Compression Level and (Hybrid-only) target bitrate controls, an output folder,
 // and the actual Record/Stop control with a live elapsed-time/error readout.
 //
-// This file's own content is ENTIRELY wrapped in #ifdef HDS_STANDALONE_GUI_ENABLED: it reads
-// record_engine/record_gather directly (file-scope statics in hds_standalone.c, promoted from
-// locals inside main() specifically so this file could reach them -- see their own declaration
-// comment), which simply don't exist in clap_plugin.c's own translation unit at all. Still
-// #include'd unconditionally from both hosts (same convention as every other hds_clap_*_draw.c
-// file) -- in a CLAP build this whole file compiles to nothing.
+// This file's own content is ENTIRELY wrapped in #if defined(HDS_STANDALONE_GUI_ENABLED) ||
+// defined(HDS_ANDROID_GUI_ENABLED): it reads record_engine/record_gather directly (file-scope
+// statics in src/recording_engine.c, which both hds_standalone.c and hds_android.c #include --
+// see that file's own header comment), which simply don't exist in clap_plugin.c's own
+// translation unit at all. Still #include'd unconditionally from all three hosts (same convention
+// as every other hds_clap_*_draw.c file) -- in a CLAP (hds.clap/hds_fx.clap) build this whole file
+// compiles to nothing.
 //
-// #include'd by clap_plugin.c/hds_standalone.c after hds_clap_play_draw.c (needs HdsPlayKnobDrag/
-// hds_play_rect_contains) and hds_fx_gui_draw.c (needs HdsFxGuiViewState/hds_fx_gui_browser_open_folder),
-// and (in hds_standalone.c specifically) after RecordEngine/RecordGatherState/record_engine/
-// record_gather are all defined -- see hds_standalone.c's own include-order comment.
+// #include'd by clap_plugin.c/hds_standalone.c/hds_android.c after hds_clap_play_draw.c (needs
+// HdsPlayKnobDrag/hds_play_rect_contains) and hds_fx_gui_draw.c (needs HdsFxGuiViewState/
+// hds_fx_gui_browser_open_folder), and after src/recording_engine.c's own
+// RecordEngine/RecordGatherState/record_engine/record_gather are all defined -- see each
+// includer's own include-order comment.
 
-#ifdef HDS_STANDALONE_GUI_ENABLED
+#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
 
 #include <sys/stat.h> // mkdir() -- creating the output folder if it doesn't exist yet
 
@@ -348,4 +350,4 @@ static void hds_clap_recording_on_scroll(HdsClapPlugin *p, HdsClapRecordingViewS
     if (vs->scroll_offset_px > max_scroll) vs->scroll_offset_px = max_scroll;
 }
 
-#endif // HDS_STANDALONE_GUI_ENABLED
+#endif // defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)

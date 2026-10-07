@@ -286,11 +286,21 @@ it sizes itself as a fraction of that constant.
   automatically by the build) — everything else statically links.
 - **PipeWire**: auto-detected at build time via pkg-config; `make` prints
   which backend it found. Falls back to ALSA-only if PipeWire isn't present.
-- **Android**: `src/hds_android.c` + `android/` is a headless backend-only
-  test build (AAudio out, raw MIDI in via `android.media.midi`, no GUI, no
-  OSC). `tools/build_android_manual.sh` produces a real signed APK. See
-  `android/README.md` for how the SDK/NDK get fetched, what's verified,
-  and the real D8 compatibility bug it works around.
+- **Android**: `src/hds_android.c` + `android/` builds a real touchscreen
+  native GUI (the same Cairo-drawn tab bar as `hds.clap`, including the
+  Recording tab) with AAudio I/O, raw MIDI in via `android.media.midi`, no
+  OSC. Both AAudio streams (output, and a best-effort input once
+  `RECORD_AUDIO` is granted) are opened against the real device/channel
+  count a connected class-compliant USB audio interface reports — see
+  `hds_android.c`'s own "Real external audio input" section — so a
+  multichannel USB interface's inputs reach ext-in/the Recording tab's raw
+  channels, and its outputs get HDS's own multichannel routing, not a
+  stereo downmix. There's no on-screen device picker (Android routes to
+  whatever's plugged in/selected at the OS level; the Devices tab is
+  Polyphony + Block Size only here). `tools/build_android_manual.sh`
+  produces a real signed APK. See `android/README.md` for how the SDK/NDK
+  get fetched, what's verified, and the real D8 compatibility bug it works
+  around.
 
 ## Third-party code
 

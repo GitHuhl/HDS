@@ -66,7 +66,7 @@ typedef enum {
     HDS_CLAP_TAB_FX,
     HDS_CLAP_TAB_ROUTING,
     HDS_CLAP_TAB_DEVICES,
-#ifdef HDS_STANDALONE_GUI_ENABLED
+#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
     HDS_CLAP_TAB_RECORDING,
 #endif
     HDS_CLAP_TAB_COUNT
@@ -135,10 +135,13 @@ static double hds_clap_gui_tab_content_w(HdsClapPlugin *p, HdsClapTab active_tab
 // native-GUI placeholder was removed once the Play tab's per-oscillator "Load .sfz..." button made
 // it moot (see this file's own header comment); Sequencer is 100% standalone-only (the Sequencer
 // transport/lane/MIDI-playback workflow -- see clap_plugin_process()'s own comment), per explicit
-// product direction -- a DAW host already owns sequencing for its plugins. Recording is likewise
-// standalone-only (WavRecorder/the record_enable writer thread), which is why it's conditional on
-// HDS_STANDALONE_GUI_ENABLED both in the HdsClapTab enum above and the label array below, rather
-// than being excluded outright like Mapping/Sequencer.
+// product direction -- a DAW host already owns sequencing for its plugins. Recording is a plugin-
+// host exclusion too, but not a platform one: a CLAP host still owns recording for hds.clap/
+// hds_fx.clap (same reasoning as Sequencer), but Android IS one of the apps that needs it (there's
+// no host to do it instead) -- see src/recording_engine.c's own header comment. So Recording is
+// conditional on defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED) both in
+// the HdsClapTab enum above and the label array below, rather than being excluded outright like
+// Mapping/Sequencer.
 // Global is never a tab of its own, on any platform: it lives in the persistent left sidebar,
 // alongside the tab bar/content, on every tab except FX (see hds_clap_gui_sidebar_w() above and
 // this file's own header comment). hds_clap_global_render()/_on_button_press()/_on_scroll()
@@ -146,7 +149,7 @@ static double hds_clap_gui_tab_content_w(HdsClapPlugin *p, HdsClapTab active_tab
 // WHERE this file calls them changes.
 static const char *const HDS_CLAP_TAB_LABELS[HDS_CLAP_TAB_COUNT] = {
     "Play", "Filters", "LFOs", "Envelopes", "FX", "Routing", "Devices",
-#ifdef HDS_STANDALONE_GUI_ENABLED
+#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
     "Recording",
 #endif
 };
@@ -175,7 +178,7 @@ typedef struct {
     HdsClapRoutingViewState routing_view;     // same convention -- see hds_clap_routing_draw.c's own header comment
     HdsClapDevicesViewState devices_view;      // same convention -- see hds_clap_devices_draw.c's own header comment
     HdsClapGlobalViewState global_view;        // same convention -- see hds_clap_global_draw.c's own header comment
-#ifdef HDS_STANDALONE_GUI_ENABLED
+#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
     HdsClapRecordingViewState recording_view;  // same convention -- see hds_clap_recording_draw.c's own header comment (standalone-only tab)
 #endif
 } HdsClapGuiViewState;
@@ -196,7 +199,7 @@ static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
     hds_clap_routing_view_state_init(&vs->routing_view);
     hds_clap_devices_view_state_init(&vs->devices_view);
     hds_clap_global_view_state_init(&vs->global_view);
-#ifdef HDS_STANDALONE_GUI_ENABLED
+#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
     hds_clap_recording_view_state_init(&vs->recording_view);
 #endif
 }
@@ -337,7 +340,7 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
         case HDS_CLAP_TAB_DEVICES:
             hds_clap_devices_render(cr, p, &vs->devices_view, content_w, content_h);
             break;
-#ifdef HDS_STANDALONE_GUI_ENABLED
+#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
         case HDS_CLAP_TAB_RECORDING:
             hds_clap_recording_render(cr, p, &vs->recording_view, content_w, content_h);
             break;
@@ -429,7 +432,7 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
             return hds_clap_routing_on_button_press(p, &vs->routing_view, content_tab_x, content_py, button);
         case HDS_CLAP_TAB_DEVICES:
             return hds_clap_devices_on_button_press(p, &vs->devices_view, content_h, content_tab_x, content_py, button);
-#ifdef HDS_STANDALONE_GUI_ENABLED
+#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
         case HDS_CLAP_TAB_RECORDING:
             return hds_clap_recording_on_button_press(p, &vs->recording_view, &vs->fx_view, content_tab_x, content_py, button);
 #endif
@@ -466,7 +469,7 @@ static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_motion(p, &vs->envelopes_view, content_w, content_tab_x, content_py);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_motion(&vs->routing_view, content_tab_x, content_py);
     else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_motion(&vs->devices_view, content_tab_x, content_py);
-#ifdef HDS_STANDALONE_GUI_ENABLED
+#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
     else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_motion(&vs->recording_view, content_tab_x, content_py);
 #endif
 }
@@ -481,7 +484,7 @@ static void hds_clap_gui_on_button_release(HdsClapPlugin *p, HdsClapGuiViewState
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_button_release(&vs->envelopes_view);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_button_release(&vs->routing_view);
     else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_button_release(&vs->devices_view);
-#ifdef HDS_STANDALONE_GUI_ENABLED
+#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
     else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_button_release(&vs->recording_view);
 #endif
 }
@@ -513,7 +516,7 @@ static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_scroll(&vs->lfos_view, content_h, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_scroll(&vs->envelopes_view, content_h, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_scroll(&vs->routing_view, content_h, delta);
-#ifdef HDS_STANDALONE_GUI_ENABLED
+#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
     else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_scroll(p, &vs->recording_view, content_h, delta);
 #endif
 }

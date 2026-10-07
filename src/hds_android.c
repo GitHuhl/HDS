@@ -19,6 +19,16 @@
 // falls back to when no capture device is open).
 #include "backend.c"
 
+// WAV/WavPack recording engine (RecordRing/WavRecorder/WavPackRecorder/RecordEngine/
+// RecordGatherState, the writer thread, record_engine/record_gather themselves) -- shared
+// verbatim with hds_standalone.c, see that file's own include-site comment. HDS_WAVPACK_ENABLED is
+// never defined in this translation unit (no wavpack cross-build for the NDK yet -- see
+// CMakeLists.txt), so the preprocessor's "undefined == 0" rule alone selects recording_engine.c's
+// WavPack STUB automatically; nothing here needs to say so explicitly. This file's own Recording
+// section (further down, in the AAudio callback) drives record_engine/record_gather the same way
+// hds_standalone.c's main loop does.
+#include "recording_engine.c"
+
 #include <jni.h>
 #include <aaudio/AAudio.h>
 #include <android/log.h>
@@ -55,10 +65,11 @@
 #include "hds_clap_routing_draw.c"
 #include "hds_clap_devices_draw.c"
 #include "hds_clap_global_draw.c"
-// Compiles to nothing (HDS_STANDALONE_GUI_ENABLED is never defined here) but still #include'd
-// unconditionally, same convention clap_plugin.c/hds_standalone.c both already use -- see each
-// file's own identical comment: hds_clap_gui_draw.c's own HDS_CLAP_TAB_RECORDING dispatch needs
-// its types declared regardless.
+// Now a REAL tab here, not a no-op include: hds_clap_recording_draw.c's own guard is
+// defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED) (see that file's own
+// header comment), and record_engine/record_gather/RecordEngine/RecordGatherState are already
+// defined above via src/recording_engine.c -- this file's own Recording section (further down,
+// in the AAudio callback) drives them exactly like hds_standalone.c's main loop does.
 #include "hds_clap_recording_draw.c"
 #include "hds_clap_gui_draw.c"
 #include "hds_android_gui.c"
@@ -98,14 +109,92 @@ static SynthVoice g_voices[MAX_VOICES];
 static float g_global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT];
 static MonoNoteStack g_mono_stacks[COMBI_PROGRAM_COUNT + 1];
 static MidiLiveState g_midi_live;
-// Fed to render_audio_block as a permanently-silent 2-channel "external input" -- same fallback
-// hds_standalone.c's own capture_buffer uses when no capture device is open, just permanent here
-// since this build never opens one. Sized to the hard per-block ceiling, same convention as that
-// file's own capture_buffer/buffer statics.
-static float g_ext_in_silence[BUFFER_SIZE * 2];
+// -----------------------------------------------------------------------------------------------
+// Real external audio input (mic / USB class-compliant interface) -- a second, independent AAudio
+// INPUT stream feeding a lock-free ring, read by the OUTPUT callback right before
+// render_audio_block(), same SPSC-ring idiom as the MIDI ring above (two AAudio callbacks run on
+// their own independent threads/timing, exactly like the MIDI Binder thread does relative to the
+// audio callback -- no lock may ever sit between them). The SAME captured buffer this produces is
+// used both as render_audio_block's own `ext_in_buffer` (so FX ext-in sources/the Routing tab's
+// External Input source actually receive real audio) and as the Recording engine's own
+// `capture_buffer` (so raw Input Channel checkboxes on the Recording tab capture something real) --
+// exactly the dual-use relationship hds_standalone.c's own capture_buffer already has (see
+// recording_engine.c's own wav_recorder_gather_block comment).
+//
+// Channel count is NOT hardcoded to 2: both this stream and the output stream below are opened
+// against whatever channel count MainActivity.java's own AudioManager.getDevices() enumeration
+// found for the chosen device (preferring a class-compliant USB interface's real channel count
+// over the built-in mic/speaker's usual stereo-or-mono), capped at RECORD_MAX_CHANNELS/
+// OUTPUT_MAX_CHANNELS -- the same multichannel ceiling the desktop build's own Routing tab already
+// exposes. A USB interface with, say, 8 real inputs is therefore a genuine 8-channel ext-in/
+// Recording-tab source here, not silently downmixed to stereo.
+#define HDS_ANDROID_INPUT_RING_CAPACITY (1 << 17) // power-of-two, interleaved floats across however many channels are actually open -- generous jitter headroom (~170ms at 16ch/48kHz) between the two independent AAudio callback threads, see this section's own header comment
+typedef struct {
+    float data[HDS_ANDROID_INPUT_RING_CAPACITY];
+    _Atomic size_t write_idx; // only ever written by the input callback thread (producer)
+    _Atomic size_t read_idx;  // only ever written by the output callback thread (consumer)
+} HdsAndroidInputRing;
+static HdsAndroidInputRing g_input_ring;
 
-static AAudioStream *g_stream = NULL;
+// Wait-free push (producer: input callback thread) -- drops the newest samples rather than
+// blocking or overwriting unread ones if the ring is ever full (same tradeoff RecordRing makes:
+// losing a moment of ext-in audio is far preferable to stalling either realtime callback).
+static void hds_android_input_ring_push(const float *data, size_t n) {
+    size_t w = atomic_load_explicit(&g_input_ring.write_idx, memory_order_relaxed);
+    size_t r = atomic_load_explicit(&g_input_ring.read_idx, memory_order_acquire);
+    size_t free_space = HDS_ANDROID_INPUT_RING_CAPACITY - (w - r);
+    if (n > free_space) return;
+    for (size_t i = 0; i < n; i++) g_input_ring.data[(w + i) & (HDS_ANDROID_INPUT_RING_CAPACITY - 1)] = data[i];
+    atomic_store_explicit(&g_input_ring.write_idx, w + n, memory_order_release);
+}
+
+// Wait-free pop (consumer: output callback thread). Returns how many floats were actually
+// available (never blocks) -- the caller zero-fills whatever's short, same "silence, never
+// garbage, on underrun" posture as the output callback's own numFrames>frames_to_render fallback.
+static size_t hds_android_input_ring_pop(float *out, size_t max_n) {
+    size_t r = atomic_load_explicit(&g_input_ring.read_idx, memory_order_relaxed);
+    size_t w = atomic_load_explicit(&g_input_ring.write_idx, memory_order_acquire);
+    size_t n = (w - r) < max_n ? (w - r) : max_n;
+    for (size_t i = 0; i < n; i++) out[i] = g_input_ring.data[(r + i) & (HDS_ANDROID_INPUT_RING_CAPACITY - 1)];
+    atomic_store_explicit(&g_input_ring.read_idx, r + n, memory_order_release);
+    return n;
+}
+
+// Popped into every output callback, then handed to render_audio_block as ext_in_buffer AND to
+// wav_recorder_gather_block as capture_buffer -- see this section's own header comment. Sized to
+// the hard per-block ceiling at the hard channel ceiling, same convention as RecordRing's own
+// pop_buf/frame_buf statics. Zero-filled up front; only ever partially overwritten by an actual
+// pop (see hds_android_audio_callback's own zero-fill-the-shortfall comment), so a channel count of
+// 0 (no input stream open at all -- no permission, or still mid-permission-request) or a
+// momentary ring underrun both degrade to silence, never garbage, exactly like g_ext_in_silence
+// used to be used unconditionally before this real input path existed.
+static float g_ext_in_captured[BUFFER_SIZE * RECORD_MAX_CHANNELS];
+
+static AAudioStream *g_stream = NULL;       // output (always opened)
+static AAudioStream *g_input_stream = NULL; // input (best-effort -- NULL if never opened: no RECORD_AUDIO permission yet, or the open itself failed)
+static int g_input_channels = 0;            // the INPUT stream's own real, AAudio-granted channel count -- 0 whenever g_input_stream is NULL
+static int g_output_channels = 2;           // the OUTPUT stream's own real, AAudio-granted channel count -- defaults to 2 until nativeInit() actually opens the stream and reads back the true value
+// Requested device id/channel count, set by nativeConfigureAudio() (called from MainActivity.java
+// BEFORE nativeInit() -- see that file's own AudioManager.getDevices() enumeration) and consumed
+// by hds_android_try_open_output()/hds_android_try_open_input() below. AAUDIO_UNSPECIFIED (0) for
+// either id means "let AAudio/the OS pick the current default route," same as this file's own
+// pre-existing behavior entirely lacked any opinion of its own.
+static int32_t g_requested_input_device_id = AAUDIO_UNSPECIFIED;
+static int32_t g_requested_input_channels = 2;
+static int32_t g_requested_output_device_id = AAUDIO_UNSPECIFIED;
+static int32_t g_requested_output_channels = 2;
+
 static bool g_engine_initialized = false;
+
+// Recording engine lifecycle/edge-detection state -- mirrors hds_standalone.c's own main()-local
+// variables of the identical names exactly (see that file's own Recording section), just promoted
+// to file scope here since this file has no single top-level loop to declare them in: the AAudio
+// output callback IS the per-block loop, called repeatedly by AAudio itself rather than written as
+// one here.
+static bool record_writer_thread_ok = false;
+static bool applied_record_enable = false;
+static int recorder_input_channels_at_start = 0;
+static uint64_t record_last_reported_drops = 0;
 
 static void hds_android_engine_init(void) {
     if (g_engine_initialized) return;
@@ -117,7 +206,13 @@ static void hds_android_engine_init(void) {
     memset(g_fx_gr_db, 0, sizeof(g_fx_gr_db));
     memset(g_fx_dump_avail_sec, 0, sizeof(g_fx_dump_avail_sec));
     memset(g_ext_in_peak, 0, sizeof(g_ext_in_peak));
-    memset(g_ext_in_silence, 0, sizeof(g_ext_in_silence));
+    memset(g_ext_in_captured, 0, sizeof(g_ext_in_captured));
+    // Starts the SAME dedicated recording writer thread hds_standalone.c's own main() starts --
+    // see recording_engine.c's own record_writer_thread_main comment. Started once, here, rather
+    // than lazily on the first record_enable edge, so a start request the very first callback
+    // already sees (unlikely, but no reason to race it) always has a thread ready to receive it.
+    record_writer_thread_ok = (pthread_create(&record_engine.thread, NULL, record_writer_thread_main, &record_engine) == 0);
+    if (!record_writer_thread_ok) HDS_LOGW("recording writer thread failed to start -- Recording tab will report start_failed");
 #if defined(HDS_ANDROID_GUI_ENABLED)
     // Wires the HdsFxGuiHost view onto this process's own real fx[] -- mirrors
     // hds_standalone.c's own main()/clap_factory_create_plugin()'s identical lines exactly (see
@@ -277,10 +372,24 @@ static void hds_android_feed_midi_bytes(const unsigned char *data, int length) {
 }
 
 // -----------------------------------------------------------------------------------------------
+// AAudio input (mic / USB interface) -- opened best-effort (see nativeOpenAudioInput below); this
+// callback's only job is to push whatever AAudio handed it into the SPSC ring, as fast and as
+// simply as possible (no engine call of any kind happens on this thread -- see this file's own
+// "Real external audio input" section header comment for why the two streams never share more
+// than that ring).
+static aaudio_data_callback_result_t hds_android_audio_input_callback(
+    AAudioStream *stream, void *userData, void *audioData, int32_t numFrames) {
+    (void)stream; (void)userData;
+    hds_android_input_ring_push((const float *)audioData, (size_t)numFrames * (size_t)g_input_channels);
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+// -----------------------------------------------------------------------------------------------
 // AAudio output. Renders directly into the buffer AAudio itself hands this callback -- no Bitmap,
 // no Java-side copy, no intermediate buffer of this file's own; see this file's own header comment
-// for why that matters. audioData is already PCM_FLOAT, already interleaved stereo, because that's
-// exactly what the stream was opened as below.
+// for why that matters. audioData is already PCM_FLOAT, already interleaved at whatever channel
+// count the stream was opened with (g_output_channels) -- a class-compliant multichannel USB
+// interface gets every one of its own real output channels here, not a stereo downmix.
 static long g_callback_count = 0; // diagnostic only -- paces the xrun log below to roughly once/sec
 
 static aaudio_data_callback_result_t hds_android_audio_callback(
@@ -291,14 +400,86 @@ static aaudio_data_callback_result_t hds_android_audio_callback(
     int frames_to_render = numFrames;
     if (frames_to_render > BUFFER_SIZE) frames_to_render = BUFFER_SIZE; // render_audio_block's own hard ceiling (effective_block_size() clamps to this)
     g_knobs.block_size_frames = (float)frames_to_render;
+
+    // Pop this block's worth of real captured input (mic/USB) out of the ring -- see this file's
+    // own "Real external audio input" section header comment. Zero-filled up front so a channel
+    // count of 0 (no input stream open) or a momentary ring underrun (startup, or the input
+    // thread's callback briefly lagging the output one) both degrade to silence, never garbage,
+    // for whatever the pop came up short on.
+    memset(g_ext_in_captured, 0, sizeof(g_ext_in_captured));
+    if (g_input_channels > 0) {
+        hds_android_input_ring_pop(g_ext_in_captured, (size_t)frames_to_render * (size_t)g_input_channels);
+    }
+
     render_audio_block(&g_sample_engine, &g_engine, g_voices, &g_knobs, g_global_lfo_phases,
-                        g_ext_in_silence, 2, 2, &g_midi_live, out, 120.0f,
+                        g_ext_in_captured, g_input_channels, g_output_channels, &g_midi_live, out, 120.0f,
                         g_ext_in_peak, NULL, g_fx_gr_db, g_fx_dump_avail_sec);
+
+    // --- Recording (Recording tab) ---
+    // Edge-triggered start/stop on record_enable, exactly like hds_standalone.c's own main loop
+    // (see recording_engine.c's own header comment for why this logic is platform-specific glue,
+    // not part of the shared engine file). A mid-take input-channel-count change (unplugging a USB
+    // interface, or the RECORD_AUDIO permission being granted/revoked) desyncs capture_buffer's
+    // stride from what the open file committed to -- same safety stop hds_standalone.c's own
+    // detected_input_channels check performs.
+    if (record_gather.active && g_input_channels != recorder_input_channels_at_start) {
+        HDS_LOGW("input channel count changed mid-recording -- stopping for safety");
+        atomic_store_explicit(&record_engine.command, RECORD_CMD_STOP, memory_order_release);
+        record_gather.active = false;
+    }
+    bool want_recording = record_writer_thread_ok && g_knobs.record_enable != 0.0f;
+    if (want_recording && !applied_record_enable) {
+        bool sel_include_synth_output = g_knobs.record_include_synth_output != 0.0f;
+        bool sel_downmix_stereo = g_knobs.record_downmix_stereo != 0.0f;
+        bool sel_input_channel[RECORD_MAX_CHANNELS];
+        for (int c = 0; c < RECORD_MAX_CHANNELS; c++) sel_input_channel[c] = (c < g_input_channels) && (g_knobs.record_input_channel_enable[c] != 0.0f);
+        int channels = wav_recorder_compute_channels(sel_include_synth_output, sel_downmix_stereo, sel_input_channel, g_input_channels);
+
+        if (channels <= 0) {
+            HDS_LOGW("record: cannot start -- no channels selected");
+            atomic_store_explicit(&record_engine.start_failed, true, memory_order_relaxed);
+        } else {
+            snprintf(record_engine.cmd_path, sizeof(record_engine.cmd_path), "%s", g_knobs.record_path);
+            record_engine.cmd_include_synth_output = sel_include_synth_output;
+            record_engine.cmd_downmix_stereo = sel_downmix_stereo;
+            record_engine.cmd_input_channel_count = g_input_channels;
+            record_engine.cmd_record_format = (int)g_knobs.record_format;
+            record_engine.cmd_wavpack_hybrid = g_knobs.record_wavpack_hybrid != 0.0f;
+            record_engine.cmd_wavpack_correction_file = g_knobs.record_wavpack_correction_file != 0.0f;
+            record_engine.cmd_wavpack_hybrid_bitrate = g_knobs.record_wavpack_hybrid_bitrate;
+            record_engine.cmd_wavpack_compression_level = (int)g_knobs.record_wavpack_compression_level;
+            for (int c = 0; c < RECORD_MAX_CHANNELS; c++) record_engine.cmd_input_channel_enable[c] = sel_input_channel[c];
+
+            record_gather.sel_include_synth_output = sel_include_synth_output;
+            record_gather.sel_downmix_stereo = sel_downmix_stereo;
+            record_gather.sel_input_channel_count = g_input_channels;
+            for (int c = 0; c < RECORD_MAX_CHANNELS; c++) record_gather.sel_input_channel[c] = sel_input_channel[c];
+            record_gather.channels = channels;
+            record_gather.active = true;
+            recorder_input_channels_at_start = g_input_channels;
+
+            atomic_store_explicit(&record_engine.start_failed, false, memory_order_relaxed);
+            atomic_store_explicit(&record_engine.command, RECORD_CMD_START, memory_order_release);
+            HDS_LOGI("record: start requested '%s', %d channel(s)%s", g_knobs.record_path, channels, sel_downmix_stereo ? " (downmixed)" : "");
+        }
+    } else if (!want_recording && applied_record_enable) {
+        atomic_store_explicit(&record_engine.command, RECORD_CMD_STOP, memory_order_release);
+        record_gather.active = false;
+    }
+    applied_record_enable = want_recording;
+    if (record_gather.active) wav_recorder_gather_block(&record_gather, &record_engine, out, g_output_channels, g_ext_in_captured, frames_to_render);
+
+    uint64_t record_dropped_now = atomic_load_explicit(&record_engine.ring.dropped_samples, memory_order_relaxed);
+    if (record_dropped_now != record_last_reported_drops) {
+        HDS_LOGW("record: writer thread falling behind -- %llu sample(s) dropped so far", (unsigned long long)record_dropped_now);
+        record_last_reported_drops = record_dropped_now;
+    }
+
     if (numFrames > frames_to_render) {
         // AAudio asked for more than render_audio_block's hard per-block ceiling can produce in one
         // call (shouldn't happen at any realistic buffer size, but silence, never garbage, for the
         // remainder if it ever does).
-        memset(out + (size_t)frames_to_render * 2, 0, (size_t)(numFrames - frames_to_render) * 2 * sizeof(float));
+        memset(out + (size_t)frames_to_render * (size_t)g_output_channels, 0, (size_t)(numFrames - frames_to_render) * (size_t)g_output_channels * sizeof(float));
     }
     // Diagnostic only, paced to ~once/sec (not every callback -- logging itself isn't free and
     // this runs on the realtime thread): AAudioStream_getXRunCount() is a real, cheap, always-
@@ -316,31 +497,118 @@ static aaudio_data_callback_result_t hds_android_audio_callback(
 }
 
 // -----------------------------------------------------------------------------------------------
-// JNI entry points. Package/class match MainActivity.kt's own `NativeBridge` object -- see
-// android/app/src/main/java/.../NativeBridge.kt.
+// JNI entry points. Package/class match MainActivity.java's own `NativeBridge` class -- see
+// android/app/src/main/java/.../NativeBridge.java.
 
-// Builds and opens a SHARED stream. Previously tried AAUDIO_SHARING_MODE_EXCLUSIVE first (the
-// real dedicated-hardware path, in principle lower latency and more glitch-resistant than
-// SHARED) -- reverted after real on-device testing made things WORSE, not better: dropouts went
-// from "only under heavy chords" to "constantly," which points at EXCLUSIVE landing on a worse
-// HAL path on that device than AudioFlinger's own SHARED mixer, not at anything this file's own
-// code got wrong. SHARED is the one that was actually confirmed working (modulo the chord-stutter
-// bug fixed elsewhere in this file); EXCLUSIVE is not worth the risk for a build whose whole
-// point is proving basic correctness, not chasing the lowest possible latency.
-static aaudio_result_t hds_android_try_open(AAudioStream **out_stream) {
+// Builds and opens a SHARED OUTPUT stream against `device_id` (AAUDIO_UNSPECIFIED lets AAudio/the
+// OS pick the current default route) at `channel_count` real channels. Previously tried
+// AAUDIO_SHARING_MODE_EXCLUSIVE first (the real dedicated-hardware path, in principle lower
+// latency and more glitch-resistant than SHARED) -- reverted after real on-device testing made
+// things WORSE, not better: dropouts went from "only under heavy chords" to "constantly," which
+// points at EXCLUSIVE landing on a worse HAL path on that device than AudioFlinger's own SHARED
+// mixer, not at anything this file's own code got wrong. SHARED is the one that was actually
+// confirmed working (modulo the chord-stutter bug fixed elsewhere in this file); EXCLUSIVE is not
+// worth the risk for a build whose whole point is proving basic correctness, not chasing the
+// lowest possible latency.
+//
+// On failure, retries ONCE with AAUDIO_UNSPECIFIED device id/channel count (the OS's own default
+// route/count) -- output must never silently fail to open just because a specifically-requested
+// multichannel USB device didn't grant LOW_LATENCY/that exact channel count on a given phone; a
+// stereo default route is far preferable to no sound at all.
+static aaudio_result_t hds_android_try_open_output(AAudioStream **out_stream, int32_t device_id, int32_t channel_count) {
     AAudioStreamBuilder *builder = NULL;
     aaudio_result_t result = AAudio_createStreamBuilder(&builder);
     if (result != AAUDIO_OK) return result;
+    AAudioStreamBuilder_setDeviceId(builder, device_id);
     AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
     AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
-    AAudioStreamBuilder_setChannelCount(builder, 2);
+    AAudioStreamBuilder_setChannelCount(builder, channel_count);
     AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE);
     AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setDataCallback(builder, hds_android_audio_callback, NULL);
     result = AAudioStreamBuilder_openStream(builder, out_stream);
     AAudioStreamBuilder_delete(builder);
+    if (result != AAUDIO_OK && (device_id != AAUDIO_UNSPECIFIED || channel_count != AAUDIO_UNSPECIFIED)) {
+        HDS_LOGW("output open failed for device=%d channels=%d (result=%d) -- retrying with the OS default route",
+                 (int)device_id, (int)channel_count, (int)result);
+        return hds_android_try_open_output(out_stream, AAUDIO_UNSPECIFIED, AAUDIO_UNSPECIFIED);
+    }
     return result;
+}
+
+// Builds and opens a SHARED INPUT stream, same device/channel-count posture as output above --
+// but best-effort, never retried: a failure here (most commonly RECORD_AUDIO not granted yet)
+// just means ext-in/Recording-tab raw channels stay silent, never that the app can't run at all.
+static aaudio_result_t hds_android_try_open_input(AAudioStream **out_stream, int32_t device_id, int32_t channel_count) {
+    AAudioStreamBuilder *builder = NULL;
+    aaudio_result_t result = AAudio_createStreamBuilder(&builder);
+    if (result != AAUDIO_OK) return result;
+    AAudioStreamBuilder_setDeviceId(builder, device_id);
+    AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_INPUT);
+    AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
+    AAudioStreamBuilder_setChannelCount(builder, channel_count);
+    AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE);
+    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+    AAudioStreamBuilder_setDataCallback(builder, hds_android_audio_input_callback, NULL);
+    result = AAudioStreamBuilder_openStream(builder, out_stream);
+    AAudioStreamBuilder_delete(builder);
+    return result;
+}
+
+// Called from MainActivity.java's own AudioManager.getDevices() enumeration, BEFORE nativeInit()
+// -- stores which device id/channel count nativeInit() should open the OUTPUT stream against, and
+// which hds_android_gui_... no, which nativeOpenAudioInput() below should use for the INPUT
+// stream. Harmless to call more than once (e.g. if a device is hot-plugged later and Java
+// re-enumerates) -- just updates these globals; an already-open stream isn't itself reopened by
+// this call alone (see nativeOpenAudioInput's own comment on retrying).
+JNIEXPORT void JNICALL
+Java_com_hds_androidtest_NativeBridge_nativeConfigureAudio(JNIEnv *env, jobject thiz,
+    jint inputDeviceId, jint inputChannels, jint outputDeviceId, jint outputChannels) {
+    (void)env; (void)thiz;
+    g_requested_input_device_id = (int32_t)inputDeviceId;
+    g_requested_input_channels = (inputChannels > 0) ? (int32_t)inputChannels : 2;
+    if (g_requested_input_channels > RECORD_MAX_CHANNELS) g_requested_input_channels = RECORD_MAX_CHANNELS;
+    g_requested_output_device_id = (int32_t)outputDeviceId;
+    g_requested_output_channels = (outputChannels > 0) ? (int32_t)outputChannels : 2;
+    if (g_requested_output_channels > OUTPUT_MAX_CHANNELS) g_requested_output_channels = OUTPUT_MAX_CHANNELS;
+    HDS_LOGI("configured: input device=%d channels=%d, output device=%d channels=%d",
+             (int)g_requested_input_device_id, (int)g_requested_input_channels,
+             (int)g_requested_output_device_id, (int)g_requested_output_channels);
+}
+
+// Opens the INPUT stream against whatever nativeConfigureAudio() last stored, reading back
+// AAudioStream_getChannelCount()'s own real granted value into g_input_channels (which is what
+// gates every use of g_input_ring/g_ext_in_captured elsewhere in this file -- see this file's own
+// "Real external audio input" section). Called opportunistically from nativeInit() (in case
+// RECORD_AUDIO was already granted from a previous run) AND from MainActivity.java's own
+// onRequestPermissionsResult once the user actually grants it this run -- a no-op (returns true
+// immediately) if a stream is already open, so calling it twice is always safe.
+JNIEXPORT jboolean JNICALL
+Java_com_hds_androidtest_NativeBridge_nativeOpenAudioInput(JNIEnv *env, jobject thiz) {
+    (void)env; (void)thiz;
+    if (g_input_stream != NULL) return JNI_TRUE;
+
+    aaudio_result_t result = hds_android_try_open_input(&g_input_stream, g_requested_input_device_id, g_requested_input_channels);
+    if (result != AAUDIO_OK || g_input_stream == NULL) {
+        // Expected and harmless before RECORD_AUDIO is granted -- not logged as a warning the
+        // first time (every cold start hits this before the permission dialog resolves), just
+        // info: ext-in/Recording-tab raw channels stay silent until a later call succeeds.
+        HDS_LOGI("input stream not open yet (result=%d) -- RECORD_AUDIO not granted, or no input device available", (int)result);
+        g_input_stream = NULL;
+        g_input_channels = 0;
+        return JNI_FALSE;
+    }
+    g_input_channels = AAudioStream_getChannelCount(g_input_stream);
+    if (AAudioStream_requestStart(g_input_stream) != AAUDIO_OK) {
+        AAudioStream_close(g_input_stream);
+        g_input_stream = NULL;
+        g_input_channels = 0;
+        return JNI_FALSE;
+    }
+    HDS_LOGI("input stream opened: %d channel(s)", g_input_channels);
+    return JNI_TRUE;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -348,11 +616,17 @@ Java_com_hds_androidtest_NativeBridge_nativeInit(JNIEnv *env, jobject thiz) {
     (void)env; (void)thiz;
     hds_android_engine_init();
 
-    aaudio_result_t result = hds_android_try_open(&g_stream);
+    aaudio_result_t result = hds_android_try_open_output(&g_stream, g_requested_output_device_id, g_requested_output_channels);
     if (result != AAUDIO_OK || g_stream == NULL) {
-        HDS_LOGW("SHARED open failed (result=%d)", (int)result);
+        HDS_LOGW("SHARED output open failed (result=%d)", (int)result);
         return JNI_FALSE;
     }
+    // The real, AAudio-granted channel count -- may differ from what was requested (a device can
+    // decline a specific count), so every subsequent render_audio_block/interleave call in the
+    // output callback reads THIS back, never the request. See hds_android_try_open_output()'s own
+    // comment on why open() itself still never fails outright over a channel-count mismatch (it
+    // falls back to the OS default route/count instead).
+    g_output_channels = AAudioStream_getChannelCount(g_stream);
 
     // Maximize buffer headroom rather than picking a specific multiplier -- a previous version of
     // this code set a fixed 2x framesPerBurst, confirmed on real hardware to make dropouts WORSE
@@ -368,15 +642,21 @@ Java_com_hds_androidtest_NativeBridge_nativeInit(JNIEnv *env, jobject thiz) {
     int32_t frames_per_burst = AAudioStream_getFramesPerBurst(g_stream);
     int32_t buffer_capacity = AAudioStream_getBufferCapacityInFrames(g_stream);
     int32_t actual_buffer_frames = AAudioStream_setBufferSizeInFrames(g_stream, buffer_capacity);
-    HDS_LOGI("opened: sharing=%d performance=%d framesPerBurst=%d bufferCapacity=%d bufferFrames=%d",
+    HDS_LOGI("opened: sharing=%d performance=%d channels=%d framesPerBurst=%d bufferCapacity=%d bufferFrames=%d",
              (int)AAudioStream_getSharingMode(g_stream), (int)AAudioStream_getPerformanceMode(g_stream),
-             (int)frames_per_burst, (int)buffer_capacity, (int)actual_buffer_frames);
+             (int)g_output_channels, (int)frames_per_burst, (int)buffer_capacity, (int)actual_buffer_frames);
 
     if (AAudioStream_requestStart(g_stream) != AAUDIO_OK) {
         AAudioStream_close(g_stream);
         g_stream = NULL;
         return JNI_FALSE;
     }
+
+    // Opportunistic: succeeds immediately if RECORD_AUDIO was already granted in a previous run
+    // (Android remembers the grant across launches), otherwise harmlessly no-ops until
+    // MainActivity.java's own onRequestPermissionsResult calls nativeOpenAudioInput() again once
+    // the user actually grants it this run -- see that function's own comment.
+    Java_com_hds_androidtest_NativeBridge_nativeOpenAudioInput(env, thiz);
     return JNI_TRUE;
 }
 
@@ -402,10 +682,27 @@ Java_com_hds_androidtest_NativeBridge_nativeShutdown(JNIEnv *env, jobject thiz) 
     // its own comment), so this is safe to call unconditionally here too.
     hds_android_gui_surface_destroyed();
 #endif
+    if (g_input_stream) {
+        AAudioStream_requestStop(g_input_stream);
+        AAudioStream_close(g_input_stream);
+        g_input_stream = NULL;
+        g_input_channels = 0;
+    }
     if (g_stream) {
         AAudioStream_requestStop(g_stream);
         AAudioStream_close(g_stream);
         g_stream = NULL;
+    }
+    // Flush/finalize a still-running take: signal the writer thread to stop (if a recording was
+    // active) and to exit, then join it so its final fclose actually happens before the process
+    // considers itself shut down -- same ordering as hds_standalone.c's own main() teardown (both
+    // AAudio streams are already stopped above, so nothing can still be calling into
+    // record_gather/record_engine from here on).
+    if (record_gather.active) atomic_store_explicit(&record_engine.command, RECORD_CMD_STOP, memory_order_release);
+    if (record_writer_thread_ok) {
+        atomic_store_explicit(&record_engine.shutdown, true, memory_order_release);
+        pthread_join(record_engine.thread, NULL);
+        record_writer_thread_ok = false;
     }
 }
 
