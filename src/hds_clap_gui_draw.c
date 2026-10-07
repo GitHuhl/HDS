@@ -82,6 +82,72 @@ static double hds_clap_gui_sidebar_w(HdsClapTab active_tab) {
     return (active_tab == HDS_CLAP_TAB_FX) ? 0.0 : HDS_CLAP_GLOBAL_SIDEBAR_W;
 }
 
+// Most tabs here draw at FIXED absolute pixel positions and never stretch their own content to
+// fill whatever tab_area_w they're actually given -- confirmed on a real device: correctly drawn,
+// correctly colored, but simply too small, with plain unfilled background (not a clip edge)
+// covering the rest of the screen past each tab's own fixed content, because that content was
+// never asked to grow into the extra room at all. hds_clap_gui_tab_fill_scale() below is how this
+// file (not any individual tab file -- zero changes needed there) fixes that: an ADDITIONAL
+// uniform cairo_scale() applied only around the active tab's own content (after the sidebar/
+// tab-bar/BAR_H translates, which must stay crisp and tab_area_w-wide themselves), stretching
+// that tab's own real content width to actually fill tab_area_w.
+//
+// Each width below is that tab's own ACTUAL rightmost drawn element (not a single shared "every
+// tab is 1150/1080 wide" guess -- confirmed by reading each file's own row/column layout math
+// directly, since they differ a lot: Play's 4 oscillator columns stop at ~660, LFOs' own row
+// background is an explicit 1080, Devices on CLAP/Android shows only Polyphony+Block Size at
+// ~290 -- its device/MIDI/latency pickers are HDS_STANDALONE_GUI_ENABLED-only). FX and Envelopes
+// are excluded (return tab_area_w itself, making the scale below always exactly 1.0 for them)
+// because their own layouts are already proportional -- FX's own row/column widths are computed
+// AS A FRACTION of whatever tab_area_w it's handed (see hds_fx_gui_draw.c's own row-layout
+// comment), and Envelopes' own panel_w is literally `window_w - 2*MARGIN` -- scaling either a
+// second time here would double them.
+static double hds_clap_gui_tab_content_w(HdsClapPlugin *p, HdsClapTab active_tab, double tab_area_w) {
+    switch (active_tab) {
+        case HDS_CLAP_TAB_FX:
+        case HDS_CLAP_TAB_ENVELOPES:
+            return tab_area_w;
+        case HDS_CLAP_TAB_PLAY:
+            // Combi mode is a sibling view (hds_clap_combi_draw.c) with its own, much wider,
+            // 8-lane layout (hds_combi_lane_x(7) + HDS_COMBI_LANE_W landing at ~1180) -- NOT
+            // Play's own 4-column one (HDS_PLAY_MARGIN + 4*HDS_PLAY_OSC_COL_W + 3*HDS_PLAY_OSC_GAP
+            // + a trailing margin, landing at ~660).
+            return ((int)p->knobs.performance_mode == 1) ? 1180.0 : 660.0;
+        case HDS_CLAP_TAB_FILTERS:
+            return 600.0; // per-filter row (type_pill's own right edge) and the 3-band EQ section below it land in the same ~590-600 range
+        case HDS_CLAP_TAB_LFOS:
+            return 1080.0; // HdsLfoRowLayout.row's own explicit width
+        case HDS_CLAP_TAB_ROUTING:
+#ifdef HDS_STANDALONE_GUI_ENABLED
+            return 1150.0; // standalone's own per-output-pair pill row (OUTPUT_PAIR_MAX wide) needs much more room
+#else
+            return 560.0; // CLAP/Android: a single mainout_pill + vu_bar only
+#endif
+        case HDS_CLAP_TAB_DEVICES:
+#ifdef HDS_STANDALONE_GUI_ENABLED
+            return 450.0; // standalone's own Output/Input/MIDI/Latency pickers
+#else
+            return 290.0; // CLAP/Android: Polyphony + Block Size only -- device pickers are standalone-only
+#endif
+#ifdef HDS_STANDALONE_GUI_ENABLED
+        case HDS_CLAP_TAB_RECORDING:
+            return 540.0; // folder_field + browse_btn's own right edge
+#endif
+        default:
+            return tab_area_w; // not yet individually measured -- a harmless no-stretch fallback, same as FX/Envelopes above
+    }
+}
+
+// Never shrinks below 1.0: a tab_area_w NARROWER than the fixed design width relies on that tab's
+// own existing scroll/clip machinery instead (exactly like vertical overflow already does) --
+// squeezing content down to fit would make it just as hard to hit as the dead-space problem this
+// exists to fix in the first place.
+static double hds_clap_gui_tab_fill_scale(HdsClapPlugin *p, HdsClapTab active_tab, double tab_area_w) {
+    double content_w = hds_clap_gui_tab_content_w(p, active_tab, tab_area_w);
+    double s = tab_area_w / content_w;
+    return (s > 1.0) ? s : 1.0;
+}
+
 // Mapping and Sequencer never exist here at all (not even as a placeholder tab): Mapping's own
 // native-GUI placeholder was removed once the Play tab's per-oscillator "Load .sfz..." button made
 // it moot (see this file's own header comment); Sequencer is 100% standalone-only (the Sequencer
@@ -228,6 +294,23 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
     cairo_rectangle(cr, 0, HDS_CLAP_TAB_BAR_H, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
     cairo_clip(cr);
     cairo_translate(cr, 0, HDS_CLAP_TAB_BAR_H);
+    // See hds_clap_gui_tab_fill_scale()'s own comment: stretches the active tab's own fixed
+    // ~1150-wide design to actually fill tab_area_w instead of leaving dead space past its own
+    // right edge. Always exactly 1.0 on FX (a pure no-op there). Every non-FX tab below is called
+    // with its OWN NATIVE content width/height (content_w, content_h -- i.e. "as if tab_area_w
+    // were exactly 1150 wide", which after this cairo_scale() is now true in device-pixel terms)
+    // instead of the real tab_area_w/window_h, exactly mirroring hds_clap_gui_on_button_press()'s
+    // own identical fill_scale division on the hit-test side.
+    double fill_scale = hds_clap_gui_tab_fill_scale(p, vs->active_tab, tab_area_w);
+    double content_w = hds_clap_gui_tab_content_w(p, vs->active_tab, tab_area_w);
+    double content_h = (vs->window_h - HDS_CLAP_TAB_BAR_H) / fill_scale;
+    // Scoped to its own save/restore, NOT the outer one -- the shared file browser drawn just
+    // below is sized/positioned against vs->fx_view.window_w/h (real, un-fill-scaled dimensions,
+    // set by hds_clap_gui_on_resize()) regardless of which tab opened it, so it must render in
+    // the SAME un-scaled coordinate space those dimensions assume, never through this tab's own
+    // extra zoom.
+    cairo_save(cr);
+    cairo_scale(cr, fill_scale, fill_scale);
     switch (vs->active_tab) {
         case HDS_CLAP_TAB_FX:
             hds_fx_gui_render(cr, &p->gui_host, &vs->fx_view);
@@ -240,8 +323,8 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
             // background (same "flood-fill background first" convention every tab in this GUI
             // uses), which would otherwise immediately paint over the pills.
             bool combi_mode = ((int)p->knobs.performance_mode == 1);
-            if (combi_mode) hds_clap_combi_render(cr, p, &vs->combi_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
-            else hds_clap_play_render(cr, p, &vs->play_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            if (combi_mode) hds_clap_combi_render(cr, p, &vs->combi_view, content_w, content_h);
+            else hds_clap_play_render(cr, p, &vs->play_view, content_w, content_h);
             HdsFxRect single_r, combi_r;
             hds_clap_play_mode_toggle_rects(&single_r, &combi_r);
             hds_fx_draw_pill(cr, single_r.x, single_r.y, single_r.w, single_r.h, "Single", !combi_mode, false);
@@ -249,29 +332,30 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
             break;
         }
         case HDS_CLAP_TAB_FILTERS:
-            hds_clap_filters_render(cr, p, &vs->filters_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            hds_clap_filters_render(cr, p, &vs->filters_view, content_w, content_h);
             break;
         case HDS_CLAP_TAB_LFOS:
-            hds_clap_lfos_render(cr, p, &vs->lfos_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            hds_clap_lfos_render(cr, p, &vs->lfos_view, content_w, content_h);
             break;
         case HDS_CLAP_TAB_ENVELOPES:
-            hds_clap_envelopes_render(cr, p, &vs->envelopes_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            hds_clap_envelopes_render(cr, p, &vs->envelopes_view, content_w, content_h);
             break;
         case HDS_CLAP_TAB_ROUTING:
-            hds_clap_routing_render(cr, p, &vs->routing_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            hds_clap_routing_render(cr, p, &vs->routing_view, content_w, content_h);
             break;
         case HDS_CLAP_TAB_DEVICES:
-            hds_clap_devices_render(cr, p, &vs->devices_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            hds_clap_devices_render(cr, p, &vs->devices_view, content_w, content_h);
             break;
 #ifdef HDS_STANDALONE_GUI_ENABLED
         case HDS_CLAP_TAB_RECORDING:
-            hds_clap_recording_render(cr, p, &vs->recording_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H);
+            hds_clap_recording_render(cr, p, &vs->recording_view, content_w, content_h);
             break;
 #endif
         default:
-            hds_clap_gui_render_placeholder(cr, vs->window_w, vs->window_h - HDS_CLAP_TAB_BAR_H, "Coming soon");
+            hds_clap_gui_render_placeholder(cr, content_w, content_h, "Coming soon");
             break;
     }
+    cairo_restore(cr); // closes the fill_scale save just above -- back to the un-scaled coordinate space for the browser below
     // The shared file browser (see hds_fx_gui_draw.c's own HdsFxBrowser comment) draws on top of
     // whichever tab is active, REGARDLESS of active_tab -- it's opened from the FX tab's own NAM
     // pills, but also from the Play tab's own Multisample .sfz loader and the Global sidebar's own
@@ -320,32 +404,41 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
         }
         return true; // still consumed -- clicking empty bar space is a no-op, not a click-through
     }
+    // See hds_clap_gui_tab_fill_scale()'s own comment (and hds_clap_gui_render()'s identical
+    // divide-by-fill_scale treatment, which this mirrors exactly): every non-FX tab's own content
+    // now renders stretched to fill tab_area_w, so hit-testing it has to divide back down into
+    // that tab's own NATIVE (pre-stretch) coordinate space first, or every click would land
+    // somewhere other than what the user is actually looking at under their finger.
+    double fill_scale = hds_clap_gui_tab_fill_scale(p, vs->active_tab, tab_area_w);
+    double content_w = hds_clap_gui_tab_content_w(p, vs->active_tab, tab_area_w);
+    double content_tab_x = tab_x / fill_scale;
+    double content_py = (y - HDS_CLAP_TAB_BAR_H) / fill_scale;
+    double content_h = (vs->window_h - HDS_CLAP_TAB_BAR_H) / fill_scale;
     switch (vs->active_tab) {
         case HDS_CLAP_TAB_FX:
-            return hds_fx_gui_on_button_press(&p->gui_host, &vs->fx_view, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_fx_gui_on_button_press(&p->gui_host, &vs->fx_view, tab_x, y - HDS_CLAP_TAB_BAR_H, button); // fill_scale always 1.0 here
         case HDS_CLAP_TAB_PLAY: {
             HdsFxRect single_r, combi_r;
             hds_clap_play_mode_toggle_rects(&single_r, &combi_r);
-            double py = y - HDS_CLAP_TAB_BAR_H;
-            if (hds_play_rect_contains(&single_r, tab_x, py)) { if (button == 1) p->knobs.performance_mode = 0.0f; return true; }
-            if (hds_play_rect_contains(&combi_r, tab_x, py)) { if (button == 1) p->knobs.performance_mode = 1.0f; return true; }
+            if (hds_play_rect_contains(&single_r, content_tab_x, content_py)) { if (button == 1) p->knobs.performance_mode = 0.0f; return true; }
+            if (hds_play_rect_contains(&combi_r, content_tab_x, content_py)) { if (button == 1) p->knobs.performance_mode = 1.0f; return true; }
             if ((int)p->knobs.performance_mode == 1)
-                return hds_clap_combi_on_button_press(p, &vs->combi_view, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, py, button);
-            return hds_clap_play_on_button_press(p, &vs->play_view, &vs->fx_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, py, button);
+                return hds_clap_combi_on_button_press(p, &vs->combi_view, content_h, content_tab_x, content_py, button);
+            return hds_clap_play_on_button_press(p, &vs->play_view, &vs->fx_view, content_w, content_h, content_tab_x, content_py, button);
         }
         case HDS_CLAP_TAB_FILTERS:
-            return hds_clap_filters_on_button_press(p, &vs->filters_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_filters_on_button_press(p, &vs->filters_view, content_w, content_h, content_tab_x, content_py, button);
         case HDS_CLAP_TAB_LFOS:
-            return hds_clap_lfos_on_button_press(p, &vs->lfos_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_lfos_on_button_press(p, &vs->lfos_view, content_w, content_h, content_tab_x, content_py, button);
         case HDS_CLAP_TAB_ENVELOPES:
-            return hds_clap_envelopes_on_button_press(p, &vs->envelopes_view, tab_area_w, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_envelopes_on_button_press(p, &vs->envelopes_view, content_w, content_h, content_tab_x, content_py, button);
         case HDS_CLAP_TAB_ROUTING:
-            return hds_clap_routing_on_button_press(p, &vs->routing_view, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_routing_on_button_press(p, &vs->routing_view, content_tab_x, content_py, button);
         case HDS_CLAP_TAB_DEVICES:
-            return hds_clap_devices_on_button_press(p, &vs->devices_view, vs->window_h - HDS_CLAP_TAB_BAR_H, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_devices_on_button_press(p, &vs->devices_view, content_h, content_tab_x, content_py, button);
 #ifdef HDS_STANDALONE_GUI_ENABLED
         case HDS_CLAP_TAB_RECORDING:
-            return hds_clap_recording_on_button_press(p, &vs->recording_view, &vs->fx_view, tab_x, y - HDS_CLAP_TAB_BAR_H, button);
+            return hds_clap_recording_on_button_press(p, &vs->recording_view, &vs->fx_view, content_tab_x, content_py, button);
 #endif
         default:
             return true;
@@ -363,18 +456,24 @@ static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     double sidebar_w = hds_clap_gui_sidebar_w(vs->active_tab);
     double tab_x = x - sidebar_w;
     double tab_area_w = vs->window_w - sidebar_w;
-    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_motion(&p->gui_host, &vs->fx_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
+    // See hds_clap_gui_on_button_press()'s own identical comment -- same divide-by-fill_scale
+    // treatment, kept in sync with it and with hds_clap_gui_render()'s own matching cairo_scale().
+    double fill_scale = hds_clap_gui_tab_fill_scale(p, vs->active_tab, tab_area_w);
+    double content_w = hds_clap_gui_tab_content_w(p, vs->active_tab, tab_area_w);
+    double content_tab_x = tab_x / fill_scale;
+    double content_py = (y - HDS_CLAP_TAB_BAR_H) / fill_scale;
+    if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_motion(&p->gui_host, &vs->fx_view, tab_x, y - HDS_CLAP_TAB_BAR_H); // fill_scale always 1.0 here
     else if (vs->active_tab == HDS_CLAP_TAB_PLAY) {
-        if ((int)p->knobs.performance_mode == 1) hds_clap_combi_on_motion(&vs->combi_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
-        else hds_clap_play_on_motion(p, &vs->play_view, tab_area_w, tab_x, y - HDS_CLAP_TAB_BAR_H);
+        if ((int)p->knobs.performance_mode == 1) hds_clap_combi_on_motion(&vs->combi_view, content_tab_x, content_py);
+        else hds_clap_play_on_motion(p, &vs->play_view, content_w, content_tab_x, content_py);
     }
-    else if (vs->active_tab == HDS_CLAP_TAB_FILTERS) hds_clap_filters_on_motion(&vs->filters_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
-    else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_motion(&vs->lfos_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
-    else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_motion(p, &vs->envelopes_view, tab_area_w, tab_x, y - HDS_CLAP_TAB_BAR_H);
-    else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_motion(&vs->routing_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
-    else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_motion(&vs->devices_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_FILTERS) hds_clap_filters_on_motion(&vs->filters_view, content_tab_x, content_py);
+    else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_motion(&vs->lfos_view, content_tab_x, content_py);
+    else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_motion(p, &vs->envelopes_view, content_w, content_tab_x, content_py);
+    else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_motion(&vs->routing_view, content_tab_x, content_py);
+    else if (vs->active_tab == HDS_CLAP_TAB_DEVICES) hds_clap_devices_on_motion(&vs->devices_view, content_tab_x, content_py);
 #ifdef HDS_STANDALONE_GUI_ENABLED
-    else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_motion(&vs->recording_view, tab_x, y - HDS_CLAP_TAB_BAR_H);
+    else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_motion(&vs->recording_view, content_tab_x, content_py);
 #endif
 }
 
@@ -405,14 +504,20 @@ static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
     // Hidden on the FX tab (sidebar_w == 0 there), so this naturally never matches while it's active.
     if (sidebar_w > 0.0 && x < sidebar_w) { hds_clap_global_on_scroll(p, &vs->global_view, vs->window_h, delta); return; }
     if (y < HDS_CLAP_TAB_BAR_H) return;
+    // See hds_clap_gui_on_button_press()'s own identical comment -- content_h keeps this tab's own
+    // max-scroll math in the same NATIVE (pre-fill_scale) units its content_h-vs-content-height
+    // comparison already assumes.
+    double tab_area_w = vs->window_w - sidebar_w;
+    double fill_scale = hds_clap_gui_tab_fill_scale(p, vs->active_tab, tab_area_w);
+    double content_h = (vs->window_h - HDS_CLAP_TAB_BAR_H) / fill_scale;
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_scroll(&p->gui_host, &vs->fx_view, delta);
     else if (vs->active_tab == HDS_CLAP_TAB_PLAY && (int)p->knobs.performance_mode != 1)
-        hds_clap_play_on_scroll(&vs->play_view, hds_play_program(p), vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
-    else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_scroll(&vs->lfos_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
-    else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_scroll(&vs->envelopes_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
-    else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_scroll(&vs->routing_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
+        hds_clap_play_on_scroll(&vs->play_view, hds_play_program(p), content_h, delta);
+    else if (vs->active_tab == HDS_CLAP_TAB_LFOS) hds_clap_lfos_on_scroll(&vs->lfos_view, content_h, delta);
+    else if (vs->active_tab == HDS_CLAP_TAB_ENVELOPES) hds_clap_envelopes_on_scroll(&vs->envelopes_view, content_h, delta);
+    else if (vs->active_tab == HDS_CLAP_TAB_ROUTING) hds_clap_routing_on_scroll(&vs->routing_view, content_h, delta);
 #ifdef HDS_STANDALONE_GUI_ENABLED
-    else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_scroll(p, &vs->recording_view, vs->window_h - HDS_CLAP_TAB_BAR_H, delta);
+    else if (vs->active_tab == HDS_CLAP_TAB_RECORDING) hds_clap_recording_on_scroll(p, &vs->recording_view, content_h, delta);
 #endif
 }
 

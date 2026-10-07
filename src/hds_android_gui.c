@@ -186,19 +186,7 @@ static void hds_touch_ring_push(int action, int pointer_count, float x, float y)
 // Rewriting every tab file's own layout math to be responsive would be a large, invasive change
 // to files this port's own explicit "minimal deviation" mandate (and every other platform's own
 // regression safety) argues hard against. Instead, this window's logical WIDTH is held fixed
-// forever at HDS_ANDROID_GUI_LOGICAL_W -- set to HDS_CLAP_GUI_DEFAULT_W itself (desktop's own
-// total default window width, tab content PLUS the Global sidebar alongside it -- see that
-// constant's own comment), not just the 1150 tab-content portion alone: Global is no longer its
-// own Android tab (see hds_clap_gui_draw.c's own header comment on the sidebar-everywhere-except-
-// FX revert), so the sidebar now eats real width out of THIS window on every tab but FX exactly
-// the way it already does on desktop, and the logical width budget has to include it too or every
-// non-FX tab's own fixed-pixel content gets clipped by hds_clap_gui_render()'s own tab_area_w clip
-// rect -- confirmed on a real device: with this constant left at the old 1150-only value, the
-// sidebar's own 260px bite out of that budget visibly clipped the right edge of every tab's
-// content instead of leaving genuine dead space, which read as "not scaled up enough" even though
-// the transform was already mapping the full logical width to the full real screen width. Tying
-// this to HDS_CLAP_GUI_DEFAULT_W directly (rather than a second hardcoded number) means the two
-// can never drift out of sync like this again. hds_android_gui_redraw() computes ONE scale factor
+// forever at HDS_ANDROID_GUI_LOGICAL_W, and hds_android_gui_redraw() computes ONE scale factor
 // (real buffer width / this constant) applied identically on both axes -- real on-device testing
 // showed independent-per-axis scaling visibly distorting round knobs into ellipses, and scaling
 // less on X than a width-only factor would (a phone's own landscape aspect ratio is wider than
@@ -208,7 +196,22 @@ static void hds_touch_ring_push(int action, int pointer_count, float x, float y)
 // vertically at this scale is already handled by each tab's own pre-existing scroll/clip
 // machinery, exactly as a short desktop window would be -- see
 // hds_android_gui_scroll_by_px()'s own comment for how that machinery is driven here.
-#define HDS_ANDROID_GUI_LOGICAL_W ((int)HDS_CLAP_GUI_DEFAULT_W)
+//
+// 1150 -- the tab CONTENT's own effective design width (every hds_clap_*_draw.c tab was laid out
+// and tested against exactly this, on desktop too: HDS_CLAP_GUI_DEFAULT_W's own tab_area_w is
+// 1150 once its sidebar is subtracted) -- NOT HDS_CLAP_GUI_DEFAULT_W (1150 plus the Global
+// sidebar's own 160px alongside it). A real, confirmed-on-device regression briefly used the
+// larger, sidebar-inclusive value instead: it stopped the sidebar from clipping the right edge of
+// every non-FX tab's content, but EVERY fixed-logical-unit element in the whole GUI -- every knob,
+// every hit-test radius, every pill -- got proportionally smaller to make room for it, to the
+// point knobs became difficult to drag reliably at all. Scale (hence real on-screen, real
+// hit-test size) matters far more than a clipped sidebar-adjacent sliver of content: this is the
+// same "whatever doesn't fit, scrolls/clips instead of shrinking everything to avoid it" posture
+// this file's own logical-HEIGHT handling already takes, now applied to width too. The Global
+// sidebar's own fixed 160px bite does still clip a little off the right edge of non-FX tabs at
+// this width (hds_clap_gui_render()'s own tab_area_w clip rect) -- a real, accepted, far smaller
+// cost than shrinking every control in the app to avoid it.
+#define HDS_ANDROID_GUI_LOGICAL_W 1150
 
 // -----------------------------------------------------------------------------------------------
 typedef struct {
@@ -414,6 +417,18 @@ static void hds_android_gui_scroll_by_px(HdsAndroidGuiWindow *w, double x, doubl
     HdsClapGuiViewState *vs = &w->view;
     double window_h = vs->window_h - HDS_CLAP_TAB_BAR_H;
     double sidebar_w = hds_clap_gui_sidebar_w(vs->active_tab);
+    // See hds_clap_gui_tab_fill_scale()'s own comment in hds_clap_gui_draw.c (this mirrors its
+    // render-side cairo_scale()/hit-test-side divide exactly): every non-FX tab's own scrollable
+    // content now renders stretched by this factor, so both the dragged-pixel delta and the
+    // content-height comparison it's clamped against have to be divided back down into that
+    // tab's own NATIVE (pre-stretch) units, or scrolling would drift out of sync with -- feel
+    // faster/slower than, and eventually clamp at the wrong point relative to -- what's on
+    // screen. Always exactly 1.0 for FX (a harmless no-op division) and for the sidebar branch
+    // just below (which never reads it at all -- the sidebar isn't fill-scaled, see this file's
+    // own header comment).
+    double fill_scale = hds_clap_gui_tab_fill_scale(w->plugin, vs->active_tab, vs->window_w - sidebar_w);
+    double visible_h = window_h / fill_scale; // NOT named content_h -- several cases below already declare their own content_h (that tab's own total content height, a different quantity) in their own nested scope
+    double content_delta_px = delta_px / fill_scale;
     if (sidebar_w > 0.0 && x < sidebar_w) {
         HdsClapGlobalViewState *gv = &vs->global_view;
         ProgramState *prog = hds_play_program(w->plugin);
@@ -464,14 +479,14 @@ static void hds_android_gui_scroll_by_px(HdsAndroidGuiWindow *w, double x, doubl
         case HDS_CLAP_TAB_LFOS: {
             HdsClapLfosViewState *lv = &vs->lfos_view;
             if (lv->dropdown_kind == HDS_LFO_DROPDOWN_DEST) {
-                lv->dest_scroll_px -= delta_px;
+                lv->dest_scroll_px -= content_delta_px;
                 if (lv->dest_scroll_px < 0.0) lv->dest_scroll_px = 0.0;
                 return;
             }
             double content_h = HDS_LFO_HEADER_H + LFO_COUNT * HDS_LFO_ROW_H;
-            double max_scroll = content_h - window_h;
+            double max_scroll = content_h - visible_h;
             if (max_scroll < 0.0) max_scroll = 0.0;
-            lv->scroll_offset_px -= delta_px;
+            lv->scroll_offset_px -= content_delta_px;
             if (lv->scroll_offset_px < 0.0) lv->scroll_offset_px = 0.0;
             if (lv->scroll_offset_px > max_scroll) lv->scroll_offset_px = max_scroll;
             return;
@@ -479,14 +494,14 @@ static void hds_android_gui_scroll_by_px(HdsAndroidGuiWindow *w, double x, doubl
         case HDS_CLAP_TAB_ENVELOPES: {
             HdsClapEnvelopesViewState *ev = &vs->envelopes_view;
             if (ev->dropdown_kind == HDS_ENV_DROPDOWN_DEST) {
-                ev->dest_scroll_px -= delta_px;
+                ev->dest_scroll_px -= content_delta_px;
                 if (ev->dest_scroll_px < 0.0) ev->dest_scroll_px = 0.0;
                 return;
             }
             double content_h = HDS_ENV_HEADER_H + ASSIGNABLE_EG_COUNT * HDS_ENV_PANEL_H;
-            double max_scroll = content_h - window_h;
+            double max_scroll = content_h - visible_h;
             if (max_scroll < 0.0) max_scroll = 0.0;
-            ev->scroll_offset_px -= delta_px;
+            ev->scroll_offset_px -= content_delta_px;
             if (ev->scroll_offset_px < 0.0) ev->scroll_offset_px = 0.0;
             if (ev->scroll_offset_px > max_scroll) ev->scroll_offset_px = max_scroll;
             return;
@@ -494,9 +509,9 @@ static void hds_android_gui_scroll_by_px(HdsAndroidGuiWindow *w, double x, doubl
         case HDS_CLAP_TAB_ROUTING: {
             HdsClapRoutingViewState *rv = &vs->routing_view;
             double content_h = hds_clap_routing_content_h();
-            double max_scroll = content_h - window_h;
+            double max_scroll = content_h - visible_h;
             if (max_scroll < 0.0) max_scroll = 0.0;
-            rv->scroll_offset_px -= delta_px;
+            rv->scroll_offset_px -= content_delta_px;
             if (rv->scroll_offset_px < 0.0) rv->scroll_offset_px = 0.0;
             if (rv->scroll_offset_px > max_scroll) rv->scroll_offset_px = max_scroll;
             return;
@@ -508,9 +523,9 @@ static void hds_android_gui_scroll_by_px(HdsAndroidGuiWindow *w, double x, doubl
             // guards this identically).
             if ((int)w->plugin->knobs.performance_mode == 1) return;
             HdsClapPlayViewState *pv = &vs->play_view;
-            double max_scroll = hds_play_content_h(hds_play_program(w->plugin)) - window_h;
+            double max_scroll = hds_play_content_h(hds_play_program(w->plugin)) - visible_h;
             if (max_scroll < 0.0) max_scroll = 0.0;
-            pv->scroll_offset_px -= delta_px;
+            pv->scroll_offset_px -= content_delta_px;
             if (pv->scroll_offset_px < 0.0) pv->scroll_offset_px = 0.0;
             if (pv->scroll_offset_px > max_scroll) pv->scroll_offset_px = max_scroll;
             return;
