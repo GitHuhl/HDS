@@ -243,11 +243,37 @@ typedef struct {
     // it never flips back from SCROLL to PARAM mid-sequence; the dropdown-open check is
     // evaluated fresh on every move instead, since dropdown state can only ever actually change
     // at a down event, never mid-drag.
-    enum { HDS_ANDROID_TOUCH_NONE, HDS_ANDROID_TOUCH_PARAM, HDS_ANDROID_TOUCH_SCROLL } gesture_mode;
+    //
+    // HDS_ANDROID_TOUCH_DROPDOWN_PENDING is the one exception to "down always issues
+    // on_button_press immediately": every hds_clap_*_on_button_press() in this codebase commits a
+    // dropdown-row selection (or an outside-click close) SYNCHRONOUSLY on press -- the right
+    // behavior for a mouse click, where press and release happen at the same point by definition,
+    // but wrong for a touch, where a press that LANDS on an already-open list might just as easily
+    // be the start of a drag-to-scroll. Confirmed on a real device: committing on press made an
+    // open dropdown's own list impossible to scroll with one finger at all -- the first touch
+    // always selected whatever row it landed on before any move event could turn it into a scroll.
+    // So when a touch starts over an already-open dropdown/browser, the press is DEFERRED into
+    // this mode instead of being issued -- see hds_android_touch_ring_drain_and_dispatch()'s own
+    // comment for exactly how it's resolved into either a tap (commit the deferred press, at the
+    // down position, on release) or a drag (promote to SCROLL once it moves past
+    // HDS_ANDROID_TAP_SLOP_PX from the down point, never committing a press at all). Tapping a
+    // currently-CLOSED dropdown pill to open it is NOT this case -- that press is unambiguous (a
+    // pill tap, not a list-row tap) and still commits immediately, same as any other pill/button;
+    // the very next move already scrolls the newly-opened list correctly via the plain
+    // PARAM-mode-plus-dropdown-open check below, exactly as before this mode existed.
+    enum { HDS_ANDROID_TOUCH_NONE, HDS_ANDROID_TOUCH_PARAM, HDS_ANDROID_TOUCH_SCROLL, HDS_ANDROID_TOUCH_DROPDOWN_PENDING } gesture_mode;
     // Baseline for this move's own scroll/drag delta -- set at the start of every touch sequence
     // and re-baselined whenever gesture_mode (re-)enters SCROLL (so a baseline jump at that
     // instant never itself produces a scroll delta). LOGICAL (post-un-scale) units.
     double touch_last_y;
+    // The ORIGINAL down position of the current touch sequence, logical units -- distinct from
+    // touch_last_y (which tracks the previous MOVE event, not the down event). Only meaningful
+    // while gesture_mode == HDS_ANDROID_TOUCH_DROPDOWN_PENDING: used both to measure total
+    // displacement since touch-down against HDS_ANDROID_TAP_SLOP_PX (a per-move delta against
+    // touch_last_y could never detect a slow, deliberate drag that moves well under the slop
+    // distance on every individual frame) and, if the touch never exceeds that slop before lifting,
+    // as the exact point the deferred tap finally commits at.
+    double touch_down_x, touch_down_y;
     // Leftover fractional pixels for the two scrollable widgets indexed by a plain INTEGER row
     // position rather than a continuous pixel offset (the FX tab's own file browser and
     // dropdown lists, HdsFxBrowser.scroll/HdsFxDropdown.scroll) -- see
@@ -312,6 +338,14 @@ static void hds_android_gui_swap_rb_inplace(unsigned char *bits, int32_t width, 
 // PARAM gesture was in flight (a knob being dragged, say) when a second finger landed, releases
 // it cleanly first -- exactly like lifting that one finger would have, so nothing is ever left
 // stuck mid-drag.
+// Touch slop for HDS_ANDROID_TOUCH_DROPDOWN_PENDING's own tap-vs-drag disambiguation (see that
+// mode's own comment on HdsAndroidGuiWindow.gesture_mode) -- logical pixels, measured as total
+// displacement from the touch-DOWN point, not a per-move delta. Roughly matches Android's own
+// conventional ~8dp touch slop; exact value isn't load-bearing, just needs to be comfortably
+// larger than finger jitter during a stationary tap and comfortably smaller than a deliberate
+// scroll gesture.
+#define HDS_ANDROID_TAP_SLOP_PX 10.0
+
 static void hds_android_gui_enter_scroll_mode(HdsAndroidGuiWindow *w, double logical_y) {
     if (w->gesture_mode == HDS_ANDROID_TOUCH_PARAM) {
         hds_clap_gui_on_button_release(w->plugin, &w->view);
@@ -479,24 +513,38 @@ static void hds_android_gui_scroll_by_px(HdsAndroidGuiWindow *w, double x, doubl
 // gesture_mode keeps a single continuous touch sequence from ever driving BOTH a knob and a
 // background-content scroll: it is decided once, then sticky for the rest of that sequence --
 //   - action 0 (sequence start) always arrives with pointer_count==1 (MotionEvent's own
-//     ACTION_DOWN contract) -- always enters PARAM mode and issues on_button_press (this is also
-//     what opens/closes/selects-from a dropdown in the first place, and how a single-finger tap
-//     switches tabs). Baselines touch_last_y/row_accum_px unconditionally, so the very first move
-//     afterward -- whether it turns out to drag a param or scroll a just-opened dropdown -- has a
-//     correct delta from this exact instant, not a stale one.
+//     ACTION_DOWN contract). If the touch lands over an ALREADY-open dropdown/browser (checked
+//     BEFORE issuing anything -- see hds_android_gui_dropdown_open()), the press is DEFERRED into
+//     HDS_ANDROID_TOUCH_DROPDOWN_PENDING instead of being issued immediately (see that mode's own
+//     comment on HdsAndroidGuiWindow.gesture_mode for why). Otherwise, same as always: enters
+//     PARAM mode and issues on_button_press right away (this is also what OPENS a currently-closed
+//     dropdown in the first place, and how a single-finger tap switches tabs -- unambiguous, so
+//     never deferred). Baselines touch_last_y/touch_down_x/touch_down_y/row_accum_px
+//     unconditionally either way, so the very first move afterward has a correct delta/slop
+//     origin from this exact instant, not a stale one.
 //   - action 3 (pointer count changed mid-sequence, a finger added or removed) moves to SCROLL
-//     mode the instant two or more fingers are down, however the sequence started -- and STAYS
-//     in SCROLL mode even if it drops back to one finger (lifting one of two scrolling fingers
-//     must never suddenly start dragging a knob under the remaining finger).
-//   - action 1 (move): hds_android_gui_dropdown_open() is checked FRESH on every move (unlike
-//     gesture_mode, dropdown state only ever actually changes at a down event, so this can never
-//     flicker mid-drag) -- SCROLL mode OR an open dropdown/browser both route into
-//     hds_android_gui_scroll_by_px(), continuous and smooth; PARAM mode with nothing open routes
-//     into on_motion(); never both for the same move, which is the whole point -- a scroll can
-//     never touch a param, and a param drag can never also scroll the list underneath it.
-//   - action 2 (sequence end) always calls on_button_release (itself a no-op if nothing was ever
-//     captured, e.g. a SCROLL-mode sequence -- same convention hds_standalone_gui_x11.c's own
-//     unconditional release call already relies on) and resets gesture_mode to NONE.
+//     mode the instant two or more fingers are down, however the sequence started (including from
+//     DROPDOWN_PENDING -- enter_scroll_mode()'s own release-if-PARAM check simply doesn't match,
+//     since no press was ever issued to release) -- and STAYS in SCROLL mode even if it drops back
+//     to one finger (lifting one of two scrolling fingers must never suddenly start dragging a
+//     knob under the remaining finger).
+//   - action 1 (move): DROPDOWN_PENDING measures total displacement from touch_down_x/y against
+//     HDS_ANDROID_TAP_SLOP_PX on every move; once exceeded, promotes to SCROLL (a real drag, never
+//     commits the deferred press) -- until then, does nothing at all (no scroll, no on_motion:
+//     there is genuinely no decision yet). Once not (still) PENDING, this is the same check as
+//     before: hds_android_gui_dropdown_open() is checked FRESH every move (unlike gesture_mode,
+//     dropdown state only actually changes at a down event, so this can never flicker mid-drag) --
+//     SCROLL mode OR an open dropdown/browser both route into hds_android_gui_scroll_by_px(),
+//     continuous and smooth; PARAM mode with nothing open routes into on_motion(); never both for
+//     the same move, which is the whole point -- a scroll can never touch a param, and a param
+//     drag can never also scroll the list underneath it.
+//   - action 2 (sequence end): if still DROPDOWN_PENDING (never promoted to a drag), this is a
+//     genuine tap -- NOW issues the deferred on_button_press, at the ORIGINAL down position (where
+//     the finger stayed, within slop, the whole time). Either way, always then calls
+//     on_button_release (itself a no-op if nothing was ever captured, e.g. a SCROLL-mode sequence
+//     or a PENDING one that got its deferred press just above -- same convention
+//     hds_standalone_gui_x11.c's own unconditional release call already relies on) and resets
+//     gesture_mode to NONE.
 static void hds_android_touch_ring_drain_and_dispatch(HdsAndroidGuiWindow *w) {
     unsigned int tail = atomic_load_explicit(&g_touch_ring_tail, memory_order_relaxed);
     unsigned int head = atomic_load_explicit(&g_touch_ring_head, memory_order_acquire);
@@ -505,14 +553,29 @@ static void hds_android_touch_ring_drain_and_dispatch(HdsAndroidGuiWindow *w) {
         double x = (double)ev.x / w->scale;
         double y = (double)ev.y / w->scale;
         if (ev.action == 0) { // sequence start, always one finger
-            w->gesture_mode = HDS_ANDROID_TOUCH_PARAM;
             w->touch_last_y = y;
+            w->touch_down_x = x;
+            w->touch_down_y = y;
             w->row_accum_px = 0.0;
-            hds_clap_gui_on_button_press(w->plugin, &w->view, x, y, 1);
+            if (hds_android_gui_dropdown_open(&w->view, x)) {
+                w->gesture_mode = HDS_ANDROID_TOUCH_DROPDOWN_PENDING; // defer -- could be a tap-to-select or a drag-to-scroll
+            } else {
+                w->gesture_mode = HDS_ANDROID_TOUCH_PARAM;
+                hds_clap_gui_on_button_press(w->plugin, &w->view, x, y, 1);
+            }
         } else if (ev.action == 3) { // pointer count changed mid-sequence
             if (ev.pointer_count >= 2) hds_android_gui_enter_scroll_mode(w, y);
             else if (w->gesture_mode == HDS_ANDROID_TOUCH_SCROLL) hds_android_gui_enter_scroll_mode(w, y); // still scrolling, just re-baseline
         } else if (ev.action == 1) { // move
+            if (w->gesture_mode == HDS_ANDROID_TOUCH_DROPDOWN_PENDING) {
+                double dx = x - w->touch_down_x, dy = y - w->touch_down_y;
+                if (dx * dx + dy * dy > HDS_ANDROID_TAP_SLOP_PX * HDS_ANDROID_TAP_SLOP_PX) {
+                    w->gesture_mode = HDS_ANDROID_TOUCH_SCROLL; // a real drag -- the tap never commits
+                } else {
+                    tail = (tail + 1) % HDS_TOUCH_RING_CAPACITY;
+                    continue; // still deciding -- no scroll, no motion, no touch_last_y update yet
+                }
+            }
             bool scroll_now = (w->gesture_mode == HDS_ANDROID_TOUCH_SCROLL) || hds_android_gui_dropdown_open(&w->view, x);
             if (scroll_now) {
                 // Natural/"content follows finger" convention (standard on touchscreens):
@@ -526,6 +589,9 @@ static void hds_android_touch_ring_drain_and_dispatch(HdsAndroidGuiWindow *w) {
             }
             w->touch_last_y = y;
         } else { // action 2: sequence end (last finger up, or ACTION_CANCEL)
+            if (w->gesture_mode == HDS_ANDROID_TOUCH_DROPDOWN_PENDING) {
+                hds_clap_gui_on_button_press(w->plugin, &w->view, w->touch_down_x, w->touch_down_y, 1);
+            }
             hds_clap_gui_on_button_release(w->plugin, &w->view);
             w->gesture_mode = HDS_ANDROID_TOUCH_NONE;
         }
