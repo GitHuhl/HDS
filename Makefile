@@ -355,7 +355,7 @@ $(BUILD_DIR)/fx_chain-arm64.o: $(FX_CHAIN_DEPS) | $(BUILD_DIR)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
 arm64: $(ARM64_BIN_OBJ) $(BUILD_DIR)/recording_engine-arm64.o $(BUILD_DIR)/fx_chain-arm64.o $(ARM64_NAM_OBJS)
-	$(ARM64_CXX) $(STRIPFLAGS) -o $(ARM64_BIN) $(ARM64_BIN_OBJ) $(BUILD_DIR)/recording_engine-arm64.o $(BUILD_DIR)/fx_chain-arm64.o $(ARM64_NAM_OBJS) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo
+	$(ARM64_CXX) $(STRIPFLAGS) -o $(ARM64_BIN) $(ARM64_BIN_OBJ) $(BUILD_DIR)/recording_engine-arm64.o $(BUILD_DIR)/fx_chain-arm64.o $(ARM64_NAM_OBJS) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo -lwavpack
 	mkdir -p $(ARM64_LIBDIR)
 	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
 	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_BIN)
