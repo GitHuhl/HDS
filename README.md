@@ -4,6 +4,10 @@
 feature branch cut from `main` and land via pull request. Don't push directly
 to `main`.**
 
+![HDS's native GUI, Play tab, default patch](docs/hds-play-tab.png)
+
+*The native GUI (Play tab, default patch), shown here hosted as `hds.clap`; `synth_engine --gui` draws the same interface.*
+
 A software synthesizer with a shared DSP core, distributed as three builds:
 
 - **`synth_engine`** — standalone binary. Owns real audio I/O (ALSA or
