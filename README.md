@@ -283,7 +283,10 @@ it sizes itself as a fraction of that constant.
   automatically by the build) — everything else statically links.
 - **PipeWire**: auto-detected at build time via pkg-config; `make` prints
   which backend it found. Falls back to ALSA-only if PipeWire isn't present.
-- **Android**: `src/hds_android.c` + `android/` builds a real touchscreen
+- **Android** *(experimental, unofficial — currently disabled: its SDK entries in
+  `shell.nix` and the `make android` target are commented out, so `nix-shell`
+  needs no license acceptance. Uncomment the lines marked `ANDROID DISABLED` to
+  re-enable.)*: `src/hds_android.c` + `android/` builds a real touchscreen
   native GUI (the same Cairo-drawn tab bar as `hds.clap`, including the
   Recording tab) with AAudio I/O, raw MIDI in via `android.media.midi`, no
   OSC. Both AAudio streams (output, and a best-effort input once
