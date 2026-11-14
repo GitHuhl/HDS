@@ -134,7 +134,7 @@ static void hds_fx_gui_pump_events(HdsFxGuiWindow *w) {
                 break;
             case ConfigureNotify:
                 if (ev.xconfigure.width != w->view.window_w || ev.xconfigure.height != w->view.window_h) {
-                    hds_fx_gui_on_resize(&w->view, ev.xconfigure.width, ev.xconfigure.height);
+                    hds_fx_gui_on_resize(w->plugin, &w->view, ev.xconfigure.width, ev.xconfigure.height);
                     cairo_xlib_surface_set_size(w->surface, ev.xconfigure.width, ev.xconfigure.height);
                     hds_fx_gui_resize_backbuffer(w);
                 }
@@ -272,7 +272,7 @@ static bool hds_fx_gui_adjust_size(const clap_plugin_t *plugin, uint32_t *width,
 static bool hds_fx_gui_set_size(const clap_plugin_t *plugin, uint32_t width, uint32_t height) {
     HdsFxGuiWindow *w = (HdsFxGuiWindow *)hds_fx_gui_host_of(plugin)->gui_window;
     if (!w) return false;
-    hds_fx_gui_on_resize(&w->view, (int)width, (int)height);
+    hds_fx_gui_on_resize(w->plugin, &w->view, (int)width, (int)height);
     XResizeWindow(w->display, w->win, (unsigned int)w->view.window_w, (unsigned int)w->view.window_h);
     cairo_xlib_surface_set_size(w->surface, w->view.window_w, w->view.window_h);
     hds_fx_gui_resize_backbuffer(w);

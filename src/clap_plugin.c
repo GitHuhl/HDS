@@ -96,7 +96,7 @@ static void hds_clap_build_osc_dispatch_table_once(void) {
 // this plugin's own platform shim -- see each file's own header comment for why hds.clap gets its
 // own small X11 shell instead of further genericizing hds_fx_gui_x11.c (which stays exactly as
 // hds_fx.clap alone needs it).
-#include "hds_fx_gui_draw.c"
+#include "hds_fx_gui_draw.h" // FX pool GUI, compiled separately (src/hds_fx_gui_draw.c)
 // hds_clap_play_draw.c and hds_clap_filters_draw.c come BEFORE hds_clap_gui_draw.c: they define
 // HdsClapPlayViewState/HdsClapFiltersViewState, which HdsClapGuiViewState (hds_clap_gui_draw.c's
 // own view-state struct) nests exactly the same way it already nests hds_fx_gui_draw.c's own
@@ -1290,6 +1290,8 @@ static const clap_plugin_t *clap_factory_create_plugin(const clap_plugin_factory
     // header comment and this file's own comment on the struct. The four port_* pointers stay
     // NULL (calloc already guarantees this): hds.clap has no flat N-port Input/Output concept.
     p->gui_host.fx = p->knobs.fx;
+    p->gui_host.slot_count = FX_SLOT_COUNT;
+    p->gui_host.port_count = HDS_FX_PORT_COUNT;
     p->gui_host.source_count = SOURCE_COUNT;
     p->gui_host.source_label = hds_clap_source_label;
     p->gui_host.fx_gr_db = p->fx_gr_db;

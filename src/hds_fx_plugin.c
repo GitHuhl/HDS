@@ -224,7 +224,7 @@ static const clap_host_t *hds_fx_gui_clap_host_of(const clap_plugin_t *plugin) {
 // just defined above, plus FXSlotParams/FX_TYPE_*/FX_SLOT_COUNT, all already in scope from
 // fx_types.h/this file's own defines). hds_fx_gui_x11.c: the X11/XEmbed/event-pump shim, needs
 // everything hds_fx_gui_draw.c defines (HdsFxGuiViewState, hds_fx_gui_render, hds_fx_gui_on_*).
-#include "hds_fx_gui_draw.c"
+#include "hds_fx_gui_draw.h" // FX pool GUI, compiled separately (src/hds_fx_gui_draw.c)
 #ifdef _WIN32
 #include "hds_fx_gui_win32.c"
 #else
@@ -905,6 +905,8 @@ static const clap_plugin_t *hds_fx_factory_create_plugin(const clap_plugin_facto
     // header comment. gui_window starts NULL (calloc already guarantees this; explicit here only
     // for readability, matching how every other flag/pointer above is left to calloc's zero-init).
     p->gui_host.fx = p->fx;
+    p->gui_host.slot_count = FX_SLOT_COUNT;
+    p->gui_host.port_count = HDS_FX_PORT_COUNT;
     p->gui_host.port_input_stereo = p->port_input_stereo;
     p->gui_host.port_output_channel = p->port_output_channel;
     p->gui_host.port_input_off = p->port_input_off;
