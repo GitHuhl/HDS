@@ -286,10 +286,10 @@ FORCE:
 # list $(CLAP_OBJ) has below (plus src/hds_engine_instance.h and src/hds_clap_global_draw.c -- both
 # real prerequisites of $(CLAP_OBJ) too; their absence there is a pre-existing gap this same pass
 # fixes) so editing any of them triggers a rebuild here as well.
-$(BIN_OBJ): $(SRC) src/backend.c src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/sequencer.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_global_draw.c src/hds_clap_gui_draw.c src/hds_standalone_gui_x11.c | $(BUILD_DIR)
+$(BIN_OBJ): $(SRC) src/backend.c src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/sequencer.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_global_draw.c src/hds_clap_gui_draw.c src/hds_standalone_gui_x11.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -DHDS_STANDALONE_GUI_ENABLED=1 $(shell pkg-config --cflags cairo x11) -c $(SRC) -o $@
 
-$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_global_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_x11.c | $(BUILD_DIR)
+$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_global_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_x11.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(HDS_FX_CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
 $(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.h src/hds_config.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_fx_gui_x11.c src/nam_bridge.h | $(BUILD_DIR)
@@ -344,7 +344,7 @@ ARM64_BIN_OBJ := $(BUILD_DIR)/hds_standalone-arm64.o
 # hds_standalone.c itself stays plain C, compiled by $(ARM64_CC) exactly like the native
 # $(BIN_OBJ) rule above -- only the FINAL link step needs $(ARM64_CXX), to pull in libstdc++ for
 # the NAM objects linked alongside it, same reasoning as $(BIN)/clap's own rules.
-$(ARM64_BIN_OBJ): $(SRC) src/backend.c src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
+$(ARM64_BIN_OBJ): $(SRC) src/backend.c src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
 	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $(SRC) -o $@
 
@@ -478,7 +478,7 @@ WIN_CLAP_OBJ := $(BUILD_DIR)/clap_plugin-win.o
 WIN_HDS_FX_BIN := hds_fx-windows.clap
 WIN_HDS_FX_OBJ := $(BUILD_DIR)/hds_fx_plugin-win.o
 
-$(WIN_CLAP_OBJ): $(CLAP_SRC) src/backend.c src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_win32.c | $(BUILD_DIR)
+$(WIN_CLAP_OBJ): $(CLAP_SRC) src/backend.c src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_win32.c | $(BUILD_DIR)
 	$(WIN_CC) $(WIN_CFLAGS) -c $(CLAP_SRC) -o $@
 
 $(WIN_HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.h src/hds_config.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_fx_gui_win32.c src/nam_bridge.h | $(BUILD_DIR)
