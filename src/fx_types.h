@@ -6,10 +6,8 @@
 // via apply_program_eq() in backend.c -- one generic implementation, two callers). Shared between
 // backend.c (the synth's own embedded FX bus, driven over OSC) and src/hds_fx_plugin.c (the
 // standalone HDS FX CLAP plugin, driven by native CLAP params, no OSC/networking at all). Both
-// #include this header and then src/fx_chain.c (the actual run_fx_*/process_fx_chain DSP, which
-// only needs what's below plus a handful of basic defines like SAMPLE_RATE/SAMPLE_PATH_LEN/
-// FX_SLOT_COUNT that each includer already has defined by the time it gets here) -- so the exact
-// same ported effects (HT-76, Fairchild 670, LA-2A, FDNVerb, NAM, ...) run identically in both, and
+// link the same separately compiled fx_chain.o (see fx_chain.h) -- so the exact same ported effects
+// (HT-76, Fairchild 670, LA-2A, FDNVerb, NAM, ...) run identically in both, and
 // a slot's param layout is byte-for-byte interchangeable between them.
 //
 // Pure code motion out of backend.c: nothing here was rewritten, just lifted out (verbatim, own
@@ -18,6 +16,12 @@
 // hds_fx_plugin.c's own header comment for the new plugin this made possible.
 #ifndef HDS_FX_TYPES_H
 #define HDS_FX_TYPES_H
+
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "hds_config.h"
 
 // One band of a Program's post-filter 3-band EQ (see ProgramState.eq_bands[3] and
 // run_eq_band()/render_audio_block's EQ dispatch for the DSP). Band 0 = Low Shelf, band 1 = Mid
@@ -45,7 +49,7 @@ typedef struct { float b0, b1, b2, a1, a2; } EqBiquadCoeffs;
 // true identity filter algebraically (b0=a0/b1=a1/b2=a2 before normalizing falls out of the same
 // formulas at A=1), but skipped here anyway as a cheap, explicit bypass -- no trig needed at all
 // for a band a player has left flat.
-static EqBiquadCoeffs compute_eq_band_coeffs(const EqBandParams *band, int band_index) {
+static inline EqBiquadCoeffs compute_eq_band_coeffs(const EqBandParams *band, int band_index) {
     EqBiquadCoeffs c = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f }; // transparent passthrough
     float gain_db = fmaxf(-18.0f, fminf(18.0f, band->gain_db));
     if (gain_db == 0.0f) return c;

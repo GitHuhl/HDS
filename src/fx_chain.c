@@ -1,27 +1,29 @@
-// fx_chain: the FX slot bus -- every FX_TYPE_* effect's own DSP (run_fx_ensemble through
-// run_fx_fdnverb), the per-slot state lifecycle (reset_fx_engine/sync_fx_engine_types), and the
-// Series/Parallel routing dispatcher (process_fx_chain) that runs them once per sample. Split out
-// of backend.c for the same "human-manageability" reason as hds_standalone.c's own split (this is
-// roughly a third of backend.c's own line count) -- NOT for any architectural reason: every
-// function here already worked purely off FXSlotParams/FXSlotEngine/a sidechain snapshot (verified
-// by grep before this move -- zero references to SynthVoice, oscillator state, or g_engine
-// anywhere in this file), so there was nothing to untangle, just something to relocate.
+// fx_chain.c -- the FX slot bus: every FX_TYPE_* effect's DSP (run_fx_ensemble through
+// run_fx_fdnverb), the per-slot state lifecycle, and the Series/Parallel routing dispatcher
+// (process_fx_chain). Compiled once as its own object and linked into synth_engine, hds.clap and
+// hds_fx.clap; see fx_chain.h for the public interface. Slot and source counts are runtime
+// parameters, so the synth's 12-slot bus and HDS FX's 32-slot bus share this one object.
 //
-// #include'd by backend.c at the exact position this code used to occupy inline (right after
-// FXSlotEngine's own definition, before FX_TYPE_ENSEMBLE's old position) -- both real binaries
-// still see this as part of the SAME translation unit as backend.c itself, exactly like backend.c
-// is already #include'd wholesale by both hds_standalone.c and clap_plugin.c. Pure code motion:
-// no new cross-file call, nothing lost to inlining, no behavior change -- the two globals declared
-// in here (g_hardtune_held_note/g_hardtune_bend_semitones/g_hardtune_modwheel/
-// g_hardtune_channel_pressure) are read by handle_note_on/handle_note_off/dispatch_midi_event much
-// later in backend.c's own body, exactly as before this split, since this #include still lands at
-// the same point in the file relative to everything else.
-//
-// FXSlotParams/FXSlotEngine themselves, and every FX_TYPE_* enum value, stay in backend.c proper
-// (not here) -- they're part of SynthSharedControls's own layout and the OSC control table, used
-// by code far outside the FX system itself, not something this file owns.
-static void reset_fx_engine(FXSlotEngine engine[FX_SLOT_COUNT]) {
-    for (int s = 0; s < FX_SLOT_COUNT; s++) { engine[s].active_type = FX_TYPE_OFF; engine[s].state = NULL; }
+// FXSlotParams/FXSlotEngine and every FX_TYPE_* value live in fx_types.h.
+
+#include "fx_chain.h"
+
+#include <errno.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef HDS_NAM_ENABLED
+#define HDS_NAM_ENABLED 1
+#endif
+#if HDS_NAM_ENABLED
+#include "nam_bridge.h"
+#endif
+
+void reset_fx_engine(FXSlotEngine *engine, int slot_count) {
+    for (int s = 0; s < slot_count; s++) { engine[s].active_type = FX_TYPE_OFF; engine[s].state = NULL; }
 }
 
 // --- FX_TYPE_ENSEMBLE: ported from Airwindows StereoEnsemble (MIT license) ---
@@ -1783,7 +1785,7 @@ static void run_fx_cabs2(FXSlotEngine *engine, const FXSlotParams *params, float
 // a plain one-shot full-file decode. Keeps every channel present in the file (unlike the sampler's
 // mono/stereo-only pre-roll) since the caller, not this loader, should decide how to handle >2
 // channels. Returns NULL on any failure (out_frames/out_channels/out_sample_rate left at 0).
-static float *seq_audio_load_wav_from_disk(const char *path, int *out_frames, int *out_channels, int *out_sample_rate) {
+float *seq_audio_load_wav_from_disk(const char *path, int *out_frames, int *out_channels, int *out_sample_rate) {
     *out_frames = 0; *out_channels = 0; *out_sample_rate = 0;
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[seq-audio] failed to open '%s': %s\n", path, strerror(errno)); return NULL; }
@@ -2027,8 +2029,8 @@ static void fx_nam_reload_ir(FxNamState *st, const char *path) {
 // any type change already applied by the time this runs; a slot switched to FX_TYPE_NAM within the
 // SAME block this runs simply picks up its load on the next block instead, same one-block grace
 // every other live-knob check in a per-block poll like this already has.
-static void poll_fx_nam_requests(const FXSlotParams fx[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT]) {
-    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+void poll_fx_nam_requests(const FXSlotParams *fx, FXSlotEngine *fx_engine, int slot_count) {
+    for (int s = 0; s < slot_count; s++) {
         if (fx_engine[s].active_type != FX_TYPE_NAM || !fx_engine[s].state) continue;
         FxNamState *st = (FxNamState *)fx_engine[s].state;
         const char *want_model = fx[s].nam_model_path;
@@ -4149,22 +4151,22 @@ static void run_fx_deesser(FXSlotEngine *engine, const FXSlotParams *params, flo
 // handle_note_off (via g_hardtune_note_stack, declared later where MonoNoteStack is defined --
 // these two plain floats live here instead, before run_fx_hardtune's own definition, since that
 // function needs them and is defined well before MonoNoteStack is).
-static float g_hardtune_held_note = -1.0f;
+float g_hardtune_held_note = -1.0f;
 // Live pitch bend, in SEMITONES (already scaled by Program 0's own pb_range_up/pb_range_down, the
 // same convention render_audio_block's own per-Program pitch bend already uses -- see
 // dispatch_midi_event's own HDS_MIDI_PITCH_BEND branch). Applied by FX_TYPE_HARDTUNE as a final
 // multiplicative adjustment layered on top of its ALREADY-corrected pitch, unconditionally
 // (regardless of Target Source) -- see that effect's own comment for why it's never fed back into
 // detection or quantization.
-static float g_hardtune_bend_semitones = 0.0f;
+float g_hardtune_bend_semitones = 0.0f;
 // Mod Wheel (CC1) and channel aftertouch, mirrored from MidiLiveState purely so FX_TYPE_HARDTUNE's
 // own Vibrato Depth can be scaled by a live controller (same "gate an LFO depth with the mod
 // wheel" idea as PackLfoParams.mod_source_cc, but this global effect has no MidiLiveState of its
 // own to read -- same reason g_hardtune_bend_semitones/g_hardtune_held_note are globals instead).
 // Updated by dispatch_midi_event's HDS_MIDI_CC/HDS_MIDI_CHANNEL_PRESSURE branches, right alongside
 // their canonical MidiLiveState update.
-static float g_hardtune_modwheel = 0.0f;
-static float g_hardtune_channel_pressure = 0.0f;
+float g_hardtune_modwheel = 0.0f;
+float g_hardtune_channel_pressure = 0.0f;
 
 #define FX_HARDTUNE_ABS_MIN_HZ 70.0f
 #define FX_HARDTUNE_ABS_MAX_HZ 1100.0f
@@ -4798,7 +4800,7 @@ static void run_fx_fdnverb(FXSlotEngine *engine, const FXSlotParams *params, flo
 // dispatch_midi_event(), so this simply sits at a permanent, honest 0 there -- MIDI Trigger mode is
 // still selectable in that build for GUI parity, it just never fires, exactly like the Dump-button/
 // On-Air Override plumbing hds_fx_plugin.c already documents needing no MIDI at all.
-static int g_bcastdly_notes_held = 0;
+int g_bcastdly_notes_held = 0;
 
 // Same idea as g_bcastdly_notes_held just above, but for the sustain pedal (CC64) instead of note
 // events -- set directly from dispatch_midi_event()'s own CC64 handling in backend.c, right
@@ -4808,7 +4810,7 @@ static int g_bcastdly_notes_held = 0;
 // g_bcastdly_notes_held is true -- a foot switch wired to CC64 (sustain) is just as valid a
 // hands-free trigger source as a held key, and the two are purely additive, same as every other
 // pair of gates this effect already combines.
-static bool g_bcastdly_sustain_held = false;
+bool g_bcastdly_sustain_held = false;
 
 // --- FX_TYPE_BROADCAST_DELAY: an original implementation of the on-air "profanity delay"/dump
 // buffer -- see this effect's own FX_TYPE_BROADCAST_DELAY comment in fx_types.h for the full
@@ -4816,7 +4818,7 @@ static bool g_bcastdly_sustain_held = false;
 // delay at this engine's own fixed SAMPLE_RATE -- a fixed array embedded in the state struct,
 // calloc'd once on first use, same convention FX_TYPE_TAPEDELAY2's own dL/dR arrays already use
 // for a (much smaller) fixed-size delay line.
-#define HDS_BCASTDLY_MAX_SEC 60
+// HDS_BCASTDLY_MAX_SEC is in fx_chain.h (the GUI's delay-time knob range reads it too).
 #define HDS_BCASTDLY_MAX_SAMPLES (SAMPLE_RATE * HDS_BCASTDLY_MAX_SEC + 8) // +8 guard past the nominal max for the interpolated read never quite reaching the write cursor
 
 typedef struct {
@@ -4947,8 +4949,7 @@ static void run_fx_broadcastdelay(FXSlotEngine *engine, const FXSlotParams *para
 // --- FX_TYPE_DBX120X: see its own #define comment above for the full design rationale (why
 // zero-crossing period measurement on a heavily band-limited mono signal, not a general pitch
 // tracker, is what makes this robust on polyphonic/complex program material) and param map.
-#define FX_DBX120X_TRACK_MIN_HZ 30.0f
-#define FX_DBX120X_TRACK_MAX_HZ 300.0f
+// FX_DBX120X_TRACK_MIN_HZ/MAX_HZ are in fx_chain.h (the GUI's pitch-tracker readout reads them too).
 
 static inline float fx_dbx120x_fraction_to_track_hz(float fraction) {
     fraction = fmaxf(0.0f, fminf(1.0f, fraction));
@@ -5191,8 +5192,8 @@ static void run_fx_dbx120x(FXSlotEngine *engine, const FXSlotParams *params, flo
 // this must be called at least once after any fx_type change and before that slot is dispatched --
 // render_audio_block satisfies this once per block; a test or other direct caller driving
 // process_fx_chain() outside render_audio_block must call this itself first.
-static void sync_fx_engine_types(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT]) {
-    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+void sync_fx_engine_types(const FXSlotParams *fx_params, FXSlotEngine *fx_engine, int slot_count) {
+    for (int s = 0; s < slot_count; s++) {
         int type = (int)fx_params[s].fx_type;
         if (type != fx_engine[s].active_type) {
             // FX_TYPE_NAM's state owns real C++ objects (via the bridge) that a bare free() would
@@ -5233,7 +5234,7 @@ static void sync_fx_engine_types(const FXSlotParams fx_params[FX_SLOT_COUNT], FX
 // in the shared pool, independent of fx_source/chain_to_next's own same-source array-position
 // adjacency. A slot whose OWN source hasn't run yet this sample simply still holds last sample's
 // value here -- the same frozen-snapshot tradeoff sc_snapshot_l/r above already accepts.
-static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlotEngine fx_engine[FX_SLOT_COUNT], int routing_mode, int source_id, const float sc_snapshot_l[SOURCE_COUNT], const float sc_snapshot_r[SOURCE_COUNT], float *l, float *r, float gr_db_out[FX_SLOT_COUNT], float dump_avail_out[FX_SLOT_COUNT], float slot_out_l[FX_SLOT_COUNT], float slot_out_r[FX_SLOT_COUNT]) {
+void process_fx_chain(const FXSlotParams *fx_params, FXSlotEngine *fx_engine, int slot_count, int routing_mode, int source_id, const float *sc_snapshot_l, const float *sc_snapshot_r, int source_count, float *l, float *r, float *gr_db_out, float *dump_avail_out, float *slot_out_l, float *slot_out_r) {
     // A NaN/Inf sample reaching a slot is never a valid audio value, but several ported effects'
     // own persistent state (e.g. run_fx_tapedelay2's sweepL/R, accumulated from squared input) has
     // no boundary check of its own -- once poisoned, a non-finite value can propagate into a
@@ -5254,7 +5255,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
     bool branch_open = false;
     bool continue_branch = false;
 
-    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+    for (int s = 0; s < slot_count; s++) {
         if ((int)fx_params[s].fx_source != source_id) continue; // not this source's slot
         int type = fx_engine[s].active_type;
 
@@ -5263,7 +5264,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
         // self-reference even though the GUI already refuses to let one be picked: wire/state data
         // (a loaded project, a live OSC write) is never assumed sane just because the UI is.
         int input_from = (fx_params[s].input_from_slot >= 0.0f) ? (int)(fx_params[s].input_from_slot + 0.5f) : -1;
-        if (input_from == s || input_from < 0 || input_from >= FX_SLOT_COUNT) input_from = -1;
+        if (input_from == s || input_from < 0 || input_from >= slot_count) input_from = -1;
 
         float dry_l, dry_r;
         if (input_from >= 0) {
@@ -5309,7 +5310,7 @@ static void process_fx_chain(const FXSlotParams fx_params[FX_SLOT_COUNT], FXSlot
         // ordinary non-external-sidechain compression.
         float sc_l, sc_r;
         int sc_src = (int)fx_params[s].sidechain_source;
-        if (sc_src < 0 || sc_src >= SOURCE_COUNT) {
+        if (sc_src < 0 || sc_src >= source_count) {
             sc_l = dry_l; sc_r = dry_r;
         } else {
             sc_l = sc_snapshot_l[sc_src]; sc_r = sc_snapshot_r[sc_src];
