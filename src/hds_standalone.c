@@ -961,14 +961,8 @@ static bool interactive_recover_output_device(SynthSharedControls *knobs, HdsPcm
     }
 }
 
-// WAV/WavPack recording engine (RecordRing/WavRecorder/WavPackRecorder/RecordEngine/
-// RecordGatherState, the dedicated writer thread, record_engine/record_gather themselves) now
-// lives in src/recording_engine.c -- extracted so hds_android.c can #include it too (see that
-// file's own Recording section). #include'd here, at this exact spot, so it still sees
-// HDS_WAVPACK_ENABLED/<wavpack/wavpack.h> (both above, via this file's own #include order) and
-// everything backend.c declares (SAMPLE_RATE/BUFFER_SIZE/RECORD_MAX_CHANNELS/RECORD_PATH_LEN) --
-// a pure code-motion refactor, zero behavior change.
-#include "recording_engine.c"
+// WAV/WavPack recording engine: compiled separately (src/recording_engine.c); its interface
+// (record_engine/record_gather and friends) comes in via backend.c's #include "recording_engine.h".
 
 // --- Minimal JSON reader (HdsJsonValue/hds_json_parse/hds_json_object_get/hds_json_free) lives in
 // backend.c now, not here -- clap_plugin.c's own new Combi-lane Program picker (see
