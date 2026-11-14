@@ -83,7 +83,7 @@
 #define HDS_STANDALONE_GUI_ENABLED 0
 #endif
 
-#include "backend.c"
+#include "backend.h" // shared engine, compiled separately (src/backend.c)
 
 // Keeps track of which ALSA sequencer client:port pairs are currently subscribed to feed our
 // own MIDI input port, so a full rescan (on startup, or when the user's midi_device selection
