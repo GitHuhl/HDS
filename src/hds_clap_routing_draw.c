@@ -33,19 +33,13 @@
 // OSC-driven Routing tab of its own to report from) -- see HdsClapPlugin.ext_in_peak's own comment
 // in clap_plugin.c and hds_clap_gui_render()'s own comment on setting gui_routing_tab_visible.
 
-typedef struct {
-    HdsPlayKnobDrag knob_drag; // reused verbatim -- see hds_clap_filters_draw.c's own header comment on this pattern
-    double scroll_offset_px;   // whole tab's own vertical scroll (source rows + the Drum Bus Key
-                                // Routing section below them) -- same convention as
-                                // hds_clap_lfos_draw.c's own scroll_offset_px. Needed now that
-                                // SOURCE_COUNT (41, since Drum Buses were appended -- see
-                                // DRUM_BUS_COUNT's own comment in backend.c) plus the new section
-                                // below it overflows any reasonable window height.
-    int drum_bus_selected;     // 1..DRUM_BUS_COUNT -- which Drum Bus the Key Routing grid below
-                                // currently shows/edits (see its own comment).
-} HdsClapRoutingViewState;
+#include "hds_clap_gui.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-static void hds_clap_routing_view_state_init(HdsClapRoutingViewState *vs) {
+void hds_clap_routing_view_state_init(HdsClapRoutingViewState *vs) {
     memset(vs, 0, sizeof(*vs));
     vs->drum_bus_selected = 1;
 }
@@ -218,7 +212,7 @@ static void hds_routing_db_toggle_note(HdsSampleEngine *se, int note, int bus) {
     }
 }
 
-static void hds_clap_routing_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRoutingViewState *vs, double window_w, double window_h) {
+void hds_clap_routing_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRoutingViewState *vs, double window_w, double window_h) {
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
     cairo_rectangle(cr, 0, 0, window_w, window_h);
     cairo_fill(cr);
@@ -367,7 +361,7 @@ static void hds_clap_routing_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRoutin
     }
 }
 
-static bool hds_clap_routing_on_button_press(HdsClapPlugin *p, HdsClapRoutingViewState *vs, double x, double y, int button) {
+bool hds_clap_routing_on_button_press(HdsClapPlugin *p, HdsClapRoutingViewState *vs, double x, double y, int button) {
     if (y < HDS_ROUTING_HEADER_H) return false;
 
     // Drum Bus Key Routing section, checked first: its own y range sits past every Source row
@@ -445,16 +439,16 @@ static bool hds_clap_routing_on_button_press(HdsClapPlugin *p, HdsClapRoutingVie
     return true;
 }
 
-static void hds_clap_routing_on_motion(HdsClapRoutingViewState *vs, double x, double y) {
+void hds_clap_routing_on_motion(HdsClapRoutingViewState *vs, double x, double y) {
     hds_play_apply_knob_drag(&vs->knob_drag, x, y);
 }
 
-static void hds_clap_routing_on_button_release(HdsClapRoutingViewState *vs) { hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL); }
+void hds_clap_routing_on_button_release(HdsClapRoutingViewState *vs) { hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL); }
 
 // Whole-tab vertical scroll (same convention as hds_clap_lfos_draw.c's own scroll_offset_px) --
 // needed now that SOURCE_COUNT (41) plus the Drum Bus Key Routing section below it overflows any
 // reasonable window height, with no way to reach the later rows/the grid at all otherwise.
-static void hds_clap_routing_on_scroll(HdsClapRoutingViewState *vs, double window_h, int delta) {
+void hds_clap_routing_on_scroll(HdsClapRoutingViewState *vs, double window_h, int delta) {
     double content_h = hds_clap_routing_content_h();
     double max_scroll = content_h - window_h;
     if (max_scroll < 0.0) max_scroll = 0.0;

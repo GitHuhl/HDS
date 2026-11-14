@@ -46,31 +46,13 @@
 // hds_fx_gui_on_*) and hds_clap_play_draw.c (needs HdsClapPlayViewState), and after
 // HdsFxGuiHost/HdsClapPlugin are both defined.
 
-#define HDS_CLAP_TAB_BAR_H 36.0
-// 1080 (every tab's own original effective width) + HDS_CLAP_GLOBAL_SIDEBAR_W (260, the sidebar
-// added alongside it) -- so no existing tab's own layout math needed to change to make room for
-// the sidebar; it's purely additional space to its left. See this file's own header comment.
-// Irrelevant on Android (HDS_ANDROID_GUI_ENABLED): the actual window size there always comes from
-// the real device screen, never this constant -- left untouched rather than special-cased, since
-// nothing on that path ever reads it.
-#define HDS_CLAP_GUI_DEFAULT_W (1150 + (int)HDS_CLAP_GLOBAL_SIDEBAR_W)
-#define HDS_CLAP_GUI_DEFAULT_H 760
-#define HDS_CLAP_GUI_MIN_W (740 + (int)HDS_CLAP_GLOBAL_SIDEBAR_W)
-#define HDS_CLAP_GUI_MIN_H 420
+#include "hds_clap_gui.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-typedef enum {
-    HDS_CLAP_TAB_PLAY = 0,
-    HDS_CLAP_TAB_FILTERS,
-    HDS_CLAP_TAB_LFOS,
-    HDS_CLAP_TAB_ENVELOPES,
-    HDS_CLAP_TAB_FX,
-    HDS_CLAP_TAB_ROUTING,
-    HDS_CLAP_TAB_DEVICES,
-#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
-    HDS_CLAP_TAB_RECORDING,
-#endif
-    HDS_CLAP_TAB_COUNT
-} HdsClapTab;
+#define HDS_CLAP_TAB_BAR_H 36.0
 
 // ONE uniform extra-zoom factor, applied identically to every tab's own content AND the Global
 // sidebar below -- see hds_clap_gui_tab_fill_scale()'s own fuller comment further down (defined
@@ -154,36 +136,7 @@ static const char *const HDS_CLAP_TAB_LABELS[HDS_CLAP_TAB_COUNT] = {
 #endif
 };
 
-typedef struct {
-    int window_w, window_h;
-    HdsClapTab active_tab;
-
-    // The FX tab's own view state -- a genuine, nested HdsFxGuiViewState (same type
-    // hds_fx.clap's own single-tab window uses directly), kept in sync with a SHRUNK window_h
-    // (real window_h minus the tab bar) by hds_clap_gui_on_resize() so hds_fx_gui_render()'s own
-    // background fill/clip rect never draws over or under the tab bar -- see this file's own
-    // header comment.
-    HdsFxGuiViewState fx_view;
-
-    // The Play tab's own view state (hds_clap_play_draw.c) -- unlike fx_view, it doesn't need its
-    // own window_w/window_h copy: every Play-tab function takes this HdsClapGuiViewState's own
-    // window_w/window_h directly as plain parameters (see hds_clap_gui_render()'s own dispatch),
-    // since hds_clap_play_draw.c has no equivalent of hds_fx_gui_render()'s single-struct-in
-    // calling convention to match.
-    HdsClapPlayViewState play_view;
-    HdsClapCombiViewState combi_view; // the Play tab's own Combi-mode sub-view -- see hds_clap_combi_draw.c's own header comment and this file's own HDS_CLAP_TAB_PLAY dispatch for why it's a sibling of play_view, not nested inside it
-    HdsClapFiltersViewState filters_view; // same convention as play_view -- see hds_clap_filters_draw.c's own header comment
-    HdsClapLfosViewState lfos_view;       // same convention -- see hds_clap_lfos_draw.c's own header comment
-    HdsClapEnvelopesViewState envelopes_view; // same convention -- see hds_clap_envelopes_draw.c's own header comment
-    HdsClapRoutingViewState routing_view;     // same convention -- see hds_clap_routing_draw.c's own header comment
-    HdsClapDevicesViewState devices_view;      // same convention -- see hds_clap_devices_draw.c's own header comment
-    HdsClapGlobalViewState global_view;        // same convention -- see hds_clap_global_draw.c's own header comment
-#if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
-    HdsClapRecordingViewState recording_view;  // same convention -- see hds_clap_recording_draw.c's own header comment (standalone-only tab)
-#endif
-} HdsClapGuiViewState;
-
-static void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
+void hds_clap_gui_view_state_init(HdsClapGuiViewState *vs) {
     memset(vs, 0, sizeof(*vs));
     vs->window_w = HDS_CLAP_GUI_DEFAULT_W;
     vs->window_h = HDS_CLAP_GUI_DEFAULT_H;
@@ -224,7 +177,7 @@ static void hds_clap_gui_render_placeholder(cairo_t *cr, double w, double h, con
     hds_fx_centered_text(cr, w / 2, h / 2, label);
 }
 
-static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewState *vs) {
+void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewState *vs) {
     // Gates the Routing tab's own ext-in VU meters (see HdsClapPlugin.ext_in_peak's own comment) --
     // set directly whenever the Routing tab becomes/stops being the active tab. Cheap and always
     // correct to just set this on every redraw rather than hooking the tab-bar's own click handler
@@ -367,7 +320,7 @@ static void hds_clap_gui_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGuiViewSta
                         // the "panel repeating itself" symptom (a new copy marching rightward every ~33ms).
 }
 
-static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int button) {
+bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int button) {
     // The shared file browser (see hds_clap_gui_render()'s own comment) is a true modal: while
     // open, it owns every click regardless of where it lands or which tab is actually active --
     // checked FIRST, even before the sidebar. hds_fx_gui_on_button_press() itself already checks
@@ -441,7 +394,7 @@ static bool hds_clap_gui_on_button_press(HdsClapPlugin *p, HdsClapGuiViewState *
     }
 }
 
-static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y) {
+void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y) {
     // Unconditional, not gated by x/active_tab: a drag that started in the sidebar (or the tab
     // area) must keep receiving motion even if the pointer strays outside that region afterward --
     // each handler already no-ops on its own if it has no drag in flight (same pattern every other
@@ -474,7 +427,7 @@ static void hds_clap_gui_on_motion(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
 #endif
 }
 
-static void hds_clap_gui_on_button_release(HdsClapPlugin *p, HdsClapGuiViewState *vs) {
+void hds_clap_gui_on_button_release(HdsClapPlugin *p, HdsClapGuiViewState *vs) {
     // Same "unconditional, each side no-ops on its own" reasoning as on_motion just above.
     hds_clap_global_on_button_release(&vs->global_view);
     if (vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_button_release(&p->gui_host, &vs->fx_view);
@@ -489,13 +442,13 @@ static void hds_clap_gui_on_button_release(HdsClapPlugin *p, HdsClapGuiViewState
 #endif
 }
 
-static void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int action, char ch) {
+void hds_clap_gui_on_key(HdsClapPlugin *p, HdsClapGuiViewState *vs, int action, char ch) {
     // The shared file browser's own path bar needs key events regardless of active_tab too -- same
     // "modal owns everything" reasoning as hds_clap_gui_on_button_press()'s own browser check.
     if (vs->fx_view.browser.open || vs->active_tab == HDS_CLAP_TAB_FX) hds_fx_gui_on_key(&p->gui_host, &vs->fx_view, action, ch);
 }
 
-static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int delta) {
+void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, double x, double y, int delta) {
     if (vs->fx_view.browser.open) { hds_fx_gui_on_scroll(&p->gui_host, &vs->fx_view, delta); return; }
     double sidebar_w = hds_clap_gui_sidebar_w(vs->active_tab);
     // Hidden on the FX tab (sidebar_w == 0 there), so this naturally never matches while it's
@@ -521,7 +474,7 @@ static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
 #endif
 }
 
-static void hds_clap_gui_on_resize(HdsClapPlugin *p, HdsClapGuiViewState *vs, int w, int h) {
+void hds_clap_gui_on_resize(HdsClapPlugin *p, HdsClapGuiViewState *vs, int w, int h) {
     if (w < HDS_CLAP_GUI_MIN_W) w = HDS_CLAP_GUI_MIN_W;
     if (h < HDS_CLAP_GUI_MIN_H) h = HDS_CLAP_GUI_MIN_H;
     vs->window_w = w;

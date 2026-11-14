@@ -47,24 +47,18 @@
 // (which owns the tab-bar/tab-content region this sidebar sits beside -- see its own header comment
 // on how the two are composed together).
 
-// Fixed width, not resizable independently: a permanent, constant-
-// width column, not a panel that grows/shrinks with the rest of the window. hds_clap_gui_draw.c
-// reads this same constant to know where the tab bar/content region starts.
-#define HDS_CLAP_GLOBAL_SIDEBAR_W 160.0 // a hardcoded pixel width (not a percentage of window_w -- see this file's own header comment); every sub-element below is laid out as a fraction of this one constant, so this is the only place a new width needs to change
+#include "hds_clap_gui.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define HDS_GLOBAL_DROPDOWN_NONE 0
 #define HDS_GLOBAL_DROPDOWN_HARDSYNC 1
 #define HDS_GLOBAL_DROPDOWN_FMALGO 2
 #define HDS_GLOBAL_DROPDOWN_ARPSTYLE 3
 
-typedef struct {
-    int dropdown_kind; // HDS_GLOBAL_DROPDOWN_*
-    HdsFxRect dropdown_anchor;
-    HdsPlayKnobDrag knob_drag;
-    double scroll_offset_px; // the whole sidebar's own vertical scroll -- see hds_clap_lfos_draw.c's own identical field/convention; the stacked content is taller than a typical window
-} HdsClapGlobalViewState;
-
-static void hds_clap_global_view_state_init(HdsClapGlobalViewState *vs) { memset(vs, 0, sizeof(*vs)); }
+void hds_clap_global_view_state_init(HdsClapGlobalViewState *vs) { memset(vs, 0, sizeof(*vs)); }
 
 #define HDS_GLOBAL_MARGIN 12.0
 #define HDS_GLOBAL_CONTENT_TOP 12.0
@@ -262,7 +256,7 @@ static void hds_clap_global_compute_layout(int fm_algo, double scroll_offset_px,
     out->content_h = y + scroll_offset_px + HDS_GLOBAL_MARGIN; // undo the scroll subtraction this function started with, so callers get the SAME content height regardless of current scroll position
 }
 
-static void hds_global_section_label(cairo_t *cr, double x, double y, const char *text) {
+void hds_global_section_label(cairo_t *cr, double x, double y, const char *text) {
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 10.0);
     hds_fx_rgb(cr, 0.55, 0.55, 0.58);
@@ -278,7 +272,7 @@ static void hds_global_poll_scl_pick(HdsClapPlugin *p) {
     p->scl_browser_result[0] = '\0';
 }
 
-static void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalViewState *vs, double window_w, double window_h) {
+void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalViewState *vs, double window_w, double window_h) {
     hds_global_poll_scl_pick(p);
     (void)window_w; // always HDS_CLAP_GLOBAL_SIDEBAR_W wide -- see this file's own header comment
     hds_fx_rgb(cr, 0.12, 0.12, 0.145); // one shade lighter than the tab-content area, reads as a distinct panel
@@ -431,7 +425,7 @@ static void hds_clap_global_render(cairo_t *cr, HdsClapPlugin *p, HdsClapGlobalV
     }
 }
 
-static bool hds_clap_global_on_button_press(HdsClapPlugin *p, HdsClapGlobalViewState *vs, HdsFxGuiViewState *fxvs, double window_h, double x, double y, int button) {
+bool hds_clap_global_on_button_press(HdsClapPlugin *p, HdsClapGlobalViewState *vs, HdsFxGuiViewState *fxvs, double window_h, double x, double y, int button) {
     ProgramState *prog = hds_play_program(p);
 
     if (vs->dropdown_kind != HDS_GLOBAL_DROPDOWN_NONE) {
@@ -529,16 +523,16 @@ static bool hds_clap_global_on_button_press(HdsClapPlugin *p, HdsClapGlobalViewS
     return true;
 }
 
-static void hds_clap_global_on_motion(HdsClapGlobalViewState *vs, double x, double y) {
+void hds_clap_global_on_motion(HdsClapGlobalViewState *vs, double x, double y) {
     hds_play_apply_knob_drag(&vs->knob_drag, x, y);
 }
 
-static void hds_clap_global_on_button_release(HdsClapGlobalViewState *vs) { hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL); }
+void hds_clap_global_on_button_release(HdsClapGlobalViewState *vs) { hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL); }
 
 // Same scroll convention as hds_clap_lfos_draw.c/hds_clap_envelopes_draw.c's own scroll handlers --
 // content_h comes from the SAME layout function render/hit-test already use, so it can never
 // disagree with what's actually on screen.
-static void hds_clap_global_on_scroll(HdsClapPlugin *p, HdsClapGlobalViewState *vs, double window_h, int delta) {
+void hds_clap_global_on_scroll(HdsClapPlugin *p, HdsClapGlobalViewState *vs, double window_h, int delta) {
     ProgramState *prog = hds_play_program(p);
     int algo = (int)prog->fm_algorithm; if (algo < 0 || algo >= HDS_GLOBAL_FMALGO_COUNT) algo = 0;
     HdsGlobalLayout L;

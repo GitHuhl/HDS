@@ -18,6 +18,12 @@
 // knob -- unlike Polyphony's own free integer range, a fixed small preset set is exactly the kind
 // of control this GUI already renders as a dropdown pill (Type/Slope/Waveform/Mode, ...) elsewhere.
 
+#include "hds_clap_gui.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #define HDS_DEV_DROPDOWN_NONE 0
 #define HDS_DEV_DROPDOWN_BLOCKSIZE 1
 #define HDS_DEV_DROPDOWN_OUTPUT 2
@@ -50,19 +56,7 @@ static int hds_dev_latency_index(float ms) {
 }
 #endif
 
-typedef struct {
-    int dropdown_kind; // HDS_DEV_DROPDOWN_*
-    HdsFxRect dropdown_anchor;
-    HdsPlayKnobDrag knob_drag; // reused verbatim -- see hds_clap_filters_draw.c's own header comment on this pattern
-#ifdef HDS_STANDALONE_GUI_ENABLED
-    // Scanned once at GUI startup and again on "Rescan Devices" -- a real subprocess spawn+read
-    // (see hds_scan_alsa_devices()/hds_scan_midi_devices() in hds_standalone.c), never per-frame.
-    bool devices_scanned;
-    HdsDeviceList output_devices, input_devices, midi_devices;
-#endif
-} HdsClapDevicesViewState;
-
-static void hds_clap_devices_view_state_init(HdsClapDevicesViewState *vs) { memset(vs, 0, sizeof(*vs)); }
+void hds_clap_devices_view_state_init(HdsClapDevicesViewState *vs) { memset(vs, 0, sizeof(*vs)); }
 
 #define HDS_DEV_MARGIN 10.0
 #define HDS_DEV_CONTENT_TOP 34.0
@@ -147,7 +141,7 @@ static bool hds_dev_string_dropdown_hit_test(const HdsFxRect *anchor, double win
 }
 #endif
 
-static void hds_clap_devices_render(cairo_t *cr, HdsClapPlugin *p, HdsClapDevicesViewState *vs, double window_w, double window_h) {
+void hds_clap_devices_render(cairo_t *cr, HdsClapPlugin *p, HdsClapDevicesViewState *vs, double window_w, double window_h) {
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
     cairo_rectangle(cr, 0, 0, window_w, window_h);
     cairo_fill(cr);
@@ -286,7 +280,7 @@ static void hds_clap_devices_render(cairo_t *cr, HdsClapPlugin *p, HdsClapDevice
 #endif
 }
 
-static bool hds_clap_devices_on_button_press(HdsClapPlugin *p, HdsClapDevicesViewState *vs, double window_h, double x, double y, int button) {
+bool hds_clap_devices_on_button_press(HdsClapPlugin *p, HdsClapDevicesViewState *vs, double window_h, double x, double y, int button) {
     if (vs->dropdown_kind == HDS_DEV_DROPDOWN_BLOCKSIZE) {
         double list_h = HDS_DEV_BLOCKSIZE_COUNT * 16.0;
         double below_y = vs->dropdown_anchor.y + vs->dropdown_anchor.h + 2.0;
@@ -377,8 +371,8 @@ static bool hds_clap_devices_on_button_press(HdsClapPlugin *p, HdsClapDevicesVie
     return true;
 }
 
-static void hds_clap_devices_on_motion(HdsClapDevicesViewState *vs, double x, double y) {
+void hds_clap_devices_on_motion(HdsClapDevicesViewState *vs, double x, double y) {
     hds_play_apply_knob_drag(&vs->knob_drag, x, y);
 }
 
-static void hds_clap_devices_on_button_release(HdsClapDevicesViewState *vs) { hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL); }
+void hds_clap_devices_on_button_release(HdsClapDevicesViewState *vs) { hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL); }

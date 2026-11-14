@@ -25,6 +25,12 @@
 // lookup_lfo_waveform() in backend.c consumes this file's own HDS_LFO_WAVE_NAMES ordering, not
 // WaveType at all. Never conflate the two.
 
+#include "hds_clap_gui.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #define HDS_LFO_DROPDOWN_NONE 0
 #define HDS_LFO_DROPDOWN_WAVE 1
 #define HDS_LFO_DROPDOWN_TEMPOSYNC 2
@@ -53,17 +59,7 @@ static const char *const HDS_LFO_TEMPOSYNC_NAMES[HDS_LFO_TEMPOSYNC_COUNT] = {
     "1/64", "1/64 D", "1/64 T",
 };
 
-typedef struct {
-    int dropdown_kind;   // HDS_LFO_DROPDOWN_*
-    int dropdown_row;    // which LFO (0-15) the open dropdown belongs to
-    HdsFxRect dropdown_anchor;
-    double dest_scroll_px; // the open Destination list's own internal scroll (reset whenever a NEW one opens)
-    HdsPlayKnobDrag knob_drag; // reused verbatim -- see this file's own header comment
-    HdsCtxMenu ctx_menu;       // Rate's/Depth's/Phase's own "Modulate From" menu, if one is open
-    double scroll_offset_px;  // the whole 16-row list's own vertical scroll, same convention as HdsFxGuiViewState's own
-} HdsClapLfosViewState;
-
-static void hds_clap_lfos_view_state_init(HdsClapLfosViewState *vs) {
+void hds_clap_lfos_view_state_init(HdsClapLfosViewState *vs) {
     memset(vs, 0, sizeof(*vs));
     vs->dropdown_kind = HDS_LFO_DROPDOWN_NONE;
 }
@@ -146,7 +142,7 @@ static void hds_clap_lfos_render_dest_dropdown(cairo_t *cr, HdsClapLfosViewState
     hds_dest_list_render(cr, &bg, &vs->dest_scroll_px, current);
 }
 
-static void hds_clap_lfos_render(cairo_t *cr, HdsClapPlugin *p, HdsClapLfosViewState *vs, double window_w, double window_h) {
+void hds_clap_lfos_render(cairo_t *cr, HdsClapPlugin *p, HdsClapLfosViewState *vs, double window_w, double window_h) {
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
     cairo_rectangle(cr, 0, 0, window_w, window_h);
     cairo_fill(cr);
@@ -253,7 +249,7 @@ static void hds_clap_lfos_render(cairo_t *cr, HdsClapPlugin *p, HdsClapLfosViewS
 // ---------------------------------------------------------------------------------------------
 // Interaction
 // ---------------------------------------------------------------------------------------------
-static bool hds_clap_lfos_on_button_press(HdsClapPlugin *p, HdsClapLfosViewState *vs, double window_w, double window_h, double x, double y, int button) {
+bool hds_clap_lfos_on_button_press(HdsClapPlugin *p, HdsClapLfosViewState *vs, double window_w, double window_h, double x, double y, int button) {
     ProgramState *prog = hds_play_program(p);
 
     if (vs->ctx_menu.open) return hds_play_ctxmenu_handle_click(p, &vs->ctx_menu, window_w, window_h, x, y);
@@ -350,17 +346,17 @@ static bool hds_clap_lfos_on_button_press(HdsClapPlugin *p, HdsClapLfosViewState
     return true; // clicking empty row space is a no-op, not a click-through (matches this GUI's own tab-bar convention)
 }
 
-static void hds_clap_lfos_on_motion(HdsClapLfosViewState *vs, double x, double y) {
+void hds_clap_lfos_on_motion(HdsClapLfosViewState *vs, double x, double y) {
     hds_play_apply_knob_drag(&vs->knob_drag, x, y);
 }
 
-static void hds_clap_lfos_on_button_release(HdsClapLfosViewState *vs) {
+void hds_clap_lfos_on_button_release(HdsClapLfosViewState *vs) {
     double anchor_x = 0.0, anchor_y = 0.0;
     HdsPlayKnobMenu menu = hds_play_release_knob_drag(&vs->knob_drag, &anchor_x, &anchor_y);
     if (menu.kind != 0) vs->ctx_menu = (HdsCtxMenu){true, anchor_x, anchor_y, menu.kind, menu.arg};
 }
 
-static void hds_clap_lfos_on_scroll(HdsClapLfosViewState *vs, double window_h, int delta) {
+void hds_clap_lfos_on_scroll(HdsClapLfosViewState *vs, double window_h, int delta) {
     if (vs->dropdown_kind == HDS_LFO_DROPDOWN_DEST) {
         vs->dest_scroll_px -= delta * HDS_DEST_LIST_ROW_H * 3.0;
         if (vs->dest_scroll_px < 0.0) vs->dest_scroll_px = 0.0;

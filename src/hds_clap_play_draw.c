@@ -26,6 +26,12 @@
 // become knobs too, for the same one-interaction-model reason -- again the same real
 // range, just dragged instead of typed/spun.
 
+#include "hds_clap_gui.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "hds_clap_adsr.h"
 
 // ---------------------------------------------------------------------------------------------
@@ -84,7 +90,7 @@ static void hds_play_osc_fields(ProgramState *prog, int osc, HdsPlayOscFields *f
     }
 }
 
-static ProgramState *hds_play_program(HdsClapPlugin *p) { return &p->knobs.programs[SINGLE_PROGRAM_SLOT]; }
+ProgramState *hds_play_program(HdsClapPlugin *p) { return &p->knobs.programs[SINGLE_PROGRAM_SLOT]; }
 
 // ---------------------------------------------------------------------------------------------
 // Shape combo -- same indices as the WaveType enum (backend.c),
@@ -94,8 +100,7 @@ static ProgramState *hds_play_program(HdsClapPlugin *p) { return &p->knobs.progr
 static const char *const HDS_PLAY_SHAPE_NAMES[HDS_PLAY_SHAPE_COUNT] = {
     "Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Multisample", "Off", "Rev Saw",
 };
-#define HDS_PLAY_EGMODE_COUNT 7
-static const char *const HDS_PLAY_EGMODE_NAMES[HDS_PLAY_EGMODE_COUNT] = {
+const char *const HDS_PLAY_EGMODE_NAMES[HDS_PLAY_EGMODE_COUNT] = {
     "ADSR", "AR", "AD", "ASR", "AHD", "DADSR", "AHDSR",
 };
 
@@ -103,47 +108,6 @@ static const char *const HDS_PLAY_EGMODE_NAMES[HDS_PLAY_EGMODE_COUNT] = {
 #define HDS_PLAY_DROPDOWN_SHAPE 1
 #define HDS_PLAY_DROPDOWN_EGMODE 2
 
-// A knob's own right-click menu, if it has one -- stashed at right-press time (see
-// hds_play_start_knob_drag()) and consulted on release if the button never actually dragged.
-// kind==0 means "no menu": most knobs don't have one -- it's only wired onto destination-capable
-// knobs (oscillator Pitch/Phase/Pulse-Width/Fine/Curve/Volume/Pan, Filter Cutoff/Resonance, LFO
-// Rate/Depth/Phase) -- every other knob still gets double-click-reset and right-drag fine
-// adjustment, just no menu. kind/arg are interpreted entirely by whichever *_draw.c file opened
-// the menu (each file defines its own small kind-constant space); this struct itself stays
-// generic so every tab can keep sharing ONE HdsPlayKnobDrag type.
-typedef struct {
-    int kind;
-    int arg;
-} HdsPlayKnobMenu;
-
-typedef struct {
-    float *target;      // knob currently being dragged, NULL = none
-    double lo, hi;       // that knob's own real backend-unit range
-    double start_y, start_val;
-
-    // Right-click support: button is 0 (idle), 1 (left, dragging at normal
-    // sensitivity) or 3 (right -- either still a "was this a click or a drag" pending gesture, or
-    // promoted to a fine-sensitivity drag once the pointer moves past the threshold). press_x/y is
-    // where the right button went down; right_moved flips true the first time the pointer clears
-    // HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX from there.
-    // A right-release with right_moved still false fires `menu` (if it has one) instead of having
-    // done anything to the value -- a real "was this a click or a drag" gesture, not a fixed
-    // click-vs-hold timer.
-    int button;
-    double press_x, press_y;
-    bool right_moved;
-    HdsPlayKnobMenu menu;
-
-    // Double-click-to-reset bookkeeping (mirrors PotentiometerKnob.mouseDoubleClickEvent, which
-    // always resets to a literal 0.0 regardless of the knob's own range -- clamped into range same
-    // as any other write). last_click_target is compared by POINTER IDENTITY (which knob), not
-    // value, so two different knobs' clicks never combine into a false double-click.
-    float *last_click_target;
-    struct timespec last_click_time;
-    double last_click_x, last_click_y;
-} HdsPlayKnobDrag;
-
-static bool hds_play_rect_contains(const HdsFxRect *r, double x, double y); // defined below
 
 // Generic right-click popup menu (checkable rows, optional section headers) -- reused by every
 // tab that has its own "Modulate From"/Key Track/Mod Source menu. kind/arg are
@@ -152,19 +116,6 @@ static bool hds_play_rect_contains(const HdsFxRect *r, double x, double y); // d
 #define HDS_CTXMENU_ROW_H 16.0
 #define HDS_CTXMENU_SECTION_H 14.0
 #define HDS_CTXMENU_W 160.0
-#define HDS_CTXMENU_MAX_ROWS 24
-
-typedef struct {
-    bool is_section, checkable, checked, disabled;
-    char label[40];
-    int group, index; // meaning is up to whichever file built this row
-} HdsCtxMenuRow;
-
-typedef struct {
-    bool open;
-    double x, y;
-    int kind, arg;
-} HdsCtxMenu;
 
 static void hds_ctxmenu_add(HdsCtxMenuRow *rows, int *count, bool is_section, bool checkable, bool checked, bool disabled, int group, int index, const char *label) {
     if (*count >= HDS_CTXMENU_MAX_ROWS) return;
@@ -198,7 +149,7 @@ static void hds_ctxmenu_row_rect(const HdsCtxMenu *m, const HdsCtxMenuRow *rows,
     out->y = y; out->h = rows[i].is_section ? HDS_CTXMENU_SECTION_H : HDS_CTXMENU_ROW_H;
 }
 
-static void hds_ctxmenu_render(cairo_t *cr, const HdsCtxMenu *m, const HdsCtxMenuRow *rows, int count, double win_w, double win_h) {
+void hds_ctxmenu_render(cairo_t *cr, const HdsCtxMenu *m, const HdsCtxMenuRow *rows, int count, double win_w, double win_h) {
     if (!m->open || count == 0) return;
     double total_h = hds_ctxmenu_total_h(rows, count);
     double mx, my; hds_ctxmenu_origin(m, total_h, win_w, win_h, &mx, &my);
@@ -234,21 +185,7 @@ static int hds_ctxmenu_hit_row(const HdsCtxMenu *m, const HdsCtxMenuRow *rows, i
     return -1;
 }
 
-// The 100-entry Destination list -- shared by every LFO row's
-// own Destination pill (hds_clap_lfos_draw.c) AND every assignable EG's own eg_dest_target
-// (hds_clap_envelopes_draw.c), plus this file's own "Modulate From" menu content below (which shows
-// an already-pointed-elsewhere source's current destination inline). Lives here, in an
-// EARLIER-included file, rather than in hds_clap_lfos_draw.c where it used to live, purely because
-// of the fixed single-TU #include order (see clap_plugin.c/hds_standalone.c): this file's own
-// "Modulate From" builder needs it, and can't reach forward into a later-included file. Indices
-// 84-89 are retired placeholders from a pre-simplification design (kept only so a target ID already
-// saved in an old patch still resolves to SOME row of this same list) -- shown as "--" and, since
-// nothing meaningful would happen selecting them, simply not offered for selection. Indices 8-13
-// used to be retired the exact same way but were reclaimed for Osc 3/4 Fine and Osc 1-4 Curve (see
-// HDS_PLAY_FINE_DEST_TARGET/HDS_PLAY_CURVE_DEST_TARGET's own comment) -- precisely the kind of reuse
-// this "keep the number reserved, never delete it" convention exists to make safe.
-#define HDS_LFO_DEST_COUNT 100
-static void hds_lfo_dest_label(int target, char *buf, size_t buflen) {
+void hds_lfo_dest_label(int target, char *buf, size_t buflen) {
     static const char *const fixed[48] = {
         "None", "Osc 1 Pitch", "Osc 2 Pitch", "Osc 1+2 Pitch", "O1 Fine", "O2 Fine", "Osc 1 Amp", "Osc 2 Amp",
         "O3 Fine", "O4 Fine", "Osc 1 Curve", "Osc 2 Curve", "Osc 3 Curve", "Osc 4 Curve", // 8-13: reclaimed from "retired"
@@ -280,9 +217,9 @@ static void hds_lfo_dest_label(int target, char *buf, size_t buflen) {
 // Rate/Depth/Phase's own right-click "Modulate From" menu target numbers (LFOs tab) and the same
 // LFO's own Destination-dropdown target (below) both need these (two ranges each:
 // LFO 1-4's original slots, LFO 5-16 appended after target 47).
-static int hds_lfo_rate_dest_target(int idx) { return idx < 4 ? 14 + idx : 44 + idx; }
+int hds_lfo_rate_dest_target(int idx) { return idx < 4 ? 14 + idx : 44 + idx; }
 static int hds_lfo_depth_dest_target(int idx) { return idx < 4 ? 18 + idx : 56 + idx; }
-static int hds_lfo_phase_dest_target(int idx) { return idx < 4 ? 28 + idx : 68 + idx; }
+int hds_lfo_phase_dest_target(int idx) { return idx < 4 ? 28 + idx : 68 + idx; }
 
 // ---------------------------------------------------------------------------------------------
 // The Destination dropdown's shared DISPLAY order -- grouped by what a target actually modulates
@@ -299,9 +236,7 @@ static int hds_lfo_phase_dest_target(int idx) { return idx < 4 ? 28 + idx : 68 +
 // consistent, never a stale cache" convention every other dropdown in this GUI already uses.
 // ---------------------------------------------------------------------------------------------
 #define HDS_DEST_LIST_MAX_ROWS 100
-#define HDS_DEST_LIST_ROW_H 17.0
 #define HDS_DEST_LIST_SECTION_H 14.0
-#define HDS_DEST_LIST_MAX_H 340.0
 
 typedef struct {
     bool is_section;
@@ -365,7 +300,7 @@ static void hds_dest_list_build(HdsDestListRow *rows, int *count) {
 // Renders the grouped list into `bg` (already positioned/sized by the caller's own anchor logic),
 // clamping *scroll_px into range first exactly like the old flat-list renderer did. `current` is
 // the field's OWN CURRENTLY STORED target (for highlighting), never a display index.
-static void hds_dest_list_render(cairo_t *cr, const HdsFxRect *bg, double *scroll_px, int current) {
+void hds_dest_list_render(cairo_t *cr, const HdsFxRect *bg, double *scroll_px, int current) {
     HdsDestListRow rows[HDS_DEST_LIST_MAX_ROWS]; int count = 0;
     hds_dest_list_build(rows, &count);
 
@@ -415,7 +350,7 @@ static void hds_dest_list_render(cairo_t *cr, const HdsFxRect *bg, double *scrol
 // Returns true and writes *out_target if (x,y) landed on a real (non-section) row inside `bg`;
 // false (no write) for a miss outside `bg` or a hit on a section header -- clicking a header is a
 // no-op, same convention hds_ctxmenu_hit_row() already uses for its own section rows.
-static bool hds_dest_list_hit_test(const HdsFxRect *bg, double scroll_px, double x, double y, int *out_target) {
+bool hds_dest_list_hit_test(const HdsFxRect *bg, double scroll_px, double x, double y, int *out_target) {
     if (!hds_play_rect_contains(bg, x, y)) return false;
     HdsDestListRow rows[HDS_DEST_LIST_MAX_ROWS]; int count = 0;
     hds_dest_list_build(rows, &count);
@@ -553,13 +488,9 @@ static void hds_play_build_filter_cutoff_menu_rows(HdsClapPlugin *p, int filt_id
     hds_play_append_modulate_from_rows(p, hds_filt_cutoff_dest_target(filt_idx), rows, count);
 }
 
-#define HDS_CTXMENU_KIND_MODULATE_FROM 1
-#define HDS_CTXMENU_KIND_LFO_DEPTH 2
-#define HDS_CTXMENU_KIND_FILTER_CUTOFF 3
-
 // Builds whichever row list `menu->kind` needs -- the one place both rendering (draw whatever's
 // open) and hit-testing (below) get their content from, so the two can never disagree.
-static void hds_play_build_ctxmenu_rows(HdsClapPlugin *p, const HdsCtxMenu *menu, HdsCtxMenuRow *rows, int *count) {
+void hds_play_build_ctxmenu_rows(HdsClapPlugin *p, const HdsCtxMenu *menu, HdsCtxMenuRow *rows, int *count) {
     switch (menu->kind) {
         case HDS_CTXMENU_KIND_MODULATE_FROM: hds_play_build_modulate_from_rows(p, menu->arg, rows, count); break;
         case HDS_CTXMENU_KIND_LFO_DEPTH: hds_play_build_lfo_depth_menu_rows(p, menu->arg, rows, count); break;
@@ -574,7 +505,7 @@ static void hds_play_build_ctxmenu_rows(HdsClapPlugin *p, const HdsCtxMenu *menu
 // and applies whatever the hit row means first if one was hit. A preset row (Key Track/either
 // Modulation Source list) always SETS its own value on click, never toggles back off, unlike a
 // "Modulate From" row.
-static bool hds_play_ctxmenu_handle_click(HdsClapPlugin *p, HdsCtxMenu *menu, double win_w, double win_h, double x, double y) {
+bool hds_play_ctxmenu_handle_click(HdsClapPlugin *p, HdsCtxMenu *menu, double win_w, double win_h, double x, double y) {
     if (!menu->open) return false;
     HdsCtxMenuRow rows[HDS_CTXMENU_MAX_ROWS]; int count = 0;
     hds_play_build_ctxmenu_rows(p, menu, rows, &count);
@@ -598,34 +529,7 @@ static bool hds_play_ctxmenu_handle_click(HdsClapPlugin *p, HdsCtxMenu *menu, do
     return true;
 }
 
-typedef struct {
-    int dropdown_kind;         // HDS_PLAY_DROPDOWN_* -- one at a time, same convention as the FX tab's own
-    int dropdown_index;        // which oscillator (0-3, SHAPE) or which Amp EG (0-3, EGMODE)
-    HdsFxRect dropdown_anchor;
-
-    HdsPlayKnobDrag knob_drag;
-    HdsCtxMenu ctx_menu;        // the open "Modulate From" menu (if any) from a right-click-without-
-                                 // drag release on Pitch/Phase/Pulse-Width -- see knob_drag.menu
-
-    int adsr_drag_eg;           // -1 = not dragging any Amp EG curve; else 0-3
-    int adsr_active_node[4];    // per-EG "which node is highlighted/being dragged", -1 = none
-
-    bool amp_eg_live_sync;      // "Sync" toggle -- while true, every change to Amp EG 0 (Osc1) is
-                                 // immediately mirrored onto Amp EGs 1-3, which are drawn disabled
-
-    // This tab's own vertical scroll -- stays permanently 0.0 (and so, by construction, changes
-    // nothing at all) on any host tall enough to show hds_play_content_h()'s own full content at
-    // once, which every desktop default window size already is; only needed once a host's own
-    // window got shorter than that (Android, see hds_android_gui_scroll_by_px()'s own PLAY case),
-    // which this file had never needed to support until then. Same convention every other
-    // scrollable tab here already uses (subtract from the layout's own fixed top-of-content
-    // constant, see every HDS_PLAY_CONTENT_TOP/hds_play_eg_top_y() call site in this file) rather
-    // than a cairo_translate(), so render and every hit-test function agree on row positions by
-    // construction, never by keeping two copies of the same arithmetic in sync.
-    double scroll_offset_px;
-} HdsClapPlayViewState;
-
-static void hds_clap_play_view_state_init(HdsClapPlayViewState *vs) {
+void hds_clap_play_view_state_init(HdsClapPlayViewState *vs) {
     memset(vs, 0, sizeof(*vs));
     vs->dropdown_kind = HDS_PLAY_DROPDOWN_NONE;
     vs->adsr_drag_eg = -1;
@@ -646,11 +550,6 @@ static void hds_clap_play_view_state_init(HdsClapPlayViewState *vs) {
 #define HDS_PLAY_KNOB_STRIDE 46.0 // vertical space one knob (label+arc+value) reserves
 #define HDS_PLAY_PILL_H 18.0
 #define HDS_PLAY_CHECK_H 15.0
-// 46.0, not 30.0: leaves an 8px-margin, 16px-tall strip at the very top of the tab for the Mode
-// toggle (Single/Combi, see hds_clap_play_mode_toggle_rects()/hds_clap_gui_draw.c's own
-// HDS_CLAP_TAB_PLAY dispatch, which draws/hit-tests it and switches to hds_clap_combi_draw.c's own
-// 8-lane mixer view when Combi is selected) above every oscillator/EG section header.
-#define HDS_PLAY_CONTENT_TOP 52.0 // below this file's own "Oscillators"/"Amp EGs" section labels
 
 // Single/Combi Mode toggle -- drawn/hit-tested by hds_clap_gui_draw.c's own HDS_CLAP_TAB_PLAY
 // dispatch (not this file's own render/press functions), since switching to Combi mode means
@@ -659,7 +558,7 @@ static void hds_clap_play_view_state_init(HdsClapPlayViewState *vs) {
 // p->knobs.performance_mode directly (0=Single, 1=Combi) -- Sequencer (2) is deliberately never
 // reachable from this native GUI (see clap_plugin.c's own task #83 comment: this plugin's
 // process() never runs Sequencer-mode transport/lane playback at all).
-static void hds_clap_play_mode_toggle_rects(HdsFxRect *single_r, HdsFxRect *combi_r) {
+void hds_clap_play_mode_toggle_rects(HdsFxRect *single_r, HdsFxRect *combi_r) {
     *single_r = (HdsFxRect){HDS_PLAY_MARGIN, 4.0, 70.0, 16.0};
     *combi_r  = (HdsFxRect){HDS_PLAY_MARGIN + 74.0, 4.0, 70.0, 16.0};
 }
@@ -762,7 +661,6 @@ typedef struct {
 #define HDS_PLAY_EG_FIELD_H   1
 #define HDS_PLAY_EG_FIELD_A   2
 #define HDS_PLAY_EG_FIELD_DEC 3
-#define HDS_PLAY_EG_FIELD_S   4
 #define HDS_PLAY_EG_FIELD_R   5
 
 // Per envelope-type, the ORDERED list of which fields are visible and in what left-to-right
@@ -774,7 +672,7 @@ typedef struct {
 // Attack's (2), so toggling visibility over fixed slots rendered Hold before Attack for exactly
 // those two types. -1 terminates a shorter row; each row has 6 entries (the max, DADSR/AHDSR),
 // matching HDS_PLAY_EGMODE_NAMES's own row order (ADSR, AR, AD, ASR, AHD, DADSR, AHDSR).
-static const int HDS_PLAY_EG_FIELD_ORDER[HDS_PLAY_EGMODE_COUNT][6] = {
+const int HDS_PLAY_EG_FIELD_ORDER[HDS_PLAY_EGMODE_COUNT][6] = {
     /* ADSR  */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_DEC, HDS_PLAY_EG_FIELD_S, HDS_PLAY_EG_FIELD_R, -1, -1},
     /* AR    */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_R, -1, -1, -1, -1},
     /* AD    */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_DEC, -1, -1, -1, -1},
@@ -784,7 +682,7 @@ static const int HDS_PLAY_EG_FIELD_ORDER[HDS_PLAY_EGMODE_COUNT][6] = {
     /* AHDSR */ {HDS_PLAY_EG_FIELD_A, HDS_PLAY_EG_FIELD_H, HDS_PLAY_EG_FIELD_DEC, HDS_PLAY_EG_FIELD_S, HDS_PLAY_EG_FIELD_R, -1},
 };
 
-static int hds_play_eg_dial_count(int env_type) {
+int hds_play_eg_dial_count(int env_type) {
     if (env_type < 0 || env_type >= HDS_PLAY_EGMODE_COUNT) env_type = 0;
     int n = 0;
     while (n < 6 && HDS_PLAY_EG_FIELD_ORDER[env_type][n] >= 0) n++;
@@ -828,14 +726,14 @@ static void hds_play_compute_eg_layout(int eg_index, int env_type, double col_x,
     }
 }
 
-static const char *const HDS_PLAY_DIAL_LABELS[6] = {"Dly", "Hld", "A", "Dec", "S", "R"};
+const char *const HDS_PLAY_DIAL_LABELS[6] = {"Dly", "Hld", "A", "Dec", "S", "R"};
 // Real backend-unit range for each of the 6 PackEGParams fields (d,h,a,dec,s,r), same order as
 // HDS_PLAY_DIAL_LABELS -- shared by render (the knob arc's own fraction) and interaction (drag
 // range) so they can never disagree, same "one source of truth" rule this whole file follows.
-static const double HDS_PLAY_EG_LO[6] = {0, 0, 1, 1, 0, 1};
-static const double HDS_PLAY_EG_HI[6] = {1000, 1000, 1000, 2000, 100, 2000};
+const double HDS_PLAY_EG_LO[6] = {0, 0, 1, 1, 0, 1};
+const double HDS_PLAY_EG_HI[6] = {1000, 1000, 1000, 2000, 100, 2000};
 
-static float *hds_play_eg_dial_target(PackEGParams *eg, int i) {
+float *hds_play_eg_dial_target(PackEGParams *eg, int i) {
     switch (i) {
         case 0: return &eg->d; case 1: return &eg->h; case 2: return &eg->a;
         case 3: return &eg->dec; case 4: return &eg->s; default: return &eg->r;
@@ -888,7 +786,7 @@ static void hds_play_osc_knob_value_text(HdsPlayOscKnobId id, double val, char *
 // Generic knob draw -- label above, arc at (cx,cy), value readout below, all relative to the
 // knob's own center (unlike hds_fx_draw_knob's row-relative anchoring -- see hds_fx_draw_knob_arc's
 // own comment on why the arc itself was extracted into a shared primitive for exactly this reason).
-static void hds_play_draw_knob(cairo_t *cr, double cx, double cy, double radius, float value01, bool disabled, const char *label, const char *value_text) {
+void hds_play_draw_knob(cairo_t *cr, double cx, double cy, double radius, float value01, bool disabled, const char *label, const char *value_text) {
     if (label && label[0]) {
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 8.0);
@@ -904,7 +802,7 @@ static void hds_play_draw_knob(cairo_t *cr, double cx, double cy, double radius,
     }
 }
 
-static bool hds_play_rect_contains(const HdsFxRect *r, double x, double y) {
+bool hds_play_rect_contains(const HdsFxRect *r, double x, double y) {
     return r->w > 0 && r->h > 0 && x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
 }
 
@@ -915,7 +813,7 @@ static bool hds_play_rect_contains(const HdsFxRect *r, double x, double y) {
 // TOP-LEFT corner is this knob's own CENTER, not one centered on it). A generous radius (the
 // visual radius plus a few px) rather than the bare drawn radius, matching how forgiving a real
 // click target should be for a small 9px knob.
-static bool hds_play_knob_hit_test(const HdsFxRect *r, double x, double y) {
+bool hds_play_knob_hit_test(const HdsFxRect *r, double x, double y) {
     if (r->w <= 0) return false;
     double dx = x - r->x, dy = y - r->y;
     double hit_r = r->w + 4.0;
@@ -940,12 +838,6 @@ static void hds_play_draw_osc_knob(cairo_t *cr, const HdsFxRect *r, float *targe
 
 #define HDS_PLAY_DRAG_PIXELS_FULL_RANGE 150.0
 
-// Generic across every tab that has a click-and-drag knob (not just Play's own oscillator/EG
-// knobs) -- takes the HdsPlayKnobDrag descriptor directly rather than a whole tab's own view
-// state, so a later tab file (e.g. hds_clap_filters_draw.c) can reuse it verbatim against its own
-// view state's own drag field, the same way it already reuses hds_play_draw_knob()/
-// hds_play_knob_hit_test().
-#define HDS_PLAY_NO_MENU ((HdsPlayKnobMenu){0, 0})
 #define HDS_PLAY_DOUBLE_CLICK_MS 400.0
 #define HDS_PLAY_DOUBLE_CLICK_PX 4.0
 
@@ -954,7 +846,7 @@ static void hds_play_draw_osc_knob(cairo_t *cr, const HdsFxRect *r, float *targe
 // (right): recorded as pending; hds_play_apply_knob_drag()/hds_play_release_knob_drag() below
 // promote it to a fine-sensitivity drag once the pointer moves past HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX,
 // or open `menu` on release if it never did (a simple click-vs-drag gesture test).
-static void hds_play_start_knob_drag(HdsPlayKnobDrag *drag, float *target, double lo, double hi, double x, double y, int button, HdsPlayKnobMenu menu) {
+void hds_play_start_knob_drag(HdsPlayKnobDrag *drag, float *target, double lo, double hi, double x, double y, int button, HdsPlayKnobMenu menu) {
     if (!target) return;
     if (button == 3) {
         drag->target = target; drag->lo = lo; drag->hi = hi;
@@ -989,7 +881,7 @@ static void hds_play_start_knob_drag(HdsPlayKnobDrag *drag, float *target, doubl
 // HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX of its own ORIGINAL press point, after which it applies the
 // exact same linear mapping at 1/10th sensitivity (HDS_PLAY_RIGHT_DRAG_SENSITIVITY), always
 // measured from that same press point (never a running last-position).
-static void hds_play_apply_knob_drag(HdsPlayKnobDrag *drag, double x, double y) {
+void hds_play_apply_knob_drag(HdsPlayKnobDrag *drag, double x, double y) {
     if (!drag->target) return;
     if (drag->button == 3) {
         double mdx = x - drag->press_x, mdy = y - drag->press_y;
@@ -1015,7 +907,7 @@ static void hds_play_apply_knob_drag(HdsPlayKnobDrag *drag, double x, double y) 
 // HDS_PLAY_RIGHT_CLICK_THRESHOLD_PX of wherever the button was released in that case (right_moved is
 // still false), so there's no need to plumb the release event's own x/y through the ~8 on_button_
 // release call sites in this codebase just for this.
-static HdsPlayKnobMenu hds_play_release_knob_drag(HdsPlayKnobDrag *drag, double *out_anchor_x, double *out_anchor_y) {
+HdsPlayKnobMenu hds_play_release_knob_drag(HdsPlayKnobDrag *drag, double *out_anchor_x, double *out_anchor_y) {
     HdsPlayKnobMenu menu = HDS_PLAY_NO_MENU;
     if (drag->target && drag->button == 3 && !drag->right_moved && drag->menu.kind != 0) {
         menu = drag->menu;
@@ -1271,7 +1163,7 @@ static void hds_play_poll_sfz_pick(HdsClapPlugin *p) {
     p->sfz_browser_result[0] = '\0';
 }
 
-static void hds_clap_play_render(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewState *vs, double window_w, double window_h) {
+void hds_clap_play_render(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewState *vs, double window_w, double window_h) {
     hds_play_poll_sfz_pick(p);
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
     cairo_rectangle(cr, 0, 0, window_w, window_h);
@@ -1340,7 +1232,7 @@ static void hds_play_copy_eg0_to_all(ProgramState *prog) {
     }
 }
 
-static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState *vs, HdsFxGuiViewState *fxvs, double window_w, double window_h, double x, double y, int button) {
+bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState *vs, HdsFxGuiViewState *fxvs, double window_w, double window_h, double x, double y, int button) {
     ProgramState *prog = hds_play_program(p);
 
     if (vs->ctx_menu.open) return hds_play_ctxmenu_handle_click(p, &vs->ctx_menu, window_w, window_h, x, y);
@@ -1477,7 +1369,7 @@ static bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState
     return false;
 }
 
-static void hds_clap_play_on_motion(HdsClapPlugin *p, HdsClapPlayViewState *vs, double window_w, double x, double y) {
+void hds_clap_play_on_motion(HdsClapPlugin *p, HdsClapPlayViewState *vs, double window_w, double x, double y) {
     ProgramState *prog = hds_play_program(p);
     (void)window_w;
 
@@ -1508,7 +1400,7 @@ static void hds_clap_play_on_motion(HdsClapPlugin *p, HdsClapPlayViewState *vs, 
     }
 }
 
-static void hds_clap_play_on_button_release(HdsClapPlayViewState *vs) {
+void hds_clap_play_on_button_release(HdsClapPlayViewState *vs) {
     double anchor_x = 0.0, anchor_y = 0.0;
     HdsPlayKnobMenu menu = hds_play_release_knob_drag(&vs->knob_drag, &anchor_x, &anchor_y);
     if (menu.kind != 0) {
@@ -1523,7 +1415,7 @@ static void hds_clap_play_on_button_release(HdsClapPlayViewState *vs) {
 // space one knob row already reserves everywhere else in this file, so a wheel step moves roughly
 // one row at a time. Permanently a no-op (max_scroll clamps to 0) on any host tall enough to show
 // hds_play_content_h() in full, which every desktop default window size already is.
-static void hds_clap_play_on_scroll(HdsClapPlayViewState *vs, ProgramState *prog, double window_h, int delta) {
+void hds_clap_play_on_scroll(HdsClapPlayViewState *vs, ProgramState *prog, double window_h, int delta) {
     double max_scroll = hds_play_content_h(prog) - window_h;
     if (max_scroll < 0.0) max_scroll = 0.0;
     vs->scroll_offset_px -= delta * HDS_PLAY_KNOB_STRIDE;

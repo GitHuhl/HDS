@@ -104,24 +104,15 @@ static void hds_clap_build_osc_dispatch_table_once(void) {
 // since it reuses that file's own generic knob primitives (HdsPlayKnobDrag/hds_play_draw_knob/
 // hds_play_knob_hit_test/hds_play_start_knob_drag) rather than duplicating them -- see its own
 // header comment.
-#include "hds_clap_play_draw.c"
-#include "hds_clap_combi_draw.c"
-#include "hds_clap_filters_draw.c"
-#include "hds_clap_lfos_draw.c"
+#include "hds_clap_gui.h" // synth GUI tabs + dispatcher, compiled separately (src/hds_clap_*_draw.c)
 // hds_clap_envelopes_draw.c comes after hds_clap_lfos_draw.c (which is itself just a consumer,
 // alongside this file, of hds_clap_play_draw.c's own hds_lfo_dest_label()/HDS_LFO_DEST_COUNT/
 // hds_dest_list_build()/HDS_DEST_LIST_ROW_H/HDS_DEST_LIST_MAX_H -- the shared 100-entry
 // matrix_shared_routes list) rather than re-transcribing any of it -- see its own header comment.
-#include "hds_clap_envelopes_draw.c"
-#include "hds_clap_routing_draw.c"
-#include "hds_clap_devices_draw.c"
-#include "hds_clap_global_draw.c"
 // hds_clap_recording_draw.c compiles to nothing in this TU (HDS_STANDALONE_GUI_ENABLED is never
 // defined here -- see that file's own header comment) but is still #include'd unconditionally,
 // same convention as every other hds_clap_*_draw.c file, right before hds_clap_gui_draw.c since
 // that file's own HDS_CLAP_TAB_RECORDING dispatch needs its types/functions declared already.
-#include "hds_clap_recording_draw.c"
-#include "hds_clap_gui_draw.c"
 #ifdef _WIN32
 #include "hds_clap_gui_win32.c"
 #else

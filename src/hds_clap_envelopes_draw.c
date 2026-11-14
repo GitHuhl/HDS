@@ -26,22 +26,18 @@
 // ported -- a pure GUI convenience with no backend field of its own, lowest priority of anything
 // seen on any tab so far.
 
+#include "hds_clap_gui.h"
+#include "hds_clap_adsr.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #define HDS_ENV_DROPDOWN_NONE 0
 #define HDS_ENV_DROPDOWN_MODE 1
 #define HDS_ENV_DROPDOWN_DEST 2
 
-typedef struct {
-    int dropdown_kind;   // HDS_ENV_DROPDOWN_*
-    int dropdown_row;    // which assignable EG (0-5) the open dropdown belongs to
-    HdsFxRect dropdown_anchor;
-    double dest_scroll_px; // the open Destination list's own internal scroll -- see hds_clap_lfos_draw.c's own identical field
-    HdsPlayKnobDrag knob_drag; // reused verbatim -- see hds_clap_filters_draw.c's own header comment on this pattern
-    int adsr_drag_eg;        // -1 = not dragging any curve; else 0-5
-    int adsr_active_node[ASSIGNABLE_EG_COUNT];
-    double scroll_offset_px; // the whole 6-panel list's own vertical scroll, same convention as hds_clap_lfos_draw.c's own
-} HdsClapEnvelopesViewState;
-
-static void hds_clap_envelopes_view_state_init(HdsClapEnvelopesViewState *vs) {
+void hds_clap_envelopes_view_state_init(HdsClapEnvelopesViewState *vs) {
     memset(vs, 0, sizeof(*vs));
     vs->dropdown_kind = HDS_ENV_DROPDOWN_NONE;
     vs->adsr_drag_eg = -1;
@@ -110,7 +106,7 @@ static void hds_clap_env_render_dest_dropdown(cairo_t *cr, HdsClapEnvelopesViewS
 // ---------------------------------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------------------------------
-static void hds_clap_envelopes_render(cairo_t *cr, HdsClapPlugin *p, HdsClapEnvelopesViewState *vs, double window_w, double window_h) {
+void hds_clap_envelopes_render(cairo_t *cr, HdsClapPlugin *p, HdsClapEnvelopesViewState *vs, double window_w, double window_h) {
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
     cairo_rectangle(cr, 0, 0, window_w, window_h);
     cairo_fill(cr);
@@ -214,7 +210,7 @@ static void hds_clap_envelopes_render(cairo_t *cr, HdsClapPlugin *p, HdsClapEnve
 // ---------------------------------------------------------------------------------------------
 // Interaction
 // ---------------------------------------------------------------------------------------------
-static bool hds_clap_envelopes_on_button_press(HdsClapPlugin *p, HdsClapEnvelopesViewState *vs, double window_w, double window_h, double x, double y, int button) {
+bool hds_clap_envelopes_on_button_press(HdsClapPlugin *p, HdsClapEnvelopesViewState *vs, double window_w, double window_h, double x, double y, int button) {
     ProgramState *prog = hds_play_program(p);
     double panel_w = window_w - 2.0 * HDS_ENV_MARGIN;
 
@@ -297,7 +293,7 @@ static bool hds_clap_envelopes_on_button_press(HdsClapPlugin *p, HdsClapEnvelope
     return true;
 }
 
-static void hds_clap_envelopes_on_motion(HdsClapPlugin *p, HdsClapEnvelopesViewState *vs, double window_w, double x, double y) {
+void hds_clap_envelopes_on_motion(HdsClapPlugin *p, HdsClapEnvelopesViewState *vs, double window_w, double x, double y) {
     ProgramState *prog = hds_play_program(p);
     double panel_w = window_w - 2.0 * HDS_ENV_MARGIN;
 
@@ -320,12 +316,12 @@ static void hds_clap_envelopes_on_motion(HdsClapPlugin *p, HdsClapEnvelopesViewS
     }
 }
 
-static void hds_clap_envelopes_on_button_release(HdsClapEnvelopesViewState *vs) {
+void hds_clap_envelopes_on_button_release(HdsClapEnvelopesViewState *vs) {
     hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL);
     vs->adsr_drag_eg = -1;
 }
 
-static void hds_clap_envelopes_on_scroll(HdsClapEnvelopesViewState *vs, double window_h, int delta) {
+void hds_clap_envelopes_on_scroll(HdsClapEnvelopesViewState *vs, double window_h, int delta) {
     if (vs->dropdown_kind == HDS_ENV_DROPDOWN_DEST) {
         vs->dest_scroll_px -= delta * HDS_DEST_LIST_ROW_H * 3.0;
         if (vs->dest_scroll_px < 0.0) vs->dest_scroll_px = 0.0;

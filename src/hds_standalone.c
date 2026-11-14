@@ -1211,17 +1211,7 @@ static void poll_stdin_control(SynthSharedControls *knobs, HdsSampleEngine *se) 
 // the nearest analogous count instead.
 #define HDS_FX_PORT_COUNT SOURCE_COUNT
 
-// Real ALSA/MIDI device enumeration for the native GUI's own Devices tab (standalone-only --
-// hds_clap_devices_draw.c's own header comment explains why hds.clap/hds_fx.clap never call these
-// at all: a CLAP host owns its own device selection). Shells out to aplay/arecord -L and aconnect
-// -i via popen()/fgets() rather than using libasound directly (unlike enumerate_pcm_devices()
-// above), with a fallback to one safe entry if the tool itself is missing. A real subprocess
-// spawn+read, so only ever called from a "Rescan" click or the GUI's own startup, never per-frame.
-#define HDS_DEVLIST_MAX 24
-typedef struct {
-    char names[HDS_DEVLIST_MAX][AUDIO_DEVICE_NAME_LEN];
-    int count;
-} HdsDeviceList;
+#include "hds_standalone_devices.h" // HdsDeviceList, hds_scan_alsa_devices, hds_scan_midi_devices
 
 static void hds_devlist_add(HdsDeviceList *list, const char *name) {
     if (list->count >= HDS_DEVLIST_MAX || !name[0]) return;
@@ -1232,7 +1222,7 @@ static void hds_devlist_add(HdsDeviceList *list, const char *name) {
 
 // `aplay -L`/`arecord -L` list one PCM device name per unindented line, with indented description
 // lines following each -- only the unindented ones are real device names. "default" always first.
-static void hds_scan_alsa_devices(const char *tool, HdsDeviceList *out) {
+void hds_scan_alsa_devices(const char *tool, HdsDeviceList *out) {
     out->count = 0;
     hds_devlist_add(out, "default");
     char cmd[64]; snprintf(cmd, sizeof(cmd), "%s -L 2>/dev/null", tool);
@@ -1255,7 +1245,7 @@ static void hds_scan_alsa_devices(const char *tool, HdsDeviceList *out) {
 // source of truth. Index 0 is always "auto" (rendered as "Auto (recommended)" -- see
 // hds_clap_devices_draw.c's own render code -- but stored/wired on the wire as literal "auto",
 // matching backend.c's own midi_device default and OSC convention).
-static void hds_scan_midi_devices(HdsDeviceList *out) {
+void hds_scan_midi_devices(HdsDeviceList *out) {
     out->count = 0;
     hds_devlist_add(out, "auto");
     FILE *fp = popen("aconnect -i 2>/dev/null", "r");
@@ -1279,19 +1269,10 @@ static void hds_scan_midi_devices(HdsDeviceList *out) {
 }
 
 #include "hds_fx_gui_draw.h" // FX pool GUI, compiled separately (src/hds_fx_gui_draw.c)
-#include "hds_clap_play_draw.c"
-#include "hds_clap_combi_draw.c"
-#include "hds_clap_filters_draw.c"
-#include "hds_clap_lfos_draw.c"
-#include "hds_clap_envelopes_draw.c"
-#include "hds_clap_routing_draw.c"
-#include "hds_clap_devices_draw.c"
-#include "hds_clap_global_draw.c"
+#include "hds_clap_gui.h" // synth GUI tabs + dispatcher, compiled separately (src/hds_clap_*_draw.c)
 // Needs record_engine/record_gather (file-scope statics defined earlier in this same TU, right
 // after RecordEngine's own type definition) and HDS_STANDALONE_GUI_ENABLED (forced 1 for this
 // build by the Makefile) -- see hds_clap_recording_draw.c's own header comment.
-#include "hds_clap_recording_draw.c"
-#include "hds_clap_gui_draw.c"
 #include "hds_standalone_gui_x11.c"
 #endif
 
