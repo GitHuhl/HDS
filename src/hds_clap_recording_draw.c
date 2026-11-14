@@ -21,16 +21,17 @@
 // RecordEngine/RecordGatherState/record_engine/record_gather are all defined -- see each
 // includer's own include-order comment.
 
+#include "hds_clap_gui.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #if defined(HDS_STANDALONE_GUI_ENABLED) || defined(HDS_ANDROID_GUI_ENABLED)
 
 #include <sys/stat.h> // mkdir() -- creating the output folder if it doesn't exist yet
 
-typedef struct {
-    bool folder_initialized; // lazy-inits p->record_folder to "~/HDS_Recordings" on first render -- see this file's own render function
-    double scroll_offset_px;
-} HdsClapRecordingViewState;
-
-static void hds_clap_recording_view_state_init(HdsClapRecordingViewState *vs) { memset(vs, 0, sizeof(*vs)); }
+void hds_clap_recording_view_state_init(HdsClapRecordingViewState *vs) { memset(vs, 0, sizeof(*vs)); }
 
 #define HDS_REC_MARGIN 12.0
 #define HDS_REC_PILL_H 18.0
@@ -155,7 +156,7 @@ static bool hds_recording_any_source_selected(const HdsClapPlugin *p) {
     return false;
 }
 
-static void hds_clap_recording_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRecordingViewState *vs, double window_w, double window_h) {
+void hds_clap_recording_render(cairo_t *cr, HdsClapPlugin *p, HdsClapRecordingViewState *vs, double window_w, double window_h) {
     hds_recording_ensure_folder_default(p, vs);
 
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
@@ -291,7 +292,7 @@ static void hds_recording_cycle_wavpack_bitrate(HdsClapPlugin *p) {
     p->knobs.record_wavpack_hybrid_bitrate = HDS_REC_WP_BITRATE_PRESETS[idx];
 }
 
-static bool hds_clap_recording_on_button_press(HdsClapPlugin *p, HdsClapRecordingViewState *vs, HdsFxGuiViewState *fxvs, double x, double y, int button) {
+bool hds_clap_recording_on_button_press(HdsClapPlugin *p, HdsClapRecordingViewState *vs, HdsFxGuiViewState *fxvs, double x, double y, int button) {
     if (button != 1) return true;
     bool wavpack_selected = p->knobs.record_format != 0.0f;
     HdsRecordingLayout L;
@@ -348,10 +349,10 @@ static bool hds_clap_recording_on_button_press(HdsClapPlugin *p, HdsClapRecordin
     return true;
 }
 
-static void hds_clap_recording_on_button_release(HdsClapRecordingViewState *vs) { (void)vs; }
-static void hds_clap_recording_on_motion(HdsClapRecordingViewState *vs, double x, double y) { (void)vs; (void)x; (void)y; }
+void hds_clap_recording_on_button_release(HdsClapRecordingViewState *vs) { (void)vs; }
+void hds_clap_recording_on_motion(HdsClapRecordingViewState *vs, double x, double y) { (void)vs; (void)x; (void)y; }
 
-static void hds_clap_recording_on_scroll(HdsClapPlugin *p, HdsClapRecordingViewState *vs, double window_h, int delta) {
+void hds_clap_recording_on_scroll(HdsClapPlugin *p, HdsClapRecordingViewState *vs, double window_h, int delta) {
     HdsRecordingLayout L;
     hds_clap_recording_compute_layout(0.0, p->knobs.record_format != 0.0f, &L);
     double max_scroll = L.content_h - window_h;

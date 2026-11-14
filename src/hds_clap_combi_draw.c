@@ -47,6 +47,12 @@
 // dispatch calls this file's render/press/motion/release functions directly, not
 // hds_clap_play_draw.c -- the two tab-file bodies never call each other).
 
+#include "hds_clap_gui.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 // Loads a saved .hdsprog's "fields" object onto Combi lane `lane_idx` (0..COMBI_PROGRAM_COUNT-1,
 // i.e. programs[lane_idx]) DIRECTLY -- no OSC round-trip, no frontend needed, matching
 // hds_load_program_file()'s own "reuse osc_dispatch_table, no OSC needed" posture in
@@ -113,9 +119,6 @@ static void hds_load_program_file_to_combi_lane(SynthSharedControls *knobs, cons
 #define HDS_COMBI_DROPDOWN_PROGRAM 1
 #define HDS_COMBI_DROPDOWN_MIDI 2
 
-#define HDS_COMBI_PROGRAM_NAME_LEN 64
-#define HDS_COMBI_PROGRAM_LIST_MAX 24 // see this file's own header comment on why no scroll
-
 #define HDS_COMBI_MARGIN 10.0
 #define HDS_COMBI_LANE_W 140.0
 #define HDS_COMBI_LANE_GAP 6.0
@@ -123,19 +126,7 @@ static void hds_load_program_file_to_combi_lane(SynthSharedControls *knobs, cons
 #define HDS_COMBI_PILL_H 16.0
 #define HDS_COMBI_DD_ROW_H 16.0
 
-typedef struct {
-    int dropdown_kind;   // HDS_COMBI_DROPDOWN_*
-    int dropdown_lane;   // which lane (0..COMBI_PROGRAM_COUNT-1) the open dropdown belongs to
-    HdsFxRect dropdown_anchor;
-
-    HdsPlayKnobDrag knob_drag; // reused verbatim -- see hds_clap_filters_draw.c's own header comment on this pattern
-
-    char lane_program_label[COMBI_PROGRAM_COUNT][HDS_COMBI_PROGRAM_NAME_LEN]; // "" = "(none)"
-    char program_list_cache[HDS_COMBI_PROGRAM_LIST_MAX][HDS_COMBI_PROGRAM_NAME_LEN];
-    int program_list_count;
-} HdsClapCombiViewState;
-
-static void hds_clap_combi_view_state_init(HdsClapCombiViewState *vs) {
+void hds_clap_combi_view_state_init(HdsClapCombiViewState *vs) {
     memset(vs, 0, sizeof(*vs));
     vs->dropdown_kind = HDS_COMBI_DROPDOWN_NONE;
 }
@@ -185,7 +176,7 @@ static const char *hds_combi_midi_channel_label(int ch, char *buf, size_t buflen
     return buf;
 }
 
-static void hds_clap_combi_render(cairo_t *cr, HdsClapPlugin *p, HdsClapCombiViewState *vs, double window_w, double window_h) {
+void hds_clap_combi_render(cairo_t *cr, HdsClapPlugin *p, HdsClapCombiViewState *vs, double window_w, double window_h) {
     (void)window_w;
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
     cairo_rectangle(cr, 0, 0, window_w, window_h);
@@ -261,7 +252,7 @@ static void hds_clap_combi_render(cairo_t *cr, HdsClapPlugin *p, HdsClapCombiVie
     }
 }
 
-static bool hds_clap_combi_on_button_press(HdsClapPlugin *p, HdsClapCombiViewState *vs, double window_h, double x, double y, int button) {
+bool hds_clap_combi_on_button_press(HdsClapPlugin *p, HdsClapCombiViewState *vs, double window_h, double x, double y, int button) {
     if (vs->dropdown_kind == HDS_COMBI_DROPDOWN_PROGRAM) {
         int n = vs->program_list_count;
         double list_h = (n > 0 ? n : 1) * HDS_COMBI_DD_ROW_H;
@@ -351,8 +342,8 @@ static bool hds_clap_combi_on_button_press(HdsClapPlugin *p, HdsClapCombiViewSta
     return false;
 }
 
-static void hds_clap_combi_on_motion(HdsClapCombiViewState *vs, double x, double y) {
+void hds_clap_combi_on_motion(HdsClapCombiViewState *vs, double x, double y) {
     hds_play_apply_knob_drag(&vs->knob_drag, x, y);
 }
 
-static void hds_clap_combi_on_button_release(HdsClapCombiViewState *vs) { hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL); }
+void hds_clap_combi_on_button_release(HdsClapCombiViewState *vs) { hds_play_release_knob_drag(&vs->knob_drag, NULL, NULL); }

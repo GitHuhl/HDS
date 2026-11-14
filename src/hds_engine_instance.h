@@ -25,6 +25,14 @@
 // HdsPendingLoadState/HdsEngineState/HdsSampleEngine/HdsStateRequestContext/HdsSmfImportContext/
 // HdsSmfTrackImportContext/HdsSubscribeContext/HdsFxUploadContext, all defined there) and AFTER
 // hds_fx_gui_host.h (needs HdsFxGuiHost).
+#ifndef HDS_ENGINE_INSTANCE_H
+#define HDS_ENGINE_INSTANCE_H
+
+#include "../third_party/clap/include/clap/clap.h"
+#include "backend.h"
+#include "hds_fx_gui_host.h"
+#include "hds_fx_gui_browser.h"
+
 
 // hds_clap_source_label: text for Source index `idx` (Program 1..COMBI_PROGRAM_COUNT, then Combi
 // Mix, then Ext In
@@ -36,7 +44,7 @@
 // comment -- OSC/SFZ-only for now), but this label still needs to be correct now: without it, this
 // same Source combo (already live for Program/Ext-In sources) would show a bogus "Ext In N" for
 // every Drum Bus id once SOURCE_COUNT grew to include them.
-static void hds_clap_source_label(int idx, char *buf, size_t buflen) {
+static inline void hds_clap_source_label(int idx, char *buf, size_t buflen) {
     if (idx < COMBI_PROGRAM_COUNT) snprintf(buf, buflen, "Program %d", idx + 1);
     else if (idx == COMBI_PROGRAM_COUNT) snprintf(buf, buflen, "Combi Mix");
     else if (idx < DRUM_BUS_SOURCE_BASE) snprintf(buf, buflen, "Ext In %d", idx - COMBI_PROGRAM_COUNT);
@@ -205,3 +213,5 @@ typedef struct {
     // tab renders (see that file's own lazy-init comment).
     char record_folder[RECORD_PATH_LEN];
 } HdsClapPlugin;
+
+#endif // HDS_ENGINE_INSTANCE_H

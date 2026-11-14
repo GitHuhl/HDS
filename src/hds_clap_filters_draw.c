@@ -15,24 +15,19 @@
 // knobs have no right-click menu at all (a post-filter EQ band's own 2-3 knobs are constant for
 // the whole block, never a mod-matrix destination -- see EqBandParams' own comment).
 
+#include "hds_clap_gui.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #define HDS_FILT_DROPDOWN_NONE 0
 #define HDS_FILT_DROPDOWN_TYPE 1
 
 #define HDS_FILT_TYPE_COUNT 5
 static const char *const HDS_FILT_TYPE_NAMES[HDS_FILT_TYPE_COUNT] = {"Off", "LPF", "HPF", "BPF", "Notch"};
 
-typedef struct {
-    int dropdown_kind;   // HDS_FILT_DROPDOWN_* -- only Type ever opens a real option list (5 items);
-                          // Chain Mode and Slope are plain binary click-to-toggle pills instead (see
-                          // this file's own header comment on why a 2-option control doesn't need one)
-    int dropdown_index;  // which filter slot (0-4) the open Type dropdown belongs to
-    HdsFxRect dropdown_anchor;
-    HdsPlayKnobDrag knob_drag; // reused verbatim from hds_clap_play_draw.c -- see this file's own header comment
-    HdsCtxMenu ctx_menu;       // Cutoff's/Resonance's own "Modulate From" menu, if one is open
-    double scroll_offset_px;  // this tab's own vertical scroll -- same convention as hds_clap_lfos_draw.c's own identical field; 5 filter rows + the 3-band EQ section stack taller than a short window
-} HdsClapFiltersViewState;
-
-static void hds_clap_filters_view_state_init(HdsClapFiltersViewState *vs) {
+void hds_clap_filters_view_state_init(HdsClapFiltersViewState *vs) {
     memset(vs, 0, sizeof(*vs));
     vs->dropdown_kind = HDS_FILT_DROPDOWN_NONE;
 }
@@ -118,7 +113,7 @@ static void hds_clap_filters_render_dropdown(cairo_t *cr, HdsClapFiltersViewStat
     }
 }
 
-static void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFiltersViewState *vs, double window_w, double window_h) {
+void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFiltersViewState *vs, double window_w, double window_h) {
     (void)window_w;
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
     cairo_rectangle(cr, 0, 0, window_w, window_h);
@@ -225,7 +220,7 @@ static void hds_clap_filters_render(cairo_t *cr, HdsClapPlugin *p, HdsClapFilter
 // target, Res on the odd one right after it).
 static int hds_filt_res_dest_target(int idx) { return 91 + idx * 2; }
 
-static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersViewState *vs, double window_w, double window_h, double x, double y, int button) {
+bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersViewState *vs, double window_w, double window_h, double x, double y, int button) {
     ProgramState *prog = hds_play_program(p);
 
     if (vs->ctx_menu.open) return hds_play_ctxmenu_handle_click(p, &vs->ctx_menu, window_w, window_h, x, y);
@@ -290,11 +285,11 @@ static bool hds_clap_filters_on_button_press(HdsClapPlugin *p, HdsClapFiltersVie
     return false;
 }
 
-static void hds_clap_filters_on_motion(HdsClapFiltersViewState *vs, double x, double y) {
+void hds_clap_filters_on_motion(HdsClapFiltersViewState *vs, double x, double y) {
     hds_play_apply_knob_drag(&vs->knob_drag, x, y);
 }
 
-static void hds_clap_filters_on_scroll(HdsClapFiltersViewState *vs, double window_h, int delta) {
+void hds_clap_filters_on_scroll(HdsClapFiltersViewState *vs, double window_h, int delta) {
     double max_scroll = hds_clap_filters_content_h() - window_h;
     if (max_scroll < 0.0) max_scroll = 0.0;
     vs->scroll_offset_px -= delta * HDS_FILT_ROW_H;
@@ -302,7 +297,7 @@ static void hds_clap_filters_on_scroll(HdsClapFiltersViewState *vs, double windo
     if (vs->scroll_offset_px > max_scroll) vs->scroll_offset_px = max_scroll;
 }
 
-static void hds_clap_filters_on_button_release(HdsClapFiltersViewState *vs) {
+void hds_clap_filters_on_button_release(HdsClapFiltersViewState *vs) {
     double anchor_x = 0.0, anchor_y = 0.0;
     HdsPlayKnobMenu menu = hds_play_release_knob_drag(&vs->knob_drag, &anchor_x, &anchor_y);
     if (menu.kind != 0) vs->ctx_menu = (HdsCtxMenu){true, anchor_x, anchor_y, menu.kind, menu.arg};
