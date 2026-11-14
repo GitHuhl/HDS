@@ -74,20 +74,7 @@ static char *hds_realpath_compat(const char *path, char *resolved) {
 #endif
 
 
-#define SAMPLE_RATE 48000
-// BUFFER_SIZE and MAX_VOICES are now hard CEILINGS for array allocation only -- how many
-// frames actually get rendered per block, and how many voices are actually allowed to be
-// simultaneously active, are live user controls (SynthSharedControls.block_size_frames and
-// .active_voice_limit, both on the Audio tab) rather than a number picked once at compile time
-// and shipped fixed. This exists because the right value for either one is a property of the
-// ACTUAL machine this is running on -- a fast desktop and a constrained embedded board don't
-// have the same answer, and guessing one number for every deployment either wastes headroom on
-// fast hardware or underruns on slow hardware. The diagnostics on write_audio_block/
-// handle_note_on/the main loop's [perf] check exist so that tuning these live is an informed
-// process (raise it, watch for [perf]/[voices]/[audio] warnings, back off if you see them) --
-// see effective_voice_limit()/effective_block_size() for how the live values get clamped into
-// these ceilings.
-#define BUFFER_SIZE 1024
+#include "hds_config.h" // SAMPLE_RATE, BUFFER_SIZE
 #define MAX_VOICES  256
 #define LFO_COUNT   16
 // LFOs 3-16 (0-indexed 2-15) run at a decimated control rate instead of full audio rate -- 16
@@ -158,14 +145,7 @@ static char *hds_realpath_compat(const char *path, char *resolved) {
 #define OUTPUT_MAX_CHANNELS 16
 #define OUTPUT_PAIR_MAX (OUTPUT_MAX_CHANNELS / 2)
 #define AUDIO_DEVICE_NAME_LEN 64
-// Recording: hard ceiling on how many raw input channels can be captured/selected at once
-// (generous for a class-compliant multichannel interface -- 2/4/8 are the common real cases).
-// Also doubles as the channel count actually requested when opening the capture PCM stream --
-// see query_device_channel_count()/open_pcm_stream() in main().
-#define RECORD_MAX_CHANNELS 16
-// Fixed-size output path buffer for the WAV recorder -- bigger than AUDIO_DEVICE_NAME_LEN since
-// a real filesystem path (not just an ALSA device name) needs the room.
-#define RECORD_PATH_LEN 256
+#include "recording_engine.h" // RECORD_MAX_CHANNELS, RECORD_PATH_LEN, RecordEngine
 // Programmable tempo: hard ceiling on how many (time, bpm) tempo markers the tempo-map can hold
 // at once -- see the Tempo section on SynthSharedControls and compute_current_tempo_bpm().
 #define TEMPO_MARKER_MAX 16
