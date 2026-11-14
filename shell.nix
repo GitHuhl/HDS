@@ -100,6 +100,9 @@ let
   mingwMcfgthread = pkgs.pkgsCross.mingwW64.windows.mcfgthreads;
   mingw = pkgs.pkgsCross.mingwW64;
 
+  # ANDROID DISABLED: Android is an experimental, unofficial platform. Its SDK (unfree, needs
+  # license acceptance) is commented out below so plain `nix-shell` works with no env vars.
+  # To re-enable, uncomment every line tagged by the 'ANDROID DISABLED' notes in this file.
   # android/nix/android-sdk.nix is the single source of truth for this (also used standalone by
   # tools/build_android_manual.sh, when run outside this shell -- see that script's own comment on
   # why it still falls back to calling nix-build itself in that case). Passing THIS file's own
@@ -113,9 +116,9 @@ let
   # running `nix-shell` itself, same as nixpkgs expects for any unfree/licensed package. The
   # Makefile's own `android` target sets both for you; entering this shell directly (not via
   # `make android`) needs them exported by hand first.
-  androidSdk = import ./android/nix/android-sdk.nix { inherit pkgs; };
-  androidNdkVersion = "26.1.10909125";
-  androidBuildToolsVersion = "34.0.0";
+  # androidSdk = import ./android/nix/android-sdk.nix { inherit pkgs; };
+  # androidNdkVersion = "26.1.10909125";
+  # androidBuildToolsVersion = "34.0.0";
 in
 pkgs.mkShell {
   buildInputs = [
@@ -245,7 +248,7 @@ pkgs.mkShell {
     echo "    make clap-windows    -> hds-windows.clap"
     echo "    make hds-fx-windows  -> hds_fx-windows.clap"
     echo
-    echo "  make android    -> android/app/build/manual/hds-backend-test.apk (see android/README.md)"
+    # echo "  make android    -> android/app/build/manual/hds-backend-test.apk (see android/README.md)"
     echo
 
     # pkgsCross.mingwW64.stdenv.cc alone has no pthread.h/libwinpthread on its search path (see the
@@ -341,9 +344,9 @@ pkgs.mkShell {
     # not reliance on buildInputs' automatic PATH injection). ANDROID_SDK_ROOT/ANDROID_NDK_ROOT
     # are the same env var names tools/build_android_manual.sh checks for before falling back to
     # running nix-build itself -- see that script's own comment.
-    export ANDROID_SDK_ROOT="${androidSdk}/libexec/android-sdk"
-    export ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/${androidNdkVersion}"
-    export PATH="$ANDROID_SDK_ROOT/build-tools/${androidBuildToolsVersion}:$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+    # export ANDROID_SDK_ROOT="''${androidSdk}/libexec/android-sdk"
+    # export ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/''${androidNdkVersion}"
+    # export PATH="$ANDROID_SDK_ROOT/build-tools/''${androidBuildToolsVersion}:$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
 
     # tools/build_android_cairo_deps.sh cross-builds pixman/freetype/cairo for the NDK aarch64
     # target from source (no such prebuilt Android libs exist anywhere) -- same "point straight at
@@ -352,8 +355,8 @@ pkgs.mkShell {
     # whatever pixman/freetype/cairo version this nixpkgs revision already carries (the exact same
     # cairo 1.18.0/freetype 2.13.2 the native Linux build above already links against -- one
     # version to think about, not two).
-    export HDS_ANDROID_PIXMAN_SRC="${pkgs.pixman.src}"
-    export HDS_ANDROID_FREETYPE_SRC="${pkgs.freetype.src}"
-    export HDS_ANDROID_CAIRO_SRC="${pkgs.cairo.src}"
+    # export HDS_ANDROID_PIXMAN_SRC="''${pkgs.pixman.src}"
+    # export HDS_ANDROID_FREETYPE_SRC="''${pkgs.freetype.src}"
+    # export HDS_ANDROID_CAIRO_SRC="''${pkgs.cairo.src}"
   '';
 }

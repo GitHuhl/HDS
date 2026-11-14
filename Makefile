@@ -228,7 +228,7 @@ ARM64_BIN := synth_engine-arm64
 # $ORIGIN-relative, i.e. "next to me".
 ARM64_LIBDIR := arm64-libs
 
-.PHONY: all run-backend run-frontend clean clean-windows clap hds-fx arm64 clap-windows hds-fx-windows android FORCE
+.PHONY: all run-backend run-frontend clean clean-windows clap hds-fx arm64 clap-windows hds-fx-windows FORCE
 
 all: $(BIN)
 
@@ -497,8 +497,9 @@ hds-fx-windows: $(WIN_HDS_FX_OBJ) $(WIN_NAM_OBJS)
 # .PHONY) rather than tracking $(ANDROID_APK) as a real target: the script's own APK output
 # timestamp isn't a reliable signal for "needs rebuilding" the way a .o's mtime is, since it
 # depends on source files, the Java sources, AND the manifest all at once.
-android: FORCE
-	NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1 NIXPKGS_ALLOW_UNFREE=1 ./tools/build_android_manual.sh
+# ANDROID DISABLED (experimental platform; its shell.nix SDK is commented out too):
+# android: FORCE
+# 	NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1 NIXPKGS_ALLOW_UNFREE=1 ./tools/build_android_manual.sh
 
 run-backend: $(BIN)
 	./$(BIN)
