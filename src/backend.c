@@ -1,34 +1,14 @@
 // hds_core: the shared DSP/OSC/state engine -- oscillators, filters, the FX chain, the OSC
 // control protocol, the sequencer/arpeggiator, sample streaming, and every other part of this
-// synth that doesn't touch a physical device directly. Compiled into BOTH real targets via plain
-// #include (this project's existing single-translation-unit-per-binary convention, see
-// clap_plugin.c's own header comment for why): src/hds_standalone.c (the ALSA/PipeWire-backed
-// synth_engine executable, which also owns main()) and src/clap_plugin.c (the CLAP plugin, whose
-// host owns the actual audio device -- see hds_standalone.c's own header comment for the full
-// split rationale and exactly what moved out of this file to get here).
+// synth that doesn't touch a physical device directly. Compiled once as its own object
+// (build/backend.o) and linked into both synth_engine (src/hds_standalone.c, which owns the
+// ALSA/PipeWire audio device and main()) and hds.clap (src/clap_plugin.c, whose host owns the
+// device). backend.h is the interface those files use; backend_types.h holds the data model.
 //
 // This project targets Linux only -- see shell.nix's own header comment for why Windows support
 // was dropped entirely (the real, ongoing cost of maintaining a second audio backend, WASAPI vs.
 // ALSA).
-#include <math.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <signal.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
-#include <string.h>
-#include <stdint.h>
-#include <time.h>
-#include <pthread.h>
-#include <stdatomic.h>
-#include <stddef.h>
-#include <dirent.h> // native SFZ parser's case-insensitive sample-path fallback (sfz_resolve_sample_path)
-#include <limits.h> // PATH_MAX, for the same parser's #include cycle-guard/path buffers
-#include <ctype.h>  // isalpha/isalnum/isspace, for the same parser's hand-written tokenizer
-#include <strings.h> // strcasecmp -- SFZ opcode names are conventionally lowercase, matched case-insensitively here for robustness
-#include <lo/lo.h>
+#include "backend.h"
 
 #ifdef _WIN32
 // Two small POSIX-portability gaps, both only reachable through the native SFZ parser (Windows CLAP
@@ -64,16 +44,13 @@ static char *hds_realpath_compat(const char *path, char *resolved) {
 // build) is guarded accordingly. On by default -- unlike PipeWire, this isn't probing for an
 // optional system package (Eigen/NeuralAmpModelerCore are vendored, always present), so every
 // normal x86_64 build gets it for free with nothing to detect.
-#ifndef HDS_NAM_ENABLED
-#define HDS_NAM_ENABLED 1
-#endif
+// HDS_NAM_ENABLED's default (1) lives in hds_config.h.
 #if HDS_NAM_ENABLED
 #include "nam_bridge.h" // extern "C" shim over NeuralAmpModelerCore -- see that header's own
                          // comment and FX_TYPE_NAM below; this is the ONLY C++ this file touches,
                          // and only indirectly through these few functions.
 #endif
 
-#include "backend_types.h" // core data model: limits, ProgramState, SynthSharedControls, SynthVoice
 
 volatile sig_atomic_t g_synth_running = 1;
 
@@ -82,21 +59,6 @@ void handle_sigint(int sig) {
     g_synth_running = 0;
 }
 
-// Clamp the live polyphony/block-size controls into their hard array-allocation ceilings.
-// Centralized here so every loop bound and buffer-fill site derives the same clamped value the
-// same way, rather than each repeating its own (fmaxf/fminf + cast) inline.
-static inline int effective_voice_limit(const SynthSharedControls *knobs) {
-    int n = (int)knobs->active_voice_limit;
-    if (n < 1) n = 1;
-    if (n > MAX_VOICES) n = MAX_VOICES;
-    return n;
-}
-static inline int effective_block_size(const SynthSharedControls *knobs) {
-    int n = (int)knobs->block_size_frames;
-    if (n < 1) n = 1;
-    if (n > BUFFER_SIZE) n = BUFFER_SIZE;
-    return n;
-}
 
 // Programmable tempo: resolves the Tempo knob (tempo_bpm) plus an optional tempo-map
 // (tempo_marker_count time/bpm pairs) into a single "what's the tempo right now" value.
@@ -108,7 +70,7 @@ static inline int effective_block_size(const SynthSharedControls *knobs) {
 // after the last it holds the last marker's bpm flat -- the same convention a DAW tempo track
 // uses. Markers don't need to be given in time order: this scans for the nearest-before and
 // nearest-after markers directly, so out-of-order input still resolves correctly.
-static float compute_current_tempo_bpm(const SynthSharedControls *knobs, double elapsed_seconds) {
+float compute_current_tempo_bpm(const SynthSharedControls *knobs, double elapsed_seconds) {
     // Tempo is Program-scoped (see the Program Save/Load allowlist), so "the current tempo" has
     // to resolve to a specific slot -- Combi lane 1 (programs[0]) in Combi mode, matching every
     // other per-Program precompute's own resolution; Single Program mode's own dedicated slot
@@ -1789,7 +1751,7 @@ static const OscParamEntry OSC_PARAMS[] = {
 };
 #define OSC_PARAMS_COUNT (sizeof(OSC_PARAMS) / sizeof(OSC_PARAMS[0]))
 
-static OscDispatchSlot osc_dispatch_table[OSC_DISPATCH_TABLE_SIZE];
+OscDispatchSlot osc_dispatch_table[OSC_DISPATCH_TABLE_SIZE];
 
 // FNV-1a: fast, simple, and more than good enough for a fixed, known-at-startup key set with no
 // adversarial-input concern (OSC addresses are our own compile-time-generated strings).
@@ -1824,7 +1786,7 @@ static void osc_dispatch_insert(const char *address, size_t offset, OscParamKind
 
 // Mirrors dump_osc_params_addresses.c's own expansion loop exactly (same nested-index shape),
 // since that's the same enumeration this table's correctness depends on matching.
-static void build_osc_dispatch_table(void) {
+void build_osc_dispatch_table(void) {
     for (size_t i = 0; i < OSC_PARAMS_COUNT; i++) {
         const OscParamEntry *e = &OSC_PARAMS[i];
         int n1 = (e->num_indices >= 1) ? e->count : 1;
@@ -1848,7 +1810,7 @@ static void build_osc_dispatch_table(void) {
     }
 }
 
-static const OscDispatchSlot *osc_dispatch_lookup(const char *address) {
+const OscDispatchSlot *osc_dispatch_lookup(const char *address) {
     uint32_t h = osc_hash_address(address) & (OSC_DISPATCH_TABLE_SIZE - 1);
     for (int probes = 0; probes < OSC_DISPATCH_TABLE_SIZE; probes++) {
         const OscDispatchSlot *slot = &osc_dispatch_table[h];
@@ -1861,7 +1823,7 @@ static const OscDispatchSlot *osc_dispatch_lookup(const char *address) {
 
 // --- Minimal JSON reader, for --program (hds_standalone.c's own hds_load_program_file()) AND
 
-static void hds_json_free(HdsJsonValue *v) {
+void hds_json_free(HdsJsonValue *v) {
     if (!v) return;
     for (HdsJsonMember *m = v->first_member; m; ) {
         HdsJsonMember *next = m->next;
@@ -2032,7 +1994,7 @@ static HdsJsonValue *hds_json_parse_value(const char **p) {
 // Top-level entry point: parses a whole JSON document, requiring the entire (whitespace-trimmed)
 // input to be consumed -- trailing garbage after a syntactically valid value is still a malformed
 // document, not a value to silently truncate to. Returns NULL on any parse failure.
-static HdsJsonValue *hds_json_parse(const char *text) {
+HdsJsonValue *hds_json_parse(const char *text) {
     const char *p = text;
     HdsJsonValue *root = hds_json_parse_value(&p);
     if (!root) return NULL;
@@ -2045,7 +2007,7 @@ static HdsJsonValue *hds_json_parse(const char *text) {
 // or its "fields"/"sfz_file" sub-objects), never a hot path, so a hash lookup would be pure
 // overkill (unlike osc_dispatch_table, which really does need O(1) for every incoming OSC message
 // during real-time playback).
-static HdsJsonValue *hds_json_object_get(const HdsJsonValue *obj, const char *key) {
+HdsJsonValue *hds_json_object_get(const HdsJsonValue *obj, const char *key) {
     if (!obj || obj->type != HDS_JSON_OBJECT) return NULL;
     for (HdsJsonMember *m = obj->first_member; m; m = m->next) {
         if (m->key && strcmp(m->key, key) == 0) return m->value;
@@ -2062,7 +2024,7 @@ static int hds_qsort_strcmp(const void *a, const void *b) {
 // Combi-lane Program picker (hds_clap_combi_draw.c) both see the identical list. Caller owns the
 // returned array (and each of its strings) via free(); returns NULL (out_count 0) if
 // ~/HDS_Programs doesn't exist or has no saved Programs.
-static char **hds_scan_programs_folder(int *out_count) {
+char **hds_scan_programs_folder(int *out_count) {
     *out_count = 0;
     const char *home = getenv("HOME");
     if (!home) return NULL;
@@ -2108,7 +2070,7 @@ static char **hds_scan_programs_folder(int *out_count) {
 // osc_dispatch_table (see above) -- an out-of-range index (e.g. "/hds/lfo/99/rate") simply was
 // never inserted into the table, so it correctly falls through to "unrecognized address" below
 // rather than needing its own explicit bounds check.
-static int generic_osc_handler(const char *path, const char *types, lo_arg **argv, int argc,
+int generic_osc_handler(const char *path, const char *types, lo_arg **argv, int argc,
                                 lo_message msg, void *user_data) {
     (void)msg;
     SynthSharedControls *knobs = (SynthSharedControls *)user_data;
@@ -2127,7 +2089,7 @@ static int generic_osc_handler(const char *path, const char *types, lo_arg **arg
     return 0;
 }
 
-static void osc_error_handler(int num, const char *msg, const char *path) {
+void osc_error_handler(int num, const char *msg, const char *path) {
     fprintf(stderr, "[osc] liblo error %d (%s): %s\n", num, path ? path : "?", msg);
 }
 
@@ -2175,7 +2137,7 @@ static void send_full_state_dump(lo_address reply_addr, const SynthSharedControl
     lo_send(reply_addr, "/hds/status/state_dump_complete", "");
 }
 
-static int request_state_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int request_state_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argv; (void)argc;
     HdsStateRequestContext *ctx = (HdsStateRequestContext *)user_data;
     // Reply to whoever actually sent this request (lo_message_get_source), not ctx->reply_addr's
@@ -2201,7 +2163,7 @@ static int request_state_handler(const char *path, const char *types, lo_arg **a
 // no separate registry/heartbeat bookkeeping needed. Reply-to-sender (see request_state_handler's
 // own comment) -- a controller MUST send this from its own actual listening socket so the reply
 // lands back at its real listening port, not an unrelated scan-only socket.
-static int ping_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int ping_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argv; (void)argc;
     const SynthSharedControls *knobs = (const SynthSharedControls *)user_data;
     lo_address source = lo_message_get_source(msg);
@@ -2210,7 +2172,7 @@ static int ping_handler(const char *path, const char *types, lo_arg **argv, int 
     return 0;
 }
 
-static int subscribe_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int subscribe_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argv; (void)argc;
     HdsSubscribeContext *ctx = (HdsSubscribeContext *)user_data;
     lo_address source = lo_message_get_source(msg);
@@ -2226,7 +2188,7 @@ static int subscribe_handler(const char *path, const char *types, lo_arg **argv,
 }
 
 // FIXED: Restored 'init_default_controls' macro mapping setup routine missing from compilation stack
-static void init_default_controls(SynthSharedControls *knobs) {
+void init_default_controls(SynthSharedControls *knobs) {
     knobs->programs[0].is_polyphonic = 1.0f; knobs->programs[0].vco1_shape = 0.0f; knobs->programs[0].vco2_shape = (float)WAVE_OFF;
     knobs->programs[0].fm_intensity = 0.0f; knobs->programs[0].vco1_vol = 0.8f; knobs->programs[0].vco2_vol = 0.5f;
     knobs->programs[0].portamento_time_ms = 150.0f; knobs->master_volume = 0.50f;
@@ -2406,7 +2368,7 @@ static void init_default_controls(SynthSharedControls *knobs) {
     snprintf(knobs->midi_device, AUDIO_DEVICE_NAME_LEN, "auto");
 }
 
-static void init_voice(SynthVoice *voice) {
+void init_voice(SynthVoice *voice) {
     voice->midi_note = -1;
     voice->midi_velocity = 100;
     voice->program_index = 0;
@@ -3422,11 +3384,7 @@ typedef enum { SAMPLE_CMD_NONE = 0, SAMPLE_CMD_START, SAMPLE_CMD_STOP } SampleSt
 // Sequencer audio-lane RAM loading ("Load Audio", SeqLaneState.audio_path)
 // ============================================================================
 
-static HdsStreamsState g_streams_state;
-#define g_sample_streams g_streams_state.sample_streams
-#define g_sample_disk_thread g_streams_state.sample_disk_thread
-#define g_sample_disk_thread_shutdown g_streams_state.sample_disk_thread_shutdown
-#define g_seq_audio g_streams_state.seq_audio
+HdsStreamsState g_streams_state;
 
 // Renders one sample of preview playback for a single Sequencer audio lane (see the "Preview"
 // button comment on SeqLaneState.audio_preview_trigger), applying the lane's own volume/pan
@@ -3486,7 +3444,7 @@ static int claim_sample_stream(HdsSampleEngine *se, int slot_index, unsigned int
 
 // Releases a claimed stream back to the pool (audio-thread only) and tells the disk thread to
 // close its file. Safe to call even if a STOP is already pending/being processed.
-static void release_sample_stream(HdsSampleEngine *se, int stream_index) {
+void release_sample_stream(HdsSampleEngine *se, int stream_index) {
     if (stream_index < 0 || stream_index >= MAX_SAMPLE_STREAMS) return;
     atomic_store_explicit(&se->streams->sample_streams[stream_index].command, SAMPLE_CMD_STOP, memory_order_release);
     se->streams->sample_streams[stream_index].in_use = false;
@@ -3502,7 +3460,7 @@ static void request_sample_stream_release(HdsSampleEngine *se, int stream_index)
     atomic_store_explicit(&se->streams->sample_streams[stream_index].release_requested, true, memory_order_release);
 }
 
-static void *sample_disk_thread_main(void *arg) {
+void *sample_disk_thread_main(void *arg) {
     HdsSampleEngine *se = (HdsSampleEngine *)arg;
     for (;;) {
         bool work_done = false;
@@ -3846,7 +3804,7 @@ static void apply_playback_end(SampleSlot *slot, float end_frac) {
 // this only at message-receipt time (like the old apply_sample_slot_zone_metadata() did every
 // block) would leave a sample that was still queued when its metadata arrived stuck on the
 // load-time placeholder loop points forever.
-static void drain_pending_sample_loads(HdsSampleEngine *se) {
+void drain_pending_sample_loads(HdsSampleEngine *se) {
     for (int i = 0; i < SAMPLE_LOADS_PER_BLOCK && se->pending->pending_load_count > 0; i++) {
         PendingSampleLoad *p = &se->pending->pending_loads[se->pending->pending_load_head];
         se->pending->pending_load_head = (se->pending->pending_load_head + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
@@ -3922,7 +3880,7 @@ static void drain_pending_sample_loads(HdsSampleEngine *se) {
 // saved state only ever touches that Program's own zones. Loading itself stays exactly as
 // immediate as it always was -- there's no separate "is this relevant right now" gate here at
 // all; a zone loads because its owning Program actually has it assigned, full stop.
-static void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
+void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     int found_index = -1;
     for (int s = 0; s < se->slots->sample_slot_count; s++) {
         if (se->slots->sample_slots[s].active && se->slots->sample_slots[s].zone_id == rec->zone_id) { found_index = s; break; }
@@ -4023,7 +3981,7 @@ static void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     // posture as SampleSlot.drum_bus's own comment describes.
 }
 
-static void apply_zone_remove(HdsSampleEngine *se, int32_t zone_id) {
+void apply_zone_remove(HdsSampleEngine *se, int32_t zone_id) {
     for (int s = 0; s < se->slots->sample_slot_count; s++) {
         if (se->slots->sample_slots[s].active && se->slots->sample_slots[s].zone_id == zone_id) {
             se->slots->sample_slots[s].active = false;
@@ -4057,7 +4015,7 @@ static void unload_zones_for_osc(HdsSampleEngine *se, int osc_index, int owner_p
 // loop_release_exit, end_frac, assigned_osc, owner_program) + path. liblo only dispatches here
 // when the incoming type string matches exactly, so argc/types are already guaranteed correct --
 // no manual validation needed, unlike generic_osc_handler's table.
-static int zone_upsert_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int zone_upsert_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argc; (void)msg;
     HdsSampleEngine *se = (HdsSampleEngine *)user_data;
     ZoneRecordWire rec;
@@ -4070,7 +4028,7 @@ static int zone_upsert_handler(const char *path, const char *types, lo_arg **arg
     return 0;
 }
 // "/hds/zone/remove" i -- a single zone_id.
-static int zone_remove_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int zone_remove_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argc; (void)msg;
     HdsSampleEngine *se = (HdsSampleEngine *)user_data;
     apply_zone_remove(se, argv[0]->i);
@@ -4082,7 +4040,7 @@ static int zone_remove_handler(const char *path, const char *types, lo_arg **arg
 // the Mapping-tab wire protocol, and it's a cheap in-place field update on an already-loaded zone
 // (like apply_zone_upsert's own "path unchanged" branch), never a reason to reload the sample
 // itself. Silently a no-op if zone_id isn't currently active (e.g. a stale message after removal).
-static int zone_drum_bus_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int zone_drum_bus_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argc; (void)msg;
     HdsSampleEngine *se = (HdsSampleEngine *)user_data;
     int32_t zone_id = argv[0]->i;
@@ -4110,7 +4068,7 @@ static int32_t g_next_native_zone_id = -1; // decrements per native-loaded zone;
     // zone_ids are always >= 1 (SamplerMappingGrid._next_zone_id only ever increments from 1), so
     // this negative space can never collide with one.
 
-static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_program, const char *sfz_path) {
+int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_program, const char *sfz_path) {
     if (osc_index < 0 || osc_index > 3) return 0;
     owner_program = clamp_owner_program((float)owner_program);
 
@@ -4319,7 +4277,7 @@ static int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_pr
 // of only guarding the effect). se->pending->vco_shape_last[p][o] uses -1 (never a real WaveType)
 // as "not yet observed" so the very first poll after startup/a fresh instance never unloads
 // anything -- see HdsPendingLoadState.vco_shape_last's own comment.
-static void poll_vco_shape_unload(HdsSampleEngine *se, const SynthSharedControls *knobs) {
+void poll_vco_shape_unload(HdsSampleEngine *se, const SynthSharedControls *knobs) {
     if (!se->pending->vco_shape_last_init) {
         for (int p = 0; p <= COMBI_PROGRAM_COUNT; p++) for (int o = 0; o < 4; o++) se->pending->vco_shape_last[p][o] = -1.0f;
         se->pending->vco_shape_last_init = true;
@@ -4342,7 +4300,7 @@ static void poll_vco_shape_unload(HdsSampleEngine *se, const SynthSharedControls
 // a payload the frontend decoded itself -- see this pass's own design rationale: a backend on
 // another system has its samples with it locally, so only a path needs to cross the wire). Reuses
 // the exact same hds_load_sfz_for_osc() the CLI --sfz-vcoN flags call.
-static int zone_load_sfz_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int zone_load_sfz_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argc; (void)msg;
     HdsSampleEngine *se = (HdsSampleEngine *)user_data;
     int osc_index = argv[0]->i;
@@ -5203,7 +5161,7 @@ static const FmAlgorithm FM_ALGORITHMS[FM_ALGORITHM_COUNT] = {
 // point from an earlier render_order slot to a later one -- a bad hand-edited row would otherwise
 // silently read a not-yet-rendered oscillator's stale modulator_output from the previous sample
 // instead of failing loudly.
-static void assert_fm_algorithms_acyclic(void) {
+void assert_fm_algorithms_acyclic(void) {
     for (int a = 0; a < FM_ALGORITHM_COUNT; a++) {
         const FmAlgorithm *alg = &FM_ALGORITHMS[a];
         int position[4];
@@ -5238,7 +5196,7 @@ static float sample_osc_zone_pan_offset(HdsSampleEngine *se, int stream_idx) {
 
 // target_program: which of knobs->programs[COMBI_PROGRAM_COUNT] this note belongs to (0 in
 // --- Microtuning (Scala .scl import -- see SynthSharedControls.tuning_enable's own comment) ---
-static HdsTuningTable g_tuning_table;
+HdsTuningTable g_tuning_table;
 
 // Parses one .scl pitch line into a ratio. Returns false (leaving *out_ratio untouched) if the
 // line has no parseable number at all -- a blank/malformed line the caller should skip rather
@@ -5266,7 +5224,7 @@ static bool hds_parse_scl_pitch_line(const char *line, float *out_ratio) {
 // where it originated) rather than in hds_standalone.c specifically so hds_clap_global_draw.c's own
 // "Load Scale (.scl)..." button can call it too -- it has no standalone-specific dependency at all,
 // just plain FILE I/O and a write into g_tuning_table just above, which both hosts already share.
-static bool hds_tuning_load_scl(const char *file_path) {
+bool hds_tuning_load_scl(const char *file_path) {
     FILE *f = fopen(file_path, "r");
     if (!f) return false;
     char line[256];
@@ -5331,7 +5289,7 @@ static float hds_note_to_hz(const SynthSharedControls *knobs, int note) {
 // simultaneously-mono-mode Combi Programs never collide on voice 0 -- a direct generalization of
 // today's hardcoded "mono always uses voice 0", byte-identical when target_program is always 0
 // (Single Program/Sequencer modes).
-static void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], int target_program, int note, int velocity, bool poly_mode_active, MonoNoteStack *mono_stack) {
+void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], int target_program, int note, int velocity, bool poly_mode_active, MonoNoteStack *mono_stack) {
     // FX_TYPE_HARDTUNE's own global note tracker (see its own comment) -- unconditional on
     // poly_mode_active, unlike the Program-scoped mono_stack just below.
     mono_stack_push(&g_hardtune_note_stack, note, velocity);
@@ -5544,7 +5502,7 @@ static void trigger_voice_release(HdsSampleEngine *se, SynthVoice *voice) {
     }
 }
 
-static void handle_note_off(HdsSampleEngine *se, SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int target_program, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
+void handle_note_off(HdsSampleEngine *se, SynthVoice voices[], const SynthSharedControls *knobs, const MidiLiveState *midi_live, int target_program, int note, bool poly_mode_active, MonoNoteStack *mono_stack) {
     // FX_TYPE_HARDTUNE's own global note tracker (see its own comment) -- unconditional on
     // poly_mode_active, unlike the Program-scoped mono_stack below.
     mono_stack_remove(&g_hardtune_note_stack, note);
@@ -5670,7 +5628,7 @@ static uint32_t hds_crc32(const uint8_t *data, size_t len) {
     return ~crc;
 }
 
-static int fx_upload_begin_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int fx_upload_begin_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argc; (void)msg;
     HdsFxUploadContext *ctx = (HdsFxUploadContext *)user_data;
     HdsEngineState *engine = ctx->engine;
@@ -5696,7 +5654,7 @@ static int fx_upload_begin_handler(const char *path, const char *types, lo_arg *
     return 0;
 }
 
-static int fx_upload_chunk_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int fx_upload_chunk_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argc; (void)msg;
     HdsFxUploadContext *ctx = (HdsFxUploadContext *)user_data;
     HdsEngineState *engine = ctx->engine;
@@ -5712,7 +5670,7 @@ static int fx_upload_chunk_handler(const char *path, const char *types, lo_arg *
     return 0;
 }
 
-static int fx_upload_end_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int fx_upload_end_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)argv; (void)argc;
     HdsFxUploadContext *ctx = (HdsFxUploadContext *)user_data;
     HdsEngineState *engine = ctx->engine;
@@ -5764,24 +5722,12 @@ static int fx_upload_end_handler(const char *path, const char *types, lo_arg **a
 // caller in the whole program, reaching every value through this one unchanging pointer instead
 // of implicitly. Provably behavior-identical by construction; verified empirically per-phase via
 // the determinism-check harness (see the plan doc) rather than trusted on this reasoning alone.
-static HdsEngineState g_engine;
+HdsEngineState g_engine;
 
 // Temporary bridge macros (multi-instance Phase 2 only): every pre-existing g_* name below now
 // expands to the matching g_engine field, so this phase is a pure rename/regroup with zero
 // control-flow change. Removed incrementally in later phases as each subsystem's functions gain
 // a real `engine` parameter (see the plan doc's phase breakdown).
-#define g_seq_midi g_engine.seq_midi
-#define g_transport_state g_engine.transport_state
-#define g_transport_playhead_sec g_engine.transport_playhead_sec
-#define g_transport_last_play_trigger g_engine.transport_last_play_trigger
-#define g_transport_last_pause_trigger g_engine.transport_last_pause_trigger
-#define g_transport_last_stop_trigger g_engine.transport_last_stop_trigger
-#define g_transport_last_seek_start_trigger g_engine.transport_last_seek_start_trigger
-#define g_transport_last_seek_back_trigger g_engine.transport_last_seek_back_trigger
-#define g_transport_last_seek_fwd_trigger g_engine.transport_last_seek_fwd_trigger
-#define g_metronome_next_click_sec g_engine.metronome_next_click_sec
-#define g_metronome_click_samples_left g_engine.metronome_click_samples_left
-#define g_metronome_click_phase g_engine.metronome_click_phase
 
 // --- Metronome state (declared here, ahead of poll_transport_triggers below, so a Seek can
 // resync it -- see the `seeked` block's own comment further down). A cheap, deliberately
@@ -5800,7 +5746,7 @@ static HdsEngineState g_engine;
 // used -- matching the Arpeggiator's own transport-independence. Schedules (but does not itself
 // render) upcoming clicks: crossing one or more beat boundaries this block arms/re-arms the
 // click-sample countdown that render_audio_block's per-sample loop actually renders from.
-static void poll_metronome(HdsEngineState *engine, const SynthSharedControls *knobs, float current_tempo_bpm, int block_size) {
+void poll_metronome(HdsEngineState *engine, const SynthSharedControls *knobs, float current_tempo_bpm, int block_size) {
     if (knobs->metronome_enable == 0.0f) {
         // Not engaged -- keep the next-click schedule pinned to "right now" so re-enabling
         // starts cleanly on the very next beat instead of firing a backlog of missed clicks, and
@@ -6291,7 +6237,7 @@ static bool hds_song_import_smf_track(HdsEngineState *engine, int lane_index, co
 // Fired once, synchronously -- same posture as song_import_smf_handler() just below, which this
 // mirrors closely (a per-lane import instead of a whole-song one, no tempo/knobs argument since
 // this never touches any).
-static int song_import_smf_track_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int song_import_smf_track_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types;
     HdsSmfTrackImportContext *ctx = (HdsSmfTrackImportContext *)user_data;
     if (argc != 2) return 0;
@@ -6324,7 +6270,7 @@ static int song_import_smf_track_handler(const char *path, const char *types, lo
 // the file, applies it, and immediately reports the result back to reply_addr as one small bundle
 // -- there's no periodic per-block status poll for this the way send_seq_audio_status has, since
 // an import is a one-shot event, not ongoing state.
-static int song_import_smf_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int song_import_smf_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types;
     HdsSmfImportContext *ctx = (HdsSmfImportContext *)user_data;
     if (argc != 2) return 0;
@@ -6407,7 +6353,7 @@ static unsigned int arp_xorshift32(unsigned int *state) {
 // they only update engine->arp_held_notes[p] via arp_note_on/arp_note_off. This function is the
 // only place that actually triggers voices for such a Program, synthesizing its own note-on/off
 // calls exactly like seq_playback_midi_events already does for recorded Sequencer events.
-static void poll_arpeggiator(HdsEngineState *engine, HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], const MidiLiveState *midi_live, int block_size) {
+void poll_arpeggiator(HdsEngineState *engine, HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], const MidiLiveState *midi_live, int block_size) {
     bool combi_mode_active = ((int)knobs->performance_mode == 1);
     int active_program_count = combi_mode_active ? COMBI_PROGRAM_COUNT : 1;
 
@@ -6610,7 +6556,7 @@ static void arp_note_off(HdsEngineState *engine, const ProgramState *prog, int t
     // should replace the latched chord -- see dispatch_midi_event's own Hold-handling comment.
 }
 
-static void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, HdsMidiEventType type, int midi_channel_1_16, int data1, int value,
+void dispatch_midi_event(HdsEngineState *engine, HdsSampleEngine *se, HdsMidiEventType type, int midi_channel_1_16, int data1, int value,
                                  SynthVoice voices[], SynthSharedControls *knobs,
                                  float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT],
                                  MonoNoteStack mono_stacks[COMBI_PROGRAM_COUNT + 1], MidiLiveState *midi_live, float current_tempo_bpm) {
@@ -6882,7 +6828,7 @@ static void apply_program_eq(HdsEngineState *engine, int p, const EqBiquadCoeffs
 // for every other type). Deliberately NOT smoothed like gr_db_out above -- it already changes
 // slowly and smoothly on its own (a double-precision accumulator ramping toward a target, never a
 // fast audio-rate envelope), so a raw per-block reading is already perfectly readable.
-static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm, float ext_in_peak_out[EXT_IN_PAIR_COUNT], float *per_program_out, float gr_db_out[FX_SLOT_COUNT], float dump_avail_out[FX_SLOT_COUNT]) {
+float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice voices[], const SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], const float *ext_in_buffer, int ext_in_channels, int output_channels, const MidiLiveState *midi_live, float *out_buffer, float current_tempo_bpm, float ext_in_peak_out[EXT_IN_PAIR_COUNT], float *per_program_out, float gr_db_out[FX_SLOT_COUNT], float dump_avail_out[FX_SLOT_COUNT]) {
     float peak = 0.0f;
     float gr_db_raw[FX_SLOT_COUNT]; // this block's own raw, unsmoothed readings -- see gr_db_out's own comment above
     for (int s = 0; s < FX_SLOT_COUNT; s++) gr_db_raw[s] = 0.0f;
@@ -8277,7 +8223,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
 // if nothing is listening on the reply port, lo_send_bundle simply has nowhere to deliver to --
 // a no-op, not an error, same as the old stream-socket's behavior whenever client_fd wasn't
 // connected.
-static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
+void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
     lo_bundle b = lo_bundle_new(LO_TT_IMMEDIATE);
     lo_message m;
     m = lo_message_new(); lo_message_add_float(m, status->peak); lo_bundle_add_message(b, "/hds/status/peak", m);
@@ -8314,7 +8260,7 @@ static void send_osc_status(lo_address reply_addr, const EngineStatus *status) {
 // set -- only lanes with a non-idle load_state (at most SEQ_LANE_COUNT, in practice usually 0)
 // get a message, so an unused Sequencer session costs nothing extra on this reply port. Sent at
 // the same vu_decimator cadence as send_osc_status(), from the same call site.
-static void send_seq_audio_status(HdsStreamsState *streams, lo_address reply_addr) {
+void send_seq_audio_status(HdsStreamsState *streams, lo_address reply_addr) {
     lo_bundle b = lo_bundle_new(LO_TT_IMMEDIATE);
     bool any = false;
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {

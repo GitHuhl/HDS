@@ -21,4 +21,9 @@
 // Fixed-size buffer for sample/model/IR file paths (Sample Bank, FX slot NAM model + cab IR).
 #define SAMPLE_PATH_LEN 256
 
+// Neural Amp Modeler FX slot support (FX_TYPE_NAM). On by default; the C++ bridge is vendored.
+#ifndef HDS_NAM_ENABLED
+#define HDS_NAM_ENABLED 1
+#endif
+
 #endif // HDS_CONFIG_H

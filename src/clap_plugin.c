@@ -29,9 +29,7 @@
 #include <stdarg.h>
 #include "../third_party/clap/include/clap/clap.h"
 
-#define main backend_main_unused
-#include "backend.c"
-#undef main
+#include "backend.h" // shared engine, compiled separately (src/backend.c)
 
 // hds_fx_gui_draw.c's own HDS_FX_PORT_COUNT (hds_fx_plugin.c's own flat "8 real stereo ports"
 // constant) is used to clamp/size the Input/Output dropdown machinery it shares with every host --

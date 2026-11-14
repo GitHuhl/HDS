@@ -54,6 +54,10 @@ STANDALONE_UNIT_OBJS := $(BUILD_DIR)/recording_engine.o
 # visibility so the two .clap files never interpose each other's fx_chain symbols in one host
 # (same reason as NAM_CXXFLAGS' -fvisibility=hidden; CLAP_EXPORT keeps clap_entry visible).
 FX_CHAIN_OBJ := $(BUILD_DIR)/fx_chain.o
+# backend.o (the shared synth engine) is linked into synth_engine and hds.clap; same -fPIC/hidden
+# visibility reasoning as fx_chain.o.
+BACKEND_OBJ := $(BUILD_DIR)/backend.o
+BACKEND_DEPS := src/backend.c src/backend.h src/backend_types.h src/hds_config.h src/fx_types.h src/fx_chain.h src/recording_engine.h src/nam_bridge.h
 FX_CHAIN_DEPS := src/fx_chain.c src/fx_chain.h src/fx_types.h src/hds_config.h src/nam_bridge.h
 CLAP_OBJ := $(BUILD_DIR)/clap_plugin.o
 
@@ -286,10 +290,10 @@ FORCE:
 # list $(CLAP_OBJ) has below (plus src/hds_engine_instance.h and src/hds_clap_global_draw.c -- both
 # real prerequisites of $(CLAP_OBJ) too; their absence there is a pre-existing gap this same pass
 # fixes) so editing any of them triggers a rebuild here as well.
-$(BIN_OBJ): $(SRC) src/backend.c src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/sequencer.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_global_draw.c src/hds_clap_gui_draw.c src/hds_standalone_gui_x11.c | $(BUILD_DIR)
+$(BIN_OBJ): $(SRC) src/backend.h src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/sequencer.c src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_global_draw.c src/hds_clap_gui_draw.c src/hds_standalone_gui_x11.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -DHDS_STANDALONE_GUI_ENABLED=1 $(shell pkg-config --cflags cairo x11) -c $(SRC) -o $@
 
-$(CLAP_OBJ): $(CLAP_SRC) src/backend.c src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_global_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_x11.c | $(BUILD_DIR)
+$(CLAP_OBJ): $(CLAP_SRC) src/backend.h src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_global_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_x11.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(HDS_FX_CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
 $(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.h src/hds_config.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_fx_gui_x11.c src/nam_bridge.h | $(BUILD_DIR)
@@ -312,11 +316,14 @@ $(BUILD_DIR)/recording_engine.o: src/recording_engine.c src/recording_engine.h s
 $(FX_CHAIN_OBJ): $(FX_CHAIN_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
 
-$(BIN): $(BIN_OBJ) $(STANDALONE_UNIT_OBJS) $(FX_CHAIN_OBJ) $(NAM_OBJS)
-	$(CXX) $(STRIPFLAGS) -o $@ $(BIN_OBJ) $(STANDALONE_UNIT_OBJS) $(FX_CHAIN_OBJ) $(NAM_OBJS) $(LDLIBS) $(PIPEWIRE_LDLIBS) $(shell pkg-config --libs cairo x11)
+$(BACKEND_OBJ): $(BACKEND_DEPS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
 
-clap: $(CLAP_OBJ) $(FX_CHAIN_OBJ) $(NAM_OBJS)
-	$(CXX) $(STRIPFLAGS) -shared -o $(CLAP_BIN) $(CLAP_OBJ) $(FX_CHAIN_OBJ) $(NAM_OBJS) $(LDLIBS) $(shell pkg-config --libs cairo x11)
+$(BIN): $(BIN_OBJ) $(BACKEND_OBJ) $(STANDALONE_UNIT_OBJS) $(FX_CHAIN_OBJ) $(NAM_OBJS)
+	$(CXX) $(STRIPFLAGS) -o $@ $(BIN_OBJ) $(BACKEND_OBJ) $(STANDALONE_UNIT_OBJS) $(FX_CHAIN_OBJ) $(NAM_OBJS) $(LDLIBS) $(PIPEWIRE_LDLIBS) $(shell pkg-config --libs cairo x11)
+
+clap: $(CLAP_OBJ) $(BACKEND_OBJ) $(FX_CHAIN_OBJ) $(NAM_OBJS)
+	$(CXX) $(STRIPFLAGS) -shared -o $(CLAP_BIN) $(CLAP_OBJ) $(BACKEND_OBJ) $(FX_CHAIN_OBJ) $(NAM_OBJS) $(LDLIBS) $(shell pkg-config --libs cairo x11)
 
 hds-fx: $(HDS_FX_OBJ) $(FX_CHAIN_OBJ) $(NAM_OBJS)
 	$(CXX) $(STRIPFLAGS) -shared -o $(HDS_FX_BIN) $(HDS_FX_OBJ) $(FX_CHAIN_OBJ) $(NAM_OBJS) $(HDS_FX_LDLIBS)
@@ -344,18 +351,21 @@ ARM64_BIN_OBJ := $(BUILD_DIR)/hds_standalone-arm64.o
 # hds_standalone.c itself stays plain C, compiled by $(ARM64_CC) exactly like the native
 # $(BIN_OBJ) rule above -- only the FINAL link step needs $(ARM64_CXX), to pull in libstdc++ for
 # the NAM objects linked alongside it, same reasoning as $(BIN)/clap's own rules.
-$(ARM64_BIN_OBJ): $(SRC) src/backend.c src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
+$(ARM64_BIN_OBJ): $(SRC) src/backend.h src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/sequencer.c src/nam_bridge.h | $(BUILD_DIR)
 	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $(SRC) -o $@
 
 $(BUILD_DIR)/recording_engine-arm64.o: src/recording_engine.c src/recording_engine.h src/hds_config.h | $(BUILD_DIR)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/backend-arm64.o: $(BACKEND_DEPS) | $(BUILD_DIR)
+	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/fx_chain-arm64.o: $(FX_CHAIN_DEPS) | $(BUILD_DIR)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
-arm64: $(ARM64_BIN_OBJ) $(BUILD_DIR)/recording_engine-arm64.o $(BUILD_DIR)/fx_chain-arm64.o $(ARM64_NAM_OBJS)
-	$(ARM64_CXX) $(STRIPFLAGS) -o $(ARM64_BIN) $(ARM64_BIN_OBJ) $(BUILD_DIR)/recording_engine-arm64.o $(BUILD_DIR)/fx_chain-arm64.o $(ARM64_NAM_OBJS) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo -lwavpack
+arm64: $(ARM64_BIN_OBJ) $(BUILD_DIR)/backend-arm64.o $(BUILD_DIR)/recording_engine-arm64.o $(BUILD_DIR)/fx_chain-arm64.o $(ARM64_NAM_OBJS)
+	$(ARM64_CXX) $(STRIPFLAGS) -o $(ARM64_BIN) $(ARM64_BIN_OBJ) $(BUILD_DIR)/backend-arm64.o $(BUILD_DIR)/recording_engine-arm64.o $(BUILD_DIR)/fx_chain-arm64.o $(ARM64_NAM_OBJS) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo -lwavpack
 	mkdir -p $(ARM64_LIBDIR)
 	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
 	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_BIN)
@@ -478,7 +488,7 @@ WIN_CLAP_OBJ := $(BUILD_DIR)/clap_plugin-win.o
 WIN_HDS_FX_BIN := hds_fx-windows.clap
 WIN_HDS_FX_OBJ := $(BUILD_DIR)/hds_fx_plugin-win.o
 
-$(WIN_CLAP_OBJ): $(CLAP_SRC) src/backend.c src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_win32.c | $(BUILD_DIR)
+$(WIN_CLAP_OBJ): $(CLAP_SRC) src/backend.h src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_clap_play_draw.c src/hds_clap_combi_draw.c src/hds_clap_adsr.h src/hds_clap_filters_draw.c src/hds_clap_lfos_draw.c src/hds_clap_envelopes_draw.c src/hds_clap_routing_draw.c src/hds_clap_devices_draw.c src/hds_clap_gui_draw.c src/hds_clap_gui_win32.c | $(BUILD_DIR)
 	$(WIN_CC) $(WIN_CFLAGS) -c $(CLAP_SRC) -o $@
 
 $(WIN_HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.h src/hds_config.h src/hds_fx_gui_draw.c src/hds_fx_gui_browser.c src/hds_fx_gui_win32.c src/nam_bridge.h | $(BUILD_DIR)
@@ -499,12 +509,16 @@ $(WIN_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp $(WIN_NAM_FLAGS_STAMP) | 
 $(WIN_NAM_BUILD_DIR)/%.o: src/%.cpp $(WIN_NAM_FLAGS_STAMP) | $(WIN_NAM_BUILD_DIR)
 	$(WIN_CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
+WIN_BACKEND_OBJ := $(BUILD_DIR)/backend-win.o
+$(WIN_BACKEND_OBJ): $(BACKEND_DEPS) | $(BUILD_DIR)
+	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
+
 WIN_FX_CHAIN_OBJ := $(BUILD_DIR)/fx_chain-win.o
 $(WIN_FX_CHAIN_OBJ): $(FX_CHAIN_DEPS) | $(BUILD_DIR)
 	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
 
-clap-windows: $(WIN_CLAP_OBJ) $(WIN_FX_CHAIN_OBJ) $(WIN_NAM_OBJS)
-	$(WIN_CXX) -shared $(STRIPFLAGS) $(WIN_LDFLAGS) -o $(WIN_CLAP_BIN) $(WIN_CLAP_OBJ) $(WIN_FX_CHAIN_OBJ) $(WIN_NAM_OBJS) $(WIN_LDLIBS)
+clap-windows: $(WIN_CLAP_OBJ) $(WIN_BACKEND_OBJ) $(WIN_FX_CHAIN_OBJ) $(WIN_NAM_OBJS)
+	$(WIN_CXX) -shared $(STRIPFLAGS) $(WIN_LDFLAGS) -o $(WIN_CLAP_BIN) $(WIN_CLAP_OBJ) $(WIN_BACKEND_OBJ) $(WIN_FX_CHAIN_OBJ) $(WIN_NAM_OBJS) $(WIN_LDLIBS)
 	@if [ -n "$(WIN_EXTRA_RUNTIME_DLLS)" ]; then cp -f $(WIN_EXTRA_RUNTIME_DLLS) .; fi
 
 hds-fx-windows: $(WIN_HDS_FX_OBJ) $(WIN_FX_CHAIN_OBJ) $(WIN_NAM_OBJS)
