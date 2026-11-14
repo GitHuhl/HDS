@@ -159,12 +159,8 @@ pkgs.mkShell {
     aarch64.stdenv.cc
     aarch64.alsa-lib
     aarch64.liblo
-    aarch64.wavpack   # NOT currently linked for this arm64 (Raspberry Pi) target specifically --
-                      # ARM64_LDFLAGS in the Makefile has no -lwavpack, and arm64-libs/ has no
-                      # libwavpack.so bundled for the Pi's own runtime yet. The native Linux build
-                      # (pkgs.wavpack above) IS linked -- see its own comment. Left here so wiring
-                      # up the Pi target later needs no shell.nix change, just the Makefile/bundling
-                      # work (mirroring how liblo is already cross-built/bundled for it).
+    aarch64.wavpack   # WavPack recording for the arm64 build: linked via ARM64_LDFLAGS and bundled
+                      # into arm64-libs/ (see ARM64_BUNDLE_LIBS below), same as liblo.
     pkgs.patchelf   # rewrites the Nix store RPATH/interpreter the cross linker bakes into arm64 --
                      # those store paths don't exist on the Pi. The Makefile's arm64 rule runs
                      # `patchelf --set-rpath '$ORIGIN/arm64-libs' --set-interpreter
@@ -300,11 +296,10 @@ pkgs.mkShell {
     # include/lib paths here so the Makefile's ARM64_CFLAGS/ARM64_LDFLAGS can find them. ARM64_CC
     # is NOT exported here -- aarch64.stdenv.cc's prefixed binary name
     # (aarch64-unknown-linux-gnu-gcc) is already on PATH via buildInputs above, so the Makefile's
-    # own `?=` default covers it. No wavpack include/lib path here -- WavPack recording is
-    # disabled (see HDS_WAVPACK_ENABLED in src/backend.c), so nothing in this build actually
-    # references libwavpack right now.
-    export ARM64_CFLAGS="-I${aarch64.alsa-lib.dev}/include -I${aarch64.liblo}/include"
-    export ARM64_LDFLAGS="-L${aarch64.alsa-lib}/lib -L${aarch64.liblo}/lib"
+    # own `?=` default covers it. WavPack recording is enabled on every synth_engine build
+    # (HDS_WAVPACK_ENABLED in src/recording_engine.c), so aarch64.wavpack is linked and bundled too.
+    export ARM64_CFLAGS="-I${aarch64.alsa-lib.dev}/include -I${aarch64.liblo}/include -I${aarch64.wavpack.dev or aarch64.wavpack}/include"
+    export ARM64_LDFLAGS="-L${aarch64.alsa-lib}/lib -L${aarch64.liblo}/lib -L${aarch64.wavpack}/lib"
 
     # liblo is a pure protocol library -- no external config files, no hardware coupling -- safe
     # (and worth doing) to bundle straight alongside the output binary via a $ORIGIN-relative
@@ -333,7 +328,7 @@ pkgs.mkShell {
     # revision the way the liblo/alsa-lib paths above were (no Nix available to re-check from
     # inside this port's own dev environment -- worth confirming with `ls` on the actual path
     # `nix-shell` resolves this to, the first time this target is built for real).
-    export ARM64_BUNDLE_LIBS="${aarch64.liblo}/lib/liblo.so.7 ${aarch64.stdenv.cc.cc.lib}/lib/libstdc++.so.6 ${aarch64.stdenv.cc.cc.lib}/lib/libgcc_s.so.1"
+    export ARM64_BUNDLE_LIBS="${aarch64.liblo}/lib/liblo.so.7 ${aarch64.wavpack}/lib/libwavpack.so.1 ${aarch64.stdenv.cc.cc.lib}/lib/libstdc++.so.6 ${aarch64.stdenv.cc.cc.lib}/lib/libgcc_s.so.1"
 
     # Android (make android / tools/build_android_manual.sh): unlike every other buildInputs
     # entry above, androidSdk's own layout (composeAndroidPackages' output under
