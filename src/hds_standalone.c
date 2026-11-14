@@ -207,7 +207,7 @@ static void midi_autoconnect_scan(snd_seq_t *seq, int our_port, const char *midi
 // did. #include'd here, immediately below -- sequencer.c's own audio-lane loader calls
 // seq_audio_load_wav_from_disk(), which now lives in fx_chain.c (already #include'd via backend.c
 // above, so it's in scope here regardless -- see that function's own comment for why it moved).
-#include "sequencer.c"
+#include "sequencer.h" // Sequencer transport/lanes/MIDI clock, compiled separately (src/sequencer.c)
 
 // g_sample_slot_state/g_pending_load_state: the standalone-only global instances of the two
 // sample-engine tiers that have no genuine core-code reference by name (unlike g_streams_state,

@@ -2,10 +2,8 @@
 // and song-as-MIDI save/load -- standalone-only (the ALSA/PipeWire-backed synth_engine executable
 // is the only thing that ever drives any of this; a CLAP plugin instance never does, per the
 // user's own explicit direction -- see clap_plugin_process()'s own header comment in
-// clap_plugin.c). #include'd once, by src/hds_standalone.c, at the exact point this code used to
-// physically occupy in that file -- not by backend.c, and never compiled on its own, exactly like
-// fx_chain.c's own relationship to backend.c. This is a pure code-motion split: nothing here was
-// rewritten, just moved, verbatim, one file further out.
+// clap_plugin.c). Compiled as its own object and linked into synth_engine only; sequencer.h is the
+// interface hds_standalone.c's main loop and MIDI/OSC dispatch use.
 //
 // What stays behind, in backend.c, and why: the Sequencer's own DATA shapes (SeqLaneState,
 // SeqAudioLane, SeqMidiLane, and the transport/seq_midi fields on HdsEngineState) are genuinely
@@ -20,6 +18,8 @@
 // right next to the Sequencer conceptually -- both are explicitly kept alive in CLAP (arp and
 // tempo sync stay fully functional there, and the metronome now runs its own independent clock --
 // see poll_metronome's own comment in backend.c), so they belong with the shared core, not here.
+
+#include "sequencer.h"
 
 // --- Sequencer transport / audio-lane polling (moved here, verbatim, from backend.c): all of
 // it was already only reachable from main()'s own loop (a CLAP plugin instance never calls
@@ -195,7 +195,7 @@ static void *seq_audio_loader_thread_main(void *arg) {
 // pattern in main()'s loop): notices when a lane's requested audio_path differs from what's
 // already loading/loaded, and spawns a loader thread for it -- never more than one in flight per
 // lane at a time. Call this from main()'s loop, same cadence as every other live-knob check.
-static void poll_seq_audio_load_requests(HdsStreamsState *streams, const SynthSharedControls *knobs) {
+void poll_seq_audio_load_requests(HdsStreamsState *streams, const SynthSharedControls *knobs) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         SeqAudioLane *lane = &streams->seq_audio[l];
         const char *want_path = knobs->seq_lanes[l].audio_path;
@@ -240,7 +240,7 @@ static void poll_seq_audio_load_requests(HdsStreamsState *streams, const SynthSh
 // unlike a transport-driven lane -- auditioning a sound must never depend on whether the
 // Sequencer happens to be running. Call once per block from main()'s loop, same as
 // poll_seq_audio_load_requests.
-static void poll_seq_audio_preview_triggers(HdsStreamsState *streams, const SynthSharedControls *knobs) {
+void poll_seq_audio_preview_triggers(HdsStreamsState *streams, const SynthSharedControls *knobs) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         SeqAudioLane *lane = &streams->seq_audio[l];
         float want_trigger = knobs->seq_lanes[l].audio_preview_trigger;
@@ -268,7 +268,7 @@ static void poll_seq_audio_preview_triggers(HdsStreamsState *streams, const Synt
 // re-triggering anything. Call once per block from main()'s loop. current_tempo_bpm is this
 // block's already-resolved tempo (see the Seek Back/Forward triggers' own comment on why "right
 // now" rather than "at the seek target").
-static void poll_transport_triggers(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs, float current_tempo_bpm) {
+void poll_transport_triggers(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs, float current_tempo_bpm) {
     if (knobs->seq_transport_play_trigger != engine->transport_last_play_trigger) {
         engine->transport_last_play_trigger = knobs->seq_transport_play_trigger;
         if (engine->transport_state != TRANSPORT_PLAYING) {
@@ -346,7 +346,7 @@ static void poll_transport_triggers(HdsStreamsState *streams, HdsEngineState *en
 // PLAYING when that happens. A cheap, unconditional scan -- armed_for_transport is false for
 // every lane in the overwhelmingly common case (load already finished before Play was pressed),
 // so this is a no-op most of the time.
-static void poll_seq_audio_transport_catchup(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
+void poll_seq_audio_transport_catchup(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
     if (engine->transport_state != TRANSPORT_PLAYING) return;
     for (int l = 0; l < SEQ_LANE_COUNT; l++) {
         SeqAudioLane *al = &streams->seq_audio[l];
@@ -358,7 +358,7 @@ static void poll_seq_audio_transport_catchup(HdsStreamsState *streams, HdsEngine
 
 // Advances the real playhead by exactly one block's worth of time, only while PLAYING. Call once
 // per block from main()'s loop, after block_size is known for this iteration.
-static void advance_transport_playhead(HdsEngineState *engine, int block_size) {
+void advance_transport_playhead(HdsEngineState *engine, int block_size) {
     if (engine->transport_state == TRANSPORT_PLAYING) {
         engine->transport_playhead_sec += (double)block_size / (double)SAMPLE_RATE;
     }
@@ -369,7 +369,7 @@ static void advance_transport_playhead(HdsEngineState *engine, int block_size) {
 // lane's recorded events and fires any whose timestamp has now been reached, via the exact same
 // handle_note_on/handle_note_off functions live MIDI already calls (see this section's own scope
 // comment for why that's a deliberate choice, not a shortcut).
-static void seq_playback_midi_events(HdsEngineState *engine, HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack *mono_stack, const MidiLiveState *midi_live) {
+void seq_playback_midi_events(HdsEngineState *engine, HdsSampleEngine *se, SynthVoice voices[], SynthSharedControls *knobs, float global_lfo_phases[COMBI_PROGRAM_COUNT + 1][LFO_COUNT], MonoNoteStack *mono_stack, const MidiLiveState *midi_live) {
     if (engine->transport_state != TRANSPORT_PLAYING) return;
     // Sequencer's recorded MIDI always targets Single Program mode's own dedicated ProgramState
     // (SINGLE_PROGRAM_SLOT, not any Combi lane -- see this section's scope comment and
@@ -412,9 +412,9 @@ static void seq_playback_midi_events(HdsEngineState *engine, HdsSampleEngine *se
 // typical block sizes, negligible for tempo derivation and the same polling-granularity tradeoff
 // every other block-polled input here already accepts).
 #define HDS_MIDI_CLOCK_TICKS_PER_QUARTER 24
-#define HDS_MIDI_CLOCK_TIMEOUT_SEC 2.0 // no tick for this long -> treat the external clock as gone
+// HDS_MIDI_CLOCK_TIMEOUT_SEC is in sequencer.h (hds_standalone.c's main loop checks it too).
 
-static double hds_monotonic_seconds(void) {
+double hds_monotonic_seconds(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
@@ -422,7 +422,7 @@ static double hds_monotonic_seconds(void) {
 // Hooked directly into process_midi_input's SND_SEQ_EVENT_CLOCK case -- runs unconditionally
 // regardless of seq_sync_source (cheap bookkeeping either way), so switching sync source live
 // doesn't need to "catch up" on tempo -- it's already tracked in the background.
-static void hds_handle_midi_clock_tick(HdsEngineState *engine) {
+void hds_handle_midi_clock_tick(HdsEngineState *engine) {
     double now = hds_monotonic_seconds();
     if (engine->midi_clock_tick_count > 0) {
         double delta = now - engine->midi_clock_last_tick_sec;
@@ -448,7 +448,7 @@ static void hds_handle_midi_clock_tick(HdsEngineState *engine) {
 
 // MIDI Start (0xFA): always begins from the top, exactly like the GUI's own Stop->Play transition
 // -- see transport_start_fresh()'s own comment for what "fresh" means for a Rec-armed lane.
-static void hds_handle_midi_transport_start(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
+void hds_handle_midi_transport_start(HdsStreamsState *streams, HdsEngineState *engine, const SynthSharedControls *knobs) {
     engine->transport_playhead_sec = 0.0;
     engine->transport_state = TRANSPORT_PLAYING;
     transport_start_fresh(streams, engine, knobs);
@@ -456,7 +456,7 @@ static void hds_handle_midi_transport_start(HdsStreamsState *streams, HdsEngineS
 
 // MIDI Continue (0xFB): resumes from exactly wherever the transport currently sits -- no
 // repositioning, same as the GUI's own Paused->Playing transition.
-static void hds_handle_midi_transport_continue(HdsEngineState *engine) {
+void hds_handle_midi_transport_continue(HdsEngineState *engine) {
     engine->transport_state = TRANSPORT_PLAYING;
 }
 
@@ -464,7 +464,7 @@ static void hds_handle_midi_transport_continue(HdsEngineState *engine) {
 // Control's own Stop/Continue semantics (a subsequent Continue must resume from here), the same
 // distinction the GUI's own separate Pause and Stop buttons already make. A performer who wants
 // to rewind to the top sends Start, not Stop, exactly as most DAWs already behave.
-static void hds_handle_midi_transport_stop(HdsEngineState *engine) {
+void hds_handle_midi_transport_stop(HdsEngineState *engine) {
     if (engine->transport_state == TRANSPORT_PLAYING) engine->transport_state = TRANSPORT_PAUSED;
 }
 
@@ -578,7 +578,7 @@ static bool hds_song_load_midi(HdsEngineState *engine, const char *file_path) {
     return true;
 }
 
-static int song_save_midi_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int song_save_midi_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)msg;
     HdsEngineState *engine = (HdsEngineState *)user_data;
     if (argc != 1) return 0;
@@ -589,7 +589,7 @@ static int song_save_midi_handler(const char *path, const char *types, lo_arg **
     return 0;
 }
 
-static int song_load_midi_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
+int song_load_midi_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data) {
     (void)path; (void)types; (void)msg;
     HdsEngineState *engine = (HdsEngineState *)user_data;
     if (argc != 1) return 0;

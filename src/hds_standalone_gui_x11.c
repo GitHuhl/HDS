@@ -53,7 +53,7 @@
 #include <cairo/cairo-xlib.h>
 #include <pthread.h>
 
-#include "hds_fx_gui_browser.c" // hds_fx_gui_browser_refresh() -- reused verbatim, same as hds_clap_gui_x11.c's own identical include
+#include "hds_fx_gui_browser.h" // hds_fx_gui_browser_refresh(), compiled separately (src/hds_fx_gui_browser.c)
 
 typedef struct {
     HdsClapPlugin *plugin;
