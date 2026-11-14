@@ -521,10 +521,10 @@ static void hds_clap_gui_on_scroll(HdsClapPlugin *p, HdsClapGuiViewState *vs, do
 #endif
 }
 
-static void hds_clap_gui_on_resize(HdsClapGuiViewState *vs, int w, int h) {
+static void hds_clap_gui_on_resize(HdsClapPlugin *p, HdsClapGuiViewState *vs, int w, int h) {
     if (w < HDS_CLAP_GUI_MIN_W) w = HDS_CLAP_GUI_MIN_W;
     if (h < HDS_CLAP_GUI_MIN_H) h = HDS_CLAP_GUI_MIN_H;
     vs->window_w = w;
     vs->window_h = h;
-    hds_fx_gui_on_resize(&vs->fx_view, w, h - (int)HDS_CLAP_TAB_BAR_H);
+    hds_fx_gui_on_resize(&p->gui_host, &vs->fx_view, w, h - (int)HDS_CLAP_TAB_BAR_H);
 }

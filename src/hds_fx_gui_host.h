@@ -17,7 +17,10 @@
 #pragma once
 
 typedef struct {
-    FXSlotParams *fx;               // [FX_SLOT_COUNT], real, mutable -- never NULL
+    FXSlotParams *fx;               // [slot_count], real, mutable -- never NULL
+    int slot_count;                 // how many slots fx[] (and fx_gr_db/fx_dump_avail_sec) hold
+    int port_count;                 // port-model hosts: number of stereo I/O ports (also sizes the
+                                    // port_* arrays below); Source-combo hosts: their SOURCE_COUNT
     float *port_input_stereo;       // [N ports], or NULL -- see this file's own header comment
     float *port_output_channel;     // [N ports], or NULL
     float *port_input_off;          // [N ports], or NULL

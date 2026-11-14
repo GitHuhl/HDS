@@ -84,7 +84,7 @@ static LRESULT CALLBACK hds_clap_gui_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPA
             if (w) {
                 int width = LOWORD(lp), height = HIWORD(lp);
                 if (width > 0 && height > 0 && (width != w->view.window_w || height != w->view.window_h)) {
-                    hds_clap_gui_on_resize(&w->view, width, height);
+                    hds_clap_gui_on_resize(w->plugin, &w->view, width, height);
                     hds_clap_gui_resize_backbuffer(w);
                 }
             }
@@ -229,7 +229,7 @@ static bool hds_clap_gui_adjust_size(const clap_plugin_t *plugin, uint32_t *widt
 static bool hds_clap_gui_set_size(const clap_plugin_t *plugin, uint32_t width, uint32_t height) {
     HdsClapGuiWindow *w = (HdsClapGuiWindow *)((HdsClapPlugin *)plugin->plugin_data)->gui_window;
     if (!w) return false;
-    hds_clap_gui_on_resize(&w->view, (int)width, (int)height);
+    hds_clap_gui_on_resize(w->plugin, &w->view, (int)width, (int)height);
     SetWindowPos(w->hwnd, NULL, 0, 0, w->view.window_w, w->view.window_h, SWP_NOMOVE | SWP_NOZORDER);
     hds_clap_gui_resize_backbuffer(w);
     return true;

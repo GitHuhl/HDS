@@ -621,7 +621,7 @@ static int hds_fx_prev_same_source_slot(const HdsFxGuiHost *p, int slot) {
 // comment for why this existence check matters.
 static int hds_fx_next_same_source_slot(const HdsFxGuiHost *p, int slot) {
     int src = (int)p->fx[slot].fx_source;
-    for (int i = slot + 1; i < FX_SLOT_COUNT; i++) if ((int)p->fx[i].fx_source == src) return i;
+    for (int i = slot + 1; i < p->slot_count; i++) if ((int)p->fx[i].fx_source == src) return i;
     return -1;
 }
 
@@ -655,7 +655,7 @@ static bool hds_fx_slot_is_chain_tail(const HdsFxGuiHost *p, int slot) {
 // link, same "protect both ends of a link from a silent Up/Down rewire" reasoning as chain_to_next's
 // own array-position link below.
 static bool hds_fx_slot_is_referenced_as_input(const HdsFxGuiHost *p, int slot) {
-    for (int i = 0; i < FX_SLOT_COUNT; i++) {
+    for (int i = 0; i < p->slot_count; i++) {
         if (i == slot || p->fx[i].input_from_slot < 0.0f) continue;
         if ((int)(p->fx[i].input_from_slot + 0.5f) == slot) return true;
     }
@@ -1094,11 +1094,11 @@ static bool hds_fx_knob_contains(const HdsFxRect *r, double px, double py) {
 // ---------------------------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------------------------
-static double hds_fx_gui_content_height(void) { return FX_SLOT_COUNT * HDS_FX_GUI_ROW_H; }
+static double hds_fx_gui_content_height(const HdsFxGuiHost *p) { return p->slot_count * HDS_FX_GUI_ROW_H; }
 
-static double hds_fx_gui_max_scroll(const HdsFxGuiViewState *vs) {
+static double hds_fx_gui_max_scroll(const HdsFxGuiHost *p, const HdsFxGuiViewState *vs) {
     double visible = (double)vs->window_h - HDS_FX_GUI_HEADER_H;
-    double max_scroll = hds_fx_gui_content_height() - visible;
+    double max_scroll = hds_fx_gui_content_height(p) - visible;
     return max_scroll > 0.0 ? max_scroll : 0.0;
 }
 
@@ -1148,10 +1148,10 @@ static int hds_fx_dropdown_option_count(const HdsFxGuiHost *p, int kind) {
         // + (FX_SLOT_COUNT - 1): the "FX Slot Output" section, one entry per OTHER slot in the pool
         // (see hds_fx_slot_output_target()'s own comment) -- always exactly FX_SLOT_COUNT-1 long
         // regardless of which row is open, since every row excludes exactly one slot: itself.
-        case HDS_FX_DROPDOWN_INPUT: return 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT + (FX_SLOT_COUNT - 1); // Off + 8 mono + 8 stereo + slot outputs
-        case HDS_FX_DROPDOWN_OUTPUT: return 1 + HDS_FX_PORT_COUNT; // Off + 8 (always that port's real stereo pair)
-        case HDS_FX_DROPDOWN_SIDECHAIN: return 1 + HDS_FX_PORT_COUNT; // "Same as Source" + 8
-        case HDS_FX_DROPDOWN_SOURCE: return p->source_count + (FX_SLOT_COUNT - 1); // no Off/Mono/Stereo suboptions -- a plain Source combo, plus the same slot-output section INPUT gets
+        case HDS_FX_DROPDOWN_INPUT: return 1 + p->port_count + p->port_count + (p->slot_count - 1); // Off + 8 mono + 8 stereo + slot outputs
+        case HDS_FX_DROPDOWN_OUTPUT: return 1 + p->port_count; // Off + 8 (always that port's real stereo pair)
+        case HDS_FX_DROPDOWN_SIDECHAIN: return 1 + p->port_count; // "Same as Source" + 8
+        case HDS_FX_DROPDOWN_SOURCE: return p->source_count + (p->slot_count - 1); // no Off/Mono/Stereo suboptions -- a plain Source combo, plus the same slot-output section INPUT gets
         case HDS_FX_DROPDOWN_OUT_PAIR: return 1 + p->output_pair_count; // Off (clears every pair) + one entry per real output pair
         case HDS_FX_DROPDOWN_ONAIR_MODE: return 2; // MIDI Trigger Enabled, Disabled -- two independent checkable toggles, see this kind's own comment
         default: return 0;
@@ -1166,12 +1166,12 @@ static void hds_fx_dropdown_option_label(const HdsFxGuiHost *p, int kind, int ro
             snprintf(buf, buflen, "%s", hds_fx_type_name(HDS_FX_SELECTABLE_TYPES[idx]));
             return;
         case HDS_FX_DROPDOWN_INPUT: {
-            int base = 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT;
+            int base = 1 + p->port_count + p->port_count;
             if (idx < base) {
                 if (idx == 0) { snprintf(buf, buflen, "Off"); return; }
                 int j = idx - 1;
-                bool stereo = j >= HDS_FX_PORT_COUNT;
-                int port = stereo ? (j - HDS_FX_PORT_COUNT) : j;
+                bool stereo = j >= p->port_count;
+                int port = stereo ? (j - p->port_count) : j;
                 hds_fx_format_input_pill(buf, buflen, port, stereo);
                 return;
             }
@@ -1220,26 +1220,26 @@ static int hds_fx_dropdown_current_index(const HdsFxGuiHost *p, int kind, int ro
         case HDS_FX_DROPDOWN_INPUT: {
             if (p->fx[row].input_from_slot >= 0.0f) {
                 int target = (int)(p->fx[row].input_from_slot + 0.5f);
-                int base = 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT;
+                int base = 1 + p->port_count + p->port_count;
                 return base + (target < row ? target : target - 1);
             }
             int port = (int)p->fx[row].fx_source;
-            if (port < 0 || port >= HDS_FX_PORT_COUNT) port = 0;
+            if (port < 0 || port >= p->port_count) port = 0;
             if (p->port_input_off[port] != 0.0f) return 0;
             bool stereo = p->port_input_stereo[port] != 0.0f;
-            return 1 + (stereo ? HDS_FX_PORT_COUNT + port : port);
+            return 1 + (stereo ? p->port_count + port : port);
         }
         case HDS_FX_DROPDOWN_OUTPUT: {
             int g = (int)p->fx[row].fx_source;
-            if (g < 0 || g >= HDS_FX_PORT_COUNT) g = 0;
+            if (g < 0 || g >= p->port_count) g = 0;
             if (p->port_output_off[g] != 0.0f) return 0;
             int ch = (int)p->port_output_channel[g];
-            if (ch < 0 || ch >= HDS_FX_PORT_COUNT) ch = g;
+            if (ch < 0 || ch >= p->port_count) ch = g;
             return 1 + ch;
         }
         case HDS_FX_DROPDOWN_SIDECHAIN: {
             int sc = (int)p->fx[row].sidechain_source;
-            return (sc < 0 || sc >= HDS_FX_PORT_COUNT) ? 0 : sc + 1;
+            return (sc < 0 || sc >= p->port_count) ? 0 : sc + 1;
         }
         case HDS_FX_DROPDOWN_SOURCE: {
             if (p->fx[row].input_from_slot >= 0.0f) {
@@ -1289,18 +1289,18 @@ static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
             return;
         }
         case HDS_FX_DROPDOWN_INPUT: {
-            int base = 1 + HDS_FX_PORT_COUNT + HDS_FX_PORT_COUNT;
+            int base = 1 + p->port_count + p->port_count;
             if (idx >= base) {
                 p->fx[row].input_from_slot = (float)hds_fx_slot_output_target(row, idx - base);
                 return;
             }
             p->fx[row].input_from_slot = -1.0f; // picking a normal port Input clears any slot-output override
             int port = (int)p->fx[row].fx_source;
-            if (port < 0 || port >= HDS_FX_PORT_COUNT) port = 0;
+            if (port < 0 || port >= p->port_count) port = 0;
             if (idx == 0) { p->port_input_off[port] = 1.0f; return; }
             int j = idx - 1;
-            bool new_stereo = j >= HDS_FX_PORT_COUNT;
-            int new_port = new_stereo ? (j - HDS_FX_PORT_COUNT) : j;
+            bool new_stereo = j >= p->port_count;
+            int new_port = new_stereo ? (j - p->port_count) : j;
             p->fx[row].fx_source = (float)new_port;
             p->port_input_stereo[new_port] = new_stereo ? 1.0f : 0.0f;
             p->port_input_off[new_port] = 0.0f;
@@ -1308,7 +1308,7 @@ static void hds_fx_dropdown_apply(HdsFxGuiHost *p, int kind, int row, int idx) {
         }
         case HDS_FX_DROPDOWN_OUTPUT: {
             int g = (int)p->fx[row].fx_source;
-            if (g < 0 || g >= HDS_FX_PORT_COUNT) g = 0;
+            if (g < 0 || g >= p->port_count) g = 0;
             if (idx == 0) { p->port_output_off[g] = 1.0f; return; }
             p->port_output_channel[g] = (float)(idx - 1); // always that port's own real stereo pair
             p->port_output_off[g] = 0.0f;
@@ -1819,7 +1819,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
     cairo_rectangle(cr, 0, HDS_FX_GUI_HEADER_H, width, height - HDS_FX_GUI_HEADER_H);
     cairo_clip(cr);
 
-    for (int s = 0; s < FX_SLOT_COUNT; s++) {
+    for (int s = 0; s < p->slot_count; s++) {
         double y = HDS_FX_GUI_HEADER_H + s * HDS_FX_GUI_ROW_H - vs->scroll_offset_px;
         if (y + HDS_FX_GUI_ROW_H < HDS_FX_GUI_HEADER_H || y > height) continue; // off-screen, skip
 
@@ -1828,7 +1828,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         const FXSlotParams *slot = &p->fx[s];
         int fx_type = (int)slot->fx_type;
         int port = (int)slot->fx_source;
-        if (port < 0 || port >= HDS_FX_PORT_COUNT) port = 0;
+        if (port < 0 || port >= p->port_count) port = 0;
         int param_count = hds_fx_type_param_count(fx_type);
         bool uses_sc = hds_fx_type_uses_sidechain(fx_type);
         bool is_head = hds_fx_slot_is_chain_head(p, s);
@@ -1839,7 +1839,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 10);
         hds_fx_rgb(cr, 0.42, 0.42, 0.45);
-        char numbuf[8]; snprintf(numbuf, sizeof(numbuf), "%02d", s + 1);
+        char numbuf[12]; snprintf(numbuf, sizeof(numbuf), "%02d", s + 1);
         hds_fx_left_text(cr, HDS_FX_ROW_MARGIN, y + HDS_FX_GUI_ROW_H / 2 + 3, numbuf);
 
         hds_fx_draw_pill(cr, L.type_pill.x, L.type_pill.y, L.type_pill.w, L.type_pill.h, hds_fx_type_name(fx_type), fx_type != FX_TYPE_OFF, false);
@@ -1881,7 +1881,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         if (uses_sc) {
             int sc = (int)slot->sidechain_source;
             char scbuf[16];
-            if (sc < 0 || sc >= HDS_FX_PORT_COUNT) snprintf(scbuf, sizeof(scbuf), "= Src");
+            if (sc < 0 || sc >= p->port_count) snprintf(scbuf, sizeof(scbuf), "= Src");
             else snprintf(scbuf, sizeof(scbuf), "SC In%d", sc + 1);
             hds_fx_draw_pill(cr, L.sidechain_pill.x, L.sidechain_pill.y, L.sidechain_pill.w, L.sidechain_pill.h, scbuf, sc >= 0, false);
         } else {
@@ -1949,7 +1949,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
                 snprintf(outbuf, sizeof(outbuf), "Off");
             } else {
                 int out_ch = (int)p->port_output_channel[port];
-                if (out_ch < 0 || out_ch >= HDS_FX_PORT_COUNT) out_ch = port;
+                if (out_ch < 0 || out_ch >= p->port_count) out_ch = port;
                 snprintf(outbuf, sizeof(outbuf), "Out %d", out_ch + 1); // always that port's own real stereo pair -- no Mono/Stereo choice, see the "Dropdowns" section's own comment
             }
             hds_fx_draw_pill(cr, L.output_pill.x, L.output_pill.y, L.output_pill.w, L.output_pill.h, outbuf, is_tail && !output_off, !is_tail);
@@ -2041,7 +2041,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         // Chain-to-Next: always live, unconditionally -- no mode to gate it (see this file's own
         // header comment). Disabled only on the very last pool slot, which has no "next" at all.
         bool chain_on = slot->chain_to_next != 0.0f;
-        bool chain_available = s < FX_SLOT_COUNT - 1;
+        bool chain_available = s < p->slot_count - 1;
         hds_fx_rounded_rect(cr, L.chain_btn.x, L.chain_btn.y, L.chain_btn.w, L.chain_btn.h, 3);
         if (chain_on) hds_fx_rgb(cr, 0.18, 0.55, 0.35);
         else hds_fx_rgb(cr, 0.20, 0.20, 0.23);
@@ -2061,7 +2061,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
         // end) -- see hds_fx_slot_participates_in_chain()'s own comment for why swapping a chained
         // slot is unsafe, not just inconvenient.
         bool chained = hds_fx_slot_participates_in_chain(p, s);
-        bool can_up = s > 0 && !chained, can_down = s < FX_SLOT_COUNT - 1 && !chained;
+        bool can_up = s > 0 && !chained, can_down = s < p->slot_count - 1 && !chained;
         hds_fx_rgb(cr, can_up ? 0.65 : 0.28, can_up ? 0.65 : 0.28, can_up ? 0.68 : 0.30);
         cairo_set_font_size(cr, 9);
         hds_fx_centered_text(cr, L.up_btn.x + L.up_btn.w / 2, L.up_btn.y + L.up_btn.h / 2 + 3, "^"); // was the UTF-8 triangle glyph -- see the chain-arrow's own comment just above on why
@@ -2073,10 +2073,10 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
 
     // Scrollbar hint (a thin track on the right edge -- not draggable in this first pass, just a
     // position indicator; the mouse wheel is the only way to scroll for now).
-    double max_scroll = hds_fx_gui_max_scroll(vs);
+    double max_scroll = hds_fx_gui_max_scroll(p, vs);
     if (max_scroll > 0.0) {
         double visible_h = (double)height - HDS_FX_GUI_HEADER_H;
-        double content_h = hds_fx_gui_content_height();
+        double content_h = hds_fx_gui_content_height(p);
         double thumb_h = visible_h * (visible_h / content_h);
         double thumb_y = HDS_FX_GUI_HEADER_H + (visible_h - thumb_h) * (vs->scroll_offset_px / max_scroll);
         hds_fx_rgba(cr, 1, 1, 1, 0.15);
@@ -2105,7 +2105,7 @@ static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewSt
 // The caller (hds_fx_gui_on_button_press) is responsible for checking
 // hds_fx_slot_participates_in_chain() first -- this function itself has no chain awareness.
 static void hds_fx_swap_slots(HdsFxGuiHost *p, int a, int b) {
-    if (a < 0 || b < 0 || a >= FX_SLOT_COUNT || b >= FX_SLOT_COUNT || a == b) return;
+    if (a < 0 || b < 0 || a >= p->slot_count || b >= p->slot_count || a == b) return;
     FXSlotParams tmp = p->fx[a];
     p->fx[a] = p->fx[b];
     p->fx[b] = tmp;
@@ -2149,7 +2149,7 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
     if (y < HDS_FX_GUI_HEADER_H) return false;
 
     int row = (int)((y - HDS_FX_GUI_HEADER_H + vs->scroll_offset_px) / HDS_FX_GUI_ROW_H);
-    if (row < 0 || row >= FX_SLOT_COUNT) return false;
+    if (row < 0 || row >= p->slot_count) return false;
     double row_y = HDS_FX_GUI_HEADER_H + row * HDS_FX_GUI_ROW_H - vs->scroll_offset_px;
     HdsFxRowLayout L;
     hds_fx_gui_compute_row_layout(width, row_y, &L);
@@ -2196,7 +2196,7 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
     }
     if (hds_fx_rect_contains(&L.bypass_btn, x, y)) { if (button == 1) p->fx[row].bypass = (p->fx[row].bypass != 0.0f) ? 0.0f : 1.0f; return true; }
     if (hds_fx_rect_contains(&L.chain_btn, x, y)) {
-        if (button == 1 && row < FX_SLOT_COUNT - 1) {
+        if (button == 1 && row < p->slot_count - 1) {
             bool turning_on = p->fx[row].chain_to_next == 0.0f;
             p->fx[row].chain_to_next = turning_on ? 1.0f : 0.0f;
             if (turning_on) {
@@ -2279,7 +2279,7 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
 static void hds_fx_gui_on_motion(HdsFxGuiHost *p, HdsFxGuiViewState *vs, double x, double y) {
     if (y >= HDS_FX_GUI_HEADER_H) {
         int row = (int)((y - HDS_FX_GUI_HEADER_H + vs->scroll_offset_px) / HDS_FX_GUI_ROW_H);
-        vs->hover_row = (row >= 0 && row < FX_SLOT_COUNT) ? row : -1;
+        vs->hover_row = (row >= 0 && row < p->slot_count) ? row : -1;
     } else {
         vs->hover_row = -1;
     }
@@ -2388,16 +2388,16 @@ static void hds_fx_gui_on_scroll(const HdsFxGuiHost *p, HdsFxGuiViewState *vs, i
         return;
     }
     vs->scroll_offset_px -= delta * (HDS_FX_GUI_ROW_H * 3.0);
-    double max_scroll = hds_fx_gui_max_scroll(vs);
+    double max_scroll = hds_fx_gui_max_scroll(p, vs);
     if (vs->scroll_offset_px < 0.0) vs->scroll_offset_px = 0.0;
     if (vs->scroll_offset_px > max_scroll) vs->scroll_offset_px = max_scroll;
 }
 
-static void hds_fx_gui_on_resize(HdsFxGuiViewState *vs, int w, int h) {
+static void hds_fx_gui_on_resize(const HdsFxGuiHost *p, HdsFxGuiViewState *vs, int w, int h) {
     if (w < HDS_FX_GUI_MIN_W) w = HDS_FX_GUI_MIN_W;
     if (h < HDS_FX_GUI_MIN_H) h = HDS_FX_GUI_MIN_H;
     vs->window_w = w; vs->window_h = h;
-    double max_scroll = hds_fx_gui_max_scroll(vs);
+    double max_scroll = hds_fx_gui_max_scroll(p, vs);
     if (vs->scroll_offset_px > max_scroll) vs->scroll_offset_px = max_scroll;
     vs->dropdown.kind = HDS_FX_DROPDOWN_NONE; // same reasoning as hds_fx_gui_on_scroll's own comment
 }

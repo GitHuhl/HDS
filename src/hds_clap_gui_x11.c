@@ -79,7 +79,7 @@ static void hds_clap_gui_pump_events(HdsClapGuiWindow *w) {
                 break;
             case ConfigureNotify:
                 if (ev.xconfigure.width != w->view.window_w || ev.xconfigure.height != w->view.window_h) {
-                    hds_clap_gui_on_resize(&w->view, ev.xconfigure.width, ev.xconfigure.height);
+                    hds_clap_gui_on_resize(w->plugin, &w->view, ev.xconfigure.width, ev.xconfigure.height);
                     cairo_xlib_surface_set_size(w->surface, ev.xconfigure.width, ev.xconfigure.height);
                     hds_clap_gui_resize_backbuffer(w);
                 }
@@ -210,7 +210,7 @@ static bool hds_clap_gui_adjust_size(const clap_plugin_t *plugin, uint32_t *widt
 static bool hds_clap_gui_set_size(const clap_plugin_t *plugin, uint32_t width, uint32_t height) {
     HdsClapGuiWindow *w = (HdsClapGuiWindow *)((HdsClapPlugin *)plugin->plugin_data)->gui_window;
     if (!w) return false;
-    hds_clap_gui_on_resize(&w->view, (int)width, (int)height);
+    hds_clap_gui_on_resize(w->plugin, &w->view, (int)width, (int)height);
     XResizeWindow(w->display, w->win, (unsigned int)w->view.window_w, (unsigned int)w->view.window_h);
     cairo_xlib_surface_set_size(w->surface, w->view.window_w, w->view.window_h);
     hds_clap_gui_resize_backbuffer(w);

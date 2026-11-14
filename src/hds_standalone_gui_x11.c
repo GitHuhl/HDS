@@ -121,7 +121,7 @@ static void hds_standalone_gui_pump_events(HdsStandaloneGuiWindow *w) {
                 break;
             case ConfigureNotify:
                 if (ev.xconfigure.width != w->view.window_w || ev.xconfigure.height != w->view.window_h) {
-                    hds_clap_gui_on_resize(&w->view, ev.xconfigure.width, ev.xconfigure.height);
+                    hds_clap_gui_on_resize(w->plugin, &w->view, ev.xconfigure.width, ev.xconfigure.height);
                     cairo_xlib_surface_set_size(w->surface, ev.xconfigure.width, ev.xconfigure.height);
                     hds_standalone_gui_resize_backbuffer(w);
                 }

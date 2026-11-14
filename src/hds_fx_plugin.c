@@ -905,6 +905,8 @@ static const clap_plugin_t *hds_fx_factory_create_plugin(const clap_plugin_facto
     // header comment. gui_window starts NULL (calloc already guarantees this; explicit here only
     // for readability, matching how every other flag/pointer above is left to calloc's zero-init).
     p->gui_host.fx = p->fx;
+    p->gui_host.slot_count = FX_SLOT_COUNT;
+    p->gui_host.port_count = HDS_FX_PORT_COUNT;
     p->gui_host.port_input_stereo = p->port_input_stereo;
     p->gui_host.port_output_channel = p->port_output_channel;
     p->gui_host.port_input_off = p->port_input_off;
