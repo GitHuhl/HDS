@@ -224,7 +224,7 @@ static const clap_host_t *hds_fx_gui_clap_host_of(const clap_plugin_t *plugin) {
 // just defined above, plus FXSlotParams/FX_TYPE_*/FX_SLOT_COUNT, all already in scope from
 // fx_types.h/this file's own defines). hds_fx_gui_x11.c: the X11/XEmbed/event-pump shim, needs
 // everything hds_fx_gui_draw.c defines (HdsFxGuiViewState, hds_fx_gui_render, hds_fx_gui_on_*).
-#include "hds_fx_gui_draw.c"
+#include "hds_fx_gui_draw.h" // FX pool GUI, compiled separately (src/hds_fx_gui_draw.c)
 #ifdef _WIN32
 #include "hds_fx_gui_win32.c"
 #else

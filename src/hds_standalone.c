@@ -1278,7 +1278,7 @@ static void hds_scan_midi_devices(HdsDeviceList *out) {
     pclose(fp);
 }
 
-#include "hds_fx_gui_draw.c"
+#include "hds_fx_gui_draw.h" // FX pool GUI, compiled separately (src/hds_fx_gui_draw.c)
 #include "hds_clap_play_draw.c"
 #include "hds_clap_combi_draw.c"
 #include "hds_clap_filters_draw.c"

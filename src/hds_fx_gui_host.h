@@ -16,6 +16,10 @@
 // included wherever a concrete host struct is defined, with nothing else dragged in.
 #pragma once
 
+#include <stddef.h>
+
+#include "fx_types.h"
+
 typedef struct {
     FXSlotParams *fx;               // [slot_count], real, mutable -- never NULL
     int slot_count;                 // how many slots fx[] (and fx_gr_db/fx_dump_avail_sec) hold

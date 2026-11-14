@@ -35,6 +35,8 @@
 #include <math.h>
 #include <stdio.h>
 
+#include "hds_fx_gui_draw.h"
+
 // ---------------------------------------------------------------------------------------------
 // Font selection -- a drop-in stand-in for cairo_select_font_face(), needed because Android has
 // no Fontconfig, and Cairo's own "toy font" backend (the thing cairo_select_font_face/
@@ -54,7 +56,8 @@
 // #include'd strictly after this one (see this file's own header comment + every host's own
 // #include order), so this is the one place in the whole codebase where "cairo_select_font_face"
 // still means the real library function.
-static void hds_font_select_face(cairo_t *cr, const char *family, cairo_font_slant_t slant, cairo_font_weight_t weight) {
+#undef cairo_select_font_face // the real Cairo function, just for hds_font_select_face's body
+void hds_font_select_face(cairo_t *cr, const char *family, cairo_font_slant_t slant, cairo_font_weight_t weight) {
 #if defined(HDS_ANDROID_GUI_ENABLED)
     // family is always "sans-serif" at every real call site (checked) -- nothing to switch on.
     // slant is dropped (Android ships two bundled font FACES -- regular and bold, see
@@ -69,15 +72,13 @@ static void hds_font_select_face(cairo_t *cr, const char *family, cairo_font_sla
     cairo_select_font_face(cr, family, slant, weight);
 #endif
 }
-#define cairo_select_font_face hds_font_select_face
+#define cairo_select_font_face hds_font_select_face // back on for the rest of this file (see hds_fx_gui_draw.h)
 
 // ---------------------------------------------------------------------------------------------
 // Layout constants
 // ---------------------------------------------------------------------------------------------
 #define HDS_FX_GUI_DEFAULT_W 1150
 #define HDS_FX_GUI_DEFAULT_H 760
-#define HDS_FX_GUI_MIN_W 740
-#define HDS_FX_GUI_MIN_H 380
 // Tall enough to fit, all strictly inside this one row's own bounds: a short label naming what the
 // knob actually does, the knob itself, and its current value -- see hds_fx_draw_knob's own comment
 // for why a bare unlabeled pot was wrong twice over (no name AND no visible value).
@@ -712,16 +713,7 @@ static int hds_fx_slot_output_target(int row, int list_pos) {
 // See fx_types.h's own param[5]/param[7]/param[8] comments for what each toggle actually does.
 #define HDS_FX_DROPDOWN_ONAIR_MODE 7
 
-typedef struct { double x, y, w, h; } HdsFxRect;
 
-typedef struct {
-    int kind;         // one of HDS_FX_DROPDOWN_* above; NONE when closed
-    int row;          // which pool slot this dropdown belongs to
-    HdsFxRect anchor; // the pill's own rect at the moment it was opened -- positions the list
-    int scroll;       // index of the first VISIBLE option -- see hds_fx_dropdown_visible_rows()'s
-                        // own comment. Always reset to 0 by hds_fx_dropdown_open() below; nothing
-                        // else should ever need to touch this field directly.
-} HdsFxDropdown;
 
 // The one place a dropdown is ever opened -- see every hds_fx_gui_on_button_press() call site
 // below. Exists specifically so scroll always starts at 0 on a fresh open; forgetting that reset
@@ -734,36 +726,9 @@ static void hds_fx_dropdown_open(HdsFxDropdown *dd, int kind, int row, HdsFxRect
     dd->scroll = 0;
 }
 
-#include "hds_fx_gui_browser.h" // HdsFxBrowser, hds_fx_safe_copy, hds_fx_gui_browser_refresh
 
-typedef struct {
-    int window_w, window_h;
-    double scroll_offset_px;
-    int hover_row; // -1 = none
 
-    // Drag state: drag_kind 0 = none, 1 = Mix knob, 2 = a param knob (drag_param_index valid).
-    int drag_kind;
-    int drag_row;
-    int drag_param_index;
-    double drag_start_y;
-    float drag_start_value;
-
-    // FX_TYPE_BROADCAST_DELAY's On-Air Override button (param[5]) is HELD, not clicked -- live for
-    // exactly as long as the mouse button stays down, same real-world behavior as a physical panic
-    // button. -1 when nothing is held; otherwise the row whose param[5] this view press set to 1.0,
-    // so hds_fx_gui_on_button_release() (which gets no x/y of its own -- see its own comment) knows
-    // which row's param[5] to clear back to 0.0 on release.
-    int tone_override_row;
-
-    HdsFxDropdown dropdown;
-
-    // FX_TYPE_NAM's own Model/IR path fields are the only free-text-adjacent inputs anywhere in
-    // this GUI (every other value is a knob, a toggle, or a dropdown option) -- see HdsFxBrowser's
-    // own comment above for how clicking either pill opens this in-house file browser.
-    HdsFxBrowser browser;
-} HdsFxGuiViewState;
-
-static void hds_fx_gui_view_state_init(HdsFxGuiViewState *vs) {
+void hds_fx_gui_view_state_init(HdsFxGuiViewState *vs) {
     memset(vs, 0, sizeof(*vs));
     vs->window_w = HDS_FX_GUI_DEFAULT_W;
     vs->window_h = HDS_FX_GUI_DEFAULT_H;
@@ -777,10 +742,10 @@ static void hds_fx_gui_view_state_init(HdsFxGuiViewState *vs) {
 // cairo_show_text() leaves a "current point" that the next cairo_arc() would otherwise implicitly
 // connect to with a stray line before stroking; ported from the mockup that found this bug).
 // ---------------------------------------------------------------------------------------------
-static void hds_fx_rgb(cairo_t *cr, double r, double g, double b) { cairo_set_source_rgb(cr, r, g, b); }
-static void hds_fx_rgba(cairo_t *cr, double r, double g, double b, double a) { cairo_set_source_rgba(cr, r, g, b, a); }
+void hds_fx_rgb(cairo_t *cr, double r, double g, double b) { cairo_set_source_rgb(cr, r, g, b); }
+void hds_fx_rgba(cairo_t *cr, double r, double g, double b, double a) { cairo_set_source_rgba(cr, r, g, b, a); }
 
-static void hds_fx_rounded_rect(cairo_t *cr, double x, double y, double w, double h, double r) {
+void hds_fx_rounded_rect(cairo_t *cr, double x, double y, double w, double h, double r) {
     cairo_new_path(cr);
     if (r > w / 2) r = w / 2;
     if (r > h / 2) r = h / 2;
@@ -791,7 +756,7 @@ static void hds_fx_rounded_rect(cairo_t *cr, double x, double y, double w, doubl
     cairo_close_path(cr);
 }
 
-static void hds_fx_centered_text(cairo_t *cr, double cx, double y, const char *text) {
+void hds_fx_centered_text(cairo_t *cr, double cx, double y, const char *text) {
     cairo_text_extents_t ext;
     cairo_text_extents(cr, text, &ext);
     cairo_new_path(cr);
@@ -800,7 +765,7 @@ static void hds_fx_centered_text(cairo_t *cr, double cx, double y, const char *t
     cairo_new_path(cr);
 }
 
-static void hds_fx_left_text(cairo_t *cr, double x, double y, const char *text) {
+void hds_fx_left_text(cairo_t *cr, double x, double y, const char *text) {
     cairo_new_path(cr);
     cairo_move_to(cr, x, y);
     cairo_show_text(cr, text);
@@ -834,11 +799,11 @@ static void hds_fx_draw_pill_kind(cairo_t *cr, double x, double y, double w, dou
     cairo_restore(cr);
 }
 
-static void hds_fx_draw_pill(cairo_t *cr, double x, double y, double w, double h, const char *text, bool active, bool disabled) {
+void hds_fx_draw_pill(cairo_t *cr, double x, double y, double w, double h, const char *text, bool active, bool disabled) {
     hds_fx_draw_pill_kind(cr, x, y, w, h, text, active, disabled, 0);
 }
 
-__attribute__((unused)) static void hds_fx_draw_mute_pill(cairo_t *cr, double x, double y, double w, double h, const char *text, bool active, bool disabled) {
+void hds_fx_draw_mute_pill(cairo_t *cr, double x, double y, double w, double h, const char *text, bool active, bool disabled) {
     hds_fx_draw_pill_kind(cr, x, y, w, h, text, active, disabled, 1);
 }
 
@@ -860,7 +825,7 @@ __attribute__((unused)) static void hds_fx_draw_mute_pill(cairo_t *cr, double x,
 // to the knob's own cy instead, since Play tab's controls aren't laid out in fixed-height rows).
 // Extracted rather than duplicated so both callers' knobs are pixel-identical and any future
 // visual tweak (colors, sweep angle, tick length) never has to be made twice.
-static void hds_fx_draw_knob_arc(cairo_t *cr, double cx, double cy, double radius, float value01, bool disabled) {
+void hds_fx_draw_knob_arc(cairo_t *cr, double cx, double cy, double radius, float value01, bool disabled) {
     if (value01 < 0.0f) value01 = 0.0f; else if (value01 > 1.0f) value01 = 1.0f;
     double start = M_PI * 0.75, sweep = M_PI * 1.5;
     cairo_new_path(cr);
@@ -1562,7 +1527,7 @@ static void hds_fx_browser_compute_layout(const HdsFxGuiViewState *vs, HdsFxBrow
 static void hds_android_gui_request_file_pick(const char *ext, const char *title, char *dest, size_t dest_len);
 #endif
 
-static void hds_fx_gui_browser_open(HdsFxGuiViewState *vs, const char *ext, const char *title, char *dest, size_t dest_len) {
+void hds_fx_gui_browser_open(HdsFxGuiViewState *vs, const char *ext, const char *title, char *dest, size_t dest_len) {
 #if defined(HDS_ANDROID_GUI_ENABLED)
     // Never opens this file's own in-house browser UI on Android -- see the forward declaration's
     // own comment just above. NAM Model/IR and the Global sidebar's own .scl are self-contained
@@ -1595,7 +1560,7 @@ static void hds_fx_gui_browser_open(HdsFxGuiViewState *vs, const char *ext, cons
 // __attribute__((unused)): only ever called from the Recording tab's own folder picker
 // (hds_clap_recording_draw.c), which is standalone-only -- unused (and correctly so, same posture
 // as hds_fx_draw_mute_pill() above) in both CLAP plugin builds.
-__attribute__((unused)) static void hds_fx_gui_browser_open_folder(HdsFxGuiViewState *vs, const char *title, char *dest, size_t dest_len) {
+void hds_fx_gui_browser_open_folder(HdsFxGuiViewState *vs, const char *title, char *dest, size_t dest_len) {
 #if defined(HDS_ANDROID_GUI_ENABLED)
     // No real folder-tree WRITE support on Android: Storage Access Framework's directory-picking
     // equivalent (ACTION_OPEN_DOCUMENT_TREE) returns a content:// tree Uri, not a POSIX path
@@ -1676,7 +1641,7 @@ static bool hds_fx_gui_browser_on_click(HdsFxGuiViewState *vs, double x, double 
     return true; // clicked somewhere inside the panel but not on any live control -- still consumed
 }
 
-static void hds_fx_gui_render_browser(cairo_t *cr, const HdsFxGuiViewState *vs) {
+void hds_fx_gui_render_browser(cairo_t *cr, const HdsFxGuiViewState *vs) {
     const HdsFxBrowser *b = &vs->browser;
     if (!b->open) return;
     HdsFxBrowserLayout L;
@@ -1776,7 +1741,7 @@ static void hds_fx_gui_render_browser(cairo_t *cr, const HdsFxGuiViewState *vs) 
     cairo_restore(cr);
 }
 
-static void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewState *vs) {
+void hds_fx_gui_render(cairo_t *cr, HdsFxGuiHost *p, const HdsFxGuiViewState *vs) {
     int width = vs->window_w, height = vs->window_h;
 
     hds_fx_rgb(cr, 0.10, 0.10, 0.12);
@@ -2122,7 +2087,7 @@ static void hds_fx_swap_slots(HdsFxGuiHost *p, int a, int b) {
 // (see the "Dropdowns" section above) rather than mutating anything directly; a NAM Model/IR pill
 // opens the file browser (see HdsFxBrowser's own comment); bypass/chain/up/down toggle
 // immediately; a knob starts a drag tracked in *vs instead.
-static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, double x, double y, int button) {
+bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, double x, double y, int button) {
     int width = vs->window_w;
 
     if (vs->browser.open) {
@@ -2276,7 +2241,7 @@ static bool hds_fx_gui_on_button_press(HdsFxGuiHost *p, HdsFxGuiViewState *vs, d
 
 #define HDS_FX_DRAG_PIXELS_FULL_RANGE 150.0
 
-static void hds_fx_gui_on_motion(HdsFxGuiHost *p, HdsFxGuiViewState *vs, double x, double y) {
+void hds_fx_gui_on_motion(HdsFxGuiHost *p, HdsFxGuiViewState *vs, double x, double y) {
     if (y >= HDS_FX_GUI_HEADER_H) {
         int row = (int)((y - HDS_FX_GUI_HEADER_H + vs->scroll_offset_px) / HDS_FX_GUI_ROW_H);
         vs->hover_row = (row >= 0 && row < p->slot_count) ? row : -1;
@@ -2303,7 +2268,7 @@ static void hds_fx_gui_on_motion(HdsFxGuiHost *p, HdsFxGuiViewState *vs, double 
     }
 }
 
-static void hds_fx_gui_on_button_release(HdsFxGuiHost *p, HdsFxGuiViewState *vs) {
+void hds_fx_gui_on_button_release(HdsFxGuiHost *p, HdsFxGuiViewState *vs) {
     vs->drag_kind = 0;
     // On-Air Override (param[5]) is HELD -- see hds_fx_gui_on_button_press()'s own comment on this
     // button. Unconditional and independent of where the mouse actually is now (it may have moved
@@ -2315,17 +2280,8 @@ static void hds_fx_gui_on_button_release(HdsFxGuiHost *p, HdsFxGuiViewState *vs)
     }
 }
 
-// Named key actions the platform shim (hds_fx_gui_x11.c) translates a real X11 KeyPress into --
-// keeps this file free of any X11 type, the same "zero windowing references" discipline this
-// file's own header comment already holds every other piece of drawing/hit-test logic to. A no-op
-// unless the file browser's own path bar is being typed into (see HdsFxBrowser's own
-// path_bar_editing field) -- this GUI has exactly one thing keyboard input can ever reach.
-#define HDS_FX_KEY_CHAR 0      // a printable character in `ch`
-#define HDS_FX_KEY_BACKSPACE 1
-#define HDS_FX_KEY_ENTER 2     // tries the typed text as an exact file first, then as a directory
-#define HDS_FX_KEY_ESCAPE 3    // discards the typed text, reverting to the last dir that listed OK
 
-static void hds_fx_gui_on_key(HdsFxGuiHost *p, HdsFxGuiViewState *vs, int action, char ch) {
+void hds_fx_gui_on_key(HdsFxGuiHost *p, HdsFxGuiViewState *vs, int action, char ch) {
     (void)p; // no longer needed here -- a committed path bar entry is applied by the platform
              // shim's own hds_fx_gui_browser_refresh() (see path_bar_commit_attempt's own comment),
              // not directly from this keystroke handler.
@@ -2360,7 +2316,7 @@ static void hds_fx_gui_on_key(HdsFxGuiHost *p, HdsFxGuiViewState *vs, int action
 }
 
 // delta: +1 (wheel up / X11 Button4) or -1 (wheel down / X11 Button5).
-static void hds_fx_gui_on_scroll(const HdsFxGuiHost *p, HdsFxGuiViewState *vs, int delta) {
+void hds_fx_gui_on_scroll(const HdsFxGuiHost *p, HdsFxGuiViewState *vs, int delta) {
     if (vs->browser.open) {
         HdsFxBrowserLayout L;
         hds_fx_browser_compute_layout(vs, &L);
@@ -2393,7 +2349,7 @@ static void hds_fx_gui_on_scroll(const HdsFxGuiHost *p, HdsFxGuiViewState *vs, i
     if (vs->scroll_offset_px > max_scroll) vs->scroll_offset_px = max_scroll;
 }
 
-static void hds_fx_gui_on_resize(const HdsFxGuiHost *p, HdsFxGuiViewState *vs, int w, int h) {
+void hds_fx_gui_on_resize(const HdsFxGuiHost *p, HdsFxGuiViewState *vs, int w, int h) {
     if (w < HDS_FX_GUI_MIN_W) w = HDS_FX_GUI_MIN_W;
     if (h < HDS_FX_GUI_MIN_H) h = HDS_FX_GUI_MIN_H;
     vs->window_w = w; vs->window_h = h;

@@ -96,7 +96,7 @@ static void hds_clap_build_osc_dispatch_table_once(void) {
 // this plugin's own platform shim -- see each file's own header comment for why hds.clap gets its
 // own small X11 shell instead of further genericizing hds_fx_gui_x11.c (which stays exactly as
 // hds_fx.clap alone needs it).
-#include "hds_fx_gui_draw.c"
+#include "hds_fx_gui_draw.h" // FX pool GUI, compiled separately (src/hds_fx_gui_draw.c)
 // hds_clap_play_draw.c and hds_clap_filters_draw.c come BEFORE hds_clap_gui_draw.c: they define
 // HdsClapPlayViewState/HdsClapFiltersViewState, which HdsClapGuiViewState (hds_clap_gui_draw.c's
 // own view-state struct) nests exactly the same way it already nests hds_fx_gui_draw.c's own
