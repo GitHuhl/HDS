@@ -9,8 +9,9 @@
 // too, without either platform shim's own window/event-pump code needing to be shared -- see each
 // platform file's own header comment on why those stay separate, small copies.
 //
-// #include'd right after hds_fx_gui_draw.c (needs HdsFxBrowser/HDS_FX_BROWSER_*/hds_fx_safe_copy,
-// all defined there).
+// Compiled as its own object; hds_fx_gui_browser.h is its interface.
+#include "hds_fx_gui_browser.h"
+#include <stdio.h>    // snprintf
 #include <dirent.h>   // opendir/readdir/closedir
 #include <sys/stat.h> // stat/S_ISDIR/S_ISREG
 #include <strings.h>  // strcasecmp -- case-insensitive *.nam/*.wav filtering and sorting
@@ -49,7 +50,7 @@ static bool hds_fx_path_has_ext(const char *name, const char *ext) {
 // lives (hds_fx.clap's own window keeps it at the top level; hds.clap's own nests it one level
 // down, inside its own FX-tab sub-state, yet reuses this SAME instance from its Play/Global tabs
 // too -- see hds_clap_gui_draw.c's own header comment).
-static void hds_fx_gui_browser_refresh(HdsFxBrowser *b) {
+void hds_fx_gui_browser_refresh(HdsFxBrowser *b) {
     if (!b->open || !b->needs_refresh) return;
     b->needs_refresh = false;
 

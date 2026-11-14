@@ -13,7 +13,7 @@
 #include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM/GET_WHEEL_DELTA_WPARAM
 #include <cairo/cairo-win32.h>
 
-#include "hds_fx_gui_browser.c" // hds_fx_gui_browser_refresh() -- see that file's own header comment
+#include "hds_fx_gui_browser.h" // hds_fx_gui_browser_refresh(), compiled separately (src/hds_fx_gui_browser.c)
 
 typedef struct {
     HdsClapPlugin *plugin;

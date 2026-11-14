@@ -39,7 +39,7 @@
 #include <cairo/cairo-win32.h>
 #include <stdlib.h> // calloc/free
 
-#include "hds_fx_gui_browser.c" // hds_fx_gui_browser_refresh() -- unchanged, dirent/stat are portable via mingw-w64's own headers
+#include "hds_fx_gui_browser.h" // hds_fx_gui_browser_refresh(), compiled separately (src/hds_fx_gui_browser.c)
 
 typedef struct {
     HdsFxGuiHost *plugin; // the real, persistent view -- see hds_fx_gui_host_of()'s own comment

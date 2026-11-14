@@ -17,7 +17,7 @@
 #include <X11/keysym.h>
 #include <cairo/cairo-xlib.h>
 
-#include "hds_fx_gui_browser.c" // hds_fx_gui_browser_refresh() -- see that file's own header comment
+#include "hds_fx_gui_browser.h" // hds_fx_gui_browser_refresh(), compiled separately (src/hds_fx_gui_browser.c)
 
 typedef struct {
     HdsClapPlugin *plugin;
