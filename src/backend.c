@@ -163,7 +163,7 @@ static char *hds_realpath_compat(const char *path, char *resolved) {
 // the "never moves" safety property. See the Sample Bank section on SynthSharedControls and
 // find_matching_sample_slot().
 #define SAMPLE_SLOT_CAPACITY 100000
-#define SAMPLE_PATH_LEN 256
+// SAMPLE_PATH_LEN lives in hds_config.h (shared with fx_types.h).
 // How many independent round-robin groups (Mapping tab's Round-Robin Group control) can exist at
 // once -- a real, small, legitimately-boundable UI concept (like MAX_VOICES/MAX_SAMPLE_STREAMS),
 // entirely unrelated to how many zones the Sample Bank can hold. See find_matching_sample_slot().
@@ -1478,7 +1478,7 @@ static float run_svf_filter_p(float input, const FilterParams *p, float cutoff_m
 // point in the file (see HdsEngineState's own comment on why it's declared so late).
 
 
-#include "fx_chain.c"
+#include "fx_chain.h" // FX bus DSP, compiled separately (src/fx_chain.c)
 
 // --- Curve/Drive: a single physical pot per oscillator/LFO (curve_drive, -1..1 in the struct),
 // reinterpreted by the currently-active waveform -- see lookup_osc_sample()/lookup_lfo_waveform()
@@ -8996,7 +8996,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
     // FX bus engine state: persists across calls (and across FX_TYPE changes -- see
     // process_fx_chain) for the same "one synth engine instance" reason as above.
     FXSlotEngine *fx_engine = engine->fx_engine;
-    if (!engine->fx_engine_initialized) { reset_fx_engine(fx_engine); engine->fx_engine_initialized = true; }
+    if (!engine->fx_engine_initialized) { reset_fx_engine(fx_engine, FX_SLOT_COUNT); engine->fx_engine_initialized = true; }
 
     // Always-on master safety limiter gain, one per output pair (evaluated after every source
     // routed to that pair has been summed in -- see its use below). Persists across calls for the
@@ -9029,7 +9029,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
     // a real, measured underrun regression at any voice count, since it's a flat per-sample tax
     // paid regardless of patch complexity). See process_fx_chain()'s own comment for how the two
     // pieces fit together now.
-    sync_fx_engine_types(knobs->fx, fx_engine);
+    sync_fx_engine_types(knobs->fx, fx_engine, FX_SLOT_COUNT);
 #if HDS_NAM_ENABLED
     // Same "once per block, right after sync_fx_engine_types" precondition as that call itself --
     // see poll_fx_nam_requests()'s own comment in fx_chain.c. Hoisted up here (rather than each
@@ -9038,7 +9038,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
     // way they already share every other piece of render_audio_block -- this was the actual fix
     // for the CLAP-plugin-side gap fx_nam_reload_model/fx_nam_reload_ir's own comment used to
     // document as a known, unaddressed limitation.
-    poll_fx_nam_requests(knobs->fx, fx_engine);
+    poll_fx_nam_requests(knobs->fx, fx_engine, FX_SLOT_COUNT);
 #endif
     bool source_has_fx_slots[SOURCE_COUNT] = {false};
     for (int s = 0; s < FX_SLOT_COUNT; s++) {
@@ -10127,7 +10127,7 @@ static float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, Syn
         // effect to.
         for (int src = 0; src < SOURCE_COUNT; src++) {
             if (!source_has_fx_slots[src]) continue;
-            process_fx_chain(knobs->fx, fx_engine, /* always Parallel, matches HDS FX */ 1, src, sc_snapshot_l, sc_snapshot_r, &bus_l[src], &bus_r[src], gr_db_raw, dump_avail_out, engine->fx_slot_out_l, engine->fx_slot_out_r);
+            process_fx_chain(knobs->fx, fx_engine, FX_SLOT_COUNT, /* always Parallel, matches HDS FX */ 1, src, sc_snapshot_l, sc_snapshot_r, SOURCE_COUNT, &bus_l[src], &bus_r[src], gr_db_raw, dump_avail_out, engine->fx_slot_out_l, engine->fx_slot_out_r);
         }
 
         // CLAP multi-out (see this function's own per_program_out comment) -- captured here,

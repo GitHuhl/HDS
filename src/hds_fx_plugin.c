@@ -90,13 +90,8 @@
 #include <errno.h> // needed by fx_chain.c's own seq_audio_load_wav_from_disk() (strerror(errno))
 #include "../third_party/clap/include/clap/clap.h" // already pulls in ext/gui.h and ext/timer-support.h
 
-// The handful of plain constants fx_types.h/fx_chain.c need defined before they're #include'd --
-// backend.c normally supplies these (see its own header comment on each); this file supplies its
-// own copies instead of pulling in backend.c wholesale, since none of backend.c's synth machinery
-// is wanted here at all.
-#define SAMPLE_RATE 48000
-#define BUFFER_SIZE 1024
-#define SAMPLE_PATH_LEN 256
+// SAMPLE_RATE/BUFFER_SIZE/SAMPLE_PATH_LEN come from hds_config.h (via fx_chain.h below).
+#include "hds_config.h"
 // The synth's own FX bus uses 12 (SynthSharedControls.fx[FX_SLOT_COUNT]) because it's a shared
 // budget with everything else a Combi Program needs; HDS FX has no synth competing for that budget
 // at all, so this is sized generously -- 32 slots shared across all 8 ports, plenty of headroom for
@@ -133,7 +128,7 @@
 // further down in this file (both need FXSlotParams/fx_chain.c's globals already in scope, so they
 // can't live any earlier than this #include).
 #include "fx_types.h"
-#include "fx_chain.c"
+#include "fx_chain.h" // FX bus DSP, compiled separately (src/fx_chain.c)
 #include "hds_fx_gui_host.h" // HdsFxGuiHost -- see its own header comment; HdsFxPlugin embeds one below
 
 // ---------------------------------------------------------------------------------------------
@@ -458,7 +453,7 @@ static void hds_fx_init_pool_defaults(HdsFxPlugin *p) {
         p->fx[s].sidechain_source = -1.0f; // "Same as Source" -- see FXSlotParams' own comment
         p->fx[s].input_from_slot = -1.0f; // not used -- see FXSlotParams' own comment
     }
-    reset_fx_engine(p->fx_engine);
+    reset_fx_engine(p->fx_engine, FX_SLOT_COUNT);
     for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
         p->port_input_stereo[port] = 1.0f;  // default: read the port as real stereo, today's obvious behavior
         p->port_output_channel[port] = (float)port; // default: write back to the SAME port (always its own real stereo pair)
@@ -761,14 +756,14 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
     // PRECONDITION for process_fx_chain() (see its own comment): a slot's active_type must be
     // synced to its current fx_type once per block, before any per-sample dispatch. One call now
     // (not once per port) -- there's only one pool.
-    sync_fx_engine_types(p->fx, p->fx_engine);
+    sync_fx_engine_types(p->fx, p->fx_engine, FX_SLOT_COUNT);
 #if HDS_NAM_ENABLED
     // Same "once per block, right after sync_fx_engine_types" precondition as that call itself --
     // see poll_fx_nam_requests()'s own comment in fx_chain.c. This plugin has no separate
     // standalone-style main loop to poll from the way hds_standalone.c does, so process() itself is
     // the one place per block this can run -- the equivalent shared call for the synth's own side
     // lives in backend.c's render_audio_block instead.
-    poll_fx_nam_requests(p->fx, p->fx_engine);
+    poll_fx_nam_requests(p->fx, p->fx_engine, FX_SLOT_COUNT);
 #endif
     // gr_db_scratch zeroed once per block, then refreshed by whichever port's call owns each slot
     // this sample -- same convention as backend.c's own gr_db_out (see render_audio_block).
@@ -821,7 +816,7 @@ static clap_process_status hds_fx_plugin_process(const clap_plugin_t *plugin, co
         }
         for (int port = 0; port < HDS_FX_PORT_COUNT; port++) {
             float l = sc_snapshot_l[port], r = sc_snapshot_r[port];
-            process_fx_chain(p->fx, p->fx_engine, /* always Parallel */ 1, port, sc_snapshot_l, sc_snapshot_r, &l, &r, p->gr_db_scratch, p->dump_avail_scratch, p->fx_slot_out_l, p->fx_slot_out_r);
+            process_fx_chain(p->fx, p->fx_engine, FX_SLOT_COUNT, /* always Parallel */ 1, port, sc_snapshot_l, sc_snapshot_r, SOURCE_COUNT, &l, &r, p->gr_db_scratch, p->dump_avail_scratch, p->fx_slot_out_l, p->fx_slot_out_r);
 
             if (p->port_output_off[port] != 0.0f) continue; // Off: this chain's Output goes nowhere
 

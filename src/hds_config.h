@@ -18,4 +18,7 @@
 // these ceilings.
 #define BUFFER_SIZE 1024
 
+// Fixed-size buffer for sample/model/IR file paths (Sample Bank, FX slot NAM model + cab IR).
+#define SAMPLE_PATH_LEN 256
+
 #endif // HDS_CONFIG_H
