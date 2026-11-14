@@ -1407,7 +1407,7 @@ int main(int argc, char **argv) {
     // comment above).
     g_gui_ctx.gui_host.fx = g_gui_ctx.knobs.fx;
     g_gui_ctx.gui_host.slot_count = FX_SLOT_COUNT;
-    g_gui_ctx.gui_host.port_count = HDS_FX_PORT_COUNT;
+    g_gui_ctx.gui_host.port_count = SOURCE_COUNT; // == HDS_FX_PORT_COUNT, which is only defined in GUI builds
     g_gui_ctx.gui_host.fx_gr_db = g_gui_ctx.fx_gr_db;
     g_gui_ctx.gui_host.fx_dump_avail_sec = g_gui_ctx.fx_dump_avail_sec;
     g_gui_ctx.gui_host.source_count = SOURCE_COUNT;
