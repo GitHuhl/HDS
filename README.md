@@ -47,17 +47,41 @@ make clap-windows             # -> hds-windows.clap
 make hds-fx-windows           # -> hds_fx-windows.clap
 ```
 
+## Testing
+
+```
+make test         # build everything, run the tests, compare against tests/golden.txt
+make test-golden  # same, but rewrite tests/golden.txt
+```
+
+Run inside `nix-shell`: it pins every library the results depend on and provides Xvfb for the
+GUI test. `make test` runs four programs from `tests/`:
+
+- `test_fx_chain` — every FX type (except NAM) with four parameter/mix/routing/sidechain
+  variants, plus a 32-slot, 8-source bus: checks the output is finite and fingerprints it.
+- `test_recording` — records WAV and WavPack through the recording engine and reads both back,
+  checking every sample.
+- `test_clap_render` — plays notes through `hds.clap` (checks it sounds and then releases to
+  silence) and checks `hds_fx.clap` with every slot Off passes all 8 ports through bit-exactly.
+- `test_clap_gui` — opens both plugin GUIs on Xvfb, clicks through every tab of `hds.clap`, and
+  checks each view rendered and differs from the others. Text is pinned to the vendored DejaVu
+  Sans so the captures match on every machine; they're saved to `build/tests/out/`.
+
+The fingerprints in `tests/golden.txt` are bit-exact, so any change to the sound or the GUI fails
+`make test`. If the change was intended, run `make test-golden` and commit the updated file along
+with it, so the diff shows which outputs changed.
+
 ## Source layout
 
 | File | What it is |
 | --- | --- |
-| `src/backend.c` | The shared DSP/state core: oscillators, filters, envelopes, LFOs, the FX chain dispatch, the OSC address table (`OSC_PARAMS[]`). `#include`d by both entry points below — never compiled or linked on its own. |
+| `src/backend.c` / `backend.h` / `backend_types.h` | The shared DSP/state core: oscillators, filters, envelopes, LFOs, the FX chain dispatch, the OSC address table (`OSC_PARAMS[]`). Compiled once and linked into both `synth_engine` and `hds.clap`; `backend.h` is its interface, `backend_types.h` its data model. |
 | `src/hds_standalone.c` | `synth_engine`'s own `main()`: ALSA/PipeWire I/O, MIDI sequencer, recording, the Sample Bank disk-streaming thread, the interactive terminal/arrow-key controls, and (opt-in) the native GUI. |
 | `src/clap_plugin.c` | `hds.clap`'s CLAP plugin wrapper: calls the same backend functions a block at a time instead of owning a device, plus CLAP's params/state/gui extensions. |
 | `src/sequencer.c` | The Sequencer engine (lanes, transport, MIDI/audio playback) — standalone-only, since a DAW host already owns sequencing for its plugins. |
 | `src/fx_chain.c` / `src/fx_types.h` | The FX slot engine and every `FX_TYPE_*` shared by all three builds. |
 | `src/hds_fx_plugin.c` | `hds_fx.clap`'s own CLAP plugin wrapper around just the FX chain. |
-| `src/hds_clap_*_draw.c`, `src/hds_fx_gui_draw.c` | The native Cairo-drawn GUI: one file per tab (Play, Filters, LFOs, Envelopes, Routing, Devices, Global sidebar, FX), platform-agnostic (no X11/Win32 calls). |
+| `src/hds_clap_*_draw.c` / `hds_clap_gui.h`, `src/hds_fx_gui_draw.c` / `.h` | The native Cairo-drawn GUI: one file per tab (Play, Filters, LFOs, Envelopes, Routing, Devices, Global sidebar, FX), platform-agnostic (no X11/Win32 calls). Each is its own object; Routing, Devices, Recording and the tab dispatcher are built once per host because they contain standalone-only code. |
 | `src/hds_clap_gui_x11.c` / `_win32.c`, `src/hds_fx_gui_x11.c` / `_win32.c`, `src/hds_standalone_gui_x11.c` | The platform shims (window creation, event pump) for each of the above, per OS and per host context. |
 
 ## Control protocol: OSC

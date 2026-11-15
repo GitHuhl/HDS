@@ -150,6 +150,7 @@ pkgs.mkShell {
     # auto-detection posture as the PipeWire block above -- just needs both on PATH here.
     pkgs.cairo
     pkgs.xorg.libX11
+    pkgs.xorg.xorgserver # Xvfb, for `make test`'s GUI test (tests/run_tests.sh)
 
     # --- Raspberry Pi 5 / aarch64 Linux cross-build (make arm64) ---
     # aarch64.stdenv.cc installs its binaries under the aarch64-unknown-linux-gnu- prefix (gcc,

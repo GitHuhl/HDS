@@ -239,7 +239,7 @@ ARM64_BIN := synth_engine-arm64
 # $ORIGIN-relative, i.e. "next to me".
 ARM64_LIBDIR := arm64-libs
 
-.PHONY: all run-backend run-frontend clean clean-windows clap hds-fx arm64 clap-windows hds-fx-windows FORCE
+.PHONY: all run-backend run-frontend clean clean-windows clap hds-fx arm64 clap-windows hds-fx-windows test test-golden FORCE
 
 all: $(BIN)
 
@@ -585,6 +585,34 @@ hds-fx-windows: $(WIN_HDS_FX_OBJ) $(WIN_FX_GUI_OBJ) $(WIN_BROWSER_OBJ) $(WIN_FX_
 
 run-backend: $(BIN)
 	./$(BIN)
+
+# --- Tests (tests/) ---
+# `make test` builds synth_engine, hds.clap and hds_fx.clap plus four test programs, runs them
+# (tests/run_tests.sh), and compares their audio/GUI fingerprints with tests/golden.txt.
+# `make test-golden` does the same but rewrites tests/golden.txt -- only after an intended change
+# to the sound or the GUI, reviewing the diff. Run both inside nix-shell (it provides Xvfb for the
+# GUI test and pins every library, which the fingerprints depend on).
+TEST_DIR := $(BUILD_DIR)/tests
+TEST_BINS := $(TEST_DIR)/test_fx_chain $(TEST_DIR)/test_recording $(TEST_DIR)/test_clap_render $(TEST_DIR)/test_clap_gui
+TEST_CFLAGS := $(CFLAGS) -Isrc -I$(CLAP_INC)
+
+$(TEST_DIR):
+	mkdir -p $@
+$(TEST_DIR)/test_fx_chain: tests/test_fx_chain.c tests/test_common.h $(FX_CHAIN_OBJ) $(NAM_OBJS) | $(TEST_DIR)
+	$(CC) $(TEST_CFLAGS) -c $< -o $@.o
+	$(CXX) -o $@ $@.o $(FX_CHAIN_OBJ) $(NAM_OBJS) -lm
+$(TEST_DIR)/test_recording: tests/test_recording.c tests/test_common.h $(BUILD_DIR)/recording_engine.o | $(TEST_DIR)
+	$(CC) $(TEST_CFLAGS) $< $(BUILD_DIR)/recording_engine.o -o $@ -lwavpack -lpthread -lm
+$(TEST_DIR)/test_clap_render: tests/test_clap_render.c tests/test_common.h tests/clap_test_host.h | $(TEST_DIR)
+	$(CC) $(TEST_CFLAGS) $< -o $@ -ldl -lm
+$(TEST_DIR)/test_clap_gui: tests/test_clap_gui.c tests/test_common.h tests/clap_test_host.h | $(TEST_DIR)
+	$(CC) $(TEST_CFLAGS) $(shell pkg-config --cflags x11) $< -o $@ -ldl $(shell pkg-config --libs x11) -lm
+
+test: $(BIN) clap hds-fx $(TEST_BINS)
+	tests/run_tests.sh $(TEST_DIR) ./$(CLAP_BIN) ./$(HDS_FX_BIN)
+
+test-golden: $(BIN) clap hds-fx $(TEST_BINS)
+	tests/run_tests.sh --update $(TEST_DIR) ./$(CLAP_BIN) ./$(HDS_FX_BIN)
 
 clean:
 	rm -f $(BIN) $(CLAP_BIN) $(HDS_FX_BIN) $(ARM64_BIN)
