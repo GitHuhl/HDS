@@ -79,7 +79,8 @@ with it, so the diff shows which outputs changed.
 | `src/hds_standalone.c` | `synth_engine`'s own `main()`: ALSA/PipeWire I/O, MIDI sequencer, recording, the Sample Bank disk-streaming thread, the interactive terminal/arrow-key controls, and (opt-in) the native GUI. |
 | `src/clap_plugin.c` | `hds.clap`'s CLAP plugin wrapper: calls the same backend functions a block at a time instead of owning a device, plus CLAP's params/state/gui extensions. |
 | `src/sequencer.c` | The Sequencer engine (lanes, transport, MIDI/audio playback) — standalone-only, since a DAW host already owns sequencing for its plugins. |
-| `src/fx_chain.c` / `src/fx_types.h` | The FX slot engine and every `FX_TYPE_*` shared by all three builds. |
+| `src/fx_chain.c` / `fx_chain.h` / `fx_types.h` | The FX slot engine (slot lifecycle, routing, `process_fx_chain`) shared by all three builds, and the slot data model. |
+| `src/fx/` | Each `FX_TYPE_*` effect's DSP, one file per family: Airwindows modulation and tone ports, NAM, EQ/filters, compressors, gate/limiters, pitch, reverb/delay. `fx_effects.h` is the internal interface `fx_chain.c` calls through. |
 | `src/hds_fx_plugin.c` | `hds_fx.clap`'s own CLAP plugin wrapper around just the FX chain. |
 | `src/hds_clap_*_draw.c` / `hds_clap_gui.h`, `src/hds_fx_gui_draw.c` / `.h` | The native Cairo-drawn GUI: one file per tab (Play, Filters, LFOs, Envelopes, Routing, Devices, Global sidebar, FX), platform-agnostic (no X11/Win32 calls). Each is its own object; Routing, Devices, Recording and the tab dispatcher are built once per host because they contain standalone-only code. |
 | `src/hds_clap_gui_x11.c` / `_win32.c`, `src/hds_fx_gui_x11.c` / `_win32.c`, `src/hds_standalone_gui_x11.c` | The platform shims (window creation, event pump) for each of the above, per OS and per host context. |
