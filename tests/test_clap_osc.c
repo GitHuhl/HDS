@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 
 #define BS 256
+#define TEMPO_STEPS_MAX 32 // distinct tempos the 64-marker map holds as steps (2*32-1 = 63)
 #define MAX_MSGS 8192
 
 // ---- received-message log ---------------------------------------------------------------------
@@ -137,23 +138,45 @@ static void write_smf(const char *path) {
     fwrite(hdr, 1, 14, f); put_track(f, &t0); put_track(f, &t1); put_track(f, &t2); fclose(f);
 }
 
-// Conductor track with 11 Set Tempo events a beat apart: 120, 120 (a repeat, no change), then 100,
-// 110, ..., 180 -- 10 distinct tempos, more than the 16-slot map holds as steps (2 slots per
-// change), plus one note track.
-static void write_smf_many_tempos(const char *path) {
-    Buf t0 = {0}, t1 = {0};
-    const int bpm[11] = { 120, 120, 100, 110, 120, 130, 140, 150, 160, 170, 180 };
+// Conductor track with Set Tempo events a beat apart -- bpm[] -- plus one note track.
+typedef struct { unsigned char b[1024]; int n; } BigBuf;
+static void write_smf_tempos(const char *path, const int *bpm, int count) {
+    Buf t1 = {0}; BigBuf t0b = {0}; Buf *t0 = (Buf *)&t0b; // conductor track can exceed Buf's 512 bytes
     unsigned char eot[] = { 0xFF, 0x2F, 0x00 };
-    for (int i = 0; i < 11; i++) {
+    for (int i = 0; i < count; i++) {
         uint32_t usec = (uint32_t)(60000000 / bpm[i]);
         unsigned char ev[6] = { 0xFF, 0x51, 0x03, (unsigned char)(usec >> 16), (unsigned char)(usec >> 8), (unsigned char)usec };
-        put_vlq(&t0, i ? 480 : 0); put(&t0, ev, 6);
+        put_vlq(t0, i ? 480 : 0); put(t0, ev, 6);
     }
-    put_vlq(&t0, 0); put(&t0, eot, 3);
+    put_vlq(t0, 0); put(t0, eot, 3);
     ev3(&t1, 0, 0x90, 60, 100); ev3(&t1, 480, 0x80, 60, 0); put_vlq(&t1, 0); put(&t1, eot, 3);
     FILE *f = fopen(path, "wb");
     unsigned char hdr[14] = { 'M','T','h','d', 0,0,0,6, 0,1, 0,2, 0x01,0xE0 };
-    fwrite(hdr, 1, 14, f); put_track(f, &t0); put_track(f, &t1); fclose(f);
+    fwrite(hdr, 1, 14, f); put_track(f, t0); put_track(f, &t1); fclose(f);
+}
+
+// Imports bpm[0..count) and checks the reply's tempo map is the first `keep` distinct tempos (want[])
+// as instant steps: marker 0 = want[0], then each change a same-time (hold previous, new) pair.
+static int check_tempo_steps(const char *dir, const char *name, const int *bpm, int count, const int *want, int keep) {
+    char mid[512]; snprintf(mid, sizeof mid, "%s/%s", dir, name); write_smf_tempos(mid, bpm, count);
+    g_nmsgs = 0;
+    lo_send_from(g_plugin_addr, g_srv, LO_TT_IMMEDIATE, "/hds/song/import_smf", "sf", mid, 1.0f);
+    process_block(-1, 0, NULL); collect(2000, "/hds/status/smf_import/marker_count"); collect(300, NULL);
+    const Msg *n = find_msg("/hds/status/smf_import/tempo_marker_count");
+    int markers = 2 * keep - 1, ok = n && n->f == (float)markers;
+    for (int i = 0; ok && i < markers; i++) {
+        char at[64], ab[64];
+        snprintf(at, sizeof at, "/hds/status/smf_import/tempo_marker/%d/time", i); snprintf(ab, sizeof ab, "/hds/status/smf_import/tempo_marker/%d/bpm", i);
+        const Msg *mt = find_msg(at), *mb = find_msg(ab);
+        if (!mt || !mb) { ok = 0; break; }
+        int step = (i + 1) / 2;
+        float expect = (float)((i % 2 == 1) ? want[step - 1] : want[step]);
+        if (fabsf(mb->f - expect) > 1e-3f) ok = 0;
+        if (i % 2 == 0 && i > 0) { char pt[64]; snprintf(pt, sizeof pt, "/hds/status/smf_import/tempo_marker/%d/time", i - 1);
+            const Msg *prev = find_msg(pt); if (!prev || prev->f != mt->f) ok = 0; }
+    }
+    if (!ok) printf("     (%s: got %g markers, expected %d)\n", name, n ? n->f : -1, markers);
+    return ok;
 }
 
 int main(int argc, char **argv) {
@@ -189,7 +212,7 @@ int main(int argc, char **argv) {
     TestHash hs; test_hash_init(&hs);
     int n = request_state(&hs);
     test_check(find_msg("/hds/status/state_dump_complete") != NULL, "clap_osc/state_dump/complete", "no state_dump_complete (got %d messages)", g_nmsgs);
-    test_check(n == 5117, "clap_osc/state_dump/count", "%d control messages, expected one per OSC address (5117)", n);
+    test_check(n == 5981, "clap_osc/state_dump/count", "%d control messages, expected one per OSC address (5981)", n);
     test_hash_print(&hs, "clap_osc/state_dump/default");
 
     // parameter writes
@@ -258,28 +281,20 @@ int main(int argc, char **argv) {
     }
     test_hash_print(&hm, "clap_osc/smf/report");
 
-    // Many tempo changes: the repeat is skipped, and only the first 8 distinct tempos fit as steps
-    // (1 + 2*7 = 15 markers), each change a same-time (hold, switch) pair.
-    char mid2[512]; snprintf(mid2, sizeof mid2, "%s/osc_test_tempos.mid", dir); write_smf_many_tempos(mid2);
-    g_nmsgs = 0;
-    lo_send_from(g_plugin_addr, g_srv, LO_TT_IMMEDIATE, "/hds/song/import_smf", "sf", mid2, 1.0f);
-    process_block(-1, 0, NULL); collect(2000, "/hds/status/smf_import/marker_count"); collect(200, NULL);
-    const Msg *n2 = find_msg("/hds/status/smf_import/tempo_marker_count");
-    int pairs_ok = n2 && n2->f == 15.0f;
-    float expect_bpm[8] = { 120, 100, 110, 120, 130, 140, 150, 160 };
-    for (int i = 0; pairs_ok && i < 15; i++) {
-        char at[64], ab[64];
-        snprintf(at, sizeof at, "/hds/status/smf_import/tempo_marker/%d/time", i); snprintf(ab, sizeof ab, "/hds/status/smf_import/tempo_marker/%d/bpm", i);
-        const Msg *mt = find_msg(at), *mb = find_msg(ab);
-        if (!mt || !mb) { pairs_ok = 0; break; }
-        int step = (i + 1) / 2; // marker 0 = tempo 0; markers 2k-1, 2k = (hold tempo k-1, tempo k)
-        float want = (i % 2 == 1) ? expect_bpm[step - 1] : expect_bpm[step];
-        if (fabsf(mb->f - want) > 1e-3f) pairs_ok = 0;
-        if (i % 2 == 0 && i > 0) { char pt[64]; snprintf(pt, sizeof pt, "/hds/status/smf_import/tempo_marker/%d/time", i - 1);
-            const Msg *prev = find_msg(pt); if (!prev || prev->f != mt->f) pairs_ok = 0; }
+    // 11 tempo events with one repeat: all 10 distinct tempos fit (19 markers), the repeat skipped.
+    {
+        const int bpm[11] = { 120, 120, 100, 110, 120, 130, 140, 150, 160, 170, 180 };
+        const int want[10] = { 120, 100, 110, 120, 130, 140, 150, 160, 170, 180 };
+        test_check(check_tempo_steps(dir, "osc_test_tempos.mid", bpm, 11, want, 10), "clap_osc/smf/tempo_steps",
+                   "10 distinct tempos (one repeat) should import as 19 step markers");
     }
-    test_check(pairs_ok, "clap_osc/smf/tempo_steps_capacity", "expected 15 markers = the first 8 distinct tempos as steps, got %g markers",
-               n2 ? n2->f : -1);
+    // 40 distinct tempos: more than the map holds as steps -- the first 32 are kept (63 markers).
+    {
+        int bpm[40], want[40];
+        for (int i = 0; i < 40; i++) bpm[i] = want[i] = 60 + 3 * i;
+        test_check(check_tempo_steps(dir, "osc_test_tempos_40.mid", bpm, 40, want, TEMPO_STEPS_MAX), "clap_osc/smf/tempo_steps_capacity",
+                   "40 distinct tempos should keep the first %d as steps", TEMPO_STEPS_MAX);
+    }
 
     p->stop_processing(p); p->deactivate(p);
     lo_address_free(g_plugin_addr); lo_server_free(g_srv);
