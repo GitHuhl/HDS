@@ -51,6 +51,7 @@ run fx_chain "$bindir/test_fx_chain"
 run recording "$bindir/test_recording" "$out"
 run clap_render "$bindir/test_clap_render" "$synth" "$fx"
 run clap_osc "$bindir/test_clap_osc" "$out" "$synth"
+run clap_patches "$bindir/test_clap_patches" "$synth"
 run standalone "$bindir/test_standalone" "$out" "$root/synth_engine"
 
 xvfb_pid=""
