@@ -62,6 +62,9 @@ STANDALONE_UNITS := targets/standalone/hds_standalone core/recording_engine core
 objs     = $(addprefix $(BUILD_DIR)/$(1)/,$(addsuffix .o,$(2)))
 nam_objs = $(addprefix $(BUILD_DIR)/$(1)/nam/,$(addsuffix .o,$(NAM_UNITS)))
 
+# The variant rules below define the first explicit target (the NAM .flags stamp), so pin the default.
+.DEFAULT_GOAL := all
+
 # --- Per-variant compile rules ---
 # $(1) variant, $(2) C compiler, $(3) C flags, $(4) C++ compiler for NAM
 define variant_rules
