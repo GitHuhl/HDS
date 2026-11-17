@@ -53,12 +53,15 @@ STANDALONE_UNIT_OBJS = $(BUILD_DIR)/recording_engine.o $(BUILD_DIR)/sequencer.o 
 # fx_chain.o is shared by synth_engine, hds.clap and hds_fx.clap: built -fPIC and with hidden
 # visibility so the two .clap files never interpose each other's fx_chain symbols in one host
 # (same reason as NAM_CXXFLAGS' -fvisibility=hidden; CLAP_EXPORT keeps clap_entry visible).
-FX_CHAIN_OBJ := $(BUILD_DIR)/fx_chain.o
+# The FX bus: fx_chain.c (slot lifecycle + process_fx_chain) plus one object per effect family in
+# src/fx/. FX_CHAIN_OBJ is the whole list, for linking.
+FX_EFFECTS := fx_airwindows_mod fx_airwindows_tone fx_nam fx_eq_filter fx_compressors fx_limiters fx_pitch fx_reverb_delay
+FX_CHAIN_OBJ := $(BUILD_DIR)/fx_chain.o $(FX_EFFECTS:%=$(BUILD_DIR)/fx/%.o)
 # backend.o (the shared synth engine) is linked into synth_engine and hds.clap; same -fPIC/hidden
 # visibility reasoning as fx_chain.o.
 BACKEND_OBJ := $(BUILD_DIR)/backend.o
 BACKEND_DEPS := src/backend.c src/backend.h src/backend_types.h src/hds_config.h src/fx_types.h src/fx_chain.h src/recording_engine.h src/nam_bridge.h
-FX_CHAIN_DEPS := src/fx_chain.c src/fx_chain.h src/fx_types.h src/hds_config.h src/nam_bridge.h
+FX_CHAIN_DEPS := src/fx_chain.h src/fx/fx_effects.h src/fx_types.h src/hds_config.h src/nam_bridge.h
 CLAP_OBJ := $(BUILD_DIR)/clap_plugin.o
 
 # --- Neural Amp Modeler FX slot (FX_TYPE_NAM in backend.c) ---
@@ -313,7 +316,11 @@ $(NAM_BUILD_DIR)/%.o: src/%.cpp $(NAM_FLAGS_STAMP) | $(NAM_BUILD_DIR)
 $(BUILD_DIR)/recording_engine.o: src/recording_engine.c src/recording_engine.h src/hds_config.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(FX_CHAIN_OBJ): $(FX_CHAIN_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/fx_chain.o: src/fx_chain.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
+$(BUILD_DIR)/fx $(BUILD_DIR)/fx-arm64 $(BUILD_DIR)/fx-win:
+	mkdir -p $@
+$(BUILD_DIR)/fx/%.o: src/fx/%.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)/fx
 	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
 
 $(BUILD_DIR)/sequencer.o: src/sequencer.c src/sequencer.h src/backend.h src/backend_types.h src/hds_config.h | $(BUILD_DIR)
@@ -394,11 +401,15 @@ $(BUILD_DIR)/sequencer-arm64.o: src/sequencer.c src/sequencer.h src/backend.h sr
 $(BUILD_DIR)/backend-arm64.o: $(BACKEND_DEPS) | $(BUILD_DIR)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/fx_chain-arm64.o: $(FX_CHAIN_DEPS) | $(BUILD_DIR)
+ARM64_FX_CHAIN_OBJS := $(BUILD_DIR)/fx_chain-arm64.o $(FX_EFFECTS:%=$(BUILD_DIR)/fx-arm64/%.o)
+$(BUILD_DIR)/fx-arm64/%.o: src/fx/%.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)/fx-arm64
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
-arm64: $(ARM64_BIN_OBJ) $(BUILD_DIR)/backend-arm64.o $(BUILD_DIR)/sequencer-arm64.o $(BUILD_DIR)/recording_engine-arm64.o $(BUILD_DIR)/fx_chain-arm64.o $(ARM64_NAM_OBJS)
-	$(ARM64_CXX) $(STRIPFLAGS) -o $(ARM64_BIN) $(ARM64_BIN_OBJ) $(BUILD_DIR)/backend-arm64.o $(BUILD_DIR)/sequencer-arm64.o $(BUILD_DIR)/recording_engine-arm64.o $(BUILD_DIR)/fx_chain-arm64.o $(ARM64_NAM_OBJS) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo -lwavpack
+$(BUILD_DIR)/fx_chain-arm64.o: src/fx_chain.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)
+	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
+
+arm64: $(ARM64_BIN_OBJ) $(BUILD_DIR)/backend-arm64.o $(BUILD_DIR)/sequencer-arm64.o $(BUILD_DIR)/recording_engine-arm64.o $(ARM64_FX_CHAIN_OBJS) $(ARM64_NAM_OBJS)
+	$(ARM64_CXX) $(STRIPFLAGS) -o $(ARM64_BIN) $(ARM64_BIN_OBJ) $(BUILD_DIR)/backend-arm64.o $(BUILD_DIR)/sequencer-arm64.o $(BUILD_DIR)/recording_engine-arm64.o $(ARM64_FX_CHAIN_OBJS) $(ARM64_NAM_OBJS) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo -lwavpack
 	mkdir -p $(ARM64_LIBDIR)
 	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
 	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_BIN)
@@ -558,8 +569,10 @@ WIN_BROWSER_OBJ := $(BUILD_DIR)/hds_fx_gui_browser-win.o
 $(WIN_BROWSER_OBJ): $(BROWSER_DEPS) | $(BUILD_DIR)
 	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
 
-WIN_FX_CHAIN_OBJ := $(BUILD_DIR)/fx_chain-win.o
-$(WIN_FX_CHAIN_OBJ): $(FX_CHAIN_DEPS) | $(BUILD_DIR)
+WIN_FX_CHAIN_OBJ := $(BUILD_DIR)/fx_chain-win.o $(FX_EFFECTS:%=$(BUILD_DIR)/fx-win/%.o)
+$(BUILD_DIR)/fx-win/%.o: src/fx/%.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)/fx-win
+	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
+$(BUILD_DIR)/fx_chain-win.o: src/fx_chain.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)
 	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
 
 clap-windows: $(WIN_CLAP_OBJ) $(WIN_CLAP_GUI_OBJS) $(WIN_FX_GUI_OBJ) $(WIN_BROWSER_OBJ) $(WIN_BACKEND_OBJ) $(WIN_FX_CHAIN_OBJ) $(WIN_NAM_OBJS)
