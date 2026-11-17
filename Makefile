@@ -150,7 +150,7 @@ hds_fx-windows.clap: $(WIN_HDS_FX_OBJS)
 
 # --- Tests (tests/, run by tests/run_tests.sh; see the README's Testing section) ---
 TEST_DIR := $(BUILD_DIR)/tests
-TEST_BINS := $(addprefix $(TEST_DIR)/,test_backend test_fx_chain test_recording test_clap_render test_clap_osc test_clap_gui)
+TEST_BINS := $(addprefix $(TEST_DIR)/,test_backend test_fx_chain test_recording test_clap_render test_clap_osc test_clap_gui test_standalone)
 LINUX_NAM := $(call nam_objs,linux)
 RECORDING_OBJ := $(call objs,linux-sa,core/recording_engine)
 
@@ -167,6 +167,7 @@ $(TEST_DIR)/test_recording: $(RECORDING_OBJ)
 $(TEST_DIR)/test_clap_render: TEST_LINK = -ldl
 $(TEST_DIR)/test_clap_osc:    TEST_LINK = -ldl -llo
 $(TEST_DIR)/test_clap_gui:    TEST_LINK = -ldl $(GUI_LDLIBS)
+$(TEST_DIR)/test_standalone:  TEST_LINK = -llo
 
 test: synth_engine hds.clap hds_fx.clap $(TEST_BINS)
 	tests/run_tests.sh $(TEST_DIR) ./hds.clap ./hds_fx.clap

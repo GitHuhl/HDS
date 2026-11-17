@@ -59,7 +59,7 @@ make test-golden  # same, but rewrite tests/golden.txt
 ```
 
 Run inside `nix-shell`: it pins every library the results depend on and provides Xvfb for the
-GUI test. `make test` runs six programs from `tests/`:
+GUI test. `make test` runs seven programs from `tests/`:
 
 - `test_backend` — links `backend.o` directly: the JSON reader (valid documents, escapes, nesting,
   and rejection of malformed input), the Scala `.scl` tuning loader (cents, ratios, comments, CRLF;
@@ -77,6 +77,12 @@ GUI test. `make test` runs six programs from `tests/`:
   writes that show up in the next dump and change the sound, loading a generated `.sfz` (silent
   before the load, sounding after), and importing a generated 3-track MIDI file (lanes, tempo map,
   marker). Uses UDP port 9010, so close any running HDS plugin instance first.
+- `test_standalone` — runs the real `synth_engine` headless (`--no-midi`, ALSA's `null`
+  devices, OSC port 9100) and covers what only the standalone does: its audio loop is running,
+  the state dump and an OSC parameter write, and end to end, importing a generated MIDI file,
+  recording to a WAV while the Sequencer plays it, and checking the WAV is finalized and contains
+  the notes; then SIGINT must exit cleanly. Pass/fail only (the standalone's timing isn't
+  deterministic, so nothing is fingerprinted).
 - `test_clap_gui` — opens both plugin GUIs on Xvfb, clicks through every tab of `hds.clap`, and
   checks each view rendered and differs from the others. Text is pinned to the vendored DejaVu
   Sans so the captures match on every machine; they're saved to `build/tests/out/`.
@@ -176,6 +182,7 @@ port.
 | `--program <path.hdsprog>` | none | Loads a full Program at startup. |
 | `--master-volume <0.0-1.0>` | none | Sets master volume once at startup. |
 | `--gui` | off | Opens the native Cairo GUI as this process's own top-level window. |
+| `--no-midi` | off | Runs without the ALSA MIDI sequencer (control is OSC-only). Without it, a sequencer that can't be opened is fatal at startup. With `--output-device null --input-device null` this runs with no audio or MIDI hardware at all, which is how `make test` drives it. |
 
 Arrow keys work as live controls whenever stdin is a real terminal:
 Up/Down nudge master volume, Left/Right cycle through saved Programs in
