@@ -5,7 +5,7 @@
 // MIDI hardware needed) and its own OSC ports. Checks:
 //   - it starts and answers /hds/ping
 //   - the audio loop runs: status pushes keep arriving
-//   - /hds/request_state returns one message per control address
+//   - /hds/request_state returns one message per control address (5981)
 //   - an OSC parameter write shows up in the next state dump
 //   - end to end: import a generated MIDI file, start recording to a WAV, press Play on the
 //     Sequencer, stop; the WAV is a valid, finalized file and contains the notes (not silence)
@@ -154,7 +154,7 @@ int main(int argc, char **argv) {
 
     // full state dump
     int n = request_state();
-    test_check(find_msg("/hds/status/state_dump_complete") && n == 5117, "standalone/state_dump", "%d control messages, expected 5117", n);
+    test_check(find_msg("/hds/status/state_dump_complete") && n == 5981, "standalone/state_dump", "%d control messages, expected 5981", n);
 
     // parameter write
     send_f("/hds/master_volume", 0.5f); collect(200, NULL);

@@ -87,7 +87,7 @@
 #include "core/recording_engine.h" // RECORD_MAX_CHANNELS, RECORD_PATH_LEN, RecordEngine
 // Programmable tempo: hard ceiling on how many (time, bpm) tempo markers the tempo-map can hold
 // at once -- see the Tempo section on SynthSharedControls and compute_current_tempo_bpm().
-#define TEMPO_MARKER_MAX 16
+#define TEMPO_MARKER_MAX 64 // 32 distinct tempos from an imported MIDI file (each change is a 2-marker step)
 // DFD (direct-from-disk) sample playback: the Mapping tab's Sample Bank has no product-facing
 // cap on how many zones can be loaded -- the catalog now travels over its own dedicated,
 // event-driven socket (see zone_upsert_handler()/zone_remove_handler()), not the
