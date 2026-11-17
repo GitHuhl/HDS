@@ -214,7 +214,7 @@ int main(int argc, char **argv) {
     process_block(-1, 0, NULL); collect(2000, "/hds/status/smf_import/marker_count");
     collect(200, NULL);
     const Msg *ok = find_msg("/hds/status/smf_import/ok"), *lanes = find_msg("/hds/status/smf_import/lanes_used"),
-              *tm = find_msg("/hds/status/smf_import/tempo_marker_count"),
+              *tm = find_msg("/hds/status/smf_import/tempo_marker_count"), *tb = find_msg("/hds/status/smf_import/tempo_bpm"),
               *t0 = find_msg("/hds/status/smf_import/tempo_marker/0/time"), *b0 = find_msg("/hds/status/smf_import/tempo_marker/0/bpm"),
               *t1 = find_msg("/hds/status/smf_import/tempo_marker/1/time"), *b1 = find_msg("/hds/status/smf_import/tempo_marker/1/bpm"),
               *mc = find_msg("/hds/status/smf_import/marker_count"), *ml = find_msg("/hds/status/smf_import/marker/0/label"),
@@ -225,6 +225,8 @@ int main(int argc, char **argv) {
     test_check(tm && tm->f == 2.0f && t0 && b0 && t1 && b1 && t0->f == 0.0f && fabsf(b0->f - 120.0f) < 1e-3f &&
                fabsf(t1->f - 2.0f) < 1e-4f && fabsf(b1->f - 100.0f) < 1e-3f, "clap_osc/smf/tempo_map",
                "tempo map wrong: %g markers, (%g s, %g BPM), (%g s, %g BPM)", tm ? tm->f : -1, t0 ? t0->f : -1, b0 ? b0->f : -1, t1 ? t1->f : -1, b1 ? b1->f : -1);
+    // The flat tempo reported alongside a tempo map is the song's starting tempo, not a stale value.
+    test_check(tb && fabsf(tb->f - 120.0f) < 1e-3f, "clap_osc/smf/tempo_bpm", "reported tempo_bpm %g, expected the starting tempo 120", tb ? tb->f : -1);
     test_check(mc && mc->f == 1.0f && ml && strcmp(ml->s, "Verse") == 0, "clap_osc/smf/marker", "marker report wrong");
     TestHash hm; test_hash_init(&hm);
     for (int i = 0; i < g_nmsgs; i++) {

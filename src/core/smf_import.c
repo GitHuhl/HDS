@@ -314,6 +314,11 @@ static bool hds_song_import_smf(HdsEngineState *engine, SynthSharedControls *kno
                 prog->tempo_marker_bpm[i] = 60000000.0f / (float)tempo_events[i].usec_per_qn;
             }
             prog->tempo_marker_count = (float)n;
+            // Keep the flat tempo consistent with the map: the song's starting tempo. Playback
+            // ignores it while markers exist (compute_current_tempo_bpm holds the first marker's
+            // bpm before it anyway), but the import reply, the state dump and any controller that
+            // caches tempo_bpm would otherwise see whatever stale value was there before.
+            prog->tempo_bpm = prog->tempo_marker_bpm[0];
         }
     }
 
