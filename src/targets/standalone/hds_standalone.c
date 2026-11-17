@@ -1750,7 +1750,13 @@ int main(int argc, char **argv) {
         // device, or a read comes back short/broken -- external input degrading to silence
         // should never be able to stall or crash the synth's own audio output.
         static float capture_buffer[BUFFER_SIZE * RECORD_MAX_CHANNELS];
-        memset(capture_buffer, 0, sizeof(float) * (size_t)block_size * (size_t)detected_input_channels);
+        // block_size <= BUFFER_SIZE (effective_block_size) and detected_input_channels <=
+        // RECORD_MAX_CHANNELS (query_device_channel_count), so this always fits; the explicit clamp
+        // keeps that true locally (and lets the compiler see it -- without it, GCC's aarch64 build
+        // warned about an impossible >8 GB memset here).
+        size_t capture_floats = (size_t)block_size * (size_t)detected_input_channels;
+        if (capture_floats > sizeof(capture_buffer) / sizeof(capture_buffer[0])) capture_floats = sizeof(capture_buffer) / sizeof(capture_buffer[0]);
+        memset(capture_buffer, 0, sizeof(float) * capture_floats);
         if (pcm_capture_handle) {
             uint32_t got = read_capture_block(pcm_capture_handle, capture_buffer, detected_input_channels, (uint32_t)block_size);
             if (got < (uint32_t)block_size) {
