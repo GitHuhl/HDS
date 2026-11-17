@@ -606,11 +606,14 @@ run-backend: $(BIN)
 # to the sound or the GUI, reviewing the diff. Run both inside nix-shell (it provides Xvfb for the
 # GUI test and pins every library, which the fingerprints depend on).
 TEST_DIR := $(BUILD_DIR)/tests
-TEST_BINS := $(TEST_DIR)/test_fx_chain $(TEST_DIR)/test_recording $(TEST_DIR)/test_clap_render $(TEST_DIR)/test_clap_gui
+TEST_BINS := $(TEST_DIR)/test_backend $(TEST_DIR)/test_fx_chain $(TEST_DIR)/test_recording $(TEST_DIR)/test_clap_render $(TEST_DIR)/test_clap_osc $(TEST_DIR)/test_clap_gui
 TEST_CFLAGS := $(CFLAGS) -Isrc -I$(CLAP_INC)
 
 $(TEST_DIR):
 	mkdir -p $@
+$(TEST_DIR)/test_backend: tests/test_backend.c tests/test_common.h $(BACKEND_OBJ) $(FX_CHAIN_OBJ) $(BUILD_DIR)/recording_engine.o $(NAM_OBJS) | $(TEST_DIR)
+	$(CC) $(TEST_CFLAGS) -c $< -o $@.o
+	$(CXX) -o $@ $@.o $(BACKEND_OBJ) $(FX_CHAIN_OBJ) $(BUILD_DIR)/recording_engine.o $(NAM_OBJS) -llo -lwavpack -lpthread -lm
 $(TEST_DIR)/test_fx_chain: tests/test_fx_chain.c tests/test_common.h $(FX_CHAIN_OBJ) $(NAM_OBJS) | $(TEST_DIR)
 	$(CC) $(TEST_CFLAGS) -c $< -o $@.o
 	$(CXX) -o $@ $@.o $(FX_CHAIN_OBJ) $(NAM_OBJS) -lm
@@ -618,6 +621,8 @@ $(TEST_DIR)/test_recording: tests/test_recording.c tests/test_common.h $(BUILD_D
 	$(CC) $(TEST_CFLAGS) $< $(BUILD_DIR)/recording_engine.o -o $@ -lwavpack -lpthread -lm
 $(TEST_DIR)/test_clap_render: tests/test_clap_render.c tests/test_common.h tests/clap_test_host.h | $(TEST_DIR)
 	$(CC) $(TEST_CFLAGS) $< -o $@ -ldl -lm
+$(TEST_DIR)/test_clap_osc: tests/test_clap_osc.c tests/test_common.h tests/clap_test_host.h | $(TEST_DIR)
+	$(CC) $(TEST_CFLAGS) $< -o $@ -ldl -llo -lm
 $(TEST_DIR)/test_clap_gui: tests/test_clap_gui.c tests/test_common.h tests/clap_test_host.h | $(TEST_DIR)
 	$(CC) $(TEST_CFLAGS) $(shell pkg-config --cflags x11) $< -o $@ -ldl $(shell pkg-config --libs x11) -lm
 
