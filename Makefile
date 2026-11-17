@@ -61,7 +61,7 @@ FX_CHAIN_OBJ := $(BUILD_DIR)/fx_chain.o $(FX_EFFECTS:%=$(BUILD_DIR)/fx/%.o)
 # visibility reasoning as fx_chain.o.
 # The shared engine: backend.c plus the subsystems split out of it into src/engine/. BACKEND_OBJ is
 # the whole list, for linking.
-ENGINE_UNITS := json tuning smf_import sfz_parser
+ENGINE_UNITS := json tuning smf_import sfz_parser osc_protocol
 BACKEND_OBJ := $(BUILD_DIR)/backend.o $(ENGINE_UNITS:%=$(BUILD_DIR)/engine/%.o)
 BACKEND_DEPS := src/backend.h src/engine/sfz_parser.h src/hds_compat.h src/backend_types.h src/hds_config.h src/fx_types.h src/fx_chain.h src/recording_engine.h src/nam_bridge.h
 FX_CHAIN_DEPS := src/fx_chain.h src/fx/fx_effects.h src/fx_types.h src/hds_config.h src/nam_bridge.h
