@@ -64,7 +64,10 @@ float compute_current_tempo_bpm(const SynthSharedControls *knobs, double elapsed
     int next = -1; double next_time = 1e18;
     for (int i = 0; i < count; i++) {
         double t = (double)prog->tempo_marker_time[i];
-        if (t <= elapsed_seconds && t > prev_time) { prev = i; prev_time = t; }
+        // >= : of several markers at the SAME time, the last one wins once that time is reached,
+        // so a pair (t, old_bpm), (t, new_bpm) is an instant step rather than a ramp. Markers at
+        // distinct times behave exactly as before. (The SMF importer writes tempo changes this way.)
+        if (t <= elapsed_seconds && t >= prev_time) { prev = i; prev_time = t; }
         if (t > elapsed_seconds && t < next_time) { next = i; next_time = t; }
     }
     if (prev < 0 && next < 0) return prog->tempo_bpm; // defensive fallback, shouldn't happen when count > 0
