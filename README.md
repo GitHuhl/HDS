@@ -47,6 +47,10 @@ make clap-windows             # -> hds-windows.clap
 make hds-fx-windows           # -> hds_fx-windows.clap
 ```
 
+Background on the less obvious build choices (NAM symbol visibility, the mingw-w64 pthread
+workarounds, static vs. dynamic linking on Windows, arm64 library bundling, PipeWire detection)
+is in [`docs/building.md`](docs/building.md).
+
 ## Testing
 
 ```
