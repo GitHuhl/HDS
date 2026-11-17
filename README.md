@@ -59,7 +59,7 @@ make test-golden  # same, but rewrite tests/golden.txt
 ```
 
 Run inside `nix-shell`: it pins every library the results depend on and provides Xvfb for the
-GUI test. `make test` runs seven programs from `tests/`:
+GUI test. `make test` runs eight programs from `tests/`:
 
 - `test_backend` — links `backend.o` directly: the JSON reader (valid documents, escapes, nesting,
   and rejection of malformed input), the Scala `.scl` tuning loader (cents, ratios, comments, CRLF;
@@ -77,6 +77,12 @@ GUI test. `make test` runs seven programs from `tests/`:
   writes that show up in the next dump and change the sound, loading a generated `.sfz` (silent
   before the load, sounding after), and importing a generated 3-track MIDI file (lanes, tempo map,
   marker). Uses UDP port 9010, so close any running HDS plugin instance first.
+- `test_clap_patches` — renders 19 sounds through `hds.clap` (fresh instance each, settings over
+  OSC, the same chord-then-legato note sequence): every oscillator shape, two oscillators, hard
+  sync, FM, low-pass filter, filter key tracking, amp envelope, LFO to pitch and to filter cutoff,
+  mono glide, and the arpeggiator. Each must be audible, and all must sound different from each
+  other (with control patches, so FM and key tracking are proven to change the sound themselves);
+  each is fingerprinted. This is what guards the voice engine in `backend.c`.
 - `test_standalone` — runs the real `synth_engine` headless (`--no-midi`, ALSA's `null`
   devices, OSC port 9100) and covers what only the standalone does: its audio loop is running,
   the state dump and an OSC parameter write, and end to end, importing a generated MIDI file,
