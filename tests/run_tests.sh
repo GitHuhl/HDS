@@ -46,9 +46,11 @@ run() { # name, command...
     fi
 }
 
+run backend "$bindir/test_backend" "$out"
 run fx_chain "$bindir/test_fx_chain"
 run recording "$bindir/test_recording" "$out"
 run clap_render "$bindir/test_clap_render" "$synth" "$fx"
+run clap_osc "$bindir/test_clap_osc" "$out" "$synth"
 
 xvfb_pid=""
 if [ -z "${DISPLAY:-}" ] && command -v Xvfb >/dev/null; then

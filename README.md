@@ -55,14 +55,24 @@ make test-golden  # same, but rewrite tests/golden.txt
 ```
 
 Run inside `nix-shell`: it pins every library the results depend on and provides Xvfb for the
-GUI test. `make test` runs four programs from `tests/`:
+GUI test. `make test` runs six programs from `tests/`:
 
+- `test_backend` — links `backend.o` directly: the JSON reader (valid documents, escapes, nesting,
+  and rejection of malformed input), the Scala `.scl` tuning loader (cents, ratios, comments, CRLF;
+  malformed files rejected without touching the loaded scale), and the OSC address table (every
+  address unique and resolvable; the whole address space is fingerprinted, so any protocol change
+  shows up).
 - `test_fx_chain` — every FX type (except NAM) with four parameter/mix/routing/sidechain
   variants, plus a 32-slot, 8-source bus: checks the output is finite and fingerprints it.
 - `test_recording` — records WAV and WavPack through the recording engine and reads both back,
   checking every sample.
 - `test_clap_render` — plays notes through `hds.clap` (checks it sounds and then releases to
   silence) and checks `hds_fx.clap` with every slot Off passes all 8 ports through bit-exactly.
+- `test_clap_osc` — drives `hds.clap` over its real OSC protocol from an in-process host:
+  ping/pong, a full `/hds/request_state` dump (one message per address, fingerprinted), parameter
+  writes that show up in the next dump and change the sound, loading a generated `.sfz` (silent
+  before the load, sounding after), and importing a generated 3-track MIDI file (lanes, tempo map,
+  marker). Uses UDP port 9010, so close any running HDS plugin instance first.
 - `test_clap_gui` — opens both plugin GUIs on Xvfb, clicks through every tab of `hds.clap`, and
   checks each view rendered and differs from the others. Text is pinned to the vendored DejaVu
   Sans so the captures match on every machine; they're saved to `build/tests/out/`.
