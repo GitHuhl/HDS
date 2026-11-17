@@ -85,8 +85,8 @@ with it, so the diff shows which outputs changed.
 
 | File | What it is |
 | --- | --- |
-| `src/backend.c` / `backend.h` / `backend_types.h` | The shared DSP/state core: oscillators, filters, envelopes, LFOs, voices, the sample engine, the FX chain dispatch. Compiled once and linked into both `synth_engine` and `hds.clap`; `backend.h` is its interface, `backend_types.h` its data model. |
-| `src/engine/` | Self-contained subsystems split out of `backend.c`: the JSON reader (`json.c`), Scala tuning import (`tuning.c`), Standard MIDI File import (`smf_import.c`), the SFZ parser (`sfz_parser.c`/`.h`), and the OSC control protocol (`osc_protocol.c`: the `OSC_PARAMS[]` address table, dispatch, state dump, discovery and status pushes). Linked wherever `backend.o` is. |
+| `src/backend.c` / `backend.h` / `backend_types.h` | The shared DSP/state core: oscillators, filters, envelopes, LFOs, voices, the FX chain dispatch. Compiled once and linked into both `synth_engine` and `hds.clap`; `backend.h` is its interface, `backend_types.h` its data model. |
+| `src/engine/` | Self-contained subsystems split out of `backend.c`: the JSON reader (`json.c`), Scala tuning import (`tuning.c`), Standard MIDI File import (`smf_import.c`), the SFZ parser (`sfz_parser.c`/`.h`), the Sample Bank / direct-from-disk sample engine (`sample_engine.c`/`.h`: zones, stream pool and disk thread, SFZ-to-zone loading, the sample oscillator), and the OSC control protocol (`osc_protocol.c`: the `OSC_PARAMS[]` address table, dispatch, state dump, discovery and status pushes). Linked wherever `backend.o` is. |
 | `src/hds_standalone.c` | `synth_engine`'s own `main()`: ALSA/PipeWire I/O, MIDI sequencer, recording, the Sample Bank disk-streaming thread, the interactive terminal/arrow-key controls, and (opt-in) the native GUI. |
 | `src/clap_plugin.c` | `hds.clap`'s CLAP plugin wrapper: calls the same backend functions a block at a time instead of owning a device, plus CLAP's params/state/gui extensions. |
 | `src/sequencer.c` | The Sequencer engine (lanes, transport, MIDI/audio playback) — standalone-only, since a DAW host already owns sequencing for its plugins. |
