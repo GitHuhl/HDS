@@ -59,8 +59,11 @@ FX_EFFECTS := fx_airwindows_mod fx_airwindows_tone fx_nam fx_eq_filter fx_compre
 FX_CHAIN_OBJ := $(BUILD_DIR)/fx_chain.o $(FX_EFFECTS:%=$(BUILD_DIR)/fx/%.o)
 # backend.o (the shared synth engine) is linked into synth_engine and hds.clap; same -fPIC/hidden
 # visibility reasoning as fx_chain.o.
-BACKEND_OBJ := $(BUILD_DIR)/backend.o
-BACKEND_DEPS := src/backend.c src/backend.h src/backend_types.h src/hds_config.h src/fx_types.h src/fx_chain.h src/recording_engine.h src/nam_bridge.h
+# The shared engine: backend.c plus the subsystems split out of it into src/engine/. BACKEND_OBJ is
+# the whole list, for linking.
+ENGINE_UNITS := json tuning smf_import sfz_parser
+BACKEND_OBJ := $(BUILD_DIR)/backend.o $(ENGINE_UNITS:%=$(BUILD_DIR)/engine/%.o)
+BACKEND_DEPS := src/backend.h src/engine/sfz_parser.h src/hds_compat.h src/backend_types.h src/hds_config.h src/fx_types.h src/fx_chain.h src/recording_engine.h src/nam_bridge.h
 FX_CHAIN_DEPS := src/fx_chain.h src/fx/fx_effects.h src/fx_types.h src/hds_config.h src/nam_bridge.h
 CLAP_OBJ := $(BUILD_DIR)/clap_plugin.o
 
@@ -353,7 +356,11 @@ BROWSER_DEPS := src/hds_fx_gui_browser.c src/hds_fx_gui_browser.h src/hds_config
 $(BROWSER_OBJ): $(BROWSER_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
 
-$(BACKEND_OBJ): $(BACKEND_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/engine $(BUILD_DIR)/engine-arm64 $(BUILD_DIR)/engine-win:
+	mkdir -p $@
+$(BUILD_DIR)/engine/%.o: src/engine/%.c $(BACKEND_DEPS) | $(BUILD_DIR)/engine
+	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
+$(BUILD_DIR)/backend.o: src/backend.c $(BACKEND_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
 
 $(BIN): $(BIN_OBJ) $(BACKEND_OBJ) $(STANDALONE_UNIT_OBJS) $(FX_CHAIN_OBJ) $(NAM_OBJS)
@@ -398,7 +405,10 @@ $(BUILD_DIR)/recording_engine-arm64.o: src/recording_engine.c src/recording_engi
 $(BUILD_DIR)/sequencer-arm64.o: src/sequencer.c src/sequencer.h src/backend.h src/backend_types.h src/hds_config.h | $(BUILD_DIR)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/backend-arm64.o: $(BACKEND_DEPS) | $(BUILD_DIR)
+ARM64_BACKEND_OBJS := $(BUILD_DIR)/backend-arm64.o $(ENGINE_UNITS:%=$(BUILD_DIR)/engine-arm64/%.o)
+$(BUILD_DIR)/engine-arm64/%.o: src/engine/%.c $(BACKEND_DEPS) | $(BUILD_DIR)/engine-arm64
+	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
+$(BUILD_DIR)/backend-arm64.o: src/backend.c $(BACKEND_DEPS) | $(BUILD_DIR)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
 ARM64_FX_CHAIN_OBJS := $(BUILD_DIR)/fx_chain-arm64.o $(FX_EFFECTS:%=$(BUILD_DIR)/fx-arm64/%.o)
@@ -408,8 +418,8 @@ $(BUILD_DIR)/fx-arm64/%.o: src/fx/%.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)/fx-arm64
 $(BUILD_DIR)/fx_chain-arm64.o: src/fx_chain.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
-arm64: $(ARM64_BIN_OBJ) $(BUILD_DIR)/backend-arm64.o $(BUILD_DIR)/sequencer-arm64.o $(BUILD_DIR)/recording_engine-arm64.o $(ARM64_FX_CHAIN_OBJS) $(ARM64_NAM_OBJS)
-	$(ARM64_CXX) $(STRIPFLAGS) -o $(ARM64_BIN) $(ARM64_BIN_OBJ) $(BUILD_DIR)/backend-arm64.o $(BUILD_DIR)/sequencer-arm64.o $(BUILD_DIR)/recording_engine-arm64.o $(ARM64_FX_CHAIN_OBJS) $(ARM64_NAM_OBJS) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo -lwavpack
+arm64: $(ARM64_BIN_OBJ) $(ARM64_BACKEND_OBJS) $(BUILD_DIR)/sequencer-arm64.o $(BUILD_DIR)/recording_engine-arm64.o $(ARM64_FX_CHAIN_OBJS) $(ARM64_NAM_OBJS)
+	$(ARM64_CXX) $(STRIPFLAGS) -o $(ARM64_BIN) $(ARM64_BIN_OBJ) $(ARM64_BACKEND_OBJS) $(BUILD_DIR)/sequencer-arm64.o $(BUILD_DIR)/recording_engine-arm64.o $(ARM64_FX_CHAIN_OBJS) $(ARM64_NAM_OBJS) $(ARM64_LDFLAGS) -lasound -lm -lpthread -llo -lwavpack
 	mkdir -p $(ARM64_LIBDIR)
 	cp -Lf $(ARM64_BUNDLE_LIBS) $(ARM64_LIBDIR)/
 	patchelf --set-rpath '$$ORIGIN/$(ARM64_LIBDIR)' --set-interpreter $(ARM64_INTERP) $(ARM64_BIN)
@@ -553,8 +563,10 @@ $(WIN_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp $(WIN_NAM_FLAGS_STAMP) | 
 $(WIN_NAM_BUILD_DIR)/%.o: src/%.cpp $(WIN_NAM_FLAGS_STAMP) | $(WIN_NAM_BUILD_DIR)
 	$(WIN_CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
-WIN_BACKEND_OBJ := $(BUILD_DIR)/backend-win.o
-$(WIN_BACKEND_OBJ): $(BACKEND_DEPS) | $(BUILD_DIR)
+WIN_BACKEND_OBJ := $(BUILD_DIR)/backend-win.o $(ENGINE_UNITS:%=$(BUILD_DIR)/engine-win/%.o)
+$(BUILD_DIR)/engine-win/%.o: src/engine/%.c $(BACKEND_DEPS) | $(BUILD_DIR)/engine-win
+	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
+$(BUILD_DIR)/backend-win.o: src/backend.c $(BACKEND_DEPS) | $(BUILD_DIR)
 	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
 
 WIN_CLAP_GUI_OBJS := $(call gui_objs,gui-win,$(GUI_SHARED_TABS) $(GUI_PER_HOST_TABS))
