@@ -28,11 +28,11 @@
 ## audio/MIDI device code at all (a CLAP host owns that, supplying buffers/note-events instead --
 ## see clap_plugin.c's own header comment), so cross-building them needed no WASAPI/WinMM code and
 ## never did even the first time a Windows CLAP build existed, before this project's native
-## Xlib/Cairo GUI existed to need porting too (see src/hds_clap_gui_win32.c/hds_fx_gui_win32.c's own
+## Xlib/Cairo GUI existed to need porting too (see src/platform/win32/hds_clap_gui_win32.c/hds_fx_gui_win32.c's own
 ## header comments for that GUI-porting story). The ImGui/GLFW touch client (hds_pi_touch) is gone
 ## for good too -- the Pi target is backend-only now (synth_engine-arm64, no GUI client for that
 ## target). See git history if that one's ever revived.
-## WavPack recording support is enabled (HDS_WAVPACK_ENABLED in src/hds_standalone.c) --
+## WavPack recording support is enabled (HDS_WAVPACK_ENABLED in src/targets/standalone/hds_standalone.c) --
 ## pkgs.wavpack/aarch64.wavpack in buildInputs below is what actually provides it; nothing else in
 ## this file needed to change when it was turned back on.
 ## `pkgs` is pinned to a fixed nixpkgs-24.05 release tarball (URL + content hash below) rather
@@ -131,10 +131,10 @@ pkgs.mkShell {
     pkgs.alsa-lib          # backend.c's audio I/O (ALSA) -- headers + lib in one nixpkgs derivation
     pkgs.liblo              # the OSC control protocol (backend.c's embedded control surface)
     pkgs.wavpack             # WavPack recording (Recording tab) -- see HDS_WAVPACK_ENABLED in
-                              # src/hds_standalone.c and -lwavpack in the Makefile's own LDLIBS.
+                              # src/targets/standalone/hds_standalone.c and -lwavpack in the Makefile's own LDLIBS.
     pkgs.pipewire            # backend.c's OPTIONAL native PipeWire backend (--backend pipewire,
                               # alongside the always-present ALSA backend above -- see
-                              # HDS_PIPEWIRE_ENABLED in src/backend.c). The Makefile auto-detects
+                              # HDS_PIPEWIRE_ENABLED in src/core/backend.c). The Makefile auto-detects
                               # this via `pkg-config --exists libpipewire-0.3` at build time, so
                               # just having it on PATH here is what turns the feature on -- nothing
                               # else in this file needs to change for that.
@@ -144,8 +144,8 @@ pkgs.mkShell {
                               # `make hds-fx` uses to find Cairo/X11 below (see HDS_FX_CFLAGS/
                               # HDS_FX_LDLIBS in the Makefile).
 
-    # --- HDS FX's own real embedded GUI (make hds-fx) --- src/hds_fx_gui_draw.c (Cairo drawing)
-    # + src/hds_fx_gui_x11.c (the X11 window/XEmbed/event-pump shim, see that file's own header
+    # --- HDS FX's own real embedded GUI (make hds-fx) --- src/gui/hds_fx_gui_draw.c (Cairo drawing)
+    # + src/platform/x11/hds_fx_gui_x11.c (the X11 window/XEmbed/event-pump shim, see that file's own header
     # comment). Found via `pkg-config --cflags/--libs cairo x11` in the Makefile, same
     # auto-detection posture as the PipeWire block above -- just needs both on PATH here.
     pkgs.cairo
@@ -298,14 +298,14 @@ pkgs.mkShell {
     # is NOT exported here -- aarch64.stdenv.cc's prefixed binary name
     # (aarch64-unknown-linux-gnu-gcc) is already on PATH via buildInputs above, so the Makefile's
     # own `?=` default covers it. WavPack recording is enabled on every synth_engine build
-    # (HDS_WAVPACK_ENABLED in src/recording_engine.c), so aarch64.wavpack is linked and bundled too.
+    # (HDS_WAVPACK_ENABLED in src/core/recording_engine.c), so aarch64.wavpack is linked and bundled too.
     export ARM64_CFLAGS="-I${aarch64.alsa-lib.dev}/include -I${aarch64.liblo}/include -I${aarch64.wavpack.dev or aarch64.wavpack}/include"
     export ARM64_LDFLAGS="-L${aarch64.alsa-lib}/lib -L${aarch64.liblo}/lib -L${aarch64.wavpack}/lib"
 
     # liblo is a pure protocol library -- no external config files, no hardware coupling -- safe
     # (and worth doing) to bundle straight alongside the output binary via a $ORIGIN-relative
     # RPATH, so the Pi needs no `apt-get install` for it (WavPack was bundled here too before it
-    # was disabled -- see src/backend.c's HDS_WAVPACK_ENABLED). alsa-lib is deliberately NOT
+    # was disabled -- see src/core/backend.c's HDS_WAVPACK_ENABLED). alsa-lib is deliberately NOT
     # bundled -- it's not just an ABI-compatible .so: `strings` on this cross-built libasound.so.2
     # shows its compiled-in default config directory is THIS BUILD MACHINE's own
     # /nix/store/...-alsa-lib-.../share/alsa path (where alsa.conf, card definitions, and

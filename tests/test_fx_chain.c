@@ -7,7 +7,7 @@
 // the sound). A last case uses a 32-slot, 8-source bus with slots placed above index 12, the shape
 // hds_fx.clap uses, to cover the runtime slot_count/source_count paths.
 #include "test_common.h"
-#include "fx_chain.h"
+#include "fx/fx_chain.h"
 
 #include <stdlib.h>
 

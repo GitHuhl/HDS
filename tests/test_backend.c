@@ -5,7 +5,7 @@
 //     control address, fingerprinted, so any addition/removal/rename in the protocol shows up
 // Usage: test_backend <scratch dir>
 #include "test_common.h"
-#include "backend.h"
+#include "core/backend.h"
 
 #include <stdlib.h>
 

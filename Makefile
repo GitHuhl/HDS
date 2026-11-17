@@ -1,6 +1,8 @@
 CC ?= cc
 CXX ?= g++
 CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
+# Every project #include is relative to src/ (e.g. "core/backend.h"); the CLAP SDK is <clap/clap.h>.
+override CFLAGS += -Isrc -Ithird_party/clap/include
 # No -g anywhere in CFLAGS above (never was), so there's no DWARF debug info to omit -- but by
 # default the linker still keeps every binary's full symbol table (function/variable names), which
 # is exactly what makes a disassembler pleasant to read. STRIPFLAGS (-s, "strip at link time") on
@@ -10,7 +12,7 @@ CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
 # enough effort (a stripped binary's function boundaries/args are still recoverable via a decompiler,
 # just unnamed) -- it just raises the floor past "nm/objdump immediately hands you every symbol".
 STRIPFLAGS := -s
-# WavPack recording (see HDS_WAVPACK_ENABLED in src/hds_standalone.c) -- -lwavpack added back
+# WavPack recording (see HDS_WAVPACK_ENABLED in src/targets/standalone/hds_standalone.c) -- -lwavpack added back
 # here, same shared LDLIBS list $(BIN)/hds.clap both already link (see -lasound's own precedent
 # just above: hds.clap links it too despite never touching audio device I/O itself, since nothing
 # here is worth a second near-duplicate LDLIBS variable over). Only synth_engine's own translation
@@ -45,7 +47,7 @@ $(info PipeWire backend (--backend pipewire): $(if $(filter 1,$(PIPEWIRE_AVAILAB
 # translation unit per binary, same as before this split -- see hds_standalone.c's own header
 # comment for the full rationale.
 BIN := synth_engine
-SRC := src/hds_standalone.c
+SRC := src/targets/standalone/hds_standalone.c
 BUILD_DIR := build
 BIN_OBJ := $(BUILD_DIR)/hds_standalone.o
 # Separately compiled units linked into synth_engine (see each file's header for its interface).
@@ -59,16 +61,16 @@ FX_EFFECTS := fx_airwindows_mod fx_airwindows_tone fx_nam fx_eq_filter fx_compre
 FX_CHAIN_OBJ := $(BUILD_DIR)/fx_chain.o $(FX_EFFECTS:%=$(BUILD_DIR)/fx/%.o)
 # backend.o (the shared synth engine) is linked into synth_engine and hds.clap; same -fPIC/hidden
 # visibility reasoning as fx_chain.o.
-# The shared engine: backend.c plus the subsystems split out of it into src/engine/. BACKEND_OBJ is
+# The shared engine: backend.c plus the subsystems split out of it into src/core/. BACKEND_OBJ is
 # the whole list, for linking.
 ENGINE_UNITS := json tuning smf_import sfz_parser osc_protocol sample_engine
 BACKEND_OBJ := $(BUILD_DIR)/backend.o $(ENGINE_UNITS:%=$(BUILD_DIR)/engine/%.o)
-BACKEND_DEPS := src/backend.h src/engine/sfz_parser.h src/engine/sample_engine.h src/hds_compat.h src/backend_types.h src/hds_config.h src/fx_types.h src/fx_chain.h src/recording_engine.h src/nam_bridge.h
-FX_CHAIN_DEPS := src/fx_chain.h src/fx/fx_effects.h src/fx_types.h src/hds_config.h src/nam_bridge.h
+BACKEND_DEPS := src/core/backend.h src/core/sfz_parser.h src/core/sample_engine.h src/core/hds_compat.h src/core/backend_types.h src/core/hds_config.h src/fx/fx_types.h src/fx/fx_chain.h src/core/recording_engine.h src/fx/nam_bridge.h
+FX_CHAIN_DEPS := src/fx/fx_chain.h src/fx/fx_effects.h src/fx/fx_types.h src/core/hds_config.h src/fx/nam_bridge.h
 CLAP_OBJ := $(BUILD_DIR)/clap_plugin.o
 
 # --- Neural Amp Modeler FX slot (FX_TYPE_NAM in backend.c) ---
-# NeuralAmpModelerCore is a C++/Eigen library with no C API -- src/nam_bridge.cpp is the one
+# NeuralAmpModelerCore is a C++/Eigen library with no C API -- src/fx/nam_bridge.cpp is the one
 # extern "C" shim backend.c calls into (see its own header comment), and this is the ONLY C++ in
 # HDS. Both Eigen and NeuralAmpModelerCore are vendored whole under third_party/ (not a system
 # package like PipeWire -- there is nothing to auto-detect, so unlike HDS_PIPEWIRE_ENABLED's
@@ -104,7 +106,7 @@ NAM_INC := -I$(NAM_DIR) -I$(NAM_DIR)/Dependencies/nlohmann -I$(EIGEN_DIR)
 # -DNAM_SAMPLE_FLOAT here is load-bearing, not cosmetic: NAM_SAMPLE (dsp.h) is `double` unless this
 # is defined, and every real DSP class's actual compiled `process(NAM_SAMPLE**, ...)` signature --
 # WaveNet::process, ContainerModel::process, the Conv1D/RingBuffer internals, all of it -- lives in
-# the OTHER 16 files below, none of which ever defined this themselves. src/nam_bridge.cpp used to
+# the OTHER 16 files below, none of which ever defined this themselves. src/fx/nam_bridge.cpp used to
 # be the ONLY translation unit that flipped NAM_SAMPLE to `float` (a local #define before its NAM
 # includes), which affects nothing outside that one .cpp -- so nam_bridge.cpp called through the
 # vtable believing every process() took `float**`, while the actual compiled code on the other side
@@ -137,7 +139,7 @@ NAM_INC := -I$(NAM_DIR) -I$(NAM_DIR)/Dependencies/nlohmann -I$(EIGEN_DIR)
 # calls, aren't affected -- hidden visibility only hides a symbol from OTHER .so's, never from code
 # in the SAME .so), and each plugin's own required export (clap_entry) lives in a plain C file this
 # flag never touches, so it stays fully visible exactly as CLAP hosts require.
-NAM_CXXFLAGS := -O2 -std=c++20 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -DNAM_SAMPLE_FLOAT $(NAM_INC)
+NAM_CXXFLAGS := -O2 -std=c++20 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -DNAM_SAMPLE_FLOAT $(NAM_INC) -Isrc
 NAM_SRCS := \
 	$(NAM_DIR)/NAM/activations.cpp \
 	$(NAM_DIR)/NAM/container.cpp \
@@ -155,7 +157,7 @@ NAM_SRCS := \
 	$(NAM_DIR)/NAM/wavenet/a2_fast.cpp \
 	$(NAM_DIR)/NAM/wavenet/model.cpp \
 	$(NAM_DIR)/NAM/wavenet/slimmable.cpp \
-	src/nam_bridge.cpp
+	src/fx/nam_bridge.cpp
 # Flattened into one directory (no name collisions between NAM/, NAM/wavenet/, and src/ -- verified
 # by hand against the list above) so the three pattern rules below can all target it uniformly.
 NAM_OBJS := $(addprefix $(NAM_BUILD_DIR)/,$(notdir $(NAM_SRCS:.cpp=.o)))
@@ -163,25 +165,25 @@ NAM_OBJS := $(addprefix $(NAM_BUILD_DIR)/,$(notdir $(NAM_SRCS:.cpp=.o)))
 # --- Linux CLAP plugin ---
 # Produces hds.clap (a plain ELF shared object under the required .clap extension -- real hosts
 # scan for it at ~/.clap/, /usr/lib/clap/, or $CLAP_PATH). #include's the whole of backend.c (see
-# src/clap_plugin.c's own header comment) -- backend.c is the shared DSP/OSC/state core ONLY,
-# with every ALSA/PipeWire-touching line long since moved out to src/hds_standalone.c (see that
+# src/targets/clap/clap_plugin.c's own header comment) -- backend.c is the shared DSP/OSC/state core ONLY,
+# with every ALSA/PipeWire-touching line long since moved out to src/targets/standalone/hds_standalone.c (see that
 # file's own header comment), so this build never sees alsa/asoundlib.h or any device-I/O symbol
 # at all, exactly as a plugin whose host owns the actual audio device should.
 CLAP_INC := third_party/clap/include
 CLAP_BIN := hds.clap
-CLAP_SRC := src/clap_plugin.c
+CLAP_SRC := src/targets/clap/clap_plugin.c
 
 # --- HDS FX: standalone, synth-free CLAP effects plugin (make hds-fx) ---
 # Produces hds_fx.clap. Unlike $(CLAP_BIN) above, this does NOT #include backend.c at all -- see
-# src/hds_fx_plugin.c's own header comment for why (no OSC/networking, no synth, just src/fx_types.h
-# + src/fx_chain.c, the same FX DSP backend.c's own embedded FX bus already runs). NAM (FX_TYPE_NAM)
+# src/targets/fx_clap/hds_fx_plugin.c's own header comment for why (no OSC/networking, no synth, just src/fx/fx_types.h
+# + src/fx/fx_chain.c, the same FX DSP backend.c's own embedded FX bus already runs). NAM (FX_TYPE_NAM)
 # IS enabled here (HDS_NAM_ENABLED 1 in hds_fx_plugin.c itself, same nam_bridge.h/.cpp C++ bridge
 # $(CLAP_BIN) already links), so this target needs the same $(NAM_INC)/$(NAM_OBJS)/$(CXX) final-
 # link treatment $(BIN)/$(CLAP_BIN) already get below, not a plain $(CC) link. It ALSO needs Cairo +
-# X11 (src/hds_fx_gui_x11.c -- the real embedded GUI, see that file's own header comment): both are
+# X11 (src/platform/x11/hds_fx_gui_x11.c -- the real embedded GUI, see that file's own header comment): both are
 # pulled in via pkg-config rather than hardcoded flags, same posture as the PipeWire auto-detection
 # above.
-HDS_FX_SRC := src/hds_fx_plugin.c
+HDS_FX_SRC := src/targets/fx_clap/hds_fx_plugin.c
 HDS_FX_BIN := hds_fx.clap
 HDS_FX_OBJ := $(BUILD_DIR)/hds_fx_plugin.o
 HDS_FX_CFLAGS := $(shell pkg-config --cflags cairo x11) $(NAM_INC)
@@ -219,7 +221,7 @@ HDS_FX_LDLIBS := $(shell pkg-config --libs cairo x11) -lm
 #
 # $(ARM64_LIBDIR) bundles liblo only -- a pure protocol library with no external config files or
 # hardware coupling, confirmed safe to ship as a plain .so file (WavPack was bundled here too
-# before it was disabled -- see src/hds_standalone.c's HDS_WAVPACK_ENABLED). alsa-lib is deliberately
+# before it was disabled -- see src/targets/standalone/hds_standalone.c's HDS_WAVPACK_ENABLED). alsa-lib is deliberately
 # NOT bundled -- `strings` on the cross-built libasound.so.2 shows its compiled-in default config
 # directory is THIS BUILD MACHINE's own Nix store path (where alsa.conf, card definitions, and
 # dmix/plug setups live). That directory won't exist on the Pi, and even if it did, it would
@@ -282,9 +284,9 @@ FORCE:
 
 # backend.c/clap_plugin.c stay plain C, compiled by $(CC) exactly as before -- only the FINAL link
 # step (below) needs $(CXX), to pull in libstdc++ for the NAM objects linked alongside them.
-# src/backend.c and src/fx_chain.c are listed explicitly (not just $(SRC)/$(CLAP_SRC)) because
+# src/core/backend.c and src/fx/fx_chain.c are listed explicitly (not just $(SRC)/$(CLAP_SRC)) because
 # every real source file #includes them rather than links against them -- without this, editing
-# either alone wouldn't trigger a rebuild of any object depending on it. src/sequencer.c is the
+# either alone wouldn't trigger a rebuild of any object depending on it. src/core/sequencer.c is the
 # same story but ONLY for $(BIN_OBJ)/$(ARM64_BIN_OBJ): it's #include'd by hds_standalone.c alone
 # (never reachable from a CLAP plugin instance -- see its own header comment), so it's deliberately
 # left off $(CLAP_OBJ)'s own prerequisite list below.
@@ -293,16 +295,16 @@ FORCE:
 # concern: this same file is also compiled for the aarch64 cross-build below, which has no Cairo/X11
 # cross-built at all). Native $(BIN_OBJ) always turns it on (this machine has Cairo/X11 via nix, same
 # as $(CLAP_OBJ) already does), so it needs the matching cflags and the same draw-file prerequisite
-# list $(CLAP_OBJ) has below (plus src/hds_engine_instance.h and src/hds_clap_global_draw.c -- both
+# list $(CLAP_OBJ) has below (plus src/gui/hds_engine_instance.h and src/gui/hds_clap_global_draw.c -- both
 # real prerequisites of $(CLAP_OBJ) too; their absence there is a pre-existing gap this same pass
 # fixes) so editing any of them triggers a rebuild here as well.
-$(BIN_OBJ): $(SRC) src/backend.h src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/sequencer.h src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.h src/hds_fx_gui_browser.h src/hds_clap_adsr.h src/hds_standalone_gui_x11.c | $(BUILD_DIR) src/hds_clap_gui.h src/hds_standalone_devices.h
+$(BIN_OBJ): $(SRC) src/core/backend.h src/core/backend_types.h src/core/hds_config.h src/core/recording_engine.h src/fx/fx_types.h src/fx/fx_chain.h src/core/hds_config.h src/core/sequencer.h src/fx/nam_bridge.h src/gui/hds_fx_gui_host.h src/gui/hds_engine_instance.h src/gui/hds_fx_gui_draw.h src/gui/hds_fx_gui_browser.h src/gui/hds_clap_adsr.h src/platform/x11/hds_standalone_gui_x11.c | $(BUILD_DIR) src/gui/hds_clap_gui.h src/targets/standalone/hds_standalone_devices.h
 	$(CC) $(CFLAGS) $(PIPEWIRE_CFLAGS) -DHDS_STANDALONE_GUI_ENABLED=1 $(shell pkg-config --cflags cairo x11) -c $(SRC) -o $@
 
-$(CLAP_OBJ): $(CLAP_SRC) src/backend.h src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/nam_bridge.h src/hds_fx_gui_host.h src/hds_engine_instance.h src/hds_fx_gui_draw.h src/hds_fx_gui_browser.h src/hds_clap_adsr.h src/hds_clap_gui_x11.c | $(BUILD_DIR) src/hds_clap_gui.h src/hds_standalone_devices.h
+$(CLAP_OBJ): $(CLAP_SRC) src/core/backend.h src/core/backend_types.h src/core/hds_config.h src/core/recording_engine.h src/fx/fx_types.h src/fx/fx_chain.h src/core/hds_config.h src/fx/nam_bridge.h src/gui/hds_fx_gui_host.h src/gui/hds_engine_instance.h src/gui/hds_fx_gui_draw.h src/gui/hds_fx_gui_browser.h src/gui/hds_clap_adsr.h src/platform/x11/hds_clap_gui_x11.c | $(BUILD_DIR) src/gui/hds_clap_gui.h src/targets/standalone/hds_standalone_devices.h
 	$(CC) $(CFLAGS) $(HDS_FX_CFLAGS) -fPIC -I$(CLAP_INC) -c $(CLAP_SRC) -o $@
 
-$(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.h src/hds_config.h src/hds_fx_gui_draw.h src/hds_fx_gui_browser.h src/hds_fx_gui_x11.c src/nam_bridge.h | $(BUILD_DIR)
+$(HDS_FX_OBJ): $(HDS_FX_SRC) src/fx/fx_types.h src/fx/fx_chain.h src/core/hds_config.h src/gui/hds_fx_gui_draw.h src/gui/hds_fx_gui_browser.h src/platform/x11/hds_fx_gui_x11.c src/fx/nam_bridge.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(HDS_FX_CFLAGS) -fPIC -I$(CLAP_INC) -c $(HDS_FX_SRC) -o $@
 
 # Three source directories (NAM/, NAM/wavenet/, src/) flattened into one object directory -- see
@@ -313,54 +315,54 @@ $(NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/%.cpp $(NAM_FLAGS_STAMP) | $(NAM_BUILD_DIR)
 $(NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp $(NAM_FLAGS_STAMP) | $(NAM_BUILD_DIR)
 	$(CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
-$(NAM_BUILD_DIR)/%.o: src/%.cpp $(NAM_FLAGS_STAMP) | $(NAM_BUILD_DIR)
+$(NAM_BUILD_DIR)/%.o: src/fx/%.cpp $(NAM_FLAGS_STAMP) | $(NAM_BUILD_DIR)
 	$(CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/recording_engine.o: src/recording_engine.c src/recording_engine.h src/hds_config.h | $(BUILD_DIR)
+$(BUILD_DIR)/recording_engine.o: src/core/recording_engine.c src/core/recording_engine.h src/core/hds_config.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/fx_chain.o: src/fx_chain.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/fx_chain.o: src/fx/fx_chain.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
 $(BUILD_DIR)/fx $(BUILD_DIR)/fx-arm64 $(BUILD_DIR)/fx-win:
 	mkdir -p $@
 $(BUILD_DIR)/fx/%.o: src/fx/%.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)/fx
 	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
 
-$(BUILD_DIR)/sequencer.o: src/sequencer.c src/sequencer.h src/backend.h src/backend_types.h src/hds_config.h | $(BUILD_DIR)
+$(BUILD_DIR)/sequencer.o: src/core/sequencer.c src/core/sequencer.h src/core/backend.h src/core/backend_types.h src/core/hds_config.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # File browser shared by all three GUIs (-fPIC/hidden: also linked into both .clap files).
 FX_GUI_OBJ := $(BUILD_DIR)/hds_fx_gui_draw.o
-FX_GUI_DEPS := src/hds_fx_gui_draw.c src/hds_fx_gui_draw.h src/hds_fx_gui_host.h src/hds_fx_gui_browser.h src/fx_chain.h src/fx_types.h src/hds_config.h
+FX_GUI_DEPS := src/gui/hds_fx_gui_draw.c src/gui/hds_fx_gui_draw.h src/gui/hds_fx_gui_host.h src/gui/hds_fx_gui_browser.h src/fx/fx_chain.h src/fx/fx_types.h src/core/hds_config.h
 $(FX_GUI_OBJ): $(FX_GUI_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags cairo) -fPIC -fvisibility=hidden -c $< -o $@
 
 # Synth GUI (hds_clap_*_draw.c). Six tabs are identical in both hosts and built once; the four
 # that read HDS_STANDALONE_GUI_ENABLED (it changes their view-state layouts and pulls in
-# standalone-only device/recording code) are built once per host. See src/hds_clap_gui.h.
+# standalone-only device/recording code) are built once per host. See src/gui/hds_clap_gui.h.
 GUI_SHARED_TABS := play combi filters lfos envelopes global
 GUI_PER_HOST_TABS := routing devices recording gui
-GUI_DEPS := src/hds_clap_gui.h src/hds_clap_adsr.h src/hds_engine_instance.h src/hds_fx_gui_draw.h src/hds_fx_gui_host.h src/hds_fx_gui_browser.h src/hds_standalone_devices.h src/backend.h src/backend_types.h src/fx_chain.h src/fx_types.h src/hds_config.h src/recording_engine.h
+GUI_DEPS := src/gui/hds_clap_gui.h src/gui/hds_clap_adsr.h src/gui/hds_engine_instance.h src/gui/hds_fx_gui_draw.h src/gui/hds_fx_gui_host.h src/gui/hds_fx_gui_browser.h src/targets/standalone/hds_standalone_devices.h src/core/backend.h src/core/backend_types.h src/fx/fx_chain.h src/fx/fx_types.h src/core/hds_config.h src/core/recording_engine.h
 gui_objs = $(foreach t,$(2),$(BUILD_DIR)/$(1)/hds_clap_$(t)_draw.o)
 CLAP_GUI_OBJS := $(call gui_objs,gui,$(GUI_SHARED_TABS) $(GUI_PER_HOST_TABS))
 STANDALONE_GUI_OBJS := $(call gui_objs,gui,$(GUI_SHARED_TABS)) $(call gui_objs,gui-standalone,$(GUI_PER_HOST_TABS))
 $(BUILD_DIR)/gui $(BUILD_DIR)/gui-standalone $(BUILD_DIR)/gui-win:
 	mkdir -p $@
-$(BUILD_DIR)/gui/%.o: src/%.c $(GUI_DEPS) | $(BUILD_DIR)/gui
+$(BUILD_DIR)/gui/%.o: src/gui/%.c $(GUI_DEPS) | $(BUILD_DIR)/gui
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags cairo) -fPIC -fvisibility=hidden -c $< -o $@
-$(BUILD_DIR)/gui-standalone/%.o: src/%.c $(GUI_DEPS) | $(BUILD_DIR)/gui-standalone
+$(BUILD_DIR)/gui-standalone/%.o: src/gui/%.c $(GUI_DEPS) | $(BUILD_DIR)/gui-standalone
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags cairo) -DHDS_STANDALONE_GUI_ENABLED=1 -c $< -o $@
 
 BROWSER_OBJ := $(BUILD_DIR)/hds_fx_gui_browser.o
-BROWSER_DEPS := src/hds_fx_gui_browser.c src/hds_fx_gui_browser.h src/hds_config.h
+BROWSER_DEPS := src/gui/hds_fx_gui_browser.c src/gui/hds_fx_gui_browser.h src/core/hds_config.h
 $(BROWSER_OBJ): $(BROWSER_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
 
 $(BUILD_DIR)/engine $(BUILD_DIR)/engine-arm64 $(BUILD_DIR)/engine-win:
 	mkdir -p $@
-$(BUILD_DIR)/engine/%.o: src/engine/%.c $(BACKEND_DEPS) | $(BUILD_DIR)/engine
+$(BUILD_DIR)/engine/%.o: src/core/%.c $(BACKEND_DEPS) | $(BUILD_DIR)/engine
 	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
-$(BUILD_DIR)/backend.o: src/backend.c $(BACKEND_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/backend.o: src/core/backend.c $(BACKEND_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
 
 $(BIN): $(BIN_OBJ) $(BACKEND_OBJ) $(STANDALONE_UNIT_OBJS) $(FX_CHAIN_OBJ) $(NAM_OBJS)
@@ -386,7 +388,7 @@ $(ARM64_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/%.cpp $(ARM64_NAM_FLAGS_STAMP) | $(AR
 $(ARM64_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp $(ARM64_NAM_FLAGS_STAMP) | $(ARM64_NAM_BUILD_DIR)
 	$(ARM64_CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
-$(ARM64_NAM_BUILD_DIR)/%.o: src/%.cpp $(ARM64_NAM_FLAGS_STAMP) | $(ARM64_NAM_BUILD_DIR)
+$(ARM64_NAM_BUILD_DIR)/%.o: src/fx/%.cpp $(ARM64_NAM_FLAGS_STAMP) | $(ARM64_NAM_BUILD_DIR)
 	$(ARM64_CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
 ARM64_INTERP := /lib/ld-linux-aarch64.so.1
@@ -395,27 +397,27 @@ ARM64_BIN_OBJ := $(BUILD_DIR)/hds_standalone-arm64.o
 # hds_standalone.c itself stays plain C, compiled by $(ARM64_CC) exactly like the native
 # $(BIN_OBJ) rule above -- only the FINAL link step needs $(ARM64_CXX), to pull in libstdc++ for
 # the NAM objects linked alongside it, same reasoning as $(BIN)/clap's own rules.
-$(ARM64_BIN_OBJ): $(SRC) src/backend.h src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/sequencer.h src/nam_bridge.h | $(BUILD_DIR)
+$(ARM64_BIN_OBJ): $(SRC) src/core/backend.h src/core/backend_types.h src/core/hds_config.h src/core/recording_engine.h src/fx/fx_types.h src/fx/fx_chain.h src/core/hds_config.h src/core/sequencer.h src/fx/nam_bridge.h | $(BUILD_DIR)
 	@test -n "$(ARM64_CFLAGS)" || (echo "ARM64_CFLAGS not set -- run this from inside 'nix-shell' at the repo root" >&2; exit 1)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $(SRC) -o $@
 
-$(BUILD_DIR)/recording_engine-arm64.o: src/recording_engine.c src/recording_engine.h src/hds_config.h | $(BUILD_DIR)
+$(BUILD_DIR)/recording_engine-arm64.o: src/core/recording_engine.c src/core/recording_engine.h src/core/hds_config.h | $(BUILD_DIR)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/sequencer-arm64.o: src/sequencer.c src/sequencer.h src/backend.h src/backend_types.h src/hds_config.h | $(BUILD_DIR)
+$(BUILD_DIR)/sequencer-arm64.o: src/core/sequencer.c src/core/sequencer.h src/core/backend.h src/core/backend_types.h src/core/hds_config.h | $(BUILD_DIR)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
 ARM64_BACKEND_OBJS := $(BUILD_DIR)/backend-arm64.o $(ENGINE_UNITS:%=$(BUILD_DIR)/engine-arm64/%.o)
-$(BUILD_DIR)/engine-arm64/%.o: src/engine/%.c $(BACKEND_DEPS) | $(BUILD_DIR)/engine-arm64
+$(BUILD_DIR)/engine-arm64/%.o: src/core/%.c $(BACKEND_DEPS) | $(BUILD_DIR)/engine-arm64
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
-$(BUILD_DIR)/backend-arm64.o: src/backend.c $(BACKEND_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/backend-arm64.o: src/core/backend.c $(BACKEND_DEPS) | $(BUILD_DIR)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
 ARM64_FX_CHAIN_OBJS := $(BUILD_DIR)/fx_chain-arm64.o $(FX_EFFECTS:%=$(BUILD_DIR)/fx-arm64/%.o)
 $(BUILD_DIR)/fx-arm64/%.o: src/fx/%.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)/fx-arm64
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/fx_chain-arm64.o: src/fx_chain.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/fx_chain-arm64.o: src/fx/fx_chain.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)
 	$(ARM64_CC) $(CFLAGS) $(ARM64_CFLAGS) -c $< -o $@
 
 arm64: $(ARM64_BIN_OBJ) $(ARM64_BACKEND_OBJS) $(BUILD_DIR)/sequencer-arm64.o $(BUILD_DIR)/recording_engine-arm64.o $(ARM64_FX_CHAIN_OBJS) $(ARM64_NAM_OBJS)
@@ -512,7 +514,7 @@ WIN_EXTRA_RUNTIME_DLLS ?=
 # definition), and without it the linker looks for __imp_cairo_* import-thunk symbols that were
 # never generated at all (confirmed directly: this is exactly the undefined-reference error a first
 # link attempt without this flag produces).
-WIN_CFLAGS := -O2 -Wall -Wextra -std=gnu11 -DCAIRO_WIN32_STATIC_BUILD -I$(WIN_DEPS)/include -I$(WIN_DEPS)/include/cairo -I$(WIN_DEPS)/include/lo -I$(CLAP_INC) $(NAM_INC) $(WIN_EXTRA_CFLAGS)
+WIN_CFLAGS := -O2 -Wall -Wextra -std=gnu11 -Isrc -DCAIRO_WIN32_STATIC_BUILD -I$(WIN_DEPS)/include -I$(WIN_DEPS)/include/cairo -I$(WIN_DEPS)/include/lo -I$(CLAP_INC) $(NAM_INC) $(WIN_EXTRA_CFLAGS)
 # No blanket -static: on nixpkgs' own mingw cross gcc it forces plain -Bstatic across the ENTIRE
 # link, including gcc's own automatically-appended default-library tail (which mentions -lmcfgthread
 # TWICE more on top of our own explicit one below, un-interruptible by anything on our own command
@@ -542,10 +544,10 @@ WIN_CLAP_OBJ := $(BUILD_DIR)/clap_plugin-win.o
 WIN_HDS_FX_BIN := hds_fx-windows.clap
 WIN_HDS_FX_OBJ := $(BUILD_DIR)/hds_fx_plugin-win.o
 
-$(WIN_CLAP_OBJ): $(CLAP_SRC) src/backend.h src/backend_types.h src/hds_config.h src/recording_engine.h src/fx_types.h src/fx_chain.h src/hds_config.h src/nam_bridge.h src/hds_fx_gui_host.h src/hds_fx_gui_draw.h src/hds_fx_gui_browser.h src/hds_clap_adsr.h src/hds_clap_gui_win32.c | $(BUILD_DIR) src/hds_clap_gui.h src/hds_standalone_devices.h
+$(WIN_CLAP_OBJ): $(CLAP_SRC) src/core/backend.h src/core/backend_types.h src/core/hds_config.h src/core/recording_engine.h src/fx/fx_types.h src/fx/fx_chain.h src/core/hds_config.h src/fx/nam_bridge.h src/gui/hds_fx_gui_host.h src/gui/hds_fx_gui_draw.h src/gui/hds_fx_gui_browser.h src/gui/hds_clap_adsr.h src/platform/win32/hds_clap_gui_win32.c | $(BUILD_DIR) src/gui/hds_clap_gui.h src/targets/standalone/hds_standalone_devices.h
 	$(WIN_CC) $(WIN_CFLAGS) -c $(CLAP_SRC) -o $@
 
-$(WIN_HDS_FX_OBJ): $(HDS_FX_SRC) src/fx_types.h src/fx_chain.h src/hds_config.h src/hds_fx_gui_draw.h src/hds_fx_gui_browser.h src/hds_fx_gui_win32.c src/nam_bridge.h | $(BUILD_DIR)
+$(WIN_HDS_FX_OBJ): $(HDS_FX_SRC) src/fx/fx_types.h src/fx/fx_chain.h src/core/hds_config.h src/gui/hds_fx_gui_draw.h src/gui/hds_fx_gui_browser.h src/platform/win32/hds_fx_gui_win32.c src/fx/nam_bridge.h | $(BUILD_DIR)
 	$(WIN_CC) $(WIN_CFLAGS) -c $(HDS_FX_SRC) -o $@
 
 # Windows' own NAM object set: SEPARATE .o files from $(NAM_OBJS)/$(ARM64_NAM_OBJS) (wrong ABI/ISA
@@ -560,17 +562,17 @@ $(WIN_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/%.cpp $(WIN_NAM_FLAGS_STAMP) | $(WIN_NA
 $(WIN_NAM_BUILD_DIR)/%.o: $(NAM_DIR)/NAM/wavenet/%.cpp $(WIN_NAM_FLAGS_STAMP) | $(WIN_NAM_BUILD_DIR)
 	$(WIN_CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
-$(WIN_NAM_BUILD_DIR)/%.o: src/%.cpp $(WIN_NAM_FLAGS_STAMP) | $(WIN_NAM_BUILD_DIR)
+$(WIN_NAM_BUILD_DIR)/%.o: src/fx/%.cpp $(WIN_NAM_FLAGS_STAMP) | $(WIN_NAM_BUILD_DIR)
 	$(WIN_CXX) $(NAM_CXXFLAGS) -c $< -o $@
 
 WIN_BACKEND_OBJ := $(BUILD_DIR)/backend-win.o $(ENGINE_UNITS:%=$(BUILD_DIR)/engine-win/%.o)
-$(BUILD_DIR)/engine-win/%.o: src/engine/%.c $(BACKEND_DEPS) | $(BUILD_DIR)/engine-win
+$(BUILD_DIR)/engine-win/%.o: src/core/%.c $(BACKEND_DEPS) | $(BUILD_DIR)/engine-win
 	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
-$(BUILD_DIR)/backend-win.o: src/backend.c $(BACKEND_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/backend-win.o: src/core/backend.c $(BACKEND_DEPS) | $(BUILD_DIR)
 	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
 
 WIN_CLAP_GUI_OBJS := $(call gui_objs,gui-win,$(GUI_SHARED_TABS) $(GUI_PER_HOST_TABS))
-$(BUILD_DIR)/gui-win/%.o: src/%.c $(GUI_DEPS) | $(BUILD_DIR)/gui-win
+$(BUILD_DIR)/gui-win/%.o: src/gui/%.c $(GUI_DEPS) | $(BUILD_DIR)/gui-win
 	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
 
 WIN_FX_GUI_OBJ := $(BUILD_DIR)/hds_fx_gui_draw-win.o
@@ -584,7 +586,7 @@ $(WIN_BROWSER_OBJ): $(BROWSER_DEPS) | $(BUILD_DIR)
 WIN_FX_CHAIN_OBJ := $(BUILD_DIR)/fx_chain-win.o $(FX_EFFECTS:%=$(BUILD_DIR)/fx-win/%.o)
 $(BUILD_DIR)/fx-win/%.o: src/fx/%.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)/fx-win
 	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
-$(BUILD_DIR)/fx_chain-win.o: src/fx_chain.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/fx_chain-win.o: src/fx/fx_chain.c $(FX_CHAIN_DEPS) | $(BUILD_DIR)
 	$(WIN_CC) $(WIN_CFLAGS) -c $< -o $@
 
 clap-windows: $(WIN_CLAP_OBJ) $(WIN_CLAP_GUI_OBJS) $(WIN_FX_GUI_OBJ) $(WIN_BROWSER_OBJ) $(WIN_BACKEND_OBJ) $(WIN_FX_CHAIN_OBJ) $(WIN_NAM_OBJS)

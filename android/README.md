@@ -71,7 +71,7 @@ across this entire build.
 
 ## What's real here vs. what's a workaround
 
-**Real, unmodified**: `src/hds_android.c` (the native glue: AAudio output callback calling
+**Real, unmodified**: `src/targets/android/hds_android.c` (the native glue: AAudio output callback calling
 `render_audio_block()` directly into AAudio's own buffer, a hand-written raw MIDI 1.0 parser
 feeding `dispatch_midi_event()`) compiles and links cleanly with the actual NDK clang --
 confirmed via `file`/`llvm-nm`, which show a real ARM64 shared object exporting exactly the three
@@ -141,7 +141,7 @@ realtime audio callback is a textbook priority-inversion hazard: if the MIDI thr
 directly into its hard deadline. That matches the reported symptom precisely: a chord is several
 Note On messages arriving on the MIDI thread within the same few milliseconds, each one taking
 the lock. Fixed by replacing the mutex with a true lock-free single-producer/single-consumer
-ring buffer (`hds_midi_ring_push`/`hds_midi_ring_drain_and_dispatch` in `src/hds_android.c`): the
+ring buffer (`hds_midi_ring_push`/`hds_midi_ring_drain_and_dispatch` in `src/targets/android/hds_android.c`): the
 MIDI thread only ever writes `head`, the audio thread only ever writes `tail`, each side only
 ever reads the other's index, and the audio thread drains the ring (applying every queued event)
 at the top of its own callback, before `render_audio_block()` -- so neither thread can ever block
@@ -168,11 +168,11 @@ than this same tradeoff needing to move further.
 
 ## The native GUI
 
-The real tab bar (`src/hds_clap_gui_draw.c` -- the SAME file hds.clap and the standalone app
+The real tab bar (`src/gui/hds_clap_gui_draw.c` -- the SAME file hds.clap and the standalone app
 already embed) now fills the whole screen, landscape-only. Three real, non-obvious problems were
 found and fixed getting there, each confirmed directly rather than assumed:
 
-**Architecture: direct-buffer Cairo, no Java Bitmap, no pixel copy.** `src/hds_android_gui.c`
+**Architecture: direct-buffer Cairo, no Java Bitmap, no pixel copy.** `src/targets/android/hds_android_gui.c`
 locks the `SurfaceView`'s own `ANativeWindow` buffer (`ANativeWindow_lock`), wraps that EXACT
 memory in a `cairo_image_surface_t` (`cairo_image_surface_create_for_data`), calls
 `hds_clap_gui_render()` straight into it, then posts (`ANativeWindow_unlockAndPost`). There is no

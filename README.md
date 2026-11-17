@@ -21,7 +21,7 @@ A software synthesizer with a shared DSP core, distributed as three builds:
   synth engine) for running the same FX chains on other tracks. Also has
   a native embedded GUI.
 
-All three share one DSP/state core (`src/backend.c`), so a patch, an FX
+All three share one DSP/state core (`src/core/backend.c`), so a patch, an FX
 chain, or a bug fix behaves identically everywhere.
 
 ## Building
@@ -83,18 +83,17 @@ with it, so the diff shows which outputs changed.
 
 ## Source layout
 
-| File | What it is |
+Every `#include` is relative to `src/` (e.g. `#include "core/backend.h"`); the Makefile passes
+`-Isrc` and the CLAP SDK's include directory to every compile.
+
+| Directory | What's in it |
 | --- | --- |
-| `src/backend.c` / `backend.h` / `backend_types.h` | The shared DSP/state core: oscillators, filters, envelopes, LFOs, voices, the FX chain dispatch. Compiled once and linked into both `synth_engine` and `hds.clap`; `backend.h` is its interface, `backend_types.h` its data model. |
-| `src/engine/` | Self-contained subsystems split out of `backend.c`: the JSON reader (`json.c`), Scala tuning import (`tuning.c`), Standard MIDI File import (`smf_import.c`), the SFZ parser (`sfz_parser.c`/`.h`), the Sample Bank / direct-from-disk sample engine (`sample_engine.c`/`.h`: zones, stream pool and disk thread, SFZ-to-zone loading, the sample oscillator), and the OSC control protocol (`osc_protocol.c`: the `OSC_PARAMS[]` address table, dispatch, state dump, discovery and status pushes). Linked wherever `backend.o` is. |
-| `src/hds_standalone.c` | `synth_engine`'s own `main()`: ALSA/PipeWire I/O, MIDI sequencer, recording, the Sample Bank disk-streaming thread, the interactive terminal/arrow-key controls, and (opt-in) the native GUI. |
-| `src/clap_plugin.c` | `hds.clap`'s CLAP plugin wrapper: calls the same backend functions a block at a time instead of owning a device, plus CLAP's params/state/gui extensions. |
-| `src/sequencer.c` | The Sequencer engine (lanes, transport, MIDI/audio playback) — standalone-only, since a DAW host already owns sequencing for its plugins. |
-| `src/fx_chain.c` / `fx_chain.h` / `fx_types.h` | The FX slot engine (slot lifecycle, routing, `process_fx_chain`) shared by all three builds, and the slot data model. |
-| `src/fx/` | Each `FX_TYPE_*` effect's DSP, one file per family: Airwindows modulation and tone ports, NAM, EQ/filters, compressors, gate/limiters, pitch, reverb/delay. `fx_effects.h` is the internal interface `fx_chain.c` calls through. |
-| `src/hds_fx_plugin.c` | `hds_fx.clap`'s own CLAP plugin wrapper around just the FX chain. |
-| `src/hds_clap_*_draw.c` / `hds_clap_gui.h`, `src/hds_fx_gui_draw.c` / `.h` | The native Cairo-drawn GUI: one file per tab (Play, Filters, LFOs, Envelopes, Routing, Devices, Global sidebar, FX), platform-agnostic (no X11/Win32 calls). Each is its own object; Routing, Devices, Recording and the tab dispatcher are built once per host because they contain standalone-only code. |
-| `src/hds_clap_gui_x11.c` / `_win32.c`, `src/hds_fx_gui_x11.c` / `_win32.c`, `src/hds_standalone_gui_x11.c` | The platform shims (window creation, event pump) for each of the above, per OS and per host context. |
+| `src/core/` | The synth engine shared by `synth_engine` and `hds.clap`. `backend.c` (voices, oscillators, filters, envelopes, LFOs, `render_audio_block`, MIDI dispatch, arpeggiator) with `backend.h` (its interface) and `backend_types.h` (the data model); the subsystems split out of it: `osc_protocol.c` (the `OSC_PARAMS[]` address table, dispatch, state dump, discovery, status pushes), `sample_engine.c`/`.h` (Sample Bank zones, stream pool and disk thread, the sample oscillator), `sfz_parser.c`/`.h`, `smf_import.c`, `tuning.c`, `json.c`; plus `recording_engine.c` (WAV/WavPack recording) and `sequencer.c` (standalone-only transport, lanes and MIDI clock). `hds_config.h` holds build-wide constants, `hds_compat.h` the Windows POSIX shims. |
+| `src/fx/` | The FX bus shared by all three builds: `fx_chain.c`/`.h` (slot lifecycle, routing, `process_fx_chain`), `fx_types.h` (the slot data model), one file per effect family (Airwindows modulation and tone ports, NAM, EQ/filters, compressors, gate/limiters, pitch, reverb/delay) behind the internal `fx_effects.h`, and the C++ NAM bridge (`nam_bridge.cpp`/`.h`). |
+| `src/gui/` | The native Cairo-drawn GUI, platform-free: the FX pool view (`hds_fx_gui_draw.c`/`.h`, `hds_fx_gui_host.h`), the file browser (`hds_fx_gui_browser.c`/`.h`), and the synth's tabs (`hds_clap_*_draw.c` behind `hds_clap_gui.h`, plus `hds_engine_instance.h`, the per-instance context they draw). Routing, Devices, Recording and the tab dispatcher are built once per host because they contain standalone-only code. |
+| `src/platform/x11/`, `src/platform/win32/` | Window creation and event pumping per OS and host (`hds_clap_gui_*`, `hds_fx_gui_*`, `hds_standalone_gui_x11.c`). Each is `#include`d by the one target that uses it. |
+| `src/targets/` | One directory per product: `standalone/hds_standalone.c` (`synth_engine`'s `main()`: ALSA/PipeWire audio, ALSA MIDI, recording, terminal controls, the optional GUI), `clap/clap_plugin.c` (`hds.clap`), `fx_clap/hds_fx_plugin.c` (`hds_fx.clap`), and `android/` (experimental, currently disabled and out of date). |
+| `tests/` | `make test` — see Testing above. |
 
 ## Control protocol: OSC
 
@@ -193,7 +192,7 @@ Up to 32 shared slots, each independently routable, each settable to any of:
   hardware family's own famous simplicity — plus a sidechain highpass and
   a saturation stage run through a genuine 4x-oversampled signal path; an
   original design, not reverse-engineered from any real 160-family
-  schematic, see `FX_TYPE_DBX160`'s own comment in `src/fx_types.h`) — all
+  schematic, see `FX_TYPE_DBX160`'s own comment in `src/fx/fx_types.h`) — all
   report live gain-reduction metering back to the GUI.
 - **Tone**: EQ3 (3-band), MultiFilter (wide-range steep filter), Density3
   (highpass into a density/waveshaping saturator), PointyGuitar (amp-style
@@ -203,7 +202,7 @@ Up to 32 shared slots, each independently routable, each settable to any of:
   + HPF channel EQ, E/G switch, gain-proportional bandwidth on the two bell
   bands, always-on saturation stage — an original design built on this
   engine's own RBJ-cookbook biquad math, not a port of any specific plugin;
-  see `FX_TYPE_SSL4K`'s own comment in `src/fx_types.h`).
+  see `FX_TYPE_SSL4K`'s own comment in `src/fx/fx_types.h`).
 - **Time-based**: Ensemble (fixed-delay chorus), CreamCoat (FDN reverb),
   FDNVerb (algorithmic reverb), StereoChorus, StereoDoubler (micro-pitch
   detune), TapeDelay2 (tape echo, with optional stereo ping-pong),
@@ -239,7 +238,7 @@ Up to 32 shared slots, each independently routable, each settable to any of:
   button out and forces it off, regardless of the mouse or MIDI). Exists
   so two Broadcast Delay slots can run at once, each with its own On-Air
   Override wired to whichever trigger source(s) that instance actually
-  needs; see `FX_TYPE_BROADCAST_DELAY`'s own comment in `src/fx_types.h`).
+  needs; see `FX_TYPE_BROADCAST_DELAY`'s own comment in `src/fx/fx_types.h`).
 - **Low end**: DBX120X, a subharmonic ("sub-bass") synthesizer. Unlike most
   digital subharmonic generators (which run a general pitch tracker across
   whatever's playing and fall apart on anything polyphonic), this one never
@@ -252,13 +251,13 @@ Up to 32 shared slots, each independently routable, each settable to any of:
   or two octaves down, gated in/out by Threshold/Release so it only
   appears when there's real low-frequency energy present, with its own
   Synthesis Level separate from the slot's generic Mix. See
-  `FX_TYPE_DBX120X`'s own comment in `src/fx_types.h`.
+  `FX_TYPE_DBX120X`'s own comment in `src/fx/fx_types.h`.
 - **NAM**: Neural Amp Modeler — loads a trained `.nam` amp model plus an
   optional cabinet impulse response.
 
 Several of the tone/time-based effects are ports of MIT-licensed
 [Airwindows](https://www.airwindows.com/) plugins — see each `FX_TYPE_*`'s
-own comment in `src/fx_types.h` for which one and any changes made porting it.
+own comment in `src/fx/fx_types.h` for which one and any changes made porting it.
 
 ## Native GUI
 
@@ -310,7 +309,7 @@ lossy file), a 4-step Compression Level (Fast/Normal/High/Very High), and
 an 8-preset Hybrid Bitrate (bits/sample, 2-24) used only in Hybrid mode.
 
 Global sidebar: a hardcoded 160px pixel width (`HDS_CLAP_GLOBAL_SIDEBAR_W`
-in `src/hds_clap_global_draw.c`), not a percentage — every control inside
+in `src/gui/hds_clap_global_draw.c`), not a percentage — every control inside
 it sizes itself as a fraction of that constant.
 
 ## Platform notes
@@ -326,7 +325,7 @@ it sizes itself as a fraction of that constant.
 - **Android** *(experimental, unofficial — currently disabled: its SDK entries in
   `shell.nix` and the `make android` target are commented out, so `nix-shell`
   needs no license acceptance. Uncomment the lines marked `ANDROID DISABLED` to
-  re-enable.)*: `src/hds_android.c` + `android/` builds a real touchscreen
+  re-enable.)*: `src/targets/android/hds_android.c` + `android/` builds a real touchscreen
   native GUI (the same Cairo-drawn tab bar as `hds.clap`, including the
   Recording tab) with AAudio I/O, raw MIDI in via `android.media.midi`, no
   OSC. Both AAudio streams (output, and a best-effort input once
@@ -360,4 +359,4 @@ it sizes itself as a fraction of that constant.
 Vendored under `third_party/`: the CLAP SDK, Eigen, and Neural Amp Modeler
 Core (NAM). The circuit-modeled dynamics processors (FetComp, FairKid67,
 OptoComp) and the Airwindows ports above are otherwise self-contained C
-ports with no external dependency — see `src/fx_types.h` for sources.
+ports with no external dependency — see `src/fx/fx_types.h` for sources.

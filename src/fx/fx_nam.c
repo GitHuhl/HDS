@@ -1,7 +1,7 @@
 // fx_nam.c -- Neural Amp Modeler slot: model/cab-IR loading and per-sample processing.
 // Moved verbatim out of fx_chain.c; each effect's run_fx_*() is called by process_fx_chain() via
 // fx_effects.h, and its state struct stays private to this file.
-#include "fx_effects.h"
+#include "fx/fx_effects.h"
 
 #include <errno.h>
 #include <math.h>
@@ -11,7 +11,7 @@
 #include <string.h>
 
 #if HDS_NAM_ENABLED
-#include "../nam_bridge.h"
+#include "fx/nam_bridge.h"
 #endif
 
 #if HDS_NAM_ENABLED

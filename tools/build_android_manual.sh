@@ -87,7 +87,7 @@ echo "=== Compiling the native engine (hds_android.c -> libhds_native.so) ==="
   -I "$ANDROID_DIR/app/src/main/cpp/stub" \
   -I "$ANDROID_DEPS/include" -I "$ANDROID_DEPS/include/cairo" \
   -I "$ANDROID_DEPS/include/freetype2" -I "$ANDROID_DEPS/include/pixman-1" \
-  "$ROOT/src/hds_android.c" -o "$WORK/hds_android.o"
+  "$ROOT/src/targets/android/hds_android.c" -o "$WORK/hds_android.o"
 # nam_bridge_stub.c stands in for the real nam_bridge.cpp (NAM needs a C++/Eigen toolchain this
 # build doesn't have -- see that stub's own header comment for exactly what it does and doesn't
 # change). Plain C, compiled the same way as hds_android.c itself.
