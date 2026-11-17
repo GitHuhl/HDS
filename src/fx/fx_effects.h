@@ -7,7 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "../fx_chain.h"
+#include "fx/fx_chain.h"
 
 // --- Small DSP building blocks shared by effects in different files ---
 

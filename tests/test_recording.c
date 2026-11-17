@@ -2,7 +2,7 @@
 // then reads both files back and checks they hold exactly the samples that were recorded (bit-exact
 // float for WAV; for WavPack, which stores 24-bit integer PCM, the exact 24-bit conversion).
 #include "test_common.h"
-#include "recording_engine.h"
+#include "core/recording_engine.h"
 
 #include <stdlib.h>
 #include <time.h>

@@ -1,7 +1,7 @@
 // fx_compressors.c -- Compressors: FET, dbx 160, Fairchild 670 (FairKid67), opto.
 // Moved verbatim out of fx_chain.c; each effect's run_fx_*() is called by process_fx_chain() via
 // fx_effects.h, and its state struct stays private to this file.
-#include "fx_effects.h"
+#include "fx/fx_effects.h"
 
 #include <errno.h>
 #include <math.h>
