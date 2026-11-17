@@ -7,7 +7,7 @@
 //   - parameter writes over OSC show up in the next dump, and change the rendered sound
 //   - /hds/zone/load_sfz: a generated sine-wave WAV + one-region .sfz loads and plays
 //   - /hds/song/import_smf: a generated 3-track type-1 MIDI file (two tempos, one marker) imports
-//     with the expected lanes/tempo/marker report
+//     with the expected lanes/marker report and its tempo change as an instant step in the tempo map
 // Usage: test_clap_osc <scratch dir> <hds.clap>
 #include "test_common.h"
 #include "clap_test_host.h"
@@ -137,6 +137,25 @@ static void write_smf(const char *path) {
     fwrite(hdr, 1, 14, f); put_track(f, &t0); put_track(f, &t1); put_track(f, &t2); fclose(f);
 }
 
+// Conductor track with 11 Set Tempo events a beat apart: 120, 120 (a repeat, no change), then 100,
+// 110, ..., 180 -- 10 distinct tempos, more than the 16-slot map holds as steps (2 slots per
+// change), plus one note track.
+static void write_smf_many_tempos(const char *path) {
+    Buf t0 = {0}, t1 = {0};
+    const int bpm[11] = { 120, 120, 100, 110, 120, 130, 140, 150, 160, 170, 180 };
+    unsigned char eot[] = { 0xFF, 0x2F, 0x00 };
+    for (int i = 0; i < 11; i++) {
+        uint32_t usec = (uint32_t)(60000000 / bpm[i]);
+        unsigned char ev[6] = { 0xFF, 0x51, 0x03, (unsigned char)(usec >> 16), (unsigned char)(usec >> 8), (unsigned char)usec };
+        put_vlq(&t0, i ? 480 : 0); put(&t0, ev, 6);
+    }
+    put_vlq(&t0, 0); put(&t0, eot, 3);
+    ev3(&t1, 0, 0x90, 60, 100); ev3(&t1, 480, 0x80, 60, 0); put_vlq(&t1, 0); put(&t1, eot, 3);
+    FILE *f = fopen(path, "wb");
+    unsigned char hdr[14] = { 'M','T','h','d', 0,0,0,6, 0,1, 0,2, 0x01,0xE0 };
+    fwrite(hdr, 1, 14, f); put_track(f, &t0); put_track(f, &t1); fclose(f);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s scratchdir hds.clap\n", argv[0]); return 2; }
     const char *dir = argv[1];
@@ -217,14 +236,17 @@ int main(int argc, char **argv) {
               *tm = find_msg("/hds/status/smf_import/tempo_marker_count"), *tb = find_msg("/hds/status/smf_import/tempo_bpm"),
               *t0 = find_msg("/hds/status/smf_import/tempo_marker/0/time"), *b0 = find_msg("/hds/status/smf_import/tempo_marker/0/bpm"),
               *t1 = find_msg("/hds/status/smf_import/tempo_marker/1/time"), *b1 = find_msg("/hds/status/smf_import/tempo_marker/1/bpm"),
+              *t2 = find_msg("/hds/status/smf_import/tempo_marker/2/time"), *b2 = find_msg("/hds/status/smf_import/tempo_marker/2/bpm"),
               *mc = find_msg("/hds/status/smf_import/marker_count"), *ml = find_msg("/hds/status/smf_import/marker/0/label"),
               *err = find_msg("/hds/status/smf_import/error");
     test_check(ok && ok->f == 1.0f, "clap_osc/smf/ok", "import failed: %s", err ? err->s : "(no reply)");
     test_check(lanes && lanes->f == 2.0f, "clap_osc/smf/lanes", "lanes_used %g, expected 2 (two note tracks)", lanes ? lanes->f : -1);
-    // Two tempo events -> a tempo map: 120 BPM at 0 s, then 100 BPM at tick 1920 = 4 beats at 120 = 2.0 s
-    test_check(tm && tm->f == 2.0f && t0 && b0 && t1 && b1 && t0->f == 0.0f && fabsf(b0->f - 120.0f) < 1e-3f &&
-               fabsf(t1->f - 2.0f) < 1e-4f && fabsf(b1->f - 100.0f) < 1e-3f, "clap_osc/smf/tempo_map",
-               "tempo map wrong: %g markers, (%g s, %g BPM), (%g s, %g BPM)", tm ? tm->f : -1, t0 ? t0->f : -1, b0 ? b0->f : -1, t1 ? t1->f : -1, b1 ? b1->f : -1);
+    // 120 BPM at 0 s, then an instant change to 100 BPM at tick 1920 = 4 beats at 120 = 2.0 s. MIDI tempo
+    // changes are steps, so the map holds 120 up to 2.0 s and switches there: (0,120) (2,120) (2,100).
+    test_check(tm && tm->f == 3.0f && t0 && b0 && t1 && b1 && t2 && b2 && t0->f == 0.0f && fabsf(b0->f - 120.0f) < 1e-3f &&
+               fabsf(t1->f - 2.0f) < 1e-4f && fabsf(b1->f - 120.0f) < 1e-3f && t2->f == t1->f && fabsf(b2->f - 100.0f) < 1e-3f,
+               "clap_osc/smf/tempo_map", "tempo map wrong: %g markers, (%g s, %g), (%g s, %g), (%g s, %g)", tm ? tm->f : -1,
+               t0 ? t0->f : -1, b0 ? b0->f : -1, t1 ? t1->f : -1, b1 ? b1->f : -1, t2 ? t2->f : -1, b2 ? b2->f : -1);
     // The flat tempo reported alongside a tempo map is the song's starting tempo, not a stale value.
     test_check(tb && fabsf(tb->f - 120.0f) < 1e-3f, "clap_osc/smf/tempo_bpm", "reported tempo_bpm %g, expected the starting tempo 120", tb ? tb->f : -1);
     test_check(mc && mc->f == 1.0f && ml && strcmp(ml->s, "Verse") == 0, "clap_osc/smf/marker", "marker report wrong");
@@ -235,6 +257,29 @@ int main(int argc, char **argv) {
         test_hash_bytes(&hm, g_msgs[i].s, strlen(g_msgs[i].s) + 1);
     }
     test_hash_print(&hm, "clap_osc/smf/report");
+
+    // Many tempo changes: the repeat is skipped, and only the first 8 distinct tempos fit as steps
+    // (1 + 2*7 = 15 markers), each change a same-time (hold, switch) pair.
+    char mid2[512]; snprintf(mid2, sizeof mid2, "%s/osc_test_tempos.mid", dir); write_smf_many_tempos(mid2);
+    g_nmsgs = 0;
+    lo_send_from(g_plugin_addr, g_srv, LO_TT_IMMEDIATE, "/hds/song/import_smf", "sf", mid2, 1.0f);
+    process_block(-1, 0, NULL); collect(2000, "/hds/status/smf_import/marker_count"); collect(200, NULL);
+    const Msg *n2 = find_msg("/hds/status/smf_import/tempo_marker_count");
+    int pairs_ok = n2 && n2->f == 15.0f;
+    float expect_bpm[8] = { 120, 100, 110, 120, 130, 140, 150, 160 };
+    for (int i = 0; pairs_ok && i < 15; i++) {
+        char at[64], ab[64];
+        snprintf(at, sizeof at, "/hds/status/smf_import/tempo_marker/%d/time", i); snprintf(ab, sizeof ab, "/hds/status/smf_import/tempo_marker/%d/bpm", i);
+        const Msg *mt = find_msg(at), *mb = find_msg(ab);
+        if (!mt || !mb) { pairs_ok = 0; break; }
+        int step = (i + 1) / 2; // marker 0 = tempo 0; markers 2k-1, 2k = (hold tempo k-1, tempo k)
+        float want = (i % 2 == 1) ? expect_bpm[step - 1] : expect_bpm[step];
+        if (fabsf(mb->f - want) > 1e-3f) pairs_ok = 0;
+        if (i % 2 == 0 && i > 0) { char pt[64]; snprintf(pt, sizeof pt, "/hds/status/smf_import/tempo_marker/%d/time", i - 1);
+            const Msg *prev = find_msg(pt); if (!prev || prev->f != mt->f) pairs_ok = 0; }
+    }
+    test_check(pairs_ok, "clap_osc/smf/tempo_steps_capacity", "expected 15 markers = the first 8 distinct tempos as steps, got %g markers",
+               n2 ? n2->f : -1);
 
     p->stop_processing(p); p->deactivate(p);
     lo_address_free(g_plugin_addr); lo_server_free(g_srv);

@@ -1,6 +1,7 @@
 // test_backend.c -- unit tests for backend.o's plain-function subsystems:
 //   - the JSON reader (hds_json_parse/hds_json_object_get/hds_json_free), used for .hdsprog files
 //   - the Scala (.scl) microtuning loader (hds_tuning_load_scl -> g_tuning_table)
+//   - the tempo map (compute_current_tempo_bpm): linear ramps, same-time steps, hold, flat tempo
 //   - the OSC address table (build_osc_dispatch_table/osc_dispatch_lookup): every concrete
 //     control address, fingerprinted, so any addition/removal/rename in the protocol shows up
 // Usage: test_backend <scratch dir>
@@ -142,10 +143,38 @@ static void test_osc_table(void) {
     test_hash_print(&h, "backend/osc/address_space");
 }
 
+// ---------------------------------------------------------------------------------------------
+// Tempo map (compute_current_tempo_bpm): markers interpolate linearly; two markers at the same time
+// are an instant step (what the SMF importer writes for a MIDI tempo change)
+// ---------------------------------------------------------------------------------------------
+static SynthSharedControls g_knobs;
+static float tempo_at(const float *times, const float *bpms, int n, double t) {
+    ProgramState *prog = &g_knobs.programs[SINGLE_PROGRAM_SLOT];
+    g_knobs.performance_mode = 0.0f;
+    prog->tempo_bpm = 77.0f; prog->tempo_marker_count = (float)n;
+    for (int i = 0; i < n; i++) { prog->tempo_marker_time[i] = times[i]; prog->tempo_marker_bpm[i] = bpms[i]; }
+    return compute_current_tempo_bpm(&g_knobs, t);
+}
+
+static void test_tempo_map(void) {
+    init_default_controls(&g_knobs);
+    const float st[] = { 0.0f, 2.0f, 2.0f }, sb[] = { 120.0f, 120.0f, 100.0f };
+    float a = tempo_at(st, sb, 3, 1.0), b = tempo_at(st, sb, 3, 1.999), c = tempo_at(st, sb, 3, 2.0), d = tempo_at(st, sb, 3, 9.0);
+    test_check(a == 120.0f && b == 120.0f && c == 100.0f && d == 100.0f, "backend/tempo/step",
+               "step map gave %g, %g, %g, %g at 1.0/1.999/2.0/9.0 s (expected 120, 120, 100, 100)", a, b, c, d);
+    const float rt[] = { 0.0f, 4.0f }, rb[] = { 120.0f, 80.0f };
+    float r = tempo_at(rt, rb, 2, 2.0);
+    test_check(fabsf(r - 100.0f) < 1e-3f, "backend/tempo/ramp", "two-marker map gave %g at the midpoint (expected a linear 100)", r);
+    const float ht[] = { 1.0f, 3.0f }, hb[] = { 90.0f, 90.0f };
+    float h = tempo_at(ht, hb, 2, 0.0), z = tempo_at(ht, hb, 0, 5.0);
+    test_check(h == 90.0f && z == 77.0f, "backend/tempo/hold_and_flat", "before-first-marker %g (expected 90), no markers %g (expected the flat 77)", h, z);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : ".";
     test_json();
     test_scl(dir);
     test_osc_table();
+    test_tempo_map();
     return test_exit_code();
 }

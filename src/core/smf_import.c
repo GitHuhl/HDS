@@ -299,19 +299,39 @@ static bool hds_song_import_smf(HdsEngineState *engine, SynthSharedControls *kno
 
     if (import_tempo) {
         ProgramState *prog = &knobs->programs[SINGLE_PROGRAM_SLOT];
-        if (tempo_count <= 1) {
-            // The common case, a file with one flat, unchanging tempo: no map needed at all --
-            // matches compute_current_tempo_bpm()'s own "no markers" fast path.
-            prog->tempo_bpm = (tempo_count == 1) ? (60000000.0f / (float)tempo_events[0].usec_per_qn) : 120.0f;
+        // MIDI Set Tempo events are instantaneous: the tempo holds until the next one. The tempo
+        // map interpolates linearly between markers, so each change is written as a STEP -- a
+        // marker holding the old tempo at the change time, then one with the new tempo at the
+        // same time (compute_current_tempo_bpm resolves same-time markers to the last one).
+        // Repeated identical tempos are skipped, and of several events at the same tick the last
+        // one wins, so only real changes use map slots.
+        float step_time[TEMPO_MARKER_MAX], step_bpm[TEMPO_MARKER_MAX];
+        int steps = 0, dropped = 0;
+        for (int i = 0; i < tempo_count; i++) {
+            float t = (float)hds_smf_ticks_to_seconds(tempo_events[i].tick, tempo_events, tempo_count, ticks_per_quarter);
+            float bpm = 60000000.0f / (float)tempo_events[i].usec_per_qn;
+            if (steps > 0 && step_time[steps - 1] == t) { step_bpm[steps - 1] = bpm; continue; }   // same tick: last wins
+            if (steps > 0 && step_bpm[steps - 1] == bpm) continue;                                  // no actual change
+            // Each change after the first needs 2 map slots (hold + new tempo).
+            if (steps >= TEMPO_MARKER_MAX || (steps > 0 && 2 * steps + 1 > TEMPO_MARKER_MAX)) { dropped++; continue; }
+            step_time[steps] = t; step_bpm[steps] = bpm; steps++;
+        }
+        if (steps > 1 && step_bpm[steps - 1] == step_bpm[steps - 2]) steps--; // a same-tick override can undo a change
+        if (dropped > 0) {
+            fprintf(stderr, "[smf] file has more tempo changes than this engine's %d-slot tempo map holds as steps "
+                            "(%d per change) -- keeping the first %d, dropping %d\n", TEMPO_MARKER_MAX, 2, steps, dropped);
+        }
+        if (steps <= 1) {
+            // One flat, unchanging tempo (the common case): no map needed at all -- matches
+            // compute_current_tempo_bpm()'s own "no markers" fast path.
+            prog->tempo_bpm = (steps == 1) ? step_bpm[0] : 120.0f;
             prog->tempo_marker_count = 0.0f;
         } else {
-            int n = tempo_count < TEMPO_MARKER_MAX ? tempo_count : TEMPO_MARKER_MAX;
-            if (tempo_count > TEMPO_MARKER_MAX) {
-                fprintf(stderr, "[smf] file has %d tempo changes, more than this engine's %d-slot tempo map holds -- keeping the first %d\n", tempo_count, TEMPO_MARKER_MAX, TEMPO_MARKER_MAX);
-            }
-            for (int i = 0; i < n; i++) {
-                prog->tempo_marker_time[i] = (float)hds_smf_ticks_to_seconds(tempo_events[i].tick, tempo_events, tempo_count, ticks_per_quarter);
-                prog->tempo_marker_bpm[i] = 60000000.0f / (float)tempo_events[i].usec_per_qn;
+            int n = 0;
+            prog->tempo_marker_time[n] = step_time[0]; prog->tempo_marker_bpm[n] = step_bpm[0]; n++;
+            for (int i = 1; i < steps; i++) {
+                prog->tempo_marker_time[n] = step_time[i]; prog->tempo_marker_bpm[n] = step_bpm[i - 1]; n++; // hold the old tempo up to the change
+                prog->tempo_marker_time[n] = step_time[i]; prog->tempo_marker_bpm[n] = step_bpm[i];     n++; // then switch
             }
             prog->tempo_marker_count = (float)n;
             // Keep the flat tempo consistent with the map: the song's starting tempo. Playback

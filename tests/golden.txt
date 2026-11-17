@@ -11,7 +11,7 @@ clap_gui/hds/tab6 bf0770f80dee36b7
 clap_gui/hds_fx/tab0 c6d1ece45326b03d
 clap_osc/params/audio 0d6074db8093774b
 clap_osc/sfz/audio 6bea67e58f4bc5c3
-clap_osc/smf/report 0272c6adb24e395a
+clap_osc/smf/report c2471f47e1141842
 clap_osc/state_dump/default 592b5b243d858b5f
 clap_render/hds/notes 3aa05ee7af347da3
 fx_chain/32slot_8source/eq3 0931c2969ae749b7
