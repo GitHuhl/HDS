@@ -1345,6 +1345,7 @@ int main(int argc, char **argv) {
     // Raspberry Pi) keeps working unchanged. See hds_standalone_gui_x11.c's own header comment for
     // what the window itself does.
     bool cli_gui = false;
+    bool cli_no_midi = false; // --no-midi: run without the ALSA MIDI sequencer (headless/CI use; control is OSC-only)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--osc-listen-port") == 0 && i + 1 < argc) osc_listen_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--osc-reply-host") == 0 && i + 1 < argc) osc_reply_host = argv[++i];
@@ -1360,6 +1361,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--program") == 0 && i + 1 < argc) cli_program_path = argv[++i];
         else if (strcmp(argv[i], "--master-volume") == 0 && i + 1 < argc) { cli_master_volume = (float)atof(argv[++i]); cli_master_volume_set = true; }
         else if (strcmp(argv[i], "--gui") == 0) cli_gui = true;
+        else if (strcmp(argv[i], "--no-midi") == 0) cli_no_midi = true;
     }
 
     if (strcmp(cli_backend, "pipewire") == 0) {
@@ -1592,25 +1594,33 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[sample] failed to start disk streaming thread -- WAVE_SAMPLE playback will be unavailable this session\n");
     }
 
-    snd_seq_t *seq_handle;
-    int seq_err = snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
-    if (seq_err < 0) {
-        fprintf(stderr, "MIDI sequencer failed to open: %s\n", snd_strerror(seq_err));
-        close_pcm_stream(pcm_handle); if (pcm_capture_handle) close_pcm_stream(pcm_capture_handle);
-        lo_address_free(osc_reply_addr); lo_server_free(osc_server); return 1;
-    }
-    snd_seq_set_client_name(seq_handle, "YourSynth Socket Engine");
-    int our_midi_port = snd_seq_create_simple_port(seq_handle, "Input", SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE, SND_SEQ_PORT_TYPE_MIDI_GENERIC);
+    // --no-midi leaves seq_handle NULL; every MIDI step below (auto-connect, input polling, close)
+    // is skipped for a NULL handle. Without it, a sequencer that fails to open is still fatal, so a
+    // broken MIDI setup is never silently ignored.
+    snd_seq_t *seq_handle = NULL;
+    int our_midi_port = -1;
+    if (cli_no_midi) {
+        fprintf(stderr, "MIDI disabled (--no-midi): control is OSC-only this session\n");
+    } else {
+        int seq_err = snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
+        if (seq_err < 0) {
+            fprintf(stderr, "MIDI sequencer failed to open: %s (run with --no-midi to start without MIDI)\n", snd_strerror(seq_err));
+            close_pcm_stream(pcm_handle); if (pcm_capture_handle) close_pcm_stream(pcm_capture_handle);
+            lo_address_free(osc_reply_addr); lo_server_free(osc_server); return 1;
+        }
+        snd_seq_set_client_name(seq_handle, "YourSynth Socket Engine");
+        our_midi_port = snd_seq_create_simple_port(seq_handle, "Input", SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE, SND_SEQ_PORT_TYPE_MIDI_GENERIC);
 
-    // Subscribe our own port to the ALSA System client's Announce port -- this makes every
-    // client/port creation and removal on the whole system show up as SND_SEQ_EVENT_PORT_START/
-    // PORT_EXIT events in our own input stream (handled in process_midi_input), which is what
-    // lets a USB MIDI keyboard plugged in after startup auto-connect too, with no aconnect ever
-    // needed. Best-effort: if it fails, MIDI auto-connect still works at startup, just not live.
-    snd_seq_connect_from(seq_handle, our_midi_port, SND_SEQ_CLIENT_SYSTEM, SND_SEQ_PORT_SYSTEM_ANNOUNCE);
+        // Subscribe our own port to the ALSA System client's Announce port -- this makes every
+        // client/port creation and removal on the whole system show up as SND_SEQ_EVENT_PORT_START/
+        // PORT_EXIT events in our own input stream (handled in process_midi_input), which is what
+        // lets a USB MIDI keyboard plugged in after startup auto-connect too, with no aconnect ever
+        // needed. Best-effort: if it fails, MIDI auto-connect still works at startup, just not live.
+        snd_seq_connect_from(seq_handle, our_midi_port, SND_SEQ_CLIENT_SYSTEM, SND_SEQ_PORT_SYSTEM_ANNOUNCE);
+    }
 
     MidiSourceList midi_sources = {0};
-    midi_autoconnect_scan(seq_handle, our_midi_port, g_gui_ctx.knobs.midi_device, &midi_sources);
+    if (seq_handle) midi_autoconnect_scan(seq_handle, our_midi_port, g_gui_ctx.knobs.midi_device, &midi_sources);
     MidiLiveState midi_live = {0}; // pitch_bend/channel_pressure/cc[] all start at their "centered/off" 0.0
     char applied_midi_device[AUDIO_DEVICE_NAME_LEN];
     snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", g_gui_ctx.knobs.midi_device);
@@ -1716,7 +1726,7 @@ int main(int argc, char **argv) {
         if (strncmp(g_gui_ctx.knobs.midi_device, applied_midi_device, AUDIO_DEVICE_NAME_LEN) != 0) {
             // Selection changed live from the Audio tab -- drop whatever was auto-connected
             // under the old selection and rescan under the new one.
-            midi_autoconnect_scan(seq_handle, our_midi_port, g_gui_ctx.knobs.midi_device, &midi_sources);
+            if (seq_handle) midi_autoconnect_scan(seq_handle, our_midi_port, g_gui_ctx.knobs.midi_device, &midi_sources);
             snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", g_gui_ctx.knobs.midi_device);
         }
 
@@ -1733,7 +1743,7 @@ int main(int argc, char **argv) {
         // discrete "on change" event the way /hds/zone/load_sfz is.
         poll_vco_shape_unload(&g_sample_engine, &g_gui_ctx.knobs);
 
-        process_midi_input(&g_streams_state, &g_engine, &g_sample_engine, seq_handle, voices, &g_gui_ctx.knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live, current_tempo_bpm);
+        if (seq_handle) process_midi_input(&g_streams_state, &g_engine, &g_sample_engine, seq_handle, voices, &g_gui_ctx.knobs, global_lfo_phases, mono_stacks, our_midi_port, &midi_sources, &midi_live, current_tempo_bpm);
         seq_playback_midi_events(&g_engine, &g_sample_engine, voices, &g_gui_ctx.knobs, global_lfo_phases, &mono_stacks[SINGLE_PROGRAM_SLOT], &midi_live); // fires any Seq-mode lane's recorded events reached by the playhead (always targets SINGLE_PROGRAM_SLOT)
 
         // voice_limit is computed fresh every iteration since it's a live, user-adjustable
@@ -1913,7 +1923,7 @@ int main(int argc, char **argv) {
     for (int l = 0; l < SEQ_LANE_COUNT; l++) free(g_seq_audio[l].pcm);
     lo_server_free(osc_server);
     lo_address_free(osc_reply_addr);
-    snd_seq_close(seq_handle);
+    if (seq_handle) snd_seq_close(seq_handle);
     close_pcm_stream(pcm_handle);
     if (pcm_capture_handle) close_pcm_stream(pcm_capture_handle);
 #if HDS_PIPEWIRE_ENABLED
