@@ -48,7 +48,8 @@ NAM_UNITS := activations container conv1d convnet dsp get_dsp linear lstm nam_fi
              sequential util wav a2_fast model slimmable nam_bridge
 
 # --- Source units, by subsystem (paths under src/, no extension) ---
-CORE_UNITS  := core/backend core/json core/tuning core/smf_import core/sfz_parser core/osc_protocol core/sample_engine
+CORE_UNITS  := core/backend core/render core/voices core/midi_dispatch core/arpeggiator core/metronome core/defaults \
+               core/fx_upload core/program_files core/json core/tuning core/smf_import core/sfz_parser core/osc_protocol core/sample_engine
 FX_UNITS    := fx/fx_chain $(addprefix fx/,fx_airwindows_mod fx_airwindows_tone fx_nam fx_eq_filter \
                fx_compressors fx_limiters fx_pitch fx_reverb_delay)
 FX_GUI_UNITS := gui/hds_fx_gui_draw gui/hds_fx_gui_browser
