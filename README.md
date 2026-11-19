@@ -70,7 +70,8 @@ GUI test. `make test` runs nine programs from `tests/`:
   variants, plus a 32-slot, 8-source bus: checks the output is finite and fingerprints it.
 - `test_sample_engine` — the DFD sample engine on its own, with its real disk and loader threads:
   a new note never plays a previous note's leftover ring audio or inherits its end-of-file, reverse
-  zones play from their end, loop splices are crossfaded, and zone and SFZ loads never open a file
+  zones play from their end, loop splices are crossfaded, a reloaded file is never read through a
+  handle cached from before, and zone and SFZ loads never open a file
   on the audio thread (checked with a FIFO that blocks any open). Pass/fail checks only.
 - `test_recording` — records WAV and WavPack through the recording engine and reads both back,
   checking every sample.

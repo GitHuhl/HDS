@@ -1557,7 +1557,10 @@ typedef struct {
     _Atomic bool live_loop_enabled, live_loop_release_exit;
     _Atomic unsigned int live_loop_start, live_loop_end, live_playback_end;
     _Atomic int live_loop_crossfade;
-    FILE *disk_file_handle;           // disk-thread-owned exclusively
+    FILE *disk_file_handle;           // disk-thread-owned exclusively: borrowed from the disk
+                                       // thread's open-file cache (see DiskFileCache in
+                                       // sample_engine.c), never fclose()d through this pointer.
+    int disk_file_entry;              // disk-thread-owned: that cache entry's index, -1 for none
     // Disk-thread-owned copies of the claim_* fields, taken at START.
     unsigned int disk_data_start_offset, disk_total_frames;
     unsigned short disk_num_channels, disk_bits_per_sample, disk_audio_format;
@@ -1586,9 +1589,6 @@ typedef struct {
                                        // direction, the file could not be opened, or a read
                                        // failed). Keeps the disk thread from picking the stream
                                        // again; reset false on SAMPLE_CMD_START.
-    unsigned int disk_file_frame;     // disk-thread-owned: the frame disk_file_handle's position
-                                       // is at (UINT_MAX: unknown), so sequential reads skip the
-                                       // fseek and keep stdio's read buffer.
     // Disk-thread-owned write, audio-thread-owned read (render_sample_osc) -- the ONLY reliable
     // way to tell "the ring is under-filled because this non-looping zone has genuinely finished"
     // apart from "the ring is under-filled because this freshly-claimed stream hasn't been

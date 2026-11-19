@@ -78,8 +78,15 @@ static void free_prepared_sample(HdsPreparedSample *ps) {
 // first SAMPLE_PRE_ROLL_LIMIT frames into freshly allocated RAM pre-roll buffers. Touches no
 // engine state, so it runs on the sample loader thread (or, with no loader thread, wherever the
 // caller is). Only the first two channels of a multichannel file are kept.
+// Bumped every time a sample file is (re)read for a zone load. The disk thread's open-file cache
+// drops its handles when it changes, so a file replaced on disk and then reloaded is never read
+// through a handle opened on the old one. Process-wide (shared by every plugin instance): an
+// extra bump only costs another instance one reopen per file.
+static _Atomic unsigned int g_sample_file_generation = 0;
+
 static bool prepare_sample_file(const char *path, HdsPreparedSample *out) {
     memset(out, 0, sizeof(*out));
+    atomic_fetch_add_explicit(&g_sample_file_generation, 1, memory_order_release);
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[sample] failed to open '%s': %s\n", path, strerror(errno)); return false; }
 
@@ -379,7 +386,83 @@ void request_sample_stream_release(HdsSampleEngine *se, int stream_index) {
 #define DISK_CHUNK_FRAMES 4096
 #define DISK_SCRATCH_BYTES (DISK_CHUNK_FRAMES * 8 * 4) // a chunk of up to 8 channels at 32 bits
 
+// --- The disk thread's open-file cache ---
+//
+// Opening a file costs a directory lookup and, on a cold disk, a seek -- doing it on every note-on
+// let a burst of notes run their rings dry before any audio arrived. The disk thread instead keeps
+// up to DISK_FILE_CACHE_SIZE files open, keyed by path, and shares one FILE* between every stream
+// playing that file (each entry remembers where its FILE* is positioned, so a read from another
+// stream just seeks first). Entries no stream is using stay open until evicted
+// least-recently-used. All of it is private to the disk thread: no locks.
+#define DISK_FILE_CACHE_SIZE 64 // > MAX_SAMPLE_STREAMS, so a free or idle entry always exists
+
 typedef struct {
+    char path[SAMPLE_PATH_LEN];
+    FILE *f;
+    int refs;                   // streams currently using it
+    unsigned long long last_use;
+    long long pos;              // byte offset f is at, -1: unknown
+    bool stale;                 // opened before the last g_sample_file_generation bump: close once unused
+} DiskFileEntry;
+
+typedef struct {
+    DiskFileEntry e[DISK_FILE_CACHE_SIZE];
+    unsigned long long clock;
+    unsigned int generation;
+} DiskFileCache;
+
+static void disk_cache_close_entry(DiskFileEntry *ent) {
+    if (ent->f) fclose(ent->f);
+    ent->f = NULL; ent->path[0] = '\0'; ent->refs = 0; ent->stale = false; ent->pos = -1;
+}
+
+// A zone was reloaded since the last check: close every idle entry, and mark the busy ones so
+// they close as soon as their last stream lets go (new sessions never pick a stale entry).
+static void disk_cache_check_generation(DiskFileCache *c) {
+    unsigned int g = atomic_load_explicit(&g_sample_file_generation, memory_order_acquire);
+    if (g == c->generation) return;
+    c->generation = g;
+    for (int i = 0; i < DISK_FILE_CACHE_SIZE; i++) {
+        if (!c->e[i].f) continue;
+        if (c->e[i].refs == 0) disk_cache_close_entry(&c->e[i]);
+        else c->e[i].stale = true;
+    }
+}
+
+// Returns an entry index holding `path` open (refs already taken), or -1 if it can't be opened.
+static int disk_cache_acquire(DiskFileCache *c, const char *path) {
+    disk_cache_check_generation(c);
+    int victim = -1;
+    for (int i = 0; i < DISK_FILE_CACHE_SIZE; i++) {
+        DiskFileEntry *ent = &c->e[i];
+        if (ent->f && !ent->stale && strcmp(ent->path, path) == 0) {
+            ent->refs++; ent->last_use = ++c->clock;
+            return i;
+        }
+        if (ent->refs > 0) continue;
+        if (victim < 0 || !ent->f || (c->e[victim].f && ent->last_use < c->e[victim].last_use)) victim = i;
+    }
+    if (victim < 0) return -1; // unreachable while DISK_FILE_CACHE_SIZE > MAX_SAMPLE_STREAMS
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    DiskFileEntry *ent = &c->e[victim];
+    disk_cache_close_entry(ent);
+    snprintf(ent->path, sizeof(ent->path), "%s", path);
+    ent->f = f; ent->refs = 1; ent->last_use = ++c->clock; ent->pos = 0;
+    return victim;
+}
+
+static void disk_cache_release_stream(DiskFileCache *c, SampleStream *st) {
+    if (st->disk_file_entry >= 0) {
+        DiskFileEntry *ent = &c->e[st->disk_file_entry];
+        if (--ent->refs == 0 && ent->stale) disk_cache_close_entry(ent);
+    }
+    st->disk_file_entry = -1;
+    st->disk_file_handle = NULL;
+}
+
+typedef struct {
+    DiskFileCache *files;
     unsigned char *raw;   // DISK_SCRATCH_BYTES
     float *l, *r;         // DISK_CHUNK_FRAMES each: the chunk being written
     float *xl, *xr;       // DISK_CHUNK_FRAMES each: the loop crossfade's pre-loop frames
@@ -387,18 +470,22 @@ typedef struct {
 
 // Reads up to `count` frames starting at file frame `pos` into l[]/r[]. Returns how many it got
 // (fewer only at a read error or a file shorter than its header says).
-static unsigned int disk_read_frames(SampleStream *st, unsigned int pos, unsigned int count, float *l, float *r, unsigned char *raw) {
+// The FILE* may be shared with other streams playing the same file (see DiskFileCache): the
+// entry's `pos` says where it is, so a stream's sequential reads still skip the fseek and keep
+// stdio's read buffer as long as nothing else read from it in between.
+static unsigned int disk_read_frames(SampleStream *st, DiskFileCache *files, unsigned int pos, unsigned int count, float *l, float *r, unsigned char *raw) {
     unsigned int frame_bytes = (unsigned int)st->disk_num_channels * (st->disk_bits_per_sample / 8u);
-    if (frame_bytes == 0) return 0;
+    if (frame_bytes == 0 || st->disk_file_entry < 0) return 0;
+    DiskFileEntry *ent = &files->e[st->disk_file_entry];
     unsigned int max_frames = DISK_SCRATCH_BYTES / frame_bytes;
     if (count > max_frames) count = max_frames;
     if (count == 0) return 0;
-    if (st->disk_file_frame != pos) {
-        long byte_offset = (long)st->disk_data_start_offset + (long)pos * (long)frame_bytes;
-        if (fseek(st->disk_file_handle, byte_offset, SEEK_SET) != 0) { st->disk_file_frame = UINT_MAX; return 0; }
+    long long byte_offset = (long long)st->disk_data_start_offset + (long long)pos * (long long)frame_bytes;
+    if (ent->pos != byte_offset) {
+        if (fseek(ent->f, (long)byte_offset, SEEK_SET) != 0) { ent->pos = -1; return 0; }
     }
-    unsigned int got = (unsigned int)fread(raw, frame_bytes, count, st->disk_file_handle);
-    st->disk_file_frame = (got == count) ? pos + got : UINT_MAX;
+    unsigned int got = (unsigned int)fread(raw, frame_bytes, count, ent->f);
+    ent->pos = (got == count) ? byte_offset + (long long)got * frame_bytes : -1;
     decode_wav_frames(raw, got, st->disk_num_channels, st->disk_bits_per_sample, st->disk_audio_format, l, r);
     return got;
 }
@@ -466,7 +553,7 @@ static void disk_fill_forward(SampleStream *st, unsigned int space, DiskScratch 
     unsigned int n = end - pos;
     if (n > space) n = space;
     if (n > DISK_CHUNK_FRAMES) n = DISK_CHUNK_FRAMES;
-    unsigned int got = disk_read_frames(st, pos, n, sc->l, sc->r, sc->raw);
+    unsigned int got = disk_read_frames(st, sc->files, pos, n, sc->l, sc->r, sc->raw);
     if (got == 0) { disk_mark_exhausted(st); return; }
 
     if (loop_active) {
@@ -477,7 +564,7 @@ static void disk_fill_forward(SampleStream *st, unsigned int space, DiskScratch 
         unsigned int xf_start = z.loop_end - xf;
         unsigned int lo = (pos > xf_start) ? pos : xf_start, hi = pos + got;
         if (xf > 0 && hi > lo) {
-            unsigned int pre = disk_read_frames(st, lo - loop_len, hi - lo, sc->xl, sc->xr, sc->raw);
+            unsigned int pre = disk_read_frames(st, sc->files, lo - loop_len, hi - lo, sc->xl, sc->xr, sc->raw);
             for (unsigned int k = 0; k < pre; k++) {
                 float t = (float)(lo + k - xf_start + 1) / (float)(xf + 1);
                 unsigned int i = lo - pos + k;
@@ -510,7 +597,7 @@ static void disk_fill_reverse(SampleStream *st, unsigned int space, DiskScratch 
     if (n > space) n = space;
     if (n > DISK_CHUNK_FRAMES) n = DISK_CHUNK_FRAMES;
     unsigned int first = pos - n + 1;
-    unsigned int got = disk_read_frames(st, first, n, sc->l, sc->r, sc->raw);
+    unsigned int got = disk_read_frames(st, sc->files, first, n, sc->l, sc->r, sc->raw);
     if (got != n) { disk_mark_exhausted(st); return; }
     disk_ring_write(st, sc->l, sc->r, n, true);
 
@@ -525,13 +612,12 @@ static void disk_fill_reverse(SampleStream *st, unsigned int space, DiskScratch 
 // audio. If the session number read here is already older than the audio thread's current one
 // (it claimed again while this ran), the mismatch just keeps the voice silent until the next
 // START -- already pending -- is processed.
-static void sample_disk_start_session(SampleStream *st) {
-    if (st->disk_file_handle) { fclose(st->disk_file_handle); st->disk_file_handle = NULL; }
+static void sample_disk_start_session(SampleStream *st, DiskFileCache *files) {
+    disk_cache_release_stream(files, st);
     unsigned int session = atomic_load_explicit(&st->session, memory_order_acquire);
     st->active_slot_index = atomic_load_explicit(&st->slot_index, memory_order_relaxed);
     st->active_start_frame = atomic_load_explicit(&st->start_frame, memory_order_relaxed);
     st->disk_exhausted = false;
-    st->disk_file_frame = UINT_MAX;
     atomic_store_explicit(&st->disk_reached_eof, false, memory_order_relaxed);
     st->disk_reverse = atomic_load_explicit(&st->claim_reverse, memory_order_relaxed);
     st->disk_total_frames = atomic_load_explicit(&st->claim_total_frames, memory_order_relaxed);
@@ -543,7 +629,8 @@ static void sample_disk_start_session(SampleStream *st) {
     if (atomic_load_explicit(&st->claim_loaded, memory_order_relaxed)) {
         char path[SAMPLE_PATH_LEN];
         stream_load_path(st, path);
-        st->disk_file_handle = fopen(path, "rb");
+        st->disk_file_entry = disk_cache_acquire(files, path);
+        if (st->disk_file_entry >= 0) st->disk_file_handle = files->e[st->disk_file_entry].f;
     }
     if (st->disk_file_handle) {
         // Forward zones get the pre-roll fast path (it always covers frames [0, pre_roll_frames)):
@@ -563,15 +650,20 @@ static void sample_disk_start_session(SampleStream *st) {
 void *sample_disk_thread_main(void *arg) {
     HdsSampleEngine *se = (HdsSampleEngine *)arg;
     DiskScratch sc = {
+        calloc(1, sizeof(DiskFileCache)),
         malloc(DISK_SCRATCH_BYTES),
         malloc(sizeof(float) * DISK_CHUNK_FRAMES), malloc(sizeof(float) * DISK_CHUNK_FRAMES),
         malloc(sizeof(float) * DISK_CHUNK_FRAMES), malloc(sizeof(float) * DISK_CHUNK_FRAMES),
     };
-    if (!sc.raw || !sc.l || !sc.r || !sc.xl || !sc.xr) {
+    if (!sc.files || !sc.raw || !sc.l || !sc.r || !sc.xl || !sc.xr) {
         fprintf(stderr, "[sample] disk thread: out of memory -- WAVE_SAMPLE streaming unavailable\n");
-        free(sc.raw); free(sc.l); free(sc.r); free(sc.xl); free(sc.xr);
+        free(sc.files); free(sc.raw); free(sc.l); free(sc.r); free(sc.xl); free(sc.xr);
         return NULL;
     }
+    for (int i = 0; i < DISK_FILE_CACHE_SIZE; i++) sc.files->e[i].pos = -1;
+    sc.files->generation = atomic_load_explicit(&g_sample_file_generation, memory_order_acquire);
+    // Streams still pointing at a cache from an earlier run of this thread (deactivate/activate).
+    for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) { se->streams->sample_streams[i].disk_file_entry = -1; se->streams->sample_streams[i].disk_file_handle = NULL; }
     while (!atomic_load_explicit(&se->streams->sample_disk_thread_shutdown, memory_order_acquire)) {
         bool work_done = false;
         SampleStream *streams = se->streams->sample_streams;
@@ -581,10 +673,10 @@ void *sample_disk_thread_main(void *arg) {
             // Acquire-exchange: pairs with claim_sample_stream's release-store of `command`.
             int cmd = atomic_exchange_explicit(&st->command, SAMPLE_CMD_NONE, memory_order_acquire);
             if (cmd == SAMPLE_CMD_START) {
-                sample_disk_start_session(st);
+                sample_disk_start_session(st, sc.files);
                 work_done = true;
             } else if (cmd == SAMPLE_CMD_STOP) {
-                if (st->disk_file_handle) { fclose(st->disk_file_handle); st->disk_file_handle = NULL; }
+                disk_cache_release_stream(sc.files, st); // the file stays open in the cache
                 work_done = true;
             }
         }
@@ -610,7 +702,11 @@ void *sample_disk_thread_main(void *arg) {
 
         if (!work_done) { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); } // 1ms idle poll
     }
-    free(sc.raw); free(sc.l); free(sc.r); free(sc.xl); free(sc.xr);
+    // Every handle is the cache's: close them all, and leave no stream pointing at one (the hosts'
+    // post-join cleanup loops then find nothing left to fclose).
+    for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) { se->streams->sample_streams[i].disk_file_entry = -1; se->streams->sample_streams[i].disk_file_handle = NULL; }
+    for (int i = 0; i < DISK_FILE_CACHE_SIZE; i++) disk_cache_close_entry(&sc.files->e[i]);
+    free(sc.files); free(sc.raw); free(sc.l); free(sc.r); free(sc.xl); free(sc.xr);
     return NULL;
 }
 

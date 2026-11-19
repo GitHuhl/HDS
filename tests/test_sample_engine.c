@@ -225,6 +225,37 @@ static void test_retrigger_stress_never_mixes_files(void) {
     remove_all_zones();
 }
 
+// The disk thread keeps files open between notes (DiskFileCache). Many notes of one zone must
+// keep streaming it, and a file replaced on disk and then reloaded must stream the new contents,
+// not the old file through a handle still open from earlier notes.
+static float play_reverse_until_heard(void) {
+    Osc o = start_note();
+    float v = 0.0f;
+    for (int i = 0; i < 2000 && v == 0.0f; i++) { v = render(&o); if (v == 0.0f) sleep_ms(1); }
+    if (o.idx >= 0) release_sample_stream(&g_se, o.idx);
+    return v;
+}
+static void test_cached_file_reused_then_reloaded(void) {
+    char a[300], tmp[300];
+    snprintf(a, sizeof a, "%s/cached.wav", g_dir); snprintf(tmp, sizeof tmp, "%s/cached.tmp", g_dir);
+    write_wav(a, 20000, value_half);
+    ZoneRecordWire z = zone(9, a);
+    z.reverse = 1.0f; // every note streams from disk at once
+    test_check(load_zone(&z), "sample_engine/file_cache/load", "zone never loaded");
+    int good = 0;
+    for (int n = 0; n < 50; n++) good += play_reverse_until_heard() == 0.5f;
+    test_check(good == 50, "sample_engine/file_cache/repeat_notes", "%d of 50 repeated notes played the file", good);
+
+    // Replace the file (a new inode, as an editor's save does) and reload the zone.
+    write_wav(tmp, 20000, value_minus_quarter);
+    rename(tmp, a);
+    remove_all_zones();
+    test_check(load_zone(&z), "sample_engine/file_cache/reload", "zone never reloaded");
+    float v = play_reverse_until_heard();
+    test_check(v == -0.25f, "sample_engine/file_cache/reload_reads_new_file", "after the reload a note played %g, expected the new file's -0.25", v);
+    remove_all_zones();
+}
+
 #ifndef HDS_TEST_BASELINE
 // Watchdog: these checks call audio-thread entry points with a zone/SFZ path that is a FIFO with
 // no writer -- fopen() on it blocks until someone opens the other end. On the audio thread, that
@@ -306,6 +337,7 @@ int main(int argc, char **argv) {
     test_old_eof_does_not_end_new_note();
     test_loop_splice_is_crossfaded();
     test_retrigger_stress_never_mixes_files();
+    test_cached_file_reused_then_reloaded();
 #ifndef HDS_TEST_BASELINE
     test_sfz_loads_through_loader();
     test_audio_thread_never_opens_files();
