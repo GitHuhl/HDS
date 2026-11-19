@@ -212,6 +212,16 @@ typedef struct {
     // the next time Record is pressed). Defaults to "~/HDS_Recordings" the first time the Recording
     // tab renders (see that file's own lazy-init comment).
     char record_folder[RECORD_PATH_LEN];
+
+    // CLAP state.load() -> process() zone hand-off (see clap_state_load). state.load() runs on the
+    // main thread and may overlap process(), which owns the zone catalog, so a loaded project's
+    // zones travel as one batch: the main thread publishes it in pending_state_zones, process()
+    // takes and applies it, then parks it in applied_state_zones for the main thread to free
+    // (process() never calls free()). `activated` is main-thread-only: while it is false the host
+    // may not call process(), so a state load applies its zones directly.
+    _Atomic(struct HdsStateZoneBatch *) pending_state_zones;
+    _Atomic(struct HdsStateZoneBatch *) applied_state_zones;
+    bool activated;
 } HdsClapPlugin;
 
 #endif // HDS_ENGINE_INSTANCE_H
