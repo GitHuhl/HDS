@@ -1081,9 +1081,9 @@ static void hds_load_program_file(SynthSharedControls *knobs, HdsSampleEngine *s
 // below is a no-op unless hds_stdin_raw_mode_enable() actually managed to put a real terminal into
 // raw mode. Every load this triggers (arrow-key Program cycling) reuses hds_load_program_file()
 // itself, so it's the exact same bounded, small-text-file-only work --program already does at
-// startup, just triggered live instead -- and per the existing live /hds/zone/load_sfz OSC handler,
-// this file's PCM sample loading is already deferred/throttled (SAMPLE_LOADS_PER_BLOCK), so nothing
-// here can block the audio thread on real disk I/O.
+// startup, just triggered live instead -- and, like the live /hds/zone/load_sfz OSC handler, its
+// SFZ and sample loading goes to the sample loader thread once that is running, so nothing here
+// blocks the audio thread on sample I/O (the small .hdsprog text file itself is still read here).
 static struct termios g_stdin_orig_termios;
 static bool g_stdin_raw_mode_active = false;
 
@@ -1504,10 +1504,9 @@ int main(int argc, char **argv) {
     // --sfz-vcoN startup loading: right here, after the OSC methods are registered (so a
     // subsequent /hds/zone/load_sfz can still layer on top live) but before open_pcm_stream()
     // opens the real-time audio device -- hds_load_sfz_for_osc() only does text parsing + path/
-    // stat() resolution + one header-only WAV read per region (no PCM decode, which stays
-    // throttled through drain_pending_sample_loads() at SAMPLE_LOADS_PER_BLOCK per block, same as
-    // any other zone load), so even a large multisample library enqueues fast and never risks
-    // blocking a thread that has real-time constraints. A bad/missing path logs and continues
+    // stat() resolution + one header-only WAV read per region (no PCM decode: the queued zone
+    // loads go to the sample loader thread, started below, on the first audio block), so even a
+    // large multisample library enqueues fast and never blocks the real-time loop. A bad/missing path logs and continues
     // starting -- never fatal, matching load_sample_slot()'s own established failure posture.
     for (int i = 0; i < 4; i++) {
         if (!cli_sfz_path[i]) continue;
@@ -1593,6 +1592,10 @@ int main(int argc, char **argv) {
     if (!sample_disk_thread_ok) {
         fprintf(stderr, "[sample] failed to start disk streaming thread -- WAVE_SAMPLE playback will be unavailable this session\n");
     }
+    // Sample loader thread: zone and SFZ file reads happen there from now on, not in this loop
+    // (--sfz-vcoN/--program loads above already ran in-thread, before audio started; their
+    // queued zone loads are handed to it by the first drain_pending_sample_loads()).
+    hds_sample_loader_start(&g_sample_engine);
 
     // --no-midi leaves seq_handle NULL; every MIDI step below (auto-connect, input polling, close)
     // is skipped for a NULL handle. Without it, a sequencer that fails to open is still fatal, so a
@@ -1730,13 +1733,11 @@ int main(int argc, char **argv) {
             snprintf(applied_midi_device, sizeof(applied_midi_device), "%s", g_gui_ctx.knobs.midi_device);
         }
 
-        // Sample Bank: reconciliation now happens once per "/hds/zone/upsert"/"/hds/zone/remove"
+        // Sample Bank: reconciliation happens once per "/hds/zone/upsert"/"/hds/zone/remove"
         // OSC message (dispatched inline inside the lo_server_recv_noblock() drain above, at
-        // receipt), not every audio block -- see apply_zone_upsert()/apply_zone_remove(). The one
-        // piece of work that genuinely can't happen at message-receipt time is finishing a load
-        // that got throttled into the pending-loads queue; that's drained here, at most
-        // SAMPLE_LOADS_PER_BLOCK entries per
-        // block (see its #define for the real-time trade-off this bounds).
+        // receipt) -- see apply_zone_upsert()/apply_zone_remove(). Loads go through here: queued
+        // zone loads are handed to the sample loader thread, and finished ones (zones and SFZs)
+        // are swapped into the catalog, a bounded amount per block, with no file I/O in this loop.
         drain_pending_sample_loads(&g_sample_engine);
         // Detects any oscillator's own Shape switching away from Multisample and unloads whatever
         // zones it still owns -- see poll_vco_shape_unload's own comment for why this can't be a
@@ -1911,6 +1912,7 @@ int main(int argc, char **argv) {
         atomic_store_explicit(&record_engine.shutdown, true, memory_order_release);
         pthread_join(record_engine.thread, NULL);
     }
+    hds_sample_loader_free(&g_sample_engine);
     if (sample_disk_thread_ok) {
         atomic_store_explicit(&g_sample_disk_thread_shutdown, true, memory_order_release);
         pthread_join(g_sample_disk_thread, NULL);
