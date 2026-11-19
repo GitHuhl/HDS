@@ -552,6 +552,55 @@ static bool clap_state_save(const clap_plugin_t *plugin, const clap_ostream_t *s
     return ok;
 }
 
+// A loaded project's Sample Bank, as one unit: clear every zone, then upsert these.
+typedef struct HdsStateZoneBatch {
+    int count, capacity;
+    ZoneRecordWire *recs;
+} HdsStateZoneBatch;
+
+static void state_zone_batch_free(HdsStateZoneBatch *b) {
+    if (!b) return;
+    free(b->recs);
+    free(b);
+}
+
+// Owner of the catalog only: process(), or the main thread while the plugin is not activated.
+static void state_zone_batch_apply(HdsClapPlugin *p, const HdsStateZoneBatch *b) {
+    // Loading a project means "this project's own samples", not "these on top of what was there".
+    for (int s = 0; s < p->sample_slot_state.sample_slot_count; s++) {
+        if (p->sample_slot_state.sample_slots[s].active) apply_zone_remove(&p->sample_engine, p->sample_slot_state.sample_slots[s].zone_id);
+    }
+    // Each brand-new zone is queued for the sample loader (or, without one, for
+    // drain_pending_sample_loads()); no file is read here.
+    for (int i = 0; i < b->count; i++) apply_zone_upsert(&p->sample_engine, &b->recs[i]);
+}
+
+// process(): apply a batch clap_state_load() published, if any. Takes one only once the main
+// thread has freed the previous one, so process() never has to free a batch itself.
+static void state_zone_batch_poll(HdsClapPlugin *p) {
+    if (atomic_load_explicit(&p->pending_state_zones, memory_order_relaxed) == NULL) return;
+    if (atomic_load_explicit(&p->applied_state_zones, memory_order_acquire) != NULL) return;
+    HdsStateZoneBatch *b = atomic_exchange_explicit(&p->pending_state_zones, NULL, memory_order_acq_rel);
+    if (!b) return;
+    state_zone_batch_apply(p, b);
+    atomic_store_explicit(&p->applied_state_zones, b, memory_order_release);
+}
+
+// Main thread: free a batch process() has finished with.
+static void state_zone_batch_collect(HdsClapPlugin *p) {
+    state_zone_batch_free(atomic_exchange_explicit(&p->applied_state_zones, NULL, memory_order_acq_rel));
+}
+
+// Main thread, process() not running (not activated, or inside activate()): apply a pending
+// batch directly.
+static void state_zone_batch_apply_pending_now(HdsClapPlugin *p) {
+    state_zone_batch_collect(p);
+    HdsStateZoneBatch *b = atomic_exchange_explicit(&p->pending_state_zones, NULL, memory_order_acq_rel);
+    if (!b) return;
+    state_zone_batch_apply(p, b);
+    state_zone_batch_free(b);
+}
+
 static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *stream) {
     HdsClapPlugin *p = (HdsClapPlugin *)plugin->plugin_data;
 
@@ -576,11 +625,10 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
     if (sscanf(cursor, "HDS%d", &version) != 1 || version < 1 || version > HDS_CLAP_STATE_VERSION) { free(b.buf); return false; }
     cursor = first_newline + 1;
 
-    // Clear whatever's currently loaded before applying the saved zones -- loading a project
-    // means "this project's own samples," not "add these on top of whatever was already there."
-    for (int s = 0; s < p->sample_slot_state.sample_slot_count; s++) {
-        if (p->sample_slot_state.sample_slots[s].active) apply_zone_remove(&p->sample_engine, p->sample_slot_state.sample_slots[s].zone_id);
-    }
+    // The zones are collected here and applied by whoever owns the catalog (see
+    // HdsStateZoneBatch) -- never mutated from this (main) thread while process() may run.
+    HdsStateZoneBatch *batch = calloc(1, sizeof(*batch));
+    if (!batch) { free(b.buf); return false; }
 
     int applied_knobs = 0, skipped_knobs = 0, applied_zones = 0;
     while (*cursor) {
@@ -650,9 +698,13 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
                 rec.assigned_osc = (float)assigned_osc;
                 rec.owner_program = (float)owner_program;
                 snprintf(rec.path, sizeof(rec.path), "%s", path);
-                // brand-new zone -> queued via enqueue_pending_sample_load(), picked up by this
-                // instance's own drain_pending_sample_loads() poll in process().
-                apply_zone_upsert(&p->sample_engine, &rec);
+                if (batch->count == batch->capacity) {
+                    int cap = batch->capacity ? batch->capacity * 2 : 64;
+                    ZoneRecordWire *grown = realloc(batch->recs, sizeof(*grown) * (size_t)cap);
+                    if (!grown) { state_zone_batch_free(batch); free(b.buf); return false; }
+                    batch->recs = grown; batch->capacity = cap;
+                }
+                batch->recs[batch->count++] = rec;
                 applied_zones++;
             }
         }
@@ -662,6 +714,12 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
     fprintf(stderr, "[hds-clap] state load: %d knob(s) applied, %d skipped (unrecognized address), %d zone(s) queued\n",
             applied_knobs, skipped_knobs, applied_zones);
     free(b.buf);
+
+    // Publish the batch. A batch from an earlier load that process() never took is replaced
+    // (a newer project wins) and freed here; one it already applied is collected first.
+    state_zone_batch_collect(p);
+    state_zone_batch_free(atomic_exchange_explicit(&p->pending_state_zones, batch, memory_order_acq_rel));
+    if (!p->activated) state_zone_batch_apply_pending_now(p);
 
     // REVERTED: this used to also proactively push send_full_state_dump() here (and a matching
     // push in clap_plugin_activate()) to close the activate()/state.load() ordering race -- see
@@ -715,6 +773,8 @@ static void clap_plugin_destroy(const clap_plugin_t *plugin) {
     // removed -- every instance load+unload cycle across a whole session was leaking however much
     // RAM its own loaded multisamples' pre-roll caches used, for good, until the host itself quit.
     // Whatever the sample loader still holds (finished loads never applied, retired buffers).
+    state_zone_batch_collect(p);
+    state_zone_batch_free(atomic_exchange_explicit(&p->pending_state_zones, NULL, memory_order_acq_rel));
     hds_sample_loader_free(&p->sample_engine);
     for (int s = 0; s < p->sample_slot_state.sample_slot_count; s++) {
         free(p->sample_slot_state.sample_slots[s].pre_roll_l);
@@ -855,6 +915,10 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
     // sample_engine.c's "Sample loader thread" section). If it can't start, loads fall back to
     // the old throttled in-process() path.
     hds_sample_loader_start(&p->sample_engine);
+    // A state load that arrived while process() could still have been running, but before it
+    // took the batch: apply it now, while nothing else can be touching the catalog.
+    state_zone_batch_apply_pending_now(p);
+    p->activated = true;
 
     p->vu_decimator = 0;
     return true;
@@ -862,6 +926,9 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
 
 static void clap_plugin_deactivate(const clap_plugin_t *plugin) {
     HdsClapPlugin *p = (HdsClapPlugin *)plugin->plugin_data;
+    // process() no longer runs: a batch it never took is applied right away instead.
+    p->activated = false;
+    state_zone_batch_apply_pending_now(p);
 
     // Loads still queued or finished-but-unapplied stay in their queues and continue on the next
     // activate().
@@ -1020,6 +1087,7 @@ static clap_process_status clap_plugin_process(const clap_plugin_t *plugin, cons
     // uses below, for the same reason (block_size itself isn't resolved until the chunking loop
     // further down).
     poll_metronome(&p->engine, &p->knobs, current_tempo_bpm, (int)process->frames_count);
+    state_zone_batch_poll(p);
     drain_pending_sample_loads(&p->sample_engine);
     // Detects any oscillator's own Shape switching away from Multisample and unloads whatever
     // zones it still owns -- see poll_vco_shape_unload's own comment for why this can't be a
