@@ -90,6 +90,12 @@ void init_voice(SynthVoice *voice);
 void release_sample_stream(HdsSampleEngine *se, int stream_index);
 void *sample_disk_thread_main(void *arg);
 void drain_pending_sample_loads(HdsSampleEngine *se);
+// The sample loader thread (sample_engine.c): start it alongside the disk thread, stop it before
+// the engine state can go away, and free whatever it still holds once the engine is destroyed.
+// While it isn't running, loads fall back to the old in-thread path (tests, Android).
+bool hds_sample_loader_start(HdsSampleEngine *se);
+void hds_sample_loader_stop(HdsSampleEngine *se);
+void hds_sample_loader_free(HdsSampleEngine *se);
 void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec);
 void apply_zone_remove(HdsSampleEngine *se, int32_t zone_id);
 int zone_upsert_handler(const char *path, const char *types, lo_arg **argv, int argc, lo_message msg, void *user_data);

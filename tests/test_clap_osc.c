@@ -14,6 +14,7 @@
 
 #include <lo/lo.h>
 #include <stdlib.h>
+#include <time.h>
 #include <sys/socket.h>
 
 #define BS 256
@@ -244,7 +245,12 @@ int main(int argc, char **argv) {
     test_check(pk < 1e-6f, "clap_osc/sfz/silent_before_load", "VCO1 in Sample mode with no zones made sound (peak %g)", pk);
     // owner_program 8 = SINGLE_PROGRAM_SLOT, the program Single mode plays (0..7 are the Combi programs)
     lo_send_from(g_plugin_addr, g_srv, LO_TT_IMMEDIATE, "/hds/zone/load_sfz", "iis", 0, 8, sfz);
-    for (int b = 0; b < 20; b++) process_block(-1, 0, NULL);
+    // The first block receives the message and hands the SFZ to the sample loader thread; the
+    // pause gives that thread time to parse it and read the WAV, so the next block installs the
+    // zone. Same block count as before, so the rendered audio is unchanged.
+    process_block(-1, 0, NULL);
+    { struct timespec ts = {0, 200000000}; nanosleep(&ts, NULL); }
+    for (int b = 1; b < 20; b++) process_block(-1, 0, NULL);
     TestHash hz; test_hash_init(&hz); pk = play_phrase(&hz);
     test_check(pk > 0.01f, "clap_osc/sfz/plays", "no sound from the loaded SFZ (peak %g)", pk);
     test_hash_print(&hz, "clap_osc/sfz/audio");

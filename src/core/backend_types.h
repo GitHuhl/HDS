@@ -94,10 +94,9 @@
 // fixed SynthSharedControls struct, specifically so it can scale with a real multisample
 // instrument's zone count instead of a compile-time constant. g_sample_slots[] is still a single
 // preallocated-once array sized SAMPLE_SLOT_CAPACITY, though, rather than a realloc()'d/growable
-// one: sample_disk_thread_main() dereferences &g_sample_slots[index] directly with no lock, which
-// is only safe because that array's base address never moves for the life of the process --
-// letting it move (via realloc) while the disk thread concurrently reads from it would be a
-// genuine use-after-free race, not a style preference. SAMPLE_SLOT_CAPACITY is deliberately huge
+// one: the GUI and the CLAP state code reach into it by index from other threads, which is only
+// safe because that array's base address never moves for the life of the process (the disk
+// thread itself no longer reads it -- see SampleStream.claim_path). SAMPLE_SLOT_CAPACITY is deliberately huge
 // (~34MB total at ~340 bytes/slot) so it is never the real constraint in practice, while keeping
 // the "never moves" safety property. See the Sample Bank section on SynthSharedControls and
 // find_matching_sample_slot().
@@ -1372,7 +1371,8 @@ typedef struct {
     // SAMPLE_XFADE_SIZE crossfade (today's exact behavior, a practical click-avoidance measure
     // that predates real loop_crossfade= support). >=0 = this zone's own explicit crossfade
     // length in frames, INCLUDING 0 (an explicit "hard cut, no crossfade" author choice) -- see
-    // render_sample_osc's own loop-splice comment.
+    // disk_fill_forward()'s loop-splice comment (the crossfade is mixed by the disk thread as it
+    // writes the ring).
     int loop_crossfade_frames;
 
     // seq_length/seq_position: round-robin cycling, decoupled from `group` entirely now (a zone
@@ -1532,7 +1532,36 @@ typedef struct {
                                      // -- hence atomic, not plain.
 
     _Atomic int command;              // SampleStreamCommand
+    // Session handshake. Every claim starts a new session: the audio thread bumps `session`
+    // (release, after writing slot_index/start_frame) before publishing START. The disk thread,
+    // once it has reset write_ptr/read_ptr/disk_reached_eof for the session it picked up, stores
+    // that session number in `ready_session` (release). Until the two match, the ring and the EOF
+    // flag still belong to an earlier session on this pool entry, so render_sample_osc holds the
+    // voice silent and does not touch read_ptr. Without this, a note that reads the ring at once
+    // (reverse, or a start offset past the pre-roll) played the previous session's leftover audio,
+    // or was ended at once by that session's EOF flag, whenever the disk thread was late.
+    _Atomic unsigned int session;       // written by the audio thread only
+    _Atomic unsigned int ready_session; // written by the disk thread only
+    // The disk thread never reads SampleSlot: the audio thread owns the catalog and may reload or
+    // edit a slot at any time. Instead, claim_sample_stream() copies what a session needs into
+    // these fields (before the session release-store, so the disk thread's acquire of `session`
+    // makes them visible), and the loop/end settings are republished on every live edit of the
+    // zone (publish_zone_edit_to_streams), so dragging a loop point still affects a held note.
+    // claim_path holds the file path as relaxed atomic 8-byte words: a pool entry claimed again
+    // while the disk thread is copying it can still mix two paths, but that copy then belongs to
+    // a superseded session and is discarded (its ready_session never matches).
+    _Atomic uint64_t claim_path[SAMPLE_PATH_LEN / 8];
+    _Atomic bool claim_loaded, claim_reverse;
+    _Atomic unsigned int claim_data_offset, claim_total_frames, claim_pre_roll_frames;
+    _Atomic unsigned int claim_channels, claim_bits, claim_audio_format;
+    _Atomic bool live_loop_enabled, live_loop_release_exit;
+    _Atomic unsigned int live_loop_start, live_loop_end, live_playback_end;
+    _Atomic int live_loop_crossfade;
     FILE *disk_file_handle;           // disk-thread-owned exclusively
+    // Disk-thread-owned copies of the claim_* fields, taken at START.
+    unsigned int disk_data_start_offset, disk_total_frames;
+    unsigned short disk_num_channels, disk_bits_per_sample, disk_audio_format;
+    bool disk_reverse;
     unsigned int disk_read_frame_pos; // disk-thread-owned: how far into the source file it's read
     int active_slot_index;            // disk-thread-owned: private copy of slot_index, captured
                                        // only once, at the instant the disk thread actually
@@ -1552,13 +1581,14 @@ typedef struct {
     unsigned int active_start_frame;  // disk-thread-owned: private copy of start_frame, captured
                                        // once at SAMPLE_CMD_START consumption, same reasoning and
                                        // same synchronization as active_slot_index above.
-    bool disk_reverse_exhausted;      // disk-thread-owned only. Forward's "nothing left to
-                                       // stream" (disk_read_frame_pos >= total_frames) is self-
-                                       // sustaining forever once true, since pos only grows;
-                                       // reverse has no such natural resting state (pos can't go
-                                       // below 0), so this flag stands in for "already read frame
-                                       // 0 of a non-looping reverse zone, nothing further to give."
-                                       // Reset false on SAMPLE_CMD_START.
+    bool disk_exhausted;              // disk-thread-owned only: this session has nothing more
+                                       // to read (a non-looping zone reached its end in either
+                                       // direction, the file could not be opened, or a read
+                                       // failed). Keeps the disk thread from picking the stream
+                                       // again; reset false on SAMPLE_CMD_START.
+    unsigned int disk_file_frame;     // disk-thread-owned: the frame disk_file_handle's position
+                                       // is at (UINT_MAX: unknown), so sequential reads skip the
+                                       // fseek and keep stdio's read buffer.
     // Disk-thread-owned write, audio-thread-owned read (render_sample_osc) -- the ONLY reliable
     // way to tell "the ring is under-filled because this non-looping zone has genuinely finished"
     // apart from "the ring is under-filled because this freshly-claimed stream hasn't been
@@ -1575,8 +1605,8 @@ typedef struct {
     // silently killed the instant it should have started: a note that looks like it triggered
     // (envelope attacking normally) but is never actually audible. Set true by the disk thread at
     // the exact moment it determines there is truly nothing left (forward: disk_read_frame_pos
-    // reaches slot->playback_end_frame; reverse: the existing disk_reverse_exhausted trip above);
-    // reset false on SAMPLE_CMD_START, same as disk_reverse_exhausted.
+    // reaches slot->playback_end_frame; reverse: it reads frame 0 of a non-looping zone); reset
+    // false on SAMPLE_CMD_START, same as disk_exhausted.
     _Atomic bool disk_reached_eof;
     _Atomic bool release_requested;  // audio-thread-owned write (request_sample_stream_release(),
                                        // called once from trigger_voice_release() at the owning
@@ -1717,9 +1747,9 @@ typedef struct {
     int drum_bus; // 0 = off (the OSC-safe default) -- see SampleSlot.drum_bus's own comment
 } ZoneRecordWire;
 // A zone whose file needs (re)loading, queued rather than loaded immediately -- see
-// drain_pending_sample_loads()'s comment. A plain ring buffer, audio-thread-only (both the
-// enqueue and the drain run on main()'s single thread), so no cross-thread synchronization is
-// needed here at all, unlike the disk-streaming ring buffers elsewhere in this file.
+// drain_pending_sample_loads()'s comment, which hands these to the sample loader thread. The
+// queue itself is a plain ring buffer, audio-thread-only (both the enqueue and the drain run on
+// the audio thread), so it needs no cross-thread synchronization.
 typedef struct {
     int slot_index;
     int zone_id; // carried through only for the error message if the load fails
@@ -1779,6 +1809,77 @@ typedef struct {
 // This tier (see HdsSampleSlotState's own comment for why this is split into several structs):
 // the throttled sample-load queue plus round-robin cycling state, grouped together since both
 // need PendingSampleLoad (just declared) and nothing later.
+// --- Sample loader thread (see sample_engine.c's "Sample loader thread" section) ---
+//
+// Every file read a zone or SFZ load needs (WAV header, RAM pre-roll decode, the .sfz text and
+// each region's header) happens on this thread; the audio thread only hands jobs over and swaps
+// finished results into the catalog. Three bounded lock-free queues connect them (HdsMpmcQueue
+// cells; any thread may push, any may pop): requests (audio and GUI threads -> loader), results
+// (loader -> audio thread) and garbage (audio thread -> loader, buffers the audio thread retired
+// and must not free itself).
+
+// A WAV file's layout plus its decoded RAM pre-roll, ready to install into a SampleSlot.
+typedef struct {
+    unsigned int total_frames, sample_rate_hz, data_start_offset, pre_roll_frames;
+    unsigned short num_channels, bits_per_sample, audio_format;
+    float *pre_roll_l, *pre_roll_r; // malloc'd; ownership moves to the slot on install
+} HdsPreparedSample;
+
+#define HDS_LOAD_JOB_SAMPLE 1 // load one zone's file (PendingSampleLoad)
+#define HDS_LOAD_JOB_SFZ    2 // parse an .sfz and load every region's file
+
+typedef struct {
+    int kind;
+    PendingSampleLoad sample;          // HDS_LOAD_JOB_SAMPLE
+    int osc_index, owner_program;      // HDS_LOAD_JOB_SFZ
+    char sfz_path[SAMPLE_PATH_LEN * 2];
+} HdsLoadJob;
+
+typedef struct {
+    int kind;
+    // HDS_LOAD_JOB_SAMPLE
+    bool ok;
+    PendingSampleLoad sample;
+    HdsPreparedSample prepared;
+    // HDS_LOAD_JOB_SFZ: `count` regions, each with its zone record and (if prepared_ok[i]) its
+    // prepared file. All three arrays are malloc'd by the loader and retired by the audio thread.
+    int osc_index, owner_program, count;
+    int sw_default_note; // -1: the file set no sw_default=
+    ZoneRecordWire *records;
+    HdsPreparedSample *prepared_list;
+    bool *prepared_ok;
+} HdsLoadResult;
+
+#define HDS_LOADER_QUEUE_CAPACITY   256  // requests and results; power of two
+#define HDS_LOADER_GARBAGE_CAPACITY 8192 // retired buffers; power of two
+
+typedef struct {
+    _Atomic size_t *seq;    // one sequence number per cell
+    unsigned char *data;    // cells' payloads, elem_size bytes each
+    size_t elem_size, mask;
+    _Atomic size_t enqueue_pos, dequeue_pos;
+} HdsMpmcQueue;
+
+typedef struct {
+    bool initialized;            // queues set up (once, by hds_sample_loader_start)
+    _Atomic bool running;        // the thread is up and taking jobs
+    _Atomic bool shutdown;
+    pthread_t thread;
+    HdsMpmcQueue requests, results, garbage;
+    _Atomic size_t request_seq[HDS_LOADER_QUEUE_CAPACITY];
+    HdsLoadJob request_cells[HDS_LOADER_QUEUE_CAPACITY];
+    _Atomic size_t result_seq[HDS_LOADER_QUEUE_CAPACITY];
+    HdsLoadResult result_cells[HDS_LOADER_QUEUE_CAPACITY];
+    _Atomic size_t garbage_seq[HDS_LOADER_GARBAGE_CAPACITY];
+    void *garbage_cells[HDS_LOADER_GARBAGE_CAPACITY];
+    // Audio-thread-owned: an SFZ result being applied a few regions per block.
+    bool sfz_applying;
+    int sfz_cursor;
+    HdsLoadResult sfz_current;
+    // Buffers freed on the audio thread because the garbage queue was full (should stay 0).
+    _Atomic unsigned long inline_frees;
+} HdsSampleLoaderState;
+
 typedef struct HdsPendingLoadState {
     PendingSampleLoad pending_loads[PENDING_SAMPLE_LOAD_CAPACITY];
     int          pending_load_head, pending_load_tail, pending_load_count;
@@ -1818,6 +1919,9 @@ typedef struct HdsPendingLoadState {
     // of its own, after the ordinary voice that triggered it has already moved on into its own
     // release phase or even been stolen/reused for something else entirely).
     HdsReleaseTailPlayer release_tails[HDS_RELEASE_TAIL_POOL_SIZE];
+
+    // The sample loader thread and its queues -- see HdsSampleLoaderState.
+    HdsSampleLoaderState loader;
 } HdsPendingLoadState;
 //
 // Off by default (tuning_enable=0), reproducing today's exact 12-tone equal temperament (440Hz

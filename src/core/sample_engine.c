@@ -44,18 +44,42 @@
 #define SAMPLE_CHECK_READ(ptr, size, count, stream) \
     do { if (fread(ptr, size, count, stream) != (size_t)(count)) { fclose(stream); return false; } } while (0)
 
-// Parses a standard RIFF/WAVE header (skipping any unrecognized chunks rather than assuming a
-// fixed layout), accepts PCM (16/24/32-bit int) or IEEE float (32-bit) data, and caches the
-// first pre_roll_frames frames into RAM as float -1..1. Only the first two channels of a
-// multichannel file are read (render_sample_osc downmixes to mono anyway -- see its comment);
-// any further channels are skipped, not left to desync subsequent frame reads. Loop points are
-// reset to a safe "off, full-range" placeholder here -- the real per-zone loop points get
-// reapplied by the caller immediately after this returns (see the OSC zone handlers'
-// throttled load drain), once total_frames (just parsed below) makes that conversion possible.
-static bool load_sample_slot(HdsSampleEngine *se, int index, const char *path, int root_note) {
-    if (index < 0 || index >= SAMPLE_SLOT_CAPACITY) return false;
-    SampleSlot *slot = &se->slots->sample_slots[index];
+// Decodes `frames` interleaved WAV frames from `src` into l[]/r[] as float -1..1: the first two
+// channels, a mono file duplicated to both. The same conversions the engine has always used
+// (16/24/32-bit PCM, 32-bit float); shared by the pre-roll decode and the disk thread.
+static void decode_wav_frames(const unsigned char *src, unsigned int frames, unsigned short channels,
+                              unsigned short bits, unsigned short audio_format, float *l, float *r) {
+    const unsigned int bps = bits / 8u, frame_bytes = (unsigned int)channels * bps;
+    for (unsigned int i = 0; i < frames; i++) {
+        const unsigned char *p = src + (size_t)i * frame_bytes;
+        float v[2];
+        for (int c = 0; c < 2; c++) {
+            const unsigned char *s = p + (size_t)((c < channels) ? c : 0) * bps;
+            if (audio_format == 1) {
+                if (bits == 16) { int16_t x; memcpy(&x, s, 2); v[c] = (float)x / 32768.0f; }
+                else if (bits == 24) { int x = (s[0] << 8) | (s[1] << 16) | (s[2] << 24); v[c] = (float)x / 2147483648.0f; }
+                else { int32_t x; memcpy(&x, s, 4); v[c] = (float)x / 2147483648.0f; }
+            } else {
+                memcpy(&v[c], s, 4);
+            }
+        }
+        l[i] = v[0];
+        r[i] = v[1];
+    }
+}
 
+static void free_prepared_sample(HdsPreparedSample *ps) {
+    free(ps->pre_roll_l); free(ps->pre_roll_r);
+    ps->pre_roll_l = ps->pre_roll_r = NULL;
+}
+
+// Parses a standard RIFF/WAVE header (skipping any unrecognized chunks rather than assuming a
+// fixed layout), accepts PCM (16/24/32-bit int) or IEEE float (32-bit) data, and decodes the
+// first SAMPLE_PRE_ROLL_LIMIT frames into freshly allocated RAM pre-roll buffers. Touches no
+// engine state, so it runs on the sample loader thread (or, with no loader thread, wherever the
+// caller is). Only the first two channels of a multichannel file are kept.
+static bool prepare_sample_file(const char *path, HdsPreparedSample *out) {
+    memset(out, 0, sizeof(*out));
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[sample] failed to open '%s': %s\n", path, strerror(errno)); return false; }
 
@@ -92,6 +116,10 @@ static bool load_sample_slot(HdsSampleEngine *se, int index, const char *path, i
         fprintf(stderr, "[sample] '%s': float WAV must be 32-bit\n", path);
         fclose(f); return false;
     }
+    if (num_channels == 0) {
+        fprintf(stderr, "[sample] '%s': WAV with no channels\n", path);
+        fclose(f); return false;
+    }
     if (subchunk1_size > 16) fseek(f, subchunk1_size - 16, SEEK_CUR);
 
     SAMPLE_CHECK_READ(chunk_id, 1, 4, f);
@@ -104,80 +132,80 @@ static bool load_sample_slot(HdsSampleEngine *se, int index, const char *path, i
     unsigned int data_size;
     SAMPLE_CHECK_READ(&data_size, 4, 1, f);
 
-    int bytes_per_sample = bits_per_sample / 8;
-    unsigned int total_frames = data_size / (unsigned int)(num_channels * bytes_per_sample);
+    unsigned int bytes_per_sample = bits_per_sample / 8u;
+    unsigned int frame_bytes = (unsigned int)num_channels * bytes_per_sample;
+    unsigned int total_frames = data_size / frame_bytes;
 
-    // Free whatever this slot held before -- a live reload (the GUI pointing this slot at a new
-    // file) replaces the cache outright. This runs on the audio thread, same as every other live
-    // wire-protocol change (device switches, etc.) -- see the live-reload check in main().
-    free(slot->pre_roll_l); free(slot->pre_roll_r);
-    slot->loaded = false;
-
-    snprintf(slot->file_path, SAMPLE_PATH_LEN, "%s", path);
-    slot->root_note = root_note;
-    slot->total_frames = total_frames;
-    slot->sample_rate_hz = sample_rate;
-    slot->num_channels = num_channels;
-    slot->bits_per_sample = bits_per_sample;
-    slot->audio_format = audio_format;
-    slot->data_start_offset = (unsigned int)ftell(f);
-    // Loop points/enable are real per-zone data (the Mapping tab's waveform loop editor), not
-    // computed here -- the caller (the OSC zone handlers' throttled load drain) applies
-    // the real values from the zone record it queued this load with, immediately after this
-    // function returns, using total_frames just assigned above. These are just safe placeholders
-    // for the moment in between (and for any caller that loads a slot directly, e.g. a test): no
-    // looping, full range, so a slot is never silently looped somewhere unintended.
-    slot->loop_enabled = false;
-    slot->loop_start = 0;
-    slot->loop_end = total_frames;
-    // Same reasoning as loop_start/loop_end above: a safe default for playback_end_frame (SFZ
-    // end=), consulted on EVERY non-looping stream (unlike loop_start/loop_end, which stay
-    // dormant while loop_enabled is false) -- so unlike those, this can't just default to the
-    // BSS zero-init 0, which would make the disk thread think every non-looping zone had already
-    // reached its end before streaming a single frame. The real caller (apply_zone_upsert/
-    // drain_pending_sample_loads) overwrites this via apply_playback_end() immediately after this
-    // function returns, same as loop points above.
-    slot->playback_end_frame = total_frames;
-    slot->loop_release_exit = false;
+    out->total_frames = total_frames;
+    out->sample_rate_hz = sample_rate;
+    out->num_channels = num_channels;
+    out->bits_per_sample = bits_per_sample;
+    out->audio_format = audio_format;
+    out->data_start_offset = (unsigned int)ftell(f);
 
     unsigned int pre_roll_frames = (total_frames < SAMPLE_PRE_ROLL_LIMIT) ? total_frames : SAMPLE_PRE_ROLL_LIMIT;
-    slot->pre_roll_frames = pre_roll_frames;
-    slot->pre_roll_l = calloc((size_t)pre_roll_frames + 2, sizeof(float)); // +2: render_sample_osc reads one frame ahead
-    slot->pre_roll_r = calloc((size_t)pre_roll_frames + 2, sizeof(float));
-    if (!slot->pre_roll_l || !slot->pre_roll_r) { fclose(f); return false; }
-
-    short raw16; int raw32; float fsamp = 0.0f; unsigned char b24[3];
-    for (unsigned int i = 0; i < pre_roll_frames; i++) {
-        if (audio_format == 1) {
-            if (bits_per_sample == 16) { SAMPLE_CHECK_READ(&raw16, 2, 1, f); fsamp = (float)raw16 / 32768.0f; }
-            else if (bits_per_sample == 24) { SAMPLE_CHECK_READ(b24, 1, 3, f); int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fsamp = (float)v / 2147483648.0f; }
-            else { SAMPLE_CHECK_READ(&raw32, 4, 1, f); fsamp = (float)raw32 / 2147483648.0f; }
-        } else { SAMPLE_CHECK_READ(&fsamp, 4, 1, f); }
-        slot->pre_roll_l[i] = fsamp;
-
-        if (num_channels >= 2) {
-            if (audio_format == 1) {
-                if (bits_per_sample == 16) { SAMPLE_CHECK_READ(&raw16, 2, 1, f); fsamp = (float)raw16 / 32768.0f; }
-                else if (bits_per_sample == 24) { SAMPLE_CHECK_READ(b24, 1, 3, f); int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fsamp = (float)v / 2147483648.0f; }
-                else { SAMPLE_CHECK_READ(&raw32, 4, 1, f); fsamp = (float)raw32 / 2147483648.0f; }
-            } else { SAMPLE_CHECK_READ(&fsamp, 4, 1, f); }
-            slot->pre_roll_r[i] = fsamp;
-            if (num_channels > 2) fseek(f, (long)(num_channels - 2) * bytes_per_sample, SEEK_CUR);
-        } else {
-            slot->pre_roll_r[i] = fsamp;
-        }
+    out->pre_roll_frames = pre_roll_frames;
+    out->pre_roll_l = calloc((size_t)pre_roll_frames + 2, sizeof(float)); // +2: render_sample_osc reads one frame ahead
+    out->pre_roll_r = calloc((size_t)pre_roll_frames + 2, sizeof(float));
+    unsigned char *raw = malloc((size_t)pre_roll_frames * frame_bytes + 1);
+    if (!out->pre_roll_l || !out->pre_roll_r || !raw) { free(raw); free_prepared_sample(out); fclose(f); return false; }
+    // One read for the whole pre-roll (at most SAMPLE_PRE_ROLL_LIMIT frames), not one per sample.
+    if (pre_roll_frames > 0 && fread(raw, frame_bytes, pre_roll_frames, f) != pre_roll_frames) {
+        fprintf(stderr, "[sample] '%s': file is shorter than its data chunk says\n", path);
+        free(raw); free_prepared_sample(out); fclose(f); return false;
     }
     fclose(f);
-    slot->loaded = true;
-    // A successful load always un-tombstones the slot -- the catalog path (process_zone_catalog_
-    // message) already sets this before enqueueing, but load_sample_slot() is also a valid entry
-    // point on its own (tests, anything else loading a slot directly), and a loaded-but-inactive
-    // slot would otherwise silently never match in find_matching_sample_slot().
-    slot->active = true;
-    fprintf(stderr, "[sample] loaded slot %d: '%s' (%u frames, root note %d)\n", index, path, total_frames, root_note);
+    decode_wav_frames(raw, pre_roll_frames, num_channels, bits_per_sample, audio_format, out->pre_roll_l, out->pre_roll_r);
+    free(raw);
+    fprintf(stderr, "[sample] prepared '%s' (%u frames)\n", path, total_frames);
     return true;
 }
 
+static void retire_buffer(HdsSampleEngine *se, void *ptr);
+
+// Installs a prepared file into catalog slot `index`: swaps in its header and pre-roll in one go
+// (render_sample_osc never sees a half-installed slot) and hands the old pre-roll buffers to the
+// loader thread to free. No file I/O and no free(), so it is safe on the audio thread. Loop points
+// and end= are reset to a safe "off, full-range" placeholder -- the caller reapplies the zone's
+// real ones right after, once total_frames is known.
+static void install_prepared_sample(HdsSampleEngine *se, int index, const char *path, int root_note, HdsPreparedSample *ps) {
+    SampleSlot *slot = &se->slots->sample_slots[index];
+    retire_buffer(se, slot->pre_roll_l);
+    retire_buffer(se, slot->pre_roll_r);
+    snprintf(slot->file_path, SAMPLE_PATH_LEN, "%s", path);
+    slot->root_note = root_note;
+    slot->total_frames = ps->total_frames;
+    slot->sample_rate_hz = ps->sample_rate_hz;
+    slot->num_channels = ps->num_channels;
+    slot->bits_per_sample = ps->bits_per_sample;
+    slot->audio_format = ps->audio_format;
+    slot->data_start_offset = ps->data_start_offset;
+    slot->loop_enabled = false;
+    slot->loop_start = 0;
+    slot->loop_end = ps->total_frames;
+    // Unlike the loop points, playback_end_frame is consulted on EVERY non-looping stream, so its
+    // placeholder must be the full length, never 0 (which would end every note before it starts).
+    slot->playback_end_frame = ps->total_frames;
+    slot->loop_release_exit = false;
+    slot->pre_roll_frames = ps->pre_roll_frames;
+    slot->pre_roll_l = ps->pre_roll_l;
+    slot->pre_roll_r = ps->pre_roll_r;
+    ps->pre_roll_l = ps->pre_roll_r = NULL; // the slot owns them now
+    slot->loaded = true;
+    // A successful load always un-tombstones the slot -- a loaded-but-inactive slot would never
+    // match in find_matching_sample_slot().
+    slot->active = true;
+}
+
+// Prepare + install in the caller's thread: the path every load took before the loader thread
+// existed, still used when it isn't running (tests that drive the engine directly, Android).
+static bool load_sample_slot(HdsSampleEngine *se, int index, const char *path, int root_note) {
+    if (index < 0 || index >= SAMPLE_SLOT_CAPACITY) return false;
+    HdsPreparedSample ps;
+    if (!prepare_sample_file(path, &ps)) return false;
+    install_prepared_sample(se, index, path, root_note, &ps);
+    return true;
+}
 // Header-only counterpart to load_sample_slot()'s own RIFF chunk walk (same chunk-skip shape,
 // stopping right after reading data_size, with none of the pre-roll PCM decode that follows) --
 // needed by the SFZ parser to convert loop_start=/loop_end=/offset=/end= (given in the SFZ file as
@@ -231,29 +259,91 @@ static bool read_wav_frame_count(const char *path, unsigned int *out_total_frame
 // idle -- see claim_sample_stream/release_sample_stream and their call sites in handle_note_on/
 // render_audio_block. Ownership mirrors RecordEngine/RecordRing exactly: the disk thread is the
 // ONLY thing that ever opens/reads/closes disk_file_handle or writes into the ring buffer; the
-// audio thread is the sole consumer (read_ptr, advanced by render_sample_osc). Start/stop is the
-// same tiny atomic command handshake used there -- the audio thread publishes a command, the
-// disk thread performs the actual I/O.
+// audio thread is the sole consumer (read_ptr, advanced by render_sample_osc). Start/stop is a
+// tiny atomic command handshake -- the audio thread publishes a command, the disk thread performs
+// the actual I/O -- plus a session number (see SampleStream.session) that tells the audio thread
+// when the ring belongs to its own note.
 typedef enum { SAMPLE_CMD_NONE = 0, SAMPLE_CMD_START, SAMPLE_CMD_STOP } SampleStreamCommand;
 
 // g_sample_streams[]/g_sample_disk_thread/g_sample_disk_thread_shutdown are declared as part of
 // HdsStreamsState, just below SeqAudioLane (see that struct's own comment for why the combined
-// declaration point had to move this far down).
+// declaration lives there).
 
 // Claims a free pool slot for a NEW stream session (audio-thread only, called from
-// handle_note_on). Returns -1 if the pool is exhausted -- a real possibility if someone tries to
+// handle_note_on's WAVE_SAMPLE setup). Returns the pool index, or -1 if every slot is busy (can't
 // play more simultaneous WAVE_SAMPLE oscillators than MAX_SAMPLE_STREAMS; the caller treats -1
-// as "this oscillator stays silent until a slot frees up," never a crash.
-static int claim_sample_stream(HdsSampleEngine *se, int slot_index, unsigned int start_frame) {
+// as "this oscillator stays silent for this note" rather than stealing another stream).
+// The loop/end settings a stream's disk reads follow -- republished on every live edit of its
+// zone (see SampleStream.claim_path's comment).
+static void stream_publish_zone(SampleStream *st, const SampleSlot *slot) {
+    atomic_store_explicit(&st->live_loop_enabled, slot->loop_enabled, memory_order_relaxed);
+    atomic_store_explicit(&st->live_loop_release_exit, slot->loop_release_exit, memory_order_relaxed);
+    atomic_store_explicit(&st->live_loop_start, slot->loop_start, memory_order_relaxed);
+    atomic_store_explicit(&st->live_loop_end, slot->loop_end, memory_order_relaxed);
+    atomic_store_explicit(&st->live_playback_end, slot->playback_end_frame, memory_order_relaxed);
+    atomic_store_explicit(&st->live_loop_crossfade, slot->loop_crossfade_frames, memory_order_relaxed);
+}
+
+// Audio thread: a zone's loop/end settings changed in place (no reload) -- pass them on to every
+// stream currently playing it.
+static void publish_zone_edit_to_streams(HdsSampleEngine *se, int slot_index) {
     SampleStream *streams = se->streams->sample_streams;
     for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
+        if (streams[i].in_use && atomic_load_explicit(&streams[i].slot_index, memory_order_relaxed) == slot_index)
+            stream_publish_zone(&streams[i], &se->slots->sample_slots[slot_index]);
+    }
+}
+
+// claim_path as atomic words (see its comment): up to and including the word holding the NUL.
+static void stream_store_path(SampleStream *st, const char *path) {
+    char buf[SAMPLE_PATH_LEN];
+    memset(buf, 0, sizeof(buf));
+    snprintf(buf, sizeof(buf), "%s", path);
+    size_t words = strlen(buf) / 8 + 1;
+    for (size_t w = 0; w < words; w++) {
+        uint64_t v; memcpy(&v, buf + w * 8, 8);
+        atomic_store_explicit(&st->claim_path[w], v, memory_order_relaxed);
+    }
+}
+
+static void stream_load_path(SampleStream *st, char out[SAMPLE_PATH_LEN]) {
+    for (size_t w = 0; w < SAMPLE_PATH_LEN / 8; w++) {
+        uint64_t v = atomic_load_explicit(&st->claim_path[w], memory_order_relaxed);
+        memcpy(out + w * 8, &v, 8);
+        if (memchr(out + w * 8, '\0', 8)) return;
+    }
+    out[SAMPLE_PATH_LEN - 1] = '\0';
+}
+
+static int claim_sample_stream(HdsSampleEngine *se, int slot_index, unsigned int start_frame) {
+    SampleStream *streams = se->streams->sample_streams;
+    const SampleSlot *slot = &se->slots->sample_slots[slot_index];
+    for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
         if (!streams[i].in_use) {
-            streams[i].in_use = true;
+            SampleStream *st = &streams[i];
+            st->in_use = true;
+            unsigned int session = atomic_load_explicit(&st->session, memory_order_relaxed) + 1;
+            // Everything the disk thread will need about this zone, copied now (it never reads
+            // SampleSlot itself -- see SampleStream.claim_path).
+            stream_store_path(st, slot->file_path);
+            atomic_store_explicit(&st->claim_loaded, slot->loaded, memory_order_relaxed);
+            atomic_store_explicit(&st->claim_reverse, slot->reverse, memory_order_relaxed);
+            atomic_store_explicit(&st->claim_data_offset, slot->data_start_offset, memory_order_relaxed);
+            atomic_store_explicit(&st->claim_total_frames, slot->total_frames, memory_order_relaxed);
+            atomic_store_explicit(&st->claim_pre_roll_frames, slot->pre_roll_frames, memory_order_relaxed);
+            atomic_store_explicit(&st->claim_channels, slot->num_channels, memory_order_relaxed);
+            atomic_store_explicit(&st->claim_bits, slot->bits_per_sample, memory_order_relaxed);
+            atomic_store_explicit(&st->claim_audio_format, slot->audio_format, memory_order_relaxed);
+            stream_publish_zone(st, slot);
             atomic_store_explicit(&streams[i].slot_index, slot_index, memory_order_relaxed);
             atomic_store_explicit(&streams[i].start_frame, start_frame, memory_order_relaxed);
-            // Fresh note, fresh session -- a reclaimed pool entry must not inherit a stale `true`
-            // left over from whatever earlier note last released this same slot.
+            // Reset the release flag for this new session -- a reused pool slot otherwise carries
+            // over the previous note's release state.
             atomic_store_explicit(&streams[i].release_requested, false, memory_order_relaxed);
+            // Release-store: a disk thread that reads this session number also sees the
+            // slot_index/start_frame written above (or newer ones, whose session it then won't
+            // match -- see sample_disk_start_session()).
+            atomic_store_explicit(&streams[i].session, session, memory_order_release);
             atomic_store_explicit(&streams[i].command, SAMPLE_CMD_START, memory_order_release);
             return i;
         }
@@ -262,7 +352,7 @@ static int claim_sample_stream(HdsSampleEngine *se, int slot_index, unsigned int
 }
 
 // Releases a claimed stream back to the pool (audio-thread only) and tells the disk thread to
-// close its file. Safe to call even if a STOP is already pending/being processed.
+// close its file.
 void release_sample_stream(HdsSampleEngine *se, int stream_index) {
     if (stream_index < 0 || stream_index >= MAX_SAMPLE_STREAMS) return;
     atomic_store_explicit(&se->streams->sample_streams[stream_index].command, SAMPLE_CMD_STOP, memory_order_release);
@@ -270,7 +360,7 @@ void release_sample_stream(HdsSampleEngine *se, int stream_index) {
 }
 
 // Marks a claimed stream's note as having entered RELEASE (audio-thread only, called once from
-// trigger_voice_release() per oscillator). Read by sample_disk_thread_main() to decide whether a
+// trigger_voice_release() per oscillator). Read by the disk thread to decide whether a
 // loop_release_exit zone should keep honoring its loop or fall through to its natural end -- see
 // SampleSlot.loop_release_exit's own comment. A no-op on an already-released/invalid stream index,
 // same defensive shape as release_sample_stream() above.
@@ -279,192 +369,248 @@ void request_sample_stream_release(HdsSampleEngine *se, int stream_index) {
     atomic_store_explicit(&se->streams->sample_streams[stream_index].release_requested, true, memory_order_release);
 }
 
+// --- The disk thread ---
+//
+// One pass of its loop: take every pending START/STOP command, then read ONE chunk (up to
+// DISK_CHUNK_FRAMES) for the stream with the least audio buffered, so a note that just started
+// (empty ring) is served before rings that already hold a second or more. Each chunk is one
+// fread() of raw frames, decoded in bulk; consecutive chunks of a stream skip the fseek. Sleeps
+// 1 ms only when a pass found nothing to do.
+#define DISK_CHUNK_FRAMES 4096
+#define DISK_SCRATCH_BYTES (DISK_CHUNK_FRAMES * 8 * 4) // a chunk of up to 8 channels at 32 bits
+
+typedef struct {
+    unsigned char *raw;   // DISK_SCRATCH_BYTES
+    float *l, *r;         // DISK_CHUNK_FRAMES each: the chunk being written
+    float *xl, *xr;       // DISK_CHUNK_FRAMES each: the loop crossfade's pre-loop frames
+} DiskScratch;
+
+// Reads up to `count` frames starting at file frame `pos` into l[]/r[]. Returns how many it got
+// (fewer only at a read error or a file shorter than its header says).
+static unsigned int disk_read_frames(SampleStream *st, unsigned int pos, unsigned int count, float *l, float *r, unsigned char *raw) {
+    unsigned int frame_bytes = (unsigned int)st->disk_num_channels * (st->disk_bits_per_sample / 8u);
+    if (frame_bytes == 0) return 0;
+    unsigned int max_frames = DISK_SCRATCH_BYTES / frame_bytes;
+    if (count > max_frames) count = max_frames;
+    if (count == 0) return 0;
+    if (st->disk_file_frame != pos) {
+        long byte_offset = (long)st->disk_data_start_offset + (long)pos * (long)frame_bytes;
+        if (fseek(st->disk_file_handle, byte_offset, SEEK_SET) != 0) { st->disk_file_frame = UINT_MAX; return 0; }
+    }
+    unsigned int got = (unsigned int)fread(raw, frame_bytes, count, st->disk_file_handle);
+    st->disk_file_frame = (got == count) ? pos + got : UINT_MAX;
+    decode_wav_frames(raw, got, st->disk_num_channels, st->disk_bits_per_sample, st->disk_audio_format, l, r);
+    return got;
+}
+
+static void disk_ring_write(SampleStream *st, const float *l, const float *r, unsigned int n, bool reversed) {
+    unsigned int w = atomic_load_explicit(&st->write_ptr, memory_order_relaxed);
+    for (unsigned int i = 0; i < n; i++) {
+        unsigned int src = reversed ? n - 1 - i : i;
+        st->ring_l[(w + i) & SAMPLE_RING_MASK] = l[src];
+        st->ring_r[(w + i) & SAMPLE_RING_MASK] = r[src];
+    }
+    atomic_store_explicit(&st->write_ptr, w + n, memory_order_release);
+}
+
+static void disk_mark_exhausted(SampleStream *st) {
+    st->disk_exhausted = true;
+    atomic_store_explicit(&st->disk_reached_eof, true, memory_order_release);
+}
+
+// The zone settings a disk read follows, from the stream's own copies (see SampleStream.claim_path).
+typedef struct {
+    bool loop_active;
+    unsigned int loop_start, loop_end, playback_end, total_frames;
+    int loop_crossfade;
+} DiskZone;
+
+// SFZ loop_sustain: once this stream's owning voice has entered release AND the zone is
+// loop_release_exit, the loop is no longer honored for the rest of this session -- playback
+// continues straight through loop_end to the zone's natural end (the "sustain loop, then play out
+// the tail" behavior), a no-op for loop_continuous zones.
+static DiskZone disk_zone(SampleStream *st) {
+    DiskZone z;
+    z.total_frames = st->disk_total_frames;
+    z.loop_start = atomic_load_explicit(&st->live_loop_start, memory_order_relaxed);
+    z.loop_end = atomic_load_explicit(&st->live_loop_end, memory_order_relaxed);
+    z.playback_end = atomic_load_explicit(&st->live_playback_end, memory_order_relaxed);
+    z.loop_crossfade = atomic_load_explicit(&st->live_loop_crossfade, memory_order_relaxed);
+    if (z.playback_end > z.total_frames) z.playback_end = z.total_frames;
+    bool enabled = atomic_load_explicit(&st->live_loop_enabled, memory_order_relaxed);
+    bool release_exit = atomic_load_explicit(&st->live_loop_release_exit, memory_order_relaxed);
+    bool release_requested = atomic_load_explicit(&st->release_requested, memory_order_acquire);
+    // A loop pair caught mid-edit (start updated, end not yet) or out of range just doesn't loop
+    // for this chunk.
+    z.loop_active = enabled && !(release_exit && release_requested) && z.loop_end > z.loop_start && z.loop_end <= z.total_frames;
+    return z;
+}
+
+// Forward: one chunk from disk_read_frame_pos toward the loop end (looping) or end= (not).
+//
+// Loop splice: the jump from loop_end back to loop_start is crossfaded here, as the ring is
+// written, the standard pre-loop way -- the last `xf` frames before loop_end are blended toward
+// the `xf` frames just before loop_start, so that by the time playback jumps to loop_start the
+// signal is already the audio that naturally leads into it. Nothing on the audio thread is
+// involved, and the crossfade length is no longer tied to the ring's starvation margin. Width:
+// SFZ loop_crossfade= if the zone set it (0 = a deliberate hard cut), SAMPLE_XFADE_SIZE
+// otherwise, limited to the loop's own length and to the audio available before loop_start.
+static void disk_fill_forward(SampleStream *st, unsigned int space, DiskScratch *sc) {
+    DiskZone z = disk_zone(st);
+    bool loop_active = z.loop_active;
+    unsigned int pos = st->disk_read_frame_pos;
+    if (loop_active && pos >= z.loop_end) pos = z.loop_start;
+    unsigned int end = loop_active ? z.loop_end : z.playback_end;
+    if (pos >= end) { disk_mark_exhausted(st); return; } // only reachable when not looping
+
+    unsigned int n = end - pos;
+    if (n > space) n = space;
+    if (n > DISK_CHUNK_FRAMES) n = DISK_CHUNK_FRAMES;
+    unsigned int got = disk_read_frames(st, pos, n, sc->l, sc->r, sc->raw);
+    if (got == 0) { disk_mark_exhausted(st); return; }
+
+    if (loop_active) {
+        unsigned int loop_len = z.loop_end - z.loop_start;
+        unsigned int xf = (z.loop_crossfade < 0) ? (unsigned int)SAMPLE_XFADE_SIZE : (unsigned int)z.loop_crossfade;
+        if (xf > loop_len) xf = loop_len;
+        if (xf > z.loop_start) xf = z.loop_start;
+        unsigned int xf_start = z.loop_end - xf;
+        unsigned int lo = (pos > xf_start) ? pos : xf_start, hi = pos + got;
+        if (xf > 0 && hi > lo) {
+            unsigned int pre = disk_read_frames(st, lo - loop_len, hi - lo, sc->xl, sc->xr, sc->raw);
+            for (unsigned int k = 0; k < pre; k++) {
+                float t = (float)(lo + k - xf_start + 1) / (float)(xf + 1);
+                unsigned int i = lo - pos + k;
+                sc->l[i] += t * (sc->xl[k] - sc->l[i]);
+                sc->r[i] += t * (sc->xr[k] - sc->r[i]);
+            }
+        }
+    }
+
+    disk_ring_write(st, sc->l, sc->r, got, false);
+    pos += got;
+    if (loop_active && pos >= z.loop_end) pos = z.loop_start;
+    st->disk_read_frame_pos = pos;
+    if (!loop_active && pos >= end) disk_mark_exhausted(st);
+}
+
+// Reverse: one chunk walking backward from disk_read_frame_pos ("the next frame to read"),
+// read forward from disk in one piece and written to the ring back to front. A looping zone
+// jumps from loop_start back up to loop_end - 1 (no crossfade in this direction); a zone that
+// started below its loop_start, or isn't looping, ends at frame 0.
+static void disk_fill_reverse(SampleStream *st, unsigned int space, DiskScratch *sc) {
+    DiskZone z = disk_zone(st);
+    bool loop_active = z.loop_active;
+    unsigned int pos = st->disk_read_frame_pos;
+    if (z.total_frames == 0) { disk_mark_exhausted(st); return; }
+    if (pos >= z.total_frames) pos = z.total_frames - 1;
+    unsigned int floor = (loop_active && pos >= z.loop_start) ? z.loop_start : 0;
+
+    unsigned int n = pos - floor + 1;
+    if (n > space) n = space;
+    if (n > DISK_CHUNK_FRAMES) n = DISK_CHUNK_FRAMES;
+    unsigned int first = pos - n + 1;
+    unsigned int got = disk_read_frames(st, first, n, sc->l, sc->r, sc->raw);
+    if (got != n) { disk_mark_exhausted(st); return; }
+    disk_ring_write(st, sc->l, sc->r, n, true);
+
+    if (first > floor) st->disk_read_frame_pos = first - 1;
+    else if (loop_active) st->disk_read_frame_pos = z.loop_end - 1;
+    else disk_mark_exhausted(st);
+}
+
+// SAMPLE_CMD_START: begin the session the audio thread most recently published. The ring, the
+// EOF flag and the file all get reset BEFORE ready_session is stored, so the audio thread can
+// never read this pool entry's ring for its new note while it still holds an earlier session's
+// audio. If the session number read here is already older than the audio thread's current one
+// (it claimed again while this ran), the mismatch just keeps the voice silent until the next
+// START -- already pending -- is processed.
+static void sample_disk_start_session(SampleStream *st) {
+    if (st->disk_file_handle) { fclose(st->disk_file_handle); st->disk_file_handle = NULL; }
+    unsigned int session = atomic_load_explicit(&st->session, memory_order_acquire);
+    st->active_slot_index = atomic_load_explicit(&st->slot_index, memory_order_relaxed);
+    st->active_start_frame = atomic_load_explicit(&st->start_frame, memory_order_relaxed);
+    st->disk_exhausted = false;
+    st->disk_file_frame = UINT_MAX;
+    atomic_store_explicit(&st->disk_reached_eof, false, memory_order_relaxed);
+    st->disk_reverse = atomic_load_explicit(&st->claim_reverse, memory_order_relaxed);
+    st->disk_total_frames = atomic_load_explicit(&st->claim_total_frames, memory_order_relaxed);
+    st->disk_data_start_offset = atomic_load_explicit(&st->claim_data_offset, memory_order_relaxed);
+    st->disk_num_channels = (unsigned short)atomic_load_explicit(&st->claim_channels, memory_order_relaxed);
+    st->disk_bits_per_sample = (unsigned short)atomic_load_explicit(&st->claim_bits, memory_order_relaxed);
+    st->disk_audio_format = (unsigned short)atomic_load_explicit(&st->claim_audio_format, memory_order_relaxed);
+    unsigned int pre_roll_frames = atomic_load_explicit(&st->claim_pre_roll_frames, memory_order_relaxed);
+    if (atomic_load_explicit(&st->claim_loaded, memory_order_relaxed)) {
+        char path[SAMPLE_PATH_LEN];
+        stream_load_path(st, path);
+        st->disk_file_handle = fopen(path, "rb");
+    }
+    if (st->disk_file_handle) {
+        // Forward zones get the pre-roll fast path (it always covers frames [0, pre_roll_frames)):
+        // if the requested start falls inside that window, the ring begins exactly at the
+        // pre_roll_frames boundary; otherwise -- or for any reverse zone, which skips the pre-roll
+        // entirely (see start_sample_osc) -- at the requested frame.
+        st->disk_read_frame_pos = (!st->disk_reverse && st->active_start_frame <= pre_roll_frames)
+            ? pre_roll_frames : st->active_start_frame;
+    } else {
+        disk_mark_exhausted(st);
+    }
+    atomic_store_explicit(&st->write_ptr, 0, memory_order_relaxed);
+    atomic_store_explicit(&st->read_ptr, 0, memory_order_relaxed);
+    atomic_store_explicit(&st->ready_session, session, memory_order_release);
+}
+
 void *sample_disk_thread_main(void *arg) {
     HdsSampleEngine *se = (HdsSampleEngine *)arg;
-    for (;;) {
+    DiskScratch sc = {
+        malloc(DISK_SCRATCH_BYTES),
+        malloc(sizeof(float) * DISK_CHUNK_FRAMES), malloc(sizeof(float) * DISK_CHUNK_FRAMES),
+        malloc(sizeof(float) * DISK_CHUNK_FRAMES), malloc(sizeof(float) * DISK_CHUNK_FRAMES),
+    };
+    if (!sc.raw || !sc.l || !sc.r || !sc.xl || !sc.xr) {
+        fprintf(stderr, "[sample] disk thread: out of memory -- WAVE_SAMPLE streaming unavailable\n");
+        free(sc.raw); free(sc.l); free(sc.r); free(sc.xl); free(sc.xr);
+        return NULL;
+    }
+    while (!atomic_load_explicit(&se->streams->sample_disk_thread_shutdown, memory_order_acquire)) {
         bool work_done = false;
-        for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
-            SampleStream *st = &se->streams->sample_streams[i];
+        SampleStream *streams = se->streams->sample_streams;
 
+        for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
+            SampleStream *st = &streams[i];
+            // Acquire-exchange: pairs with claim_sample_stream's release-store of `command`.
             int cmd = atomic_exchange_explicit(&st->command, SAMPLE_CMD_NONE, memory_order_acquire);
             if (cmd == SAMPLE_CMD_START) {
-                if (st->disk_file_handle) { fclose(st->disk_file_handle); st->disk_file_handle = NULL; }
-                // This is the ONE place slot_index/start_frame are safe to read: the acquire-
-                // exchange above pairs with claim_sample_stream's release-store of `command`,
-                // which happens after it writes both -- so this read is guaranteed to see those
-                // writes. Captured into disk-thread-owned copies for every later use this
-                // session, rather than re-reading the audio-thread-owned fields again.
-                st->active_slot_index = atomic_load_explicit(&st->slot_index, memory_order_acquire);
-                st->active_start_frame = atomic_load_explicit(&st->start_frame, memory_order_acquire);
-                st->disk_reverse_exhausted = false;
-                atomic_store_explicit(&st->disk_reached_eof, false, memory_order_relaxed);
-                SampleSlot *slot = (st->active_slot_index >= 0 && st->active_slot_index < SAMPLE_SLOT_CAPACITY) ? &se->slots->sample_slots[st->active_slot_index] : NULL;
-                if (slot && slot->loaded) {
-                    st->disk_file_handle = fopen(slot->file_path, "rb");
-                    // Forward zones still get the pre-roll optimization (always covers frames
-                    // [0, pre_roll_frames)): if the requested start falls inside that window,
-                    // begin exactly at the existing pre_roll_frames boundary as before; otherwise
-                    // -- or for ANY reverse zone, which skips pre-roll entirely (see
-                    // start_sample_osc) -- begin exactly at the requested frame.
-                    st->disk_read_frame_pos = (!slot->reverse && st->active_start_frame <= slot->pre_roll_frames)
-                        ? slot->pre_roll_frames : st->active_start_frame;
-                }
-                atomic_store_explicit(&st->write_ptr, 0, memory_order_relaxed);
-                atomic_store_explicit(&st->read_ptr, 0, memory_order_release);
+                sample_disk_start_session(st);
                 work_done = true;
             } else if (cmd == SAMPLE_CMD_STOP) {
                 if (st->disk_file_handle) { fclose(st->disk_file_handle); st->disk_file_handle = NULL; }
                 work_done = true;
             }
+        }
 
-            if (!st->disk_file_handle) continue;
-            SampleSlot *slot = &se->slots->sample_slots[st->active_slot_index];
-            int bytes_per_frame_unit = slot->bits_per_sample / 8;
-            int bytes_per_frame = bytes_per_frame_unit * slot->num_channels;
-
-            // SFZ loop_sustain: once this stream's owning voice has entered release AND the zone
-            // is loop_release_exit, stop honoring loop_enabled for the rest of this session --
-            // falls through to the exact same natural-end-of-file path (below) a plain
-            // non-looping zone already takes, so playback continues forward past loop_end into
-            // the file's own release tail instead of wrapping back to loop_start again.
-            bool release_requested = atomic_load_explicit(&st->release_requested, memory_order_acquire);
-            bool loop_active = slot->loop_enabled && !(slot->loop_release_exit && release_requested);
-
+        int best = -1;
+        unsigned int best_filled = UINT_MAX, best_space = 0;
+        for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
+            SampleStream *st = &streams[i];
+            if (!st->disk_file_handle || st->disk_exhausted) continue;
             unsigned int r_ptr = atomic_load_explicit(&st->read_ptr, memory_order_acquire);
             unsigned int w_ptr = atomic_load_explicit(&st->write_ptr, memory_order_relaxed);
             unsigned int filled = (w_ptr - r_ptr) & SAMPLE_RING_MASK;
-            unsigned int free_space = SAMPLE_RING_SIZE - 1 - filled;
-            if (free_space < (unsigned int)BUFFER_SIZE) continue; // plenty already buffered -- nothing to do this pass
-
-            unsigned int chunk = (free_space < (unsigned int)BUFFER_SIZE) ? free_space : (unsigned int)BUFFER_SIZE;
-
-            if (slot->reverse) {
-                // --- Reverse read: parallel structure to the forward branch below, walking the
-                // file backward instead. disk_read_frame_pos means "the next frame to read," same
-                // convention as forward, just decreasing. Position updates are always decided by
-                // an EQUALITY check before any decrement, never by decrementing first and
-                // comparing after -- disk_read_frame_pos is unsigned, and decrementing it past 0
-                // wraps to a huge value that a `< loop_start` check would then never catch again
-                // (permanently stuck issuing a garbage fseek offset every pass thereafter).
-                if (st->disk_reverse_exhausted) continue; // nothing left to stream (non-looping, already hit frame 0)
-                for (unsigned int c = 0; c < chunk; c++) {
-                    // Per-frame seek -- unlike forward's batched sequential reads, successive
-                    // reverse frames are NOT contiguous with the previous read position, so each
-                    // one needs its own fseek. This thread already does blocking I/O by design;
-                    // more fseeks per frame is a real throughput cost under many concurrent
-                    // reverse voices, not a realtime-safety concern -- documented trade-off, not
-                    // optimized further here.
-                    long byte_offset = (long)slot->data_start_offset + (long)st->disk_read_frame_pos * bytes_per_frame;
-                    fseek(st->disk_file_handle, byte_offset, SEEK_SET);
-
-                    float fl = 0.0f, fr = 0.0f; short raw16; int raw32; unsigned char b24[3];
-                    bool ok = true;
-                    if (slot->audio_format == 1) {
-                        if (slot->bits_per_sample == 16) {
-                            if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) { ok = false; }
-                            else {
-                                fl = (float)raw16 / 32768.0f;
-                                if (slot->num_channels >= 2) { if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) ok = false; else fr = (float)raw16 / 32768.0f; } else fr = fl;
-                            }
-                        } else if (slot->bits_per_sample == 24) {
-                            if (fread(b24, 1, 3, st->disk_file_handle) != 3) { ok = false; }
-                            else {
-                                int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fl = (float)v / 2147483648.0f;
-                                if (slot->num_channels >= 2) { if (fread(b24, 1, 3, st->disk_file_handle) != 3) ok = false; else { v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fr = (float)v / 2147483648.0f; } } else fr = fl;
-                            }
-                        } else {
-                            if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) { ok = false; }
-                            else {
-                                fl = (float)raw32 / 2147483648.0f;
-                                if (slot->num_channels >= 2) { if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) ok = false; else fr = (float)raw32 / 2147483648.0f; } else fr = fl;
-                            }
-                        }
-                    } else {
-                        if (fread(&fl, 4, 1, st->disk_file_handle) != 1) { ok = false; }
-                        else if (slot->num_channels >= 2) { if (fread(&fr, 4, 1, st->disk_file_handle) != 1) ok = false; } else fr = fl;
-                    }
-                    if (!ok) break;
-
-                    unsigned int w = atomic_load_explicit(&st->write_ptr, memory_order_relaxed);
-                    st->ring_l[w & SAMPLE_RING_MASK] = fl;
-                    st->ring_r[w & SAMPLE_RING_MASK] = fr;
-                    atomic_store_explicit(&st->write_ptr, w + 1, memory_order_release);
-
-                    // Decide the NEXT position -- loop-wrap check first (correctly covers
-                    // loop_start == 0 too, since it's checked before the floor check below),
-                    // then the absolute floor (frame 0: either a genuine non-looping end, or a
-                    // reverse zone seeded outside its own loop region on the "wrong" side -- see
-                    // the Mapping tab's Start Offset documentation), then a normal decrement.
-                    if (loop_active && st->disk_read_frame_pos == slot->loop_start) {
-                        st->disk_read_frame_pos = slot->loop_end - 1;
-                    } else if (st->disk_read_frame_pos == 0) {
-                        st->disk_reverse_exhausted = true;
-                        atomic_store_explicit(&st->disk_reached_eof, true, memory_order_release);
-                        break;
-                    } else {
-                        st->disk_read_frame_pos--;
-                    }
-                }
-            } else {
-                if (loop_active && st->disk_read_frame_pos >= slot->loop_end) {
-                    st->disk_read_frame_pos = slot->loop_start;
-                } else if (!loop_active && st->disk_read_frame_pos >= slot->playback_end_frame) {
-                    // Genuinely nothing left, not just "hasn't been serviced yet" -- see
-                    // disk_reached_eof's own comment for why render_sample_osc needs this
-                    // distinction rather than inferring EOF from ring-starvation alone.
-                    atomic_store_explicit(&st->disk_reached_eof, true, memory_order_release);
-                    continue; // nothing left to stream -- render_sample_osc handles end-of-sample itself
-                }
-
-                long byte_offset = (long)slot->data_start_offset + (long)st->disk_read_frame_pos * bytes_per_frame;
-                fseek(st->disk_file_handle, byte_offset, SEEK_SET);
-
-                for (unsigned int c = 0; c < chunk; c++) {
-                    if (loop_active && st->disk_read_frame_pos >= slot->loop_end) {
-                        st->disk_read_frame_pos = slot->loop_start;
-                        byte_offset = (long)slot->data_start_offset + (long)st->disk_read_frame_pos * bytes_per_frame;
-                        fseek(st->disk_file_handle, byte_offset, SEEK_SET);
-                    }
-                    // playback_end_frame (SFZ end=, defaults to total_frames when unset): the
-                    // natural end-of-file bound for non-looping playback -- see its own comment
-                    // on SampleSlot. Never substitutes for total_frames at the loop-wrap
-                    // comparisons above, which still need the real file length.
-                    if (st->disk_read_frame_pos >= slot->playback_end_frame) break;
-
-                    float fl = 0.0f, fr = 0.0f; short raw16; int raw32; unsigned char b24[3];
-                    if (slot->audio_format == 1) {
-                        if (slot->bits_per_sample == 16) {
-                            if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) break;
-                            fl = (float)raw16 / 32768.0f;
-                            if (slot->num_channels >= 2) { if (fread(&raw16, 2, 1, st->disk_file_handle) != 1) break; fr = (float)raw16 / 32768.0f; } else fr = fl;
-                        } else if (slot->bits_per_sample == 24) {
-                            if (fread(b24, 1, 3, st->disk_file_handle) != 3) break;
-                            int v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fl = (float)v / 2147483648.0f;
-                            if (slot->num_channels >= 2) { if (fread(b24, 1, 3, st->disk_file_handle) != 3) break; v = (b24[0] << 8) | (b24[1] << 16) | (b24[2] << 24); fr = (float)v / 2147483648.0f; } else fr = fl;
-                        } else {
-                            if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) break;
-                            fl = (float)raw32 / 2147483648.0f;
-                            if (slot->num_channels >= 2) { if (fread(&raw32, 4, 1, st->disk_file_handle) != 1) break; fr = (float)raw32 / 2147483648.0f; } else fr = fl;
-                        }
-                    } else {
-                        if (fread(&fl, 4, 1, st->disk_file_handle) != 1) break;
-                        if (slot->num_channels >= 2) { if (fread(&fr, 4, 1, st->disk_file_handle) != 1) break; } else fr = fl;
-                    }
-                    if (slot->num_channels > 2) fseek(st->disk_file_handle, (long)(slot->num_channels - 2) * bytes_per_frame_unit, SEEK_CUR);
-
-                    unsigned int w = atomic_load_explicit(&st->write_ptr, memory_order_relaxed);
-                    st->ring_l[w & SAMPLE_RING_MASK] = fl;
-                    st->ring_r[w & SAMPLE_RING_MASK] = fr;
-                    atomic_store_explicit(&st->write_ptr, w + 1, memory_order_release);
-                    st->disk_read_frame_pos++;
-                }
-            }
+            unsigned int space = SAMPLE_RING_SIZE - 1 - filled;
+            if (space < (unsigned int)BUFFER_SIZE) continue; // plenty already buffered
+            if (filled < best_filled) { best = i; best_filled = filled; best_space = space; }
+        }
+        if (best >= 0) {
+            SampleStream *st = &streams[best];
+            if (st->disk_reverse) disk_fill_reverse(st, best_space, &sc);
+            else disk_fill_forward(st, best_space, &sc);
             work_done = true;
         }
 
-        if (atomic_load_explicit(&se->streams->sample_disk_thread_shutdown, memory_order_acquire)) break;
         if (!work_done) { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); } // 1ms idle poll
     }
+    free(sc.raw); free(sc.l); free(sc.r); free(sc.xl); free(sc.xr);
     return NULL;
 }
 
@@ -508,13 +654,15 @@ static void zone_record_wire_set_sfz_defaults(ZoneRecordWire *rec) {
     rec->drum_bus = 0;
 }
 
-// How many queued sample loads (each a bounded, one-file blocking file-open+pre-roll-decode) the
-// audio thread will perform per block -- the throttle that keeps a large bulk-add from stalling
-// real-time audio in one long burst; see SAMPLE_SLOT_CAPACITY's comment for the accepted
-// trade-off (one genuinely slow file, e.g. a cold network mount, still stalls the whole audio
-// thread for its own load duration -- this bounds how many such stalls can pile up per block, not
-// how long any single one can take).
+// How many queued sample loads the audio thread performs itself per block when the loader thread
+// is NOT running (tests, Android) -- each is a blocking file-open+pre-roll-decode, so this is the
+// throttle that keeps a large bulk-add from stalling audio in one long burst. With the loader
+// thread running the audio thread never opens a file at all; see drain_pending_sample_loads().
 #define SAMPLE_LOADS_PER_BLOCK 1
+// With the loader thread running: finished results applied per block, and SFZ regions installed
+// per block (each is cheap, but a catalog scan per region adds up on a large instrument).
+#define SAMPLE_RESULTS_PER_BLOCK 32
+#define SFZ_REGIONS_PER_BLOCK 64
 
 // Clamps a wire-carried oscillator index (a plain float, like every other OSC-carried enum in
 // this file) into the valid 0-3 range -- shared by every site that reads ZoneRecordWire.assigned_osc.
@@ -533,12 +681,8 @@ static inline int clamp_owner_program(float raw) {
     return v;
 }
 
-static void enqueue_pending_sample_load(HdsSampleEngine *se, int slot_index, const ZoneRecordWire *rec) {
-    if (se->pending->pending_load_count >= PENDING_SAMPLE_LOAD_CAPACITY) {
-        fprintf(stderr, "[samples] pending-load queue full -- dropping load for zone_id %d (re-send to retry)\n", rec->zone_id);
-        return;
-    }
-    PendingSampleLoad *p = &se->pending->pending_loads[se->pending->pending_load_tail];
+// Copies a zone record into a PendingSampleLoad -- the one place the record's fields are mapped.
+static void fill_pending_from_record(PendingSampleLoad *p, int slot_index, const ZoneRecordWire *rec) {
     p->slot_index = slot_index;
     p->zone_id = rec->zone_id;
     snprintf(p->path, SAMPLE_PATH_LEN, "%s", rec->path);
@@ -579,15 +723,22 @@ static void enqueue_pending_sample_load(HdsSampleEngine *se, int slot_index, con
     p->xfin_lokey = rec->xfin_lokey; p->xfin_hikey = rec->xfin_hikey;
     p->xfout_lokey = rec->xfout_lokey; p->xfout_hikey = rec->xfout_hikey;
     p->drum_bus = rec->drum_bus;
+}
+
+static void enqueue_pending_sample_load(HdsSampleEngine *se, int slot_index, const ZoneRecordWire *rec) {
+    if (se->pending->pending_load_count >= PENDING_SAMPLE_LOAD_CAPACITY) {
+        fprintf(stderr, "[samples] pending-load queue full -- dropping load for zone_id %d (re-send to retry)\n", rec->zone_id);
+        return;
+    }
+    fill_pending_from_record(&se->pending->pending_loads[se->pending->pending_load_tail], slot_index, rec);
     se->pending->pending_load_tail = (se->pending->pending_load_tail + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
     se->pending->pending_load_count++;
 }
 
-// Converts loop-point fractions to real frame indices (shared by drain_pending_sample_loads() and
-// the "path unchanged" branch of an UPSERT, both of which need total_frames -- only known once a
-// file is actually loaded -- to do this conversion). Enforces a minimum loop length of one full
-// crossfade window, same reasoning as before: a loop shorter than SAMPLE_XFADE_SIZE would have
-// render_sample_osc's loop-splice crossfade permanently active instead of a brief transition.
+// Converts loop-point fractions to real frame indices (shared by drain_pending_sample_loads()'s
+// result path and the "path unchanged" branch of an UPSERT, both of which need total_frames --
+// only known once a file is actually loaded -- to do this conversion). Keeps a minimum loop length
+// of one default crossfade window (SAMPLE_XFADE_SIZE), so a tiny loop isn't one long crossfade.
 static void apply_loop_points(SampleSlot *slot, float start_frac, float end_frac) {
     if (!slot->loaded || slot->total_frames <= 1) return;
     unsigned int total = slot->total_frames;
@@ -618,71 +769,96 @@ static void apply_playback_end(SampleSlot *slot, float end_frac) {
     slot->playback_end_frame = frame;
 }
 
-// Drains up to SAMPLE_LOADS_PER_BLOCK pending loads per call (see its #define). Immediately
-// reapplies the queued zone record's loop points once total_frames is known post-load -- doing
-// this only at message-receipt time (like the old apply_sample_slot_zone_metadata() did every
-// block) would leave a sample that was still queued when its metadata arrived stuck on the
-// load-time placeholder loop points forever.
-void drain_pending_sample_loads(HdsSampleEngine *se) {
-    for (int i = 0; i < SAMPLE_LOADS_PER_BLOCK && se->pending->pending_load_count > 0; i++) {
-        PendingSampleLoad *p = &se->pending->pending_loads[se->pending->pending_load_head];
-        se->pending->pending_load_head = (se->pending->pending_load_head + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
-        se->pending->pending_load_count--;
+// A queued load can go stale before it completes: a ZONE_OP_REMOVE can tombstone its slot (added,
+// then removed again before its turn), and apply_zone_upsert() can reuse that freed slot index for
+// a brand new, unrelated zone. The removal wins -- checked by zone_id, not just `active`, so a slow
+// load for the OLD zone can never resurrect or overwrite the NEW zone at the same index.
+static bool pending_load_still_wanted(HdsSampleEngine *se, const PendingSampleLoad *p) {
+    const SampleSlot *slot = &se->slots->sample_slots[p->slot_index];
+    return slot->active && slot->zone_id == p->zone_id;
+}
 
-        // A ZONE_OP_REMOVE can tombstone this slot_index while its load is still sitting in the
-        // queue (added, then removed again before its throttled turn comes up) -- the removal
-        // wins: skip the load rather than have load_sample_slot() resurrect a tombstoned slot by
-        // setting active back to true. Checks zone_id, not just active, because
-        // apply_zone_upsert() can now reuse a removed zone's own freed slot_index for a brand new,
-        // unrelated zone before this stale queue entry's throttled turn comes up (see that
-        // function's own comment on slot reuse) -- without the zone_id check, a slow-draining
-        // load for the OLD zone could resurrect/overwrite the NEW zone now sitting at the same
-        // index with the wrong file entirely.
-        if (!se->slots->sample_slots[p->slot_index].active || se->slots->sample_slots[p->slot_index].zone_id != p->zone_id) continue;
-
-        if (load_sample_slot(se, p->slot_index, p->path, p->root_note)) {
-            SampleSlot *slot = &se->slots->sample_slots[p->slot_index];
-            slot->min_note = p->min_note; slot->max_note = p->max_note;
-            slot->min_velocity = p->min_velocity; slot->max_velocity = p->max_velocity;
-            slot->unpitched = p->unpitched;
-            slot->round_robin_group = p->round_robin_group;
-            slot->assigned_osc = p->assigned_osc;
-            slot->loop_enabled = p->loop_enabled;
-            apply_loop_points(slot, p->loop_start_frac, p->loop_end_frac);
-            slot->tune_cents = p->tune_cents; slot->gain_db = p->gain_db; slot->pan = p->pan;
-            slot->start_offset_frac = p->start_offset_frac;
-            slot->reverse = p->reverse;
-            slot->loop_release_exit = p->loop_release_exit;
-            apply_playback_end(slot, p->end_frac);
-            // SFZ first-class opcode support -- straight field-for-field carry-through from the
-            // queued load, same convention as every field just above.
-            slot->loop_crossfade_frames = p->loop_crossfade_frames;
-            slot->seq_length = p->seq_length; slot->seq_position = p->seq_position;
-            slot->lorand = p->lorand; slot->hirand = p->hirand;
-            slot->choke_group = p->choke_group; slot->choke_off_by = p->choke_off_by;
-            slot->trigger_type = p->trigger_type;
-            slot->sw_lokey = p->sw_lokey; slot->sw_hikey = p->sw_hikey; slot->sw_last = p->sw_last;
-            slot->rt_decay = p->rt_decay;
-            slot->delay_seconds = p->delay_seconds;
-            slot->has_own_ampeg = p->has_own_ampeg;
-            slot->ampeg_delay = p->ampeg_delay; slot->ampeg_attack = p->ampeg_attack; slot->ampeg_hold = p->ampeg_hold;
-            slot->ampeg_decay = p->ampeg_decay; slot->ampeg_sustain = p->ampeg_sustain; slot->ampeg_release = p->ampeg_release;
-            slot->ampeg_start = p->ampeg_start;
-            slot->note_polyphony = p->note_polyphony;
-            slot->velcurve_count = p->velcurve_count;
-            for (int i = 0; i < p->velcurve_count && i < SFZ_MAX_VELCURVE_POINTS; i++) {
-                slot->velcurve_point[i] = p->velcurve_point[i]; slot->velcurve_gain[i] = p->velcurve_gain[i];
-            }
-            slot->xfin_lovel = p->xfin_lovel; slot->xfin_hivel = p->xfin_hivel;
-            slot->xfout_lovel = p->xfout_lovel; slot->xfout_hivel = p->xfout_hivel;
-            slot->xfin_lokey = p->xfin_lokey; slot->xfin_hikey = p->xfin_hikey;
-            slot->xfout_lokey = p->xfout_lokey; slot->xfout_hikey = p->xfout_hikey;
-            slot->drum_bus = p->drum_bus;
-        } else {
-            fprintf(stderr, "[samples] failed to load queued sample '%s' (zone_id %d)\n", p->path, p->zone_id);
-            se->slots->sample_slots[p->slot_index].active = false;
-        }
+// Copies a finished load's per-zone fields onto its slot. Runs right after the file is installed
+// -- loop points and end= are fractions that need the new total_frames -- so a zone whose
+// metadata arrived while its load was still queued never stays on the placeholder loop points.
+static void apply_pending_fields(SampleSlot *slot, const PendingSampleLoad *p) {
+    slot->min_note = p->min_note; slot->max_note = p->max_note;
+    slot->min_velocity = p->min_velocity; slot->max_velocity = p->max_velocity;
+    slot->unpitched = p->unpitched;
+    slot->round_robin_group = p->round_robin_group;
+    slot->assigned_osc = p->assigned_osc;
+    slot->loop_enabled = p->loop_enabled;
+    apply_loop_points(slot, p->loop_start_frac, p->loop_end_frac);
+    slot->tune_cents = p->tune_cents; slot->gain_db = p->gain_db; slot->pan = p->pan;
+    slot->start_offset_frac = p->start_offset_frac;
+    slot->reverse = p->reverse;
+    slot->loop_release_exit = p->loop_release_exit;
+    apply_playback_end(slot, p->end_frac);
+    // SFZ first-class opcode support -- straight field-for-field carry-through from the
+    // queued load, same convention as every field just above.
+    slot->loop_crossfade_frames = p->loop_crossfade_frames;
+    slot->seq_length = p->seq_length; slot->seq_position = p->seq_position;
+    slot->lorand = p->lorand; slot->hirand = p->hirand;
+    slot->choke_group = p->choke_group; slot->choke_off_by = p->choke_off_by;
+    slot->trigger_type = p->trigger_type;
+    slot->sw_lokey = p->sw_lokey; slot->sw_hikey = p->sw_hikey; slot->sw_last = p->sw_last;
+    slot->rt_decay = p->rt_decay;
+    slot->delay_seconds = p->delay_seconds;
+    slot->has_own_ampeg = p->has_own_ampeg;
+    slot->ampeg_delay = p->ampeg_delay; slot->ampeg_attack = p->ampeg_attack; slot->ampeg_hold = p->ampeg_hold;
+    slot->ampeg_decay = p->ampeg_decay; slot->ampeg_sustain = p->ampeg_sustain; slot->ampeg_release = p->ampeg_release;
+    slot->ampeg_start = p->ampeg_start;
+    slot->note_polyphony = p->note_polyphony;
+    slot->velcurve_count = p->velcurve_count;
+    for (int i = 0; i < p->velcurve_count && i < SFZ_MAX_VELCURVE_POINTS; i++) {
+        slot->velcurve_point[i] = p->velcurve_point[i]; slot->velcurve_gain[i] = p->velcurve_gain[i];
     }
+    slot->xfin_lovel = p->xfin_lovel; slot->xfin_hivel = p->xfin_hivel;
+    slot->xfout_lovel = p->xfout_lovel; slot->xfout_hivel = p->xfout_hivel;
+    slot->xfin_lokey = p->xfin_lokey; slot->xfin_hikey = p->xfin_hikey;
+    slot->xfout_lokey = p->xfout_lokey; slot->xfout_hikey = p->xfout_hikey;
+    slot->drum_bus = p->drum_bus;
+}
+
+// Claims a catalog slot for a brand new zone and marks it active and owned (its file still to be
+// loaded). Returns the slot index, or -1 when the Sample Bank is full.
+static int claim_catalog_slot_for_new_zone(HdsSampleEngine *se, const ZoneRecordWire *rec) {
+    int found_index = -1;
+    // Brand new zone -- reuse an earlier REMOVED zone's now-inactive slot if one exists,
+    // rather than always appending a new one. Without this, swapping a Multisample
+    // oscillator's SFZ over and over (standard sampler behavior: loading a new instrument
+    // into a slot replaces the old one, it doesn't pile up alongside it) left every previous
+    // load's own SampleSlot entry sitting inactive-but-present in the catalog forever --
+    // apply_zone_remove() already frees the big part (pre_roll_l/r) and clears `active`, but
+    // sample_slot_count itself only ever grew, so every catalog scan (find_matching_sample_
+    // slot, this same reuse scan, round-robin cycling, ...) kept walking an ever-longer tail
+    // of dead entries for the rest of the session -- a real, unbounded-with-usage cost despite
+    // no individual zone actually leaking its own RAM. A removed slot is always safe to hand
+    // to a brand new zone: apply_zone_remove() already leaves it fully reset (loaded=false,
+    // pre_roll_l/r=NULL), identical to a never-used BSS-zeroed entry -- see
+    // drain_pending_sample_loads()'s own zone_id check for the one place slot-index reuse
+    // needed a matching fix (a stale queued load for the OLD zone that used to live at this
+    // index must never be allowed to resurrect it as if it were the new zone).
+    int reuse_index = -1;
+    for (int s = 0; s < se->slots->sample_slot_count; s++) {
+        if (!se->slots->sample_slots[s].active) { reuse_index = s; break; }
+    }
+    if (reuse_index >= 0) {
+        found_index = reuse_index;
+    } else {
+        // Nothing to reuse -- append. sample_slots is a plain static array (zero-initialized
+        // BSS), so a never-before-used position already has loaded=false, pre_roll_l/r=NULL,
+        // etc.; only zone_id/active/owner_program need setting explicitly here.
+        if (se->slots->sample_slot_count >= SAMPLE_SLOT_CAPACITY) {
+            fprintf(stderr, "[samples] Sample Bank at its %d-zone capacity -- ignoring zone_id %d\n", SAMPLE_SLOT_CAPACITY, rec->zone_id);
+            return -1;
+        }
+        found_index = se->slots->sample_slot_count++;
+    }
+    se->slots->sample_slots[found_index].zone_id = rec->zone_id;
+    se->slots->sample_slots[found_index].active = true;
+    se->slots->sample_slots[found_index].owner_program = clamp_owner_program(rec->owner_program);
+    return found_index;
 }
 
 // Applies one zone upsert -- unchanged logic from the old wire-parsed version, just fed an
@@ -706,40 +882,8 @@ void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     }
 
     if (found_index < 0) {
-        // Brand new zone -- reuse an earlier REMOVED zone's now-inactive slot if one exists,
-        // rather than always appending a new one. Without this, swapping a Multisample
-        // oscillator's SFZ over and over (standard sampler behavior: loading a new instrument
-        // into a slot replaces the old one, it doesn't pile up alongside it) left every previous
-        // load's own SampleSlot entry sitting inactive-but-present in the catalog forever --
-        // apply_zone_remove() already frees the big part (pre_roll_l/r) and clears `active`, but
-        // sample_slot_count itself only ever grew, so every catalog scan (find_matching_sample_
-        // slot, this same reuse scan, round-robin cycling, ...) kept walking an ever-longer tail
-        // of dead entries for the rest of the session -- a real, unbounded-with-usage cost despite
-        // no individual zone actually leaking its own RAM. A removed slot is always safe to hand
-        // to a brand new zone: apply_zone_remove() already leaves it fully reset (loaded=false,
-        // pre_roll_l/r=NULL), identical to a never-used BSS-zeroed entry -- see
-        // drain_pending_sample_loads()'s own zone_id check for the one place slot-index reuse
-        // needed a matching fix (a stale queued load for the OLD zone that used to live at this
-        // index must never be allowed to resurrect it as if it were the new zone).
-        int reuse_index = -1;
-        for (int s = 0; s < se->slots->sample_slot_count; s++) {
-            if (!se->slots->sample_slots[s].active) { reuse_index = s; break; }
-        }
-        if (reuse_index >= 0) {
-            found_index = reuse_index;
-        } else {
-            // Nothing to reuse -- append. sample_slots is a plain static array (zero-initialized
-            // BSS), so a never-before-used position already has loaded=false, pre_roll_l/r=NULL,
-            // etc.; only zone_id/active/owner_program need setting explicitly here.
-            if (se->slots->sample_slot_count >= SAMPLE_SLOT_CAPACITY) {
-                fprintf(stderr, "[samples] Sample Bank at its %d-zone capacity -- ignoring zone_id %d\n", SAMPLE_SLOT_CAPACITY, rec->zone_id);
-                return;
-            }
-            found_index = se->slots->sample_slot_count++;
-        }
-        se->slots->sample_slots[found_index].zone_id = rec->zone_id;
-        se->slots->sample_slots[found_index].active = true;
-        se->slots->sample_slots[found_index].owner_program = clamp_owner_program(rec->owner_program);
+        found_index = claim_catalog_slot_for_new_zone(se, rec);
+        if (found_index < 0) return;
         enqueue_pending_sample_load(se, found_index, rec);
         return;
     }
@@ -789,6 +933,7 @@ void apply_zone_upsert(HdsSampleEngine *se, const ZoneRecordWire *rec) {
     slot->xfout_lovel = rec->xfout_lovel; slot->xfout_hivel = rec->xfout_hivel;
     slot->xfin_lokey = rec->xfin_lokey; slot->xfin_hikey = rec->xfin_hikey;
     slot->xfout_lokey = rec->xfout_lokey; slot->xfout_hikey = rec->xfout_hikey;
+    publish_zone_edit_to_streams(se, found_index); // held notes on this zone follow loop/end edits
     // drum_bus deliberately NOT copied here, unlike every field above -- this in-place branch
     // fires for an ordinary "/hds/zone/upsert" (the 19-float wire, zone_record_wire_set_sfz_
     // defaults() always zeroes rec->drum_bus for that path since it's not one of the 19), so
@@ -805,8 +950,9 @@ void apply_zone_remove(HdsSampleEngine *se, int32_t zone_id) {
         if (se->slots->sample_slots[s].active && se->slots->sample_slots[s].zone_id == zone_id) {
             se->slots->sample_slots[s].active = false;
             se->slots->sample_slots[s].loaded = false; // matches the pre-existing "empty path" unload behavior
-            free(se->slots->sample_slots[s].pre_roll_l); se->slots->sample_slots[s].pre_roll_l = NULL;
-            free(se->slots->sample_slots[s].pre_roll_r); se->slots->sample_slots[s].pre_roll_r = NULL;
+            // Handed to the loader thread to free (never free() on the audio thread).
+            retire_buffer(se, se->slots->sample_slots[s].pre_roll_l); se->slots->sample_slots[s].pre_roll_l = NULL;
+            retire_buffer(se, se->slots->sample_slots[s].pre_roll_r); se->slots->sample_slots[s].pre_roll_r = NULL;
             break;
         }
     }
@@ -883,22 +1029,39 @@ int zone_drum_bus_handler(const char *path, const char *types, lo_arg **argv, in
 // (the exact same function an OSC-driven zone upsert already calls) for every parsed region, so
 // DFD streaming/pre-roll setup happens through the identical, already-proven throttled-load path
 // either way -- one code path, not two to keep in sync.
-static int32_t g_next_native_zone_id = -1; // decrements per native-loaded zone; frontend-assigned
+static _Atomic int32_t g_next_native_zone_id = -1; // decrements per native-loaded zone (atomic: every plugin
+    // instance's loader thread draws from it); frontend-assigned
     // zone_ids are always >= 1 (SamplerMappingGrid._next_zone_id only ever increments from 1), so
     // this negative space can never collide with one.
 
-int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_program, const char *sfz_path) {
-    if (osc_index < 0 || osc_index > 3) return 0;
-    owner_program = clamp_owner_program((float)owner_program);
+// g_sfz_parse_scratch is one process-wide buffer; every loader thread (one per plugin instance)
+// and the in-thread fallback path take turns with it.
+static pthread_mutex_t g_sfz_parse_lock = PTHREAD_MUTEX_INITIALIZER;
 
-    // Always "replace THIS PROGRAM's own zone set on this oscillator" -- a no-op at empty-catalog
-    // startup time, the real live-reload behavior for /hds/zone/load_sfz.
-    unload_zones_for_osc(se, osc_index, owner_program);
-
+// Parses `sfz_path` into one zone record per playable region, each with a fresh native zone_id,
+// for oscillator `osc_index` of Program `owner_program`. With `prepare`, also prepares every
+// region's file (prepared[i]/ok[i]); its header then doubles as the frame count the SFZ's frame
+// opcodes are converted with. Touches no engine state: runs on the loader thread. Returns the
+// record count; the three arrays are malloc'd (NULL when the count is 0).
+static int sfz_build_records(const char *sfz_path, int osc_index, int owner_program, bool prepare,
+                             ZoneRecordWire **out_records, HdsPreparedSample **out_prepared, bool **out_ok, int *out_sw_default) {
+    *out_records = NULL; if (out_prepared) *out_prepared = NULL; if (out_ok) *out_ok = NULL;
+    *out_sw_default = -1;
+    pthread_mutex_lock(&g_sfz_parse_lock);
     char default_path[SAMPLE_PATH_LEN];
     int region_count = sfz_parse_file(sfz_path, g_sfz_parse_scratch, SFZ_MAX_REGIONS_PER_FILE, default_path, sizeof(default_path));
     if (region_count == 0) {
+        pthread_mutex_unlock(&g_sfz_parse_lock);
         fprintf(stderr, "[sfz] '%s': no regions parsed (osc %d)\n", sfz_path, osc_index + 1);
+        return 0;
+    }
+    ZoneRecordWire *records = (ZoneRecordWire *)malloc(sizeof(ZoneRecordWire) * (size_t)region_count);
+    HdsPreparedSample *prepared = prepare ? (HdsPreparedSample *)calloc((size_t)region_count, sizeof(HdsPreparedSample)) : NULL;
+    bool *ok = prepare ? (bool *)calloc((size_t)region_count, sizeof(bool)) : NULL;
+    if (!records || (prepare && (!prepared || !ok))) {
+        pthread_mutex_unlock(&g_sfz_parse_lock);
+        free(records); free(prepared); free(ok);
+        fprintf(stderr, "[sfz] '%s': out of memory\n", sfz_path);
         return 0;
     }
 
@@ -950,7 +1113,12 @@ int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_program, 
         }
 
         unsigned int total_frames = 0, sample_rate = 44100;
-        read_wav_frame_count(r->sample, &total_frames, &sample_rate); // best-effort -- 0/44100 leaves every frac/frame count below at its safe default
+        if (prepare) {
+            ok[queued] = prepare_sample_file(r->sample, &prepared[queued]);
+            if (ok[queued]) { total_frames = prepared[queued].total_frames; sample_rate = prepared[queued].sample_rate_hz; }
+        } else {
+            read_wav_frame_count(r->sample, &total_frames, &sample_rate); // best-effort -- 0/44100 leaves every frac/frame count below at its safe default
+        }
 
         float loop_start_frac = 0.0f, loop_end_frac = 1.0f, offset_frac = 0.0f, end_frac = 1.0f;
         if (r->has_loop_start) sfz_frame_to_frac(r->loop_start, total_frames, &loop_start_frac);
@@ -1007,7 +1175,7 @@ int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_program, 
 
         ZoneRecordWire rec;
         zone_record_wire_set_sfz_defaults(&rec); // every field this region doesn't explicitly set below keeps its "feature off" default
-        rec.zone_id = g_next_native_zone_id--;
+        rec.zone_id = atomic_fetch_sub_explicit(&g_next_native_zone_id, 1, memory_order_relaxed);
         rec.root_note = is_drum ? 60.0f : (float)key_center;
         rec.min_note = (float)lokey; rec.max_note = (float)hikey;
         rec.min_velocity = (float)min_vel; rec.max_velocity = (float)max_vel;
@@ -1064,20 +1232,60 @@ int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_program, 
             if (rec.drum_bus > DRUM_BUS_COUNT) rec.drum_bus = DRUM_BUS_COUNT;
         }
 
-        apply_zone_upsert(se, &rec);
-        queued++;
+        records[queued++] = rec;
     }
+    pthread_mutex_unlock(&g_sfz_parse_lock);
     free(seq_buckets);
     #undef SFZ_MAX_SEQ_BUCKETS
+    if (have_sw_default) *out_sw_default = sw_default_note;
+    if (queued == 0) { free(records); free(prepared); free(ok); return 0; }
+    *out_records = records;
+    if (out_prepared) *out_prepared = prepared;
+    if (out_ok) *out_ok = ok;
+    return queued;
+}
 
-    // Apply sw_default= (if this file set one anywhere) as this (Program, oscillator) pair's
-    // starting keyswitch state -- a fresh load always resets it, matching "loading a new
-    // instrument replaces the old one's state entirely," the same posture apply_zone_remove's own
-    // catalog-reuse comment already established for the sample catalog itself.
-    if (have_sw_default && owner_program <= SINGLE_PROGRAM_SLOT && osc_index >= 0 && osc_index < 4) {
+// sw_default= (if the file set one anywhere) becomes this (Program, oscillator) pair's starting
+// keyswitch state -- a fresh load always resets it, matching "loading a new instrument replaces
+// the old one's state entirely."
+static void apply_sfz_sw_default(HdsSampleEngine *se, int osc_index, int owner_program, int sw_default_note) {
+    if (sw_default_note >= 0 && owner_program <= SINGLE_PROGRAM_SLOT && osc_index >= 0 && osc_index < 4) {
         se->pending->keyswitch_note_plus1[owner_program][osc_index] = sw_default_note + 1;
     }
-    return queued;
+}
+
+static bool hds_sample_loader_submit(HdsSampleEngine *se, const HdsLoadJob *job);
+
+// Loads an .sfz onto one oscillator of one Program, replacing whatever zones that pair had. With
+// the loader thread running, this only submits a job and returns 0 (callable from the audio
+// thread and the GUI thread alike): the parse, every region's file and the catalog update happen
+// later -- see drain_pending_sample_loads(). Without it (startup before the threads exist, tests,
+// Android), it parses here and queues each region's load the old way, returning the zone count.
+int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_program, const char *sfz_path) {
+    if (osc_index < 0 || osc_index > 3) return 0;
+    owner_program = clamp_owner_program((float)owner_program);
+
+    if (atomic_load_explicit(&se->pending->loader.running, memory_order_acquire)) {
+        HdsLoadJob job;
+        memset(&job, 0, sizeof(job));
+        job.kind = HDS_LOAD_JOB_SFZ;
+        job.osc_index = osc_index;
+        job.owner_program = owner_program;
+        snprintf(job.sfz_path, sizeof(job.sfz_path), "%s", sfz_path);
+        if (!hds_sample_loader_submit(se, &job)) fprintf(stderr, "[sfz] loader queue full -- '%s' not loaded (retry)\n", sfz_path);
+        return 0;
+    }
+
+    // Always "replace THIS PROGRAM's own zone set on this oscillator" -- a no-op at empty-catalog
+    // startup time.
+    unload_zones_for_osc(se, osc_index, owner_program);
+    ZoneRecordWire *records;
+    int sw_default_note;
+    int n = sfz_build_records(sfz_path, osc_index, owner_program, false, &records, NULL, NULL, &sw_default_note);
+    for (int i = 0; i < n; i++) apply_zone_upsert(se, &records[i]);
+    free(records);
+    apply_sfz_sw_default(se, osc_index, owner_program, sw_default_note);
+    return n;
 }
 
 // Detects an oscillator's own Shape knob (prog->vco{1-4}_shape) moving AWAY from WAVE_SAMPLE and
@@ -1125,9 +1333,287 @@ int zone_load_sfz_handler(const char *path, const char *types, lo_arg **argv, in
     int osc_index = argv[0]->i;
     int owner_program = argv[1]->i;
     const char *sfz_path = (const char *)&argv[2]->s;
+    bool async = atomic_load_explicit(&se->pending->loader.running, memory_order_acquire);
     int n = hds_load_sfz_for_osc(se, osc_index, owner_program, sfz_path);
-    fprintf(stderr, "[sfz] /hds/zone/load_sfz osc=%d program=%d '%s': %d zone(s) queued\n", osc_index + 1, owner_program, sfz_path, n);
+    if (async) fprintf(stderr, "[sfz] /hds/zone/load_sfz osc=%d program=%d '%s': handed to the loader thread\n", osc_index + 1, owner_program, sfz_path);
+    else fprintf(stderr, "[sfz] /hds/zone/load_sfz osc=%d program=%d '%s': %d zone(s) queued\n", osc_index + 1, owner_program, sfz_path, n);
     return 0;
+}
+
+// --- Sample loader thread ---
+//
+// Everything a zone or SFZ load reads from disk happens here, off the audio thread: the WAV
+// header and RAM pre-roll decode (prepare_sample_file), and for an SFZ the .sfz text plus every
+// region's file (sfz_build_records). The audio thread only moves small jobs and results through
+// lock-free queues and installs finished results into the catalog (install_prepared_sample: a
+// pointer swap), a bounded amount per block. Buffers the audio thread replaces or removes are
+// handed back on the garbage queue and freed here, so the audio thread never calls free() either.
+// Before this, every load ran on the audio thread (drain_pending_sample_loads, one file per
+// block), and an SFZ parsed and read every region's header there in one go -- a slow disk or a
+// network mount stalled audio for as long as the file took.
+//
+// Queues: a bounded multi-producer/multi-consumer ring (Dmitry Vyukov's well-known design: one
+// sequence number per cell, so a push or pop is one CAS and never waits on another thread).
+
+static void mpmc_init(HdsMpmcQueue *q, _Atomic size_t *seq, void *cells, size_t elem_size, size_t capacity) {
+    q->seq = seq;
+    q->data = (unsigned char *)cells;
+    q->elem_size = elem_size;
+    q->mask = capacity - 1;
+    for (size_t i = 0; i < capacity; i++) atomic_store_explicit(&seq[i], i, memory_order_relaxed);
+    atomic_store_explicit(&q->enqueue_pos, 0, memory_order_relaxed);
+    atomic_store_explicit(&q->dequeue_pos, 0, memory_order_relaxed);
+}
+
+static bool mpmc_push(HdsMpmcQueue *q, const void *elem) {
+    size_t pos = atomic_load_explicit(&q->enqueue_pos, memory_order_relaxed);
+    for (;;) {
+        size_t seq = atomic_load_explicit(&q->seq[pos & q->mask], memory_order_acquire);
+        intptr_t diff = (intptr_t)seq - (intptr_t)pos;
+        if (diff == 0) {
+            if (atomic_compare_exchange_weak_explicit(&q->enqueue_pos, &pos, pos + 1, memory_order_relaxed, memory_order_relaxed)) break;
+        } else if (diff < 0) {
+            return false; // full
+        } else {
+            pos = atomic_load_explicit(&q->enqueue_pos, memory_order_relaxed);
+        }
+    }
+    memcpy(q->data + (pos & q->mask) * q->elem_size, elem, q->elem_size);
+    atomic_store_explicit(&q->seq[pos & q->mask], pos + 1, memory_order_release);
+    return true;
+}
+
+static bool mpmc_pop(HdsMpmcQueue *q, void *out) {
+    size_t pos = atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
+    for (;;) {
+        size_t seq = atomic_load_explicit(&q->seq[pos & q->mask], memory_order_acquire);
+        intptr_t diff = (intptr_t)seq - (intptr_t)(pos + 1);
+        if (diff == 0) {
+            if (atomic_compare_exchange_weak_explicit(&q->dequeue_pos, &pos, pos + 1, memory_order_relaxed, memory_order_relaxed)) break;
+        } else if (diff < 0) {
+            return false; // empty
+        } else {
+            pos = atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
+        }
+    }
+    memcpy(out, q->data + (pos & q->mask) * q->elem_size, q->elem_size);
+    atomic_store_explicit(&q->seq[pos & q->mask], pos + q->mask + 1, memory_order_release);
+    return true;
+}
+
+// Frees `ptr` without doing it on the calling thread when the loader exists: the pointer goes on
+// the garbage queue. Only if that queue is full (or there is no loader at all) is it freed here.
+static void retire_buffer(HdsSampleEngine *se, void *ptr) {
+    if (!ptr) return;
+    HdsSampleLoaderState *ld = &se->pending->loader;
+    if (ld->initialized) {
+        if (mpmc_push(&ld->garbage, &ptr)) return;
+        atomic_fetch_add_explicit(&ld->inline_frees, 1, memory_order_relaxed);
+    }
+    free(ptr);
+}
+
+static void retire_prepared_sample(HdsSampleEngine *se, HdsPreparedSample *ps) {
+    retire_buffer(se, ps->pre_roll_l);
+    retire_buffer(se, ps->pre_roll_r);
+    ps->pre_roll_l = ps->pre_roll_r = NULL;
+}
+
+static bool hds_sample_loader_submit(HdsSampleEngine *se, const HdsLoadJob *job) {
+    HdsSampleLoaderState *ld = &se->pending->loader;
+    if (!atomic_load_explicit(&ld->running, memory_order_acquire)) return false;
+    return mpmc_push(&ld->requests, job);
+}
+
+// Frees everything a result owns (loader thread at shutdown, or teardown).
+static void free_load_result(HdsLoadResult *r) {
+    if (r->kind == HDS_LOAD_JOB_SAMPLE) {
+        free_prepared_sample(&r->prepared);
+    } else if (r->kind == HDS_LOAD_JOB_SFZ) {
+        for (int i = 0; r->prepared_list && i < r->count; i++) free_prepared_sample(&r->prepared_list[i]);
+        free(r->records); free(r->prepared_list); free(r->prepared_ok);
+        r->records = NULL; r->prepared_list = NULL; r->prepared_ok = NULL;
+    }
+}
+
+static void loader_free_garbage(HdsSampleLoaderState *ld) {
+    void *ptr;
+    while (mpmc_pop(&ld->garbage, &ptr)) free(ptr);
+}
+
+static void *sample_loader_thread_main(void *arg) {
+    HdsSampleEngine *se = (HdsSampleEngine *)arg;
+    HdsSampleLoaderState *ld = &se->pending->loader;
+    HdsLoadJob job;
+    HdsLoadResult res;
+    while (!atomic_load_explicit(&ld->shutdown, memory_order_acquire)) {
+        loader_free_garbage(ld);
+        if (!mpmc_pop(&ld->requests, &job)) { struct timespec ts = {0, 2000000}; nanosleep(&ts, NULL); continue; }
+        memset(&res, 0, sizeof(res));
+        res.kind = job.kind;
+        if (job.kind == HDS_LOAD_JOB_SAMPLE) {
+            res.sample = job.sample;
+            res.ok = prepare_sample_file(job.sample.path, &res.prepared);
+        } else {
+            res.osc_index = job.osc_index;
+            res.owner_program = job.owner_program;
+            res.count = sfz_build_records(job.sfz_path, job.osc_index, job.owner_program, true,
+                                          &res.records, &res.prepared_list, &res.prepared_ok, &res.sw_default_note);
+            fprintf(stderr, "[sfz] '%s': %d zone(s) prepared (osc %d)\n", job.sfz_path, res.count, job.osc_index + 1);
+        }
+        // The results queue only fills if the audio thread has stopped draining it.
+        while (!mpmc_push(&ld->results, &res)) {
+            if (atomic_load_explicit(&ld->shutdown, memory_order_acquire)) {
+                fprintf(stderr, "[samples] loader stopping with its results queue full -- a load was dropped\n");
+                free_load_result(&res);
+                break;
+            }
+            loader_free_garbage(ld);
+            struct timespec ts = {0, 2000000}; nanosleep(&ts, NULL);
+        }
+    }
+    loader_free_garbage(ld);
+    return NULL;
+}
+
+// Starts the loader thread (CLAP activate(), standalone startup). Queued jobs and unapplied
+// results survive a stop/start cycle: the queues are set up once, on the first start.
+bool hds_sample_loader_start(HdsSampleEngine *se) {
+    HdsSampleLoaderState *ld = &se->pending->loader;
+    if (atomic_load_explicit(&ld->running, memory_order_acquire)) return true;
+    if (!ld->initialized) {
+        mpmc_init(&ld->requests, ld->request_seq, ld->request_cells, sizeof(HdsLoadJob), HDS_LOADER_QUEUE_CAPACITY);
+        mpmc_init(&ld->results, ld->result_seq, ld->result_cells, sizeof(HdsLoadResult), HDS_LOADER_QUEUE_CAPACITY);
+        mpmc_init(&ld->garbage, ld->garbage_seq, ld->garbage_cells, sizeof(void *), HDS_LOADER_GARBAGE_CAPACITY);
+        ld->initialized = true;
+    }
+    atomic_store_explicit(&ld->shutdown, false, memory_order_release);
+    if (pthread_create(&ld->thread, NULL, sample_loader_thread_main, se) != 0) {
+        fprintf(stderr, "[samples] failed to start the sample loader thread -- loading on the audio thread instead\n");
+        return false;
+    }
+    atomic_store_explicit(&ld->running, true, memory_order_release);
+    return true;
+}
+
+// Stops the loader thread (CLAP deactivate(), standalone shutdown). Returns once it has exited;
+// a load it is in the middle of finishes first.
+void hds_sample_loader_stop(HdsSampleEngine *se) {
+    HdsSampleLoaderState *ld = &se->pending->loader;
+    if (!atomic_load_explicit(&ld->running, memory_order_acquire)) return;
+    atomic_store_explicit(&ld->running, false, memory_order_release);
+    atomic_store_explicit(&ld->shutdown, true, memory_order_release);
+    pthread_join(ld->thread, NULL);
+}
+
+// Frees whatever the loader's queues still hold (CLAP destroy(), after the last deactivate()).
+void hds_sample_loader_free(HdsSampleEngine *se) {
+    HdsSampleLoaderState *ld = &se->pending->loader;
+    hds_sample_loader_stop(se);
+    if (!ld->initialized) return;
+    HdsLoadResult r;
+    while (mpmc_pop(&ld->results, &r)) free_load_result(&r);
+    HdsLoadJob j;
+    while (mpmc_pop(&ld->requests, &j)) {}
+    if (ld->sfz_applying) { free_load_result(&ld->sfz_current); ld->sfz_applying = false; }
+    loader_free_garbage(ld);
+}
+
+// Audio thread: one finished zone load into the catalog.
+static void apply_sample_result(HdsSampleEngine *se, HdsLoadResult *r) {
+    PendingSampleLoad *p = &r->sample;
+    if (!pending_load_still_wanted(se, p)) { retire_prepared_sample(se, &r->prepared); return; }
+    if (!r->ok) { se->slots->sample_slots[p->slot_index].active = false; return; } // prepare_sample_file logged why
+    install_prepared_sample(se, p->slot_index, p->path, p->root_note, &r->prepared);
+    apply_pending_fields(&se->slots->sample_slots[p->slot_index], p);
+}
+
+// Audio thread: an SFZ result replaces its (oscillator, Program) pair's zones at once, then its
+// regions go in SFZ_REGIONS_PER_BLOCK per block (sfz_apply_step).
+static void sfz_apply_begin(HdsSampleEngine *se, const HdsLoadResult *r) {
+    HdsSampleLoaderState *ld = &se->pending->loader;
+    unload_zones_for_osc(se, r->osc_index, r->owner_program);
+    ld->sfz_current = *r;
+    ld->sfz_cursor = 0;
+    ld->sfz_applying = true;
+}
+
+static void sfz_apply_step(HdsSampleEngine *se) {
+    HdsSampleLoaderState *ld = &se->pending->loader;
+    HdsLoadResult *r = &ld->sfz_current;
+    int end = ld->sfz_cursor + SFZ_REGIONS_PER_BLOCK;
+    if (end > r->count) end = r->count;
+    for (; ld->sfz_cursor < end; ld->sfz_cursor++) {
+        int i = ld->sfz_cursor;
+        if (!r->prepared_ok[i]) continue; // its file didn't load; prepare_sample_file logged why
+        int idx = claim_catalog_slot_for_new_zone(se, &r->records[i]);
+        if (idx < 0) { retire_prepared_sample(se, &r->prepared_list[i]); continue; }
+        PendingSampleLoad p;
+        fill_pending_from_record(&p, idx, &r->records[i]);
+        install_prepared_sample(se, idx, p.path, p.root_note, &r->prepared_list[i]);
+        apply_pending_fields(&se->slots->sample_slots[idx], &p);
+    }
+    if (ld->sfz_cursor >= r->count) {
+        apply_sfz_sw_default(se, r->osc_index, r->owner_program, r->sw_default_note);
+        retire_buffer(se, r->records);
+        retire_buffer(se, r->prepared_list);
+        retire_buffer(se, r->prepared_ok);
+        ld->sfz_applying = false;
+    }
+}
+
+// Called once per audio block (standalone main loop, CLAP process()). With the loader thread:
+// applies finished results (a bounded number of pointer swaps -- one SFZ step, or up to
+// SAMPLE_RESULTS_PER_BLOCK zone loads), then hands queued zone loads to the loader; no file I/O,
+// no malloc/free. Without it, falls back to loading SAMPLE_LOADS_PER_BLOCK files here.
+void drain_pending_sample_loads(HdsSampleEngine *se) {
+    HdsSampleLoaderState *ld = &se->pending->loader;
+    HdsPendingLoadState *pend = se->pending;
+
+    if (ld->initialized) {
+        if (ld->sfz_applying) {
+            sfz_apply_step(se);
+        } else {
+            HdsLoadResult r;
+            for (int n = 0; n < SAMPLE_RESULTS_PER_BLOCK && mpmc_pop(&ld->results, &r); n++) {
+                if (r.kind == HDS_LOAD_JOB_SAMPLE) {
+                    apply_sample_result(se, &r);
+                } else {
+                    sfz_apply_begin(se, &r);
+                    sfz_apply_step(se);
+                    break; // results after an SFZ wait until it is fully in, so order is kept
+                }
+            }
+        }
+    }
+
+    if (atomic_load_explicit(&ld->running, memory_order_acquire)) {
+        while (pend->pending_load_count > 0) {
+            PendingSampleLoad *p = &pend->pending_loads[pend->pending_load_head];
+            if (pending_load_still_wanted(se, p)) {
+                HdsLoadJob job;
+                job.kind = HDS_LOAD_JOB_SAMPLE;
+                job.sample = *p;
+                if (!mpmc_push(&ld->requests, &job)) break; // full: the rest go next block
+            }
+            pend->pending_load_head = (pend->pending_load_head + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
+            pend->pending_load_count--;
+        }
+        return;
+    }
+
+    for (int i = 0; i < SAMPLE_LOADS_PER_BLOCK && pend->pending_load_count > 0; i++) {
+        PendingSampleLoad *p = &pend->pending_loads[pend->pending_load_head];
+        pend->pending_load_head = (pend->pending_load_head + 1) % PENDING_SAMPLE_LOAD_CAPACITY;
+        pend->pending_load_count--;
+        if (!pending_load_still_wanted(se, p)) continue;
+        if (load_sample_slot(se, p->slot_index, p->path, p->root_note)) {
+            apply_pending_fields(&se->slots->sample_slots[p->slot_index], p);
+        } else {
+            fprintf(stderr, "[samples] failed to load queued sample '%s' (zone_id %d)\n", p->path, p->zone_id);
+            se->slots->sample_slots[p->slot_index].active = false;
+        }
+    }
 }
 
 // Round-robin hit counters, one per possible group id (index 0 unused -- group 0 means "not
@@ -1494,6 +1980,11 @@ static int start_one_sample_stream(HdsSampleEngine *se, double *ptr, bool *prero
         float frac = fmaxf(0.0f, fminf(1.0f, slot->start_offset_frac));
         start_frame = (unsigned int)(frac * (float)(slot->total_frames > 0 ? slot->total_frames - 1 : 0));
         if (slot->reverse) {
+            // "In the travel direction": a reverse zone's offset counts back from its last frame,
+            // so offset 0 starts at the end. (It used to be taken as a forward file frame, so a
+            // reverse zone with no offset started at frame 0 and stopped after one frame.)
+            unsigned int last = slot->total_frames > 0 ? slot->total_frames - 1 : 0;
+            start_frame = last - start_frame;
             // Reverse zones skip the pre-roll fast path entirely (it's only ever decoded forward
             // from file frame 0, useless for a zone that wants to start near the end) -- go
             // straight to ring consumption, accepting a brief real disk-catch-up latency window,
@@ -1751,12 +2242,29 @@ float render_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr_inout,
         }
     }
 
+    // The ring (and the EOF flag) only belong to this note once the disk thread has started this
+    // session -- see SampleStream.session. Until then, hold silent exactly like starvation, keeping
+    // ptr/preroll as they are, and leave read_ptr alone (the disk thread is about to reset it).
+    if (!preroll && atomic_load_explicit(&stream->ready_session, memory_order_acquire) != atomic_load_explicit(&stream->session, memory_order_relaxed)) {
+        *ptr_inout = ptr; *preroll_inout = preroll;
+        if (out_l_ptr) *out_l_ptr = 0.0f;
+        if (out_r_ptr) *out_r_ptr = 0.0f;
+        return 0.0f;
+    }
+
     if (!preroll) {
         unsigned int r_ptr = atomic_load_explicit(&stream->read_ptr, memory_order_acquire);
         unsigned int w_ptr = atomic_load_explicit(&stream->write_ptr, memory_order_acquire);
         unsigned int available = (w_ptr - r_ptr) & SAMPLE_RING_MASK;
 
-        if (available < (unsigned int)(SAMPLE_XFADE_SIZE + 2)) {
+        // Frames this call reads (idx0/idx1) plus how far it moves read_ptr: never past write_ptr.
+        unsigned int need = (unsigned int)ptr + 2u + (unsigned int)ratio;
+        bool at_eof = atomic_load_explicit(&stream->disk_reached_eof, memory_order_acquire);
+        // While the file still has audio to give, wait for a margin of SAMPLE_XFADE_SIZE + 2
+        // frames before resuming after starvation (as before). Once the disk thread has hit the
+        // end, play out what's left down to the last frames -- the old fixed margin cut the final
+        // ~1000 frames (about 21 ms) off the end of every streamed one-shot.
+        if (available < need || (!at_eof && available < (unsigned int)(SAMPLE_XFADE_SIZE + 2))) {
             // Ring starvation alone does NOT mean "reached the end of the file" -- it's also
             // exactly what a freshly-claimed stream's ring looks like before the (single, shared)
             // disk thread has gotten around to filling it, which can genuinely take a while under
@@ -1768,7 +2276,7 @@ float render_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr_inout,
             // silently and permanently kill a note the instant it should have started audibly
             // playing, under exactly the kind of stress-test load that makes the disk thread fall
             // behind.
-            if (!slot->loop_enabled && atomic_load_explicit(&stream->disk_reached_eof, memory_order_acquire)) {
+            if (!slot->loop_enabled && at_eof && available < need) {
                 release_sample_stream(se, *stream_idx);
                 *stream_idx = -1;
                 *ptr_inout = ptr; *preroll_inout = preroll;
@@ -1787,32 +2295,10 @@ float render_sample_osc(HdsSampleEngine *se, int *stream_idx, double *ptr_inout,
         unsigned int idx0 = (r_ptr + int_ptr) & SAMPLE_RING_MASK;
         unsigned int idx1 = (idx0 + 1) & SAMPLE_RING_MASK;
 
-        unsigned int frames_left = available - int_ptr;
-        // SFZ loop_crossfade=: this zone's own explicit loop-splice crossfade width in frames, in
-        // place of the engine's fixed SAMPLE_XFADE_SIZE default -- see SampleSlot.loop_crossfade_
-        // frames' own comment. -1 (unset) reproduces today's exact fixed-width behavior. Clamped to
-        // SAMPLE_XFADE_SIZE regardless (never widened) since the ring-starvation safety margin just
-        // above and apply_loop_points()'s own minimum loop length are both sized against that same
-        // fixed constant -- a zone asking for a longer crossfade than that gets the engine's own
-        // maximum instead of risking either safety margin.
-        unsigned int effective_xfade = (unsigned int)SAMPLE_XFADE_SIZE;
-        if (slot->loop_crossfade_frames >= 0) effective_xfade = (unsigned int)slot->loop_crossfade_frames;
-        if (effective_xfade > (unsigned int)SAMPLE_XFADE_SIZE) effective_xfade = (unsigned int)SAMPLE_XFADE_SIZE;
-        if (slot->loop_enabled && effective_xfade > 0 && frames_left <= effective_xfade && frames_left > 1) {
-            float fade_in = (float)(effective_xfade - frames_left) / (float)effective_xfade;
-            float fade_out = 1.0f - fade_in;
-            unsigned int widx0 = (r_ptr + int_ptr + effective_xfade) & SAMPLE_RING_MASK;
-            unsigned int widx1 = (widx0 + 1) & SAMPLE_RING_MASK;
-            float base_l = stream->ring_l[idx0] + frac * (stream->ring_l[idx1] - stream->ring_l[idx0]);
-            float wrap_l = stream->ring_l[widx0] + frac * (stream->ring_l[widx1] - stream->ring_l[widx0]);
-            out_l = base_l * fade_out + wrap_l * fade_in;
-            float base_r = stream->ring_r[idx0] + frac * (stream->ring_r[idx1] - stream->ring_r[idx0]);
-            float wrap_r = stream->ring_r[widx0] + frac * (stream->ring_r[widx1] - stream->ring_r[widx0]);
-            out_r = base_r * fade_out + wrap_r * fade_in;
-        } else {
-            out_l = stream->ring_l[idx0] + frac * (stream->ring_l[idx1] - stream->ring_l[idx0]);
-            out_r = stream->ring_r[idx0] + frac * (stream->ring_r[idx1] - stream->ring_r[idx0]);
-        }
+        // Loop splices are already crossfaded in the ring by the disk thread (disk_fill_forward),
+        // so this is plain linear interpolation.
+        out_l = stream->ring_l[idx0] + frac * (stream->ring_l[idx1] - stream->ring_l[idx0]);
+        out_r = stream->ring_r[idx0] + frac * (stream->ring_r[idx1] - stream->ring_r[idx0]);
 
         ptr += ratio;
         while (ptr >= 1.0) { ptr -= 1.0; r_ptr++; }

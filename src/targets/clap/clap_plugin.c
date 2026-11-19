@@ -714,6 +714,8 @@ static void clap_plugin_destroy(const clap_plugin_t *plugin) {
     // inside a host process that very much does NOT exit when one plugin instance is closed/
     // removed -- every instance load+unload cycle across a whole session was leaking however much
     // RAM its own loaded multisamples' pre-roll caches used, for good, until the host itself quit.
+    // Whatever the sample loader still holds (finished loads never applied, retired buffers).
+    hds_sample_loader_free(&p->sample_engine);
     for (int s = 0; s < p->sample_slot_state.sample_slot_count; s++) {
         free(p->sample_slot_state.sample_slots[s].pre_roll_l);
         free(p->sample_slot_state.sample_slots[s].pre_roll_r);
@@ -849,6 +851,10 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
     if (!disk_thread_ok) {
         fprintf(stderr, "[hds-clap] failed to start sample disk streaming thread -- WAVE_SAMPLE playback unavailable this session\n");
     }
+    // Sample loader thread: every zone/SFZ file read happens there, never in process() (see
+    // sample_engine.c's "Sample loader thread" section). If it can't start, loads fall back to
+    // the old throttled in-process() path.
+    hds_sample_loader_start(&p->sample_engine);
 
     p->vu_decimator = 0;
     return true;
@@ -856,6 +862,10 @@ static bool clap_plugin_activate(const clap_plugin_t *plugin, double sample_rate
 
 static void clap_plugin_deactivate(const clap_plugin_t *plugin) {
     HdsClapPlugin *p = (HdsClapPlugin *)plugin->plugin_data;
+
+    // Loads still queued or finished-but-unapplied stay in their queues and continue on the next
+    // activate().
+    hds_sample_loader_stop(&p->sample_engine);
 
     if (p->streams_state.sample_disk_thread_running) {
         atomic_store_explicit(&p->streams_state.sample_disk_thread_shutdown, true, memory_order_release);
