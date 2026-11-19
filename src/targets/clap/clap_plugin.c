@@ -502,8 +502,54 @@ static void state_buf_appendf(HdsStateBuf *b, const char *fmt, ...) {
     b->len += (size_t)needed;
 }
 
+// One saved knob value (a K or T line), resolved to where it goes in SynthSharedControls.
+typedef struct {
+    size_t offset, str_len; // str_len: OSC_KIND_STRING only
+    int kind;
+    float value;            // OSC_KIND_FLOAT
+    size_t str_at;          // OSC_KIND_STRING: index of its text in HdsStateZoneBatch.strings
+} HdsStateKnob;
+
+// A loaded project, as one unit: its knob values, then its Sample Bank (clear every zone, then
+// upsert these).
+typedef struct HdsStateZoneBatch {
+    int count, capacity;
+    ZoneRecordWire *recs;
+    int knob_count, knob_capacity;
+    HdsStateKnob *knobs;
+    char *strings;
+    size_t strings_len, strings_capacity;
+    char *raw;              // the state exactly as loaded, for a save before process() applies it
+    size_t raw_len;
+} HdsStateZoneBatch;
+
+static void state_zone_batch_free(HdsStateZoneBatch *b) {
+    if (!b) return;
+    free(b->recs);
+    free(b->knobs);
+    free(b->strings);
+    free(b->raw);
+    free(b);
+}
+
+static bool clap_state_write_all(const clap_ostream_t *stream, const char *buf, size_t len) {
+    size_t written = 0;
+    while (written < len) {
+        int64_t n = stream->write(stream, buf + written, len - written);
+        if (n <= 0) return false;
+        written += (size_t)n;
+    }
+    return true;
+}
+
 static bool clap_state_save(const clap_plugin_t *plugin, const clap_ostream_t *stream) {
     HdsClapPlugin *p = (HdsClapPlugin *)plugin->plugin_data;
+    // A load process() hasn't applied yet: the engine still holds the previous state, so save
+    // the loaded one as it was given. (Only the main thread frees a batch, so reading it here is
+    // safe even if process() takes it meanwhile.)
+    HdsStateZoneBatch *pending = atomic_load_explicit(&p->pending_state_zones, memory_order_acquire);
+    if (pending && pending->raw) return clap_state_write_all(stream, pending->raw, pending->raw_len);
+
     HdsStateBuf b = {0};
     state_buf_appendf(&b, "HDS%d\n", HDS_CLAP_STATE_VERSION);
 
@@ -541,31 +587,47 @@ static bool clap_state_save(const clap_plugin_t *plugin, const clap_ostream_t *s
             slot->assigned_osc, slot->owner_program, slot->file_path);
     }
 
-    bool ok = true;
-    size_t written = 0;
-    while (written < b.len) {
-        int64_t n = stream->write(stream, b.buf + written, b.len - written);
-        if (n <= 0) { ok = false; break; }
-        written += (size_t)n;
-    }
+    bool ok = clap_state_write_all(stream, b.buf, b.len);
     free(b.buf);
     return ok;
 }
 
-// A loaded project's Sample Bank, as one unit: clear every zone, then upsert these.
-typedef struct HdsStateZoneBatch {
-    int count, capacity;
-    ZoneRecordWire *recs;
-} HdsStateZoneBatch;
-
-static void state_zone_batch_free(HdsStateZoneBatch *b) {
-    if (!b) return;
-    free(b->recs);
-    free(b);
+static bool state_batch_add_knob(HdsStateZoneBatch *b, const OscDispatchSlot *slot, float value, const char *text) {
+    if (b->knob_count == b->knob_capacity) {
+        int cap = b->knob_capacity ? b->knob_capacity * 2 : 256;
+        HdsStateKnob *grown = realloc(b->knobs, sizeof(*grown) * (size_t)cap);
+        if (!grown) return false;
+        b->knobs = grown; b->knob_capacity = cap;
+    }
+    HdsStateKnob *k = &b->knobs[b->knob_count];
+    k->offset = slot->offset; k->kind = slot->kind; k->str_len = slot->str_len; k->value = value; k->str_at = 0;
+    if (text) {
+        size_t n = strlen(text) + 1;
+        if (b->strings_len + n > b->strings_capacity) {
+            size_t cap = b->strings_capacity ? b->strings_capacity : 1024;
+            while (cap < b->strings_len + n) cap *= 2;
+            char *grown = realloc(b->strings, cap);
+            if (!grown) return false;
+            b->strings = grown; b->strings_capacity = cap;
+        }
+        memcpy(b->strings + b->strings_len, text, n);
+        k->str_at = b->strings_len;
+        b->strings_len += n;
+    }
+    b->knob_count++;
+    return true;
 }
 
 // Owner of the catalog only: process(), or the main thread while the plugin is not activated.
+// Knobs first, as the old in-place load did: the zones' owners (e.g. a VCO's Shape) must already
+// read Multisample when poll_vco_shape_unload() next runs.
 static void state_zone_batch_apply(HdsClapPlugin *p, const HdsStateZoneBatch *b) {
+    for (int i = 0; i < b->knob_count; i++) {
+        const HdsStateKnob *k = &b->knobs[i];
+        char *field = (char *)&p->knobs + k->offset;
+        if (k->kind == OSC_KIND_FLOAT) *(float *)field = k->value;
+        else snprintf(field, k->str_len, "%s", b->strings + k->str_at);
+    }
     // Loading a project means "this project's own samples", not "these on top of what was there".
     for (int s = 0; s < p->sample_slot_state.sample_slot_count; s++) {
         if (p->sample_slot_state.sample_slots[s].active) apply_zone_remove(&p->sample_engine, p->sample_slot_state.sample_slots[s].zone_id);
@@ -625,10 +687,16 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
     if (sscanf(cursor, "HDS%d", &version) != 1 || version < 1 || version > HDS_CLAP_STATE_VERSION) { free(b.buf); return false; }
     cursor = first_newline + 1;
 
-    // The zones are collected here and applied by whoever owns the catalog (see
-    // HdsStateZoneBatch) -- never mutated from this (main) thread while process() may run.
+    // Knobs and zones are collected here and applied by whoever owns the engine state (see
+    // HdsStateZoneBatch) -- never written from this (main) thread while process() may run.
     HdsStateZoneBatch *batch = calloc(1, sizeof(*batch));
-    if (!batch) { free(b.buf); return false; }
+    if (batch) batch->raw = malloc(b.len);
+    if (!batch || !batch->raw) { state_zone_batch_free(batch); free(b.buf); return false; }
+    // The parse below writes NULs over the newlines; keep the text as received first.
+    *first_newline = '\n';
+    memcpy(batch->raw, b.buf, b.len);
+    batch->raw_len = b.len;
+    *first_newline = '\0';
 
     int applied_knobs = 0, skipped_knobs = 0, applied_zones = 0;
     while (*cursor) {
@@ -639,8 +707,10 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
             char addr[128]; double value;
             if (sscanf(cursor + 2, "%127s %lf", addr, &value) == 2) {
                 const OscDispatchSlot *slot = osc_dispatch_lookup(addr);
-                if (slot && slot->kind == OSC_KIND_FLOAT) { *(float *)((char *)&p->knobs + slot->offset) = (float)value; applied_knobs++; }
-                else skipped_knobs++;
+                if (slot && slot->kind == OSC_KIND_FLOAT) {
+                    if (!state_batch_add_knob(batch, slot, (float)value, NULL)) { state_zone_batch_free(batch); free(b.buf); return false; }
+                    applied_knobs++;
+                } else skipped_knobs++;
             }
         } else if (cursor[0] == 'T' && cursor[1] == ' ') {
             char addr[128]; int addr_chars = 0;
@@ -648,8 +718,10 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
                 const char *value = cursor + 2 + addr_chars;
                 while (*value == ' ') value++;
                 const OscDispatchSlot *slot = osc_dispatch_lookup(addr);
-                if (slot && slot->kind == OSC_KIND_STRING) { snprintf((char *)&p->knobs + slot->offset, slot->str_len, "%s", value); applied_knobs++; }
-                else skipped_knobs++;
+                if (slot && slot->kind == OSC_KIND_STRING) {
+                    if (!state_batch_add_knob(batch, slot, 0.0f, value)) { state_zone_batch_free(batch); free(b.buf); return false; }
+                    applied_knobs++;
+                } else skipped_knobs++;
             }
         } else if (cursor[0] == 'Z' && cursor[1] == ' ') {
             ZoneRecordWire rec;
@@ -711,8 +783,8 @@ static bool clap_state_load(const clap_plugin_t *plugin, const clap_istream_t *s
         cursor = line_end ? line_end + 1 : cursor + strlen(cursor);
     }
 
-    fprintf(stderr, "[hds-clap] state load: %d knob(s) applied, %d skipped (unrecognized address), %d zone(s) queued\n",
-            applied_knobs, skipped_knobs, applied_zones);
+    fprintf(stderr, "[hds-clap] state load: %d knob(s) and %d zone(s) loaded (applied on the next process()), %d knob(s) skipped (unrecognized address)\n",
+            applied_knobs, applied_zones, skipped_knobs);
     free(b.buf);
 
     // Publish the batch. A batch from an earlier load that process() never took is replaced
