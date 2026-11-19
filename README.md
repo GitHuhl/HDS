@@ -59,7 +59,7 @@ make test-golden  # same, but rewrite tests/golden.txt
 ```
 
 Run inside `nix-shell`: it pins every library the results depend on and provides Xvfb for the
-GUI test. `make test` runs eight programs from `tests/`:
+GUI test. `make test` runs nine programs from `tests/`:
 
 - `test_backend` — links `backend.o` directly: the JSON reader (valid documents, escapes, nesting,
   and rejection of malformed input), the Scala `.scl` tuning loader (cents, ratios, comments, CRLF;
@@ -68,6 +68,10 @@ GUI test. `make test` runs eight programs from `tests/`:
   shows up).
 - `test_fx_chain` — every FX type (except NAM) with four parameter/mix/routing/sidechain
   variants, plus a 32-slot, 8-source bus: checks the output is finite and fingerprints it.
+- `test_sample_engine` — the DFD sample engine on its own, with its real disk and loader threads:
+  a new note never plays a previous note's leftover ring audio or inherits its end-of-file, reverse
+  zones play from their end, loop splices are crossfaded, and zone and SFZ loads never open a file
+  on the audio thread (checked with a FIFO that blocks any open). Pass/fail checks only.
 - `test_recording` — records WAV and WavPack through the recording engine and reads both back,
   checking every sample.
 - `test_clap_render` — plays notes through `hds.clap` (checks it sounds and then releases to
@@ -104,7 +108,7 @@ Every `#include` is relative to `src/` (e.g. `#include "core/backend.h"`); the M
 
 | Directory | What's in it |
 | --- | --- |
-| `src/core/` | The synth engine shared by `synth_engine` and `hds.clap`. `backend.h` (its interface) and `backend_types.h` (the data model); `render.c` (the per-sample renderer: `render_audio_block`, FM, oscillator/filter/envelope/LFO building blocks -- one file so they stay inlined), `voices.c` (note on/off, voice allocation, sustain, glide, microtuned pitch), `midi_dispatch.c`, `arpeggiator.c`, `metronome.c`, `defaults.c` (every control's default), `fx_upload.c` (NAM file upload over OSC), `program_files.c`, and `backend.c` itself (the engine globals); `engine_internal.h` holds the few cross-file pieces among those; and: `osc_protocol.c` (the `OSC_PARAMS[]` address table, dispatch, state dump, discovery, status pushes), `sample_engine.c`/`.h` (Sample Bank zones, stream pool and disk thread, the sample oscillator), `sfz_parser.c`/`.h`, `smf_import.c`, `tuning.c`, `json.c`; plus `recording_engine.c` (WAV/WavPack recording) and `sequencer.c` (standalone-only transport, lanes and MIDI clock). `hds_config.h` holds build-wide constants, `hds_compat.h` the Windows POSIX shims. |
+| `src/core/` | The synth engine shared by `synth_engine` and `hds.clap`. `backend.h` (its interface) and `backend_types.h` (the data model); `render.c` (the per-sample renderer: `render_audio_block`, FM, oscillator/filter/envelope/LFO building blocks -- one file so they stay inlined), `voices.c` (note on/off, voice allocation, sustain, glide, microtuned pitch), `midi_dispatch.c`, `arpeggiator.c`, `metronome.c`, `defaults.c` (every control's default), `fx_upload.c` (NAM file upload over OSC), `program_files.c`, and `backend.c` itself (the engine globals); `engine_internal.h` holds the few cross-file pieces among those; and: `osc_protocol.c` (the `OSC_PARAMS[]` address table, dispatch, state dump, discovery, status pushes), `sample_engine.c`/`.h` (Sample Bank zones, stream pool and disk thread, the sample loader thread, the sample oscillator), `sfz_parser.c`/`.h`, `smf_import.c`, `tuning.c`, `json.c`; plus `recording_engine.c` (WAV/WavPack recording) and `sequencer.c` (standalone-only transport, lanes and MIDI clock). `hds_config.h` holds build-wide constants, `hds_compat.h` the Windows POSIX shims. |
 | `src/fx/` | The FX bus shared by all three builds: `fx_chain.c`/`.h` (slot lifecycle, routing, `process_fx_chain`), `fx_types.h` (the slot data model), one file per effect family (Airwindows modulation and tone ports, NAM, EQ/filters, compressors, gate/limiters, pitch, reverb/delay) behind the internal `fx_effects.h`, and the C++ NAM bridge (`nam_bridge.cpp`/`.h`). |
 | `src/gui/` | The native Cairo-drawn GUI, platform-free: the FX pool view (`hds_fx_gui_draw.c`/`.h`, `hds_fx_gui_host.h`), the file browser (`hds_fx_gui_browser.c`/`.h`), and the synth's tabs (`hds_clap_*_draw.c` behind `hds_clap_gui.h`, plus `hds_engine_instance.h`, the per-instance context they draw). Routing, Devices, Recording and the tab dispatcher are built once per host because they contain standalone-only code. |
 | `src/platform/x11/`, `src/platform/win32/` | Window creation and event pumping per OS and host (`hds_clap_gui_*`, `hds_fx_gui_*`, `hds_standalone_gui_x11.c`). Each is `#include`d by the one target that uses it. |
