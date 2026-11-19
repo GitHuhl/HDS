@@ -103,6 +103,86 @@ static uint64_t render_patch(const char *clap_path, lo_address osc, const Patch 
     return h.h;
 }
 
+// --- State save/load (CLAP state extension) ---
+// clap_state_load() runs on the main thread while process() may be running, so it only publishes
+// the loaded knobs and zones; the next process() applies them. A save in between must still
+// return the loaded state, and the engine must hold it once process() has run.
+typedef struct { char buf[1 << 20]; size_t len, pos; } MemStream;
+static int64_t mem_write(const clap_ostream_t *s, const void *b, uint64_t n) {
+    MemStream *m = s->ctx; if (m->len + n >= sizeof m->buf) return -1;
+    memcpy(m->buf + m->len, b, n); m->len += n; m->buf[m->len] = '\0'; return (int64_t)n;
+}
+static int64_t mem_read(const clap_istream_t *s, void *b, uint64_t n) {
+    MemStream *m = s->ctx; size_t k = m->len - m->pos; if (k > n) k = n;
+    memcpy(b, m->buf + m->pos, k); m->pos += k; return (int64_t)k;
+}
+static void state_save(const clap_plugin_state_t *st, const clap_plugin_t *pl, MemStream *m) {
+    m->len = 0; m->buf[0] = '\0';
+    clap_ostream_t os = { m, mem_write }; st->save(pl, &os);
+}
+static bool state_load(const clap_plugin_state_t *st, const clap_plugin_t *pl, MemStream *m) {
+    m->pos = 0; clap_istream_t is = { m, mem_read }; return st->load(pl, &is);
+}
+static void process_block(const clap_plugin_t *pl) {
+    static float l[BS], r[BS]; float *ch[2] = { l, r };
+    clap_audio_buffer_t out; memset(&out, 0, sizeof out); out.data32 = ch; out.channel_count = 2;
+    EvList evs = {0};
+    clap_input_events_t in = { &evs, ev_size, ev_get };
+    clap_output_events_t oe = { NULL, ev_push };
+    clap_process_t pr; memset(&pr, 0, sizeof pr);
+    pr.frames_count = BS; pr.audio_outputs = &out; pr.audio_outputs_count = 1; pr.in_events = &in; pr.out_events = &oe;
+    pl->process(pl, &pr);
+}
+// Replaces the value on `addr`'s K line in a saved state.
+static bool set_knob_line(MemStream *m, const char *addr, const char *value) {
+    char key[160]; snprintf(key, sizeof key, "\nK %s ", addr);
+    char *at = strstr(m->buf, key); if (!at) return false;
+    char *val = at + strlen(key), *eol = strchr(val, '\n'); if (!eol) return false;
+    size_t tail = m->len - (size_t)(eol - m->buf), vlen = strlen(value);
+    memmove(val + vlen, eol, tail + 1); memcpy(val, value, vlen);
+    m->len = (size_t)(val - m->buf) + vlen + tail;
+    return true;
+}
+static bool has_knob_line(const MemStream *m, const char *addr, const char *value) {
+    char line[200]; snprintf(line, sizeof line, "\nK %s %s\n", addr, value);
+    return strstr(m->buf, line) != NULL;
+}
+
+static void test_state_load(const char *clap_path) {
+    static MemStream m;
+    TestPlugin tp;
+    if (test_plugin_load(&tp, clap_path) != 0) { test_check(0, "clap_patches/state/load_plugin", "could not load %s", clap_path); return; }
+    const clap_plugin_t *pl = tp.plugin;
+    const clap_plugin_state_t *st = (const clap_plugin_state_t *)pl->get_extension(pl, CLAP_EXT_STATE);
+    const char *addr = "/hds/filter/0/cutoff";
+
+    // Not activated: process() can't run, so a load applies at once.
+    state_save(st, pl, &m);
+    test_check(set_knob_line(&m, addr, "1234"), "clap_patches/state/has_knob", "no K %s line in a saved state", addr);
+    test_check(state_load(st, pl, &m), "clap_patches/state/load_inactive", "state.load failed");
+    state_save(st, pl, &m);
+    test_check(has_knob_line(&m, addr, "1234"), "clap_patches/state/inactive_applied", "a load while inactive was not applied");
+
+    // Activated: the load waits for process(), but a save before then returns the loaded state.
+    pl->activate(pl, 48000, 1, BS); pl->start_processing(pl);
+    process_block(pl);
+    set_knob_line(&m, addr, "777");
+    test_check(state_load(st, pl, &m), "clap_patches/state/load_active", "state.load failed");
+    state_save(st, pl, &m);
+    test_check(has_knob_line(&m, addr, "777"), "clap_patches/state/save_before_process", "a save right after load did not return the loaded value");
+    process_block(pl);
+    state_save(st, pl, &m);
+    test_check(has_knob_line(&m, addr, "777"), "clap_patches/state/applied_by_process", "the engine does not hold the loaded value after process()");
+
+    // A load process() never takes is applied by deactivate().
+    set_knob_line(&m, addr, "555");
+    state_load(st, pl, &m);
+    pl->stop_processing(pl); pl->deactivate(pl);
+    state_save(st, pl, &m);
+    test_check(has_knob_line(&m, addr, "555"), "clap_patches/state/applied_by_deactivate", "a load pending at deactivate() was lost");
+    test_plugin_unload(&tp);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s hds.clap\n", argv[0]); return 2; }
     lo_address osc = lo_address_new("127.0.0.1", "9010");
@@ -112,6 +192,7 @@ int main(int argc, char **argv) {
     for (int a = 0; a < NPATCHES; a++) for (int b = a + 1; b < NPATCHES; b++)
         if (hashes[a] && hashes[a] == hashes[b]) { same++; printf("     (%s and %s sound identical)\n", PATCHES[a].name, PATCHES[b].name); }
     test_check(same == 0, "clap_patches/all_distinct", "%d pairs of patches rendered identically -- a setting had no effect", same);
+    test_state_load(argv[1]);
     lo_address_free(osc);
     return test_exit_code();
 }
