@@ -1860,6 +1860,14 @@ typedef struct {
     _Atomic size_t enqueue_pos, dequeue_pos;
 } HdsMpmcQueue;
 
+// A sample file the loader just read, handed to the disk thread still open (see
+// loader_hand_file_to_disk_thread in sample_engine.c).
+typedef struct {
+    FILE *f;
+    char path[SAMPLE_PATH_LEN];
+} HdsOpenedFile;
+#define HDS_OPENED_FILE_CAPACITY 64 // power of two
+
 typedef struct {
     bool initialized;            // queues set up (once, by hds_sample_loader_start)
     _Atomic bool running;        // the thread is up and taking jobs
@@ -1872,6 +1880,12 @@ typedef struct {
     HdsLoadResult result_cells[HDS_LOADER_QUEUE_CAPACITY];
     _Atomic size_t garbage_seq[HDS_LOADER_GARBAGE_CAPACITY];
     void *garbage_cells[HDS_LOADER_GARBAGE_CAPACITY];
+    // Loader -> disk thread: files left open after their zone load, so a zone's first note
+    // doesn't fopen() on the disk thread.
+    HdsMpmcQueue opened_files;
+    _Atomic bool opened_files_ready; // set once opened_files is initialized (the disk thread may start first)
+    _Atomic size_t opened_file_seq[HDS_OPENED_FILE_CAPACITY];
+    HdsOpenedFile opened_file_cells[HDS_OPENED_FILE_CAPACITY];
     // Audio-thread-owned: an SFZ result being applied a few regions per block.
     bool sfz_applying;
     int sfz_cursor;

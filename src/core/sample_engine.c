@@ -78,15 +78,31 @@ static void free_prepared_sample(HdsPreparedSample *ps) {
 // first SAMPLE_PRE_ROLL_LIMIT frames into freshly allocated RAM pre-roll buffers. Touches no
 // engine state, so it runs on the sample loader thread (or, with no loader thread, wherever the
 // caller is). Only the first two channels of a multichannel file are kept.
-// Bumped every time a sample file is (re)read for a zone load. The disk thread's open-file cache
-// drops its handles when it changes, so a file replaced on disk and then reloaded is never read
-// through a handle opened on the old one. Process-wide (shared by every plugin instance): an
-// extra bump only costs another instance one reopen per file.
+// The disk thread's open-file cache (DiskFileCache) must never read a file replaced on disk and
+// then reloaded through a handle opened on the old one. Normally the reload itself handles that:
+// the loader passes its freshly opened handle to the disk thread, which retires any older handle
+// for that path (loader_hand_file_to_disk_thread). When a load can't hand its file over (no
+// loader thread, or the hand-off queue is full), it bumps this counter instead, and the disk
+// thread drops every cached handle. Process-wide: an extra bump only costs reopens.
 static _Atomic unsigned int g_sample_file_generation = 0;
 
-static bool prepare_sample_file(const char *path, HdsPreparedSample *out) {
-    memset(out, 0, sizeof(*out));
+static bool mpmc_push(HdsMpmcQueue *q, const void *elem);
+
+// Gives `f` (just used to read `path`'s header and pre-roll) to the disk thread instead of
+// closing it. `ld` is NULL when the caller has no loader to hand it through.
+static void loader_hand_file_to_disk_thread(HdsSampleLoaderState *ld, const char *path, FILE *f) {
+    if (ld && ld->initialized) {
+        HdsOpenedFile of;
+        of.f = f;
+        snprintf(of.path, sizeof(of.path), "%s", path);
+        if (mpmc_push(&ld->opened_files, &of)) return;
+    }
+    fclose(f);
     atomic_fetch_add_explicit(&g_sample_file_generation, 1, memory_order_release);
+}
+
+static bool prepare_sample_file(const char *path, HdsPreparedSample *out, HdsSampleLoaderState *handoff) {
+    memset(out, 0, sizeof(*out));
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[sample] failed to open '%s': %s\n", path, strerror(errno)); return false; }
 
@@ -161,7 +177,7 @@ static bool prepare_sample_file(const char *path, HdsPreparedSample *out) {
         fprintf(stderr, "[sample] '%s': file is shorter than its data chunk says\n", path);
         free(raw); free_prepared_sample(out); fclose(f); return false;
     }
-    fclose(f);
+    loader_hand_file_to_disk_thread(handoff, path, f);
     decode_wav_frames(raw, pre_roll_frames, num_channels, bits_per_sample, audio_format, out->pre_roll_l, out->pre_roll_r);
     free(raw);
     fprintf(stderr, "[sample] prepared '%s' (%u frames)\n", path, total_frames);
@@ -209,7 +225,7 @@ static void install_prepared_sample(HdsSampleEngine *se, int index, const char *
 static bool load_sample_slot(HdsSampleEngine *se, int index, const char *path, int root_note) {
     if (index < 0 || index >= SAMPLE_SLOT_CAPACITY) return false;
     HdsPreparedSample ps;
-    if (!prepare_sample_file(path, &ps)) return false;
+    if (!prepare_sample_file(path, &ps, NULL)) return false;
     install_prepared_sample(se, index, path, root_note, &ps);
     return true;
 }
@@ -452,6 +468,34 @@ static int disk_cache_acquire(DiskFileCache *c, const char *path) {
     return victim;
 }
 
+static bool mpmc_pop(HdsMpmcQueue *q, void *out);
+
+// Takes every file the loader handed over (see loader_hand_file_to_disk_thread). A handle for a
+// path already cached is the newer one -- the file may have been replaced on disk -- so the old
+// entry is retired (closed now if idle, once its last stream ends otherwise) and the new handle
+// cached idle, ready for the zone's first note.
+static void disk_cache_adopt_loaded_files(DiskFileCache *c, HdsSampleEngine *se) {
+    HdsSampleLoaderState *ld = &se->pending->loader;
+    if (!atomic_load_explicit(&ld->opened_files_ready, memory_order_acquire)) return;
+    HdsOpenedFile of;
+    while (mpmc_pop(&ld->opened_files, &of)) {
+        int victim = -1;
+        for (int i = 0; i < DISK_FILE_CACHE_SIZE; i++) {
+            DiskFileEntry *ent = &c->e[i];
+            if (ent->f && !ent->stale && strcmp(ent->path, of.path) == 0) {
+                if (ent->refs == 0) disk_cache_close_entry(ent); else ent->stale = true;
+            }
+            if (ent->refs > 0) continue;
+            if (victim < 0 || !ent->f || (c->e[victim].f && ent->last_use < c->e[victim].last_use)) victim = i;
+        }
+        if (victim < 0) { fclose(of.f); continue; } // unreachable while DISK_FILE_CACHE_SIZE > MAX_SAMPLE_STREAMS
+        DiskFileEntry *ent = &c->e[victim];
+        disk_cache_close_entry(ent);
+        snprintf(ent->path, sizeof(ent->path), "%s", of.path);
+        ent->f = of.f; ent->refs = 0; ent->last_use = ++c->clock; ent->pos = -1; // position: wherever the loader left it
+    }
+}
+
 static void disk_cache_release_stream(DiskFileCache *c, SampleStream *st) {
     if (st->disk_file_entry >= 0) {
         DiskFileEntry *ent = &c->e[st->disk_file_entry];
@@ -612,8 +656,12 @@ static void disk_fill_reverse(SampleStream *st, unsigned int space, DiskScratch 
 // audio. If the session number read here is already older than the audio thread's current one
 // (it claimed again while this ran), the mismatch just keeps the voice silent until the next
 // START -- already pending -- is processed.
-static void sample_disk_start_session(SampleStream *st, DiskFileCache *files) {
+static void sample_disk_start_session(SampleStream *st, DiskFileCache *files, HdsSampleEngine *se) {
     disk_cache_release_stream(files, st);
+    // Again here, not just once per pass: the zone this note plays may have been installed (and
+    // its file handed over) after this pass's first check. The acquire on `command` makes that
+    // hand-off visible now.
+    disk_cache_adopt_loaded_files(files, se);
     unsigned int session = atomic_load_explicit(&st->session, memory_order_acquire);
     st->active_slot_index = atomic_load_explicit(&st->slot_index, memory_order_relaxed);
     st->active_start_frame = atomic_load_explicit(&st->start_frame, memory_order_relaxed);
@@ -667,13 +715,14 @@ void *sample_disk_thread_main(void *arg) {
     while (!atomic_load_explicit(&se->streams->sample_disk_thread_shutdown, memory_order_acquire)) {
         bool work_done = false;
         SampleStream *streams = se->streams->sample_streams;
+        disk_cache_adopt_loaded_files(sc.files, se);
 
         for (int i = 0; i < MAX_SAMPLE_STREAMS; i++) {
             SampleStream *st = &streams[i];
             // Acquire-exchange: pairs with claim_sample_stream's release-store of `command`.
             int cmd = atomic_exchange_explicit(&st->command, SAMPLE_CMD_NONE, memory_order_acquire);
             if (cmd == SAMPLE_CMD_START) {
-                sample_disk_start_session(st, sc.files);
+                sample_disk_start_session(st, sc.files, se);
                 work_done = true;
             } else if (cmd == SAMPLE_CMD_STOP) {
                 disk_cache_release_stream(sc.files, st); // the file stays open in the cache
@@ -1140,7 +1189,8 @@ static pthread_mutex_t g_sfz_parse_lock = PTHREAD_MUTEX_INITIALIZER;
 // opcodes are converted with. Touches no engine state: runs on the loader thread. Returns the
 // record count; the three arrays are malloc'd (NULL when the count is 0).
 static int sfz_build_records(const char *sfz_path, int osc_index, int owner_program, bool prepare,
-                             ZoneRecordWire **out_records, HdsPreparedSample **out_prepared, bool **out_ok, int *out_sw_default) {
+                             ZoneRecordWire **out_records, HdsPreparedSample **out_prepared, bool **out_ok, int *out_sw_default,
+                             HdsSampleLoaderState *handoff) {
     *out_records = NULL; if (out_prepared) *out_prepared = NULL; if (out_ok) *out_ok = NULL;
     *out_sw_default = -1;
     pthread_mutex_lock(&g_sfz_parse_lock);
@@ -1210,7 +1260,7 @@ static int sfz_build_records(const char *sfz_path, int osc_index, int owner_prog
 
         unsigned int total_frames = 0, sample_rate = 44100;
         if (prepare) {
-            ok[queued] = prepare_sample_file(r->sample, &prepared[queued]);
+            ok[queued] = prepare_sample_file(r->sample, &prepared[queued], handoff);
             if (ok[queued]) { total_frames = prepared[queued].total_frames; sample_rate = prepared[queued].sample_rate_hz; }
         } else {
             read_wav_frame_count(r->sample, &total_frames, &sample_rate); // best-effort -- 0/44100 leaves every frac/frame count below at its safe default
@@ -1377,7 +1427,7 @@ int hds_load_sfz_for_osc(HdsSampleEngine *se, int osc_index, int owner_program, 
     unload_zones_for_osc(se, osc_index, owner_program);
     ZoneRecordWire *records;
     int sw_default_note;
-    int n = sfz_build_records(sfz_path, osc_index, owner_program, false, &records, NULL, NULL, &sw_default_note);
+    int n = sfz_build_records(sfz_path, osc_index, owner_program, false, &records, NULL, NULL, &sw_default_note, NULL);
     for (int i = 0; i < n; i++) apply_zone_upsert(se, &records[i]);
     free(records);
     apply_sfz_sw_default(se, osc_index, owner_program, sw_default_note);
@@ -1549,12 +1599,12 @@ static void *sample_loader_thread_main(void *arg) {
         res.kind = job.kind;
         if (job.kind == HDS_LOAD_JOB_SAMPLE) {
             res.sample = job.sample;
-            res.ok = prepare_sample_file(job.sample.path, &res.prepared);
+            res.ok = prepare_sample_file(job.sample.path, &res.prepared, ld);
         } else {
             res.osc_index = job.osc_index;
             res.owner_program = job.owner_program;
             res.count = sfz_build_records(job.sfz_path, job.osc_index, job.owner_program, true,
-                                          &res.records, &res.prepared_list, &res.prepared_ok, &res.sw_default_note);
+                                          &res.records, &res.prepared_list, &res.prepared_ok, &res.sw_default_note, ld);
             fprintf(stderr, "[sfz] '%s': %d zone(s) prepared (osc %d)\n", job.sfz_path, res.count, job.osc_index + 1);
         }
         // The results queue only fills if the audio thread has stopped draining it.
@@ -1581,6 +1631,8 @@ bool hds_sample_loader_start(HdsSampleEngine *se) {
         mpmc_init(&ld->requests, ld->request_seq, ld->request_cells, sizeof(HdsLoadJob), HDS_LOADER_QUEUE_CAPACITY);
         mpmc_init(&ld->results, ld->result_seq, ld->result_cells, sizeof(HdsLoadResult), HDS_LOADER_QUEUE_CAPACITY);
         mpmc_init(&ld->garbage, ld->garbage_seq, ld->garbage_cells, sizeof(void *), HDS_LOADER_GARBAGE_CAPACITY);
+        mpmc_init(&ld->opened_files, ld->opened_file_seq, ld->opened_file_cells, sizeof(HdsOpenedFile), HDS_OPENED_FILE_CAPACITY);
+        atomic_store_explicit(&ld->opened_files_ready, true, memory_order_release);
         ld->initialized = true;
     }
     atomic_store_explicit(&ld->shutdown, false, memory_order_release);
@@ -1613,6 +1665,9 @@ void hds_sample_loader_free(HdsSampleEngine *se) {
     while (mpmc_pop(&ld->requests, &j)) {}
     if (ld->sfz_applying) { free_load_result(&ld->sfz_current); ld->sfz_applying = false; }
     loader_free_garbage(ld);
+    // Files the disk thread never took (it is stopped by now: CLAP deactivate(), shutdown).
+    HdsOpenedFile of;
+    while (mpmc_pop(&ld->opened_files, &of)) fclose(of.f);
 }
 
 // Audio thread: one finished zone load into the catalog.

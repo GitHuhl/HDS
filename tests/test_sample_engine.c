@@ -257,6 +257,20 @@ static void test_cached_file_reused_then_reloaded(void) {
 }
 
 #ifndef HDS_TEST_BASELINE
+// The loader hands each file it read to the disk thread still open, so a zone's first note needs
+// no fopen() there: with the file deleted right after its zone loaded, the note still streams.
+static void test_first_note_uses_loader_handle(void) {
+    char a[300]; snprintf(a, sizeof a, "%s/handed_over.wav", g_dir);
+    write_wav(a, 20000, value_minus_quarter);
+    ZoneRecordWire z = zone(10, a);
+    z.reverse = 1.0f; // streams from disk at once, nothing from the RAM pre-roll
+    test_check(load_zone(&z), "sample_engine/file_cache/handoff_load", "zone never loaded");
+    unlink(a);
+    float v = play_reverse_until_heard();
+    test_check(v == -0.25f, "sample_engine/file_cache/first_note_no_open", "the first note played %g: the disk thread had to open the (deleted) file itself", v);
+    remove_all_zones();
+}
+
 // Watchdog: these checks call audio-thread entry points with a zone/SFZ path that is a FIFO with
 // no writer -- fopen() on it blocks until someone opens the other end. On the audio thread, that
 // would be a hung engine; with the loader thread running, the call must return at once.
@@ -339,6 +353,7 @@ int main(int argc, char **argv) {
     test_retrigger_stress_never_mixes_files();
     test_cached_file_reused_then_reloaded();
 #ifndef HDS_TEST_BASELINE
+    test_first_note_uses_loader_handle();
     test_sfz_loads_through_loader();
     test_audio_thread_never_opens_files();
 #endif
