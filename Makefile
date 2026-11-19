@@ -154,7 +154,7 @@ hds_fx-windows.clap: $(WIN_HDS_FX_OBJS)
 
 # --- Tests (tests/, run by tests/run_tests.sh; see the README's Testing section) ---
 TEST_DIR := $(BUILD_DIR)/tests
-TEST_BINS := $(addprefix $(TEST_DIR)/,test_backend test_fx_chain test_recording test_clap_render test_clap_osc test_clap_patches test_clap_gui test_standalone)
+TEST_BINS := $(addprefix $(TEST_DIR)/,test_backend test_fx_chain test_sample_engine test_recording test_clap_render test_clap_osc test_clap_patches test_clap_gui test_standalone)
 LINUX_NAM := $(call nam_objs,linux)
 RECORDING_OBJ := $(call objs,linux-sa,core/recording_engine)
 
@@ -166,6 +166,9 @@ $(TEST_DIR)/test_backend:   TEST_LINK = $(call objs,linux,$(CORE_UNITS) $(FX_UNI
 $(TEST_DIR)/test_backend:   $(call objs,linux,$(CORE_UNITS) $(FX_UNITS)) $(RECORDING_OBJ) $(LINUX_NAM)
 $(TEST_DIR)/test_fx_chain:  TEST_LINK = $(call objs,linux,$(FX_UNITS)) $(LINUX_NAM)
 $(TEST_DIR)/test_fx_chain:  $(call objs,linux,$(FX_UNITS)) $(LINUX_NAM)
+# The DFD sample engine alone (stream sessions, disk thread, loader thread): no OSC/audio/FX.
+$(TEST_DIR)/test_sample_engine: TEST_LINK = $(call objs,linux,core/sample_engine core/sfz_parser) -lpthread
+$(TEST_DIR)/test_sample_engine: $(call objs,linux,core/sample_engine core/sfz_parser)
 $(TEST_DIR)/test_recording: TEST_LINK = $(RECORDING_OBJ) -lwavpack -lpthread
 $(TEST_DIR)/test_recording: $(RECORDING_OBJ)
 $(TEST_DIR)/test_clap_render: TEST_LINK = -ldl
