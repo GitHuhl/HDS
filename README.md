@@ -10,8 +10,8 @@ to `main`.**
 
 A software synthesizer with a shared DSP core, distributed as three builds:
 
-- **`synth_engine`** — standalone binary. Owns real audio I/O (ALSA or
-  PipeWire) and MIDI, controlled over OSC by anything that speaks the wire
+- **`synth_engine`** — standalone binary. Owns real audio I/O (PipeWire by
+  default, or ALSA) and MIDI, controlled over OSC by anything that speaks the wire
   protocol below. Can also open its own native GUI window (`--gui`), the
   primary control surface for this build.
 - **`hds.clap`** — the synth as a CLAP instrument plugin for any CLAP host
@@ -200,14 +200,14 @@ port.
 | --- | --- | --- |
 | `--osc-listen-port <port>` | `9000` | Incoming control port. |
 | `--osc-reply-host <host>` / `--osc-reply-port <port>` | `127.0.0.1` / `9001` | Where status feedback is sent. |
-| `--output-device <name>` / `--input-device <name>` | `default` | ALSA device string, or a PipeWire node name under `--backend pipewire`. An unopenable output device is fatal at startup (with an interactive recovery prompt if stdin is a terminal); an unopenable input device just leaves external input silent. |
-| `--backend alsa\|pipewire` | `alsa` | Audio platform shim. `pipewire` requires a build where `libpipewire-0.3` was found. |
+| `--output-device <name>` / `--input-device <name>` | `default` | A PipeWire node name (`wpctl status`), or an ALSA device string under `--backend alsa`. An unopenable output device is fatal at startup (with an interactive recovery prompt if stdin is a terminal); an unopenable input device just leaves external input silent. |
+| `--backend pipewire\|alsa` | `pipewire` | Audio platform shim. PipeWire is the default in every build where `libpipewire-0.3` was found (`nix-shell`, the flake); ALSA is still built in and opt-in with `--backend alsa`, and is the default only in builds without PipeWire (e.g. `make arm64`). |
 | `--pipewire-force-quantum` | off | Forces the whole PipeWire graph's buffer size down to match this engine's Latency control — affects every other PipeWire client on the system while running. |
 | `--sfz-vco1..4 <path>` | none | Loads an SFZ instrument onto that oscillator at startup. |
 | `--program <path.hdsprog>` | none | Loads a full Program at startup. |
 | `--master-volume <0.0-1.0>` | none | Sets master volume once at startup. |
 | `--gui` | off | Opens the native Cairo GUI as this process's own top-level window. |
-| `--no-midi` | off | Runs without the ALSA MIDI sequencer (control is OSC-only). Without it, a sequencer that can't be opened is fatal at startup. With `--output-device null --input-device null` this runs with no audio or MIDI hardware at all, which is how `make test` drives it. |
+| `--no-midi` | off | Runs without the ALSA MIDI sequencer (control is OSC-only). Without it, a sequencer that can't be opened only prints a warning, and the engine runs OSC-only. With `--output-device null --input-device null` this runs with no audio or MIDI hardware at all, which is how `make test` drives it. |
 
 Arrow keys work as live controls whenever stdin is a real terminal:
 Up/Down nudge master volume, Left/Right cycle through saved Programs in
@@ -357,7 +357,9 @@ it sizes itself as a fraction of that constant.
   with mingw-w64 and need `libmcfgthread-N.dll` alongside them (copied
   automatically by the build) — everything else statically links.
 - **PipeWire**: auto-detected at build time via pkg-config; `make` prints
-  which backend it found. Falls back to ALSA-only if PipeWire isn't present.
+  whether it found it. When found, it is the standalone's default audio backend
+  (`--backend alsa` still selects ALSA); without it, the build is ALSA-only and
+  ALSA is the default.
 - **Android** *(experimental, unofficial — currently disabled: its SDK entries in
   `shell.nix` and the `make android` target are commented out, so `nix-shell`
   needs no license acceptance. Uncomment the lines marked `ANDROID DISABLED` to

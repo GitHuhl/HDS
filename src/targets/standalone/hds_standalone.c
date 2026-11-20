@@ -1316,15 +1316,16 @@ int main(int argc, char **argv) {
     const char *cli_output_device = NULL;
     const char *cli_input_device = NULL;
     // --backend alsa|pipewire: chooses the audio platform shim's backend (see the "Audio platform
-    // shim" section above) once at startup -- ALSA remains the default, unchanged. "pipewire"
-    // opens a native libpipewire client stream instead (only available in a build where the
-    // Makefile's pkg-config check found libpipewire-0.3 -- see HDS_PIPEWIRE_ENABLED), talking to
-    // the PipeWire daemon directly rather than through the ALSA "pipewire" plugin, so it works
-    // even when that plugin itself fails to load. Device names mean different things per backend:
+    // shim" section above) once at startup. PipeWire is the default in every build that has it
+    // (the Makefile's pkg-config check found libpipewire-0.3 -- see HDS_PIPEWIRE_ENABLED): a native
+    // libpipewire client stream, talking to the PipeWire daemon directly rather than through the
+    // ALSA "pipewire" plugin, so a broken ALSA setup can't keep the engine from starting. ALSA is
+    // still built in and selectable with --backend alsa, and stays the default only in builds
+    // without PipeWire (e.g. the arm64 cross build). Device names mean different things per backend:
     // an ALSA device string (`aplay -l`-style, e.g. "hw:1,0") under --backend alsa, or a PipeWire
     // target node name (`wpctl status`-style) -- or "default" for PipeWire's own session-manager
     // default -- under --backend pipewire.
-    const char *cli_backend = "alsa";
+    const char *cli_backend = HDS_PIPEWIRE_ENABLED ? "pipewire" : "alsa";
     // --sfz-vco1 <path> .. --sfz-vco4 <path>: load a multisample instrument onto that oscillator
     // at startup, directly from the backend's own local filesystem -- no frontend needs to ever
     // connect for this synth to have playable sample content (see hds_load_sfz_for_osc() above
@@ -1371,7 +1372,7 @@ int main(int argc, char **argv) {
 #else
         fprintf(stderr, "This build has no PipeWire support (the Makefile's pkg-config check didn't find "
                          "libpipewire-0.3 at build time) -- rebuild inside nix-shell (see shell.nix), install "
-                         "libpipewire-0.3-dev and rebuild, or drop --backend pipewire to use ALSA.\n");
+                         "libpipewire-0.3-dev and rebuild, or use --backend alsa.\n");
         return 1;
 #endif
     } else if (strcmp(cli_backend, "alsa") != 0) {
@@ -1598,8 +1599,10 @@ int main(int argc, char **argv) {
     hds_sample_loader_start(&g_sample_engine);
 
     // --no-midi leaves seq_handle NULL; every MIDI step below (auto-connect, input polling, close)
-    // is skipped for a NULL handle. Without it, a sequencer that fails to open is still fatal, so a
-    // broken MIDI setup is never silently ignored.
+    // is skipped for a NULL handle. MIDI input goes through the ALSA sequencer (PipeWire bridges
+    // its MIDI devices into it), so a sequencer that fails to open -- no /dev/snd/seq, a container,
+    // a broken ALSA setup -- does the same, with a warning, rather than stopping the engine: audio
+    // and OSC control don't need it.
     snd_seq_t *seq_handle = NULL;
     int our_midi_port = -1;
     if (cli_no_midi) {
@@ -1607,10 +1610,12 @@ int main(int argc, char **argv) {
     } else {
         int seq_err = snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_INPUT, 0);
         if (seq_err < 0) {
-            fprintf(stderr, "MIDI sequencer failed to open: %s (run with --no-midi to start without MIDI)\n", snd_strerror(seq_err));
-            close_pcm_stream(pcm_handle); if (pcm_capture_handle) close_pcm_stream(pcm_capture_handle);
-            lo_address_free(osc_reply_addr); lo_server_free(osc_server); return 1;
+            fprintf(stderr, "WARNING: MIDI sequencer failed to open: %s -- continuing without MIDI; control is "
+                             "OSC-only this session (--no-midi skips this attempt)\n", snd_strerror(seq_err));
+            seq_handle = NULL;
         }
+    }
+    if (seq_handle) {
         snd_seq_set_client_name(seq_handle, "YourSynth Socket Engine");
         our_midi_port = snd_seq_create_simple_port(seq_handle, "Input", SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE, SND_SEQ_PORT_TYPE_MIDI_GENERIC);
 

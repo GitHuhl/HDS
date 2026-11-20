@@ -38,8 +38,9 @@ backend -- see hds_standalone.c's "Audio platform shim" section) -- auto-detecte
 rather than a manual flag to flip (see HDS_WAVPACK_ENABLED's own comment for that pattern), so a
 machine without libpipewire-0.3-dev (a plain apt-get libasound2-dev-only setup, or the Pi) still
 gets a normal ALSA-only build with nothing to change by hand, while nix-shell (which provides
-pipewire in shell.nix's buildInputs) picks it up automatically. --backend pipewire at runtime
-only exists in a build where this actually detected true -- see hds_standalone.c's own
+pipewire in shell.nix's buildInputs) picks it up automatically. When detected, PipeWire is
+also the standalone's default backend at runtime (--backend alsa still selects ALSA); in a build
+without it, ALSA is the only backend and the default -- see hds_standalone.c's own
 HDS_PIPEWIRE_ENABLED guard.
 Scoped to $(BIN) only: the CLAP plugin target never touches audio device I/O at all (the host
 owns that via CLAP's own audio-ports extension -- see clap_plugin.c's header comment), and the
