@@ -223,7 +223,7 @@ the oscillator's column, and all of them under **String Edit…**.
 | Fret Buzz (`buzz`) | 0-100 | The string slapping a fret near the nut when it swings wide |
 | Pickup (`pickup_pos`) | 1-50 % | Where the string is heard (from the nut) |
 | Body, Size (`body`, `body_size`) | 0-100 | Resonant body mix, and its size (larger = lower resonances) |
-| Detune, Coupling, Width (`pol_detune`, `pol_coupling`, `pol_width`) | 0-20 c; 0-100 | The second polarization: its tuning offset (beating), energy exchange with the first at the bridge (two-stage decay), and stereo spread |
+| Detune, Coupling, Width (`pol_detune`, `pol_coupling`, `pol_width`) | 0-20 c; 0-100 | The second polarization: its tuning offset (beating), energy exchange with the first at the bridge, as a rate independent of pitch (two-stage decay, slow swells at high settings), and stereo spread |
 
 The loop is tuned exactly: the delay of the loss and stiffness filters at the
 fundamental is measured and taken out, and the fractional part is corrected at

@@ -175,7 +175,11 @@ static void update_coeffs(HdsStringVoice *s, const StringModelParams *sp, float 
         P->ni = ni;
     }
     s->half_len = 0.5f * (float)s->pol[0].ni;
-    float th = clamp01(sp->pol_coupling / 100.0f) * 0.2f;
+    // Coupling is a rate, not a per-period amount: energy moves between the two polarizations at
+    // up to 0.6 Hz (Coupling 100), the same at every pitch. Applied once per period, so the angle
+    // per pass scales with the period. (Per-period rotation made the exchange 20x too fast at
+    // default settings and pitch-dependent: an audible tremolo.)
+    float th = 2.0f * (float)M_PI * 0.6f * clamp01(sp->pol_coupling / 100.0f) / f;
     s->rot_c = cosf(th); s->rot_s = sinf(th);
     s->f0 = f;
 
@@ -469,6 +473,6 @@ void hds_string_default_params(StringModelParams *sp) {
     sp->decay = 4.0f; sp->damping = 40.0f; sp->decay_keytrack = 50.0f; sp->release = 0.25f;
     sp->stiffness = 10.0f; sp->nonlinear = 15.0f;
     sp->harmonic_node = 0.0f; sp->harmonic_amt = 50.0f; sp->buzz = 0.0f;
-    sp->pol_detune = 1.5f; sp->pol_coupling = 20.0f; sp->pol_width = 40.0f;
+    sp->pol_detune = 1.5f; sp->pol_coupling = 5.0f; sp->pol_width = 40.0f;
     sp->body = 35.0f; sp->body_size = 50.0f;
 }
