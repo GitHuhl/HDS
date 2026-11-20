@@ -51,6 +51,20 @@ Background on the less obvious build choices (NAM symbol visibility, the mingw-w
 workarounds, static vs. dynamic linking on Windows, arm64 library bundling, PipeWire detection)
 is in [`docs/building.md`](docs/building.md).
 
+### Run with Nix (no checkout needed)
+
+`flake.nix` packages the standalone for x86_64 and aarch64 Linux, built from whichever revision you
+point it at, against the same pinned nixpkgs as `shell.nix`:
+
+```bash
+nix run github:GitHuhl/HDS -- --gui
+```
+
+Everything after `--` goes to `synth_engine` (see [Command-line flags](#command-line-flags)); drop
+`--gui` to run it headless, controlled over OSC. `nix run .` does the same from a checkout, and
+`nix build` leaves the binary at `result/bin/hds`. The flake needs Nix's `flakes` and `nix-command`
+features enabled, and a private repository needs your Nix to be able to fetch it from GitHub.
+
 ## Testing
 
 ```
