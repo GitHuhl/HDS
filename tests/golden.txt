@@ -31,7 +31,7 @@ clap_patches/square 309cadef4bada053
 clap_patches/triangle a0e1f66212b64373
 clap_patches/two_osc 58f406f278acd11f
 clap_patches/two_sines c1aca41d11b5d5a7
-clap_patches/unison_saw cad8d60b5124829b
+clap_patches/unison_saw e0fc31b6c8b66f2b
 clap_render/hds/notes 3aa05ee7af347da3
 fx_chain/32slot_8source/eq3 0931c2969ae749b7
 fx_chain/32slot_8source/fdnverb 5c51a3eb0a865d3a

@@ -352,7 +352,11 @@ float render_unison_saw(float phases[UNISON_SAW_VOICES], float base_dt, float de
         phases[u] += dt;
         if (phases[u] >= 1.0f) phases[u] -= 1.0f;
     }
-    float inv_n = 1.0f / (float)UNISON_SAW_VOICES;
+    // 1/sqrt(N), not 1/N: the voices are detuned and start at random phases, so they add up in
+    // power (level ~ sqrt(N) x one voice), not in amplitude. Dividing by N left the supersaw
+    // ~8.5 dB below a plain saw; this puts it level with one (measured, held note).
+    const float inv_n = 0.37796447f; // 1/sqrt(UNISON_SAW_VOICES)
+    _Static_assert(UNISON_SAW_VOICES == 7, "update inv_n to 1/sqrt(UNISON_SAW_VOICES)");
     if (out_l) *out_l = sum_l * inv_n;
     if (out_r) *out_r = sum_r * inv_n;
     return sum_mono * inv_n;
