@@ -157,7 +157,7 @@ typedef enum {
     WAVE_OFF, // Compute-bypass: skips pan trig + render + mix for this oscillator. Phase still
               // advances and its envelope still ticks (Hard Sync/FM and voice-idle logic depend on
               // both staying live), so nothing downstream needs to special-case an Off oscillator.
-    WAVE_REVSAW // Reverse (descending-ramp) sawtooth -- appended after WAVE_OFF (not inserted next
+    WAVE_REVSAW, // Reverse (descending-ramp) sawtooth -- appended after WAVE_OFF (not inserted next
                 // to WAVE_SAW) for the same reason WAVE_PULSE/WAVE_SAMPLE were appended: existing
                 // saved patches' numeric shape indices, WAVE_OFF's own included, must never shift.
                 // A plain sawtooth and its reverse are spectrally identical (every harmonic has the
@@ -180,6 +180,10 @@ typedef enum {
                 // contour (snap-then-rise vs. rise-then-snap) even though neither would sound
                 // different as a lone audio tone -- the classic reason hardware like the Moog Model
                 // D/Roland SE-02 offers a dedicated reverse-saw option on a modulation oscillator.
+    WAVE_STRING // Plucked String: a physically modeled string (src/core/string_model.c), appended
+                // for the same never-shift-saved-indices reason as everything above. Its controls
+                // are ProgramState.str[osc]; its delay lines live in the engine's HdsStringPool,
+                // claimed per sounding note (SynthVoice.str_slot).
 } WaveType;
 
 typedef struct {
@@ -365,6 +369,45 @@ typedef struct {
 // into via fx_source, not part of any one patch -- a deliberate refinement over an FX slot's
 // type/mix/bypass/params ever being treated as Program-scoped, a holdover from when there was only
 // ever one Program and the FX pool WAS that Program's own FX -- see the "Real Combi mode" plan.
+
+// Plucked String oscillator (WAVE_STRING) controls, one set per oscillator (ProgramState.str[osc]),
+// in the units the GUI/OSC show. See src/core/string_model.c for what each one does to the model.
+typedef enum {
+    STRING_EXC_PLUCK = 0,  // finger: smooth triangular displacement at the pluck point
+    STRING_EXC_PICK,       // plectrum: sharp displacement plus a short scrape
+    STRING_EXC_HAMMER,     // felt hammer: nonlinear mass-spring contact, velocity sets force
+    STRING_EXC_NOISE,      // filtered noise burst
+    STRING_EXC_BOW,        // bow: stick-slip friction while the note is held
+    STRING_EXC_COUNT
+} StringExciter;
+
+typedef struct {
+    float exciter;        // StringExciter
+    float exc_hardness;   // 0-100: pluck/pick edge sharpness, hammer felt hardness, noise burst shortness
+    float exc_bright;     // 0-100: excitation brightness
+    float exc_vel_bright; // 0-100: how much velocity adds brightness
+    float exc_noise;      // 0-100: noise/scrape mixed into the excitation
+    float exc_input;      // 0-100: other oscillators routed into this one by the FM algorithm, injected as excitation
+    float bow_pressure;   // 0-100
+    float bow_speed;      // 0-100
+    float pluck_pos;      // 1-50: % of string length from the nut where it's excited
+    float pickup_pos;     // 1-50: % of string length from the nut where it's heard
+    float decay;          // 0.05-30 s: time to fall 60 dB at middle C (low partials)
+    float damping;        // 0-100: how much faster high partials die than low ones
+    float decay_keytrack; // 0-100: higher notes decay faster (100 = decay time halves per octave)
+    float release;        // 0.01-10 s: 60 dB decay time once the key is released (damper)
+    float stiffness;      // 0-100: inharmonicity (stretched upper partials, like a stiff wire)
+    float nonlinear;      // 0-100: tension modulation (pitch rises with amplitude, falls as it decays)
+    float harmonic_node;  // 0 = off, 2-9: lightly touch the string at 1/N of its length
+    float harmonic_amt;   // 0-100: how firmly
+    float buzz;           // 0-100: fret buzz (displacement limited against a fret near the nut)
+    float pol_detune;     // 0-20 cents: second polarization's tuning offset (beating)
+    float pol_coupling;   // 0-100: energy exchange between the two polarizations at the bridge
+    float pol_width;      // 0-100: stereo spread of the two polarizations
+    float body;           // 0-100: resonant body mix
+    float body_size;      // 0-100: body size (larger = lower resonances)
+} StringModelParams;
+
 typedef struct {
     float is_polyphonic;
     float vco1_shape;
@@ -624,6 +667,9 @@ typedef struct {
     float vco2_curve_drive;
     float vco3_curve_drive;
     float vco4_curve_drive;
+
+    // Plucked String (WAVE_STRING) controls, one set per oscillator -- see StringModelParams.
+    StringModelParams str[4];
 } ProgramState;
 
 typedef struct {
@@ -1152,6 +1198,11 @@ typedef struct {
     // currently playing a zone with drum_bus set, or not even WAVE_SAMPLE -- render_audio_block's
     // stereo-mixer stage is a complete no-op for this feature in that ordinary case.
     int vco1_drum_bus, vco2_drum_bus, vco3_drum_bus, vco4_drum_bus;
+
+    // Plucked String (WAVE_STRING): the HdsStringPool slot each oscillator's string occupies (-1:
+    // none), and a pluck requested by note-on, carried out by the next render (see string_model.c).
+    int str_slot[4];
+    bool str_trigger[4];
 } SynthVoice;
 
 
@@ -1992,6 +2043,56 @@ typedef struct {
     int event_count;
     int playback_cursor; // next event index to fire during Seq-mode playback
 } SeqMidiLane;
+
+// --- Plucked String model state (string_model.c) ---
+// Each sounding string needs its own delay lines (a whole waveguide per note), far too large to
+// keep inside every SynthVoice (MAX_VOICES of them, some hosts keep voices on the stack). So the
+// engine owns a fixed pool; a note claims one slot per WAVE_STRING oscillator and gives it back
+// when that oscillator's Amp EG goes idle (or it is stolen, oldest first, when all are busy).
+#define STRING_POOL_SIZE   64
+#define STRING_LINE_LEN    4096 // power of two; lowest string ~12 Hz
+#define STRING_LINE_MASK   (STRING_LINE_LEN - 1)
+#define STRING_DISP_STAGES 4
+#define STRING_BODY_MODES  3
+
+typedef struct {
+    float line[STRING_LINE_LEN];  // the loop: one round trip nut -> bridge -> nut
+    int ni;                       // integer part of the loop delay (samples)
+    float frac_eta, frac_x1, frac_y1;                                   // fractional-delay allpass
+    float disp_c, disp_x1[STRING_DISP_STAGES], disp_y1[STRING_DISP_STAGES]; // stiffness allpasses
+    float loss_g, loss_a, loss_y1;                                      // frequency-dependent loss
+} HdsStringPol;
+
+typedef struct {
+    int *owner;                   // &SynthVoice.str_slot[osc] of the note using it (NULL: free)
+    unsigned int stamp;           // claim order, for stealing the oldest
+    int w;                        // shared write index of both polarizations' lines
+    HdsStringPol pol[2];          // two transverse polarizations
+    bool pol2_on;
+    float half_len;               // loop delay / 2 (samples): positions along the string map to ages
+    float f0;                     // current fundamental (Hz), after tension modulation
+    float rot_c, rot_s;           // polarization coupling rotation
+    bool cache_valid; float cache_f, cache_rel; StringModelParams cache_sp; // last coefficient design inputs
+    int ctl_count;                // samples until the next coefficient update
+    float rel_mix;                // 0 held .. 1 released (smoothed)
+    float energy;                 // smoothed displacement power (tension modulation)
+    float vel01;
+    int exc_type, exc_t, exc_len;
+    float exc_amp, exc_lp, exc_lp_a, exc_env, exc_decay;
+    float hammer_pos, hammer_vel, hammer_m_inv, hammer_k; bool hammer_on;
+    float bow_env, bow_prev_y;
+    unsigned int rng;
+    float body_b0[STRING_BODY_MODES], body_a1[STRING_BODY_MODES], body_a2[STRING_BODY_MODES];
+    float body_x1[STRING_BODY_MODES], body_x2[STRING_BODY_MODES], body_y1[STRING_BODY_MODES], body_y2[STRING_BODY_MODES];
+    float dc_x1, dc_y1, dc_x1b, dc_y1b;
+} HdsStringVoice;
+
+typedef struct {
+    HdsStringVoice v[STRING_POOL_SIZE];
+    unsigned int clock;
+    float scratch[STRING_LINE_LEN]; // note-on pluck shape (audio thread only)
+} HdsStringPool;
+
 typedef struct {
     // --- Sequencer MIDI lanes (the Sequencer audio lanes / sample-streaming / pending-load
     // pieces of this same "per-instance state" concept live on HdsSampleSlotState/
@@ -2102,6 +2203,9 @@ typedef struct {
     uint32_t      fx_upload_expected_crc32;
     int           fx_upload_slot;   // -1 when no upload is in progress
     bool          fx_upload_is_ir;  // which of that slot's two fields this upload targets
+
+    // Plucked String delay lines (see HdsStringPool).
+    HdsStringPool strings;
 } HdsEngineState;
 #if HDS_NAM_ENABLED
 typedef struct {

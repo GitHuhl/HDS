@@ -43,6 +43,9 @@ static const Patch PATCHES[] = {
     { "lfo_filter",    { {"/hds/filter/0/type", 1}, {"/hds/filter/0/cutoff", 800}, {"/hds/lfo/0/wave", 0}, {"/hds/lfo/0/rate", 3}, {"/hds/lfo/0/depth", 60}, {"/hds/lfo/0/dest", 90} } },
     { "mono_glide",    { {"/hds/is_polyphonic", 0}, {"/hds/portamento_time_ms", 200} } },
     { "arpeggiator",   { {"/hds/arp/enabled", 1}, {"/hds/arp/rate", 2} } },
+    { "string_pluck",  { {"/hds/vco1/shape", 10} } },
+    { "string_hammer", { {"/hds/vco1/shape", 10}, {"/hds/str/0/exciter", 2}, {"/hds/str/0/stiffness", 40}, {"/hds/str/0/buzz", 30} } },
+    { "string_bow",    { {"/hds/vco1/shape", 10}, {"/hds/str/0/exciter", 4}, {"/hds/str/0/harmonic_node", 3} } },
 };
 #define NPATCHES ((int)(sizeof PATCHES / sizeof PATCHES[0]))
 

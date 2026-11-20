@@ -49,7 +49,8 @@ NAM_UNITS := activations container conv1d convnet dsp get_dsp linear lstm nam_fi
 
 # --- Source units, by subsystem (paths under src/, no extension) ---
 CORE_UNITS  := core/backend core/render core/voices core/midi_dispatch core/arpeggiator core/metronome core/defaults \
-               core/fx_upload core/program_files core/json core/tuning core/smf_import core/sfz_parser core/osc_protocol core/sample_engine
+               core/fx_upload core/program_files core/json core/tuning core/smf_import core/sfz_parser core/osc_protocol core/sample_engine \
+               core/string_model
 FX_UNITS    := fx/fx_chain $(addprefix fx/,fx_airwindows_mod fx_airwindows_tone fx_nam fx_eq_filter \
                fx_compressors fx_limiters fx_pitch fx_reverb_delay)
 FX_GUI_UNITS := gui/hds_fx_gui_draw gui/hds_fx_gui_browser
@@ -154,7 +155,7 @@ hds_fx-windows.clap: $(WIN_HDS_FX_OBJS)
 
 # --- Tests (tests/, run by tests/run_tests.sh; see the README's Testing section) ---
 TEST_DIR := $(BUILD_DIR)/tests
-TEST_BINS := $(addprefix $(TEST_DIR)/,test_backend test_fx_chain test_sample_engine test_recording test_clap_render test_clap_osc test_clap_patches test_clap_gui test_standalone)
+TEST_BINS := $(addprefix $(TEST_DIR)/,test_backend test_fx_chain test_sample_engine test_string_model test_recording test_clap_render test_clap_osc test_clap_patches test_clap_gui test_standalone)
 LINUX_NAM := $(call nam_objs,linux)
 RECORDING_OBJ := $(call objs,linux-sa,core/recording_engine)
 
@@ -169,6 +170,9 @@ $(TEST_DIR)/test_fx_chain:  $(call objs,linux,$(FX_UNITS)) $(LINUX_NAM)
 # The DFD sample engine alone (stream sessions, disk thread, loader thread): no OSC/audio/FX.
 $(TEST_DIR)/test_sample_engine: TEST_LINK = $(call objs,linux,core/sample_engine core/sfz_parser) -lpthread
 $(TEST_DIR)/test_sample_engine: $(call objs,linux,core/sample_engine core/sfz_parser)
+# The Plucked String model alone.
+$(TEST_DIR)/test_string_model: TEST_LINK = $(call objs,linux,core/string_model)
+$(TEST_DIR)/test_string_model: $(call objs,linux,core/string_model)
 $(TEST_DIR)/test_recording: TEST_LINK = $(RECORDING_OBJ) -lwavpack -lpthread
 $(TEST_DIR)/test_recording: $(RECORDING_OBJ)
 $(TEST_DIR)/test_clap_render: TEST_LINK = -ldl

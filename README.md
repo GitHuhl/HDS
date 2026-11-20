@@ -73,7 +73,7 @@ make test-golden  # same, but rewrite tests/golden.txt
 ```
 
 Run inside `nix-shell`: it pins every library the results depend on and provides Xvfb for the
-GUI test. `make test` runs nine programs from `tests/`:
+GUI test. `make test` runs ten programs from `tests/`:
 
 - `test_backend` — links `backend.o` directly: the JSON reader (valid documents, escapes, nesting,
   and rejection of malformed input), the Scala `.scl` tuning loader (cents, ratios, comments, CRLF;
@@ -87,6 +87,10 @@ GUI test. `make test` runs nine programs from `tests/`:
   zones play from their end, loop splices are crossfaded, a reloaded file is never read through a
   handle cached from before, and zone and SFZ loads never open a file
   on the audio thread (checked with a FIFO that blocks any open). Pass/fail checks only.
+- `test_string_model` — the Plucked String oscillator's model on its own: the fundamental within
+  1 cent from E1 to E7, decay time against the Decay setting, release damping, the harmonic-node
+  touch suppressing the fundamental, and every exciter finite and bounded with every control at its
+  minimum and maximum. Pass/fail checks only (the full-engine renders are in `test_clap_patches`).
 - `test_recording` — records WAV and WavPack through the recording engine and reads both back,
   checking every sample.
 - `test_clap_render` — plays notes through `hds.clap` (checks it sounds and then releases to
@@ -186,6 +190,47 @@ A few notable addresses:
   gain, which defaults to silent) — useful since a bus sums however many
   zones got assigned to it. The FX and Routing tabs' Source rows/combos
   already show/label Drum Bus sources correctly too.
+
+- `/hds/str/<osc 0-3>/<control>` (and `/hds/combi/<lane>/str/...`) — the
+  Plucked String oscillator (Shape 10). See [Plucked String](#plucked-string).
+
+## Plucked String
+
+Shape 10 turns an oscillator into a physically modelled string: a
+dual-polarization digital waveguide (`src/core/string_model.c`), excited by
+a pluck, plectrum, felt hammer, noise burst or bow, and heard through a
+pickup and a small resonant body. It follows the oscillator's pitch (Pitch,
+Fine, bend, glide, vibrato, microtuning), its Amp EG and Volume/Pan. Its
+controls appear when the shape is selected: Decay, Damping and Position in
+the oscillator's column, and all of them under **String Edit…**.
+
+| Control (`/hds/str/<osc>/…`) | Range | What it does |
+| --- | --- | --- |
+| Exciter (`exciter`) | 0-4 | Pluck (finger), Pick (plectrum + scrape), Hammer (nonlinear felt, velocity sets force), Noise (filtered burst), Bow (stick-slip friction while the key is held) |
+| Hardness (`exc_hardness`) | 0-100 | Pluck/pick edge sharpness, hammer felt hardness and contact time, noise burst shortness |
+| Bright, Vel>Brt (`exc_bright`, `exc_vel_bright`) | 0-100 | Excitation brightness, and how much velocity adds to it |
+| Noise (`exc_noise`) | 0-100 | Finger/pick/hammer noise mixed into the excitation |
+| Position (`pluck_pos`) | 1-50 % | Where the string is plucked, struck or bowed (from the nut) |
+| Ext In (`exc_input`) | 0-100 | Whatever the FM algorithm routes into this oscillator, injected as continuous excitation (a resonator for the other oscillators) |
+| Pressure, Speed (`bow_pressure`, `bow_speed`) | 0-100 | Bow only |
+| Decay (`decay`) | 0.05-30 s | Time for the fundamental to fall 60 dB at middle C |
+| Damping (`damping`) | 0-100 | How much faster upper partials die than the fundamental |
+| Key Trk (`decay_keytrack`) | 0-100 | Higher notes decay faster (100: decay time halves per octave) |
+| Release (`release`) | 0.01-10 s | Decay time after note-off (a damper; never longer than Decay) |
+| Stiffness (`stiffness`) | 0-100 | Inharmonicity: upper partials stretched sharp like a stiff wire |
+| Tension (`nonlinear`) | 0-100 | Tension modulation: loud notes start sharp and settle as they decay |
+| Harmonic, Touch (`harmonic_node`, `harmonic_amt`) | Off, 1/2-1/9; 0-100 | A finger lightly touching the string at 1/N of its length (flageolet harmonics) |
+| Fret Buzz (`buzz`) | 0-100 | The string slapping a fret near the nut when it swings wide |
+| Pickup (`pickup_pos`) | 1-50 % | Where the string is heard (from the nut) |
+| Body, Size (`body`, `body_size`) | 0-100 | Resonant body mix, and its size (larger = lower resonances) |
+| Detune, Coupling, Width (`pol_detune`, `pol_coupling`, `pol_width`) | 0-20 c; 0-100 | The second polarization: its tuning offset (beating), energy exchange with the first at the bridge (two-stage decay), and stereo spread |
+
+The loop is tuned exactly: the delay of the loss and stiffness filters at the
+fundamental is measured and taken out, and the fractional part is corrected at
+the fundamental, so notes stay within a cent from E1 to E7 at any damping. The
+loss filter is designed per note from Decay and Damping, so decay times hold
+across the keyboard. Each sounding note borrows one of 64 string slots (the
+oldest is stolen if all are busy).
 
 A CLAP plugin instance runs its own embedded OSC server too (default
 `9010`/`9011`, incrementing per instance), so any OSC controller can drive

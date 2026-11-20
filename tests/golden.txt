@@ -1,6 +1,6 @@
 # Expected fingerprints for tests/run_tests.sh. Regenerate with 'make test-golden' after an
 # intended change to the sound or the GUI, and review the diff before committing.
-backend/osc/address_space 289ea9353da67c80
+backend/osc/address_space 154ce0accd09e288
 clap_gui/hds/tab0 f242ff547be349d6
 clap_gui/hds/tab1 d27c2402d0e0efd4
 clap_gui/hds/tab2 e484abfb618afbee
@@ -12,7 +12,7 @@ clap_gui/hds_fx/tab0 c6d1ece45326b03d
 clap_osc/params/audio 0d6074db8093774b
 clap_osc/sfz/audio 6bea67e58f4bc5c3
 clap_osc/smf/report c2471f47e1141842
-clap_osc/state_dump/default a7c929d38efa3855
+clap_osc/state_dump/default c0fc6911bfd9fa8d
 clap_patches/amp_env 316f77b273e58cbb
 clap_patches/arpeggiator f3b9fdce2033d0c3
 clap_patches/default 50c6e6b5daec884b
@@ -28,6 +28,9 @@ clap_patches/noise 0a138bb158b9b21b
 clap_patches/pulse feeeacda72692333
 clap_patches/sine 6e12eddaf595d23b
 clap_patches/square 309cadef4bada053
+clap_patches/string_bow 3f3e57fdbc6a726b
+clap_patches/string_hammer ab08e5feea2f4d4f
+clap_patches/string_pluck fcb5cc6631150ec1
 clap_patches/triangle a0e1f66212b64373
 clap_patches/two_osc 58f406f278acd11f
 clap_patches/two_sines c1aca41d11b5d5a7

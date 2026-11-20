@@ -5,7 +5,7 @@
 // MIDI hardware needed) and its own OSC ports. Checks:
 //   - it starts and answers /hds/ping
 //   - the audio loop runs: status pushes keep arriving
-//   - /hds/request_state returns one message per control address (5981)
+//   - /hds/request_state returns one message per control address (6845)
 //   - an OSC parameter write shows up in the next state dump
 //   - end to end: import a generated MIDI file, start recording to a WAV, press Play on the
 //     Sequencer, stop; the WAV is a valid, finalized file and contains the notes (not silence)
@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define LISTEN_PORT "9100"
@@ -50,8 +51,9 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 static void collect(int ms, const char *until) {
     double end = now() + ms / 1000.0;
     while (now() < end) {
-        lo_server_recv_noblock(g_srv, 20);
+        while (lo_server_recv_noblock(g_srv, 0) > 0) {} // drain everything queued, then wait a little
         if (until && find_msg(until)) return;
+        lo_server_recv_noblock(g_srv, 5);
     }
 }
 static void send_f(const char *path, float v) { lo_send_from(g_app, g_srv, LO_TT_IMMEDIATE, path, "f", v); }
@@ -126,6 +128,9 @@ int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s scratchdir synth_engine\n", argv[0]); return 2; }
     const char *dir = argv[1];
     g_srv = lo_server_new(NULL, NULL);
+    // The state dump is ~7000 datagrams in a burst: give the socket room so none are dropped.
+    int big = 8 << 20; setsockopt(lo_server_get_socket_fd(g_srv), SOL_SOCKET, SO_RCVBUFFORCE, &big, sizeof big);
+    setsockopt(lo_server_get_socket_fd(g_srv), SOL_SOCKET, SO_RCVBUF, &big, sizeof big);
     lo_server_add_method(g_srv, NULL, NULL, on_any, NULL);
     char reply_port[16]; snprintf(reply_port, sizeof reply_port, "%d", lo_server_get_port(g_srv));
     g_app = lo_address_new("127.0.0.1", LISTEN_PORT);
@@ -154,7 +159,7 @@ int main(int argc, char **argv) {
 
     // full state dump
     int n = request_state();
-    test_check(find_msg("/hds/status/state_dump_complete") && n == 5981, "standalone/state_dump", "%d control messages, expected 5981", n);
+    test_check(find_msg("/hds/status/state_dump_complete") && n == 6845, "standalone/state_dump", "%d control messages, expected 6845", n);
 
     // parameter write
     send_f("/hds/master_volume", 0.5f); collect(200, NULL);

@@ -49,6 +49,7 @@ run() { # name, command...
 run backend "$bindir/test_backend" "$out"
 run fx_chain "$bindir/test_fx_chain"
 run sample_engine "$bindir/test_sample_engine" "$out"
+run string_model "$bindir/test_string_model"
 run recording "$bindir/test_recording" "$out"
 run clap_render "$bindir/test_clap_render" "$synth" "$fx"
 run clap_osc "$bindir/test_clap_osc" "$out" "$synth"
