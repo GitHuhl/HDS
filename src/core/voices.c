@@ -37,6 +37,7 @@ void init_voice(SynthVoice *voice) {
     voice->vco1_using_own_ampeg = false; voice->vco2_using_own_ampeg = false;
     voice->vco3_using_own_ampeg = false; voice->vco4_using_own_ampeg = false;
     voice->vco1_drum_bus = 0; voice->vco2_drum_bus = 0; voice->vco3_drum_bus = 0; voice->vco4_drum_bus = 0;
+    for (int o = 0; o < 4; o++) { voice->str_slot[o] = -1; voice->str_trigger[o] = false; }
     for (int l = 0; l < LFO_COUNT; l++) {
         voice->lfo_phase[l] = 0.0f;
         voice->lfo_decim_counter[l] = 0;
@@ -239,6 +240,12 @@ void handle_note_on(HdsSampleEngine *se, SynthVoice voices[], SynthSharedControl
         } else {
             if (voices[slot].vco4_sample_stream >= 0) { release_sample_stream(se, voices[slot].vco4_sample_stream); voices[slot].vco4_sample_stream = -1; }
             if (voices[slot].vco4_layer_sample_stream >= 0) { release_sample_stream(se, voices[slot].vco4_layer_sample_stream); voices[slot].vco4_layer_sample_stream = -1; }
+        }
+        // WAVE_STRING: ask the next render to pluck/strike this voice's string (it claims a pool
+        // slot then; see string_model.c). Only on a fresh phrase -- a legato note glides.
+        {
+            float shapes[4] = { prog->vco1_shape, prog->vco2_shape, prog->vco3_shape, prog->vco4_shape };
+            for (int o = 0; o < 4; o++) voices[slot].str_trigger[o] = ((WaveType)(int)shapes[o] == WAVE_STRING);
         }
         for(int c=0; c<2; c++) { for(int f=0; f<5; f++) { voices[slot].f_low[c][f][0]=0.0f; voices[slot].f_low[c][f][1]=0.0f; voices[slot].f_band[c][f][0]=0.0f; voices[slot].f_band[c][f][1]=0.0f; } }
         for (int l = 0; l < LFO_COUNT; l++) {

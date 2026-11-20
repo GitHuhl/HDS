@@ -125,6 +125,10 @@ typedef struct {
     // than a cairo_translate(), so render and every hit-test function agree on row positions by
     // construction, never by keeping two copies of the same arithmetic in sync.
     double scroll_offset_px;
+
+    // Plucked String editor panel: which oscillator's string it's editing (-1 = closed). Opened
+    // by that oscillator's "String Edit" button; drawn over the whole tab while open.
+    int string_edit_osc;
 } HdsClapPlayViewState;
 void hds_clap_play_view_state_init(HdsClapPlayViewState *vs);
 // 46.0, not 30.0: leaves an 8px-margin, 16px-tall strip at the very top of the tab for the Mode

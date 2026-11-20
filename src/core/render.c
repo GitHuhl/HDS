@@ -3,6 +3,7 @@
 #include "core/backend.h"
 #include "core/sample_engine.h"
 #include "core/engine_internal.h"
+#include "core/string_model.h"
 
 // FIXED: Restored 'p->s' to reference sustain data properties correctly
 // Everything tick_adsr() needs BESIDES the envelope instance's own dynamic state (current_level/
@@ -352,7 +353,11 @@ float render_unison_saw(float phases[UNISON_SAW_VOICES], float base_dt, float de
         phases[u] += dt;
         if (phases[u] >= 1.0f) phases[u] -= 1.0f;
     }
-    float inv_n = 1.0f / (float)UNISON_SAW_VOICES;
+    // 1/sqrt(N), not 1/N: the voices are detuned and start at random phases, so they add up in
+    // power (level ~ sqrt(N) x one voice), not in amplitude. Dividing by N left the supersaw
+    // ~8.5 dB below a plain saw; this puts it level with one (measured, held note).
+    const float inv_n = 0.37796447f; // 1/sqrt(UNISON_SAW_VOICES)
+    _Static_assert(UNISON_SAW_VOICES == 7, "update inv_n to 1/sqrt(UNISON_SAW_VOICES)");
     if (out_l) *out_l = sum_l * inv_n;
     if (out_r) *out_r = sum_r * inv_n;
     return sum_mono * inv_n;
@@ -1139,6 +1144,15 @@ float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice
                 else tick_adsr(&voices[v].assign_eg[e-4], &eg_rates[pidx][e], eg_sustain_chase_rate);
             }
             release_idle_sample_streams(se, &voices[v]); // WAVE_SAMPLE: free any DFD stream this voice's oscillator(s) no longer need
+            // WAVE_STRING: give back a string whose oscillator went quiet or stopped being a string.
+            {
+                const ADSR *egs[4] = { &voices[v].vco1_eg, &voices[v].vco2_eg, &voices[v].vco3_eg, &voices[v].vco4_eg };
+                float shapes[4] = { prog->vco1_shape, prog->vco2_shape, prog->vco3_shape, prog->vco4_shape };
+                for (int o = 0; o < 4; o++) {
+                    if (voices[v].str_slot[o] >= 0 && (egs[o]->state == STATE_IDLE || (WaveType)(int)shapes[o] != WAVE_STRING))
+                        hds_string_release(&engine->strings, &voices[v].str_slot[o]);
+                }
+            }
 
             // Mono Legato glide randomization: each voice's own glide_time_multiplier (rerolled
             // per glide event in handle_note_on/off) scales the plain Glide Time knob, so
@@ -1579,6 +1593,12 @@ float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice
                     depth = fmaxf(0.0f, depth);
                     modulator_sum += modulator_output[src] * depth;
                 }
+                if (shape_arr[osc] == WAVE_STRING) {
+                    const ADSR *str_eg[4] = { &voices[v].vco1_eg, &voices[v].vco2_eg, &voices[v].vco3_eg, &voices[v].vco4_eg };
+                    osc_out[osc] = hds_string_render(&engine->strings, &voices[v].str_slot[osc], &voices[v].str_trigger[osc],
+                        &prog->str[osc], hz_arr[osc], modulator_sum, str_eg[osc]->state == STATE_RELEASE,
+                        voices[v].midi_velocity, &osc_side_l[osc], &osc_side_r[osc]);
+                } else
                 osc_out[osc] = render_fm_oscillator(
                     se,
                     shape_arr[osc], own_phase_arr[osc], dt_arr[osc], phase_offset_arr[osc], modulator_sum,
@@ -1621,10 +1641,10 @@ float render_audio_block(HdsSampleEngine *se, HdsEngineState *engine, SynthVoice
             // oscillator naturally contributes exactly 0 here (its pan was never computed above,
             // staying 0.0f, and its osc_out/side stay 0.0f too since render was skipped). ---
             bool osc_uses_side[4] = {
-                shape_arr[0] == WAVE_UNISON_SAW || shape_arr[0] == WAVE_SAMPLE,
-                shape_arr[1] == WAVE_UNISON_SAW || shape_arr[1] == WAVE_SAMPLE,
-                shape_arr[2] == WAVE_UNISON_SAW || shape_arr[2] == WAVE_SAMPLE,
-                shape_arr[3] == WAVE_UNISON_SAW || shape_arr[3] == WAVE_SAMPLE,
+                shape_arr[0] == WAVE_UNISON_SAW || shape_arr[0] == WAVE_SAMPLE || shape_arr[0] == WAVE_STRING,
+                shape_arr[1] == WAVE_UNISON_SAW || shape_arr[1] == WAVE_SAMPLE || shape_arr[1] == WAVE_STRING,
+                shape_arr[2] == WAVE_UNISON_SAW || shape_arr[2] == WAVE_SAMPLE || shape_arr[2] == WAVE_STRING,
+                shape_arr[3] == WAVE_UNISON_SAW || shape_arr[3] == WAVE_SAMPLE || shape_arr[3] == WAVE_STRING,
             };
             float gain_audible_arr[4] = {
                 (prog->vco1_mute != 0.0f || prog->vco1_vol <= 0.0f) ? 0.0f : fmaxf(0.0f, fminf(1.0f, prog->vco1_vol - mix_bal + mod_vco1_amp)),

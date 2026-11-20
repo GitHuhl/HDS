@@ -3,6 +3,7 @@
 #include "core/backend.h"
 #include "core/sample_engine.h"
 #include "core/engine_internal.h"
+#include "core/string_model.h"
 
 // FIXED: Restored 'init_default_controls' macro mapping setup routine missing from compilation stack
 void init_default_controls(SynthSharedControls *knobs) {
@@ -90,6 +91,7 @@ void init_default_controls(SynthSharedControls *knobs) {
     // musical defaults as programs[0] above, not raw zero-init -- a plain struct copy is safe
     // here since ProgramState holds no pointers. Whatever gets loaded/edited onto a slot later
     // simply overwrites this, independently of every other slot.
+    for (int o = 0; o < 4; o++) hds_string_default_params(&knobs->programs[0].str[o]);
     for (int p = 1; p <= COMBI_PROGRAM_COUNT; p++) knobs->programs[p] = knobs->programs[0];
 
     // ext_in_gain defaults to 0.0 (silence/-inf), not unity: an upstream mic pre or interface

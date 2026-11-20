@@ -213,7 +213,7 @@ int main(int argc, char **argv) {
     TestHash hs; test_hash_init(&hs);
     int n = request_state(&hs);
     test_check(find_msg("/hds/status/state_dump_complete") != NULL, "clap_osc/state_dump/complete", "no state_dump_complete (got %d messages)", g_nmsgs);
-    test_check(n == 5981, "clap_osc/state_dump/count", "%d control messages, expected one per OSC address (5981)", n);
+    test_check(n == 6845, "clap_osc/state_dump/count", "%d control messages, expected one per OSC address (6845)", n);
     test_hash_print(&hs, "clap_osc/state_dump/default");
 
     // parameter writes

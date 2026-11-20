@@ -96,9 +96,10 @@ ProgramState *hds_play_program(HdsClapPlugin *p) { return &p->knobs.programs[SIN
 // Shape combo -- same indices as the WaveType enum (backend.c),
 // load-bearing for saved patches so this order must never change.
 // ---------------------------------------------------------------------------------------------
-#define HDS_PLAY_SHAPE_COUNT 10
+#define HDS_PLAY_SHAPE_COUNT 11
 static const char *const HDS_PLAY_SHAPE_NAMES[HDS_PLAY_SHAPE_COUNT] = {
     "Saw", "Square", "Triangle", "Sine", "Unison Saw", "Noise", "Pulse", "Multisample", "Off", "Rev Saw",
+    "Plucked String",
 };
 const char *const HDS_PLAY_EGMODE_NAMES[HDS_PLAY_EGMODE_COUNT] = {
     "ADSR", "AR", "AD", "ASR", "AHD", "DADSR", "AHDSR",
@@ -534,6 +535,7 @@ void hds_clap_play_view_state_init(HdsClapPlayViewState *vs) {
     vs->dropdown_kind = HDS_PLAY_DROPDOWN_NONE;
     vs->adsr_drag_eg = -1;
     for (int i = 0; i < 4; i++) vs->adsr_active_node[i] = -1;
+    vs->string_edit_osc = -1;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -576,6 +578,8 @@ typedef struct {
     HdsFxRect pitch_knob;
     HdsFxRect uni_width_knob;  // Unison Saw shape only
     HdsFxRect uni_detune_knob; // Unison Saw shape only
+    HdsFxRect str_edit_btn;    // Plucked String only: opens the string editor panel
+    HdsFxRect str_knob[3];     // Plucked String only: Decay, Damping, Pluck Position
     HdsFxRect vol_knob;
     HdsFxRect mute_btn;
     HdsFxRect pan_knob;
@@ -627,6 +631,14 @@ static void hds_play_compute_osc_layout(int osc, int shape, double col_x, double
     y += HDS_PLAY_KNOB_STRIDE;
     out->pitch_knob = (HdsFxRect){cx, y + HDS_PLAY_KNOB_R + 9.0, HDS_PLAY_KNOB_R, HDS_PLAY_KNOB_R};
     y += HDS_PLAY_KNOB_STRIDE;
+
+    if (shape == WAVE_STRING) {
+        out->str_edit_btn = (HdsFxRect){col_x, y, HDS_PLAY_OSC_COL_W, HDS_PLAY_PILL_H};
+        y += HDS_PLAY_PILL_H + 4.0;
+        double xs[3] = { col_x + 24.0, cx, col_x + HDS_PLAY_OSC_COL_W - 24.0 };
+        for (int k = 0; k < 3; k++) out->str_knob[k] = (HdsFxRect){xs[k], y + HDS_PLAY_KNOB_R + 9.0, HDS_PLAY_KNOB_R, HDS_PLAY_KNOB_R};
+        y += HDS_PLAY_KNOB_STRIDE;
+    }
 
     if (shape == WAVE_UNISON_SAW) {
         out->uni_width_knob = (HdsFxRect){cx, y + HDS_PLAY_KNOB_R + 9.0, HDS_PLAY_KNOB_R, HDS_PLAY_KNOB_R};
@@ -953,7 +965,7 @@ static void hds_play_dropdown_bg_rect(const HdsFxRect *anchor, int kind, double 
     double below_y = anchor->y + anchor->h + 2.0;
     double y0 = (below_y + list_h > window_h) ? (anchor->y - list_h - 2.0) : below_y;
     if (y0 < 0.0) y0 = 0.0;
-    *out = (HdsFxRect){anchor->x, y0, 78.0, list_h};
+    *out = (HdsFxRect){anchor->x, y0, kind == HDS_PLAY_DROPDOWN_SHAPE ? 104.0 : 78.0, list_h};
 }
 
 static void hds_play_dropdown_option_rect(const HdsFxRect *anchor, int kind, double window_h, int idx, HdsFxRect *out) {
@@ -997,6 +1009,156 @@ static void hds_play_render_dropdown(cairo_t *cr, HdsClapPlayViewState *vs, doub
 // ---------------------------------------------------------------------------------------------
 #define HDS_PLAY_OSC_GAP 18.0 // widened for breathing room between strips
 #define HDS_PLAY_REGION_GAP 20.0 // vertical gap between the oscillator region and the EG region below it
+
+
+// ---------------------------------------------------------------------------------------------
+// Plucked String (WAVE_STRING) controls -- every StringModelParams field, as one table shared by
+// the oscillator column's three inline knobs and the full String Edit panel (render and hit-test
+// both read it, so they can't disagree). Units are the backend's own (see StringModelParams).
+// ---------------------------------------------------------------------------------------------
+typedef enum { HDS_STR_FMT_INT, HDS_STR_FMT_PCT, HDS_STR_FMT_SEC, HDS_STR_FMT_CENTS, HDS_STR_FMT_NODE } HdsStrFmt;
+typedef struct { size_t off; const char *label; float lo, hi; HdsStrFmt fmt; } HdsStrKnob;
+#define HDS_STR_K(field, label, lo, hi, fmt) { offsetof(StringModelParams, field), label, lo, hi, fmt }
+
+static const HdsStrKnob HDS_STR_DECAY = HDS_STR_K(decay, "Decay", 0.05f, 30.0f, HDS_STR_FMT_SEC);
+static const HdsStrKnob HDS_STR_DAMPING = HDS_STR_K(damping, "Damping", 0.0f, 100.0f, HDS_STR_FMT_INT);
+static const HdsStrKnob HDS_STR_POSITION = HDS_STR_K(pluck_pos, "Position", 1.0f, 50.0f, HDS_STR_FMT_PCT);
+
+typedef struct { const char *title; int count; HdsStrKnob knobs[6]; } HdsStrGroup;
+static const HdsStrGroup HDS_STR_GROUPS[] = {
+    { "Excitation", 6, { HDS_STR_K(exc_hardness, "Hardness", 0, 100, HDS_STR_FMT_INT), HDS_STR_K(exc_bright, "Bright", 0, 100, HDS_STR_FMT_INT),
+                         HDS_STR_K(exc_vel_bright, "Vel>Brt", 0, 100, HDS_STR_FMT_INT), HDS_STR_K(exc_noise, "Noise", 0, 100, HDS_STR_FMT_INT),
+                         HDS_STR_K(pluck_pos, "Position", 1, 50, HDS_STR_FMT_PCT), HDS_STR_K(exc_input, "Ext In", 0, 100, HDS_STR_FMT_INT) } },
+    { "Bow", 2, { HDS_STR_K(bow_pressure, "Pressure", 0, 100, HDS_STR_FMT_INT), HDS_STR_K(bow_speed, "Speed", 0, 100, HDS_STR_FMT_INT) } },
+    { "String", 6, { HDS_STR_K(decay, "Decay", 0.05f, 30, HDS_STR_FMT_SEC), HDS_STR_K(damping, "Damping", 0, 100, HDS_STR_FMT_INT),
+                     HDS_STR_K(decay_keytrack, "Key Trk", 0, 100, HDS_STR_FMT_INT), HDS_STR_K(release, "Release", 0.01f, 10, HDS_STR_FMT_SEC),
+                     HDS_STR_K(stiffness, "Stiffness", 0, 100, HDS_STR_FMT_INT), HDS_STR_K(nonlinear, "Tension", 0, 100, HDS_STR_FMT_INT) } },
+    { "Touch", 3, { HDS_STR_K(harmonic_node, "Harmonic", 0, 9, HDS_STR_FMT_NODE), HDS_STR_K(harmonic_amt, "Touch", 0, 100, HDS_STR_FMT_INT),
+                    HDS_STR_K(buzz, "Fret Buzz", 0, 100, HDS_STR_FMT_INT) } },
+    { "Pickup & Body", 3, { HDS_STR_K(pickup_pos, "Pickup", 1, 50, HDS_STR_FMT_PCT), HDS_STR_K(body, "Body", 0, 100, HDS_STR_FMT_INT),
+                            HDS_STR_K(body_size, "Size", 0, 100, HDS_STR_FMT_INT) } },
+    { "Polarization", 3, { HDS_STR_K(pol_detune, "Detune", 0, 20, HDS_STR_FMT_CENTS), HDS_STR_K(pol_coupling, "Coupling", 0, 100, HDS_STR_FMT_INT),
+                           HDS_STR_K(pol_width, "Width", 0, 100, HDS_STR_FMT_INT) } },
+};
+#define HDS_STR_GROUP_COUNT ((int)(sizeof HDS_STR_GROUPS / sizeof HDS_STR_GROUPS[0]))
+static const char *const HDS_STR_EXCITER_NAMES[STRING_EXC_COUNT] = { "Pluck", "Pick", "Hammer", "Noise", "Bow" };
+
+static float *hds_str_field(ProgramState *prog, int osc, const HdsStrKnob *k) {
+    return (float *)((char *)&prog->str[osc] + k->off);
+}
+
+static void hds_str_value_text(const HdsStrKnob *k, float v, char *buf, size_t n) {
+    switch (k->fmt) {
+        case HDS_STR_FMT_PCT: snprintf(buf, n, "%d%%", (int)(v + 0.5f)); break;
+        case HDS_STR_FMT_SEC: if (v < 1.0f) snprintf(buf, n, "%dms", (int)(v * 1000.0f + 0.5f)); else snprintf(buf, n, "%.2fs", v); break;
+        case HDS_STR_FMT_CENTS: snprintf(buf, n, "%.1fc", v); break;
+        case HDS_STR_FMT_NODE: { int node = (int)(v + 0.5f); if (node < 2) snprintf(buf, n, "Off"); else snprintf(buf, n, "1/%d", node); break; }
+        default: snprintf(buf, n, "%d", (int)(v + 0.5f)); break;
+    }
+}
+
+static void hds_str_draw_knob(cairo_t *cr, ProgramState *prog, int osc, const HdsStrKnob *k, double cx, double cy, double r, bool dim) {
+    float *v = hds_str_field(prog, osc, k);
+    char txt[16]; hds_str_value_text(k, *v, txt, sizeof txt);
+    hds_play_draw_knob(cr, cx, cy, r, (float)((*v - k->lo) / (k->hi - k->lo)), dim, k->label, txt);
+}
+
+// --- String Edit panel layout ---
+#define HDS_STR_PANEL_ROW_H 62.0
+#define HDS_STR_PANEL_KNOB_DX 74.0
+#define HDS_STR_PANEL_KNOB_R 13.0
+#define HDS_STR_PANEL_LABEL_W 118.0
+
+typedef struct {
+    HdsFxRect panel, close_btn, exciter_btn[STRING_EXC_COUNT];
+    double row_y[HDS_STR_GROUP_COUNT]; // knob centre line of each group's row
+    double knob_x0;                    // centre x of each row's first knob
+} HdsStrPanelLayout;
+
+static void hds_str_panel_layout(double window_w, double window_h, HdsStrPanelLayout *L) {
+    memset(L, 0, sizeof(*L));
+    double w = fmin(window_w - 2.0 * HDS_PLAY_MARGIN, 640.0);
+    double h = 96.0 + HDS_STR_GROUP_COUNT * HDS_STR_PANEL_ROW_H;
+    if (h > window_h - 30.0) h = window_h - 30.0;
+    L->panel = (HdsFxRect){HDS_PLAY_MARGIN, 26.0, w, h};
+    L->close_btn = (HdsFxRect){L->panel.x + w - 70.0, L->panel.y + 8.0, 60.0, HDS_PLAY_PILL_H};
+    for (int e = 0; e < STRING_EXC_COUNT; e++)
+        L->exciter_btn[e] = (HdsFxRect){L->panel.x + HDS_STR_PANEL_LABEL_W + e * 72.0, L->panel.y + 40.0, 68.0, HDS_PLAY_PILL_H};
+    L->knob_x0 = L->panel.x + HDS_STR_PANEL_LABEL_W + HDS_STR_PANEL_KNOB_DX / 2.0 - 4.0;
+    for (int g = 0; g < HDS_STR_GROUP_COUNT; g++) L->row_y[g] = L->panel.y + 100.0 + g * HDS_STR_PANEL_ROW_H;
+}
+
+static void hds_str_render_panel(cairo_t *cr, HdsClapPlugin *p, int osc, double window_w, double window_h) {
+    ProgramState *prog = hds_play_program(p);
+    HdsStrPanelLayout L; hds_str_panel_layout(window_w, window_h, &L);
+    hds_fx_rgba(cr, 0.0, 0.0, 0.0, 0.55);
+    cairo_new_path(cr); cairo_rectangle(cr, 0, 0, window_w, window_h); cairo_fill(cr);
+    hds_fx_rgb(cr, 0.12, 0.12, 0.15);
+    cairo_new_path(cr); cairo_rectangle(cr, L.panel.x, L.panel.y, L.panel.w, L.panel.h); cairo_fill(cr);
+    hds_fx_rgba(cr, 1, 1, 1, 0.22);
+    cairo_set_line_width(cr, 1.0);
+    cairo_new_path(cr); cairo_rectangle(cr, L.panel.x + 0.5, L.panel.y + 0.5, L.panel.w - 1, L.panel.h - 1); cairo_stroke(cr);
+
+    char title[48]; snprintf(title, sizeof title, "Osc %d \xe2\x80\x94 Plucked String", osc + 1);
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 12.0);
+    hds_fx_rgb(cr, 0.85, 0.86, 0.88);
+    hds_fx_left_text(cr, L.panel.x + 12.0, L.panel.y + 21.0, title);
+    hds_fx_draw_pill(cr, L.close_btn.x, L.close_btn.y, L.close_btn.w, L.close_btn.h, "Close", false, false);
+
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 10.0);
+    hds_fx_rgb(cr, 0.55, 0.55, 0.58);
+    hds_fx_left_text(cr, L.panel.x + 12.0, L.exciter_btn[0].y + 13.0, "Exciter");
+    int exciter = (int)(prog->str[osc].exciter + 0.5f);
+    for (int e = 0; e < STRING_EXC_COUNT; e++)
+        hds_fx_draw_pill(cr, L.exciter_btn[e].x, L.exciter_btn[e].y, L.exciter_btn[e].w, L.exciter_btn[e].h, HDS_STR_EXCITER_NAMES[e], e == exciter, false);
+
+    for (int g = 0; g < HDS_STR_GROUP_COUNT; g++) {
+        const HdsStrGroup *G = &HDS_STR_GROUPS[g];
+        bool group_dim = (g == 1 && exciter != STRING_EXC_BOW); // Bow controls only act on the Bow exciter
+        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+        cairo_set_font_size(cr, 10.0);
+        hds_fx_rgb(cr, group_dim ? 0.38 : 0.55, group_dim ? 0.38 : 0.55, group_dim ? 0.40 : 0.58);
+        hds_fx_left_text(cr, L.panel.x + 12.0, L.row_y[g] + 4.0, G->title);
+        for (int k = 0; k < G->count; k++) {
+            const HdsStrKnob *K = &G->knobs[k];
+            bool dim = group_dim || (K->off == offsetof(StringModelParams, harmonic_amt) && prog->str[osc].harmonic_node < 1.5f);
+            hds_str_draw_knob(cr, prog, osc, K, L.knob_x0 + k * HDS_STR_PANEL_KNOB_DX, L.row_y[g], HDS_STR_PANEL_KNOB_R, dim);
+        }
+    }
+}
+
+// Click while the panel is open: always consumed (the panel is modal), so nothing underneath
+// reacts to a click that landed on it or around it.
+static bool hds_str_panel_press(HdsClapPlugin *p, HdsClapPlayViewState *vs, double window_w, double window_h, double x, double y, int button) {
+    int osc = vs->string_edit_osc;
+    ProgramState *prog = hds_play_program(p);
+    HdsStrPanelLayout L; hds_str_panel_layout(window_w, window_h, &L);
+    if (hds_play_rect_contains(&L.close_btn, x, y) || !hds_play_rect_contains(&L.panel, x, y)) {
+        if (button == 1) vs->string_edit_osc = -1;
+        return true;
+    }
+    for (int e = 0; e < STRING_EXC_COUNT; e++) {
+        if (hds_play_rect_contains(&L.exciter_btn[e], x, y)) {
+            if (button == 1) prog->str[osc].exciter = (float)e;
+            return true;
+        }
+    }
+    for (int g = 0; g < HDS_STR_GROUP_COUNT; g++) {
+        for (int k = 0; k < HDS_STR_GROUPS[g].count; k++) {
+            const HdsStrKnob *K = &HDS_STR_GROUPS[g].knobs[k];
+            HdsFxRect r = {L.knob_x0 + k * HDS_STR_PANEL_KNOB_DX, L.row_y[g], HDS_STR_PANEL_KNOB_R, HDS_STR_PANEL_KNOB_R};
+            if (hds_play_knob_hit_test(&r, x, y)) {
+                hds_play_start_knob_drag(&vs->knob_drag, hds_str_field(prog, osc, K), K->lo, K->hi, x, y, button, HDS_PLAY_NO_MENU);
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
+static const HdsStrKnob *const HDS_STR_INLINE[3] = { &HDS_STR_DECAY, &HDS_STR_DAMPING, &HDS_STR_POSITION };
 
 static double hds_play_osc_col_x(int osc) { return HDS_PLAY_MARGIN + osc * (HDS_PLAY_OSC_COL_W + HDS_PLAY_OSC_GAP); }
 
@@ -1082,6 +1244,10 @@ static void hds_play_render_osc_strip(cairo_t *cr, HdsClapPlugin *p, HdsClapPlay
     hds_play_draw_osc_knob(cr, &L.fine_knob, f.fine_tune, HDS_PLAY_KNOB_FINE, shape);
     hds_play_draw_osc_knob(cr, &L.phase_knob, f.phase_offset, HDS_PLAY_KNOB_PHASE, shape);
     hds_play_draw_osc_knob(cr, &L.pitch_knob, f.pitch, HDS_PLAY_KNOB_PITCH, shape);
+    if (L.str_edit_btn.w > 0) {
+        hds_fx_draw_pill(cr, L.str_edit_btn.x, L.str_edit_btn.y, L.str_edit_btn.w, L.str_edit_btn.h, "String Edit\xe2\x80\xa6", vs->string_edit_osc == osc, false);
+        for (int k = 0; k < 3; k++) hds_str_draw_knob(cr, prog, osc, HDS_STR_INLINE[k], L.str_knob[k].x, L.str_knob[k].y, L.str_knob[k].w, false);
+    }
     hds_play_draw_osc_knob(cr, &L.uni_width_knob, f.unison_width, HDS_PLAY_KNOB_UNI_WIDTH, shape);
     hds_play_draw_osc_knob(cr, &L.uni_detune_knob, f.unison_detune, HDS_PLAY_KNOB_UNI_DETUNE, shape);
     hds_play_draw_osc_knob(cr, &L.vol_knob, f.vol, HDS_PLAY_KNOB_VOL, shape);
@@ -1181,6 +1347,13 @@ void hds_clap_play_render(cairo_t *cr, HdsClapPlugin *p, HdsClapPlayViewState *v
         hds_play_render_eg_panel(cr, p, vs, i, hds_play_osc_col_x(i), HDS_PLAY_OSC_COL_W, eg_top_y);
     }
 
+    // The String Edit panel covers the tab while open.
+    if (vs->string_edit_osc >= 0) {
+        HdsPlayOscFields sf; hds_play_osc_fields(prog, vs->string_edit_osc, &sf);
+        if ((int)*sf.shape == WAVE_STRING) hds_str_render_panel(cr, p, vs->string_edit_osc, window_w, window_h);
+        else vs->string_edit_osc = -1; // the oscillator stopped being a string
+    }
+
     // Whichever dropdown (if any) is open draws LAST, on top of everything else -- same "open
     // list always wins the top paint layer" rule the FX tab's own dropdown already follows.
     if (vs->dropdown_kind == HDS_PLAY_DROPDOWN_SHAPE) {
@@ -1236,6 +1409,7 @@ bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState *vs, H
     ProgramState *prog = hds_play_program(p);
 
     if (vs->ctx_menu.open) return hds_play_ctxmenu_handle_click(p, &vs->ctx_menu, window_w, window_h, x, y);
+    if (vs->string_edit_osc >= 0) return hds_str_panel_press(p, vs, window_w, window_h, x, y, button);
 
     if (vs->dropdown_kind != HDS_PLAY_DROPDOWN_NONE) {
         int count = hds_play_dropdown_option_count(vs->dropdown_kind);
@@ -1290,6 +1464,19 @@ bool hds_clap_play_on_button_press(HdsClapPlugin *p, HdsClapPlayViewState *vs, H
         if (L.force_own_amp_eg_chk.w > 0 && hds_play_rect_contains(&L.force_own_amp_eg_chk, x, y)) {
             if (button == 1 && f.force_own_amp_eg) *f.force_own_amp_eg = (*f.force_own_amp_eg != 0.0f) ? 0.0f : 1.0f;
             return true;
+        }
+        if (L.str_edit_btn.w > 0) {
+            if (hds_play_rect_contains(&L.str_edit_btn, x, y)) {
+                if (button == 1) vs->string_edit_osc = osc;
+                return true;
+            }
+            for (int k = 0; k < 3; k++) {
+                if (hds_play_knob_hit_test(&L.str_knob[k], x, y)) {
+                    const HdsStrKnob *K = HDS_STR_INLINE[k];
+                    hds_play_start_knob_drag(&vs->knob_drag, hds_str_field(prog, osc, K), K->lo, K->hi, x, y, button, HDS_PLAY_NO_MENU);
+                    return true;
+                }
+            }
         }
         if (hds_play_rect_contains(&L.mute_btn, x, y)) {
             if (button == 1) *f.mute = (*f.mute != 0.0f) ? 0.0f : 1.0f;
