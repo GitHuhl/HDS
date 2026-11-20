@@ -85,7 +85,30 @@ int main(void) {
         double touched_ratio = mag_at(9600, 24000, 146.83) / mag_at(9600, 24000, 293.66);
         test_check(touched_ratio < free_ratio * 0.1, "string_model/harmonic_node", "fundamental/2nd ratio %.3f touched vs %.3f free", touched_ratio, free_ratio);
     }
-    // 5. Every exciter, every control at its minimum and its maximum, lowest/middle/highest
+    // 5. No built-in tremolo: at default settings the amplitude envelope (10 ms RMS, decay trend
+    //    removed) never swings more than +-1.5 dB at any rate from 0.2 to 20 Hz, on any of four
+    //    notes. (The second polarization's coupling once did +-6-7 dB at a rate that rose with
+    //    pitch.)
+    {
+        const double notes[] = { 65.41, 110.0, 220.0, 440.0 };
+        double worst = 0, worst_rate = 0, worst_note = 0;
+        for (int k = 0; k < 4; k++) {
+            StringModelParams sp; hds_string_default_params(&sp);
+            render(&sp, notes[k], N_MAX, N_MAX, 100);
+            int W = 480, M = N_MAX / W, a = 20; double env[300], sx = 0, sy = 0, sxx = 0, sxy = 0; int n = 0;
+            for (int m = 0; m < M; m++) { double e = rms(m * W, W); env[m] = 20 * log10(e + 1e-12); }
+            for (int m = a; m < M; m++, n++) { sx += m; sy += env[m]; sxx += (double)m * m; sxy += m * env[m]; }
+            double sl = (n * sxy - sx * sy) / (n * sxx - sx * sx), ic = (sy - sl * sx) / n;
+            for (double f = 0.2; f <= 20.0; f += 0.05) {
+                double re = 0, im = 0;
+                for (int m = a; m < M; m++) { double r = env[m] - (ic + sl * m); re += r * cos(2 * M_PI * f * m * 0.01); im += r * sin(2 * M_PI * f * m * 0.01); }
+                double amp = 2 * sqrt(re * re + im * im) / (M - a);
+                if (amp > worst) { worst = amp; worst_rate = f; worst_note = notes[k]; }
+            }
+        }
+        test_check(worst < 1.5, "string_model/no_tremolo", "amplitude swings +-%.2f dB at %.2f Hz on the %.0f Hz note", worst, worst_rate, worst_note);
+    }
+    // 6. Every exciter, every control at its minimum and its maximum, lowest/middle/highest
     //    notes: always finite and bounded.
     {
         const size_t offs[] = { offsetof(StringModelParams, exc_hardness), offsetof(StringModelParams, exc_bright), offsetof(StringModelParams, exc_vel_bright),

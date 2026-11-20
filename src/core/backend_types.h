@@ -402,7 +402,7 @@ typedef struct {
     float harmonic_amt;   // 0-100: how firmly
     float buzz;           // 0-100: fret buzz (displacement limited against a fret near the nut)
     float pol_detune;     // 0-20 cents: second polarization's tuning offset (beating)
-    float pol_coupling;   // 0-100: energy exchange between the two polarizations at the bridge
+    float pol_coupling;   // 0-100: energy exchange between the two polarizations at the bridge (a rate: 0-0.6 Hz, independent of pitch)
     float pol_width;      // 0-100: stereo spread of the two polarizations
     float body;           // 0-100: resonant body mix
     float body_size;      // 0-100: body size (larger = lower resonances)
